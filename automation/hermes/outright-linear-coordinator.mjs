@@ -100,6 +100,8 @@ function createCard(issue) {
     config.profiles.implementer,
     "--project",
     config.project,
+    "--workspace",
+    "worktree",
     "--branch",
     branch,
     "--priority",
