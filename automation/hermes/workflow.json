@@ -51,7 +51,7 @@
   },
   "models": {
     "implementer": {
-      "id": "moonshotai/kimi-k3",
+      "id": "z-ai/glm-5.3",
       "provider": "openrouter-outright",
       "reasoningEffort": "medium"
     },

@@ -3,7 +3,7 @@
 This setup serializes the Outright Linear backlog through two independent Hermes profiles:
 
 1. A deterministic coordinator reads the Outright team through Composio CLI and creates one Hermes card according to the configured implementation sequence.
-2. `outright-implementer` uses Kimi K3 to implement and commit locally in a dedicated Git worktree.
+2. `outright-implementer` uses GLM 5.3 to implement and commit locally in a dedicated Git worktree, routing through DigitalOcean first and Cloudflare on provider failure.
 3. `outright-reviewer` uses GPT Sol with high reasoning through the Hermes `openai-codex` OAuth provider. It reviews the local branch before any PR exists; findings return to implementation.
 4. After the local gate passes, the implementer pushes and opens a PR. Automatic review agents run on that PR and on later fix commits.
 5. Each remediation round waits 30 minutes after PR creation or the latest pushed commit, retrieves pinned hosted Skillplane workflow `21n/pr-refetch-fix@1.2.0` through Composio CLI, and executes exactly one bounded fetch/fix/test/push pass. Addressed review threads may be replied to and resolved using the captured snapshot IDs.
