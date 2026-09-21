@@ -1,0 +1,19 @@
+server/database.mjs
+  s_cc0127c6616c37::t_09e2f67439ad63 2,37-41,50,217-220,222,225,227-238,240-241,405-415
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4377f96b73850357fdd18fe35229f30343465cb4",
+  "prompts": {},
+  "sessions": {
+    "s_cc0127c6616c37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7e7fd879-977e-4eda-96a8-9b05beb97e8a",
+        "model": "claude-opus-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
