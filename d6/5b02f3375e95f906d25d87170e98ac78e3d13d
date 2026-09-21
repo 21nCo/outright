@@ -1,0 +1,19 @@
+server/agent-manager.test.mjs
+  s_042fa740c37bf3::t_ba8f21df103c84 226-231,293-316
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d65b02f3375e95f906d25d87170e98ac78e3d13d",
+  "prompts": {},
+  "sessions": {
+    "s_042fa740c37bf3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e2d1f8ce-5606-4670-8d30-1b4b7f9475df",
+        "model": "claude-opus-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
