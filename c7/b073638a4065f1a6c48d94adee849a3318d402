@@ -1,0 +1,26 @@
+server/agent-manager.mjs
+  h_a39f9495f9ec1d 38-46,55-65,388-394,396-401,405-408,411,495-497,499
+server/agent-manager.test.mjs
+  h_a39f9495f9ec1d 9,320-338,498-502,504-507,510-512,515-520,526-547,557-568,573,581,590,594,599
+server/database.mjs
+  h_a39f9495f9ec1d 2,40-46,70,225-230,247-252,259-261,264-269,289,314,332,439-456
+server/database.test.mjs
+  h_a39f9495f9ec1d 4-5,227-228,239,247,250-349
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 443-446,455-462,465,471-500,507-511,513-517
+src/App.jsx
+  h_a39f9495f9ec1d 260-264
+src/styles.css
+  h_a39f9495f9ec1d 340
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c7b073638a4065f1a6c48d94adee849a3318d402",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
