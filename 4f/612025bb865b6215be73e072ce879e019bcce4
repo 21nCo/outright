@@ -1,0 +1,33 @@
+automation/hermes/reviewer.md
+  s_6126673cc0a89e::t_2208f309cebb35 5,29-30
+  s_6126673cc0a89e::t_c059707b29948e 20,26,28
+automation/hermes/workflow.json
+  s_6126673cc0a89e::t_c059707b29948e 10-43,66-67
+automation/hermes/README.md
+  s_6126673cc0a89e::t_c059707b29948e 5,9-14
+automation/hermes/outright-linear-coordinator.mjs
+  s_6126673cc0a89e::t_2208f309cebb35 80,88
+  s_6126673cc0a89e::t_c059707b29948e 35-36,43-45,135-139
+automation/hermes/implementer.md
+  s_6126673cc0a89e::t_2208f309cebb35 7
+  s_6126673cc0a89e::t_c059707b29948e 20,22-23,25
+automation/hermes/coordinator.test.mjs
+  s_6126673cc0a89e::t_a391bffc6060bb 6
+  s_6126673cc0a89e::t_c059707b29948e 17-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4f612025bb865b6215be73e072ce879e019bcce4",
+  "prompts": {},
+  "sessions": {
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
