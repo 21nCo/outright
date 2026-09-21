@@ -12,15 +12,15 @@ Linear access must go through Composio CLI. The coordinator never uses a direct 
 The installed cron job is intentionally created **paused**. Review the setup before starting it:
 
 ```bash
-hermes cron list
-hermes cron resume outright-linear-coordinator
-hermes gateway start
+hermes cron list --all
+hermes gateway install --start-now
+hermes cron resume <job-id>
 ```
 
 Pause intake without disturbing a card already in progress:
 
 ```bash
-hermes cron pause outright-linear-coordinator --reason "Manual pause"
+hermes cron pause <job-id>
 ```
 
 Inspect the board and execution history:
@@ -28,5 +28,5 @@ Inspect the board and execution history:
 ```bash
 hermes kanban boards switch outright
 hermes kanban list
-hermes cron runs outright-linear-coordinator
+hermes cron runs <job-id>
 ```
