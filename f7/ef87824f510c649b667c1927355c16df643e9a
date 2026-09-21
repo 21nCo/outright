@@ -1,0 +1,29 @@
+automation/hermes/implementer.md
+  s_6126673cc0a89e::t_e54dc63e2247b4 3,5,7,9-25
+automation/hermes/reviewer.md
+  s_6126673cc0a89e::t_e54dc63e2247b4 3,5,7,9-27
+automation/hermes/README.md
+  s_6126673cc0a89e::t_5d3cdaf45f387b 6-13
+automation/hermes/outright-linear-coordinator.mjs
+  s_6126673cc0a89e::t_8e078ce30abcf4 77-81,83,109,111
+automation/hermes/retrieve-pr-review-fix.mjs
+  s_6126673cc0a89e::t_f3b8ea86c8ad4d 1-56
+automation/hermes/workflow.json
+  s_6126673cc0a89e::t_19481ea0b93eeb 19-28,30-38
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f7ef87824f510c649b667c1927355c16df643e9a",
+  "prompts": {},
+  "sessions": {
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
