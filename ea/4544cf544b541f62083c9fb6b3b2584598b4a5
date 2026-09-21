@@ -1,0 +1,23 @@
+automation/hermes/workflow.json
+  s_6126673cc0a89e::t_ebadb17ad83150 64
+automation/hermes/implementer.md
+  s_6126673cc0a89e::t_ebadb17ad83150 9
+automation/hermes/reviewer.md
+  s_6126673cc0a89e::t_ebadb17ad83150 11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ea4544cf544b541f62083c9fb6b3b2584598b4a5",
+  "prompts": {},
+  "sessions": {
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
