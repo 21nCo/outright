@@ -267,6 +267,14 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       if (!closed) error.preserveActiveRun = true;
       throw error;
     }
+    // shutdown/stop can race with the synchronous running-state commit after
+    // the earlier pre-spawn check. Never authorize new side effects once the
+    // run has been cancelled; the unauthorized supervisor will exit when its
+    // stdin closes (and stop() has already signalled it as a fallback).
+    if (state.stopped || shuttingDown) {
+      try { child.stdin?.end?.(); } catch { /* The wrapper already exited. */ }
+      return;
+    }
     // Phase 3: authorize. Only now may the provider start side effects.
     authorizeLaunch(child);
   }

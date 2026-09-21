@@ -162,8 +162,16 @@ static process_snapshot inspect_owned_tree(pid_t supervisor_pid, pid_t provider_
     return snapshot;
   }
   struct dirent *entry;
-  errno = 0;
-  while ((entry = readdir(directory)) != NULL) {
+  for (;;) {
+    // Only errno from readdir() describes enumeration completeness. Helpers
+    // called while inspecting an entry may legitimately leave errno set (for
+    // example when a process exits between listing /proc and opening stat).
+    errno = 0;
+    entry = readdir(directory);
+    if (entry == NULL) {
+      if (errno != 0) snapshot.complete = false;
+      break;
+    }
     char *end = NULL;
     long value = strtol(entry->d_name, &end, 10);
     if (entry->d_name[0] == '\0' || end == NULL || *end != '\0' || value <= 0) continue;
@@ -190,7 +198,6 @@ static process_snapshot inspect_owned_tree(pid_t supervisor_pid, pid_t provider_
     if (state != 'Z') snapshot.live_count++;
     if (kill_live_members && state != 'Z' && pid != provider_pid) kill(pid, SIGKILL);
   }
-  if (errno != 0) snapshot.complete = false;
   if (closedir(directory) != 0) snapshot.complete = false;
   return snapshot;
 }

@@ -555,6 +555,36 @@ test("a failed running-state commit reaps the unauthorized wrapper before releas
   assert.deepEqual(manager.activeRuns(), []);
 });
 
+test("shutdown racing the running-state commit never authorizes the provider", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  child.stdin = new PassThrough();
+  const writes = [];
+  const originalWrite = child.stdin.write.bind(child.stdin);
+  child.stdin.write = (chunk) => { writes.push(String(chunk)); return originalWrite(chunk); };
+  child.kill = (signal) => {
+    child.signals.push(signal);
+    setImmediate(() => child.emit("close", null, signal));
+    return true;
+  };
+  let manager;
+  let shutdownPromise;
+  const originalUpdate = database.updateRun.bind(database);
+  database.updateRun = (id, patch) => {
+    const updated = originalUpdate(id, patch);
+    if (patch.status === "running" && !shutdownPromise) shutdownPromise = manager.shutdown();
+    return updated;
+  };
+  manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child, terminationTimeoutMs: 1000 });
+  const run = database.createRun(codexRun("run-1"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  await shutdownPromise;
+
+  assert.equal(writes.includes("go\n"), false, "shutdown cannot authorize a provider after cancellation");
+  assert.equal(database.getRun(run.id).status, "stopped");
+  assert.deepEqual(manager.activeRuns(), []);
+});
+
 test("publishes durable assistant messages before the terminal run event", async () => {
   const database = fakeDatabase();
   const child = fakeChild();
