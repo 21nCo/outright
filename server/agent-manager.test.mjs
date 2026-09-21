@@ -207,6 +207,68 @@ test("bounds checkpoint writes and write amplification for high-delta streams", 
   assert.equal(database.getRun("run-1").status, "completed");
 });
 
+test("flushes a stalled sub-threshold delta tail after the checkpoint interval", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child, checkpointMinBytes: 4096, checkpointIntervalMs: 50 });
+  database.createRun({ ...codexRun("run-1"), provider: "claude" });
+  await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-1") });
+
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "first" } } }) + "\n");
+  assert.equal(database.messages.length, 1);
+  assert.equal(database.messages[0].body, "first");
+
+  // A sub-threshold tail with no further deltas must still become durable
+  // within the checkpoint interval via the coalescing timer, not only when
+  // the next delta happens to arrive.
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: " second" } } }) + "\n");
+  assert.equal(database.messages[0].body, "first", "the tail coalesces in memory first");
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(database.messages.length, 1);
+  assert.equal(database.messages[0].body, "first second");
+  assert.equal(database.messages[0].id, "run-1:1");
+  assert.deepEqual(manager.activeRuns(), ["run-1"]);
+  child.emit("close", 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(database.getRun("run-1").status, "completed");
+});
+
+test("stops checkpoint rewrites after the transcript cap is durably flushed", async () => {
+  const database = fakeDatabase();
+  const upserts = [];
+  const originalUpsert = database.upsertMessage.bind(database);
+  database.upsertMessage = (input) => { upserts.push(input); return originalUpsert(input); };
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child, checkpointMinBytes: 4096, checkpointIntervalMs: 500 });
+  database.createRun({ ...codexRun("run-1"), provider: "claude" });
+  await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-1") });
+
+  // Stream well past the 1 MiB transcript cap: discarded deltas after the cap
+  // must not keep rewriting the capped body.
+  const chunk = "x".repeat(100);
+  const totalDeltas = 20_000; // 2,000,000 stream bytes vs a 1 MiB cap
+  let cappedAtIndex = -1;
+  let streamBytes = 0;
+  for (let index = 0; index < totalDeltas; index += 1) {
+    child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: chunk } } }) + "\n");
+    streamBytes += chunk.length;
+    if (cappedAtIndex < 0 && streamBytes > 1024 * 1024) cappedAtIndex = upserts.length;
+  }
+  child.emit("close", 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const postCapUpserts = upserts.length - cappedAtIndex;
+  const writtenBytes = upserts.reduce((sum, message) => sum + Buffer.byteLength(message.body), 0);
+  assert.ok(postCapUpserts <= 1, `expected at most one post-cap checkpoint write, got ${postCapUpserts}`);
+  assert.ok(writtenBytes <= 192 * 1024 * 1024, `expected bounded cumulative writes, got ${writtenBytes}`);
+  // Exact-once final content: the capped body plus the truncation marker.
+  assert.equal(database.messages.length, 1);
+  assert.equal(database.messages[0].id, "run-1:1");
+  assert.ok(database.messages[0].body.endsWith("[Output truncated by Outright at 1 MiB]"));
+  assert.ok(Buffer.byteLength(database.messages[0].body) <= 1024 * 1024 + Buffer.byteLength("\n\n[Output truncated by Outright at 1 MiB]"));
+  assert.equal(database.getRun("run-1").status, "completed");
+});
+
 test("commits the final transcript checkpoint with terminal run state", async () => {
   const database = fakeDatabase();
   const child = fakeChild();

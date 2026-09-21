@@ -121,6 +121,7 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
   function finish(state, exitCode, error) {
     if (!active.has(state.run.id) || state.finishing) return;
     state.finishing = true;
+    clearCheckpointTimer(state);
     const successful = exitCode === 0 && !error && !state.stopped;
     const status = state.stopped ? "stopped" : successful ? "completed" : "failed";
     const message = error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : "");
@@ -183,7 +184,7 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       const index = queue.findIndex((entry) => ![...active.values()].some((state) => state.conversation.id === entry.run.conversationId));
       if (index < 0) return;
       const entry = queue.splice(index, 1)[0];
-      const state = { ...entry, assistantSegments: [], assistantBytes: 0, assistantTruncated: false, assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, stderr: "", stopped: false, checkpointPendingBytes: 0, lastCheckpointAt: 0 };
+      const state = { ...entry, assistantSegments: [], assistantBytes: 0, assistantTruncated: false, assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, stderr: "", stopped: false, checkpointPendingBytes: 0, lastCheckpointAt: 0, checkpointTimer: null, checkpointHalted: false };
       active.set(entry.run.id, state);
       state.launch = entry.launch = (async () => {
         try {
@@ -222,21 +223,54 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
 
   // Coalesces Claude delta output into bounded durable checkpoints: a
   // checkpoint is flushed once enough new bytes (or time) have accumulated
-  // since the last one. Message/tool boundaries and run finalization always
-  // flush, so the final transcript stays exact-once.
+  // since the last one. The time bound is enforced by a real timer, so a
+  // stalled sub-threshold tail is still flushed within the interval even if no
+  // further delta ever arrives. Message/tool boundaries and run finalization
+  // always flush, so the final transcript stays exact-once. Once the transcript
+  // cap is hit and the truncated body is durably flushed, later (discarded)
+  // deltas no longer trigger rewrites — write amplification stays bounded even
+  // past the cap.
   function scheduleAssistantCheckpoint(state, deltaText) {
+    if (state.checkpointHalted) return;
     if (!state.assistantBytes) return;
     state.checkpointPendingBytes = (state.checkpointPendingBytes ?? 0) + Buffer.byteLength(deltaText ?? "");
-    if (state.checkpointPendingBytes >= checkpointMinBytes || Date.now() - (state.lastCheckpointAt ?? 0) >= checkpointIntervalMs) {
+    if (state.assistantTruncated || state.checkpointPendingBytes >= checkpointMinBytes || Date.now() - (state.lastCheckpointAt ?? 0) >= checkpointIntervalMs) {
       persistAssistantCheckpoint(state);
+      return;
     }
+    armCheckpointTimer(state);
+  }
+
+  function armCheckpointTimer(state) {
+    if (state.checkpointTimer) return;
+    const elapsed = Date.now() - (state.lastCheckpointAt ?? 0);
+    const delay = Math.max(0, checkpointIntervalMs - elapsed);
+    state.checkpointTimer = setTimeout(() => {
+      state.checkpointTimer = null;
+      // The timer is cleared at every flush boundary; if it fires, the pending
+      // tail has never been durably written, so flush it now.
+      if (!state.assistantBytes || state.checkpointHalted) return;
+      persistAssistantCheckpoint(state);
+    }, delay);
+    // Never hold the process open for a pending checkpoint alone.
+    state.checkpointTimer.unref?.();
+  }
+
+  function clearCheckpointTimer(state) {
+    if (!state.checkpointTimer) return;
+    clearTimeout(state.checkpointTimer);
+    state.checkpointTimer = null;
   }
 
   function persistAssistantCheckpoint(state) {
+    clearCheckpointTimer(state);
     state.checkpointPendingBytes = 0;
     state.lastCheckpointAt = Date.now();
     const message = pendingAssistantMessage(state);
     if (!message) return null;
+    // The capped body plus truncation marker is now durable; discarded deltas
+    // beyond the cap must not schedule further rewrites of the same body.
+    if (state.assistantTruncated) state.checkpointHalted = true;
     return database.upsertMessage(message);
   }
 
@@ -374,11 +408,18 @@ function pendingAssistantMessage(state) {
 }
 
 function clearAssistant(state) {
+  if (state.checkpointTimer) {
+    clearTimeout(state.checkpointTimer);
+    state.checkpointTimer = null;
+  }
   state.assistantSegments = [];
   state.assistantBytes = 0;
   state.assistantTruncated = false;
   state.assistantMessageId = null;
   state.assistantCreatedAt = null;
+  // A new assistant segment starts fresh checkpoint scheduling.
+  state.checkpointHalted = false;
+  state.checkpointPendingBytes = 0;
 }
 
 function markAssistantTruncated(state, truncated, emit) {
