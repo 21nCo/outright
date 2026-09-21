@@ -198,14 +198,14 @@ export function createOutrightDatabase(options = {}) {
       return db.prepare(`SELECT id, conversation_id AS conversationId, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
         prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
         finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
-        output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision FROM runs WHERE conversation_id = ? ORDER BY created_at DESC LIMIT ?`).all(conversationId, boundedLimit);
+        output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision FROM runs WHERE conversation_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(conversationId, boundedLimit);
     },
     listUnresolvedInterruptedRuns(conversationId) {
       return db.prepare(`SELECT id, conversation_id AS conversationId, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
         prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
         finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
         output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision
-        FROM runs WHERE conversation_id = ? AND status = 'interrupted' AND recovery_decision IS NULL ORDER BY created_at`).all(conversationId);
+        FROM runs WHERE conversation_id = ? AND status = 'interrupted' AND recovery_decision IS NULL ORDER BY created_at, rowid`).all(conversationId);
     },
     findUnresolvedInterruptedRun(conversationId) {
       return this.listUnresolvedInterruptedRuns(conversationId)[0];
@@ -256,9 +256,12 @@ export function createOutrightDatabase(options = {}) {
             .run(pid, finishedAt, classification, run.id);
           if (!result.changes) continue;
           counts[classification] = (counts[classification] ?? 0) + 1;
-          // A row that was actually running may still own a live wrapper that
-          // removes its own record on exit; keep those records.
-          if (run.status === "running") keepHandshakeIds.add(run.id);
+          // A row whose tree may still be live (alive/unknown) may still own
+          // a wrapper that removes its own record on exit; keep those. An
+          // 'exited' tree is proven gone, so a hard-killed wrapper can no
+          // longer unlink its record — keeping it would leak one stale file
+          // per hard-killed run.
+          if (run.status === "running" && (classification === "alive" || classification === "unknown")) keepHandshakeIds.add(run.id);
         }
       });
       reconcile.immediate();

@@ -62,9 +62,12 @@ process.stdin.on("data", (chunk) => {
     try { fs.unlinkSync(handshakePath); } catch {}
     if (signal) {
       // Re-raise the provider's termination signal so the runtime reports
-      // the accurate "stopped by signal" cause instead of a generic 137.
+      // the accurate "stopped by signal" cause instead of a generic 137 —
+      // except SIGUSR1, which Node reserves for its debugger: re-raising it
+      // would start the inspector instead of terminating this wrapper.
       process.removeAllListeners("SIGTERM");
       process.removeAllListeners("SIGINT");
+      if (signal === "SIGUSR1") process.exit(137);
       try { process.kill(process.pid, signal); }
       catch { process.exit(137); }
     } else process.exit(code ?? 0);
@@ -440,7 +443,12 @@ export function escalateTree(child, handshakePath, platform = process.platform, 
   let providerPid = null;
   try {
     const record = JSON.parse(readFileSync(handshakePath, "utf8"));
-    providerPid = Number(record?.providerPid) || null;
+    const recorded = Number(record?.providerPid);
+    // A malformed or tampered record must never reach POSIX kill: kill(-1,
+    // "SIGKILL") would terminate every process the runtime user owns. Only a
+    // safe positive pid is usable; anything else falls back to the owned
+    // process group.
+    if (Number.isSafeInteger(recorded) && recorded > 0) providerPid = recorded;
   } catch { /* No (or unreadable) handshake record. */ }
   if (providerPid) {
     try {

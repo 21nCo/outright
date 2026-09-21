@@ -622,6 +622,14 @@ test("escalation targets the provider alone when its pid is durably recorded", (
     assert.equal(escalateTree(child, handshakePath, "linux", null, kill), "group");
     assert.deepEqual(kills, [[-4242, "SIGKILL"]], "without a provider pid the owned group is killed");
 
+    // A malformed or tampered record must never reach kill: a negative pid
+    // would translate to kill(-1, "SIGKILL") and terminate every process the
+    // runtime user owns.
+    kills.length = 0;
+    writeFileSync(handshakePath, JSON.stringify({ pid: 4242, authorized: true, providerPid: -1 }));
+    assert.equal(escalateTree(child, handshakePath, "linux", null, kill), "group");
+    assert.deepEqual(kills, [[-4242, "SIGKILL"]], "an unsafe provider pid falls back to the owned group, never kill(-1)");
+
     kills.length = 0;
     assert.equal(escalateTree(child, path.join(root, "missing.json"), "linux", null, kill), "group");
     assert.deepEqual(kills, [[-4242, "SIGKILL"]], "a missing handshake record falls back to the group");
@@ -663,11 +671,15 @@ test("a zombie-only process group is not alive", { skip: process.platform === "w
 test("escalation kills the provider alone and the wrapper reaps it", { skip: process.platform === "win32", timeout: 20000 }, async (t) => {
   const database = fakeDatabase();
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-escalate-live-"));
-  const handshakePath = path.join(root, "escalate-run.json");
+  const handshakePath = path.join(root, "escalate.json");
   const provider = `process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);`;
   let child;
   const manager = createAgentManager({
     database, publish: () => {}, terminationGraceMs: 150, terminationTimeoutMs: 8000,
+    // The launch directory must match the wrapper's handshake path so
+    // escalation reads the provider pid the wrapper durably recorded; a
+    // mismatched path would silently fall back to the group-wide kill.
+    launchDirectory: root,
     spawnProcess: () => {
       child = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, process.execPath, "-e", provider], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
       return child;
@@ -720,7 +732,7 @@ test("escalation kills the provider alone and the wrapper reaps it", { skip: pro
 // container runs the actual checked-in server module from this worktree.
 test("stop completes on a host whose PID 1 does not reap orphans", { skip: process.platform === "win32", timeout: 180000 }, async (t) => {
   const docker = spawnSync("docker", ["info", "--format", "{{.ServerVersion}}"], { encoding: "utf8", timeout: 20000 });
-  if (docker.status !== 0) t.skip(`docker unavailable: ${(docker.stderr || "").trim()}`);
+  if (docker.status !== 0) return t.skip(`docker unavailable: ${(docker.stderr || "").trim()}`);
   const ignoreSignal = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
   const script = `
 import { pathToFileURL } from "node:url";
@@ -730,7 +742,7 @@ const os = await import("node:os");
 const path = await import("node:path");
 const manager = await import(pathToFileURL("/app/server/agent-manager.mjs"));
 const root = mkdtempSync(path.join(os.tmpdir(), "escalate-"));
-const handshakePath = path.join(root, "e2e-run.json");
+const handshakePath = path.join(root, "e2e.json");
 const descendant = process.env.DESCENDANT;
 const provider = [
   "const { spawn } = require('node:child_process');",
@@ -758,6 +770,7 @@ const agent = manager.createAgentManager({
   publish: () => {},
   terminationGraceMs: 300,
   terminationTimeoutMs: 6000,
+  launchDirectory: root,
   spawnProcess: () => {
     child = spawn(process.execPath, ["-e", manager.LAUNCH_WRAPPER_SOURCE, handshakePath, process.execPath, "-e", provider], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
     return child;
@@ -789,6 +802,14 @@ process.exit(outcome.resolved && !groupAlive ? 0 : 1);
     "node", "--input-type=module", "-",
   ], { input: script, encoding: "utf8", timeout: 150000, maxBuffer: 16 * 1024 * 1024 });
   const line = (result.stdout || "").split("\n").find((entry) => entry.startsWith("RESULT ")) ?? "";
+  // `docker info` can succeed while `docker run` still cannot reach the
+  // daemon; treat that connectivity failure as an unavailable environment
+  // (skip), not a failing regression.
+  if (!line) {
+    const output = `${result.stdout || ""}\n${result.stderr || ""}`;
+    if (/cannot connect|docker daemon|error during connect|no such image/i.test(output)) return t.skip(`docker run could not reach the daemon: ${output.trim().slice(0, 300)}`);
+    assert.fail(`container run produced no result: exit=${result.status} stdout=${(result.stdout || "").slice(-2000)} stderr=${(result.stderr || "").slice(-2000)}`);
+  }
   const payload = line ? JSON.parse(line.slice("RESULT ".length)) : null;
   assert.deepEqual(payload, { resolved: true, groupAlive: false }, `container run failed: exit=${result.status} stdout=${(result.stdout || "").slice(-2000)} stderr=${(result.stderr || "").slice(-2000)}`);
 });

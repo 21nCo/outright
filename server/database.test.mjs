@@ -263,20 +263,24 @@ test("reconciliation sweeps stale handshake records but keeps live-wrapper recor
     const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
     const launching = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "crashed before authorization" });
     const running = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "crashed while running" });
+    const exited = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "crashed after the tree died" });
     const finished = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "done long ago" });
     database.updateRun(launching.id, { status: "launching" });
     database.updateRun(running.id, { status: "running", pid: 4242 });
+    database.updateRun(exited.id, { status: "running", pid: 5353 });
     database.updateRun(finished.id, { status: "completed", finishedAt: "2026-09-21T00:00:00.000Z" });
     const record = (runId, pid) => writeFileSync(path.join(launchDirectory, `${runId}.json`), JSON.stringify({ pid, authorized: false }));
     record(launching.id, 111);
     record(running.id, 222);
+    record(exited.id, 555);
     record(finished.id, 333);
     record("run-that-never-existed", 444);
 
-    database.reconcileInterruptedRuns({ probeAlive: () => false });
+    database.reconcileInterruptedRuns({ probeAlive: (pid) => pid === 4242 });
 
     assert.equal(existsSync(path.join(launchDirectory, `${launching.id}.json`)), false, "the adopted launching record is removed");
-    assert.equal(existsSync(path.join(launchDirectory, `${running.id}.json`)), true, "a running row's wrapper may still be alive and removes its own record");
+    assert.equal(existsSync(path.join(launchDirectory, `${running.id}.json`)), true, "an alive tree's wrapper may still be live and removes its own record");
+    assert.equal(existsSync(path.join(launchDirectory, `${exited.id}.json`)), false, "an exited tree is proven gone, so its hard-killed wrapper's record is swept instead of leaking");
     assert.equal(existsSync(path.join(launchDirectory, `${finished.id}.json`)), false, "a terminal run's stale record is swept");
     assert.equal(existsSync(path.join(launchDirectory, "run-that-never-existed.json")), false, "a record for an unknown run is swept");
   } finally {
@@ -338,6 +342,7 @@ test("the launch directory follows an explicit absolute database filename", () =
   try {
     const database = createOutrightDatabase({ filename });
     assert.equal(database.launchDirectory, path.join(root, "custom", "launches"));
+    database.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -347,6 +352,34 @@ test("the launch directory follows an explicit absolute database filename", () =
     assert.equal(memory.launchDirectory, path.join(root, "launches"));
   } finally {
     memory.close();
+  }
+});
+
+// Regression (PR remediation round 3): created_at alone does not order two
+// runs created within the same millisecond; the recovery order gate needs a
+// deterministic tie-breaker or a newer run could pass as the older one.
+test("unresolved interrupted runs order deterministically with equal created_at", () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-order-"));
+  const database = createOutrightDatabase({ dataDirectory });
+  const other = new Database(path.join(dataDirectory, "outright.db"));
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Order", provider: "codex" });
+    const first = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "first" });
+    const second = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "second" });
+    // Force identical timestamps: without the rowid tie-breaker the
+    // oldest-unresolved selection is arbitrary.
+    other.prepare("UPDATE runs SET created_at = ?").run("2026-09-21T00:00:00.000Z");
+    database.updateRun(first.id, { status: "running", pid: 4242 });
+    database.updateRun(second.id, { status: "running", pid: 5353 });
+    database.reconcileInterruptedRuns({ probeAlive: () => false });
+
+    assert.equal(database.findUnresolvedInterruptedRun(conversation.id).id, first.id, "the older run is surfaced first even with equal created_at");
+    const unresolved = database.listUnresolvedInterruptedRuns(conversation.id);
+    assert.deepEqual(unresolved.map((run) => run.id), [first.id, second.id]);
+  } finally {
+    other.close();
+    database.close();
+    rmSync(dataDirectory, { recursive: true, force: true });
   }
 });
 
