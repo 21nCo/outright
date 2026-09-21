@@ -1,0 +1,16 @@
+automation/hermes/README.md
+  h_a39f9495f9ec1d 6
+automation/hermes/workflow.json
+  h_a39f9495f9ec1d 54
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "28b5d503d6f89eaaf9191e008988cc1641226649",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
