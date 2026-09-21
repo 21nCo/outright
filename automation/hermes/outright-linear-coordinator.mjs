@@ -82,8 +82,8 @@ ${description}
 4. Commit locally without pushing or opening a pull request, then call kanban_request_review with phase=local and reviewer=${config.profiles.reviewer}.
 5. Address every local-review finding and repeat until the reviewer emits the LOCAL_GATE_PASSED transition.
 6. After that transition, push the branch and open a pull request against main in ${config.repository}. Move ${issue.identifier} to In Review through Composio CLI and comment with the PR URL.
-7. Wait for the current PR head's checks and automatic review agents to settle. Retrieve the pinned hosted Skillplane PR remediation skill through Composio and execute exactly one bounded review-fix pass.
-8. Hand the current PR head back to ${config.profiles.reviewer} with phase=pr. If it requests another PR round, wait for the new head's review activity and invoke the hosted skill once again.
+7. Initialize the persistent PR convergence ledger, then hand the card to ${config.profiles.prFixer}. That GPT Sol High profile owns every hosted Skillplane remediation round and any architecture reset triggered by a recurring defect family.
+8. ${config.profiles.prFixer} waits for the current PR head's checks and automatic review agents to settle, retrieves the pinned hosted Skillplane PR remediation skill through Composio, executes exactly one bounded pass, and hands the exact head to ${config.profiles.reviewer}. Repeat through the same PR-fixer profile until clean or a reset/round limit blocks the loop.
 
 The local loop is capped at ${config.localReviewCycleLimit} review rounds and the PR loop at ${config.pullRequestReviewCycleLimit} hosted remediation rounds. A clean PR must wait at the human merge gate with Linear still In Review. Do not merge the PR without the user's explicit go.`;
 }

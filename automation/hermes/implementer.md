@@ -10,16 +10,8 @@ Call `kanban_request_review` with reviewer `outright-reviewer` and metadata cont
 
 ## Phase 2: publish the PR
 
-After `LOCAL_GATE_PASSED`, push the branch and open a pull request against `main`. Move the Linear issue to `In Review` with `LINEAR_UPDATE_ISSUE` and comment with the PR URL using `LINEAR_CREATE_LINEAR_COMMENT`.
+After `LOCAL_GATE_PASSED`, push the branch and open a pull request against `main`. Move the Linear issue to `In Review` with `LINEAR_UPDATE_ISSUE` and comment with the PR URL using `LINEAR_CREATE_LINEAR_COMMENT`. Initialize `.outright/pr-review-ledger-<pr-number>.md` with `node automation/hermes/pr-remediation-ledger.mjs init`, using the pinned hosted-skill identity and digest from `workflow.json`. Then call `kanban_request_review` with reviewer `outright-pr-fixer` and metadata containing `phase: "pr-fix"`, the PR URL, current head, and ledger path.
 
-## Phase 3: automatic PR review remediation
+## Phase 3 ownership
 
-For each PR round:
-
-1. Confirm the PR head equals the checked-out head and preserve unrelated work.
-2. Wait until 30 minutes have elapsed since the PR was created or, after a fix push, since the new commit reached the PR. Do not shorten this window when checks finish early. At the end of the window, capture the current checks and review surfaces; if some review jobs are still pending, report them to the reviewer instead of waiting without a bound.
-3. Retrieve the pinned hosted workflow by running `node automation/hermes/retrieve-pr-review-fix.mjs`. This must call Skillplane through Composio CLI. Follow the retrieved skill exactly for one bounded pass. It permits at most one reviewed fix commit and one normal push, and forbids a post-push refetch or wait inside that invocation.
-4. Maintain the skill's convergence ledger in `.outright/pr-review-ledger-<pr-number>.md` across rounds. The user authorizes replies to and resolution of snapshot review threads whose complete concern is fixed and verified on the current head. Use the captured thread IDs without a post-push refetch, as required by the hosted skill.
-5. Call `kanban_request_review` with reviewer `outright-reviewer` and metadata containing `phase: "pr"`, PR URL, snapshot head, current head, hosted skill version and digest, round number, findings by disposition, convergence state, thread replies/resolutions, changed files, and checks.
-
-If the reviewer requests another PR round after a new push, wait the full 30-minute window and begin a fresh bounded invocation. Stop routine mutation and escalate when the hosted skill's reset triggers fire or after eight PR remediation rounds. Do not merge the pull request, mark Linear Done, or complete the card yourself.
+`outright-pr-fixer` owns PR remediation. Do not execute hosted remediation from this profile. Do not merge the pull request, mark Linear Done, or complete the card yourself.
