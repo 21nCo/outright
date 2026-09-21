@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { buildProviderCommand, consumeBoundedLines, createAgentManager, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
+import { fileURLToPath } from "node:url";
+import { buildProviderCommand, consumeBoundedLines, createAgentManager, defaultGroupMembers, escalateTree, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
 
 const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
 
@@ -599,4 +600,195 @@ test("the launch wrapper records durable identity before authorization and clean
     for (const child of children) { try { child.kill("SIGKILL"); } catch { /* Already gone. */ } }
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// Escalation must target the provider alone (via the wrapper's durable
+// provider-pid record) so the wrapper survives to reap it; only without a
+// usable provider pid does it fall back to killing the whole group.
+test("escalation targets the provider alone when its pid is durably recorded", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-escalate-"));
+  try {
+    const handshakePath = path.join(root, "run-1.json");
+    const kills = [];
+    const kill = (pid, signal) => kills.push([pid, signal]);
+    const child = { pid: 4242, kill: (signal) => kills.push(["child", signal]) };
+
+    writeFileSync(handshakePath, JSON.stringify({ pid: 4242, authorized: true, providerPid: 777 }));
+    assert.equal(escalateTree(child, handshakePath, "linux", null, kill), "provider");
+    assert.deepEqual(kills, [[777, "SIGKILL"]], "the provider pid is killed, never the group or the wrapper");
+
+    kills.length = 0;
+    writeFileSync(handshakePath, JSON.stringify({ pid: 4242, authorized: false }));
+    assert.equal(escalateTree(child, handshakePath, "linux", null, kill), "group");
+    assert.deepEqual(kills, [[-4242, "SIGKILL"]], "without a provider pid the owned group is killed");
+
+    kills.length = 0;
+    assert.equal(escalateTree(child, path.join(root, "missing.json"), "linux", null, kill), "group");
+    assert.deepEqual(kills, [[-4242, "SIGKILL"]], "a missing handshake record falls back to the group");
+
+    kills.length = 0;
+    const calls = [];
+    assert.equal(escalateTree(child, handshakePath, "win32", (executable, args) => { calls.push([executable, ...args]); return { status: 0 }; }, kill), "group");
+    assert.deepEqual(calls, [["taskkill", "/PID", "4242", "/T", "/F"]], "windows escalation tears down the whole tree");
+    assert.deepEqual(kills, [], "windows never signals POSIX pids directly");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// A zombie cannot execute side effects: on /proc platforms a group whose every
+// member is a killed-but-unreaped zombie must not count as alive, or
+// stop/shutdown never complete on hosts whose PID 1 does not reap orphans.
+test("a zombie-only process group is not alive", { skip: process.platform === "win32" }, async () => {
+  const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { detached: true, stdio: "ignore" });
+  try {
+    assert.doesNotThrow(() => process.kill(-holder.pid, 0), "the probe group must exist for a meaningful verdict");
+    assert.equal(processGroupAlive({ pid: holder.pid }, "linux", () => [{ pid: 1, state: "Z" }]), false, "an all-zombie group is not alive");
+    assert.equal(processGroupAlive({ pid: holder.pid }, "linux", () => [{ pid: 1, state: "Z" }, { pid: 2, state: "R" }]), true, "a group with any live member stays alive");
+    assert.equal(processGroupAlive({ pid: holder.pid }, "linux", () => null), true, "unavailable member enumeration keeps the conservative verdict");
+    assert.equal(processGroupAlive({ pid: holder.pid }), true, "the default verdict for a live group is alive");
+    if (process.platform === "linux") {
+      const members = defaultGroupMembers(holder.pid);
+      assert.ok(Array.isArray(members) && members.some((member) => member.state !== "Z"), "default enumeration finds the live holder");
+    }
+  } finally {
+    try { process.kill(-holder.pid, "SIGKILL"); } catch { /* Already gone. */ }
+  }
+});
+
+// The real launch wrapper must durably record the provider pid once
+// authorized, and stopping a SIGTERM-ignoring provider must complete with the
+// whole owned group gone while the wrapper — not a group-wide SIGKILL —
+// performs the reaping.
+test("escalation kills the provider alone and the wrapper reaps it", { skip: process.platform === "win32", timeout: 20000 }, async (t) => {
+  const database = fakeDatabase();
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-escalate-live-"));
+  const handshakePath = path.join(root, "escalate-run.json");
+  const provider = `process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);`;
+  let child;
+  const manager = createAgentManager({
+    database, publish: () => {}, terminationGraceMs: 150, terminationTimeoutMs: 8000,
+    spawnProcess: () => {
+      child = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, process.execPath, "-e", provider], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+      return child;
+    },
+  });
+  t.after(() => { try { process.kill(-child.pid, "SIGKILL"); } catch { /* Already gone. */ } });
+  try {
+    const run = database.createRun(codexRun("escalate"));
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+
+    const deadline = Date.now() + 10_000;
+    let providerPid = null;
+    while (Date.now() < deadline) {
+      try { providerPid = JSON.parse(readFileSync(handshakePath, "utf8")).providerPid; } catch { /* Not written yet. */ }
+      if (providerPid) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(providerPid, "the wrapper durably records the provider pid after authorization");
+
+    const stopping = manager.stop(run.id);
+    // Poll both pids: the provider must be observed fully gone (reaped by the
+    // wrapper) no later than the wrapper itself. A group-wide SIGKILL would
+    // kill both at once; the faithful non-reaping-host regression is the
+    // container test below.
+    const gone = Date.now() + 10_000;
+    let providerGoneAt = null;
+    let wrapperGoneAt = null;
+    while (Date.now() < gone && wrapperGoneAt == null) {
+      if (providerGoneAt == null) { try { process.kill(providerPid, 0); } catch { providerGoneAt = Date.now(); } }
+      try { process.kill(child.pid, 0); } catch { wrapperGoneAt = Date.now(); }
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.ok(providerGoneAt != null, "the provider is killed by escalation");
+    assert.ok(wrapperGoneAt != null, "the wrapper exits after reaping the provider");
+    assert.ok(providerGoneAt <= wrapperGoneAt, "the wrapper reaps the provider before exiting");
+
+    assert.equal(await stopping, true, "stop completes instead of timing out on the tree");
+    assert.equal(database.getRun(run.id).status, "stopped");
+    assert.throws(() => process.kill(-child.pid, 0), { code: "ESRCH" }, "the whole owned process group is gone");
+    assert.deepEqual(manager.activeRuns(), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The production/container path: on a host whose PID 1 does not reap orphaned
+// grandchildren (node as PID 1, no init), escalating a SIGTERM-ignoring
+// provider must not leave an unreaped zombie holding the process group.
+// Reproduced faithfully in node:22-alpine with the test process as PID 1; the
+// container runs the actual checked-in server module from this worktree.
+test("stop completes on a host whose PID 1 does not reap orphans", { skip: process.platform === "win32", timeout: 180000 }, async (t) => {
+  const docker = spawnSync("docker", ["info", "--format", "{{.ServerVersion}}"], { encoding: "utf8", timeout: 20000 });
+  if (docker.status !== 0) t.skip(`docker unavailable: ${(docker.stderr || "").trim()}`);
+  const ignoreSignal = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
+  const script = `
+import { pathToFileURL } from "node:url";
+const { spawn } = await import("node:child_process");
+const { mkdtempSync, readFileSync } = await import("node:fs");
+const os = await import("node:os");
+const path = await import("node:path");
+const manager = await import(pathToFileURL("/app/server/agent-manager.mjs"));
+const root = mkdtempSync(path.join(os.tmpdir(), "escalate-"));
+const handshakePath = path.join(root, "e2e-run.json");
+const descendant = process.env.DESCENDANT;
+const provider = [
+  "const { spawn } = require('node:child_process');",
+  "process.on('SIGTERM', () => {});",
+  "spawn(process.execPath, ['-e', descendant], { stdio: 'ignore' });",
+  "setInterval(() => {}, 1000);",
+].join(" ");
+const runs = new Map();
+const database = {
+  getSettings: () => ({ maxConcurrentRuns: 8 }),
+  getConversation: (id) => ({ id, worktreePath: "/tmp" }),
+  updateConversation: () => {},
+  getRun: (id) => runs.get(id) ?? null,
+  createRun: (run) => { runs.set(run.id, run); return run; },
+  updateRun: (id, patch) => { runs.set(id, { ...runs.get(id), ...patch }); return runs.get(id); },
+  addMessage: (input) => input,
+  upsertMessage: (input) => input,
+  finishRun: (id, patch) => { runs.set(id, { ...runs.get(id), ...patch }); return { run: runs.get(id) }; },
+  appendRunEvent: () => ({}),
+  audit: () => {},
+};
+let child;
+const agent = manager.createAgentManager({
+  database,
+  publish: () => {},
+  terminationGraceMs: 300,
+  terminationTimeoutMs: 6000,
+  spawnProcess: () => {
+    child = spawn(process.execPath, ["-e", manager.LAUNCH_WRAPPER_SOURCE, handshakePath, process.execPath, "-e", provider], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+    return child;
+  },
+});
+const run = database.createRun({ id: "e2e", conversationId: "conv-1", provider: "codex", prompt: "p", approvalPolicy: "read-only" });
+await agent.schedule({ conversation: database.getConversation("conv-1"), run });
+const deadline = Date.now() + 10000;
+let providerPid = null;
+while (Date.now() < deadline) {
+  try { providerPid = JSON.parse(readFileSync(handshakePath, "utf8")).providerPid; } catch {}
+  if (providerPid) break;
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+if (!providerPid) { console.log("RESULT " + JSON.stringify({ resolved: false, error: "no provider pid recorded" })); process.exit(1); }
+let outcome;
+try { await agent.stop(run.id); outcome = { resolved: true }; }
+catch (error) { outcome = { resolved: false, error: String(error && error.message) }; }
+const groupAlive = manager.processGroupAlive(child);
+console.log("RESULT " + JSON.stringify({ ...outcome, groupAlive }));
+process.exit(outcome.resolved && !groupAlive ? 0 : 1);
+`;
+  const repo = fileURLToPath(new URL("..", import.meta.url));
+  const result = spawnSync("docker", [
+    "run", "--rm", "-i",
+    "-e", `DESCENDANT=${ignoreSignal}`,
+    "-v", `${repo}:/app:ro`,
+    "node:22-alpine",
+    "node", "--input-type=module", "-",
+  ], { input: script, encoding: "utf8", timeout: 150000, maxBuffer: 16 * 1024 * 1024 });
+  const line = (result.stdout || "").split("\n").find((entry) => entry.startsWith("RESULT ")) ?? "";
+  const payload = line ? JSON.parse(line.slice("RESULT ".length)) : null;
+  assert.deepEqual(payload, { resolved: true, groupAlive: false }, `container run failed: exit=${result.status} stdout=${(result.stdout || "").slice(-2000)} stderr=${(result.stderr || "").slice(-2000)}`);
 });

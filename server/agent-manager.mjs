@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { unlinkSync } from "node:fs";
+import { readdirSync, readFileSync, unlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -50,6 +50,12 @@ process.stdin.on("data", (chunk) => {
   authorized = true;
   const { spawn } = require("node:child_process");
   const provider = spawn(executable, commandArgs, { stdio: ["ignore", "inherit", "inherit"] });
+  // Durable provider identity: escalation targets the provider alone so this
+  // wrapper — the provider's parent — survives to reap it. Without this, a
+  // group-wide SIGKILL kills the wrapper first and a killed-but-unreaped
+  // provider lingers as a zombie in its process group on hosts whose PID 1
+  // does not reap orphans.
+  try { fs.writeFileSync(handshakePath, JSON.stringify({ pid: process.pid, authorized: true, providerPid: provider.pid, createdAt: new Date().toISOString() })); } catch { /* The record was swept; nothing needs escalation identity. */ }
   const finish = (code) => { try { fs.unlinkSync(handshakePath); } catch {} process.exit(code); };
   provider.on("error", (error) => { console.error(String((error && error.message) || error)); finish(127); });
   provider.on("close", (code, signal) => {
@@ -80,7 +86,7 @@ export function defaultLaunchCommand(command, run, launchDirectory) {
   };
 }
 
-export function createAgentManager({ database, publish, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
+export function createAgentManager({ database, publish, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
   const resolvedLaunchDirectory = launchDirectory
     ?? database.launchDirectory
     ?? (database.filename ? path.join(path.dirname(database.filename), "launches") : path.join(os.tmpdir(), "outright-launches"));
@@ -246,11 +252,22 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       if (state.child) {
         const started = Date.now();
         let escalated = false;
+        let groupEscalated = false;
         while (!state.closed || processGroupAlive(state.child)) {
           const elapsed = Date.now() - started;
           if (!escalated && elapsed >= terminationGraceMs) {
-            terminateTree(state.child, "SIGKILL");
+            // Escalate on the provider alone first: the wrapper supervisor
+            // must survive to reap it, or the killed provider lingers as a
+            // zombie in the process group on hosts whose PID 1 does not reap
+            // orphans and stop/shutdown never observe the tree as gone.
+            escalateTree(state.child, state.launchHandshakePath);
             escalated = true;
+          } else if (escalated && !groupEscalated && elapsed >= terminationGraceMs + escalationGraceMs) {
+            // The wrapper had its chance to reap; anything still executing in
+            // the group is killed outright. Liveness below recognizes the
+            // resulting non-executing zombie members as gone.
+            terminateTree(state.child, "SIGKILL");
+            groupEscalated = true;
           }
           if (elapsed >= terminationTimeoutMs) {
             // Preserve ownership and report failure; never claim a live tree stopped.
@@ -402,16 +419,79 @@ export function terminateTree(child, signal, platform = process.platform, run = 
   } catch { /* The process group already exited. */ }
 }
 
+// Escalation after the graceful SIGTERM window. The provider is killed alone
+// whenever its pid is durably known (the launch wrapper records it), so the
+// wrapper — the provider's parent — survives to reap it. A group-wide
+// SIGKILL would kill the wrapper first and leave a killed-but-unreaped
+// provider as a zombie in its process group on hosts whose PID 1 does not
+// reap orphans, which would keep every liveness probe reporting alive until
+// the termination timeout. Without a usable provider pid (an injected child
+// spawned outside the launch wrapper, or an unreadable record) the whole
+// owned group is killed as before.
+export function escalateTree(child, handshakePath, platform = process.platform, run = spawnSync, kill = process.kill) {
+  if (platform === "win32") {
+    terminateTree(child, "SIGKILL", platform, run);
+    return "group";
+  }
+  if (!child?.pid) {
+    try { child?.kill?.("SIGKILL"); } catch { /* Already gone. */ }
+    return "group";
+  }
+  let providerPid = null;
+  try {
+    const record = JSON.parse(readFileSync(handshakePath, "utf8"));
+    providerPid = Number(record?.providerPid) || null;
+  } catch { /* No (or unreadable) handshake record. */ }
+  if (providerPid) {
+    try {
+      kill(providerPid, "SIGKILL");
+      return "provider";
+    } catch (error) {
+      if (error?.code === "EPERM") return "provider";
+      // ESRCH: the provider is already gone; the wrapper is exiting on its own.
+    }
+  }
+  try { kill(-child.pid, "SIGKILL"); } catch { /* The process group already exited. */ }
+  return "group";
+}
+
 // Liveness of the provider tree: the wrapper's process group on POSIX, the
 // wrapper leader on Windows (only meaningful after a Windows taskkill /T,
 // which tears down the whole tree).
-export function processGroupAlive(child, platform = process.platform) {
+export function processGroupAlive(child, platform = process.platform, groupMembers = defaultGroupMembers) {
   if (!child?.pid) return false;
   try {
     if (platform !== "win32") process.kill(-child.pid, 0);
     else process.kill(child.pid, 0);
-    return true;
   } catch (error) { return error.code !== "ESRCH"; }
+  if (platform === "win32") return true;
+  // On hosts whose PID 1 does not reap orphans, a killed-but-unreaped member
+  // lingers as a zombie inside the group and keeps the signal probe
+  // succeeding. A zombie cannot execute side effects, so a group whose every
+  // member is a zombie is not alive.
+  const members = groupMembers(child.pid);
+  if (members == null) return true;
+  return members.some((member) => member.state !== "Z");
+}
+
+// Enumerates the members of a process group from /proc, or returns null when
+// member enumeration is unavailable (non-/proc platforms); the caller then
+// keeps the conservative kill-probe verdict.
+export function defaultGroupMembers(pgid) {
+  let entries;
+  try { entries = readdirSync("/proc"); } catch { return null; }
+  const members = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    let stat;
+    try { stat = readFileSync(`/proc/${entry}/stat`, "utf8"); } catch { continue; }
+    const close = stat.lastIndexOf(")");
+    if (close < 0) continue;
+    // After the comm field: state, ppid, pgrp, ...
+    const fields = stat.slice(close + 2).split(" ");
+    if (Number(fields[2]) === pgid) members.push({ pid: Number(entry), state: fields[0] });
+  }
+  return members;
 }
 
 function toolTranscriptLabel(event) {
