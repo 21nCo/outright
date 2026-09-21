@@ -16,9 +16,24 @@
     "reviewer": "outright-reviewer"
   },
   "models": {
-    "implementer": "moonshotai/kimi-k3",
-    "reviewer": "z-ai/glm-5.3",
-    "provider": "openrouter"
+    "implementer": {
+      "id": "moonshotai/kimi-k3",
+      "provider": "openrouter",
+      "reasoningEffort": "medium"
+    },
+    "reviewer": {
+      "id": "gpt-5.6-sol",
+      "provider": "openai-codex",
+      "reasoningEffort": "high"
+    }
   },
-  "reviewCycleLimit": 5
+  "localReviewCycleLimit": 5,
+  "pullRequestReviewCycleLimit": 8,
+  "pullRequestReviewQuietSeconds": 180,
+  "skillplane": {
+    "workspaceSlug": "21n",
+    "skillSlug": "pr-refetch-fix",
+    "semanticVersion": "1.2.0",
+    "digest": "sha256:8781c1c12fe9d5902337d6cf21bfbac49dd3a94c7eadd46bf2622db350444022"
+  }
 }

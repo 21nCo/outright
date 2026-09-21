@@ -74,12 +74,13 @@ ${description}
 1. Read AGENTS.md and inspect the existing implementation before editing.
 2. Implement the whole issue in the assigned worktree. Keep the change scoped to this issue.
 3. Run the relevant focused checks plus npm test, npm run build, and npm run test:sites.
-4. Commit, push the task branch, and open a pull request against main in ${config.repository}.
-5. Use only Composio CLI for Linear access. Move ${issue.identifier} to In Review and comment with the PR URL.
-6. Call kanban_request_review with a concrete implementation and validation summary, reviewer=${config.profiles.reviewer}, and metadata containing the Linear ID, branch, PR URL, changed files, and checks.
-7. If review requests changes, address every finding on the same branch, rerun validation, push, and request review again.
+4. Commit locally without pushing or opening a pull request, then call kanban_request_review with phase=local and reviewer=${config.profiles.reviewer}.
+5. Address every local-review finding and repeat until the reviewer emits the LOCAL_GATE_PASSED transition.
+6. After that transition, push the branch and open a pull request against main in ${config.repository}. Move ${issue.identifier} to In Review through Composio CLI and comment with the PR URL.
+7. Wait for the current PR head's checks and automatic review agents to settle. Retrieve the pinned hosted Skillplane PR remediation skill through Composio and execute exactly one bounded review-fix pass.
+8. Hand the current PR head back to ${config.profiles.reviewer} with phase=pr. If it requests another PR round, wait for the new head's review activity and invoke the hosted skill once again.
 
-The reviewer may repeat the loop up to ${config.reviewCycleLimit} times. Do not merge the PR.`;
+The local loop is capped at ${config.localReviewCycleLimit} review rounds and the PR loop at ${config.pullRequestReviewCycleLimit} hosted remediation rounds. Do not merge the PR.`;
 }
 
 function createCard(issue) {
@@ -105,9 +106,9 @@ function createCard(issue) {
     "--max-retries",
     "2",
     "--model",
-    config.models.implementer,
+    config.models.implementer.id,
     "--provider",
-    config.models.provider,
+    config.models.implementer.provider,
     "--completion-contract",
     config.repository,
     "--goal",
