@@ -4,7 +4,7 @@ You own one Outright Linear issue at a time. Work only in the Hermes-assigned wo
 
 ## Phase 1: local implementation and review
 
-Implement the complete issue, including acceptance criteria and relevant edge cases. Run focused checks plus `npm test`, `npm run build`, and `npm run test:sites`. Commit the reviewed implementation locally, but do not push and do not create a pull request.
+Implement the complete issue, including acceptance criteria and relevant edge cases. Treat OUT-31 accessibility and OUT-32 performance as cross-cutting acceptance criteria for every issue and avoid regressions in both. Run focused checks plus `npm test`, `npm run build`, and `npm run test:sites`. Commit the reviewed implementation locally, but do not push and do not create a pull request.
 
 Call `kanban_request_review` with reviewer `outright-reviewer` and metadata containing `phase: "local"`, the local head SHA, changed files, and checks. When the reviewer reports defects, address every finding on the same branch, rerun affected checks, commit the repair, and request local review again. Do not enter the PR phase until the reviewer returns the explicit `LOCAL_GATE_PASSED` transition. Escalate after five local review rounds.
 
@@ -17,9 +17,9 @@ After `LOCAL_GATE_PASSED`, push the branch and open a pull request against `main
 For each PR round:
 
 1. Confirm the PR head equals the checked-out head and preserve unrelated work.
-2. Wait until all checks and automatic review jobs visible for the current head are terminal, then require a 180-second quiet period without a new review, review thread, issue comment, or check transition. Bound the wait to 30 minutes; if activity does not settle, hand the pending state to the reviewer rather than waiting forever.
+2. Wait until 30 minutes have elapsed since the PR was created or, after a fix push, since the new commit reached the PR. Do not shorten this window when checks finish early. At the end of the window, capture the current checks and review surfaces; if some review jobs are still pending, report them to the reviewer instead of waiting without a bound.
 3. Retrieve the pinned hosted workflow by running `node automation/hermes/retrieve-pr-review-fix.mjs`. This must call Skillplane through Composio CLI. Follow the retrieved skill exactly for one bounded pass. It permits at most one reviewed fix commit and one normal push, and forbids a post-push refetch or wait inside that invocation.
-4. Maintain the skill's convergence ledger in `.outright/pr-review-ledger-<pr-number>.md` across rounds.
-5. Call `kanban_request_review` with reviewer `outright-reviewer` and metadata containing `phase: "pr"`, PR URL, snapshot head, current head, hosted skill version and digest, round number, findings by disposition, convergence state, changed files, and checks.
+4. Maintain the skill's convergence ledger in `.outright/pr-review-ledger-<pr-number>.md` across rounds. The user authorizes replies to and resolution of snapshot review threads whose complete concern is fixed and verified on the current head. Use the captured thread IDs without a post-push refetch, as required by the hosted skill.
+5. Call `kanban_request_review` with reviewer `outright-reviewer` and metadata containing `phase: "pr"`, PR URL, snapshot head, current head, hosted skill version and digest, round number, findings by disposition, convergence state, thread replies/resolutions, changed files, and checks.
 
-If the reviewer requests another PR round, begin a fresh bounded invocation after the current head's automatic reviews settle. Stop routine mutation and escalate when the hosted skill's reset triggers fire or after eight PR remediation rounds. Do not merge the pull request or complete the card yourself.
+If the reviewer requests another PR round after a new push, wait the full 30-minute window and begin a fresh bounded invocation. Stop routine mutation and escalate when the hosted skill's reset triggers fire or after eight PR remediation rounds. Do not merge the pull request, mark Linear Done, or complete the card yourself.
