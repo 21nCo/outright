@@ -141,16 +141,18 @@ function main() {
   );
   if (!issue) return;
 
-  const card = createCard(issue);
+  const fullIssueData = composio("LINEAR_GET_LINEAR_ISSUE", { issue_id: issue.id });
+  const fullIssue = { ...issue, ...(fullIssueData.issue ?? {}) };
+  const card = createCard(fullIssue);
   composio("LINEAR_UPDATE_ISSUE", {
-    issueId: issue.id,
+    issueId: fullIssue.id,
     stateId: config.linear.inProgressStateId
   });
   composio("LINEAR_CREATE_LINEAR_COMMENT", {
-    issueId: issue.id,
+    issueId: fullIssue.id,
     body: `Implementation started by the Outright Hermes workflow. Kanban card: ${card.id ?? card.task_id ?? "created"}.`
   });
-  process.stdout.write(`Queued ${issue.identifier}: ${issue.title}\n`);
+  process.stdout.write(`Queued ${fullIssue.identifier}: ${fullIssue.title}\n`);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
