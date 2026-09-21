@@ -61,7 +61,7 @@
       "reasoningEffort": "high"
     }
   },
-  "localReviewCycleLimit": 5,
+  "localReviewCycleLimit": 8,
   "pullRequestReviewCycleLimit": 8,
   "pullRequestReviewWaitSeconds": 1800,
   "humanMergeAndLinearCompletionGate": true,

@@ -8,7 +8,7 @@ Treat tests as evidence, not a substitute for review. Check correctness, complet
 
 When review metadata has `phase: "local"`, inspect the assigned worktree, the full branch diff against `main`, nearby code, and the issue's acceptance criteria. No pull request should exist yet.
 
-If actionable defects remain, call `kanban_request_changes` with concrete file, behavior, and verification requirements. After five local review cycles, block with a concise escalation.
+If actionable defects remain, call `kanban_request_changes` with concrete file, behavior, and verification requirements. After eight local review cycles, block with a concise escalation.
 
 When the local implementation is clean, call `kanban_request_changes` once with an explicit state transition beginning `LOCAL_GATE_PASSED:` and instruct the implementer to push the approved head, create the PR, and enter the automatic PR review remediation phase. This transition routes the same card and worktree back to the implementer; it is not a defect finding.
 
