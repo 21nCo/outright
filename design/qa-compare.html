@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Outright design comparison</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: 24px; color: #e7edf4; background: #050b12; font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      h1 { margin: 0 0 18px; font-size: 18px; }
+      main { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+      figure { margin: 0; min-width: 0; }
+      figcaption { margin-bottom: 8px; color: #9fb0c1; }
+      img { display: block; width: 100%; aspect-ratio: 1440 / 1024; object-fit: contain; object-position: top; border: 1px solid #203347; background: #07111b; }
+    </style>
+  </head>
+  <body>
+    <h1>Outright — selected mock vs browser implementation</h1>
+    <main>
+      <figure><figcaption>Selected visual target</figcaption><img src="./reference-option-2.png" alt="Selected Outright mock" /></figure>
+      <figure><figcaption>Browser implementation at 1440 × 1024</figcaption><img src="./implementation-1440x1024@2x.png" alt="Outright browser implementation" /></figure>
+    </main>
+  </body>
+</html>

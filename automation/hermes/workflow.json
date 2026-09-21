@@ -1,0 +1,24 @@
+{
+  "board": "outright",
+  "project": "outright",
+  "repository": "21nCo/outright",
+  "workdir": "/Users/serro/Documents/dev/n/agent/experiments/outright",
+  "linear": {
+    "teamId": "c2207a6d-b3ab-48bf-86b2-74f10ad1e566",
+    "teamName": "Outright",
+    "backlogState": "Backlog",
+    "inProgressStateId": "146721dc-493f-4c1e-81e2-1af5cf85d1e7",
+    "inReviewStateId": "f7b0a63e-08a5-4bda-9475-663364d6942a",
+    "doneStateId": "adcf891a-0592-43f4-88e8-34be03651874"
+  },
+  "profiles": {
+    "implementer": "outright-implementer",
+    "reviewer": "outright-reviewer"
+  },
+  "models": {
+    "implementer": "moonshotai/kimi-k3",
+    "reviewer": "z-ai/glm-5.3",
+    "provider": "openrouter"
+  },
+  "reviewCycleLimit": 5
+}

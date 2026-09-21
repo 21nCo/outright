@@ -1,0 +1,15 @@
+{
+  "scanRoots": [
+    "/Users/serro/Documents/dev/n"
+  ],
+  "maxDepth": 3,
+  "maxProjects": 24,
+  "excludeDirectories": [
+    ".git",
+    ".next",
+    ".turbo",
+    "dist",
+    "node_modules",
+    "vendor"
+  ]
+}

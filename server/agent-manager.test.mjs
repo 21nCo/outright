@@ -1,0 +1,243 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { PassThrough } from "node:stream";
+import { buildProviderCommand, createAgentManager, consumeBoundedLines, normalizeClaude, normalizeCodex } from "./agent-manager.mjs";
+
+const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
+
+function fakeChild() {
+  const child = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.signals = [];
+  child.kill = (signal) => { child.signals.push(signal); return true; };
+  return child;
+}
+
+function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/project" }) {
+  const messages = [];
+  const runs = new Map();
+  const conversations = new Map([[initialConversation.id, initialConversation]]);
+  return {
+    messages,
+    runs,
+    getSettings: () => ({ maxConcurrentRuns: 8 }),
+    getConversation: (id) => conversations.get(id),
+    updateConversation: (id, patch) => conversations.set(id, { ...conversations.get(id), ...patch }),
+    getRun: (id) => runs.get(id) ?? null,
+    createRun: (run) => { runs.set(run.id, run); return run; },
+    updateRun: (id, patch) => { runs.set(id, { ...runs.get(id), ...patch }); return runs.get(id); },
+    addMessage: (input) => { messages.push(input); return input; },
+    appendRunEvent: (runId, type, payload) => ({ id: messages.length + 1, runId, seq: 1, type, payload, createdAt: "" }),
+    audit: () => {},
+  };
+}
+
+function codexRun(id) {
+  return { id, conversationId: "conv-1", provider: "codex", prompt: "prompt", approvalPolicy: "read-only" };
+}
+
+test("builds sandboxed provider commands with model and reasoning settings", () => {
+  const codex = buildProviderCommand(conversation, { provider: "codex", model: "gpt-5.4", reasoningEffort: "high", approvalPolicy: "read-only", prompt: "Review" });
+  assert.deepEqual(codex.args.slice(0, 6), ["exec", "--json", "-C", "/tmp/project", "--sandbox", "read-only"]);
+  assert.ok(codex.args.includes("model_reasoning_effort=\"high\""));
+
+  const claude = buildProviderCommand(conversation, { provider: "claude", model: "sonnet", reasoningEffort: "xhigh", approvalPolicy: "workspace-write", prompt: "Implement" });
+  assert.ok(claude.args.includes("acceptEdits"));
+  assert.deepEqual(claude.args.slice(claude.args.indexOf("--effort"), claude.args.indexOf("--effort") + 2), ["--effort", "xhigh"]);
+});
+
+test("keeps the selected sandbox policy when resuming Codex sessions", () => {
+  const resumedConversation = { ...conversation, providerSessionId: "session-1" };
+  const readOnly = buildProviderCommand(resumedConversation, { provider: "codex", reasoningEffort: "medium", approvalPolicy: "read-only", prompt: "Review" });
+  assert.ok(readOnly.args.includes('sandbox_mode="read-only"'));
+  assert.equal(readOnly.args.includes("--dangerously-bypass-approvals-and-sandbox"), false);
+
+  const workspaceWrite = buildProviderCommand(resumedConversation, { provider: "codex", reasoningEffort: "medium", approvalPolicy: "workspace-write", prompt: "Implement" });
+  assert.ok(workspaceWrite.args.includes('sandbox_mode="workspace-write"'));
+
+  const fullAccess = buildProviderCommand(resumedConversation, { provider: "codex", reasoningEffort: "medium", approvalPolicy: "danger-full-access", prompt: "Run" });
+  assert.ok(fullAccess.args.includes("--dangerously-bypass-approvals-and-sandbox"));
+  assert.equal(fullAccess.args.some((argument) => argument.startsWith("sandbox_mode=")), false);
+});
+
+test("normalizes Codex and Claude streaming records", () => {
+  assert.deepEqual(normalizeCodex({ type: "thread.started", thread_id: "thread-1" })[0], { type: "session", payload: { sessionId: "thread-1" } });
+  assert.deepEqual(normalizeCodex({ type: "item.completed", item: { type: "agent_message", text: "done" } })[0], { type: "assistant.message", payload: { text: "done" } });
+  assert.deepEqual(normalizeClaude({ type: "stream_event", event: { delta: { type: "text_delta", text: "hello" } } })[0], { type: "assistant.delta", payload: { text: "hello" } });
+  assert.equal(normalizeClaude({ type: "result", result: "finished", total_cost_usd: 0.01, usage: { input_tokens: 2, output_tokens: 3 } }).at(-1).payload.costUsd, 0.01);
+});
+
+test("discards oversized provider lines and resumes at the next record", async () => {
+  const stream = new PassThrough();
+  const lines = [];
+  let overflows = 0;
+  consumeBoundedLines(stream, { maxLineBytes: 12, onLine: (line) => lines.push(line), onOverflow: () => { overflows += 1; } });
+  stream.write("first\nway-too-");
+  stream.write("large-line\nvalid\nlast");
+  stream.end();
+  await new Promise((resolve) => stream.once("end", resolve));
+  assert.deepEqual(lines, ["first", "valid", "last"]);
+  assert.equal(overflows, 1);
+});
+
+test("serializes runs per conversation even with free global capacity", async () => {
+  const database = fakeDatabase();
+  const published = [];
+  const children = [];
+  const manager = createAgentManager({ database, publish: (event) => published.push(event), spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+
+  database.createRun(codexRun("run-1"));
+  database.createRun(codexRun("run-2"));
+  await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-1") });
+  await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-2") });
+  assert.equal(manager.activeRuns().length, 1);
+  assert.equal(children.length, 1);
+
+  children[0].emit("close", 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(manager.activeRuns(), ["run-2"]);
+  assert.equal(children.length, 2);
+});
+
+test("persists ordered transcript items instead of one accumulated answer", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  database.createRun(codexRun("run-1"));
+  await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-1") });
+
+  child.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "First update" } }) + "\n");
+  child.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "ls -la" } }) + "\n");
+  child.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Final answer" } }) + "\n");
+  child.emit("close", 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.deepEqual(database.messages.map((message) => message.body), ["First update", "Tool completed: ls -la", "Final answer"]);
+  assert.deepEqual(database.messages.map((message) => message.kind), ["text", "tool", "text"]);
+});
+
+test("stop signals the process tree and resolves after termination", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  database.createRun(codexRun("run-1"));
+  await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-1") });
+
+  const stopping = manager.stop("run-1");
+  assert.deepEqual(child.signals, ["SIGTERM"]);
+  child.emit("close", 137, "SIGTERM");
+  assert.equal(await stopping, true);
+  assert.equal(database.getRun("run-1").status, "stopped");
+});
+
+const turn = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+for (const change of ["move", "revoke", "mismatch"]) {
+  test(`queued runs revalidate execution authorization after ${change}`, async () => {
+    const database = fakeDatabase({ id: "conv-1", projectId: "A", worktreeId: "A", worktreePath: "/tmp/A" });
+    let trusted = true;
+    const children = [];
+    const manager = createAgentManager({
+      database, publish: () => {},
+      validateConversation: async (target) => {
+        if (target.projectId !== "A" || target.worktreePath !== "/tmp/A") throw new Error("Invalid worktree identity");
+        return () => { if (!trusted) throw new Error("Project trust is required"); };
+      },
+      spawnProcess: () => { const child = fakeChild(); children.push(child); return child; },
+    });
+    for (const id of ["first", "queued"]) {
+      const run = database.createRun(codexRun(id));
+      await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+    }
+    if (change === "revoke") trusted = false;
+    else database.updateConversation("conv-1", change === "move" ? { projectId: "B", worktreeId: "B", worktreePath: "/tmp/B" } : { worktreePath: "/tmp/B" });
+    children[0].emit("close", 0, null);
+    await turn();
+    assert.equal(children.length, 1, "the queued run must not spawn");
+    assert.equal(database.getRun("queued").status, "failed");
+    assert.match(database.getRun("queued").error, /trust|identity/);
+    assert.deepEqual(manager.activeRuns(), []);
+  });
+}
+
+test("validation reserves capacity and cancellation prevents a late spawn", async () => {
+  const database = fakeDatabase();
+  database.getSettings = () => ({ maxConcurrentRuns: 1 });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let spawns = 0;
+  const manager = createAgentManager({ database, publish: () => {}, validateConversation: () => gate, spawnProcess: () => { spawns++; return fakeChild(); } });
+  const run = database.createRun(codexRun("pending"));
+  const scheduling = manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  assert.deepEqual(manager.activeRuns(), ["pending"]);
+  const stopping = manager.stop(run.id);
+  release();
+  await Promise.all([scheduling, stopping]);
+  assert.equal(spawns, 0);
+  assert.equal(database.getRun(run.id).status, "stopped");
+});
+
+test("a target moved during asynchronous validation never spawns", async () => {
+  const database = fakeDatabase();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let spawns = 0;
+  const manager = createAgentManager({ database, publish: () => {}, validateConversation: () => gate, spawnProcess: () => { spawns++; return fakeChild(); } });
+  const run = database.createRun(codexRun("pending"));
+  const scheduling = manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  database.updateConversation("conv-1", { worktreePath: "/tmp/changed" });
+  release();
+  await scheduling;
+  assert.equal(spawns, 0);
+  assert.equal(database.getRun(run.id).status, "failed");
+  assert.match(database.getRun(run.id).error, /target changed/);
+});
+
+for (const action of ["stop", "shutdown"]) {
+  test(`${action} waits for a descendant that ignores SIGTERM`, { skip: process.platform === "win32", timeout: 10000 }, async (t) => {
+    const database = fakeDatabase();
+    let child;
+    const manager = createAgentManager({
+      database, publish: () => {}, terminationGraceMs: 150, terminationTimeoutMs: 5000,
+      spawnProcess: () => {
+        const descendant = `process.on("SIGTERM", () => {}); process.send("ready"); setInterval(() => {}, 1000);`;
+        const parent = `const {spawn} = require("node:child_process"); const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], {stdio:["ignore","ignore","ignore","ipc"]}); child.once("message", () => process.stdout.write("ready\\n")); setInterval(() => {}, 1000);`;
+        child = spawn(process.execPath, ["-e", parent], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+        return child;
+      },
+    });
+    t.after(() => { try { process.kill(-child.pid, "SIGKILL"); } catch {} });
+    const run = database.createRun(codexRun("tree"));
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+    await once(child.stdout, "data");
+    let resolved = false;
+    const stopping = (action === "stop" ? manager.stop(run.id) : manager.shutdown()).then(() => { resolved = true; });
+    await once(child, "close");
+    assert.equal(resolved, false, "provider close is not process-tree completion");
+    assert.equal(database.getRun(run.id).status, "running");
+    assert.doesNotThrow(() => process.kill(-child.pid, 0));
+    await stopping;
+    assert.equal(database.getRun(run.id).status, "stopped");
+    assert.throws(() => process.kill(-child.pid, 0), { code: "ESRCH" });
+    assert.deepEqual(manager.activeRuns(), []);
+  });
+}
+
+test("a termination timeout retains ownership and does not drain queued work", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  let spawns = 0;
+  const manager = createAgentManager({ database, publish: () => {}, terminationGraceMs: 0, terminationTimeoutMs: 40, spawnProcess: () => { spawns++; return child; } });
+  for (const id of ["running", "queued"]) await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.createRun(codexRun(id)) });
+  await assert.rejects(manager.stop("running"), /did not terminate/);
+  assert.equal(database.getRun("running").status, "running");
+  assert.deepEqual(manager.activeRuns(), ["running"]);
+  assert.equal(spawns, 1);
+  await manager.stop("queued");
+  child.emit("close", 137, "SIGKILL");
+  assert.equal(await manager.stop("running"), true);
+  assert.deepEqual(manager.activeRuns(), []);
+});
