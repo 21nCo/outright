@@ -5,8 +5,14 @@ const MAX_ASSISTANT_BYTES = 1024 * 1024;
 const MAX_PROCESS_EVENT_BYTES = 64 * 1024;
 const MAX_ASSISTANT_EVENT_BYTES = 255 * 1024;
 const ASSISTANT_TRUNCATION_MARKER = "\n\n[Output truncated by Outright at 1 MiB]";
+// Assistant checkpoints are coalesced: a new durable checkpoint is written
+// only after this many new stream bytes (or this much time) accumulate, so a
+// long delta stream rewrites the growing transcript O(bytes/threshold) times
+// instead of once per token, while crash exposure stays bounded.
+const CHECKPOINT_MIN_BYTES = 4 * 1024;
+const CHECKPOINT_INTERVAL_MS = 500;
 
-export function createAgentManager({ database, publish, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000 }) {
+export function createAgentManager({ database, publish, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS }) {
   const active = new Map();
   const queue = [];
   let shuttingDown = false;
@@ -88,11 +94,11 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       }
       if (event.type === "assistant.delta") {
         appendAssistantText(state, event.payload.text, emit);
-        persistAssistantCheckpoint(state);
+        scheduleAssistantCheckpoint(state, event.payload.text);
       }
       if (event.type === "assistant.message") {
         const text = event.payload.text ?? "";
-        if (state.assistantText && !text.startsWith(state.assistantText)) {
+        if (state.assistantBytes && !text.startsWith(assistantBody(state))) {
           // A completed message that does not extend the accumulated deltas
           // starts a new segment; archive the prior one first.
           archiveAssistant(state, persistAssistantCheckpoint);
@@ -177,7 +183,7 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       const index = queue.findIndex((entry) => ![...active.values()].some((state) => state.conversation.id === entry.run.conversationId));
       if (index < 0) return;
       const entry = queue.splice(index, 1)[0];
-      const state = { ...entry, assistantText: "", assistantTruncated: false, assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, stderr: "", stopped: false };
+      const state = { ...entry, assistantSegments: [], assistantBytes: 0, assistantTruncated: false, assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, stderr: "", stopped: false, checkpointPendingBytes: 0, lastCheckpointAt: 0 };
       active.set(entry.run.id, state);
       state.launch = entry.launch = (async () => {
         try {
@@ -214,7 +220,21 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     publish({ type: "message.created", conversationId: state.conversation.id, payload: message });
   }
 
+  // Coalesces Claude delta output into bounded durable checkpoints: a
+  // checkpoint is flushed once enough new bytes (or time) have accumulated
+  // since the last one. Message/tool boundaries and run finalization always
+  // flush, so the final transcript stays exact-once.
+  function scheduleAssistantCheckpoint(state, deltaText) {
+    if (!state.assistantBytes) return;
+    state.checkpointPendingBytes = (state.checkpointPendingBytes ?? 0) + Buffer.byteLength(deltaText ?? "");
+    if (state.checkpointPendingBytes >= checkpointMinBytes || Date.now() - (state.lastCheckpointAt ?? 0) >= checkpointIntervalMs) {
+      persistAssistantCheckpoint(state);
+    }
+  }
+
   function persistAssistantCheckpoint(state) {
+    state.checkpointPendingBytes = 0;
+    state.lastCheckpointAt = Date.now();
     const message = pendingAssistantMessage(state);
     if (!message) return null;
     return database.upsertMessage(message);
@@ -303,17 +323,30 @@ export function consumeBoundedLines(stream, { maxLineBytes = MAX_PROVIDER_LINE_B
   });
 }
 
+// Assistant text is buffered as segments and only materialized at flush or
+// boundary, so appending a delta costs O(delta), not O(transcript so far).
 function appendAssistantText(state, text, emit) {
   if (state.assistantTruncated) return;
-  const next = boundUtf8(`${state.assistantText}${text ?? ""}`, MAX_ASSISTANT_BYTES);
-  state.assistantText = next.text;
-  markAssistantTruncated(state, next.truncated, emit);
+  const segment = String(text ?? "");
+  state.assistantSegments.push(segment);
+  state.assistantBytes += Buffer.byteLength(segment);
+  if (state.assistantBytes > MAX_ASSISTANT_BYTES) {
+    const bounded = boundUtf8(assistantBody(state), MAX_ASSISTANT_BYTES);
+    state.assistantSegments = bounded.text ? [bounded.text] : [];
+    state.assistantBytes = Buffer.byteLength(bounded.text);
+    markAssistantTruncated(state, bounded.truncated, emit);
+  }
 }
 
 function replaceAssistantText(state, text, emit) {
-  const next = boundUtf8(text ?? "", MAX_ASSISTANT_BYTES);
-  state.assistantText = next.text;
-  markAssistantTruncated(state, next.truncated, emit);
+  const bounded = boundUtf8(String(text ?? ""), MAX_ASSISTANT_BYTES);
+  state.assistantSegments = bounded.text ? [bounded.text] : [];
+  state.assistantBytes = Buffer.byteLength(bounded.text);
+  markAssistantTruncated(state, bounded.truncated, emit);
+}
+
+function assistantBody(state) {
+  return state.assistantSegments.join("");
 }
 
 function archiveAssistant(state, persist) {
@@ -322,7 +355,7 @@ function archiveAssistant(state, persist) {
 }
 
 function pendingAssistantMessage(state) {
-  const body = state.assistantText.trim();
+  const body = assistantBody(state).trim();
   if (!body) return null;
   if (!state.assistantMessageId) {
     state.transcriptSeq = (state.transcriptSeq ?? 0) + 1;
@@ -341,7 +374,8 @@ function pendingAssistantMessage(state) {
 }
 
 function clearAssistant(state) {
-  state.assistantText = "";
+  state.assistantSegments = [];
+  state.assistantBytes = 0;
   state.assistantTruncated = false;
   state.assistantMessageId = null;
   state.assistantCreatedAt = null;

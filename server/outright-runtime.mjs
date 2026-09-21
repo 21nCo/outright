@@ -220,12 +220,20 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const conversation = database.getConversation(interrupted.conversationId);
         if (!conversation) throw apiError(404, "Conversation not found");
 
-        if (interrupted.recoveryClass === "alive") {
-          if (!Number.isSafeInteger(interrupted.pid) || interrupted.pid <= 0) throw apiError(409, "The recovered provider process cannot be verified", { code: "RECOVERY_PROCESS_UNKNOWN" });
-          if (await recoveryProcessAlive(interrupted.pid)) {
-            throw apiError(409, "The recovered provider process is still active; stop it before choosing a recovery policy", { code: "RECOVERY_PROCESS_ACTIVE", pid: interrupted.pid });
+        // Every previously started run is re-probed before a decision is
+        // applied, regardless of the restart-time classification: a detached
+        // leader can exit while provider descendants still hold the process
+        // group and mutate the worktree. Only a verified-exited (or never
+        // started) run may continue; unverifiable state stays blocked.
+        if (interrupted.recoveryClass !== "never-started") {
+          if (Number.isSafeInteger(interrupted.pid) && interrupted.pid > 0) {
+            if (await recoveryProcessAlive(interrupted.pid)) {
+              throw apiError(409, "The recovered provider process is still active; stop it before choosing a recovery policy", { code: "RECOVERY_PROCESS_ACTIVE", pid: interrupted.pid });
+            }
+            interrupted = database.updateRun(interrupted.id, { recoveryClass: "exited", pid: null });
+          } else {
+            throw apiError(409, "The recovered provider process cannot be verified", { code: "RECOVERY_PROCESS_UNKNOWN" });
           }
-          interrupted = database.updateRun(interrupted.id, { recoveryClass: "exited", pid: null });
         }
 
         if (policy === "discard") {

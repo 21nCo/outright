@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Readable } from "node:stream";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -100,6 +101,44 @@ test("does not resolve an alive recovered provider while it can still mutate the
   assert.equal(response.body.code, "RECOVERY_PROCESS_ACTIVE");
   assert.equal(runtime.database.getRun(run.id).recoveryDecision, null);
 }, { recoveryProcessAlive: () => true }));
+
+// Regression: an exited leader with a live descendant was classified exited
+// at restart and could then bypass the recovery process guard entirely.
+test("re-probes the process group of an exited-classified run before recovery", { skip: process.platform === "win32" }, withRuntime(async (runtime) => {
+  const descendant = "setInterval(() => {}, 1000);";
+  const leader = `const {spawn} = require("node:child_process"); spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], {stdio: "ignore"}); process.exit(0);`;
+  const child = spawn(process.execPath, ["-e", leader], { detached: true, stdio: "ignore" });
+  const pid = child.pid;
+  child.once("exit", () => {});
+  try {
+    // Wait until the leader is gone while the descendant holds its group.
+    await new Promise((resolve) => {
+      const started = Date.now();
+      (function probe() {
+        try { process.kill(pid, 0); }
+        catch { return resolve(); }
+        if (Date.now() - started > 5000) return resolve();
+        setTimeout(probe, 25);
+      })();
+    });
+    assert.doesNotThrow(() => process.kill(-pid, 0), "the descendant must hold the leader's process group");
+    const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+    runtime.database.updateRun(run.id, { status: "running", pid });
+    // Stale restart classification: the leader had already exited by the time
+    // the restart probe ran, but the descendant still holds the process group.
+    runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+    assert.equal(runtime.database.getRun(run.id).recoveryClass, "exited");
+
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), response);
+    assert.equal(response.statusCode, 409);
+    assert.equal(response.body.code, "RECOVERY_PROCESS_ACTIVE");
+    assert.equal(runtime.database.getRun(run.id).recoveryDecision, null);
+  } finally {
+    try { process.kill(-pid, "SIGKILL"); } catch { /* Already gone. */ }
+  }
+}));
 
 test("accepts loopback and same-origin runtime requests", () => {
   const allowedHosts = runtimeAllowedHosts({});

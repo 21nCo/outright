@@ -196,7 +196,7 @@ export function createOutrightDatabase(options = {}) {
     // them "interrupted" with a best-effort process classification instead of
     // failing them outright, and leave the continuation decision to the
     // operator so uncertain side effects are never silently retried.
-    reconcileInterruptedRuns({ probeAlive = defaultProbeAlive } = {}) {
+    reconcileInterruptedRuns({ probeAlive = defaultProbeRun } = {}) {
       const pending = db.prepare("SELECT id, status, pid FROM runs WHERE status IN ('queued', 'running')").all();
       if (!pending.length) return { count: 0, counts: {} };
       const finishedAt = now();
@@ -205,7 +205,7 @@ export function createOutrightDatabase(options = {}) {
         for (const run of pending) {
           let classification = "unknown";
           if (run.status === "queued") classification = "never-started";
-          else if (run.pid != null) classification = probeAlive(run.pid) ? "alive" : "exited";
+          else if (run.pid != null) classification = normalizeProbeResult(probeAlive(run.pid));
           counts[classification] = (counts[classification] ?? 0) + 1;
           db.prepare("UPDATE runs SET status = 'interrupted', finished_at = ?, recovery_class = ? WHERE id = ?").run(finishedAt, classification, run.id);
         }
@@ -368,9 +368,25 @@ function hydratePayload(row) { return { ...row, payload: parseJson(row.payload, 
 function hydrateDetails(row) { return { ...row, details: parseJson(row.details, {}) }; }
 function parseJson(value, fallback) { try { return JSON.parse(value); } catch { return fallback; } }
 function now() { return new Date().toISOString(); }
-function defaultProbeAlive(pid) {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return error.code !== "ESRCH"; }
+// Probes the run's whole process group, not just the detached leader PID: an
+// exited leader can leave live provider descendants in process group `pid` that
+// are still able to mutate the worktree. Anything not verifiably exited is
+// reported conservatively.
+export function defaultProbeRun(pid) {
+  const targets = process.platform === "win32" ? [pid] : [pid, -pid];
+  const results = targets.map((target) => {
+    try { process.kill(target, 0); return "alive"; }
+    catch (error) { return error.code === "ESRCH" ? "exited" : "unknown"; }
+  });
+  if (results.includes("alive")) return "alive";
+  if (results.every((result) => result === "exited")) return "exited";
+  return "unknown";
+}
+
+function normalizeProbeResult(value) {
+  if (value === true) return "alive";
+  if (value === false) return "exited";
+  return ["alive", "exited", "unknown"].includes(value) ? value : "unknown";
 }
 
 export function serializePayload(payload, maxBytes = MAX_RUN_EVENT_PAYLOAD_BYTES) {

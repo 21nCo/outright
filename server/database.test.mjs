@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { spawn } from "node:child_process";
 import { createOutrightDatabase } from "./database.mjs";
 
 test("persists settings, groups, conversations, messages, runs, and search", () => {
@@ -70,6 +71,40 @@ test("a running row without a recorded pid reconciles as unknown", () => {
     database.reconcileInterruptedRuns();
     assert.equal(database.getRun(run.id).recoveryClass, "unknown");
   } finally {
+    database.close();
+  }
+});
+
+// Regression: reconciliation used to probe only the detached leader PID. A
+// leader that exits while provider descendants still hold the process group
+// was classified "exited" and could bypass the recovery process guard.
+test("classifies an exited leader with a live descendant as alive", { skip: process.platform === "win32" }, async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  let pid;
+  try {
+    const descendant = "setInterval(() => {}, 1000);";
+    const leader = `const {spawn} = require("node:child_process"); spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], {stdio: "ignore"}); process.exit(0);`;
+    const child = spawn(process.execPath, ["-e", leader], { detached: true, stdio: "ignore" });
+    pid = child.pid;
+    await new Promise((resolve) => child.once("exit", resolve));
+    await new Promise((resolve) => {
+      const started = Date.now();
+      (function probe() {
+        try { process.kill(pid, 0); }
+        catch { return resolve(); }
+        if (Date.now() - started > 5000) return resolve();
+        setTimeout(probe, 25);
+      })();
+    });
+    assert.doesNotThrow(() => process.kill(-pid, 0), "the descendant must hold the leader's process group");
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "orphaned" });
+    database.updateRun(run.id, { status: "running", pid });
+    const result = database.reconcileInterruptedRuns();
+    assert.equal(result.counts.alive, 1);
+    assert.equal(database.getRun(run.id).recoveryClass, "alive");
+  } finally {
+    if (pid) { try { process.kill(-pid, "SIGKILL"); } catch { /* Already gone. */ } }
     database.close();
   }
 });

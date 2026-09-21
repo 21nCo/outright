@@ -158,12 +158,53 @@ test("checkpoints Claude delta-only output durably without duplicating it", asyn
   await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-1") });
 
   child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "Partial" } } }) + "\n");
+  // The first delta of a segment flushes immediately, so a crash right after a
+  // stream starts still leaves a durable, inspectable checkpoint.
+  assert.equal(database.messages.length, 1);
+  assert.equal(database.messages[0].body, "Partial");
+  assert.equal(database.messages[0].id, "run-1:1");
+
+  // Small follow-up deltas coalesce instead of rewriting the transcript, and
+  // a byte-bounded batch flushes one updated checkpoint under the same id.
   child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: " answer" } } }) + "\n");
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: ` ${"x".repeat(8192)}` } } }) + "\n");
 
   assert.equal(database.messages.length, 1);
-  assert.equal(database.messages[0].body, "Partial answer");
   assert.equal(database.messages[0].id, "run-1:1");
+  assert.equal(database.messages[0].body, `Partial answer ${"x".repeat(8192)}`);
   assert.deepEqual(manager.activeRuns(), ["run-1"]);
+});
+
+test("bounds checkpoint writes and write amplification for high-delta streams", async () => {
+  const database = fakeDatabase();
+  const upserts = [];
+  const originalUpsert = database.upsertMessage.bind(database);
+  database.upsertMessage = (input) => { upserts.push(input); return originalUpsert(input); };
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child, checkpointMinBytes: 4096, checkpointIntervalMs: 500 });
+  database.createRun({ ...codexRun("run-1"), provider: "claude" });
+  await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-1") });
+
+  const deltas = 10_000;
+  const chunk = "x".repeat(100);
+  for (let index = 0; index < deltas; index += 1) {
+    child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: chunk } } }) + "\n");
+  }
+  child.emit("close", 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const totalBytes = deltas * 100;
+  const writtenBytes = upserts.reduce((sum, message) => sum + Buffer.byteLength(message.body), 0);
+  // One write per ~4 KiB of new stream bytes (plus the first flush), never
+  // one per delta; cumulative rewritten bytes stay bounded, not quadratic
+  // per token.
+  assert.ok(upserts.length <= 400, `expected at most 400 checkpoint writes, got ${upserts.length}`);
+  assert.ok(writtenBytes <= 192 * 1024 * 1024, `expected bounded cumulative writes, got ${writtenBytes}`);
+  // Exact-once final content: the terminal commit lands on the same message id.
+  assert.equal(database.messages.length, 1);
+  assert.equal(database.messages[0].id, "run-1:1");
+  assert.equal(Buffer.byteLength(database.messages[0].body), totalBytes);
+  assert.equal(database.getRun("run-1").status, "completed");
 });
 
 test("commits the final transcript checkpoint with terminal run state", async () => {
