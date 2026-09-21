@@ -25,6 +25,8 @@ const CHECKPOINT_INTERVAL_MS = 500;
 //     wrapper exits on its own (its stdin closed with the runtime) without
 //     ever starting the provider — never-started, with the pid preserved;
 //   * row 'running' with a pid -> possibly started, probed conservatively.
+// After authorization the wrapper also accepts a "stop" command, which makes
+// it tear the provider tree down in reaping order (see teardown below).
 export const LAUNCH_WRAPPER_SOURCE = `
 const fs = require("node:fs");
 const path = require("node:path");
@@ -35,6 +37,9 @@ fs.mkdirSync(path.dirname(handshakePath), { recursive: true });
 // restart.
 fs.writeFileSync(handshakePath, JSON.stringify({ pid: process.pid, authorized: false, createdAt: new Date().toISOString() }));
 let authorized = false;
+let provider = null;
+let providerGone = false;
+let teardownStarted = false;
 // Stay alive across group termination signals once authorized so this
 // wrapper — the provider's parent — can reap it. On hosts whose PID 1 does
 // not reap orphans, a killed-but-unreaped provider would remain a zombie in
@@ -44,34 +49,88 @@ let authorized = false;
 const abandon = () => { try { fs.unlinkSync(handshakePath); } catch {} process.exit(0); };
 process.on("SIGTERM", () => { if (!authorized) abandon(); });
 process.on("SIGINT", () => { if (!authorized) abandon(); });
+// Enumerates the members of this wrapper's process group from /proc, or
+// returns null when /proc is unavailable (non-Linux hosts); teardown then
+// degrades to killing the provider alone.
+const groupMembers = (pgid) => {
+  let entries;
+  try { entries = fs.readdirSync("/proc"); } catch { return null; }
+  const members = [];
+  for (const entry of entries) {
+    if (!/^\\d+$/.test(entry)) continue;
+    let stat;
+    try { stat = fs.readFileSync(\`/proc/\${entry}/stat\`, "utf8"); } catch { continue; }
+    const close = stat.lastIndexOf(")");
+    if (close < 0) continue;
+    const fields = stat.slice(close + 2).split(" ");
+    if (Number(fields[2]) === pgid) members.push({ pid: Number(entry), state: fields[0] });
+  }
+  return members;
+};
+// Ordered teardown (runtime "stop" command). The provider's descendants are
+// SIGKILLed FIRST, while their parent — the provider — is still alive to reap
+// them; only once the group holds no other member is the provider itself
+// killed, and this wrapper — its parent — reaps it. Any other order leaks:
+// killing the provider first orphans its descendants, and on a host whose
+// PID 1 does not reap they linger forever as unreaped zombies holding the
+// process group, accumulating one process-table entry per stop. The sweep is
+// bounded: if a member never disappears, the provider is killed anyway and
+// the runtime's group-wide fallback applies.
+const teardownBudgetMs = 750;
+const teardown = () => {
+  if (teardownStarted || !provider || providerGone) return;
+  teardownStarted = true;
+  const deadline = Date.now() + teardownBudgetMs;
+  const killProvider = () => { if (!providerGone) { try { process.kill(provider.pid, "SIGKILL"); } catch { /* Already gone. */ } } };
+  const sweep = () => {
+    if (providerGone) return;
+    const members = groupMembers(process.pid);
+    if (members == null) { killProvider(); return; }
+    const outstanding = members.filter((member) => member.pid !== process.pid && member.pid !== provider.pid);
+    if (outstanding.length === 0 || Date.now() >= deadline) { killProvider(); return; }
+    for (const member of outstanding) {
+      // A zombie is already dead; its parent simply has not reaped it yet.
+      if (member.state === "Z") continue;
+      try { process.kill(member.pid, "SIGKILL"); } catch { /* Already gone. */ }
+    }
+    setTimeout(sweep, 50);
+  };
+  sweep();
+};
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
-  if (authorized || !String(chunk).includes("go")) return;
-  authorized = true;
-  const { spawn } = require("node:child_process");
-  const provider = spawn(executable, commandArgs, { stdio: ["ignore", "inherit", "inherit"] });
-  // Durable provider identity: escalation targets the provider alone so this
-  // wrapper — the provider's parent — survives to reap it. Without this, a
-  // group-wide SIGKILL kills the wrapper first and a killed-but-unreaped
-  // provider lingers as a zombie in its process group on hosts whose PID 1
-  // does not reap orphans.
-  try { fs.writeFileSync(handshakePath, JSON.stringify({ pid: process.pid, authorized: true, providerPid: provider.pid, createdAt: new Date().toISOString() })); } catch { /* The record was swept; nothing needs escalation identity. */ }
-  const finish = (code) => { try { fs.unlinkSync(handshakePath); } catch {} process.exit(code); };
-  provider.on("error", (error) => { console.error(String((error && error.message) || error)); finish(127); });
-  provider.on("close", (code, signal) => {
-    try { fs.unlinkSync(handshakePath); } catch {}
-    if (signal) {
-      // Re-raise the provider's termination signal so the runtime reports
-      // the accurate "stopped by signal" cause instead of a generic 137 —
-      // except SIGUSR1, which Node reserves for its debugger: re-raising it
-      // would start the inspector instead of terminating this wrapper.
-      process.removeAllListeners("SIGTERM");
-      process.removeAllListeners("SIGINT");
-      if (signal === "SIGUSR1") process.exit(137);
-      try { process.kill(process.pid, signal); }
-      catch { process.exit(137); }
-    } else process.exit(code ?? 0);
-  });
+  const text = String(chunk);
+  if (!authorized) {
+    if (!text.includes("go")) return;
+    authorized = true;
+    const { spawn } = require("node:child_process");
+    provider = spawn(executable, commandArgs, { stdio: ["ignore", "inherit", "inherit"] });
+    // Durable provider identity: escalation targets the provider alone so this
+    // wrapper — the provider's parent — survives to reap it. Without this, a
+    // group-wide SIGKILL kills the wrapper first and a killed-but-unreaped
+    // provider lingers as a zombie in its process group on hosts whose PID 1
+    // does not reap orphans.
+    try { fs.writeFileSync(handshakePath, JSON.stringify({ pid: process.pid, authorized: true, providerPid: provider.pid, createdAt: new Date().toISOString() })); } catch { /* The record was swept; nothing needs escalation identity. */ }
+    const finish = (code) => { try { fs.unlinkSync(handshakePath); } catch {} process.exit(code); };
+    provider.on("error", (error) => { console.error(String((error && error.message) || error)); finish(127); });
+    provider.on("close", (code, signal) => {
+      providerGone = true;
+      try { fs.unlinkSync(handshakePath); } catch {}
+      if (signal) {
+        // Re-raise the provider's termination signal so the runtime reports
+        // the accurate "stopped by signal" cause instead of a generic 137 —
+        // except SIGUSR1, which Node reserves for its debugger: re-raising it
+        // would start the inspector instead of terminating this wrapper.
+        process.removeAllListeners("SIGTERM");
+        process.removeAllListeners("SIGINT");
+        if (signal === "SIGUSR1") process.exit(137);
+        try { process.kill(process.pid, signal); }
+        catch { process.exit(137); }
+      } else process.exit(code ?? 0);
+    });
+    return;
+  }
+  if (text.includes("stop")) teardown();
 });
 // The runtime went away before authorizing the launch: exit without ever
 // starting the provider, so an abandoned handshake can never mutate the
@@ -254,21 +313,28 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       await state.launch;
       if (state.child) {
         const started = Date.now();
+        let teardownRequested = false;
         let escalated = false;
         let groupEscalated = false;
         while (!state.closed || processGroupAlive(state.child)) {
           const elapsed = Date.now() - started;
-          if (!escalated && elapsed >= terminationGraceMs) {
-            // Escalate on the provider alone first: the wrapper supervisor
-            // must survive to reap it, or the killed provider lingers as a
-            // zombie in the process group on hosts whose PID 1 does not reap
-            // orphans and stop/shutdown never observe the tree as gone.
+          if (!teardownRequested && elapsed >= terminationGraceMs) {
+            // Ordered wrapper teardown first: the wrapper SIGKILLs the
+            // provider's descendants while their parent still lives to reap
+            // them, then kills and reaps the provider itself. Any other order
+            // leaks zombies on hosts whose PID 1 does not reap orphans.
+            requestWrapperTeardown(state);
+            teardownRequested = true;
+          } else if (teardownRequested && !escalated && elapsed >= terminationGraceMs + escalationGraceMs) {
+            // The wrapper never managed (or was never the launch wrapper):
+            // fall back to killing the provider alone, so the wrapper — if
+            // alive — still reaps it.
             escalateTree(state.child, state.launchHandshakePath);
             escalated = true;
-          } else if (escalated && !groupEscalated && elapsed >= terminationGraceMs + escalationGraceMs) {
-            // The wrapper had its chance to reap; anything still executing in
-            // the group is killed outright. Liveness below recognizes the
-            // resulting non-executing zombie members as gone.
+          } else if (escalated && !groupEscalated && elapsed >= terminationGraceMs + 2 * escalationGraceMs) {
+            // Last resort: the wrapper had its chance to reap; anything still
+            // executing in the group is killed outright. Liveness below
+            // recognizes the resulting non-executing zombie members as gone.
             terminateTree(state.child, "SIGKILL");
             groupEscalated = true;
           }
@@ -284,6 +350,14 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       return true;
     })();
     return state.stopping;
+  }
+
+  // Asks the launch wrapper to tear its provider tree down in reaping order
+  // (descendants first, provider last; the wrapper reaps each). Writing to a
+  // non-wrapper child (an injected spawnProcess) is harmless — the command is
+  // ignored and the escalation fallbacks in stop() still apply.
+  function requestWrapperTeardown(state) {
+    try { state.child?.stdin?.write?.("stop\n"); } catch { /* The wrapper already exited. */ }
   }
 
   function drain() {
