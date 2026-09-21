@@ -52,7 +52,7 @@
   "models": {
     "implementer": {
       "id": "moonshotai/kimi-k3",
-      "provider": "openrouter",
+      "provider": "openrouter-outright",
       "reasoningEffort": "medium"
     },
     "reviewer": {
