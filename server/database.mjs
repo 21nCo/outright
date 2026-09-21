@@ -164,25 +164,59 @@ export function createOutrightDatabase(options = {}) {
     },
     getRun(id) {
       return db.prepare(`SELECT id, conversation_id AS conversationId, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
-        prompt, status, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
+        prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
         finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
-        output_tokens AS outputTokens FROM runs WHERE id = ?`).get(id);
+        output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision FROM runs WHERE id = ?`).get(id);
     },
     listRuns(conversationId, limit = 200) {
       const boundedLimit = Math.max(1, Math.min(500, Number(limit) || 200));
       return db.prepare(`SELECT id, conversation_id AS conversationId, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
-        prompt, status, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
+        prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
         finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
-        output_tokens AS outputTokens FROM runs WHERE conversation_id = ? ORDER BY created_at DESC LIMIT ?`).all(conversationId, boundedLimit);
+        output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision FROM runs WHERE conversation_id = ? ORDER BY created_at DESC LIMIT ?`).all(conversationId, boundedLimit);
     },
-    recoverInterruptedRuns() {
+    // Crash-consistent restart reconciliation: queued/running rows belong to a
+    // dead runtime, so none of them can ever finish under this process. Mark
+    // them "interrupted" with a best-effort process classification instead of
+    // failing them outright, and leave the continuation decision to the
+    // operator so uncertain side effects are never silently retried.
+    reconcileInterruptedRuns({ probeAlive = defaultProbeAlive } = {}) {
+      const pending = db.prepare("SELECT id, status, pid FROM runs WHERE status IN ('queued', 'running')").all();
+      if (!pending.length) return { count: 0, counts: {} };
       const finishedAt = now();
-      return db.prepare(`UPDATE runs SET status = 'failed', finished_at = ?, error = 'Outright restarted before this run completed' WHERE status IN ('queued', 'running')`).run(finishedAt).changes;
+      const counts = {};
+      const reconcile = db.transaction(() => {
+        for (const run of pending) {
+          let classification = "unknown";
+          if (run.status === "queued") classification = "never-started";
+          else if (run.pid != null) classification = probeAlive(run.pid) ? "alive" : "exited";
+          counts[classification] = (counts[classification] ?? 0) + 1;
+          db.prepare("UPDATE runs SET status = 'interrupted', finished_at = ?, recovery_class = ? WHERE id = ?").run(finishedAt, classification, run.id);
+        }
+      });
+      reconcile();
+      return { count: pending.length, counts };
+    },
+    // Records the operator's explicit continuation decision exactly once.
+    // Discard fails the run; resume/retry keep it interrupted for the record
+    // while the replacement run carries the work forward.
+    resolveInterruptedRun(id, decision) {
+      const run = this.getRun(id);
+      if (!run || !["discard", "resume-session", "retry"].includes(decision)) return null;
+      if (run.status !== "interrupted" || run.recoveryDecision) return null;
+      const status = decision === "discard" ? "failed" : "interrupted";
+      const error = decision === "discard" ? "Discarded after restart recovery review" : null;
+      const stamp = now();
+      const resolve = db.transaction(() => {
+        db.prepare("UPDATE runs SET recovery_decision = ?, status = ?, error = ?, finished_at = ? WHERE id = ?").run(decision, status, error, stamp, id);
+      });
+      resolve();
+      return this.getRun(id);
     },
     updateRun(id, patch) {
       const fields = [];
       const values = [];
-      for (const [key, column] of Object.entries({ status: "status", providerSessionId: "provider_session_id", startedAt: "started_at", finishedAt: "finished_at", exitCode: "exit_code", error: "error", costUsd: "cost_usd", inputTokens: "input_tokens", outputTokens: "output_tokens" })) {
+      for (const [key, column] of Object.entries({ status: "status", pid: "pid", providerSessionId: "provider_session_id", startedAt: "started_at", finishedAt: "finished_at", exitCode: "exit_code", error: "error", costUsd: "cost_usd", inputTokens: "input_tokens", outputTokens: "output_tokens", recoveryClass: "recovery_class", recoveryDecision: "recovery_decision" })) {
         if (patch[key] === undefined) continue;
         fields.push(`${column} = ?`); values.push(patch[key]);
       }
@@ -254,8 +288,9 @@ function migrate(db) {
     CREATE TABLE IF NOT EXISTS runs (
       id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
       provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT 'medium', approval_policy TEXT NOT NULL, prompt TEXT NOT NULL,
-      status TEXT NOT NULL, provider_session_id TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
-      exit_code INTEGER, error TEXT, cost_usd REAL, input_tokens INTEGER, output_tokens INTEGER
+      status TEXT NOT NULL, pid INTEGER, provider_session_id TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+      exit_code INTEGER, error TEXT, cost_usd REAL, input_tokens INTEGER, output_tokens INTEGER,
+      recovery_class TEXT, recovery_decision TEXT
     );
     CREATE INDEX IF NOT EXISTS runs_conversation ON runs(conversation_id, created_at);
     CREATE TABLE IF NOT EXISTS run_events (
@@ -268,6 +303,9 @@ function migrate(db) {
   `);
   try { db.exec("ALTER TABLE conversations ADD COLUMN tab_position INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'medium'"); } catch { /* Already migrated. */ }
+  try { db.exec("ALTER TABLE runs ADD COLUMN pid INTEGER"); } catch { /* Already migrated. */ }
+  try { db.exec("ALTER TABLE runs ADD COLUMN recovery_class TEXT"); } catch { /* Already migrated. */ }
+  try { db.exec("ALTER TABLE runs ADD COLUMN recovery_decision TEXT"); } catch { /* Already migrated. */ }
 }
 
 function conversationColumns() {
@@ -279,6 +317,10 @@ function hydratePayload(row) { return { ...row, payload: parseJson(row.payload, 
 function hydrateDetails(row) { return { ...row, details: parseJson(row.details, {}) }; }
 function parseJson(value, fallback) { try { return JSON.parse(value); } catch { return fallback; } }
 function now() { return new Date().toISOString(); }
+function defaultProbeAlive(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return error.code !== "ESRCH"; }
+}
 
 export function serializePayload(payload, maxBytes = MAX_RUN_EVENT_PAYLOAD_BYTES) {
   const serialized = JSON.stringify(payload ?? null);

@@ -1,10 +1,75 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assertRuntimeRequest, runtimeAllowedHosts } from "./outright-runtime.mjs";
+import { Readable } from "node:stream";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { assertRuntimeRequest, createOutrightRuntime, runtimeAllowedHosts } from "./outright-runtime.mjs";
 
 function request(host, origin) {
   return { headers: { host, ...(origin ? { origin } : {}) } };
 }
+
+function requestStream(method, url, body) {
+  const stream = new Readable({ read() {} });
+  stream.method = method;
+  stream.url = url;
+  stream.headers = { host: "localhost:4173" };
+  if (body != null) stream.push(JSON.stringify(body));
+  stream.push(null);
+  return stream;
+}
+
+function responseCapture() {
+  return {
+    statusCode: null,
+    setHeader(key, value) { (this.headers ??= {})[key] = value; },
+    end(payload) { this.body = payload ? JSON.parse(payload) : null; },
+  };
+}
+
+function withRuntime(fn) {
+  return async () => {
+    const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-"));
+    process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+    const runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    try {
+      // The runtime wires its own database, manager, and event hub, so the
+      // recovery endpoint is exercised exactly as in production.
+      await fn(runtime);
+    } finally {
+      await runtime.shutdown();
+      delete process.env.OUTRIGHT_DATA_DIR;
+      rmSync(dataDirectory, { recursive: true, force: true });
+    }
+  };
+}
+
+test("reconciles runs at startup and resolves discard decisions through the API", withRuntime(async (runtime) => {
+  const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+  const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+  runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+  assert.equal(runtime.database.getRun(run.id).status, "interrupted");
+
+  const response = responseCapture();
+  assert.equal(await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), response), true);
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.status, "failed");
+  assert.equal(response.body.recoveryDecision, "discard");
+
+  const repeat = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), repeat);
+  assert.equal(repeat.statusCode, 409, "decisions are final");
+}));
+
+test("rejects a malformed recovery policy with 400", withRuntime(async (runtime) => {
+  const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+  const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+  runtime.database.reconcileInterruptedRuns();
+  const response = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "guess" }), response);
+  assert.equal(response.statusCode, 400);
+}));
 
 test("accepts loopback and same-origin runtime requests", () => {
   const allowedHosts = runtimeAllowedHosts({});

@@ -12,8 +12,8 @@ import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.m
 
 export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts() }) {
   const database = createOutrightDatabase();
-  const recoveredRuns = database.recoverInterruptedRuns();
-  if (recoveredRuns) database.audit("runtime.runs.recovered", { target: "runtime", count: recoveredRuns });
+  const reconciliation = database.reconcileInterruptedRuns();
+  if (reconciliation.count) database.audit("runtime.runs.reconciled", { target: "runtime", ...reconciliation });
   const eventHub = createRuntimeEventHub();
   const runtimeInstanceId = randomUUID();
   const wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024 });
@@ -207,6 +207,41 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       }
       const stopRunMatch = url.pathname.match(/^\/api\/runs\/([^/]+)\/stop$/);
       if (stopRunMatch && request.method === "POST") { const stopped = await agents.stop(stopRunMatch[1]); return json(response, stopped ? 202 : 404, { stopped }); }
+      const resumeRunMatch = url.pathname.match(/^\/api\/runs\/([^/]+)\/resume$/);
+      if (resumeRunMatch && request.method === "POST") {
+        const interrupted = database.getRun(resumeRunMatch[1]);
+        if (!interrupted) throw apiError(404, "Run not found");
+        if (interrupted.status !== "interrupted" || interrupted.recoveryDecision) throw apiError(409, "Run is not waiting for a recovery decision");
+        const body = await readJson(request);
+        const policy = body.policy;
+        if (!["discard", "resume-session", "retry"].includes(policy)) throw apiError(400, "Recovery policy must be discard, resume-session, or retry");
+        const conversation = database.getConversation(interrupted.conversationId);
+        if (!conversation) throw apiError(404, "Conversation not found");
+
+        if (policy === "discard") {
+          const resolved = database.resolveInterruptedRun(interrupted.id, policy);
+          database.audit("agent.run.recovery.discard", { target: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
+          publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: resolved });
+          return json(response, 200, resolved);
+        }
+
+        // Resumed and retried runs revalidate worktree identity and trust at
+        // submission, and again inside the agent drain before spawning.
+        const target = await resolveWorktreeTarget({ projectId: conversation.projectId, worktreeId: conversation.worktreeId, worktreePath: conversation.worktreePath });
+        if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
+        const providerInfo = agents.providers().find((item) => item.id === interrupted.provider);
+        if (!providerInfo?.available) throw apiError(409, `${interrupted.provider} CLI is not available`);
+        const sessionId = conversation.providerSessionId ?? interrupted.providerSessionId;
+        if (policy === "resume-session" && !sessionId) throw apiError(409, "No provider session is available to resume", { code: "NO_PROVIDER_SESSION" });
+        if (sessionId && conversation.providerSessionId !== sessionId) database.updateConversation(conversation.id, { providerSessionId: sessionId });
+
+        const resolved = database.resolveInterruptedRun(interrupted.id, policy);
+        if (!resolved) throw apiError(409, "Run is not waiting for a recovery decision");
+        const run = database.createRun({ conversationId: conversation.id, provider: interrupted.provider, model: interrupted.model, reasoningEffort: interrupted.reasoningEffort, approvalPolicy: interrupted.approvalPolicy, prompt: interrupted.prompt });
+        database.audit(`agent.run.recovery.${policy}`, { target: run.id, recoveredFrom: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
+        publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: resolved });
+        return json(response, 202, await agents.schedule({ conversation: database.getConversation(conversation.id), run, forceFreshSession: policy === "retry" }));
+      }
 
       if (url.pathname === "/api/trust" && request.method === "POST") {
         const body = await readJson(request);

@@ -29,16 +29,63 @@ test("persists settings, groups, conversations, messages, runs, and search", () 
   }
 });
 
-test("marks queued and running work as failed after a runtime restart", () => {
+test("reconciles queued and running work as interrupted after a runtime restart", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
     const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
     const queued = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "queued" });
     const running = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "running" });
-    database.updateRun(running.id, { status: "running" });
-    assert.equal(database.recoverInterruptedRuns(), 2);
-    assert.equal(database.getRun(queued.id).status, "failed");
-    assert.match(database.getRun(running.id).error, /restarted/);
+    database.updateRun(running.id, { status: "running", pid: 4242 });
+    const result = database.reconcileInterruptedRuns({ probeAlive: () => false });
+    assert.equal(result.count, 2);
+    assert.equal(result.counts["never-started"], 1);
+    assert.equal(result.counts.exited, 1);
+    assert.equal(database.getRun(queued.id).status, "interrupted");
+    assert.equal(database.getRun(running.id).recoveryClass, "exited");
+  } finally {
+    database.close();
+  }
+});
+
+test("classifies a provider process still alive after the restart", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "running" });
+    database.updateRun(run.id, { status: "running", pid: process.pid });
+    const result = database.reconcileInterruptedRuns();
+    assert.equal(result.counts.alive, 1);
+    assert.equal(database.getRun(run.id).recoveryClass, "alive");
+  } finally {
+    database.close();
+  }
+});
+
+test("a running row without a recorded pid reconciles as unknown", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "running" });
+    database.updateRun(run.id, { status: "running" });
+    database.reconcileInterruptedRuns();
+    assert.equal(database.getRun(run.id).recoveryClass, "unknown");
+  } finally {
+    database.close();
+  }
+});
+
+test("records a recovery decision exactly once", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "discarded" });
+    database.reconcileInterruptedRuns();
+    const discarded = database.resolveInterruptedRun(run.id, "discard");
+    assert.equal(discarded.status, "failed");
+    assert.match(discarded.error, /Discarded/);
+    assert.equal(discarded.recoveryDecision, "discard");
+    assert.equal(database.resolveInterruptedRun(run.id, "discard"), null, "the decision is final");
+    assert.equal(database.resolveInterruptedRun(run.id, "resume-session"), null);
   } finally {
     database.close();
   }

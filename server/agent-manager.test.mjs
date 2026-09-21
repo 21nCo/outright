@@ -119,6 +119,31 @@ test("persists ordered transcript items instead of one accumulated answer", asyn
   assert.deepEqual(database.messages.map((message) => message.kind), ["text", "tool", "text"]);
 });
 
+test("persists partial transcript output before the provider exits", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  database.createRun(codexRun("run-1"));
+  await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-1") });
+  child.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Partial answer" } }) + "\n");
+  // The run is still active, yet the completed segment is already durable.
+  assert.deepEqual(database.messages.map((message) => message.body), ["Partial answer"]);
+  assert.deepEqual(manager.activeRuns(), ["run-1"]);
+});
+
+test("records the provider pid while running and clears it at finish", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  child.pid = 4321;
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  database.createRun(codexRun("run-1"));
+  await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-1") });
+  assert.equal(database.getRun("run-1").pid, 4321);
+  child.emit("close", 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(database.getRun("run-1").pid, null);
+});
+
 test("stop signals the process tree and resolves after termination", async () => {
   const database = fakeDatabase();
   const child = fakeChild();
@@ -225,6 +250,21 @@ for (const action of ["stop", "shutdown"]) {
     assert.deepEqual(manager.activeRuns(), []);
   });
 }
+
+test("a recovery retry explicitly starts a fresh provider session", async () => {
+  const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", providerSessionId: "session-9" });
+  const spawnedArgs = [];
+  const child = fakeChild();
+  const manager = createAgentManager({
+    database, publish: () => {},
+    spawnProcess: (executable, args) => { spawnedArgs.push(args); return child; },
+  });
+  const run = database.createRun(codexRun("run-1"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run, forceFreshSession: true });
+  assert.deepEqual(spawnedArgs[0].slice(0, 2), ["exec", "--json"]);
+  assert.equal(spawnedArgs[0].includes("resume"), false);
+  child.emit("close", 0, null);
+});
 
 test("a termination timeout retains ownership and does not drain queued work", async () => {
   const database = fakeDatabase();
