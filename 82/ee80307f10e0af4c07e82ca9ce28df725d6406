@@ -1,0 +1,35 @@
+automation/hermes/retrieve-pr-review-fix.mjs
+  s_6126673cc0a89e::t_4b3bbab92ddf6c 4,7-8,14-35,80
+automation/hermes/pr-remediation-ledger.test.mjs
+  s_6126673cc0a89e::t_85f09c2e863272 1-69
+automation/hermes/reviewer.md
+  s_6126673cc0a89e::t_4b3bbab92ddf6c 23,26-28
+automation/hermes/README.md
+  s_6126673cc0a89e::t_4b3bbab92ddf6c 8-10
+automation/hermes/workflow.json
+  s_6126673cc0a89e::t_4b3bbab92ddf6c 50,59-63
+automation/hermes/implementer.md
+  s_6126673cc0a89e::t_4b3bbab92ddf6c 13,15,17
+automation/hermes/pr-fixer.md
+  s_6126673cc0a89e::t_4b3bbab92ddf6c 1-28
+automation/hermes/pr-remediation-ledger.mjs
+  s_6126673cc0a89e::t_85f09c2e863272 1-192
+automation/hermes/outright-linear-coordinator.mjs
+  s_6126673cc0a89e::t_4b3bbab92ddf6c 85-86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "82ee80307f10e0af4c07e82ca9ce28df725d6406",
+  "prompts": {},
+  "sessions": {
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
