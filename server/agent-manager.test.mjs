@@ -433,6 +433,9 @@ for (const action of ["stop", "shutdown"]) {
     let child;
     const manager = createAgentManager({
       database, publish: () => {}, terminationGraceMs: 150, terminationTimeoutMs: 5000,
+      // This injected process is deliberately not the Linux subreaper launch,
+      // so retain the generic process-group liveness and escalation contract.
+      launchCommand: (command) => ({ ...command, ownsDescendants: false }),
       spawnProcess: () => {
         const descendant = `process.on("SIGTERM", () => {}); process.send("ready"); setInterval(() => {}, 1000);`;
         const parent = `const {spawn} = require("node:child_process"); const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], {stdio:["ignore","ignore","ignore","ipc"]}); child.once("message", () => process.stdout.write("ready\\n")); setInterval(() => {}, 1000);`;
@@ -596,6 +599,19 @@ test("the launch wrapper records durable identity before authorization and clean
     assert.equal(code, 0);
     assert.equal(existsSync(marker2), true, "the authorized wrapper starts the provider");
     assert.equal(existsSync(handshakePath2), false, "the handshake record is cleaned up after completion");
+
+    // Pipe writes may be coalesced. A stop command arriving in the same chunk
+    // as authorization must still be consumed instead of being dropped by an
+    // early return after "go".
+    const handshakePath3 = path.join(launchDirectory, "launch-run-3.json");
+    const provider3 = `process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);`;
+    const child3 = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath3, process.execPath, "-e", provider3], { stdio: ["pipe", "ignore", "ignore"] });
+    children.push(child3);
+    const deadline3 = Date.now() + 10_000;
+    while (!existsSync(handshakePath3) && Date.now() < deadline3) await new Promise((resolve) => setTimeout(resolve, 10));
+    child3.stdin.write("go\nstop\n");
+    await withDeadline(new Promise((resolve) => child3.once("exit", resolve)), "coalesced authorization and stop", () => { try { child3.kill("SIGKILL"); } catch {} });
+    assert.equal(existsSync(handshakePath3), false, "the coalesced stop command tears down the authorized provider");
   } finally {
     for (const child of children) { try { child.kill("SIGKILL"); } catch { /* Already gone. */ } }
     rmSync(root, { recursive: true, force: true });
@@ -629,6 +645,18 @@ test("escalation targets the provider alone when its pid is durably recorded", (
     writeFileSync(handshakePath, JSON.stringify({ pid: 4242, authorized: true, providerPid: -1 }));
     assert.equal(escalateTree(child, handshakePath, "linux", null, kill), "group");
     assert.deepEqual(kills, [[-4242, "SIGKILL"]], "an unsafe provider pid falls back to the owned group, never kill(-1)");
+
+    for (const providerPid of [0, Number.MAX_SAFE_INTEGER + 1]) {
+      kills.length = 0;
+      writeFileSync(handshakePath, JSON.stringify({ pid: 4242, authorized: true, providerPid }));
+      assert.equal(escalateTree(child, handshakePath, "linux", null, kill), "group");
+      assert.deepEqual(kills, [[-4242, "SIGKILL"]], `provider pid ${providerPid} is never signaled directly`);
+    }
+
+    kills.length = 0;
+    writeFileSync(handshakePath, JSON.stringify({ pid: 9999, authorized: true, providerPid: 777 }));
+    assert.equal(escalateTree(child, handshakePath, "linux", null, kill), "group");
+    assert.deepEqual(kills, [[-4242, "SIGKILL"]], "a record for another supervisor cannot authorize a provider kill");
 
     kills.length = 0;
     assert.equal(escalateTree(child, path.join(root, "missing.json"), "linux", null, kill), "group");
@@ -731,19 +759,19 @@ test("wrapper teardown kills the provider and the wrapper reaps it", { skip: pro
 // SIGTERM-ignoring descendant must leave NO member in the wrapper's process
 // group — not even a killed-but-unreaped zombie, which would otherwise
 // accumulate one process-table entry per stop until PID exhaustion.
-// Reproduced faithfully in node:22-alpine with `sh` as PID 1 (no reaping):
-// the container runs the actual checked-in server module from this worktree,
+// Reproduced faithfully in node:22-bookworm with `sh` as PID 1 (no reaping):
+// the container compiles and runs the checked-in Linux subreaper supervisor,
 // the stop is issued only after the descendant has installed its signal
 // handler (ready marker), and the assertion scans /proc directly instead of
 // trusting the implementation's own liveness verdict.
-test("stop and shutdown leave no process-group members on a non-reaping PID 1", { skip: process.platform === "win32", timeout: 180000 }, async (t) => {
+test("stop and shutdown leave no provider-tree members on a non-reaping PID 1", { skip: process.platform === "win32", timeout: 180000 }, async (t) => {
   const docker = spawnSync("docker", ["info", "--format", "{{.ServerVersion}}"], { encoding: "utf8", timeout: 20000 });
   if (docker.status !== 0) return t.skip(`docker unavailable: ${(docker.stderr || "").trim()}`);
-  const descendant = "process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(process.env.READY, 'ready'); setInterval(() => {}, 1000);";
+  const descendant = "process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(process.env.READY, String(process.pid)); setInterval(() => {}, 1000);";
   const script = `
 import { pathToFileURL } from "node:url";
 const { spawn } = await import("node:child_process");
-const { existsSync, mkdtempSync, readFileSync, readdirSync } = await import("node:fs");
+const { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, writeFileSync } = await import("node:fs");
 const os = await import("node:os");
 const path = await import("node:path");
 const manager = await import(pathToFileURL("/app/server/agent-manager.mjs"));
@@ -753,12 +781,6 @@ const handshakeFor = (id) => path.join(root, \`\${id}.json\`);
 // handler and said so: stopping earlier could race past the leak entirely.
 // It arrives through the environment because the provider below evaluates
 // inside its own process, where driver-scope variables do not exist.
-const provider = [
-  "const { spawn } = require('node:child_process');",
-  "process.on('SIGTERM', () => {});",
-  "spawn(process.execPath, ['-e', process.env.DESCENDANT], { stdio: 'ignore', env: { ...process.env, READY: process.env.READY + '.' + process.pid } });",
-  "setInterval(() => {}, 1000);",
-].join(" ");
 const runs = new Map();
 const database = {
   getSettings: () => ({ maxConcurrentRuns: 8 }),
@@ -780,18 +802,22 @@ const agent = manager.createAgentManager({
   terminationGraceMs: 300,
   terminationTimeoutMs: 8000,
   launchDirectory: root,
-  // The container has no codex/claude CLI: wrap a real Node provider that
-  // ignores SIGTERM and spawns a SIGTERM-ignoring descendant, using the same
-  // crash-safe launch wrapper as production.
+  // The container has no codex/claude CLI: supervise a real Node provider that
+  // cannot service SIGCHLD while it spins, so descendants-first signaling
+  // alone would strand its killed child as a zombie after the provider dies.
   launchCommand: (_command, run, directory) => {
     const handshakePath = path.join(directory, \`\${run.id}.json\`);
-    return { executable: process.execPath, args: ["-e", manager.LAUNCH_WRAPPER_SOURCE, handshakePath, process.execPath, "-e", provider], handshakePath };
+    const provider = [
+      "const { spawn } = require('node:child_process');",
+      "process.on('SIGTERM', () => {});",
+      \`spawn(process.execPath, ['-e', process.env.DESCENDANT], { detached: true, stdio: 'ignore', env: { ...process.env, READY: process.env.READY + '.\${run.id}.' + process.pid } });\`,
+      "while (true) {}",
+    ].join(" ");
+    return manager.defaultLaunchCommand({ executable: process.execPath, args: ["-e", provider], display: "test provider" }, run, directory);
   },
-  spawnProcess: (_executable, args) => {
-    const child = spawn(process.execPath, args, { detached: true, stdio: ["pipe", "pipe", "pipe"] });
-    // The launch command's third argument is the handshake path, named after
-    // the run: recover the run id so waitForReady can find this child.
-    children.set(path.basename(args[2], ".json"), child);
+  spawnProcess: (executable, args) => {
+    const child = spawn(executable, args, { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+    children.set(path.basename(args[0], ".json"), child);
     return child;
   },
 });
@@ -811,13 +837,82 @@ const groupMembers = (pgid) => {
   }
   return members;
 };
+const processInfo = (pid) => {
+  try {
+    const stat = readFileSync(\`/proc/\${pid}/stat\`, "utf8");
+    const close = stat.lastIndexOf(")");
+    const fields = stat.slice(close + 2).split(" ");
+    return { pid, ppid: Number(fields[1]), state: fields[0] };
+  } catch { return null; }
+};
+const waitForExit = (child, label) => Promise.race([
+  new Promise((resolve) => child.once("close", (code, signal) => resolve({ code, signal }))),
+  new Promise((_, reject) => setTimeout(() => reject(new Error(label + " timed out")), 10000)),
+]);
+
+// The authorization record must commit before provider code can execute. Make
+// the rewrite fail after the initial unauthorized record and prove the child
+// blocked behind the private authorization pipe never reaches its marker.
+const failedRoot = path.join(root, "failed-authorization");
+const failedHandshake = path.join(failedRoot, "run.json");
+const failedMarker = path.join(root, "provider-must-not-run");
+const failed = spawn("/tmp/agent-supervisor", [failedHandshake, process.execPath, "-e", \`require('node:fs').writeFileSync(\${JSON.stringify(failedMarker)}, 'ran')\`], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+while (!existsSync(failedHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
+renameSync(failedRoot, failedRoot + "-moved");
+writeFileSync(failedRoot, "blocks directory recreation");
+failed.stdin.write("go\\n");
+const failedExit = await waitForExit(failed, "failed authorization");
+const authorizationSafe = failedExit.code === 75 && !existsSync(failedMarker) && groupMembers(failed.pid).length === 0;
+
+// The native command parser, like the JS fallback, must consume both commands
+// when a pipe write delivers go and stop in one chunk.
+const coalescedHandshake = path.join(root, "coalesced.json");
+const coalesced = spawn("/tmp/agent-supervisor", [coalescedHandshake, process.execPath, "-e", "process.on('SIGTERM', () => {}); while (true) {}"], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+while (!existsSync(coalescedHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
+coalesced.stdin.write("go\\nstop\\n");
+await waitForExit(coalesced, "coalesced native commands");
+const coalescedSafe = groupMembers(coalesced.pid).length === 0;
+
+// Provider stdin is data-plane input, not the supervisor control channel. A
+// provider that reads fd 0 must see EOF from /dev/null and cannot consume a
+// later stop command intended for the supervisor.
+const stdinHandshake = path.join(root, "stdin.json");
+const stdinMarker = path.join(root, "stdin-marker");
+const stdinProvider = \`const fs = require('node:fs'); fs.writeFileSync(\${JSON.stringify(stdinMarker)}, fs.readFileSync(0, 'utf8'));\`;
+const stdinChild = spawn("/tmp/agent-supervisor", [stdinHandshake, process.execPath, "-e", stdinProvider], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+while (!existsSync(stdinHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
+stdinChild.stdin.write("go\\n");
+const stdinExit = await waitForExit(stdinChild, "provider stdin isolation");
+const stdinSafe = stdinExit.code === 0 && readFileSync(stdinMarker, "utf8") === "" && groupMembers(stdinChild.pid).length === 0;
+
+// After a runtime crash closes the control pipe, an operator must still be
+// able to terminate the authorized supervisor with SIGTERM. It must retain
+// subreaper ownership until an escaped descendant is gone and reaped.
+const signalHandshake = path.join(root, "signal.json");
+const signalReady = path.join(root, "signal-ready");
+const signalProvider = [
+  "const { spawn } = require('node:child_process');",
+  "process.on('SIGTERM', () => {});",
+  \`spawn(process.execPath, ['-e', process.env.DESCENDANT], { detached: true, stdio: 'ignore', env: { ...process.env, READY: \${JSON.stringify(signalReady)} } });\`,
+  "while (true) {}",
+].join(" ");
+const signaled = spawn("/tmp/agent-supervisor", [signalHandshake, process.execPath, "-e", signalProvider], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+while (!existsSync(signalHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
+signaled.stdin.write("go\\n");
+while (!existsSync(signalReady)) await new Promise((resolve) => setTimeout(resolve, 10));
+const signalDescendantPid = Number(readFileSync(signalReady, "utf8"));
+signaled.stdin.end();
+process.kill(-signaled.pid, "SIGTERM");
+await waitForExit(signaled, "post-disconnect supervisor signal");
+const signalSafe = !existsSync(signalHandshake) && groupMembers(signaled.pid).length === 0 && processInfo(signalDescendantPid) == null;
+
 const waitForReady = async (runId) => {
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline) {
     let providerPid = null;
     try { providerPid = JSON.parse(readFileSync(handshakeFor(runId), "utf8")).providerPid; } catch {}
-    const ready = \`\${process.env.READY}.\${providerPid}\`;
-    if (providerPid && existsSync(ready)) return children.get(runId);
+    const ready = \`\${process.env.READY}.\${runId}.\${providerPid}\`;
+    if (providerPid && existsSync(ready)) return { child: children.get(runId), descendantPid: Number(readFileSync(ready, "utf8")) };
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("the provider/descendant pair never became signal-ready");
@@ -831,15 +926,19 @@ const outcome = {};
 try {
   const first = await schedule("stop-run");
   await agent.stop("stop-run");
-  outcome.membersAfterStop = groupMembers(first.pid);
+  outcome.membersAfterStop = groupMembers(first.child.pid);
+  outcome.descendantAfterStop = processInfo(first.descendantPid);
 } catch (error) { outcome.stopError = String(error && error.message); }
 try {
   const second = await schedule("shutdown-run");
   await agent.shutdown();
-  outcome.membersAfterShutdown = groupMembers(second.pid);
+  outcome.membersAfterShutdown = groupMembers(second.child.pid);
+  outcome.descendantAfterShutdown = processInfo(second.descendantPid);
 } catch (error) { outcome.shutdownError = String(error && error.message); }
-const clean = !outcome.stopError && !outcome.shutdownError && outcome.membersAfterStop.length === 0 && outcome.membersAfterShutdown.length === 0;
-console.log("RESULT " + JSON.stringify({ ...outcome, clean }));
+const clean = authorizationSafe && coalescedSafe && stdinSafe && signalSafe && !outcome.stopError && !outcome.shutdownError
+  && outcome.membersAfterStop.length === 0 && outcome.membersAfterShutdown.length === 0
+  && outcome.descendantAfterStop == null && outcome.descendantAfterShutdown == null;
+console.log("RESULT " + JSON.stringify({ authorizationSafe, coalescedSafe, stdinSafe, signalSafe, ...outcome, clean }));
 process.exit(clean ? 0 : 1);
 `;
   const repo = fileURLToPath(new URL("..", import.meta.url));
@@ -847,11 +946,12 @@ process.exit(clean ? 0 : 1);
     "run", "--rm", "-i",
     "-e", `DESCENDANT=${descendant}`,
     "-e", "READY=/tmp/descendant-ready",
+    "-e", "OUTRIGHT_AGENT_SUPERVISOR_PATH=/tmp/agent-supervisor",
     "-v", `${repo}:/app:ro`,
-    "node:22-alpine",
+    "node:22-bookworm",
     // `sh` as PID 1: it does not reap orphaned grandchildren, which is the
     // production condition this regression must survive.
-    "sh", "-c", "node --input-type=module -",
+    "sh", "-c", "OUTRIGHT_AGENT_SUPERVISOR_OUTPUT=/tmp/agent-supervisor node /app/scripts/build-agent-supervisor.mjs && node --input-type=module -",
   ], { input: script, encoding: "utf8", timeout: 150000, maxBuffer: 16 * 1024 * 1024 });
   const line = (result.stdout || "").split("\n").find((entry) => entry.startsWith("RESULT ")) ?? "";
   // `docker info` can succeed while `docker run` still cannot reach the
@@ -863,9 +963,15 @@ process.exit(clean ? 0 : 1);
     assert.fail(`container run produced no result: exit=${result.status} stdout=${(result.stdout || "").slice(-2000)} stderr=${(result.stderr || "").slice(-2000)}`);
   }
   const payload = JSON.parse(line.slice("RESULT ".length));
+  assert.equal(payload.authorizationSafe, true, "a failed authorized-handshake write must not release provider execution");
+  assert.equal(payload.coalescedSafe, true, "coalesced native go/stop commands must tear down the provider");
+  assert.equal(payload.stdinSafe, true, "provider stdin must be isolated from the supervisor control pipe");
+  assert.equal(payload.signalSafe, true, "SIGTERM after a runtime disconnect must reap the complete provider tree");
   assert.equal(payload.stopError, undefined, `stop did not resolve: ${payload.stopError}`);
   assert.equal(payload.shutdownError, undefined, `shutdown did not resolve: ${payload.shutdownError}`);
   assert.deepEqual(payload.membersAfterStop, [], `the process group still has members after stop: ${JSON.stringify(payload.membersAfterStop)}`);
   assert.deepEqual(payload.membersAfterShutdown, [], `the process group still has members after shutdown: ${JSON.stringify(payload.membersAfterShutdown)}`);
+  assert.equal(payload.descendantAfterStop, null, `a detached descendant survived stop: ${JSON.stringify(payload.descendantAfterStop)}`);
+  assert.equal(payload.descendantAfterShutdown, null, `a detached descendant survived shutdown: ${JSON.stringify(payload.descendantAfterShutdown)}`);
   assert.equal(payload.clean, true);
 });

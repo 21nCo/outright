@@ -3,7 +3,8 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
-    "postinstall": "node scripts/fix-node-pty-permissions.mjs",
+    "postinstall": "node scripts/fix-node-pty-permissions.mjs && node scripts/build-agent-supervisor.mjs",
+    "prebuild": "node scripts/build-agent-supervisor.mjs",
     "dev": "vite",
     "build": "vite build && node scripts/prepare-sites-build.mjs",
     "start": "node server/standalone.mjs",

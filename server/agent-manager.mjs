@@ -1,7 +1,8 @@
 import { spawn, spawnSync } from "node:child_process";
-import { readdirSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const MAX_PROVIDER_LINE_BYTES = 1024 * 1024;
 const MAX_ASSISTANT_BYTES = 1024 * 1024;
@@ -14,6 +15,8 @@ const ASSISTANT_TRUNCATION_MARKER = "\n\n[Output truncated by Outright at 1 MiB]
 // instead of once per token, while crash exposure stays bounded.
 const CHECKPOINT_MIN_BYTES = 4 * 1024;
 const CHECKPOINT_INTERVAL_MS = 500;
+const LINUX_AGENT_SUPERVISOR = process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH
+  || fileURLToPath(new URL("./bin/agent-supervisor", import.meta.url));
 
 // Crash-safe launch handshake. The provider is never spawned directly: this
 // tiny wrapper records its own process identity durably, then waits for the
@@ -98,39 +101,47 @@ const teardown = () => {
   sweep();
 };
 process.stdin.setEncoding("utf8");
+let commandBuffer = "";
 process.stdin.on("data", (chunk) => {
-  const text = String(chunk);
-  if (!authorized) {
-    if (!text.includes("go")) return;
-    authorized = true;
-    const { spawn } = require("node:child_process");
-    provider = spawn(executable, commandArgs, { stdio: ["ignore", "inherit", "inherit"] });
-    // Durable provider identity: escalation targets the provider alone so this
-    // wrapper — the provider's parent — survives to reap it. Without this, a
-    // group-wide SIGKILL kills the wrapper first and a killed-but-unreaped
-    // provider lingers as a zombie in its process group on hosts whose PID 1
-    // does not reap orphans.
-    try { fs.writeFileSync(handshakePath, JSON.stringify({ pid: process.pid, authorized: true, providerPid: provider.pid, createdAt: new Date().toISOString() })); } catch { /* The record was swept; nothing needs escalation identity. */ }
-    const finish = (code) => { try { fs.unlinkSync(handshakePath); } catch {} process.exit(code); };
-    provider.on("error", (error) => { console.error(String((error && error.message) || error)); finish(127); });
-    provider.on("close", (code, signal) => {
-      providerGone = true;
-      try { fs.unlinkSync(handshakePath); } catch {}
-      if (signal) {
-        // Re-raise the provider's termination signal so the runtime reports
-        // the accurate "stopped by signal" cause instead of a generic 137 —
-        // except SIGUSR1, which Node reserves for its debugger: re-raising it
-        // would start the inspector instead of terminating this wrapper.
-        process.removeAllListeners("SIGTERM");
-        process.removeAllListeners("SIGINT");
-        if (signal === "SIGUSR1") process.exit(137);
-        try { process.kill(process.pid, signal); }
-        catch { process.exit(137); }
-      } else process.exit(code ?? 0);
-    });
-    return;
+  commandBuffer += String(chunk);
+  const commands = commandBuffer.split("\\n");
+  commandBuffer = commands.pop() ?? "";
+  for (const rawCommand of commands) {
+    const command = rawCommand.trim();
+    if (!authorized && command === "go") {
+      authorized = true;
+      const { spawn } = require("node:child_process");
+      provider = spawn(executable, commandArgs, { stdio: ["ignore", "inherit", "inherit"] });
+      // Durable provider identity: escalation targets the provider alone so this
+      // wrapper — the provider's parent — survives to reap it. Without this, a
+      // group-wide SIGKILL kills the wrapper first and a killed-but-unreaped
+      // provider lingers as a zombie in its process group on hosts whose PID 1
+      // does not reap orphans.
+      try { fs.writeFileSync(handshakePath, JSON.stringify({ pid: process.pid, authorized: true, providerPid: provider.pid, createdAt: new Date().toISOString() })); } catch { /* The record was swept; nothing needs escalation identity. */ }
+      const finish = (code) => { try { fs.unlinkSync(handshakePath); } catch {} process.exit(code); };
+      provider.on("error", (error) => { console.error(String((error && error.message) || error)); finish(127); });
+      provider.on("close", (code, signal) => {
+        providerGone = true;
+        try { fs.unlinkSync(handshakePath); } catch {}
+        if (signal) {
+          // Re-raise the provider's termination signal so the runtime reports
+          // the accurate "stopped by signal" cause instead of a generic 137 —
+          // except SIGUSR1, which Node reserves for its debugger: re-raising it
+          // would start the inspector instead of terminating this wrapper.
+          process.removeAllListeners("SIGTERM");
+          process.removeAllListeners("SIGINT");
+          if (signal === "SIGUSR1") process.exit(137);
+          try { process.kill(process.pid, signal); }
+          catch { process.exit(137); }
+        } else process.exit(code ?? 0);
+      });
+      continue;
+    }
+    if (command === "stop") {
+      if (!authorized) abandon();
+      teardown();
+    }
   }
-  if (text.includes("stop")) teardown();
 });
 // The runtime went away before authorizing the launch: exit without ever
 // starting the provider, so an abandoned handshake can never mutate the
@@ -140,6 +151,18 @@ process.stdin.on("end", () => { if (!authorized) { try { fs.unlinkSync(handshake
 
 export function defaultLaunchCommand(command, run, launchDirectory) {
   const handshakePath = path.join(launchDirectory, `${run.id}.json`);
+  if (process.platform === "linux") {
+    if (!existsSync(LINUX_AGENT_SUPERVISOR)) {
+      throw new Error("Linux agent supervision is unavailable; run npm install to build server/bin/agent-supervisor");
+    }
+    return {
+      executable: LINUX_AGENT_SUPERVISOR,
+      args: [handshakePath, command.executable, ...command.args],
+      display: command.display,
+      handshakePath,
+      ownsDescendants: true,
+    };
+  }
   return {
     executable: process.execPath,
     args: ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, command.executable, ...command.args],
@@ -198,6 +221,7 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     });
     state.child = child;
     state.launchHandshakePath = launch.handshakePath;
+    state.ownsDescendants = Boolean(launch.ownsDescendants);
     // Phase 2: durable process ownership BEFORE the provider is authorized.
     // If the runtime dies before this commit, the wrapper's handshake file
     // still carries the pid and the row is provably unauthorized.
@@ -316,22 +340,24 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
         let teardownRequested = false;
         let escalated = false;
         let groupEscalated = false;
-        while (!state.closed || processGroupAlive(state.child)) {
+        while (state.ownsDescendants
+          ? !state.closed || Boolean(state.launchHandshakePath && existsSync(state.launchHandshakePath))
+          : !state.closed || processGroupAlive(state.child)) {
           const elapsed = Date.now() - started;
           if (!teardownRequested && elapsed >= terminationGraceMs) {
-            // Ordered wrapper teardown first: the wrapper SIGKILLs the
-            // provider's descendants while their parent still lives to reap
-            // them, then kills and reaps the provider itself. Any other order
-            // leaks zombies on hosts whose PID 1 does not reap orphans.
+            // The platform supervisor owns teardown. Linux adopts escaped
+            // descendants as a subreaper and does not remove its handshake
+            // until the whole tree is gone; the non-Linux wrapper uses its
+            // ordered descendant/provider fallback.
             requestWrapperTeardown(state);
             teardownRequested = true;
-          } else if (teardownRequested && !escalated && elapsed >= terminationGraceMs + escalationGraceMs) {
+          } else if (!state.ownsDescendants && teardownRequested && !escalated && elapsed >= terminationGraceMs + escalationGraceMs) {
             // The wrapper never managed (or was never the launch wrapper):
             // fall back to killing the provider alone, so the wrapper — if
             // alive — still reaps it.
             escalateTree(state.child, state.launchHandshakePath);
             escalated = true;
-          } else if (escalated && !groupEscalated && elapsed >= terminationGraceMs + 2 * escalationGraceMs) {
+          } else if (!state.ownsDescendants && escalated && !groupEscalated && elapsed >= terminationGraceMs + 2 * escalationGraceMs) {
             // Last resort: the wrapper had its chance to reap; anything still
             // executing in the group is killed outright. Liveness below
             // recognizes the resulting non-executing zombie members as gone.
@@ -353,9 +379,9 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
   }
 
   // Asks the launch wrapper to tear its provider tree down in reaping order
-  // (descendants first, provider last; the wrapper reaps each). Writing to a
-  // non-wrapper child (an injected spawnProcess) is harmless — the command is
-  // ignored and the escalation fallbacks in stop() still apply.
+  // and retain ownership until cleanup is proven. Writing to a non-wrapper
+  // child (an injected spawnProcess) is harmless — the command is ignored and
+  // the escalation fallbacks in stop() still apply.
   function requestWrapperTeardown(state) {
     try { state.child?.stdin?.write?.("stop\n"); } catch { /* The wrapper already exited. */ }
   }
@@ -522,7 +548,7 @@ export function escalateTree(child, handshakePath, platform = process.platform, 
     // "SIGKILL") would terminate every process the runtime user owns. Only a
     // safe positive pid is usable; anything else falls back to the owned
     // process group.
-    if (Number.isSafeInteger(recorded) && recorded > 0) providerPid = recorded;
+    if (record?.authorized === true && Number(record?.pid) === child.pid && Number.isSafeInteger(recorded) && recorded > 0) providerPid = recorded;
   } catch { /* No (or unreadable) handshake record. */ }
   if (providerPid) {
     try {
