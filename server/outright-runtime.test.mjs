@@ -142,28 +142,69 @@ test("re-probes the process group of an exited-classified run before recovery", 
 
 // Regression (platform-injectable): on platforms without owned process trees
 // (Windows), a gone leader with a possibly live descendant cannot be verified
-// terminated. Resume/retry must stay blocked (no replacement work scheduled)
-// while discard — which launches nothing — remains available.
+// terminated. Every policy — including discard, whose recording would clear
+// the submission gate and admit a new run while the original descendants may
+// still mutate the worktree — stays blocked until the tree is verifiably
+// terminated.
 test("blocks replacement work when the process tree cannot be verified", withRuntime(async (runtime) => {
   const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
   const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
   runtime.database.updateRun(run.id, { status: "running", pid: 424242 });
   runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
 
-  for (const policy of ["resume-session", "retry"]) {
+  for (const policy of ["resume-session", "retry", "discard"]) {
     const blocked = responseCapture();
     await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy }), blocked);
     assert.equal(blocked.statusCode, 409);
     assert.equal(blocked.body.code, "RECOVERY_PROCESS_UNKNOWN");
     assert.equal(runtime.database.getRun(run.id).recoveryDecision, null);
+    assert.equal(runtime.database.getRun(run.id).status, "interrupted");
     assert.deepEqual(runtime.database.listRuns(conversation.id).filter((candidate) => candidate.status === "queued"), [], "no replacement run may be scheduled");
   }
+}, { recoveryProcessAlive: () => "unknown" }));
 
+// Regression (end-to-end, platform-injectable): the round-5 bypass — a
+// recorded discard clears the recovery gate, so a normal submission could
+// start a second provider while the original, unverifiable process tree may
+// still be mutating the same worktree. While the tree is unknown, discard
+// must be rejected and new submissions must stay blocked; only once the tree
+// is verifiably terminated may the discard clear the gate.
+test("a discard on an unknown process tree cannot be followed by a newly scheduled run", (() => {
+  let treeVerdict = "unknown";
+  return withRuntime(async (runtime) => {
+  const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+  const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+  runtime.database.updateRun(run.id, { status: "running", pid: 424242 });
+  runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+
+  // Tree still unverifiable: discard is rejected outright.
+  const discardBlocked = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), discardBlocked);
+  assert.equal(discardBlocked.statusCode, 409);
+  assert.equal(discardBlocked.body.code, "RECOVERY_PROCESS_UNKNOWN");
+
+  // The bypass: even a successful-looking discard could not clear the gate,
+  // but the rejected one must leave ordinary submissions blocked.
+  const submission = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "start fresh while the tree is unknown" }), submission);
+  assert.equal(submission.statusCode, 409);
+  assert.equal(submission.body.code, "RUN_RECOVERY_REQUIRED");
+  assert.equal(submission.body.runId, run.id);
+  assert.deepEqual(runtime.database.listRuns(conversation.id).filter((candidate) => candidate.status === "queued"), [], "no new run may be scheduled while the tree is unknown");
+
+  // Once the tree verifiably terminated, discard succeeds and only then
+  // does the submission gate open again.
+  treeVerdict = "exited";
   const discarded = responseCapture();
   await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), discarded);
   assert.equal(discarded.statusCode, 200);
   assert.equal(runtime.database.getRun(run.id).status, "failed");
-}, { recoveryProcessAlive: () => "unknown" }));
+
+  const reopened = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "start fresh after verified termination" }), reopened);
+  assert.notEqual(reopened.body?.code, "RUN_RECOVERY_REQUIRED", "the recovery gate must open only after the discard on a verified-exited tree");
+  }, { recoveryProcessAlive: () => treeVerdict });
+})());
 
 test("the default recovery probe is conservative per platform", async () => {
   const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore", detached: process.platform !== "win32" });

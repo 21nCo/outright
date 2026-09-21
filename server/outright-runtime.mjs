@@ -224,23 +224,24 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         // applied, regardless of the restart-time classification: a detached
         // leader can exit while provider descendants still hold the process
         // group and mutate the worktree. Only a verified-exited (or never
-        // started) run may continue. A verifiably live process blocks every
+        // started) run may be resolved. A verifiably live process blocks every
         // policy; an unverifiable tree (e.g. on Windows, where the spawned
-        // tree is not owned and a gone leader proves nothing) blocks
-        // continuation, while discard — which launches no replacement work —
-        // stays available.
+        // tree is not owned and a gone leader proves nothing) blocks every
+        // policy too — including discard, because a recorded discard would
+        // clear the submission gate and let a new run start while the
+        // original descendants may still mutate the same worktree.
         if (interrupted.recoveryClass !== "never-started") {
           if (Number.isSafeInteger(interrupted.pid) && interrupted.pid > 0) {
             const verdict = recoveryVerdict(await recoveryProcessAlive(interrupted.pid));
             if (verdict === "alive") {
               throw apiError(409, "The recovered provider process is still active; stop it before choosing a recovery policy", { code: "RECOVERY_PROCESS_ACTIVE", pid: interrupted.pid });
             }
-            if (verdict !== "exited" && policy !== "discard") {
-              throw apiError(409, "The recovered provider process cannot be verified", { code: "RECOVERY_PROCESS_UNKNOWN", pid: interrupted.pid });
+            if (verdict !== "exited") {
+              throw apiError(409, "The recovered provider process cannot be verified, so no recovery decision can be recorded yet", { code: "RECOVERY_PROCESS_UNKNOWN", pid: interrupted.pid });
             }
-            if (verdict === "exited") interrupted = database.updateRun(interrupted.id, { recoveryClass: "exited", pid: null });
-          } else if (policy !== "discard") {
-            throw apiError(409, "The recovered provider process cannot be verified", { code: "RECOVERY_PROCESS_UNKNOWN" });
+            interrupted = database.updateRun(interrupted.id, { recoveryClass: "exited", pid: null });
+          } else {
+            throw apiError(409, "The recovered provider process cannot be verified, so no recovery decision can be recorded yet", { code: "RECOVERY_PROCESS_UNKNOWN" });
           }
         }
 
