@@ -112,15 +112,8 @@ function createCard(issue) {
     "4h",
     "--max-retries",
     "2",
-    "--model",
-    config.models.implementer.id,
-    "--provider",
-    config.models.implementer.provider,
     "--completion-contract",
     config.repository,
-    "--goal",
-    "--goal-max-turns",
-    "30",
     "--json"
   ]);
 }
