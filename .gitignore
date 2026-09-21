@@ -3,6 +3,7 @@ dist/
 .DS_Store
 *.log
 .outright/
+.worktrees/
 *.db
 *.db-shm
 *.db-wal
