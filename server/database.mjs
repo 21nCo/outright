@@ -155,6 +155,15 @@ export function createOutrightDatabase(options = {}) {
       db.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?").run(message.createdAt, message.conversationId);
       return message;
     },
+    upsertMessage(input) {
+      const message = { id: input.id ?? randomUUID(), createdAt: input.createdAt ?? now(), ...input };
+      db.prepare(`INSERT INTO messages (id, conversation_id, role, kind, body, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET role = excluded.role, kind = excluded.kind, body = excluded.body, payload = excluded.payload`)
+        .run(message.id, message.conversationId, message.role, message.kind ?? "text", message.body ?? "", JSON.stringify(message.payload ?? null), message.createdAt);
+      db.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?").run(message.createdAt, message.conversationId);
+      return hydratePayload(db.prepare(`SELECT id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+        FROM messages WHERE id = ?`).get(message.id));
+    },
     createRun(input) {
       const run = { id: randomUUID(), status: "queued", createdAt: now(), ...input };
       db.prepare(`INSERT INTO runs (id, conversation_id, provider, model, reasoning_effort, approval_policy, prompt, status, created_at)
@@ -174,6 +183,13 @@ export function createOutrightDatabase(options = {}) {
         prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
         finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
         output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision FROM runs WHERE conversation_id = ? ORDER BY created_at DESC LIMIT ?`).all(conversationId, boundedLimit);
+    },
+    findUnresolvedInterruptedRun(conversationId) {
+      return db.prepare(`SELECT id, conversation_id AS conversationId, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
+        prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
+        finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
+        output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision
+        FROM runs WHERE conversation_id = ? AND status = 'interrupted' AND recovery_decision IS NULL ORDER BY created_at LIMIT 1`).get(conversationId);
     },
     // Crash-consistent restart reconciliation: queued/running rows belong to a
     // dead runtime, so none of them can ever finish under this process. Mark
@@ -208,10 +224,37 @@ export function createOutrightDatabase(options = {}) {
       const error = decision === "discard" ? "Discarded after restart recovery review" : null;
       const stamp = now();
       const resolve = db.transaction(() => {
-        db.prepare("UPDATE runs SET recovery_decision = ?, status = ?, error = ?, finished_at = ? WHERE id = ?").run(decision, status, error, stamp, id);
+        const result = db.prepare("UPDATE runs SET recovery_decision = ?, status = ?, error = ?, finished_at = ? WHERE id = ? AND status = 'interrupted' AND recovery_decision IS NULL")
+          .run(decision, status, error, stamp, id);
+        if (!result.changes) return false;
+        return true;
       });
-      resolve();
+      if (!resolve()) return null;
       return this.getRun(id);
+    },
+    beginInterruptedRunRecovery(id, decision, { providerSessionId } = {}) {
+      if (!["resume-session", "retry"].includes(decision)) return null;
+      const recover = db.transaction(() => {
+        const interrupted = this.getRun(id);
+        if (!interrupted || interrupted.status !== "interrupted" || interrupted.recoveryDecision) return null;
+        const result = db.prepare("UPDATE runs SET recovery_decision = ?, finished_at = ? WHERE id = ? AND status = 'interrupted' AND recovery_decision IS NULL")
+          .run(decision, now(), id);
+        if (!result.changes) return null;
+        if (decision === "retry") this.updateConversation(interrupted.conversationId, { providerSessionId: null });
+        else if (providerSessionId && this.getConversation(interrupted.conversationId)?.providerSessionId !== providerSessionId) {
+          this.updateConversation(interrupted.conversationId, { providerSessionId });
+        }
+        const run = this.createRun({
+          conversationId: interrupted.conversationId,
+          provider: interrupted.provider,
+          model: interrupted.model,
+          reasoningEffort: interrupted.reasoningEffort,
+          approvalPolicy: interrupted.approvalPolicy,
+          prompt: interrupted.prompt,
+        });
+        return { interrupted: this.getRun(id), run, conversation: this.getConversation(interrupted.conversationId) };
+      });
+      return recover();
     },
     updateRun(id, patch) {
       const fields = [];
@@ -222,6 +265,14 @@ export function createOutrightDatabase(options = {}) {
       }
       if (fields.length) db.prepare(`UPDATE runs SET ${fields.join(", ")} WHERE id = ?`).run(...values, id);
       return this.getRun(id);
+    },
+    finishRun(id, patch, transcriptMessage = null) {
+      const finish = db.transaction(() => {
+        const message = transcriptMessage ? this.upsertMessage(transcriptMessage) : null;
+        const run = this.updateRun(id, patch);
+        return { run, message };
+      });
+      return finish();
     },
     appendRunEvent(runId, type, payload) {
       const seq = db.prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM run_events WHERE run_id = ?").get(runId).seq;

@@ -86,20 +86,22 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
         database.updateRun(state.run.id, { providerSessionId: event.payload.sessionId });
         database.updateConversation(state.conversation.id, { providerSessionId: event.payload.sessionId });
       }
-      // Completed segments are persisted at their archive boundary so the
-      // transcript on disk mirrors arrival order even if the runtime crashes.
-      if (event.type === "assistant.delta") appendAssistantText(state, event.payload.text, emit);
+      if (event.type === "assistant.delta") {
+        appendAssistantText(state, event.payload.text, emit);
+        persistAssistantCheckpoint(state);
+      }
       if (event.type === "assistant.message") {
         const text = event.payload.text ?? "";
-        if (!state.assistantText || !text.startsWith(state.assistantText)) {
+        if (state.assistantText && !text.startsWith(state.assistantText)) {
           // A completed message that does not extend the accumulated deltas
           // starts a new segment; archive the prior one first.
-          archiveAssistant(state, persistTranscriptItem);
-          replaceAssistantText(state, text, emit);
+          archiveAssistant(state, persistAssistantCheckpoint);
         }
-        archiveAssistant(state, persistTranscriptItem);
+        replaceAssistantText(state, text, emit);
+        archiveAssistant(state, persistAssistantCheckpoint);
       }
       if (["tool.started", "tool.completed"].includes(event.type)) {
+        archiveAssistant(state, persistAssistantCheckpoint);
         persistTranscriptItem(state, { kind: "tool", body: toolTranscriptLabel(event), payload: { item: event.payload.item ?? null } });
       }
       if (event.type === "usage") database.updateRun(state.run.id, event.payload);
@@ -111,17 +113,19 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
   }
 
   function finish(state, exitCode, error) {
-    if (!active.has(state.run.id)) return;
-    active.delete(state.run.id);
+    if (!active.has(state.run.id) || state.finishing) return;
+    state.finishing = true;
     const successful = exitCode === 0 && !error && !state.stopped;
     const status = state.stopped ? "stopped" : successful ? "completed" : "failed";
     const message = error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : "");
     const finishedAt = new Date().toISOString();
-    // Clear the pid: the row no longer names a supervised process, so restart
-    // reconciliation will not misread it as live or exited.
-    database.updateRun(state.run.id, { status, finishedAt, exitCode, error: message || null, pid: null });
-    // Flush the pending assistant segment; prior segments already hit disk.
-    archiveAssistant(state, persistTranscriptItem);
+    const transcriptMessage = pendingAssistantMessage(state);
+    // The last transcript checkpoint and terminal run state commit together.
+    // A crash can therefore leave the run recoverable, but never terminal with
+    // its final assistant segment missing.
+    const finished = database.finishRun(state.run.id, { status, finishedAt, exitCode, error: message || null, pid: null }, transcriptMessage);
+    active.delete(state.run.id);
+    clearAssistant(state);
     database.audit(`agent.run.${status}`, { target: state.run.id, exitCode, error: message || undefined });
     emit(state.run.id, `run.${status}`, { exitCode, error: message || null, finishedAt });
     drain();
@@ -173,7 +177,7 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       const index = queue.findIndex((entry) => ![...active.values()].some((state) => state.conversation.id === entry.run.conversationId));
       if (index < 0) return;
       const entry = queue.splice(index, 1)[0];
-      const state = { ...entry, assistantText: "", assistantTruncated: false, transcriptSeq: 0, stderr: "", stopped: false };
+      const state = { ...entry, assistantText: "", assistantTruncated: false, assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, stderr: "", stopped: false };
       active.set(entry.run.id, state);
       state.launch = entry.launch = (async () => {
         try {
@@ -198,10 +202,9 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     }
   }
 
-  // Persists one ordered transcript item immediately. Writes are bounded
-  // because assistant bodies already passed the 1 MiB truncation bound and
-  // tool payloads passed the serialized run-event bound; the deterministic id
-  // keeps the write idempotent within this run.
+  // Persists one completed ordered transcript item immediately. Assistant
+  // streams use a stable checkpoint id below so repeated delta writes update
+  // one message rather than duplicating partial content.
   function persistTranscriptItem(state, item) {
     state.transcriptSeq = (state.transcriptSeq ?? 0) + 1;
     const payload = item.kind === "text"
@@ -209,6 +212,12 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       : { runId: state.run.id, item: item.payload?.item ?? null };
     const message = database.addMessage({ id: `${state.run.id}:${state.transcriptSeq}`, conversationId: state.conversation.id, role: "assistant", kind: item.kind, body: item.body, payload });
     publish({ type: "message.created", conversationId: state.conversation.id, payload: message });
+  }
+
+  function persistAssistantCheckpoint(state) {
+    const message = pendingAssistantMessage(state);
+    if (!message) return null;
+    return database.upsertMessage(message);
   }
 
   function emit(runId, type, payload) {
@@ -308,10 +317,34 @@ function replaceAssistantText(state, text, emit) {
 }
 
 function archiveAssistant(state, persist) {
+  persist(state);
+  clearAssistant(state);
+}
+
+function pendingAssistantMessage(state) {
   const body = state.assistantText.trim();
-  if (body) persist(state, { kind: "text", body: `${body}${state.assistantTruncated ? ASSISTANT_TRUNCATION_MARKER : ""}`, payload: { truncated: state.assistantTruncated } });
+  if (!body) return null;
+  if (!state.assistantMessageId) {
+    state.transcriptSeq = (state.transcriptSeq ?? 0) + 1;
+    state.assistantMessageId = `${state.run.id}:${state.transcriptSeq}`;
+    state.assistantCreatedAt = new Date().toISOString();
+  }
+  return {
+    id: state.assistantMessageId,
+    createdAt: state.assistantCreatedAt,
+    conversationId: state.conversation.id,
+    role: "assistant",
+    kind: "text",
+    body: `${body}${state.assistantTruncated ? ASSISTANT_TRUNCATION_MARKER : ""}`,
+    payload: { runId: state.run.id, provider: state.run.provider, truncated: state.assistantTruncated },
+  };
+}
+
+function clearAssistant(state) {
   state.assistantText = "";
   state.assistantTruncated = false;
+  state.assistantMessageId = null;
+  state.assistantCreatedAt = null;
 }
 
 function markAssistantTruncated(state, truncated, emit) {

@@ -91,6 +91,45 @@ test("records a recovery decision exactly once", () => {
   }
 });
 
+test("recovery retry durably clears the provider session before the replacement run starts", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    database.updateConversation(conversation.id, { providerSessionId: "session-old" });
+    const interrupted = database.createRun({ conversationId: conversation.id, provider: "codex", model: "gpt", reasoningEffort: "high", approvalPolicy: "read-only", prompt: "retry me" });
+    database.updateRun(interrupted.id, { status: "running", providerSessionId: "session-old", pid: 4242 });
+    database.reconcileInterruptedRuns({ probeAlive: () => false });
+
+    const recovery = database.beginInterruptedRunRecovery(interrupted.id, "retry");
+    assert.equal(recovery.interrupted.recoveryDecision, "retry");
+    assert.equal(recovery.conversation.providerSessionId, null);
+    assert.equal(database.getConversation(conversation.id).providerSessionId, null);
+    assert.equal(recovery.run.status, "queued");
+    assert.equal(recovery.run.prompt, "retry me");
+    assert.equal(database.beginInterruptedRunRecovery(interrupted.id, "retry"), null, "recovery is idempotent");
+  } finally {
+    database.close();
+  }
+});
+
+test("upserts partial transcript checkpoints and commits the final checkpoint with run state", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "claude" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "claude", approvalPolicy: "read-only", prompt: "stream" });
+    const base = { id: `${run.id}:1`, conversationId: conversation.id, role: "assistant", kind: "text", createdAt: "2026-09-21T00:00:00.000Z", payload: { runId: run.id, provider: "claude" } };
+    database.upsertMessage({ ...base, body: "Partial" });
+    database.upsertMessage({ ...base, body: "Partial answer" });
+    assert.deepEqual(database.listMessages(conversation.id).map((message) => message.body), ["Partial answer"]);
+
+    database.finishRun(run.id, { status: "completed", finishedAt: "2026-09-21T00:00:01.000Z", exitCode: 0, pid: null }, { ...base, body: "Partial answer complete" });
+    assert.equal(database.getRun(run.id).status, "completed");
+    assert.deepEqual(database.listMessages(conversation.id).map((message) => message.body), ["Partial answer complete"]);
+  } finally {
+    database.close();
+  }
+});
+
 test("tracks trust and audit records", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

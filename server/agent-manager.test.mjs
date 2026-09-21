@@ -18,10 +18,12 @@ function fakeChild() {
 
 function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/project" }) {
   const messages = [];
+  const finishes = [];
   const runs = new Map();
   const conversations = new Map([[initialConversation.id, initialConversation]]);
   return {
     messages,
+    finishes,
     runs,
     getSettings: () => ({ maxConcurrentRuns: 8 }),
     getConversation: (id) => conversations.get(id),
@@ -30,6 +32,23 @@ function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/
     createRun: (run) => { runs.set(run.id, run); return run; },
     updateRun: (id, patch) => { runs.set(id, { ...runs.get(id), ...patch }); return runs.get(id); },
     addMessage: (input) => { messages.push(input); return input; },
+    upsertMessage: (input) => {
+      const index = messages.findIndex((message) => message.id === input.id);
+      if (index >= 0) messages[index] = { ...messages[index], ...input };
+      else messages.push(input);
+      return messages[index >= 0 ? index : messages.length - 1];
+    },
+    finishRun: (id, patch, transcriptMessage) => {
+      const message = transcriptMessage ? (() => {
+        const index = messages.findIndex((item) => item.id === transcriptMessage.id);
+        if (index >= 0) messages[index] = { ...messages[index], ...transcriptMessage };
+        else messages.push(transcriptMessage);
+        return messages[index >= 0 ? index : messages.length - 1];
+      })() : null;
+      runs.set(id, { ...runs.get(id), ...patch });
+      finishes.push({ id, patch, transcriptMessage });
+      return { run: runs.get(id), message };
+    },
     appendRunEvent: (runId, type, payload) => ({ id: messages.length + 1, runId, seq: 1, type, payload, createdAt: "" }),
     audit: () => {},
   };
@@ -129,6 +148,38 @@ test("persists partial transcript output before the provider exits", async () =>
   // The run is still active, yet the completed segment is already durable.
   assert.deepEqual(database.messages.map((message) => message.body), ["Partial answer"]);
   assert.deepEqual(manager.activeRuns(), ["run-1"]);
+});
+
+test("checkpoints Claude delta-only output durably without duplicating it", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  database.createRun({ ...codexRun("run-1"), provider: "claude" });
+  await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-1") });
+
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "Partial" } } }) + "\n");
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: " answer" } } }) + "\n");
+
+  assert.equal(database.messages.length, 1);
+  assert.equal(database.messages[0].body, "Partial answer");
+  assert.equal(database.messages[0].id, "run-1:1");
+  assert.deepEqual(manager.activeRuns(), ["run-1"]);
+});
+
+test("commits the final transcript checkpoint with terminal run state", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  database.createRun({ ...codexRun("run-1"), provider: "claude" });
+  await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-1") });
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "Final segment" } } }) + "\n");
+  child.emit("close", 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(database.finishes.length, 1);
+  assert.equal(database.finishes[0].transcriptMessage.body, "Final segment");
+  assert.equal(database.getRun("run-1").status, "completed");
+  assert.deepEqual(database.messages.map((message) => message.body), ["Final segment"]);
 });
 
 test("records the provider pid while running and clears it at finish", async () => {

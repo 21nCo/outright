@@ -28,11 +28,11 @@ function responseCapture() {
   };
 }
 
-function withRuntime(fn) {
+function withRuntime(fn, options = {}) {
   return async () => {
     const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-"));
     process.env.OUTRIGHT_DATA_DIR = dataDirectory;
-    const runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    const runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json", ...options });
     try {
       // The runtime wires its own database, manager, and event hub, so the
       // recovery endpoint is exercised exactly as in production.
@@ -70,6 +70,36 @@ test("rejects a malformed recovery policy with 400", withRuntime(async (runtime)
   await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "guess" }), response);
   assert.equal(response.statusCode, 400);
 }));
+
+test("blocks direct run submission until the interrupted run has a recovery decision", withRuntime(async (runtime) => {
+  const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+  const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+  runtime.database.reconcileInterruptedRuns();
+
+  const blocked = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "silently resume" }), blocked);
+  assert.equal(blocked.statusCode, 409);
+  assert.equal(blocked.body.code, "RUN_RECOVERY_REQUIRED");
+  assert.equal(blocked.body.runId, run.id);
+
+  const discarded = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), discarded);
+  assert.equal(discarded.statusCode, 200);
+  assert.equal(runtime.database.findUnresolvedInterruptedRun(conversation.id), undefined);
+}));
+
+test("does not resolve an alive recovered provider while it can still mutate the worktree", withRuntime(async (runtime) => {
+  const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+  const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+  runtime.database.updateRun(run.id, { status: "running", pid: 4242 });
+  runtime.database.reconcileInterruptedRuns({ probeAlive: () => true });
+
+  const response = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), response);
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.body.code, "RECOVERY_PROCESS_ACTIVE");
+  assert.equal(runtime.database.getRun(run.id).recoveryDecision, null);
+}, { recoveryProcessAlive: () => true }));
 
 test("accepts loopback and same-origin runtime requests", () => {
   const allowedHosts = runtimeAllowedHosts({});

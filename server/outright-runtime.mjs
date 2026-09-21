@@ -10,7 +10,7 @@ import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts() }) {
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = defaultRecoveryProcessAlive }) {
   const database = createOutrightDatabase();
   const reconciliation = database.reconcileInterruptedRuns();
   if (reconciliation.count) database.audit("runtime.runs.reconciled", { target: "runtime", ...reconciliation });
@@ -185,6 +185,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (runCreateMatch && request.method === "POST") {
         const conversation = database.getConversation(runCreateMatch[1]);
         if (!conversation) throw apiError(404, "Conversation not found");
+        const interrupted = database.findUnresolvedInterruptedRun(conversation.id);
+        if (interrupted) throw apiError(409, "Resolve the interrupted run before starting more agent work", { code: "RUN_RECOVERY_REQUIRED", runId: interrupted.id });
         const body = await readJson(request);
         const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
         if (!prompt) throw apiError(400, "Prompt is required");
@@ -209,7 +211,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (stopRunMatch && request.method === "POST") { const stopped = await agents.stop(stopRunMatch[1]); return json(response, stopped ? 202 : 404, { stopped }); }
       const resumeRunMatch = url.pathname.match(/^\/api\/runs\/([^/]+)\/resume$/);
       if (resumeRunMatch && request.method === "POST") {
-        const interrupted = database.getRun(resumeRunMatch[1]);
+        let interrupted = database.getRun(resumeRunMatch[1]);
         if (!interrupted) throw apiError(404, "Run not found");
         if (interrupted.status !== "interrupted" || interrupted.recoveryDecision) throw apiError(409, "Run is not waiting for a recovery decision");
         const body = await readJson(request);
@@ -217,6 +219,14 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (!["discard", "resume-session", "retry"].includes(policy)) throw apiError(400, "Recovery policy must be discard, resume-session, or retry");
         const conversation = database.getConversation(interrupted.conversationId);
         if (!conversation) throw apiError(404, "Conversation not found");
+
+        if (interrupted.recoveryClass === "alive") {
+          if (!Number.isSafeInteger(interrupted.pid) || interrupted.pid <= 0) throw apiError(409, "The recovered provider process cannot be verified", { code: "RECOVERY_PROCESS_UNKNOWN" });
+          if (await recoveryProcessAlive(interrupted.pid)) {
+            throw apiError(409, "The recovered provider process is still active; stop it before choosing a recovery policy", { code: "RECOVERY_PROCESS_ACTIVE", pid: interrupted.pid });
+          }
+          interrupted = database.updateRun(interrupted.id, { recoveryClass: "exited", pid: null });
+        }
 
         if (policy === "discard") {
           const resolved = database.resolveInterruptedRun(interrupted.id, policy);
@@ -233,14 +243,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (!providerInfo?.available) throw apiError(409, `${interrupted.provider} CLI is not available`);
         const sessionId = conversation.providerSessionId ?? interrupted.providerSessionId;
         if (policy === "resume-session" && !sessionId) throw apiError(409, "No provider session is available to resume", { code: "NO_PROVIDER_SESSION" });
-        if (sessionId && conversation.providerSessionId !== sessionId) database.updateConversation(conversation.id, { providerSessionId: sessionId });
-
-        const resolved = database.resolveInterruptedRun(interrupted.id, policy);
-        if (!resolved) throw apiError(409, "Run is not waiting for a recovery decision");
-        const run = database.createRun({ conversationId: conversation.id, provider: interrupted.provider, model: interrupted.model, reasoningEffort: interrupted.reasoningEffort, approvalPolicy: interrupted.approvalPolicy, prompt: interrupted.prompt });
-        database.audit(`agent.run.recovery.${policy}`, { target: run.id, recoveredFrom: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
-        publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: resolved });
-        return json(response, 202, await agents.schedule({ conversation: database.getConversation(conversation.id), run, forceFreshSession: policy === "retry" }));
+        const recovery = database.beginInterruptedRunRecovery(interrupted.id, policy, { providerSessionId: sessionId });
+        if (!recovery) throw apiError(409, "Run is not waiting for a recovery decision");
+        database.audit(`agent.run.recovery.${policy}`, { target: recovery.run.id, recoveredFrom: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
+        publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: recovery.interrupted });
+        return json(response, 202, await agents.schedule({ conversation: recovery.conversation, run: recovery.run, forceFreshSession: policy === "retry" }));
       }
 
       if (url.pathname === "/api/trust" && request.method === "POST") {
@@ -398,6 +405,16 @@ function isLoopback(address) {
   if (normalized === "::1" || normalized === "::") return true;
   const ipv4 = normalized.replace(/^::ffff:/, "");
   return ipv4.startsWith("127.");
+}
+
+function defaultRecoveryProcessAlive(pid) {
+  try {
+    if (process.platform !== "win32") process.kill(-pid, 0);
+    else process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== "ESRCH";
+  }
 }
 
 async function canonicalOf(target) {
