@@ -18,6 +18,8 @@ Outright is a local-first workspace for running coding agents across Git project
 
 - Node.js 20 or newer
 - Git
+- A C11 compiler (`cc`, `clang`, or `gcc`) on Linux; the development, build,
+  and production-start scripts compile the child-subreaper agent supervisor
 - At least one supported provider CLI on `PATH`: `codex` or `claude`
 - Optional editor CLI: `zed`, `code`, or `cursor`
 - Optional GitHub CLI (`gh`) for pull-request context
@@ -29,7 +31,7 @@ npm install
 npm run dev
 ```
 
-Open <http://localhost:4173>. The postinstall step repairs the executable permission on `node-pty`'s macOS helper when npm does not preserve it.
+Open <http://localhost:4173>. The postinstall step repairs the executable permission on `node-pty`'s macOS helper when npm does not preserve it. On Linux, `npm run dev`, `npm run build`, and `npm start` also compile the native agent supervisor before launching.
 
 ## Run the local production build
 

@@ -153,7 +153,7 @@ export function defaultLaunchCommand(command, run, launchDirectory) {
   const handshakePath = path.join(launchDirectory, `${run.id}.json`);
   if (process.platform === "linux") {
     if (!existsSync(LINUX_AGENT_SUPERVISOR)) {
-      throw new Error("Linux agent supervision is unavailable; run npm install to build server/bin/agent-supervisor");
+      throw new Error("Linux agent supervision is unavailable; install a C compiler and run npm run build:supervisor");
     }
     return {
       executable: LINUX_AGENT_SUPERVISOR,

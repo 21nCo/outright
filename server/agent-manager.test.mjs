@@ -906,6 +906,27 @@ process.kill(-signaled.pid, "SIGTERM");
 await waitForExit(signaled, "post-disconnect supervisor signal");
 const signalSafe = !existsSync(signalHandshake) && groupMembers(signaled.pid).length === 0 && processInfo(signalDescendantPid) == null;
 
+// A privileged provider may drop a descendant to another uid. Ownership is
+// still ancestry-based: the supervisor must not omit that process from its
+// zero-descendant proof merely because its credentials changed.
+const foreignHandshake = path.join(root, "foreign-uid.json");
+const foreignReady = \`/tmp/outright-foreign-ready-\${process.pid}\`;
+const foreignDescendant = \`process.setuid(65534); process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(\${JSON.stringify(foreignReady)}, String(process.pid)); setInterval(() => {}, 1000);\`;
+const foreignProvider = [
+  "const { spawn } = require('node:child_process');",
+  "process.on('SIGTERM', () => {});",
+  \`spawn(process.execPath, ['-e', \${JSON.stringify(foreignDescendant)}], { detached: true, stdio: 'ignore' });\`,
+  "while (true) {}",
+].join(" ");
+const foreign = spawn("/tmp/agent-supervisor", [foreignHandshake, process.execPath, "-e", foreignProvider], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+while (!existsSync(foreignHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
+foreign.stdin.write("go\\n");
+while (!existsSync(foreignReady)) await new Promise((resolve) => setTimeout(resolve, 10));
+const foreignDescendantPid = Number(readFileSync(foreignReady, "utf8"));
+foreign.stdin.write("stop\\n");
+await waitForExit(foreign, "foreign-uid descendant cleanup");
+const foreignUidSafe = !existsSync(foreignHandshake) && groupMembers(foreign.pid).length === 0 && processInfo(foreignDescendantPid) == null;
+
 const waitForReady = async (runId) => {
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline) {
@@ -935,10 +956,10 @@ try {
   outcome.membersAfterShutdown = groupMembers(second.child.pid);
   outcome.descendantAfterShutdown = processInfo(second.descendantPid);
 } catch (error) { outcome.shutdownError = String(error && error.message); }
-const clean = authorizationSafe && coalescedSafe && stdinSafe && signalSafe && !outcome.stopError && !outcome.shutdownError
+const clean = authorizationSafe && coalescedSafe && stdinSafe && signalSafe && foreignUidSafe && !outcome.stopError && !outcome.shutdownError
   && outcome.membersAfterStop.length === 0 && outcome.membersAfterShutdown.length === 0
   && outcome.descendantAfterStop == null && outcome.descendantAfterShutdown == null;
-console.log("RESULT " + JSON.stringify({ authorizationSafe, coalescedSafe, stdinSafe, signalSafe, ...outcome, clean }));
+console.log("RESULT " + JSON.stringify({ authorizationSafe, coalescedSafe, stdinSafe, signalSafe, foreignUidSafe, ...outcome, clean }));
 process.exit(clean ? 0 : 1);
 `;
   const repo = fileURLToPath(new URL("..", import.meta.url));
@@ -967,6 +988,7 @@ process.exit(clean ? 0 : 1);
   assert.equal(payload.coalescedSafe, true, "coalesced native go/stop commands must tear down the provider");
   assert.equal(payload.stdinSafe, true, "provider stdin must be isolated from the supervisor control pipe");
   assert.equal(payload.signalSafe, true, "SIGTERM after a runtime disconnect must reap the complete provider tree");
+  assert.equal(payload.foreignUidSafe, true, "credential changes must not remove descendants from the ownership proof");
   assert.equal(payload.stopError, undefined, `stop did not resolve: ${payload.stopError}`);
   assert.equal(payload.shutdownError, undefined, `shutdown did not resolve: ${payload.shutdownError}`);
   assert.deepEqual(payload.membersAfterStop, [], `the process group still has members after stop: ${JSON.stringify(payload.membersAfterStop)}`);

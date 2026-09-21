@@ -168,14 +168,6 @@ static process_snapshot inspect_owned_tree(pid_t supervisor_pid, pid_t provider_
     if (entry->d_name[0] == '\0' || end == NULL || *end != '\0' || value <= 0) continue;
     pid_t pid = (pid_t)value;
     if (pid == getpid()) continue;
-    char process_directory[64];
-    snprintf(process_directory, sizeof(process_directory), "/proc/%ld", (long)pid);
-    struct stat metadata;
-    if (stat(process_directory, &metadata) != 0) {
-      if (errno != ENOENT && errno != ESRCH) snapshot.complete = false;
-      continue;
-    }
-    if (metadata.st_uid != geteuid()) continue;
     char state;
     pid_t parent;
     pid_t group;
