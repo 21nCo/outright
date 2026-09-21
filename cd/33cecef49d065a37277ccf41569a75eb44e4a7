@@ -1,0 +1,19 @@
+automation/hermes/outright-linear-coordinator.mjs
+  s_6126673cc0a89e::t_74f92fa0714aa0 144-146,148,152,155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cd33cecef49d065a37277ccf41569a75eb44e4a7",
+  "prompts": {},
+  "sessions": {
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
