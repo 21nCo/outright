@@ -1,0 +1,14 @@
+automation/hermes/workflow.json
+  h_a39f9495f9ec1d 55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "575c816a16913e3ab5656b18ad8267b26d1abac8",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
