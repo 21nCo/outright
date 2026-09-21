@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync, unlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -37,8 +37,13 @@ export function createOutrightDatabase(options = {}) {
   // Launch handshake records live next to the database: the launch wrapper
   // durably records its own process identity here before the runtime may
   // authorize the provider to run, so a crash between spawning and recording
-  // the pid never loses process ownership.
-  const launchDirectory = options.launchDirectory ?? path.join(dataDirectory, "launches");
+  // the pid never loses process ownership. When an explicit filename outside
+  // the data directory is used, the records follow that file instead.
+  const launchDirectory = options.launchDirectory
+    ?? (filename && path.isAbsolute(filename) ? path.join(path.dirname(filename), "launches") : path.join(dataDirectory, "launches"));
+  // An explicit filename may live outside the data directory; its parent must
+  // exist for the database (and the launch records beside it) to open.
+  if (filename && path.isAbsolute(filename)) mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
   const db = new Database(filename);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
@@ -62,7 +67,7 @@ export function createOutrightDatabase(options = {}) {
       const update = db.transaction((entries) => {
         for (const [key, value] of entries) statement.run(key, JSON.stringify(value));
       });
-      update(Object.entries(patch));
+      update.immediate(Object.entries(patch));
       return this.getSettings();
     },
     listGroups() {
@@ -217,7 +222,12 @@ export function createOutrightDatabase(options = {}) {
       // conditional on the row still being queued/running/launching: the
       // runtime that still owns a run can finish it between the selection and
       // the update, and that terminal state must never be overwritten with
-      // "interrupted".
+      // "interrupted". The transaction runs in immediate mode: a deferred
+      // transaction would upgrade from a read snapshot to a write while
+      // another runtime commits, failing with SQLITE_BUSY_SNAPSHOT and
+      // aborting startup.
+      const adopted = [];
+      const keepHandshakeIds = new Set();
       const reconcile = db.transaction(() => {
         const pending = db.prepare("SELECT id, status, pid FROM runs WHERE status IN ('queued', 'running', 'launching')").all();
         for (const run of pending) {
@@ -234,16 +244,29 @@ export function createOutrightDatabase(options = {}) {
             // permanently gated as an unverifiable tree.
             classification = "never-started";
             const handshake = readLaunchHandshake(launchDirectory, run.id);
-            if (handshake) pid = handshake.pid;
+            if (handshake) {
+              pid = handshake.pid;
+              // The identity is now durably adopted into the row; the record
+              // itself must not linger.
+              adopted.push(run.id);
+            }
           }
           else if (run.pid != null) classification = normalizeProbeResult(probeAlive(run.pid));
           const result = db.prepare("UPDATE runs SET status = 'interrupted', pid = ?, finished_at = ?, recovery_class = ? WHERE id = ? AND status IN ('queued', 'running', 'launching')")
             .run(pid, finishedAt, classification, run.id);
           if (!result.changes) continue;
           counts[classification] = (counts[classification] ?? 0) + 1;
+          // A row that was actually running may still own a live wrapper that
+          // removes its own record on exit; keep those records.
+          if (run.status === "running") keepHandshakeIds.add(run.id);
         }
       });
-      reconcile();
+      reconcile.immediate();
+      // Handshake hygiene: adopted records are deleted, and records belonging
+      // to runs that are not pending (terminal, resolved, or unknown ids) are
+      // swept so a hard-killed runtime cannot leak one file per crash.
+      for (const runId of adopted) removeLaunchHandshake(launchDirectory, runId);
+      sweepLaunchHandshakes(launchDirectory, keepHandshakeIds);
       const count = Object.values(counts).reduce((sum, classified) => sum + classified, 0);
       return { count, counts };
     },
@@ -263,7 +286,7 @@ export function createOutrightDatabase(options = {}) {
         if (!result.changes) return false;
         return true;
       });
-      if (!resolve()) return null;
+      if (!resolve.immediate()) return null;
       return this.getRun(id);
     },
     beginInterruptedRunRecovery(id, decision, { providerSessionId } = {}) {
@@ -288,7 +311,7 @@ export function createOutrightDatabase(options = {}) {
         });
         return { interrupted: this.getRun(id), run, conversation: this.getConversation(interrupted.conversationId) };
       });
-      return recover();
+      return recover.immediate();
     },
     updateRun(id, patch) {
       const fields = [];
@@ -306,7 +329,7 @@ export function createOutrightDatabase(options = {}) {
         const run = this.updateRun(id, patch);
         return { run, message };
       });
-      return finish();
+      return finish.immediate();
     },
     appendRunEvent(runId, type, payload) {
       const seq = db.prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM run_events WHERE run_id = ?").get(runId).seq;
@@ -412,6 +435,24 @@ function readLaunchHandshake(launchDirectory, runId) {
     if (record && Number.isSafeInteger(record.pid) && record.pid > 0) return record;
   } catch { /* No handshake record exists (or it is unreadable). */ }
   return null;
+}
+function removeLaunchHandshake(launchDirectory, runId) {
+  try { unlinkSync(path.join(launchDirectory, `${runId}.json`)); } catch { /* Already gone. */ }
+}
+// Deletes handshake records that no longer belong to a pending run, so a
+// runtime hard-killed after authorization cannot leak one stale file per
+// crash. Records for rows that were actually running are kept: their wrapper
+// may still be alive and removes its own record when it exits.
+function sweepLaunchHandshakes(launchDirectory, keepRunIds) {
+  let entries;
+  try { entries = readdirSync(launchDirectory); }
+  catch { return; }
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) continue;
+    const runId = entry.slice(0, -".json".length);
+    if (keepRunIds.has(runId)) continue;
+    try { rmSync(path.join(launchDirectory, entry), { force: true }); } catch { /* Already gone. */ }
+  }
 }
 // Probes the run's whole process group, not just the detached leader PID: an
 // exited leader can leave live provider descendants in process group `pid` that

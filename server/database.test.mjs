@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import Database from "better-sqlite3";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createOutrightDatabase, defaultProbeRun } from "./database.mjs";
@@ -223,7 +224,8 @@ test("reconciles a launching row without a handshake record as never-started", (
 });
 
 test("reconciles a launching row by adopting the wrapper handshake pid as never-started", async () => {
-  const database = createOutrightDatabase({ filename: ":memory:", launchDirectory: mkdtempSync(path.join(os.tmpdir(), "outright-launches-")) });
+  const launchDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-launches-"));
+  const database = createOutrightDatabase({ filename: ":memory:", launchDirectory });
   let pid;
   try {
     const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
@@ -234,8 +236,7 @@ test("reconciles a launching row by adopting the wrapper handshake pid as never-
     const exited = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore", detached: process.platform !== "win32" });
     pid = exited.pid;
     await new Promise((resolve) => exited.once("exit", resolve));
-    mkdirSync(database.launchDirectory, { recursive: true });
-    writeFileSync(path.join(database.launchDirectory, `${run.id}.json`), JSON.stringify({ pid, authorized: false, createdAt: "2026-09-21T00:00:00.000Z" }));
+    writeFileSync(path.join(launchDirectory, `${run.id}.json`), JSON.stringify({ pid, authorized: false, createdAt: "2026-09-21T00:00:00.000Z" }));
 
     const result = database.reconcileInterruptedRuns();
     assert.equal(result.counts["never-started"], 1);
@@ -243,8 +244,109 @@ test("reconciles a launching row by adopting the wrapper handshake pid as never-
     assert.equal(recovered.status, "interrupted");
     assert.equal(recovered.recoveryClass, "never-started", "a launching row was provably never authorized, so it is never gated as an unverifiable tree");
     assert.equal(recovered.pid, pid, "the handshake pid is adopted so process ownership is not lost");
+    assert.equal(existsSync(path.join(launchDirectory, `${run.id}.json`)), false, "the adopted handshake record is removed, not lingered on");
   } finally {
     database.close();
+    rmSync(launchDirectory, { recursive: true, force: true });
+  }
+});
+
+// Regression (PR remediation round 2): the launches directory must never
+// accumulate one orphaned handshake record per hard-killed runtime. Adopted
+// records are deleted and records for runs that were not pending are swept;
+// records of rows that were actually running are kept for their still-live
+// wrappers.
+test("reconciliation sweeps stale handshake records but keeps live-wrapper records", () => {
+  const launchDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-launches-"));
+  const database = createOutrightDatabase({ filename: ":memory:", launchDirectory });
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const launching = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "crashed before authorization" });
+    const running = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "crashed while running" });
+    const finished = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "done long ago" });
+    database.updateRun(launching.id, { status: "launching" });
+    database.updateRun(running.id, { status: "running", pid: 4242 });
+    database.updateRun(finished.id, { status: "completed", finishedAt: "2026-09-21T00:00:00.000Z" });
+    const record = (runId, pid) => writeFileSync(path.join(launchDirectory, `${runId}.json`), JSON.stringify({ pid, authorized: false }));
+    record(launching.id, 111);
+    record(running.id, 222);
+    record(finished.id, 333);
+    record("run-that-never-existed", 444);
+
+    database.reconcileInterruptedRuns({ probeAlive: () => false });
+
+    assert.equal(existsSync(path.join(launchDirectory, `${launching.id}.json`)), false, "the adopted launching record is removed");
+    assert.equal(existsSync(path.join(launchDirectory, `${running.id}.json`)), true, "a running row's wrapper may still be alive and removes its own record");
+    assert.equal(existsSync(path.join(launchDirectory, `${finished.id}.json`)), false, "a terminal run's stale record is swept");
+    assert.equal(existsSync(path.join(launchDirectory, "run-that-never-existed.json")), false, "a record for an unknown run is swept");
+  } finally {
+    database.close();
+    rmSync(launchDirectory, { recursive: true, force: true });
+  }
+});
+
+// Regression (PR remediation round 2): better-sqlite3's default deferred
+// transaction let another runtime commit between reconciliation's SELECT and
+// its first UPDATE, failing with SQLITE_BUSY_SNAPSHOT and aborting startup.
+// The immediate variant acquires the write lock before reading pending rows,
+// so no other writer can commit inside that window at all.
+test("reconciliation holds the write lock across its whole read-modify-write window", () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-db-"));
+  const database = createOutrightDatabase({ dataDirectory, filename: path.join(dataDirectory, "outright.db") });
+  const other = new Database(path.join(dataDirectory, "outright.db"));
+  other.pragma("busy_timeout = 100");
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "racing writer" });
+    database.updateRun(run.id, { status: "running", pid: 4242 });
+
+    let concurrentWrite = "never-attempted";
+    const result = database.reconcileInterruptedRuns({
+      probeAlive: () => {
+        // A second runtime tries to commit while reconciliation is between
+        // its SELECT and its UPDATE. With a deferred transaction this commit
+        // would succeed and reconciliation would then abort with
+        // SQLITE_BUSY_SNAPSHOT; with the immediate transaction the writer
+        // cannot get in at all.
+        try {
+          other.prepare("UPDATE runs SET status = 'completed', finished_at = ?, exit_code = 0 WHERE id = ?").run("2026-09-21T00:00:00.000Z", run.id);
+          concurrentWrite = "committed";
+        } catch (error) {
+          concurrentWrite = error.code;
+        }
+        return "exited";
+      },
+    });
+    // The concurrent writer was locked out for the whole window, so
+    // reconciliation itself never observes a snapshot conflict and completes.
+    assert.equal(concurrentWrite, "SQLITE_BUSY", "the write lock must be held from the pending-row read through the final update");
+    assert.equal(result.count, 1);
+    assert.equal(database.getRun(run.id).status, "interrupted");
+  } finally {
+    other.close();
+    database.close();
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+// Regression (PR remediation round 2): with an explicit filename outside the
+// default data directory, handshake records must follow that file instead of
+// landing in ~/.outright/launches.
+test("the launch directory follows an explicit absolute database filename", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-db-"));
+  const filename = path.join(root, "custom", "outright.db");
+  try {
+    const database = createOutrightDatabase({ filename });
+    assert.equal(database.launchDirectory, path.join(root, "custom", "launches"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+  const memory = createOutrightDatabase({ filename: ":memory:", dataDirectory: root });
+  try {
+    // Non-filenames like ":memory:" keep the data-directory default.
+    assert.equal(memory.launchDirectory, path.join(root, "launches"));
+  } finally {
+    memory.close();
   }
 });
 

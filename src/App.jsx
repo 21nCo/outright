@@ -257,7 +257,11 @@ export function App() {
 
   const activeRun = conversation?.runs?.find((run) => ["queued", "launching", "running"].includes(run.status));
   const latestRun = conversation?.runs?.[0];
-  const interruptedRun = conversation?.runs?.find((run) => run.status === "interrupted" && !run.recoveryDecision);
+  // Recovery order: replacement work may only execute once the OLDEST
+  // unresolved interrupted run is decided (the server enforces
+  // RECOVERY_ORDER_REQUIRED), so the notice surfaces that run — the end of
+  // the newest-first runs list.
+  const interruptedRun = conversation?.runs?.filter((run) => run.status === "interrupted" && !run.recoveryDecision).at(-1);
 
   async function resolveRecovery(run, policy) {
     try {

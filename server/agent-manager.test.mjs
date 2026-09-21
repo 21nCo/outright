@@ -6,7 +6,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { buildProviderCommand, createAgentManager, consumeBoundedLines, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex } from "./agent-manager.mjs";
+import { buildProviderCommand, consumeBoundedLines, createAgentManager, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
 
 const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
 
@@ -317,6 +317,25 @@ test("persists streamed assistant edge whitespace exactly at checkpoints", async
   assert.equal(database.messages[0].body, "  indented start\ntail ", "the final commit must preserve the partial trailing space");
 });
 
+// Regression (PR remediation round 2): after the trim removal, a body of pure
+// whitespace (stray "\n\n" deltas between tool calls) was persisted and
+// recovered as an empty-looking transcript bubble. Only entirely-whitespace
+// bodies are suppressed; text-bearing content is stored byte-for-byte.
+test("suppresses a whitespace-only assistant body without trimming text", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  database.createRun({ ...codexRun("run-1"), provider: "claude" });
+  await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-1") });
+
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "\n\n" } } }) + "\n");
+  child.emit("close", 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.deepEqual(database.messages, [], "an entirely-whitespace body is not persisted as a transcript message");
+  assert.equal(database.getRun("run-1").status, "completed");
+});
+
 test("records the provider pid while running and clears it at finish", async () => {
   const database = fakeDatabase();
   const child = fakeChild();
@@ -476,23 +495,54 @@ test("a termination timeout retains ownership and does not drain queued work", a
 // so every crash window reconciles to a provable state.
 test("launch phases are durable before the provider is authorized", async () => {
   const database = fakeDatabase();
-  const phases = [];
+  // A single ordered event log proves the sequencing itself: a regression
+  // that authorizes before the durable 'running' commit (the core crash-window
+  // invariant) reorders entries here, which separate after-the-fact arrays
+  // could never detect.
+  const events = [];
   const originalUpdate = database.updateRun.bind(database);
-  database.updateRun = (id, patch) => { if (patch.status) phases.push({ status: patch.status, pid: patch.pid }); return originalUpdate(id, patch); };
+  database.updateRun = (id, patch) => {
+    if (patch.status) events.push(`update:${patch.status}`);
+    return originalUpdate(id, patch);
+  };
   const child = fakeChild();
-  const goWrites = [];
   child.stdin = new PassThrough();
-  child.stdin.write = (chunk) => { goWrites.push(String(chunk)); return true; };
-  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  const originalWrite = child.stdin.write.bind(child.stdin);
+  child.stdin.write = (chunk) => { events.push(`authorize:${String(chunk).trim()}`); return originalWrite(chunk); };
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => { events.push("spawn"); return child; } });
   await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.createRun(codexRun("run-1")) });
 
-  // Phase 1 ('launching', no pid) is committed before the spawn; phase 2
-  // ('running' with the pid) commits before the authorization byte is sent.
-  assert.deepEqual(phases, [{ status: "launching", pid: undefined }, { status: "running", pid: null }]);
-  assert.deepEqual(goWrites, ["go\n"]);
+  assert.deepEqual(events, [
+    "update:launching", // durable "possibly started" marker, before the spawn
+    "spawn",             // spawnProcess is called with the marker committed
+    "update:running",    // durable pid + running commit, before authorization
+    "authorize:go",      // only now may the provider start side effects
+  ], "the launch handshake must commit each phase before the next step");
   child.emit("close", 0, null);
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(database.getRun("run-1").status, "completed");
+});
+
+// Regression (platform-injectable): on Windows there is no owned process
+// group, so stopping a run must tear down the wrapper's whole tree via the
+// tree-aware taskkill mechanism instead of signaling only the leader.
+test("windows termination tears down the provider tree with taskkill", () => {
+  const calls = [];
+  const run = (executable, args) => { calls.push([executable, ...args]); return { status: 0 }; };
+  const child = { pid: 4242 };
+  terminateTree(child, "SIGTERM", "win32", run);
+  assert.deepEqual(calls, [["taskkill", "/PID", "4242", "/T", "/F"]], "the whole wrapper tree is terminated, not just the leader");
+
+  // POSIX still signals the owned process group; a pid-less child falls back
+  // to child.kill so injected fakes keep working.
+  const signals = [];
+  const fake = { pid: 99, kill: (signal) => signals.push(signal) };
+  terminateTree(fake, "SIGTERM", "linux", run);
+  assert.deepEqual(calls, [["taskkill", "/PID", "4242", "/T", "/F"]], "POSIX never shells out to taskkill");
+  assert.deepEqual(signals, []);
+  const pidLess = { kill: (signal) => signals.push(signal) };
+  terminateTree(pidLess, "SIGTERM", "linux", run);
+  assert.deepEqual(signals, ["SIGTERM"], "a pid-less child falls back to child.kill");
 });
 
 // The real launch wrapper must durably record its own pid and only start the
@@ -504,10 +554,23 @@ test("the launch wrapper records durable identity before authorization and clean
   const runId = "launch-run";
   const handshakePath = path.join(launchDirectory, `${runId}.json`);
   const provider = `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");`;
+  const children = [];
+  // Fail fast with cleanup instead of hanging until the suite timeout leaks
+  // processes and temp directories.
+  const withDeadline = async (promise, label, kill = () => {}) => {
+    let timer;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out`)), 5000); }),
+      ]);
+    } finally { clearTimeout(timer); kill(); }
+  };
   try {
     // Spawn the wrapper exactly as the runtime does, but never authorize:
     // closing stdin must exit it without running the provider.
     const child = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, process.execPath, "-e", provider], { stdio: ["pipe", "ignore", "ignore"] });
+    children.push(child);
     const deadline = Date.now() + 10_000;
     while (!existsSync(handshakePath) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
     const record = JSON.parse(readFileSync(handshakePath, "utf8"));
@@ -515,7 +578,7 @@ test("the launch wrapper records durable identity before authorization and clean
     assert.equal(record.authorized, false);
 
     child.stdin.end();
-    await new Promise((resolve) => child.once("exit", resolve));
+    await withDeadline(new Promise((resolve) => child.once("exit", resolve)), "unauthorized wrapper exit", () => { try { child.kill("SIGKILL"); } catch {} });
     assert.equal(existsSync(marker), false, "an unauthorized wrapper must never start the provider");
     assert.equal(existsSync(handshakePath), false, "the wrapper removes its handshake record when it exits unauthorized");
 
@@ -524,14 +587,16 @@ test("the launch wrapper records durable identity before authorization and clean
     const handshakePath2 = path.join(launchDirectory, "launch-run-2.json");
     const provider2 = `require("node:fs").writeFileSync(${JSON.stringify(marker2)}, "ran");`;
     const child2 = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath2, process.execPath, "-e", provider2], { stdio: ["pipe", "ignore", "ignore"] });
+    children.push(child2);
     const deadline2 = Date.now() + 10_000;
     while (!existsSync(handshakePath2) && Date.now() < deadline2) await new Promise((resolve) => setTimeout(resolve, 10));
     child2.stdin.write("go\n");
-    const code = await new Promise((resolve) => child2.once("exit", resolve));
+    const code = await withDeadline(new Promise((resolve) => child2.once("exit", resolve)), "authorized wrapper exit", () => { try { child2.kill("SIGKILL"); } catch {} });
     assert.equal(code, 0);
     assert.equal(existsSync(marker2), true, "the authorized wrapper starts the provider");
     assert.equal(existsSync(handshakePath2), false, "the handshake record is cleaned up after completion");
   } finally {
+    for (const child of children) { try { child.kill("SIGKILL"); } catch { /* Already gone. */ } }
     rmSync(root, { recursive: true, force: true });
   }
 });

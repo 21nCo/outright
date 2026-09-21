@@ -35,6 +35,15 @@ fs.mkdirSync(path.dirname(handshakePath), { recursive: true });
 // restart.
 fs.writeFileSync(handshakePath, JSON.stringify({ pid: process.pid, authorized: false, createdAt: new Date().toISOString() }));
 let authorized = false;
+// Stay alive across group termination signals once authorized so this
+// wrapper — the provider's parent — can reap it. On hosts whose PID 1 does
+// not reap orphans, a killed-but-unreaped provider would remain a zombie in
+// its process group and keep every liveness probe reporting alive. An
+// unauthorized wrapper must still die on the first signal: it never started
+// the provider, so nothing needs reaping.
+const abandon = () => { try { fs.unlinkSync(handshakePath); } catch {} process.exit(0); };
+process.on("SIGTERM", () => { if (!authorized) abandon(); });
+process.on("SIGINT", () => { if (!authorized) abandon(); });
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   if (authorized || !String(chunk).includes("go")) return;
@@ -43,7 +52,17 @@ process.stdin.on("data", (chunk) => {
   const provider = spawn(executable, commandArgs, { stdio: ["ignore", "inherit", "inherit"] });
   const finish = (code) => { try { fs.unlinkSync(handshakePath); } catch {} process.exit(code); };
   provider.on("error", (error) => { console.error(String((error && error.message) || error)); finish(127); });
-  provider.on("close", (code, signal) => finish(code ?? (signal ? 137 : 0)));
+  provider.on("close", (code, signal) => {
+    try { fs.unlinkSync(handshakePath); } catch {}
+    if (signal) {
+      // Re-raise the provider's termination signal so the runtime reports
+      // the accurate "stopped by signal" cause instead of a generic 137.
+      process.removeAllListeners("SIGTERM");
+      process.removeAllListeners("SIGINT");
+      try { process.kill(process.pid, signal); }
+      catch { process.exit(137); }
+    } else process.exit(code ?? 0);
+  });
 });
 // The runtime went away before authorizing the launch: exit without ever
 // starting the provider, so an abandoned handshake can never mutate the
@@ -366,22 +385,30 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
   };
 }
 
-function terminateTree(child, signal) {
+// Terminates the provider's whole process tree. On POSIX the provider runs in
+// the wrapper's process group, so signaling the group terminates everything.
+// On Windows there is no owned process group: taskkill /T /F tears down the
+// wrapper's entire tree, which is the only portable tree-aware mechanism; if
+// it is unavailable the conservative recovery probes never trust a gone
+// Windows leader (see defaultProbeRun/defaultRecoveryProcessAlive).
+export function terminateTree(child, signal, platform = process.platform, run = spawnSync) {
   try {
-    // Descendants spawned by the provider share its process group on POSIX,
-    // so signaling the group terminates the whole tree, not just the PID.
-    // On Windows the tree is not owned; only the leader can be signaled, so
-    // restart recovery must never trust a gone Windows leader (see
-    // defaultProbeRun/defaultRecoveryProcessAlive conservative handling).
-    if (child?.pid && process.platform !== "win32") process.kill(-child.pid, signal);
-    else child?.kill?.(signal);
+    if (!child?.pid) { child?.kill?.(signal); return; }
+    if (platform === "win32") {
+      run("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+      return;
+    }
+    process.kill(-child.pid, signal);
   } catch { /* The process group already exited. */ }
 }
 
-function processGroupAlive(child) {
+// Liveness of the provider tree: the wrapper's process group on POSIX, the
+// wrapper leader on Windows (only meaningful after a Windows taskkill /T,
+// which tears down the whole tree).
+export function processGroupAlive(child, platform = process.platform) {
   if (!child?.pid) return false;
   try {
-    if (process.platform !== "win32") process.kill(-child.pid, 0);
+    if (platform !== "win32") process.kill(-child.pid, 0);
     else process.kill(child.pid, 0);
     return true;
   } catch (error) { return error.code !== "ESRCH"; }
@@ -465,10 +492,11 @@ function pendingAssistantMessage(state) {
   // The body is persisted exactly as streamed: no trimming. A crash after a
   // timed or byte-bounded checkpoint recovers the stored text, so trimming
   // here would irreversibly drop leading indentation or a partial trailing
-  // newline from the preserved output. Only a genuinely empty body suppresses
-  // the message.
+  // newline from the preserved output. Only a body that is entirely
+  // whitespace (e.g. stray "\n\n" deltas between tool calls) is suppressed;
+  // text-bearing content is stored byte-for-byte.
   const body = assistantBody(state);
-  if (!body) return null;
+  if (!body.trim()) return null;
   if (!state.assistantMessageId) {
     state.transcriptSeq = (state.transcriptSeq ?? 0) + 1;
     state.assistantMessageId = `${state.run.id}:${state.transcriptSeq}`;

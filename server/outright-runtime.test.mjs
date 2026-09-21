@@ -440,14 +440,10 @@ test("the default recovery probe is conservative per platform", async () => {
   }
 });
 
-// Regression (PR convergence round 2): a hard crash between the durable
-// 'launching' marker and the pid/running commit used to restart as an unknown
-// interrupted run with no pid — which blocked every recovery policy
-// indefinitely and stranded a possibly spawned provider. The crash-safe
-// launch handshake closes the window: crashing before durable process
-// identity restarts as a provably never-started run with an explicit safe
-// continuation.
-test("a crash before durable launch identity restarts resolvable, not permanently gated", async () => {
+// Shared harness for the launch-crash regressions: seeds a run in the exact
+// crashed state, closes the seeding database, and constructs a fresh runtime
+// whose construction-time reconciliation is the restart under test.
+async function withLaunchCrash({ status, handshake }, fn) {
   const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-"));
   const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
   process.env.OUTRIGHT_DATA_DIR = dataDirectory;
@@ -456,75 +452,69 @@ test("a crash before durable launch identity restarts resolvable, not permanentl
     const seeded = createOutrightDatabase();
     const conversation = seeded.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
     const run = seeded.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "crashed mid-launch" });
-    // Crash before the wrapper recorded its identity: no handshake record.
-    seeded.updateRun(run.id, { status: "launching", startedAt: new Date().toISOString() });
+    seeded.updateRun(run.id, { status, startedAt: new Date().toISOString() });
+    let pid = null;
+    if (handshake) {
+      // The wrapper's durable self-recorded identity, written before the crash.
+      pid = await deadProcessId();
+      mkdirSync(seeded.launchDirectory, { recursive: true });
+      writeFileSync(path.join(seeded.launchDirectory, `${run.id}.json`), JSON.stringify({ pid, authorized: false, createdAt: new Date().toISOString() }));
+    }
     seeded.close();
-
     runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
-    const recovered = runtime.database.getRun(run.id);
-    assert.equal(recovered.status, "interrupted");
-    assert.equal(recovered.recoveryClass, "never-started", "the launch was provably never authorized, so it must not gate as an unverifiable tree");
-
-    // Submissions stay gated until an explicit decision exists...
-    const blocked = responseCapture();
-    await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "continue" }), blocked);
-    assert.equal(blocked.statusCode, 409);
-    assert.equal(blocked.body.code, "RUN_RECOVERY_REQUIRED");
-
-    // ...and the operator has an explicit safe continuation: a discard that
-    // would previously have been rejected RECOVERY_PROCESS_UNKNOWN now
-    // records the decision and clears the gate. (Retry's execution path is
-    // proven on the real-worktree harness below.)
-    const discarded = responseCapture();
-    await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), discarded);
-    assert.equal(discarded.statusCode, 200, `discard must succeed: ${JSON.stringify(discarded.body)}`);
-    assert.equal(runtime.database.getRun(run.id).status, "failed");
-    assert.equal(runtime.database.findUnresolvedInterruptedRun(conversation.id), undefined, "the conversation is no longer gated");
+    await fn({ runtime, conversation, run, pid });
   } finally {
     await runtime?.shutdown();
     if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
     rmSync(dataDirectory, { recursive: true, force: true });
   }
-});
+}
+
+// Regression (PR convergence round 2): a hard crash between the durable
+// 'launching' marker and the pid/running commit used to restart as an unknown
+// interrupted run with no pid — which blocked every recovery policy
+// indefinitely and stranded a possibly spawned provider. The crash-safe
+// launch handshake closes the window: crashing before durable process
+// identity restarts as a provably never-started run with an explicit safe
+// continuation.
+test("a crash before durable launch identity restarts resolvable, not permanently gated", () => withLaunchCrash({ status: "launching" }, async ({ runtime, conversation, run }) => {
+  const recovered = runtime.database.getRun(run.id);
+  assert.equal(recovered.status, "interrupted");
+  assert.equal(recovered.recoveryClass, "never-started", "the launch was provably never authorized, so it must not gate as an unverifiable tree");
+
+  // Submissions stay gated until an explicit decision exists...
+  const blocked = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "continue" }), blocked);
+  assert.equal(blocked.statusCode, 409);
+  assert.equal(blocked.body.code, "RUN_RECOVERY_REQUIRED");
+
+  // ...and the operator has an explicit safe continuation: a discard that
+  // would previously have been rejected RECOVERY_PROCESS_UNKNOWN now
+  // records the decision and clears the gate. (Retry's execution path is
+  // proven on the real-worktree harness below.)
+  const discarded = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), discarded);
+  assert.equal(discarded.statusCode, 200, `discard must succeed: ${JSON.stringify(discarded.body)}`);
+  assert.equal(runtime.database.getRun(run.id).status, "failed");
+  assert.equal(runtime.database.findUnresolvedInterruptedRun(conversation.id), undefined, "the conversation is no longer gated");
+}));
 
 // The second half of the launch crash window: the wrapper recorded its
 // process identity durably, but the runtime died before committing
 // 'running'. Ownership must be restored from the handshake record and the
 // run must remain resolvable — the wrapper exits on its own (never
 // authorized) without ever starting the provider.
-test("a crash after launch identity but before authorization keeps the pid and stays resolvable", async () => {
-  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-"));
-  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
-  process.env.OUTRIGHT_DATA_DIR = dataDirectory;
-  let runtime;
-  try {
-    const seeded = createOutrightDatabase();
-    const conversation = seeded.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
-    const run = seeded.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "crashed before authorization" });
-    seeded.updateRun(run.id, { status: "launching", startedAt: new Date().toISOString() });
-    const pid = await deadProcessId();
-    // The wrapper's durable self-recorded identity, written before the crash.
-    const launchDirectory = seeded.launchDirectory;
-    mkdirSync(launchDirectory, { recursive: true });
-    writeFileSync(path.join(launchDirectory, `${run.id}.json`), JSON.stringify({ pid, authorized: false, createdAt: new Date().toISOString() }));
-    seeded.close();
+test("a crash after launch identity but before authorization keeps the pid and stays resolvable", () => withLaunchCrash({ status: "launching", handshake: true }, async ({ runtime, conversation, run, pid }) => {
+  const recovered = runtime.database.getRun(run.id);
+  assert.equal(recovered.status, "interrupted");
+  assert.equal(recovered.recoveryClass, "never-started", "authorization is only issued after the running commit, so this launch provably never started the provider");
+  assert.equal(recovered.pid, pid, "process ownership is restored from the handshake record");
 
-    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
-    const recovered = runtime.database.getRun(run.id);
-    assert.equal(recovered.status, "interrupted");
-    assert.equal(recovered.recoveryClass, "never-started", "authorization is only issued after the running commit, so this launch provably never started the provider");
-    assert.equal(recovered.pid, pid, "process ownership is restored from the handshake record");
-
-    const discarded = responseCapture();
-    await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), discarded);
-    assert.equal(discarded.statusCode, 200, `the run must remain resolvable by an explicit decision: ${JSON.stringify(discarded.body)}`);
-    assert.equal(runtime.database.findUnresolvedInterruptedRun(conversation.id), undefined);
-  } finally {
-    await runtime?.shutdown();
-    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
-    rmSync(dataDirectory, { recursive: true, force: true });
-  }
-});
+  const discarded = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), discarded);
+  assert.equal(discarded.statusCode, 200, `the run must remain resolvable by an explicit decision: ${JSON.stringify(discarded.body)}`);
+  assert.equal(runtime.database.findUnresolvedInterruptedRun(conversation.id), undefined);
+}));
 
 // End-to-end on a real discovered, trusted worktree: replacement execution
 // must respect conversation order. Resuming or retrying a newer never-started
