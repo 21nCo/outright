@@ -421,6 +421,30 @@ test("recovery retry durably clears the provider session before the replacement 
   }
 });
 
+test("recovery keeps sessions bound to their provider and persists the replacement session", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "claude" });
+    database.updateConversation(conversation.id, { providerSessionId: "claude-session" });
+
+    const resumed = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "resume" });
+    database.updateRun(resumed.id, { status: "running", providerSessionId: "codex-session", pid: 4242 });
+    database.reconcileInterruptedRuns({ probeAlive: () => false });
+    const resumeRecovery = database.beginInterruptedRunRecovery(resumed.id, "resume-session", { providerSessionId: "codex-session" });
+    assert.equal(resumeRecovery.run.providerSessionId, "codex-session", "the replacement run carries the immutable interrupted-run session");
+    assert.equal(database.getConversation(conversation.id).providerSessionId, "claude-session", "a Codex recovery cannot overwrite the Claude conversation session");
+
+    const retried = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "retry" });
+    database.updateRun(retried.id, { status: "running", providerSessionId: "codex-session-2", pid: 4343 });
+    database.reconcileInterruptedRuns({ probeAlive: () => false });
+    const retryRecovery = database.beginInterruptedRunRecovery(retried.id, "retry");
+    assert.equal(retryRecovery.run.providerSessionId, null);
+    assert.equal(database.getConversation(conversation.id).providerSessionId, "claude-session", "retry cannot clear an unrelated provider session");
+  } finally {
+    database.close();
+  }
+});
+
 test("upserts partial transcript checkpoints and commits the final checkpoint with run state", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

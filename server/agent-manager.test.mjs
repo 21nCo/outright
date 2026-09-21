@@ -26,6 +26,7 @@ function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/
   const runs = new Map();
   const conversations = new Map([[initialConversation.id, initialConversation]]);
   return {
+    launchDirectory: mkdtempSync(path.join(os.tmpdir(), "outright-agent-test-")),
     messages,
     finishes,
     runs,
@@ -527,6 +528,51 @@ test("launch phases are durable before the provider is authorized", async () => 
   assert.equal(database.getRun("run-1").status, "completed");
 });
 
+test("a failed running-state commit reaps the unauthorized wrapper before releasing the run", async () => {
+  const database = fakeDatabase();
+  const originalUpdate = database.updateRun.bind(database);
+  database.updateRun = (id, patch) => {
+    if (patch.status === "running") throw new Error("simulated launch persistence failure");
+    return originalUpdate(id, patch);
+  };
+  const child = fakeChild();
+  child.stdin = new PassThrough();
+  const writes = [];
+  const originalWrite = child.stdin.write.bind(child.stdin);
+  child.stdin.write = (chunk) => { writes.push(String(chunk)); return originalWrite(chunk); };
+  child.kill = (signal) => {
+    child.signals.push(signal);
+    setImmediate(() => child.emit("close", null, signal));
+    return true;
+  };
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child, terminationTimeoutMs: 1000 });
+  const run = database.createRun(codexRun("run-1"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+
+  assert.equal(writes.includes("go\n"), false, "the provider is never authorized after the durable running commit fails");
+  assert.deepEqual(child.signals, ["SIGKILL"], "the unauthorized wrapper is reaped before terminalization");
+  assert.equal(database.getRun(run.id).status, "failed");
+  assert.deepEqual(manager.activeRuns(), []);
+});
+
+test("publishes durable assistant messages before the terminal run event", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const published = [];
+  const manager = createAgentManager({ database, publish: (event) => published.push(event), spawnProcess: () => child });
+  const run = database.createRun(codexRun("run-1"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  child.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Durable answer" } }) + "\n");
+  child.emit("close", 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const messageEvents = published.filter((event) => event.type === "message.created" && event.payload?.id === "run-1:1");
+  assert.ok(messageEvents.length >= 1, "the persisted assistant message is published");
+  const lastMessageIndex = published.findLastIndex((event) => event.type === "message.created" && event.payload?.id === "run-1:1");
+  const terminalIndex = published.findIndex((event) => event.type === "run.event" && event.payload?.type === "run.completed");
+  assert.ok(lastMessageIndex >= 0 && lastMessageIndex < terminalIndex, "the final durable message is visible before completion");
+});
+
 // Regression (platform-injectable): on Windows there is no owned process
 // group, so stopping a run must tear down the wrapper's whole tree via the
 // tree-aware taskkill mechanism instead of signaling only the leader.
@@ -540,10 +586,12 @@ test("windows termination tears down the provider tree with taskkill", () => {
   // POSIX still signals the owned process group; a pid-less child falls back
   // to child.kill so injected fakes keep working.
   const signals = [];
+  const kills = [];
   const fake = { pid: 99, kill: (signal) => signals.push(signal) };
-  terminateTree(fake, "SIGTERM", "linux", run);
+  terminateTree(fake, "SIGTERM", "linux", run, (pid, signal) => kills.push([pid, signal]));
   assert.deepEqual(calls, [["taskkill", "/PID", "4242", "/T", "/F"]], "POSIX never shells out to taskkill");
   assert.deepEqual(signals, []);
+  assert.deepEqual(kills, [[-99, "SIGTERM"]], "POSIX signals only the injected owned group");
   const pidLess = { kill: (signal) => signals.push(signal) };
   terminateTree(pidLess, "SIGTERM", "linux", run);
   assert.deepEqual(signals, ["SIGTERM"], "a pid-less child falls back to child.kill");
@@ -921,7 +969,11 @@ const foreignProvider = [
 const foreign = spawn("/tmp/agent-supervisor", [foreignHandshake, process.execPath, "-e", foreignProvider], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
 while (!existsSync(foreignHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
 foreign.stdin.write("go\\n");
-while (!existsSync(foreignReady)) await new Promise((resolve) => setTimeout(resolve, 10));
+const foreignReadyDeadline = Date.now() + 10000;
+while (!existsSync(foreignReady)) {
+  if (Date.now() >= foreignReadyDeadline) throw new Error("foreign-uid descendant never signaled readiness (setuid(65534) requires a root container): " + foreignReady);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
 const foreignDescendantPid = Number(readFileSync(foreignReady, "utf8"));
 foreign.stdin.write("stop\\n");
 await waitForExit(foreign, "foreign-uid descendant cleanup");

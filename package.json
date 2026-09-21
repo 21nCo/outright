@@ -8,6 +8,7 @@
     "predev": "npm run build:supervisor",
     "prebuild": "npm run build:supervisor",
     "prestart": "npm run build:supervisor",
+    "pretest": "npm run build:supervisor",
     "dev": "vite",
     "build": "vite build && node scripts/prepare-sites-build.mjs",
     "start": "node server/standalone.mjs",

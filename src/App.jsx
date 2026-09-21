@@ -257,11 +257,10 @@ export function App() {
 
   const activeRun = conversation?.runs?.find((run) => ["queued", "launching", "running"].includes(run.status));
   const latestRun = conversation?.runs?.[0];
-  // Recovery order: replacement work may only execute once the OLDEST
-  // unresolved interrupted run is decided (the server enforces
-  // RECOVERY_ORDER_REQUIRED), so the notice surfaces that run — the end of
-  // the newest-first runs list.
-  const interruptedRun = conversation?.runs?.filter((run) => run.status === "interrupted" && !run.recoveryDecision).at(-1);
+  // The dedicated value remains correct even when the oldest unresolved run
+  // falls outside the capped newest-first run history.
+  const interruptedRun = conversation?.oldestInterruptedRun
+    ?? conversation?.runs?.filter((run) => run.status === "interrupted" && !run.recoveryDecision).at(-1);
 
   async function resolveRecovery(run, policy) {
     try {
@@ -450,7 +449,7 @@ function RecoveryNotice({ run, conversation, onResolve }) {
   }[run.recoveryClass ?? "unknown"];
   // `||`, not `??`: an empty-string conversation session must not hide a
   // session still recorded on the interrupted run.
-  const sessionId = conversation?.providerSessionId || run.providerSessionId;
+  const sessionId = run.providerSessionId || (conversation?.provider === run.provider ? conversation?.providerSessionId : null);
   return <div className="recovery-notice" role="alert"><WarningCircle weight="fill" /><div className="recovery-copy"><strong>Run interrupted by a runtime restart</strong><p>Reconciliation found {classCopy}. Review the preserved partial output above, then choose how to continue before anything is retried.</p></div><div className="recovery-actions"><Button size="sm" disabled={!sessionId} onClick={() => onResolve(run, "resume-session")}><ArrowsClockwise />Resume session</Button><Button size="sm" variant="outline" onClick={() => onResolve(run, "retry")}>Retry from scratch</Button><Button size="sm" variant="ghost" onClick={() => onResolve(run, "discard")}>Discard</Button></div></div>;
 }
 function ToolActivity({ events }) { if (!events.length) return null; return <div className="tool-activity">{events.slice(-4).map((event) => <div key={event.id}><CheckCircle /><span>{toolLabel(event)}</span></div>)}</div>; }

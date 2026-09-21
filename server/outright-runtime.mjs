@@ -11,7 +11,9 @@ import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 
 export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = defaultRecoveryProcessAlive }) {
-  const database = createOutrightDatabase();
+  // The database-backed lease is acquired before reconciliation so another
+  // live runtime can never have its queued/running rows treated as crash state.
+  const database = createOutrightDatabase({ runtimeLease: true });
   const reconciliation = database.reconcileInterruptedRuns();
   if (reconciliation.count) database.audit("runtime.runs.reconciled", { target: "runtime", ...reconciliation });
   const eventHub = createRuntimeEventHub();
@@ -155,7 +157,13 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const conversation = database.getConversation(conversationMatch[1]);
         if (!conversation) throw apiError(404, "Conversation not found");
         const messagePage = database.listMessagePage(conversation.id, { limit: 200 });
-        return json(response, 200, { ...conversation, messages: messagePage.messages, messagePage: messagePage.page, runs: database.listRuns(conversation.id) });
+        return json(response, 200, {
+          ...conversation,
+          messages: messagePage.messages,
+          messagePage: messagePage.page,
+          runs: database.listRuns(conversation.id),
+          oldestInterruptedRun: database.findUnresolvedInterruptedRun(conversation.id) ?? null,
+        });
       }
       if (conversationMatch && request.method === "PATCH") {
         const conversation = database.updateConversation(conversationMatch[1], await readJson(request));
@@ -284,15 +292,22 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         const providerInfo = agents.providers().find((item) => item.id === interrupted.provider);
         if (!providerInfo?.available) throw apiError(409, `${interrupted.provider} CLI is not available`);
-        // `||`, not `??`: an empty-string conversation session must not hide a
-        // session still recorded on the interrupted run.
-        const sessionId = conversation.providerSessionId || interrupted.providerSessionId;
+        // Recovery is bound to the immutable run session first. A mutable
+        // conversation session is only a compatible fallback when the
+        // conversation still targets the same provider.
+        const sessionId = interrupted.providerSessionId
+          || (conversation.provider === interrupted.provider ? conversation.providerSessionId : null);
         if (policy === "resume-session" && !sessionId) throw apiError(409, "No provider session is available to resume", { code: "NO_PROVIDER_SESSION" });
         const recovery = database.beginInterruptedRunRecovery(interrupted.id, policy, { providerSessionId: sessionId });
         if (!recovery) throw apiError(409, "Run is not waiting for a recovery decision");
         database.audit(`agent.run.recovery.${policy}`, { target: recovery.run.id, recoveredFrom: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
         publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: recovery.interrupted });
-        return json(response, 202, await agents.schedule({ conversation: recovery.conversation, run: recovery.run, forceFreshSession: policy === "retry" }));
+        return json(response, 202, await agents.schedule({
+          conversation: recovery.conversation,
+          run: recovery.run,
+          forceFreshSession: policy === "retry",
+          providerSessionId: policy === "retry" ? null : sessionId,
+        }));
       }
 
       if (url.pathname === "/api/trust" && request.method === "POST") {

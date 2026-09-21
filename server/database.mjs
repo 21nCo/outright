@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { mkdirSync, readdirSync, readFileSync, rmSync, unlinkSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, unlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -44,11 +44,33 @@ export function createOutrightDatabase(options = {}) {
   // An explicit filename may live outside the data directory; its parent must
   // exist for the database (and the launch records beside it) to open.
   if (filename && path.isAbsolute(filename)) mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
+  if (filename !== ":memory:" || options.launchDirectory) preparePrivateLaunchDirectory(launchDirectory);
   const db = new Database(filename);
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
-  db.pragma("busy_timeout = 5000");
-  migrate(db);
+  try {
+    // A runtime keeps SQLite in exclusive locking mode for its whole lifetime.
+    // The kernel releases this lease if the process crashes, so a second
+    // runtime cannot reconcile or schedule rows owned by the first and there
+    // is no stale lock file to recover. Administrative/test database handles
+    // opt out by default.
+    if (options.runtimeLease) {
+      db.pragma("busy_timeout = 250");
+      db.pragma("locking_mode = EXCLUSIVE");
+      db.exec("BEGIN EXCLUSIVE; COMMIT;");
+    }
+    db.pragma("journal_mode = WAL");
+    db.pragma("foreign_keys = ON");
+    db.pragma("busy_timeout = 5000");
+    migrate(db);
+  } catch (error) {
+    db.close();
+    if (options.runtimeLease && ["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error?.code)) {
+      const leaseError = new Error("Another Outright runtime already owns this database");
+      leaseError.code = "OUTRIGHT_RUNTIME_LEASE_HELD";
+      leaseError.cause = error;
+      throw leaseError;
+    }
+    throw error;
+  }
 
   return {
     filename,
@@ -182,9 +204,9 @@ export function createOutrightDatabase(options = {}) {
     },
     createRun(input) {
       const run = { id: randomUUID(), status: "queued", createdAt: now(), ...input };
-      db.prepare(`INSERT INTO runs (id, conversation_id, provider, model, reasoning_effort, approval_policy, prompt, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(run.id, run.conversationId, run.provider, run.model ?? "", run.reasoningEffort ?? "medium", run.approvalPolicy, run.prompt, run.status, run.createdAt);
+      db.prepare(`INSERT INTO runs (id, conversation_id, provider, model, reasoning_effort, approval_policy, prompt, status, provider_session_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(run.id, run.conversationId, run.provider, run.model ?? "", run.reasoningEffort ?? "medium", run.approvalPolicy, run.prompt, run.status, run.providerSessionId ?? null, run.createdAt);
       return this.getRun(run.id);
     },
     getRun(id) {
@@ -208,7 +230,11 @@ export function createOutrightDatabase(options = {}) {
         FROM runs WHERE conversation_id = ? AND status = 'interrupted' AND recovery_decision IS NULL ORDER BY created_at, rowid`).all(conversationId);
     },
     findUnresolvedInterruptedRun(conversationId) {
-      return this.listUnresolvedInterruptedRuns(conversationId)[0];
+      return db.prepare(`SELECT id, conversation_id AS conversationId, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
+        prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
+        finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
+        output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision
+        FROM runs WHERE conversation_id = ? AND status = 'interrupted' AND recovery_decision IS NULL ORDER BY created_at, rowid LIMIT 1`).get(conversationId);
     },
     // Crash-consistent restart reconciliation: queued/running rows belong to a
     // dead runtime, so none of them can ever finish under this process. Mark
@@ -300,9 +326,10 @@ export function createOutrightDatabase(options = {}) {
         const result = db.prepare("UPDATE runs SET recovery_decision = ?, finished_at = ? WHERE id = ? AND status = 'interrupted' AND recovery_decision IS NULL")
           .run(decision, now(), id);
         if (!result.changes) return null;
-        if (decision === "retry") this.updateConversation(interrupted.conversationId, { providerSessionId: null });
-        else if (providerSessionId && this.getConversation(interrupted.conversationId)?.providerSessionId !== providerSessionId) {
-          this.updateConversation(interrupted.conversationId, { providerSessionId });
+        const conversation = this.getConversation(interrupted.conversationId);
+        if (conversation?.provider === interrupted.provider) {
+          if (decision === "retry") this.updateConversation(interrupted.conversationId, { providerSessionId: null });
+          else if (providerSessionId && conversation.providerSessionId !== providerSessionId) this.updateConversation(interrupted.conversationId, { providerSessionId });
         }
         const run = this.createRun({
           conversationId: interrupted.conversationId,
@@ -311,6 +338,7 @@ export function createOutrightDatabase(options = {}) {
           reasoningEffort: interrupted.reasoningEffort,
           approvalPolicy: interrupted.approvalPolicy,
           prompt: interrupted.prompt,
+          providerSessionId: decision === "resume-session" ? providerSessionId : null,
         });
         return { interrupted: this.getRun(id), run, conversation: this.getConversation(interrupted.conversationId) };
       });
@@ -428,6 +456,21 @@ function hydratePayload(row) { return { ...row, payload: parseJson(row.payload, 
 function hydrateDetails(row) { return { ...row, details: parseJson(row.details, {}) }; }
 function parseJson(value, fallback) { try { return JSON.parse(value); } catch { return fallback; } }
 function now() { return new Date().toISOString(); }
+function preparePrivateLaunchDirectory(directory) {
+  if (!directory || !path.isAbsolute(directory)) throw new Error("A private absolute launch directory is required");
+  try { mkdirSync(directory, { mode: 0o700 }); }
+  catch (error) { if (error?.code !== "EEXIST") throw error; }
+  let stat = lstatSync(directory);
+  const wrongOwner = typeof process.getuid === "function" && stat.uid !== process.getuid();
+  if (stat.isSymbolicLink() || !stat.isDirectory() || wrongOwner) {
+    throw new Error("Launch directory must be a private, non-symlink directory owned by the runtime user");
+  }
+  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+    chmodSync(directory, 0o700);
+    stat = lstatSync(directory);
+  }
+  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) throw new Error("Launch directory must not grant group or other permissions");
+}
 // Reads the launch wrapper's durable self-recorded process identity for a run
 // still in the 'launching' phase. Absent or malformed records return null; the
 // run then provably never reached authorization and reconciles as

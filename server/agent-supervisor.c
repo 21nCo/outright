@@ -162,6 +162,7 @@ static process_snapshot inspect_owned_tree(pid_t supervisor_pid, pid_t provider_
     return snapshot;
   }
   struct dirent *entry;
+  errno = 0;
   while ((entry = readdir(directory)) != NULL) {
     char *end = NULL;
     long value = strtol(entry->d_name, &end, 10);
@@ -189,7 +190,8 @@ static process_snapshot inspect_owned_tree(pid_t supervisor_pid, pid_t provider_
     if (state != 'Z') snapshot.live_count++;
     if (kill_live_members && state != 'Z' && pid != provider_pid) kill(pid, SIGKILL);
   }
-  closedir(directory);
+  if (errno != 0) snapshot.complete = false;
+  if (closedir(directory) != 0) snapshot.complete = false;
   return snapshot;
 }
 
@@ -202,6 +204,18 @@ static void reap_children(pid_t provider_pid, bool *provider_reaped, int *provid
       *provider_reaped = true;
       *provider_status = status;
     }
+  }
+}
+
+static bool no_children_remaining(void) {
+  siginfo_t info;
+  memset(&info, 0, sizeof(info));
+  for (;;) {
+    // WNOWAIT proves whether an adopted/live child still exists without
+    // consuming a provider status that reap_children() must preserve.
+    if (waitid(P_ALL, 0, &info, WEXITED | WNOHANG | WNOWAIT) == 0) return false;
+    if (errno == EINTR) continue;
+    return errno == ECHILD;
   }
 }
 
@@ -314,7 +328,8 @@ int main(int argc, char **argv) {
       }
       reap_children(provider_pid, &provider_reaped, &provider_status);
       snapshot = inspect_owned_tree(getpid(), provider_pid, true);
-      if (provider_reaped && snapshot.complete && snapshot.count == 0) {
+      bool tree_empty = snapshot.complete ? snapshot.count == 0 : no_children_remaining();
+      if (provider_reaped && tree_empty) {
         unlink(handshake_path);
         if (stop_requested || termination_requested) _exit(137);
         exit_like_provider(provider_status);

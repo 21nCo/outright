@@ -1,6 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
-import os from "node:os";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -173,8 +172,8 @@ export function defaultLaunchCommand(command, run, launchDirectory) {
 
 export function createAgentManager({ database, publish, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
   const resolvedLaunchDirectory = launchDirectory
-    ?? database.launchDirectory
-    ?? (database.filename ? path.join(path.dirname(database.filename), "launches") : path.join(os.tmpdir(), "outright-launches"));
+    ?? database.launchDirectory;
+  assertPrivateLaunchDirectory(resolvedLaunchDirectory);
   const active = new Map();
   const queue = [];
   let shuttingDown = false;
@@ -187,9 +186,9 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     ];
   }
 
-  async function schedule({ conversation, run, forceFreshSession = false }) {
+  async function schedule({ conversation, run, forceFreshSession = false, providerSessionId }) {
     if (shuttingDown) throw new Error("Agent manager is shutting down");
-    const entry = { conversation, run, forceFreshSession };
+    const entry = { conversation, run, forceFreshSession, providerSessionId };
     queue.push(entry);
     emit(run.id, "run.queued", { position: queue.length });
     drain();
@@ -197,7 +196,7 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     return database.getRun(run.id);
   }
 
-  function start(state) {
+  async function start(state) {
     const { conversation, run } = state;
     const command = buildProviderCommand(conversation, run);
     const launch = launchCommand(command, run, resolvedLaunchDirectory);
@@ -222,11 +221,8 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     state.child = child;
     state.launchHandshakePath = launch.handshakePath;
     state.ownsDescendants = Boolean(launch.ownsDescendants);
-    // Phase 2: durable process ownership BEFORE the provider is authorized.
-    // If the runtime dies before this commit, the wrapper's handshake file
-    // still carries the pid and the row is provably unauthorized.
-    database.updateRun(run.id, { pid: child.pid ?? null, status: "running" });
-
+    let resolveChildClosed;
+    const childClosed = new Promise((resolve) => { resolveChildClosed = resolve; });
     consumeBoundedLines(child.stdout, {
       maxLineBytes: MAX_PROVIDER_LINE_BYTES,
       onLine: (line) => handleProviderLine(state, line),
@@ -239,14 +235,38 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     });
     child.on("error", (error) => {
       state.processError = error;
-      if (!child.pid) { state.closed = true; finish(state, null, error); }
+      if (!child.pid) {
+        state.closed = true;
+        resolveChildClosed();
+        if (!state.launchPersistenceError) finish(state, null, error);
+      }
     });
     child.on("close", (code, signal) => {
       state.closed = true;
       state.exitCode = code;
       state.processError ??= signal ? new Error(`Process stopped by ${signal}`) : null;
-      if (!state.stopped) finish(state, code, state.processError);
+      resolveChildClosed();
+      if (!state.launchPersistenceError && !state.stopped) finish(state, code, state.processError);
     });
+    // Phase 2: durable process ownership BEFORE the provider is authorized.
+    // If the runtime dies before this commit, the wrapper's handshake file
+    // still carries the pid and the row is provably unauthorized.
+    try {
+      database.updateRun(run.id, { pid: child.pid ?? null, status: "running" });
+    } catch (error) {
+      // The provider is still unauthorized. Tear down and verify the wrapper
+      // before terminalizing the run, otherwise a failed SQLite write could
+      // release the slot while an untracked OS process remains alive.
+      state.launchPersistenceError = error;
+      try { child.stdin?.end?.(); } catch { /* The wrapper already exited. */ }
+      terminateTree(child, "SIGKILL");
+      const closed = await Promise.race([
+        childClosed.then(() => true),
+        new Promise((resolve) => setTimeout(() => resolve(false), terminationTimeoutMs)),
+      ]);
+      if (!closed) error.preserveActiveRun = true;
+      throw error;
+    }
     // Phase 3: authorize. Only now may the provider start side effects.
     authorizeLaunch(child);
   }
@@ -312,6 +332,7 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     // A crash can therefore leave the run recoverable, but never terminal with
     // its final assistant segment missing.
     const finished = database.finishRun(state.run.id, { status, finishedAt, exitCode, error: message || null, pid: null }, transcriptMessage);
+    if (finished.message) publish({ type: "message.created", conversationId: state.conversation.id, payload: finished.message });
     active.delete(state.run.id);
     clearAssistant(state);
     database.audit(`agent.run.${status}`, { target: state.run.id, exitCode, error: message || undefined });
@@ -365,7 +386,11 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
             groupEscalated = true;
           }
           if (elapsed >= terminationTimeoutMs) {
-            // Preserve ownership and report failure; never claim a live tree stopped.
+            // A native supervisor is the only process that can adopt and reap
+            // escaped descendants. If it hangs or is hard-killed, falling back
+            // to a group kill would orphan zombies to PID 1 and recreate the
+            // leak this ownership boundary prevents. Fail closed, retain the
+            // durable handshake, and never claim the tree stopped.
             state.stopping = null;
             throw new Error(`Agent process tree did not terminate: ${runId}`);
           }
@@ -409,10 +434,12 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
           authorize?.();
           // A recovery retry explicitly asks for a new provider session even
           // when the conversation still advertises the interrupted one.
-          state.conversation = entry.forceFreshSession ? { ...current, providerSessionId: null } : current;
-          start(state);
+          state.conversation = entry.providerSessionId !== undefined
+            ? { ...current, providerSessionId: entry.providerSessionId }
+            : entry.forceFreshSession ? { ...current, providerSessionId: null } : current;
+          await start(state);
         } catch (error) {
-          if (!state.stopped) finish(state, null, error);
+          if (!state.stopped && !error?.preserveActiveRun) finish(state, null, error);
         }
       })();
     }
@@ -480,7 +507,9 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     // The capped body plus truncation marker is now durable; discarded deltas
     // beyond the cap must not schedule further rewrites of the same body.
     if (state.assistantTruncated) state.checkpointHalted = true;
-    return database.upsertMessage(message);
+    const stored = database.upsertMessage(message);
+    publish({ type: "message.created", conversationId: state.conversation.id, payload: stored });
+    return stored;
   }
 
   function emit(runId, type, payload) {
@@ -511,14 +540,14 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
 // wrapper's entire tree, which is the only portable tree-aware mechanism; if
 // it is unavailable the conservative recovery probes never trust a gone
 // Windows leader (see defaultProbeRun/defaultRecoveryProcessAlive).
-export function terminateTree(child, signal, platform = process.platform, run = spawnSync) {
+export function terminateTree(child, signal, platform = process.platform, run = spawnSync, kill = process.kill) {
   try {
     if (!child?.pid) { child?.kill?.(signal); return; }
     if (platform === "win32") {
       run("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
       return;
     }
-    process.kill(-child.pid, signal);
+    kill(-child.pid, signal);
   } catch { /* The process group already exited. */ }
 }
 
@@ -533,7 +562,7 @@ export function terminateTree(child, signal, platform = process.platform, run = 
 // owned group is killed as before.
 export function escalateTree(child, handshakePath, platform = process.platform, run = spawnSync, kill = process.kill) {
   if (platform === "win32") {
-    terminateTree(child, "SIGKILL", platform, run);
+    terminateTree(child, "SIGKILL", platform, run, kill);
     return "group";
   }
   if (!child?.pid) {
@@ -797,6 +826,22 @@ export function normalizeClaude(raw) {
   }
   if (!events.length && raw.type !== "stream_event") events.push({ type: "provider.event", payload: raw });
   return events;
+}
+
+function assertPrivateLaunchDirectory(directory) {
+  if (!directory || !path.isAbsolute(directory)) throw new Error("A private absolute launch directory is required");
+  try { mkdirSync(directory, { mode: 0o700 }); }
+  catch (error) { if (error?.code !== "EEXIST") throw error; }
+  let stat = lstatSync(directory);
+  const wrongOwner = typeof process.getuid === "function" && stat.uid !== process.getuid();
+  if (stat.isSymbolicLink() || !stat.isDirectory() || wrongOwner) {
+    throw new Error("Launch directory must be a private, non-symlink directory owned by the runtime user");
+  }
+  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+    chmodSync(directory, 0o700);
+    stat = lstatSync(directory);
+  }
+  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) throw new Error("Launch directory must not grant group or other permissions");
 }
 
 function detectProvider(id, label, versionArgs, models) {

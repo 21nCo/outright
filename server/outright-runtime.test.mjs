@@ -116,6 +116,32 @@ test("reconciles runs at startup and resolves discard decisions through the API"
   assert.equal(repeat.statusCode, 409, "decisions are final");
 }));
 
+test("holds an exclusive runtime lease before startup reconciliation", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-lease-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+  let first;
+  let replacement;
+  try {
+    first = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    const conversation = first.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Lease", provider: "codex" });
+    const queued = first.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "still owned" });
+    assert.throws(
+      () => createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" }),
+      (error) => error?.code === "OUTRIGHT_RUNTIME_LEASE_HELD",
+    );
+    assert.equal(first.database.getRun(queued.id).status, "queued", "the rejected runtime must not reconcile the live owner's queue");
+    await first.shutdown();
+    first = null;
+    replacement = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+  } finally {
+    await first?.shutdown();
+    await replacement?.shutdown();
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
 test("rejects a malformed recovery policy with 400", withRuntime(async (runtime) => {
   const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
   const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
@@ -457,7 +483,7 @@ async function withLaunchCrash({ status, handshake }, fn) {
     if (handshake) {
       // The wrapper's durable self-recorded identity, written before the crash.
       pid = await deadProcessId();
-      mkdirSync(seeded.launchDirectory, { recursive: true });
+      mkdirSync(seeded.launchDirectory, { recursive: true, mode: 0o700 });
       writeFileSync(path.join(seeded.launchDirectory, `${run.id}.json`), JSON.stringify({ pid, authorized: false, createdAt: new Date().toISOString() }));
     }
     seeded.close();
@@ -514,6 +540,22 @@ test("a crash after launch identity but before authorization keeps the pid and s
   await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), discarded);
   assert.equal(discarded.statusCode, 200, `the run must remain resolvable by an explicit decision: ${JSON.stringify(discarded.body)}`);
   assert.equal(runtime.database.findUnresolvedInterruptedRun(conversation.id), undefined);
+}));
+
+test("conversation recovery metadata exposes the true oldest interrupted run beyond the bounded run history", withRuntime(async (runtime) => {
+  const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+  const oldest = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "oldest", createdAt: "2026-09-21T00:00:00.000Z" });
+  runtime.database.updateRun(oldest.id, { status: "interrupted", recoveryClass: "never-started" });
+  for (let index = 0; index < 205; index++) {
+    runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: `newer-${index}`, status: "failed", createdAt: `2026-09-22T${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}:00.000Z` });
+  }
+
+  const response = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `/api/conversations/${conversation.id}`), response);
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.runs.length, 200, "run history stays bounded");
+  assert.equal(response.body.runs.some((run) => run.id === oldest.id), false, "the oldest run is outside the bounded history");
+  assert.equal(response.body.oldestInterruptedRun.id, oldest.id, "dedicated recovery metadata remains complete");
 }));
 
 // End-to-end on a real discovered, trusted worktree: replacement execution
