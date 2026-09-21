@@ -223,7 +223,12 @@ test("flushes a stalled sub-threshold delta tail after the checkpoint interval",
   // the next delta happens to arrive.
   child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: " second" } } }) + "\n");
   assert.equal(database.messages[0].body, "first", "the tail coalesces in memory first");
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  // Poll with a deadline instead of a fixed sleep so CPU contention cannot
+  // flake the 50 ms coalescing-timer assertion.
+  const deadline = Date.now() + 1000;
+  while (database.messages[0].body !== "first second" && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
   assert.equal(database.messages.length, 1);
   assert.equal(database.messages[0].body, "first second");
   assert.equal(database.messages[0].id, "run-1:1");
@@ -283,6 +288,30 @@ test("commits the final transcript checkpoint with terminal run state", async ()
   assert.equal(database.finishes[0].transcriptMessage.body, "Final segment");
   assert.equal(database.getRun("run-1").status, "completed");
   assert.deepEqual(database.messages.map((message) => message.body), ["Final segment"]);
+});
+
+// Regression: checkpoints used to trim the assembled body before persisting,
+// so a crash after a checkpoint recovered altered text — leading indentation
+// and partial trailing whitespace were irreversibly lost.
+test("persists streamed assistant edge whitespace exactly at checkpoints", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  database.createRun({ ...codexRun("run-1"), provider: "claude" });
+  await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-1") });
+
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "  indented start\n" } } }) + "\n");
+  // The first delta of a segment flushes immediately, so this checkpoint is
+  // exactly what a restart would recover.
+  assert.equal(database.messages.length, 1);
+  assert.equal(database.messages[0].body, "  indented start\n", "the checkpoint must preserve leading indentation and the trailing newline");
+
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "tail " } } }) + "\n");
+  child.emit("close", 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(database.getRun("run-1").status, "completed");
+  assert.equal(database.messages[0].body, "  indented start\ntail ", "the final commit must preserve the partial trailing space");
 });
 
 test("records the provider pid while running and clears it at finish", async () => {

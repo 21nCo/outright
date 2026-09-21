@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Readable } from "node:stream";
-import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAlive, runtimeAllowedHosts } from "./outright-runtime.mjs";
+import { createOutrightDatabase } from "./database.mjs";
 
 function request(host, origin) {
   return { headers: { host, ...(origin ? { origin } : {}) } };
@@ -29,6 +31,15 @@ function responseCapture() {
   };
 }
 
+async function deadProcessId() {
+  // A pid that is guaranteed exited (and, on POSIX, a fully dead detached
+  // process group), so default probes classify it verifiably exited.
+  const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore", detached: process.platform !== "win32" });
+  const pid = child.pid;
+  await new Promise((resolve) => child.once("exit", resolve));
+  return pid;
+}
+
 function withRuntime(fn, options = {}) {
   return async () => {
     const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-"));
@@ -42,6 +53,48 @@ function withRuntime(fn, options = {}) {
       await runtime.shutdown();
       delete process.env.OUTRIGHT_DATA_DIR;
       rmSync(dataDirectory, { recursive: true, force: true });
+    }
+  };
+}
+
+// A full harness with a real discovered, trusted git worktree and a fake
+// provider CLI on PATH, so successful submissions and replacement runs can be
+// exercised end-to-end through the HTTP surface. POSIX-only: the fake provider
+// CLI is a shell script, so callers must skip on win32.
+function withWorktreeRuntime(fn, options = {}) {
+  return async () => {
+    const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "outright-e2e-")));
+    const repo = path.join(root, "repo");
+    const bin = path.join(root, "bin");
+    const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-"));
+    const previousPath = process.env.PATH;
+    const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+    let runtime;
+    try {
+      for (const args of [["init", repo], ["-C", repo, "config", "user.email", "test@example.com"], ["-C", repo, "config", "user.name", "Test"], ["-C", repo, "commit", "--allow-empty", "-m", "init"]]) {
+        const result = spawnSync("git", args, { encoding: "utf8" });
+        if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+      }
+      mkdirSync(bin, { recursive: true });
+      writeFileSync(path.join(bin, "codex"), "#!/bin/sh\nexit 0\n");
+      chmodSync(path.join(bin, "codex"), 0o755);
+      const configFile = path.join(root, "outright.config.json");
+      writeFileSync(configFile, JSON.stringify({ scanRoots: [root], maxDepth: 2, maxProjects: 8 }));
+      process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+      process.env.PATH = `${bin}${path.delimiter}${previousPath}`;
+      runtime = createOutrightRuntime({ configUrl: pathToFileURL(configFile), ...options });
+      const scan = await runtime.projects();
+      const project = scan.projects.find((item) => item.path === repo);
+      const worktree = project?.worktrees.find((item) => !item.isLinked);
+      if (!project || !worktree) throw new Error("the temp repo was not discovered as a project worktree");
+      runtime.database.trustProject(project.id, project.path);
+      await fn(runtime, { project, worktree });
+    } finally {
+      process.env.PATH = previousPath;
+      if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+      await runtime?.shutdown();
+      rmSync(dataDirectory, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
     }
   };
 }
@@ -199,12 +252,175 @@ test("a discard on an unknown process tree cannot be followed by a newly schedul
   await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), discarded);
   assert.equal(discarded.statusCode, 200);
   assert.equal(runtime.database.getRun(run.id).status, "failed");
+  assert.equal(runtime.database.findUnresolvedInterruptedRun(conversation.id), undefined, "no unresolved interrupted run remains after the verified discard");
+
+  // The gate actually reopening for a real submission (202 plus a scheduled
+  // replacement run on a discovered, trusted worktree) is proven end-to-end by
+  // the "opens the recovery gate" test on the real-worktree harness below.
+  }, { recoveryProcessAlive: () => treeVerdict });
+})());
+
+// Regression: recovery used to validate only the selected interrupted run, so a
+// conversation holding an older started run plus a newer queued run could
+// schedule the queued run's replacement work while the older run's process
+// tree was still live or unverifiable and mutating the same worktree.
+test("blocks recovery of a newer run while an older interrupted run is unresolved", (() => {
+  let treeVerdict = "alive";
+  return withRuntime(async (runtime) => {
+    const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const older = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "started before the crash" });
+    const newer = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "still queued at the crash" });
+    runtime.database.updateRun(older.id, { status: "running", pid: 424242 });
+    runtime.database.reconcileInterruptedRuns({ probeAlive: () => true });
+    assert.equal(runtime.database.getRun(older.id).recoveryClass, "alive");
+    assert.equal(runtime.database.getRun(newer.id).recoveryClass, "never-started");
+
+    // The UI selects the newest interrupted run first. While the older run's
+    // tree is live, every policy for the newer run stays blocked.
+    const blocked = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${newer.id}/resume`, { policy: "discard" }), blocked);
+    assert.equal(blocked.statusCode, 409);
+    assert.equal(blocked.body.code, "RECOVERY_PROCESS_ACTIVE");
+    assert.equal(runtime.database.getRun(newer.id).recoveryDecision, null);
+    assert.equal(runtime.database.getRun(older.id).recoveryDecision, null);
+    assert.deepEqual(runtime.database.listRuns(conversation.id).filter((candidate) => candidate.status === "queued"), [], "no replacement run may be scheduled");
+
+    // An unverifiable older tree blocks the newer run just the same.
+    treeVerdict = "unknown";
+    const unknownTree = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${newer.id}/resume`, { policy: "retry" }), unknownTree);
+    assert.equal(unknownTree.statusCode, 409);
+    assert.equal(unknownTree.body.code, "RECOVERY_PROCESS_UNKNOWN");
+
+    // Only once the older tree is verifiably exited may the newer run be
+    // resolved — and the older run itself still awaits its own decision.
+    treeVerdict = "exited";
+    const newerDiscard = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${newer.id}/resume`, { policy: "discard" }), newerDiscard);
+    assert.equal(newerDiscard.statusCode, 200);
+    const gate = runtime.database.findUnresolvedInterruptedRun(conversation.id);
+    assert.equal(gate.id, older.id, "the submission gate stays on the older run until it is resolved too");
+
+    const olderDiscard = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${older.id}/resume`, { policy: "discard" }), olderDiscard);
+    assert.equal(olderDiscard.statusCode, 200);
+    assert.equal(runtime.database.findUnresolvedInterruptedRun(conversation.id), undefined);
+  }, { recoveryProcessAlive: () => treeVerdict });
+})());
+
+// Regression: the discard branch did not check the conditional update result,
+// so the loser of a concurrent decision race returned HTTP 200 with a null
+// body and published a bogus resolution event.
+test("concurrent discard requests resolve exactly one decision", withRuntime(async (runtime) => {
+  const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+  const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+  runtime.database.updateRun(run.id, { status: "running", pid: 424242 });
+  runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+
+  // Two discard decisions race: both pass the initial state check before
+  // either records its decision (the probe await interleaves them).
+  const first = responseCapture();
+  const second = responseCapture();
+  await Promise.all([
+    runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), first),
+    runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), second),
+  ]);
+  const statuses = [first.statusCode, second.statusCode].sort();
+  assert.deepEqual(statuses, [200, 409], "exactly one request records the decision; the loser gets a conflict, never a null success");
+  const winner = first.statusCode === 200 ? first : second;
+  const loser = first.statusCode === 200 ? second : first;
+  assert.equal(winner.body.recoveryDecision, "discard");
+  assert.notEqual(loser.body, null, "the losing response must carry an error body");
+  const discards = runtime.database.listAudit(100).filter((entry) => entry.action === "agent.run.recovery.discard");
+  assert.equal(discards.length, 1, "one discard audit entry per run decision");
+}, { recoveryProcessAlive: () => "exited" }));
+
+// Regression: construction-time reconciliation is the restart entrypoint. The
+// runtime must mark pre-existing pending runs interrupted when it is created,
+// without a manual reconcile call.
+test("startup reconciliation marks pre-existing pending runs interrupted at construction", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+  let runtime;
+  try {
+    const seeded = createOutrightDatabase();
+    const conversation = seeded.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = seeded.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+    const pid = await deadProcessId();
+    seeded.updateRun(run.id, { status: "running", pid });
+    seeded.close();
+
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    const recovered = runtime.database.getRun(run.id);
+    assert.equal(recovered.status, "interrupted", "construction must reconcile pending rows from the previous runtime");
+    assert.equal(recovered.recoveryClass, process.platform === "win32" ? "unknown" : "exited");
+  } finally {
+    await runtime?.shutdown();
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+// End-to-end on a real discovered, trusted worktree: after a verified discard,
+// the recovery gate must actually reopen — a normal submission is accepted and
+// schedules a replacement run.
+test("opens the recovery gate and schedules a replacement run after a verified discard", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Recovery", provider: "codex" });
+  const interrupted = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+  const pid = await deadProcessId();
+  runtime.database.updateRun(interrupted.id, { status: "running", pid });
+  runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+
+  const blocked = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "silently resume" }), blocked);
+  assert.equal(blocked.statusCode, 409);
+  assert.equal(blocked.body.code, "RUN_RECOVERY_REQUIRED");
+
+  const discarded = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${interrupted.id}/resume`, { policy: "discard" }), discarded);
+  assert.equal(discarded.statusCode, 200);
 
   const reopened = responseCapture();
   await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "start fresh after verified termination" }), reopened);
-  assert.notEqual(reopened.body?.code, "RUN_RECOVERY_REQUIRED", "the recovery gate must open only after the discard on a verified-exited tree");
-  }, { recoveryProcessAlive: () => treeVerdict });
-})());
+  assert.equal(reopened.statusCode, 202, `the gate must reopen: ${JSON.stringify(reopened.body)}`);
+  assert.ok(reopened.body?.id, "the submission returns the scheduled replacement run");
+  assert.notEqual(reopened.body.id, interrupted.id);
+  assert.equal(runtime.database.findUnresolvedInterruptedRun(conversation.id), undefined);
+  const runs = runtime.database.listRuns(conversation.id);
+  assert.equal(runs.length, 2, "the replacement run is durably scheduled");
+  const replacement = runs.find((candidate) => candidate.id === reopened.body.id);
+  assert.ok(replacement, "the replacement run is persisted");
+}, { recoveryProcessAlive: () => "exited" }));
+
+// Regression: a verified-exited probe used to clear the interrupted run's pid
+// before policy validation. A later validation failure (unavailable provider,
+// no resumable session) then left the run with no process identity, so every
+// later attempt was rejected RECOVERY_PROCESS_UNKNOWN and the conversation was
+// permanently gated. The pid must survive until a decision actually commits.
+test("a failed validation after a verified-exited probe leaves recovery retryable", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Recovery", provider: "codex" });
+  const interrupted = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+  const pid = await deadProcessId();
+  runtime.database.updateRun(interrupted.id, { status: "running", pid });
+  runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+
+  // resume-session with no recorded session fails validation after the probe.
+  const failed = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${interrupted.id}/resume`, { policy: "resume-session" }), failed);
+  assert.equal(failed.statusCode, 409);
+  assert.equal(failed.body.code, "NO_PROVIDER_SESSION");
+  assert.equal(runtime.database.getRun(interrupted.id).pid, pid, "the verified pid is retained after the failed validation");
+  assert.equal(runtime.database.getRun(interrupted.id).recoveryDecision, null);
+
+  // The run is still retryable: a discard now succeeds instead of being
+  // permanently rejected as an unverifiable tree.
+  const discarded = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${interrupted.id}/resume`, { policy: "discard" }), discarded);
+  assert.equal(discarded.statusCode, 200);
+  assert.equal(runtime.database.findUnresolvedInterruptedRun(conversation.id), undefined);
+}, { recoveryProcessAlive: () => "exited" }));
+
 
 test("the default recovery probe is conservative per platform", async () => {
   const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore", detached: process.platform !== "win32" });

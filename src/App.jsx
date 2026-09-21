@@ -444,7 +444,9 @@ function RecoveryNotice({ run, conversation, onResolve }) {
     alive: "its provider process was still running after the restart and is no longer supervised; partial side effects may exist",
     unknown: "the provider process state could not be determined; partial side effects may exist",
   }[run.recoveryClass ?? "unknown"];
-  const sessionId = conversation?.providerSessionId ?? run.providerSessionId;
+  // `||`, not `??`: an empty-string conversation session must not hide a
+  // session still recorded on the interrupted run.
+  const sessionId = conversation?.providerSessionId || run.providerSessionId;
   return <div className="recovery-notice" role="alert"><WarningCircle weight="fill" /><div className="recovery-copy"><strong>Run interrupted by a runtime restart</strong><p>Reconciliation found {classCopy}. Review the preserved partial output above, then choose how to continue before anything is retried.</p></div><div className="recovery-actions"><Button size="sm" disabled={!sessionId} onClick={() => onResolve(run, "resume-session")}><ArrowsClockwise />Resume session</Button><Button size="sm" variant="outline" onClick={() => onResolve(run, "retry")}>Retry from scratch</Button><Button size="sm" variant="ghost" onClick={() => onResolve(run, "discard")}>Discard</Button></div></div>;
 }
 function ToolActivity({ events }) { if (!events.length) return null; return <div className="tool-activity">{events.slice(-4).map((event) => <div key={event.id}><CheckCircle /><span>{toolLabel(event)}</span></div>)}</div>; }

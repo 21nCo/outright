@@ -137,6 +137,66 @@ test("classifies a live leader as alive on platforms without owned process trees
   assert.equal(defaultProbeRun(process.pid, "win32"), "alive");
 });
 
+// Regression: reconciliation used to read pending rows before its transaction
+// and update each row by identifier without rechecking status. A runtime that
+// still owned the run could finish it between those operations, and the
+// terminal state was then overwritten with "interrupted", forcing a bogus
+// recovery decision on a completed run.
+test("reconciliation never reopens a run that finished concurrently", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "concurrently finished" });
+    database.updateRun(run.id, { status: "running", pid: 4242 });
+    const result = database.reconcileInterruptedRuns({
+      probeAlive: () => {
+        // The owning runtime finishes the run while the probe runs.
+        database.updateRun(run.id, { status: "completed", finishedAt: "2026-09-21T00:00:00.000Z", exitCode: 0, pid: null });
+        return "exited";
+      },
+    });
+    assert.equal(result.count, 0, "a concurrently finished run is not reconciled");
+    assert.equal(database.getRun(run.id).status, "completed");
+    assert.equal(database.getRun(run.id).recoveryClass, null);
+  } finally {
+    database.close();
+  }
+});
+
+// Regression: assistant checkpoints reuse one stable createdAt for the whole
+// stream, so a plain overwrite regressed conversations.updated_at after a newer
+// tool or user message advanced it, moving an active conversation down the
+// sidebar and search ordering while it was still streaming.
+test("message writes never move conversations.updated_at backwards", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    // Future-offset timestamps keep every value above the conversation's real
+    // creation time so MAX() comparisons are deterministic.
+    const checkpointAt = new Date(Date.now() + 100_000).toISOString();
+    const toolAt = new Date(Date.now() + 105_000).toISOString();
+    const segmentAt = new Date(Date.now() + 110_000).toISOString();
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Streaming", provider: "claude" });
+    const base = { id: `${conversation.id}:1`, conversationId: conversation.id, role: "assistant", kind: "text", createdAt: checkpointAt, payload: null };
+    database.upsertMessage({ ...base, body: "Partial" });
+    assert.equal(database.getConversation(conversation.id).updatedAt, checkpointAt);
+
+    // A newer tool message advances the conversation timestamp.
+    database.addMessage({ id: `${conversation.id}:2`, conversationId: conversation.id, role: "assistant", kind: "tool", body: "Tool completed: run", createdAt: toolAt });
+    assert.equal(database.getConversation(conversation.id).updatedAt, toolAt);
+
+    // The next assistant checkpoint carries the older stable createdAt and
+    // must not regress the newer timestamp.
+    database.upsertMessage({ ...base, body: "Partial answer" });
+    assert.equal(database.getConversation(conversation.id).updatedAt, toolAt, "the checkpoint must not regress updated_at");
+
+    // A newer checkpoint still advances it.
+    database.upsertMessage({ ...base, id: `${conversation.id}:3`, body: "New segment", createdAt: segmentAt });
+    assert.equal(database.getConversation(conversation.id).updatedAt, segmentAt);
+  } finally {
+    database.close();
+  }
+});
+
 test("records a recovery decision exactly once", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

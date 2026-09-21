@@ -392,7 +392,12 @@ function archiveAssistant(state, persist) {
 }
 
 function pendingAssistantMessage(state) {
-  const body = assistantBody(state).trim();
+  // The body is persisted exactly as streamed: no trimming. A crash after a
+  // timed or byte-bounded checkpoint recovers the stored text, so trimming
+  // here would irreversibly drop leading indentation or a partial trailing
+  // newline from the preserved output. Only a genuinely empty body suppresses
+  // the message.
+  const body = assistantBody(state);
   if (!body) return null;
   if (!state.assistantMessageId) {
     state.transcriptSeq = (state.transcriptSeq ?? 0) + 1;

@@ -220,33 +220,47 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const conversation = database.getConversation(interrupted.conversationId);
         if (!conversation) throw apiError(404, "Conversation not found");
 
-        // Every previously started run is re-probed before a decision is
-        // applied, regardless of the restart-time classification: a detached
-        // leader can exit while provider descendants still hold the process
-        // group and mutate the worktree. Only a verified-exited (or never
-        // started) run may be resolved. A verifiably live process blocks every
-        // policy; an unverifiable tree (e.g. on Windows, where the spawned
-        // tree is not owned and a gone leader proves nothing) blocks every
-        // policy too — including discard, because a recorded discard would
-        // clear the submission gate and let a new run start while the
-        // original descendants may still mutate the same worktree.
-        if (interrupted.recoveryClass !== "never-started") {
-          if (Number.isSafeInteger(interrupted.pid) && interrupted.pid > 0) {
-            const verdict = recoveryVerdict(await recoveryProcessAlive(interrupted.pid));
-            if (verdict === "alive") {
-              throw apiError(409, "The recovered provider process is still active; stop it before choosing a recovery policy", { code: "RECOVERY_PROCESS_ACTIVE", pid: interrupted.pid });
-            }
-            if (verdict !== "exited") {
-              throw apiError(409, "The recovered provider process cannot be verified, so no recovery decision can be recorded yet", { code: "RECOVERY_PROCESS_UNKNOWN", pid: interrupted.pid });
-            }
-            interrupted = database.updateRun(interrupted.id, { recoveryClass: "exited", pid: null });
-          } else {
-            throw apiError(409, "The recovered provider process cannot be verified, so no recovery decision can be recorded yet", { code: "RECOVERY_PROCESS_UNKNOWN" });
+        // Every unresolved interrupted run of the conversation is verified
+        // before any decision is recorded — not only the selected one. A
+        // conversation can carry an older started run plus a newer
+        // never-started (queued) run at the crash; recovering the queued run
+        // must not schedule replacement work while the older run's process
+        // tree can still mutate the worktree.
+        //
+        // Each previously started run is re-probed regardless of its
+        // restart-time classification: a detached leader can exit while
+        // provider descendants still hold the process group. Only a
+        // verified-exited (or never started) run may be resolved. A verifiably
+        // live process blocks every policy; an unverifiable tree (e.g. on
+        // Windows, where the spawned tree is not owned and a gone leader
+        // proves nothing) blocks every policy too — including discard, because
+        // a recorded discard would clear the submission gate and let a new run
+        // start while the original descendants may still mutate the same
+        // worktree.
+        for (const pending of database.listUnresolvedInterruptedRuns(conversation.id)) {
+          if (pending.recoveryClass === "never-started") continue;
+          if (!(Number.isSafeInteger(pending.pid) && pending.pid > 0)) {
+            throw apiError(409, "An interrupted provider process cannot be verified, so no recovery decision can be recorded yet", { code: "RECOVERY_PROCESS_UNKNOWN", runId: pending.id });
+          }
+          const verdict = recoveryVerdict(await recoveryProcessAlive(pending.pid));
+          if (verdict === "alive") {
+            throw apiError(409, "An interrupted provider process is still active; stop it before choosing a recovery policy", { code: "RECOVERY_PROCESS_ACTIVE", pid: pending.pid, runId: pending.id });
+          }
+          if (verdict !== "exited") {
+            throw apiError(409, "An interrupted provider process cannot be verified, so no recovery decision can be recorded yet", { code: "RECOVERY_PROCESS_UNKNOWN", pid: pending.pid, runId: pending.id });
+          }
+          if (pending.id === interrupted.id) {
+            // Record the verified-exited classification but keep the pid: a
+            // later validation failure (unavailable provider, missing
+            // resumable session) must leave the run retryable, not strip its
+            // only process identity and permanently reject it as unknown.
+            interrupted = database.updateRun(interrupted.id, { recoveryClass: "exited" });
           }
         }
 
         if (policy === "discard") {
           const resolved = database.resolveInterruptedRun(interrupted.id, policy);
+          if (!resolved) throw apiError(409, "Run is not waiting for a recovery decision");
           database.audit("agent.run.recovery.discard", { target: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
           publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: resolved });
           return json(response, 200, resolved);
@@ -258,7 +272,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         const providerInfo = agents.providers().find((item) => item.id === interrupted.provider);
         if (!providerInfo?.available) throw apiError(409, `${interrupted.provider} CLI is not available`);
-        const sessionId = conversation.providerSessionId ?? interrupted.providerSessionId;
+        // `||`, not `??`: an empty-string conversation session must not hide a
+        // session still recorded on the interrupted run.
+        const sessionId = conversation.providerSessionId || interrupted.providerSessionId;
         if (policy === "resume-session" && !sessionId) throw apiError(409, "No provider session is available to resume", { code: "NO_PROVIDER_SESSION" });
         const recovery = database.beginInterruptedRunRecovery(interrupted.id, policy, { providerSessionId: sessionId });
         if (!recovery) throw apiError(409, "Run is not waiting for a recovery decision");

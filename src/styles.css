@@ -343,7 +343,7 @@ button, input, textarea { font: inherit; }
 .recovery-copy { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
 .recovery-copy strong { font-size: 12px; }
 .recovery-copy p { margin: 0; color: var(--muted-foreground); font-size: 11px; line-height: 1.55; }
-.recovery-actions { flex: none; display: flex; align-items: center; gap: 6px; }
+.recovery-actions { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .run-state.failed, .run-state.stopped { color: var(--destructive); }
 .run-state.completed { color: var(--green); }
 .status-dot.error { background: var(--destructive); }

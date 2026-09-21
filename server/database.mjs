@@ -152,7 +152,9 @@ export function createOutrightDatabase(options = {}) {
       const message = { id: input.id ?? randomUUID(), createdAt: input.createdAt ?? now(), ...input };
       db.prepare("INSERT INTO messages (id, conversation_id, role, kind, body, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
         .run(message.id, message.conversationId, message.role, message.kind ?? "text", message.body ?? "", JSON.stringify(message.payload ?? null), message.createdAt);
-      db.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?").run(message.createdAt, message.conversationId);
+      // Clamp instead of overwrite: a message must never move the
+      // conversation's updated_at backwards in sidebar and search ordering.
+      db.prepare("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?").run(message.createdAt, message.conversationId);
       return message;
     },
     upsertMessage(input) {
@@ -160,7 +162,10 @@ export function createOutrightDatabase(options = {}) {
       db.prepare(`INSERT INTO messages (id, conversation_id, role, kind, body, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET role = excluded.role, kind = excluded.kind, body = excluded.body, payload = excluded.payload`)
         .run(message.id, message.conversationId, message.role, message.kind ?? "text", message.body ?? "", JSON.stringify(message.payload ?? null), message.createdAt);
-      db.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?").run(message.createdAt, message.conversationId);
+      // Assistant checkpoints reuse one stable createdAt across the whole
+      // stream, so the plain overwrite could regress updated_at after a newer
+      // tool/user message advanced it; clamp to the newer timestamp instead.
+      db.prepare("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?").run(message.createdAt, message.conversationId);
       return hydratePayload(db.prepare(`SELECT id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
         FROM messages WHERE id = ?`).get(message.id));
     },
@@ -184,12 +189,15 @@ export function createOutrightDatabase(options = {}) {
         finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
         output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision FROM runs WHERE conversation_id = ? ORDER BY created_at DESC LIMIT ?`).all(conversationId, boundedLimit);
     },
-    findUnresolvedInterruptedRun(conversationId) {
+    listUnresolvedInterruptedRuns(conversationId) {
       return db.prepare(`SELECT id, conversation_id AS conversationId, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
         prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
         finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
         output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision
-        FROM runs WHERE conversation_id = ? AND status = 'interrupted' AND recovery_decision IS NULL ORDER BY created_at LIMIT 1`).get(conversationId);
+        FROM runs WHERE conversation_id = ? AND status = 'interrupted' AND recovery_decision IS NULL ORDER BY created_at`).all(conversationId);
+    },
+    findUnresolvedInterruptedRun(conversationId) {
+      return this.listUnresolvedInterruptedRuns(conversationId)[0];
     },
     // Crash-consistent restart reconciliation: queued/running rows belong to a
     // dead runtime, so none of them can ever finish under this process. Mark
@@ -197,21 +205,27 @@ export function createOutrightDatabase(options = {}) {
     // failing them outright, and leave the continuation decision to the
     // operator so uncertain side effects are never silently retried.
     reconcileInterruptedRuns({ probeAlive = defaultProbeRun } = {}) {
-      const pending = db.prepare("SELECT id, status, pid FROM runs WHERE status IN ('queued', 'running')").all();
-      if (!pending.length) return { count: 0, counts: {} };
       const finishedAt = now();
       const counts = {};
+      // Pending rows are selected inside the transaction and each update is
+      // conditional on the row still being queued/running: the runtime that
+      // still owns a run can finish it between the selection and the update,
+      // and that terminal state must never be overwritten with "interrupted".
       const reconcile = db.transaction(() => {
+        const pending = db.prepare("SELECT id, status, pid FROM runs WHERE status IN ('queued', 'running')").all();
         for (const run of pending) {
           let classification = "unknown";
           if (run.status === "queued") classification = "never-started";
           else if (run.pid != null) classification = normalizeProbeResult(probeAlive(run.pid));
+          const result = db.prepare("UPDATE runs SET status = 'interrupted', finished_at = ?, recovery_class = ? WHERE id = ? AND status IN ('queued', 'running')")
+            .run(finishedAt, classification, run.id);
+          if (!result.changes) continue;
           counts[classification] = (counts[classification] ?? 0) + 1;
-          db.prepare("UPDATE runs SET status = 'interrupted', finished_at = ?, recovery_class = ? WHERE id = ?").run(finishedAt, classification, run.id);
         }
       });
       reconcile();
-      return { count: pending.length, counts };
+      const count = Object.values(counts).reduce((sum, classified) => sum + classified, 0);
+      return { count, counts };
     },
     // Records the operator's explicit continuation decision exactly once.
     // Discard fails the run; resume/retry keep it interrupted for the record
