@@ -1,0 +1,21 @@
+server/agent-manager.mjs
+  s_a75667985e6362::t_96f58c35e1b1eb 28-29,40-42,52-99,102-133,316,321-331,334-337,355-362
+server/agent-manager.test.mjs
+  s_a75667985e6362::t_66f75c2547e676 670-672,730-739,742,746,750-755,759,776,781,783-794,798-843,848-849,852-854,865-870
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "42a8257b04da57f4b297e65b17282acdae7bb104",
+  "prompts": {},
+  "sessions": {
+    "s_a75667985e6362": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "c691f260-6ab4-4f66-a62f-a992bda63d77",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
