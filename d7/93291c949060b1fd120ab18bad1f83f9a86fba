@@ -1,0 +1,24 @@
+server/agent-manager.mjs
+  h_a39f9495f9ec1d 8-13,15,97,101,186,223-234,236-237,326-327,330-338,342-349,358,377-378
+server/agent-manager.test.mjs
+  h_a39f9495f9ec1d 161-168,170,174,178-209
+server/database.mjs
+  h_a39f9495f9ec1d 199,208,371-389
+server/database.test.mjs
+  h_a39f9495f9ec1d 3,78-111
+server/outright-runtime.mjs
+  h_a39f9495f9ec1d 223-235
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 4,105-142
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d793291c949060b1fd120ab18bad1f83f9a86fba",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
