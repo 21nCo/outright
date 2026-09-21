@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -34,6 +34,11 @@ export function createOutrightDatabase(options = {}) {
     ?? path.join(os.homedir(), ".outright");
   mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
   const filename = options.filename ?? path.join(dataDirectory, "outright.db");
+  // Launch handshake records live next to the database: the launch wrapper
+  // durably records its own process identity here before the runtime may
+  // authorize the provider to run, so a crash between spawning and recording
+  // the pid never loses process ownership.
+  const launchDirectory = options.launchDirectory ?? path.join(dataDirectory, "launches");
   const db = new Database(filename);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
@@ -42,6 +47,7 @@ export function createOutrightDatabase(options = {}) {
 
   return {
     filename,
+    launchDirectory,
     close: () => db.close(),
     getSettings() {
       const rows = db.prepare("SELECT key, value FROM settings").all();
@@ -208,17 +214,31 @@ export function createOutrightDatabase(options = {}) {
       const finishedAt = now();
       const counts = {};
       // Pending rows are selected inside the transaction and each update is
-      // conditional on the row still being queued/running: the runtime that
-      // still owns a run can finish it between the selection and the update,
-      // and that terminal state must never be overwritten with "interrupted".
+      // conditional on the row still being queued/running/launching: the
+      // runtime that still owns a run can finish it between the selection and
+      // the update, and that terminal state must never be overwritten with
+      // "interrupted".
       const reconcile = db.transaction(() => {
-        const pending = db.prepare("SELECT id, status, pid FROM runs WHERE status IN ('queued', 'running')").all();
+        const pending = db.prepare("SELECT id, status, pid FROM runs WHERE status IN ('queued', 'running', 'launching')").all();
         for (const run of pending) {
           let classification = "unknown";
+          let pid = run.pid ?? null;
           if (run.status === "queued") classification = "never-started";
+          else if (run.status === "launching") {
+            // Crash-safe launch handshake: the provider is only authorized to
+            // run AFTER the row durably reaches 'running' with a pid, so a row
+            // still in 'launching' provably never started side effects. The
+            // wrapper's self-recorded handshake pid is adopted for the record
+            // (the wrapper exits on its own once its stdin closes), so the run
+            // is resolvable by an explicit decision instead of being
+            // permanently gated as an unverifiable tree.
+            classification = "never-started";
+            const handshake = readLaunchHandshake(launchDirectory, run.id);
+            if (handshake) pid = handshake.pid;
+          }
           else if (run.pid != null) classification = normalizeProbeResult(probeAlive(run.pid));
-          const result = db.prepare("UPDATE runs SET status = 'interrupted', finished_at = ?, recovery_class = ? WHERE id = ? AND status IN ('queued', 'running')")
-            .run(finishedAt, classification, run.id);
+          const result = db.prepare("UPDATE runs SET status = 'interrupted', pid = ?, finished_at = ?, recovery_class = ? WHERE id = ? AND status IN ('queued', 'running', 'launching')")
+            .run(pid, finishedAt, classification, run.id);
           if (!result.changes) continue;
           counts[classification] = (counts[classification] ?? 0) + 1;
         }
@@ -382,6 +402,17 @@ function hydratePayload(row) { return { ...row, payload: parseJson(row.payload, 
 function hydrateDetails(row) { return { ...row, details: parseJson(row.details, {}) }; }
 function parseJson(value, fallback) { try { return JSON.parse(value); } catch { return fallback; } }
 function now() { return new Date().toISOString(); }
+// Reads the launch wrapper's durable self-recorded process identity for a run
+// still in the 'launching' phase. Absent or malformed records return null; the
+// run then provably never reached authorization and reconciles as
+// never-started.
+function readLaunchHandshake(launchDirectory, runId) {
+  try {
+    const record = parseJson(readFileSync(path.join(launchDirectory, `${runId}.json`), "utf8"), null);
+    if (record && Number.isSafeInteger(record.pid) && record.pid > 0) return record;
+  } catch { /* No handshake record exists (or it is unreadable). */ }
+  return null;
+}
 // Probes the run's whole process group, not just the detached leader PID: an
 // exited leader can leave live provider descendants in process group `pid` that
 // are still able to mutate the worktree. Anything not verifiably exited is

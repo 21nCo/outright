@@ -440,6 +440,132 @@ test("the default recovery probe is conservative per platform", async () => {
   }
 });
 
+// Regression (PR convergence round 2): a hard crash between the durable
+// 'launching' marker and the pid/running commit used to restart as an unknown
+// interrupted run with no pid — which blocked every recovery policy
+// indefinitely and stranded a possibly spawned provider. The crash-safe
+// launch handshake closes the window: crashing before durable process
+// identity restarts as a provably never-started run with an explicit safe
+// continuation.
+test("a crash before durable launch identity restarts resolvable, not permanently gated", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+  let runtime;
+  try {
+    const seeded = createOutrightDatabase();
+    const conversation = seeded.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = seeded.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "crashed mid-launch" });
+    // Crash before the wrapper recorded its identity: no handshake record.
+    seeded.updateRun(run.id, { status: "launching", startedAt: new Date().toISOString() });
+    seeded.close();
+
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    const recovered = runtime.database.getRun(run.id);
+    assert.equal(recovered.status, "interrupted");
+    assert.equal(recovered.recoveryClass, "never-started", "the launch was provably never authorized, so it must not gate as an unverifiable tree");
+
+    // Submissions stay gated until an explicit decision exists...
+    const blocked = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "continue" }), blocked);
+    assert.equal(blocked.statusCode, 409);
+    assert.equal(blocked.body.code, "RUN_RECOVERY_REQUIRED");
+
+    // ...and the operator has an explicit safe continuation: a discard that
+    // would previously have been rejected RECOVERY_PROCESS_UNKNOWN now
+    // records the decision and clears the gate. (Retry's execution path is
+    // proven on the real-worktree harness below.)
+    const discarded = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), discarded);
+    assert.equal(discarded.statusCode, 200, `discard must succeed: ${JSON.stringify(discarded.body)}`);
+    assert.equal(runtime.database.getRun(run.id).status, "failed");
+    assert.equal(runtime.database.findUnresolvedInterruptedRun(conversation.id), undefined, "the conversation is no longer gated");
+  } finally {
+    await runtime?.shutdown();
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+// The second half of the launch crash window: the wrapper recorded its
+// process identity durably, but the runtime died before committing
+// 'running'. Ownership must be restored from the handshake record and the
+// run must remain resolvable — the wrapper exits on its own (never
+// authorized) without ever starting the provider.
+test("a crash after launch identity but before authorization keeps the pid and stays resolvable", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+  let runtime;
+  try {
+    const seeded = createOutrightDatabase();
+    const conversation = seeded.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = seeded.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "crashed before authorization" });
+    seeded.updateRun(run.id, { status: "launching", startedAt: new Date().toISOString() });
+    const pid = await deadProcessId();
+    // The wrapper's durable self-recorded identity, written before the crash.
+    const launchDirectory = seeded.launchDirectory;
+    mkdirSync(launchDirectory, { recursive: true });
+    writeFileSync(path.join(launchDirectory, `${run.id}.json`), JSON.stringify({ pid, authorized: false, createdAt: new Date().toISOString() }));
+    seeded.close();
+
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    const recovered = runtime.database.getRun(run.id);
+    assert.equal(recovered.status, "interrupted");
+    assert.equal(recovered.recoveryClass, "never-started", "authorization is only issued after the running commit, so this launch provably never started the provider");
+    assert.equal(recovered.pid, pid, "process ownership is restored from the handshake record");
+
+    const discarded = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), discarded);
+    assert.equal(discarded.statusCode, 200, `the run must remain resolvable by an explicit decision: ${JSON.stringify(discarded.body)}`);
+    assert.equal(runtime.database.findUnresolvedInterruptedRun(conversation.id), undefined);
+  } finally {
+    await runtime?.shutdown();
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+// End-to-end on a real discovered, trusted worktree: replacement execution
+// must respect conversation order. Resuming or retrying a newer never-started
+// run while an older interrupted run is still unresolved must be rejected; a
+// verified discard of the older run then reopens the ordered path.
+test("a newer run's replacement cannot execute before the older interrupted run is resolved", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Recovery", provider: "codex" });
+  const older = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "started before the crash" });
+  await new Promise((resolve) => setTimeout(resolve, 5)); // distinct created_at ordering
+  const newer = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "still queued at the crash" });
+  const pid = await deadProcessId();
+  runtime.database.updateRun(older.id, { status: "running", pid });
+  runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+  assert.equal(runtime.database.getRun(older.id).recoveryClass, "exited");
+  assert.equal(runtime.database.getRun(newer.id).recoveryClass, "never-started");
+
+  // The newer run's replacement must not execute while the older run is
+  // unresolved, or a later recovery of the older run could overwrite it.
+  for (const policy of ["resume-session", "retry"]) {
+    const blocked = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${newer.id}/resume`, { policy }), blocked);
+    assert.equal(blocked.statusCode, 409);
+    assert.equal(blocked.body.code, "RECOVERY_ORDER_REQUIRED", `policy ${policy} must respect execution order`);
+    assert.equal(blocked.body.runId, older.id);
+    assert.deepEqual(runtime.database.listRuns(conversation.id).filter((candidate) => ["queued", "launching", "running"].includes(candidate.status)), [], "no replacement work may be scheduled");
+  }
+
+  // Resolving the older run first reopens the ordered path.
+  const discardOlder = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${older.id}/resume`, { policy: "discard" }), discardOlder);
+  assert.equal(discardOlder.statusCode, 200);
+
+  const retryNewer = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${newer.id}/resume`, { policy: "retry" }), retryNewer);
+  assert.equal(retryNewer.statusCode, 202, `the newer run retries once the older run is resolved: ${JSON.stringify(retryNewer.body)}`);
+  assert.notEqual(retryNewer.body.id, newer.id);
+  const replacement = runtime.database.getRun(retryNewer.body.id);
+  assert.ok(replacement, "the replacement run is durably scheduled");
+  assert.equal(runtime.database.findUnresolvedInterruptedRun(conversation.id), undefined);
+}, { recoveryProcessAlive: () => "exited" }));
+
 test("accepts loopback and same-origin runtime requests", () => {
   const allowedHosts = runtimeAllowedHosts({});
   assert.doesNotThrow(() => assertRuntimeRequest(request("127.0.0.1:4173", "http://127.0.0.1:4173"), allowedHosts));

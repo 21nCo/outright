@@ -266,6 +266,18 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           return json(response, 200, resolved);
         }
 
+        // Replacement work must respect conversation order: resuming or
+        // retrying a run may not schedule its replacement while an older
+        // unresolved interrupted run still awaits a decision, or the newer
+        // run's side effects could later be overwritten or invalidated by a
+        // recovery of the older run. Discarding a never-started run stays
+        // allowed above because it schedules no work.
+        const unresolved = database.listUnresolvedInterruptedRuns(conversation.id);
+        const selected = unresolved.findIndex((candidate) => candidate.id === interrupted.id);
+        if (selected > 0) {
+          throw apiError(409, "Resolve the older interrupted run before resuming or retrying this one", { code: "RECOVERY_ORDER_REQUIRED", runId: unresolved[0].id });
+        }
+
         // Resumed and retried runs revalidate worktree identity and trust at
         // submission, and again inside the agent drain before spawning.
         const target = await resolveWorktreeTarget({ projectId: conversation.projectId, worktreeId: conversation.worktreeId, worktreePath: conversation.worktreePath });

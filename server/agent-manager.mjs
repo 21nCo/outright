@@ -1,4 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
+import { unlinkSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const MAX_PROVIDER_LINE_BYTES = 1024 * 1024;
 const MAX_ASSISTANT_BYTES = 1024 * 1024;
@@ -12,7 +15,56 @@ const ASSISTANT_TRUNCATION_MARKER = "\n\n[Output truncated by Outright at 1 MiB]
 const CHECKPOINT_MIN_BYTES = 4 * 1024;
 const CHECKPOINT_INTERVAL_MS = 500;
 
-export function createAgentManager({ database, publish, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS }) {
+// Crash-safe launch handshake. The provider is never spawned directly: this
+// tiny wrapper records its own process identity durably, then waits for the
+// runtime's authorization before starting the provider. Because authorization
+// is only ever issued after the run row durably reaches 'running' with a pid,
+// a hard crash can restart in one of exactly three provable states:
+//   * no handshake record -> the provider was never started (never-started);
+//   * handshake record, row still 'launching' -> never authorized, so the
+//     wrapper exits on its own (its stdin closed with the runtime) without
+//     ever starting the provider — never-started, with the pid preserved;
+//   * row 'running' with a pid -> possibly started, probed conservatively.
+export const LAUNCH_WRAPPER_SOURCE = `
+const fs = require("node:fs");
+const path = require("node:path");
+const [handshakePath, executable, ...commandArgs] = process.argv.slice(1);
+fs.mkdirSync(path.dirname(handshakePath), { recursive: true });
+// Durable process identity BEFORE anything can execute: if the runtime dies
+// before recording this pid, the handshake file restores ownership after
+// restart.
+fs.writeFileSync(handshakePath, JSON.stringify({ pid: process.pid, authorized: false, createdAt: new Date().toISOString() }));
+let authorized = false;
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  if (authorized || !String(chunk).includes("go")) return;
+  authorized = true;
+  const { spawn } = require("node:child_process");
+  const provider = spawn(executable, commandArgs, { stdio: ["ignore", "inherit", "inherit"] });
+  const finish = (code) => { try { fs.unlinkSync(handshakePath); } catch {} process.exit(code); };
+  provider.on("error", (error) => { console.error(String((error && error.message) || error)); finish(127); });
+  provider.on("close", (code, signal) => finish(code ?? (signal ? 137 : 0)));
+});
+// The runtime went away before authorizing the launch: exit without ever
+// starting the provider, so an abandoned handshake can never mutate the
+// worktree.
+process.stdin.on("end", () => { if (!authorized) { try { fs.unlinkSync(handshakePath); } catch {} process.exit(0); } });
+`;
+
+export function defaultLaunchCommand(command, run, launchDirectory) {
+  const handshakePath = path.join(launchDirectory, `${run.id}.json`);
+  return {
+    executable: process.execPath,
+    args: ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, command.executable, ...command.args],
+    display: command.display,
+    handshakePath,
+  };
+}
+
+export function createAgentManager({ database, publish, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
+  const resolvedLaunchDirectory = launchDirectory
+    ?? database.launchDirectory
+    ?? (database.filename ? path.join(path.dirname(database.filename), "launches") : path.join(os.tmpdir(), "outright-launches"));
   const active = new Map();
   const queue = [];
   let shuttingDown = false;
@@ -38,22 +90,31 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
   function start(state) {
     const { conversation, run } = state;
     const command = buildProviderCommand(conversation, run);
+    const launch = launchCommand(command, run, resolvedLaunchDirectory);
     const startedAt = new Date().toISOString();
-    database.updateRun(run.id, { status: "running", startedAt });
+    // Crash-safe launch handshake, phase 1: this durable marker means "a spawn
+    // may have been issued, but the provider was never authorized to run". A
+    // crash from here on restarts as a run that provably never started side
+    // effects (the wrapper records its identity durably but waits for
+    // authorization), so recovery always has an explicit safe continuation
+    // instead of being permanently gated on a missing pid.
+    database.updateRun(run.id, { status: "launching", startedAt });
     database.audit("agent.run.started", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath, approvalPolicy: run.approvalPolicy });
-    emit(run.id, "run.started", { provider: run.provider, model: run.model, startedAt, command: command.display });
+    emit(run.id, "run.started", { provider: run.provider, model: run.model, startedAt, command: launch.display ?? command.display });
 
-    const child = spawnProcess(command.executable, command.args, {
+    const child = spawnProcess(launch.executable, launch.args, {
       cwd: conversation.worktreePath,
       env: sanitizedEnvironment(process.env),
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
       // Own process group on POSIX so descendants can be terminated together.
       detached: process.platform !== "win32",
     });
     state.child = child;
-    // Record the provider pid so a restarted runtime can reconcile this run as
-    // a live, exited, or unknown process instead of guessing.
-    database.updateRun(run.id, { pid: child.pid ?? null });
+    state.launchHandshakePath = launch.handshakePath;
+    // Phase 2: durable process ownership BEFORE the provider is authorized.
+    // If the runtime dies before this commit, the wrapper's handshake file
+    // still carries the pid and the row is provably unauthorized.
+    database.updateRun(run.id, { pid: child.pid ?? null, status: "running" });
 
     consumeBoundedLines(child.stdout, {
       maxLineBytes: MAX_PROVIDER_LINE_BYTES,
@@ -75,6 +136,12 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       state.processError ??= signal ? new Error(`Process stopped by ${signal}`) : null;
       if (!state.stopped) finish(state, code, state.processError);
     });
+    // Phase 3: authorize. Only now may the provider start side effects.
+    authorizeLaunch(child);
+  }
+
+  function authorizeLaunch(child) {
+    try { child?.stdin?.write?.("go\n"); } catch { /* The wrapper already exited; its close event finishes the run. */ }
   }
 
   function handleProviderLine(state, line) {
@@ -122,6 +189,9 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     if (!active.has(state.run.id) || state.finishing) return;
     state.finishing = true;
     clearCheckpointTimer(state);
+    // The wrapper removes its own handshake record, but a hard kill (stop
+    // timeout) can bypass it; never leave a stale record behind.
+    try { if (state.launchHandshakePath) unlinkSync(state.launchHandshakePath); } catch { /* Already gone. */ }
     const successful = exitCode === 0 && !error && !state.stopped;
     const status = state.stopped ? "stopped" : successful ? "completed" : "failed";
     const message = error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : "");

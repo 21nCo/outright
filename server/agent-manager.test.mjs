@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { PassThrough } from "node:stream";
-import { buildProviderCommand, createAgentManager, consumeBoundedLines, normalizeClaude, normalizeCodex } from "./agent-manager.mjs";
+import { buildProviderCommand, createAgentManager, consumeBoundedLines, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex } from "./agent-manager.mjs";
 
 const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
 
@@ -440,6 +443,9 @@ test("a recovery retry explicitly starts a fresh provider session", async () => 
   const child = fakeChild();
   const manager = createAgentManager({
     database, publish: () => {},
+    // Inspect the provider command directly; the default launch command wraps
+    // it in the crash-safe launch wrapper.
+    launchCommand: (command) => ({ ...command }),
     spawnProcess: (executable, args) => { spawnedArgs.push(args); return child; },
   });
   const run = database.createRun(codexRun("run-1"));
@@ -463,4 +469,69 @@ test("a termination timeout retains ownership and does not drain queued work", a
   child.emit("close", 137, "SIGKILL");
   assert.equal(await manager.stop("running"), true);
   assert.deepEqual(manager.activeRuns(), []);
+});
+
+// The crash-safe launch handshake: the run row reaches 'launching' before any
+// spawn and 'running' with a durable pid before the provider is authorized,
+// so every crash window reconciles to a provable state.
+test("launch phases are durable before the provider is authorized", async () => {
+  const database = fakeDatabase();
+  const phases = [];
+  const originalUpdate = database.updateRun.bind(database);
+  database.updateRun = (id, patch) => { if (patch.status) phases.push({ status: patch.status, pid: patch.pid }); return originalUpdate(id, patch); };
+  const child = fakeChild();
+  const goWrites = [];
+  child.stdin = new PassThrough();
+  child.stdin.write = (chunk) => { goWrites.push(String(chunk)); return true; };
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.createRun(codexRun("run-1")) });
+
+  // Phase 1 ('launching', no pid) is committed before the spawn; phase 2
+  // ('running' with the pid) commits before the authorization byte is sent.
+  assert.deepEqual(phases, [{ status: "launching", pid: undefined }, { status: "running", pid: null }]);
+  assert.deepEqual(goWrites, ["go\n"]);
+  child.emit("close", 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(database.getRun("run-1").status, "completed");
+});
+
+// The real launch wrapper must durably record its own pid and only start the
+// provider after the runtime's authorization byte.
+test("the launch wrapper records durable identity before authorization and cleans up on exit", { timeout: 20000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-launch-"));
+  const launchDirectory = path.join(root, "launches");
+  const marker = path.join(root, "provider-ran");
+  const runId = "launch-run";
+  const handshakePath = path.join(launchDirectory, `${runId}.json`);
+  const provider = `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");`;
+  try {
+    // Spawn the wrapper exactly as the runtime does, but never authorize:
+    // closing stdin must exit it without running the provider.
+    const child = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, process.execPath, "-e", provider], { stdio: ["pipe", "ignore", "ignore"] });
+    const deadline = Date.now() + 10_000;
+    while (!existsSync(handshakePath) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    const record = JSON.parse(readFileSync(handshakePath, "utf8"));
+    assert.equal(record.pid, child.pid, "the wrapper records its own pid durably before anything can execute");
+    assert.equal(record.authorized, false);
+
+    child.stdin.end();
+    await new Promise((resolve) => child.once("exit", resolve));
+    assert.equal(existsSync(marker), false, "an unauthorized wrapper must never start the provider");
+    assert.equal(existsSync(handshakePath), false, "the wrapper removes its handshake record when it exits unauthorized");
+
+    // Authorized: the same wrapper starts the provider and passes the exit code.
+    const marker2 = path.join(root, "provider-ran-2");
+    const handshakePath2 = path.join(launchDirectory, "launch-run-2.json");
+    const provider2 = `require("node:fs").writeFileSync(${JSON.stringify(marker2)}, "ran");`;
+    const child2 = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath2, process.execPath, "-e", provider2], { stdio: ["pipe", "ignore", "ignore"] });
+    const deadline2 = Date.now() + 10_000;
+    while (!existsSync(handshakePath2) && Date.now() < deadline2) await new Promise((resolve) => setTimeout(resolve, 10));
+    child2.stdin.write("go\n");
+    const code = await new Promise((resolve) => child2.once("exit", resolve));
+    assert.equal(code, 0);
+    assert.equal(existsSync(marker2), true, "the authorized wrapper starts the provider");
+    assert.equal(existsSync(handshakePath2), false, "the handshake record is cleaned up after completion");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { createOutrightDatabase, defaultProbeRun } from "./database.mjs";
 
 test("persists settings, groups, conversations, messages, runs, and search", () => {
@@ -192,6 +195,54 @@ test("message writes never move conversations.updated_at backwards", () => {
     // A newer checkpoint still advances it.
     database.upsertMessage({ ...base, id: `${conversation.id}:3`, body: "New segment", createdAt: segmentAt });
     assert.equal(database.getConversation(conversation.id).updatedAt, segmentAt);
+  } finally {
+    database.close();
+  }
+});
+
+// Regression (round 6 / PR convergence): the launch crash window between
+// persisting 'running' state and recording the provider pid used to leave a
+// no-pid interrupted run that blocked every recovery policy indefinitely. The
+// crash-safe launch handshake splits this into a durable 'launching' phase
+// whose rows provably never authorized the provider.
+test("reconciles a launching row without a handshake record as never-started", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "crashed while launching" });
+    database.updateRun(run.id, { status: "launching", startedAt: "2026-09-21T00:00:00.000Z" });
+    const result = database.reconcileInterruptedRuns();
+    assert.equal(result.counts["never-started"], 1);
+    const recovered = database.getRun(run.id);
+    assert.equal(recovered.status, "interrupted");
+    assert.equal(recovered.recoveryClass, "never-started");
+    assert.equal(recovered.pid, null, "no handshake record means no process identity was ever recorded");
+  } finally {
+    database.close();
+  }
+});
+
+test("reconciles a launching row by adopting the wrapper handshake pid as never-started", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:", launchDirectory: mkdtempSync(path.join(os.tmpdir(), "outright-launches-")) });
+  let pid;
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "crashed before authorization" });
+    database.updateRun(run.id, { status: "launching", startedAt: "2026-09-21T00:00:00.000Z" });
+    // The wrapper durably recorded its identity, but the runtime died before
+    // committing 'running' — so the provider was never authorized to run.
+    const exited = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore", detached: process.platform !== "win32" });
+    pid = exited.pid;
+    await new Promise((resolve) => exited.once("exit", resolve));
+    mkdirSync(database.launchDirectory, { recursive: true });
+    writeFileSync(path.join(database.launchDirectory, `${run.id}.json`), JSON.stringify({ pid, authorized: false, createdAt: "2026-09-21T00:00:00.000Z" }));
+
+    const result = database.reconcileInterruptedRuns();
+    assert.equal(result.counts["never-started"], 1);
+    const recovered = database.getRun(run.id);
+    assert.equal(recovered.status, "interrupted");
+    assert.equal(recovered.recoveryClass, "never-started", "a launching row was provably never authorized, so it is never gated as an unverifiable tree");
+    assert.equal(recovered.pid, pid, "the handshake pid is adopted so process ownership is not lost");
   } finally {
     database.close();
   }
