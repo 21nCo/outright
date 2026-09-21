@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { assertRuntimeRequest, createOutrightRuntime, runtimeAllowedHosts } from "./outright-runtime.mjs";
+import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAlive, runtimeAllowedHosts } from "./outright-runtime.mjs";
 
 function request(host, origin) {
   return { headers: { host, ...(origin ? { origin } : {}) } };
@@ -139,6 +139,49 @@ test("re-probes the process group of an exited-classified run before recovery", 
     try { process.kill(-pid, "SIGKILL"); } catch { /* Already gone. */ }
   }
 }));
+
+// Regression (platform-injectable): on platforms without owned process trees
+// (Windows), a gone leader with a possibly live descendant cannot be verified
+// terminated. Resume/retry must stay blocked (no replacement work scheduled)
+// while discard — which launches nothing — remains available.
+test("blocks replacement work when the process tree cannot be verified", withRuntime(async (runtime) => {
+  const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+  const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+  runtime.database.updateRun(run.id, { status: "running", pid: 424242 });
+  runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+
+  for (const policy of ["resume-session", "retry"]) {
+    const blocked = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy }), blocked);
+    assert.equal(blocked.statusCode, 409);
+    assert.equal(blocked.body.code, "RECOVERY_PROCESS_UNKNOWN");
+    assert.equal(runtime.database.getRun(run.id).recoveryDecision, null);
+    assert.deepEqual(runtime.database.listRuns(conversation.id).filter((candidate) => candidate.status === "queued"), [], "no replacement run may be scheduled");
+  }
+
+  const discarded = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), discarded);
+  assert.equal(discarded.statusCode, 200);
+  assert.equal(runtime.database.getRun(run.id).status, "failed");
+}, { recoveryProcessAlive: () => "unknown" }));
+
+test("the default recovery probe is conservative per platform", async () => {
+  const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore", detached: process.platform !== "win32" });
+  const pid = child.pid;
+  await new Promise((resolve) => child.once("exit", resolve));
+  assert.equal(defaultRecoveryProcessAlive(pid, "win32"), "unknown", "a gone leader is unverifiable on win32");
+  assert.equal(defaultRecoveryProcessAlive(process.pid, "win32"), "alive");
+  if (process.platform !== "win32") {
+    assert.equal(defaultRecoveryProcessAlive(pid), "exited", "a fully dead detached group is exited on POSIX");
+    const live = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore", detached: true });
+    try {
+      assert.equal(defaultRecoveryProcessAlive(live.pid), "alive");
+      assert.equal(defaultRecoveryProcessAlive(live.pid, "win32"), "alive");
+    } finally {
+      try { process.kill(-live.pid, "SIGKILL"); } catch { /* Already gone. */ }
+    }
+  }
+});
 
 test("accepts loopback and same-origin runtime requests", () => {
   const allowedHosts = runtimeAllowedHosts({});

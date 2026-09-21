@@ -224,14 +224,22 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         // applied, regardless of the restart-time classification: a detached
         // leader can exit while provider descendants still hold the process
         // group and mutate the worktree. Only a verified-exited (or never
-        // started) run may continue; unverifiable state stays blocked.
+        // started) run may continue. A verifiably live process blocks every
+        // policy; an unverifiable tree (e.g. on Windows, where the spawned
+        // tree is not owned and a gone leader proves nothing) blocks
+        // continuation, while discard — which launches no replacement work —
+        // stays available.
         if (interrupted.recoveryClass !== "never-started") {
           if (Number.isSafeInteger(interrupted.pid) && interrupted.pid > 0) {
-            if (await recoveryProcessAlive(interrupted.pid)) {
+            const verdict = recoveryVerdict(await recoveryProcessAlive(interrupted.pid));
+            if (verdict === "alive") {
               throw apiError(409, "The recovered provider process is still active; stop it before choosing a recovery policy", { code: "RECOVERY_PROCESS_ACTIVE", pid: interrupted.pid });
             }
-            interrupted = database.updateRun(interrupted.id, { recoveryClass: "exited", pid: null });
-          } else {
+            if (verdict !== "exited" && policy !== "discard") {
+              throw apiError(409, "The recovered provider process cannot be verified", { code: "RECOVERY_PROCESS_UNKNOWN", pid: interrupted.pid });
+            }
+            if (verdict === "exited") interrupted = database.updateRun(interrupted.id, { recoveryClass: "exited", pid: null });
+          } else if (policy !== "discard") {
             throw apiError(409, "The recovered provider process cannot be verified", { code: "RECOVERY_PROCESS_UNKNOWN" });
           }
         }
@@ -415,13 +423,27 @@ function isLoopback(address) {
   return ipv4.startsWith("127.");
 }
 
-function defaultRecoveryProcessAlive(pid) {
+// Recovery verdicts are tri-state: "alive" (still running), "exited"
+// (verified terminated), "unknown" (cannot verify). Legacy boolean probes map
+// conservatively; anything unrecognized is unknown.
+function recoveryVerdict(value) {
+  if (value === true) return "alive";
+  if (value === false) return "exited";
+  return ["alive", "exited", "unknown"].includes(value) ? value : "unknown";
+}
+
+export function defaultRecoveryProcessAlive(pid, platform = process.platform) {
+  if (platform === "win32") {
+    // The spawned tree is not owned on Windows, so a gone leader says nothing
+    // about its descendants: only a live leader is verifiable.
+    try { process.kill(pid, 0); return "alive"; }
+    catch { return "unknown"; }
+  }
   try {
-    if (process.platform !== "win32") process.kill(-pid, 0);
-    else process.kill(pid, 0);
-    return true;
+    process.kill(-pid, 0);
+    return "alive";
   } catch (error) {
-    return error.code !== "ESRCH";
+    return error.code === "ESRCH" ? "exited" : "unknown";
   }
 }
 

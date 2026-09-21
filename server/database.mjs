@@ -372,8 +372,16 @@ function now() { return new Date().toISOString(); }
 // exited leader can leave live provider descendants in process group `pid` that
 // are still able to mutate the worktree. Anything not verifiably exited is
 // reported conservatively.
-export function defaultProbeRun(pid) {
-  const targets = process.platform === "win32" ? [pid] : [pid, -pid];
+//
+// On platforms without a portable process-group ownership mechanism (Windows),
+// a gone leader proves nothing about its descendants: the spawned tree is not
+// owned, so only a live leader is verifiable and everything else is unknown.
+export function defaultProbeRun(pid, platform = process.platform) {
+  if (platform === "win32") {
+    try { process.kill(pid, 0); return "alive"; }
+    catch { return "unknown"; }
+  }
+  const targets = [pid, -pid];
   const results = targets.map((target) => {
     try { process.kill(target, 0); return "alive"; }
     catch (error) { return error.code === "ESRCH" ? "exited" : "unknown"; }

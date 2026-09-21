@@ -300,6 +300,9 @@ function terminateTree(child, signal) {
   try {
     // Descendants spawned by the provider share its process group on POSIX,
     // so signaling the group terminates the whole tree, not just the PID.
+    // On Windows the tree is not owned; only the leader can be signaled, so
+    // restart recovery must never trust a gone Windows leader (see
+    // defaultProbeRun/defaultRecoveryProcessAlive conservative handling).
     if (child?.pid && process.platform !== "win32") process.kill(-child.pid, signal);
     else child?.kill?.(signal);
   } catch { /* The process group already exited. */ }

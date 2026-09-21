@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
-import { createOutrightDatabase } from "./database.mjs";
+import { createOutrightDatabase, defaultProbeRun } from "./database.mjs";
 
 test("persists settings, groups, conversations, messages, runs, and search", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
@@ -107,6 +107,34 @@ test("classifies an exited leader with a live descendant as alive", { skip: proc
     if (pid) { try { process.kill(-pid, "SIGKILL"); } catch { /* Already gone. */ } }
     database.close();
   }
+});
+
+// Regression (platform-injectable): on platforms without owned process trees
+// (Windows), a gone leader cannot prove its descendants exited, so the
+// persisted leader PID must classify conservatively as unknown, never exited.
+test("classifies a gone leader as unknown on platforms without owned process trees", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  let pid;
+  try {
+    const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore", detached: process.platform !== "win32" });
+    pid = child.pid;
+    await new Promise((resolve) => child.once("exit", resolve));
+    assert.equal(defaultProbeRun(pid, "win32"), "unknown", "a gone leader is never verifiably exited on win32");
+    if (process.platform !== "win32") assert.equal(defaultProbeRun(pid), "exited", "a fully dead detached group is exited on POSIX");
+
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "orphaned" });
+    database.updateRun(run.id, { status: "running", pid });
+    const result = database.reconcileInterruptedRuns({ probeAlive: (candidate) => defaultProbeRun(candidate, "win32") });
+    assert.equal(result.counts.unknown, 1);
+    assert.equal(database.getRun(run.id).recoveryClass, "unknown");
+  } finally {
+    database.close();
+  }
+});
+
+test("classifies a live leader as alive on platforms without owned process trees", () => {
+  assert.equal(defaultProbeRun(process.pid, "win32"), "alive");
 });
 
 test("records a recovery decision exactly once", () => {
