@@ -1,0 +1,39 @@
+src/recovery-policy.js
+  s_6126673cc0a89e::t_d74bd041d76a23 120
+server/outright-runtime.test.mjs
+  s_6126673cc0a89e::t_666e4bc03a3ac7 849,860,868-874
+  s_6126673cc0a89e::t_ad6511f283a337 845-848,850-859,861-867,875
+server/outright-runtime.mjs
+  s_6126673cc0a89e::t_d74bd041d76a23 347,587-599
+  s_6126673cc0a89e::t_666e4bc03a3ac7 586
+server/agent-supervisor-darwin.c
+  s_6126673cc0a89e::t_666e4bc03a3ac7 227
+server/ui-recovery.test.mjs
+  s_6126673cc0a89e::t_d74bd041d76a23 120-122
+scripts/run-tests.mjs
+  s_6126673cc0a89e::t_17e375f5a3a365 13-17
+src/App.jsx
+  s_6126673cc0a89e::t_d74bd041d76a23 187-189,191
+scripts/build-agent-supervisor.mjs
+  s_6126673cc0a89e::t_2719f84eef51b0 28,45-57,60
+  s_6126673cc0a89e::t_17e375f5a3a365 30-36
+server/agent-manager.test.mjs
+  s_6126673cc0a89e::t_17e375f5a3a365 1021
+  s_6126673cc0a89e::t_e7a3298fe7d220 1135-1139
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4882fbb60e389046b23a11a1c0d7b52f9bc040e4",
+  "prompts": {},
+  "sessions": {
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
