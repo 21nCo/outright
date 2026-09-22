@@ -236,6 +236,28 @@ export function createOutrightDatabase(options = {}) {
         output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision
         FROM runs WHERE conversation_id = ? AND status = 'interrupted' AND recovery_decision IS NULL ORDER BY created_at, rowid LIMIT 1`).get(conversationId);
     },
+    listUnresolvedInterruptedRunsForWorktree(worktreePath) {
+      return db.prepare(`SELECT runs.id, runs.conversation_id AS conversationId, runs.provider, runs.model,
+        runs.reasoning_effort AS reasoningEffort, runs.approval_policy AS approvalPolicy, runs.prompt, runs.status, runs.pid,
+        runs.provider_session_id AS providerSessionId, runs.created_at AS createdAt, runs.started_at AS startedAt,
+        runs.finished_at AS finishedAt, runs.exit_code AS exitCode, runs.error, runs.cost_usd AS costUsd,
+        runs.input_tokens AS inputTokens, runs.output_tokens AS outputTokens, runs.recovery_class AS recoveryClass,
+        runs.recovery_decision AS recoveryDecision
+        FROM runs JOIN conversations ON conversations.id = runs.conversation_id
+        WHERE conversations.worktree_path = ? AND runs.status = 'interrupted' AND runs.recovery_decision IS NULL
+        ORDER BY runs.created_at, runs.rowid`).all(worktreePath);
+    },
+    findUnresolvedInterruptedRunForWorktree(worktreePath) {
+      return db.prepare(`SELECT runs.id, runs.conversation_id AS conversationId, runs.provider, runs.model,
+        runs.reasoning_effort AS reasoningEffort, runs.approval_policy AS approvalPolicy, runs.prompt, runs.status, runs.pid,
+        runs.provider_session_id AS providerSessionId, runs.created_at AS createdAt, runs.started_at AS startedAt,
+        runs.finished_at AS finishedAt, runs.exit_code AS exitCode, runs.error, runs.cost_usd AS costUsd,
+        runs.input_tokens AS inputTokens, runs.output_tokens AS outputTokens, runs.recovery_class AS recoveryClass,
+        runs.recovery_decision AS recoveryDecision
+        FROM runs JOIN conversations ON conversations.id = runs.conversation_id
+        WHERE conversations.worktree_path = ? AND runs.status = 'interrupted' AND runs.recovery_decision IS NULL
+        ORDER BY runs.created_at, runs.rowid LIMIT 1`).get(worktreePath);
+    },
     getLaunchHandshake(runId) {
       return readLaunchHandshake(launchDirectory, runId);
     },

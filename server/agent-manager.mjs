@@ -16,6 +16,7 @@ const CHECKPOINT_MIN_BYTES = 4 * 1024;
 const CHECKPOINT_INTERVAL_MS = 500;
 const LINUX_AGENT_SUPERVISOR = process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH
   || fileURLToPath(new URL("./bin/agent-supervisor", import.meta.url));
+export const LAUNCH_AUTHORIZED_CONTROL = "__OUTRIGHT_LAUNCH_AUTHORIZED_V1__";
 
 // Crash-safe launch handshake. The provider is never spawned directly: this
 // tiny wrapper records its own process identity durably, then waits for the
@@ -210,6 +211,11 @@ process.stdin.on("data", (chunk) => {
         providerResult = { code, signal };
         finishWhenOwnedGroupIsEmpty();
       });
+      // The manager must not report the run as scheduled until the launch
+      // owner confirms that it consumed authorization after persisting the
+      // provider identity. This line is intercepted and never exposed as
+      // provider output.
+      process.stdout.write(${JSON.stringify(LAUNCH_AUTHORIZED_CONTROL)} + "\\n");
       continue;
     }
     if (command === "stop") {
@@ -303,9 +309,18 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     state.ownsDescendants = Boolean(launch.ownsDescendants);
     let resolveChildClosed;
     const childClosed = new Promise((resolve) => { resolveChildClosed = resolve; });
+    let resolveLaunchAuthorized;
+    const launchAuthorized = new Promise((resolve) => { resolveLaunchAuthorized = resolve; });
     consumeBoundedLines(child.stdout, {
       maxLineBytes: MAX_PROVIDER_LINE_BYTES,
-      onLine: (line) => handleProviderLine(state, line),
+      onLine: (line) => {
+        if (line === LAUNCH_AUTHORIZED_CONTROL) {
+          state.launchAuthorized = true;
+          resolveLaunchAuthorized();
+          return;
+        }
+        handleProviderLine(state, line);
+      },
       onOverflow: () => emit(run.id, "process.output_truncated", { stream: "stdout", maxBytes: MAX_PROVIDER_LINE_BYTES }),
     });
     child.stderr.on("data", (chunk) => {
@@ -357,6 +372,11 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     }
     // Phase 3: authorize. Only now may the provider start side effects.
     authorizeLaunch(child);
+    // A successful pipe write proves only that the command reached the OS,
+    // not that the platform owner consumed it or durably recorded the provider
+    // identity. Keep schedule() pending until the owner acknowledges that
+    // boundary, or until the child closes and finish() records the outcome.
+    await Promise.race([launchAuthorized, childClosed]);
   }
 
   function authorizeLaunch(child) {

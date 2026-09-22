@@ -372,6 +372,40 @@ test("a discard on an unknown process tree cannot be followed by a newly schedul
   }, { recoveryProcessAlive: () => treeVerdict });
 })());
 
+test("an interrupted run gates every conversation targeting the same worktree", withRuntime(async (runtime) => {
+  const first = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/shared-tree", title: "First", provider: "codex" });
+  const sibling = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/shared-tree", title: "Sibling", provider: "codex" });
+  const other = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-2", worktreePath: "/tmp/other-tree", title: "Other", provider: "codex" });
+  const interrupted = runtime.database.createRun({ conversationId: first.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+  runtime.database.updateRun(interrupted.id, { status: "interrupted", recoveryClass: "unknown" });
+
+  const blocked = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/conversations/${sibling.id}/runs`, { prompt: "start from another chat" }), blocked);
+  assert.equal(blocked.statusCode, 409);
+  assert.equal(blocked.body.code, "RUN_RECOVERY_REQUIRED");
+  assert.equal(blocked.body.runId, interrupted.id);
+
+  const unrelated = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/conversations/${other.id}/runs`, { prompt: "different checkout" }), unrelated);
+  assert.notEqual(unrelated.body.code, "RUN_RECOVERY_REQUIRED", "a different worktree is not recovery-gated by this run");
+}));
+
+test("recovery verifies unresolved runs from sibling conversations on the worktree", withRuntime(async (runtime) => {
+  const first = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/shared-tree", title: "First", provider: "codex" });
+  const sibling = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/shared-tree", title: "Sibling", provider: "codex" });
+  const uncertain = runtime.database.createRun({ conversationId: first.id, provider: "codex", approvalPolicy: "read-only", prompt: "possibly active" });
+  runtime.database.updateRun(uncertain.id, { status: "interrupted", recoveryClass: "unknown" });
+  const selected = runtime.database.createRun({ conversationId: sibling.id, provider: "codex", approvalPolicy: "read-only", prompt: "never started" });
+  runtime.database.updateRun(selected.id, { status: "interrupted", recoveryClass: "never-started" });
+
+  const response = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${selected.id}/resume`, { policy: "discard" }), response);
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.body.code, "RECOVERY_PROCESS_UNKNOWN");
+  assert.equal(response.body.runId, uncertain.id);
+  assert.equal(runtime.database.getRun(selected.id).recoveryDecision, null, "the selected decision stays pending while sibling ownership is uncertain");
+}));
+
 // Regression: recovery used to validate only the selected interrupted run, so a
 // conversation holding an older started run plus a newer queued run could
 // schedule the queued run's replacement work while the older run's process

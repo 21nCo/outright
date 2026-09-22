@@ -7,16 +7,25 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { buildProviderCommand, consumeBoundedLines, createAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
+import { buildProviderCommand, consumeBoundedLines, createAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_AUTHORIZED_CONTROL, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
 
 const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
 const fakeLaunchDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-agent-test-"));
 test.after(() => rmSync(fakeLaunchDirectory, { recursive: true, force: true }));
 
-function fakeChild() {
+function fakeChild({ autoAcknowledge = true } = {}) {
   const child = new PassThrough();
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
+  child.stdin = new PassThrough();
+  const write = child.stdin.write.bind(child.stdin);
+  child.stdin.write = (chunk, ...args) => {
+    const written = write(chunk, ...args);
+    if (autoAcknowledge && String(chunk).includes("go\n")) {
+      queueMicrotask(() => child.stdout.write(`${LAUNCH_AUTHORIZED_CONTROL}\n`));
+    }
+    return written;
+  };
   child.signals = [];
   child.kill = (signal) => { child.signals.push(signal); return true; };
   return child;
@@ -112,7 +121,6 @@ test("keeps recovered session ids run-local when the conversation switched provi
 test("handles asynchronous authorization-pipe errors without an uncaught stream error", async () => {
   const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex" });
   const child = fakeChild();
-  child.stdin = new PassThrough();
   const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
   const run = database.createRun(codexRun("run-1"));
   await manager.schedule({ conversation: database.getConversation("conv-1"), run });
@@ -468,7 +476,7 @@ for (const action of ["stop", "shutdown"]) {
       launchCommand: (command) => ({ ...command, ownsDescendants: false }),
       spawnProcess: () => {
         const descendant = `process.on("SIGTERM", () => {}); process.send("ready"); setInterval(() => {}, 1000);`;
-        const parent = `const {spawn} = require("node:child_process"); const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], {stdio:["ignore","ignore","ignore","ipc"]}); child.once("message", () => process.stdout.write("ready\\n")); setInterval(() => {}, 1000);`;
+        const parent = `const {spawn} = require("node:child_process"); const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], {stdio:["ignore","ignore","ignore","ipc"]}); process.stdout.write(${JSON.stringify(`${LAUNCH_AUTHORIZED_CONTROL}\n`)}); child.once("message", () => setTimeout(() => process.stdout.write("ready\\n"), 10)); setInterval(() => {}, 1000);`;
         child = spawn(process.execPath, ["-e", parent], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
         return child;
       },
@@ -540,7 +548,6 @@ test("launch phases are durable before the provider is authorized", async () => 
     return originalUpdate(id, patch);
   };
   const child = fakeChild();
-  child.stdin = new PassThrough();
   const originalWrite = child.stdin.write.bind(child.stdin);
   child.stdin.write = (chunk) => { events.push(`authorize:${String(chunk).trim()}`); return originalWrite(chunk); };
   const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => { events.push("spawn"); return child; } });
@@ -557,6 +564,51 @@ test("launch phases are durable before the provider is authorized", async () => 
   assert.equal(database.getRun("run-1").status, "completed");
 });
 
+test("schedule waits for the launch owner to acknowledge durable authorization", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild({ autoAcknowledge: false });
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  const run = database.createRun(codexRun("run-1"));
+  let settled = false;
+  const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run }).then((value) => {
+    settled = true;
+    return value;
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "a one-way go write is not proof that the launch owner authorized the provider");
+  assert.equal(database.getRun(run.id).status, "running");
+
+  child.stdout.write(`${LAUNCH_AUTHORIZED_CONTROL}\n`);
+  await scheduled;
+  assert.equal(settled, true);
+  child.emit("close", 0, null);
+});
+
+test("shutdown between the authorization write and owner acknowledgement still completes", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild({ autoAcknowledge: false });
+  const writes = [];
+  const originalWrite = child.stdin.write.bind(child.stdin);
+  child.stdin.write = (chunk, ...args) => { writes.push(String(chunk)); return originalWrite(chunk, ...args); };
+  child.kill = (signal) => {
+    child.signals.push(signal);
+    setImmediate(() => child.emit("close", null, signal));
+    return true;
+  };
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child, terminationTimeoutMs: 1000 });
+  const run = database.createRun(codexRun("run-1"));
+  const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run });
+
+  const deadline = Date.now() + 1000;
+  while (!writes.includes("go\n") && Date.now() < deadline) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(writes.includes("go\n"), true, "the launch reached the unacknowledged authorization boundary");
+
+  await Promise.all([scheduled, manager.shutdown()]);
+  assert.equal(database.getRun(run.id).status, "stopped");
+  assert.deepEqual(manager.activeRuns(), []);
+});
+
 test("a failed running-state commit reaps the unauthorized wrapper before releasing the run", async () => {
   const database = fakeDatabase();
   const originalUpdate = database.updateRun.bind(database);
@@ -565,7 +617,6 @@ test("a failed running-state commit reaps the unauthorized wrapper before releas
     return originalUpdate(id, patch);
   };
   const child = fakeChild();
-  child.stdin = new PassThrough();
   const writes = [];
   const originalWrite = child.stdin.write.bind(child.stdin);
   child.stdin.write = (chunk) => { writes.push(String(chunk)); return originalWrite(chunk); };
@@ -587,7 +638,6 @@ test("a failed running-state commit reaps the unauthorized wrapper before releas
 test("shutdown racing the running-state commit never authorizes the provider", async () => {
   const database = fakeDatabase();
   const child = fakeChild();
-  child.stdin = new PassThrough();
   const writes = [];
   const originalWrite = child.stdin.write.bind(child.stdin);
   child.stdin.write = (chunk) => { writes.push(String(chunk)); return originalWrite(chunk); };
@@ -620,7 +670,6 @@ test("shutdown retains ownership when a closed supervisor leaves a stale handsha
   const handshakePath = path.join(root, "run-1.json");
   const child = fakeChild();
   child.pid = 4242;
-  child.stdin = new PassThrough();
   const originalWrite = child.stdin.write.bind(child.stdin);
   child.stdin.write = (chunk) => {
     const written = originalWrite(chunk);
@@ -766,11 +815,14 @@ test("the launch wrapper records durable identity before authorization and clean
     const marker2 = path.join(root, "provider-ran-2");
     const handshakePath2 = path.join(launchDirectory, "launch-run-2.json");
     const provider2 = `require("node:fs").writeFileSync(${JSON.stringify(marker2)}, "ran"); setTimeout(() => {}, 250);`;
-    const child2 = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath2, process.execPath, "-e", provider2], { stdio: ["pipe", "ignore", "ignore"] });
+    const child2 = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath2, process.execPath, "-e", provider2], { stdio: ["pipe", "pipe", "ignore"] });
     children.push(child2);
     const deadline2 = Date.now() + 10_000;
     while (!existsSync(handshakePath2) && Date.now() < deadline2) await new Promise((resolve) => setTimeout(resolve, 10));
+    const authorizationAcknowledged = once(child2.stdout, "data");
     child2.stdin.write("go\n");
+    const [controlOutput] = await withDeadline(authorizationAcknowledged, "generic wrapper authorization acknowledgement");
+    assert.equal(controlOutput.toString(), `${LAUNCH_AUTHORIZED_CONTROL}\n`, "the generic wrapper acknowledges only after it owns the authorized provider");
     let authorizedRecord;
     while (Date.now() < deadline2) {
       try {

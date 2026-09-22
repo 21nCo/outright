@@ -23,6 +23,7 @@
 
 #define INPUT_CAPACITY 4096
 #define TEARDOWN_BUDGET_MS 750
+#define AUTHORIZED_CONTROL "__OUTRIGHT_LAUNCH_AUTHORIZED_V1__"
 
 static volatile sig_atomic_t termination_requested = 0;
 
@@ -363,6 +364,7 @@ int main(int argc, char **argv) {
   sigemptyset(&action.sa_mask);
   sigaction(SIGTERM, &action, NULL);
   sigaction(SIGINT, &action, NULL);
+  signal(SIGPIPE, SIG_IGN);
   if (write_handshake(handshake_path, false, 0) != 0) {
     dprintf(STDERR_FILENO, "Unable to persist launch ownership: %s\n", strerror(errno));
     return 73;
@@ -443,6 +445,15 @@ int main(int argc, char **argv) {
               return 75;
             }
             authorized = true;
+            // Acknowledge only after the provider identity is durable and the
+            // authorization byte has been delivered. If the manager's output
+            // pipe is gone, tear the owned tree down instead of running work
+            // that no runtime has observed as scheduled.
+            if (dprintf(STDOUT_FILENO, "%s\n", AUTHORIZED_CONTROL) < 0 && !stopping) {
+              stopping = true;
+              stop_requested = true;
+              teardown_deadline = monotonic_ms() + TEARDOWN_BUDGET_MS;
+            }
           } else if (strcmp(line_start, "stop") == 0) {
             if (!authorized) {
               unlink(handshake_path);

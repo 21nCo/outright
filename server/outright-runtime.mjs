@@ -195,7 +195,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (runCreateMatch && request.method === "POST") {
         const conversation = database.getConversation(runCreateMatch[1]);
         if (!conversation) throw apiError(404, "Conversation not found");
-        const interrupted = database.findUnresolvedInterruptedRun(conversation.id);
+        // Recovery ownership is scoped to the worktree, not the chat. Another
+        // conversation targeting the same checkout must not start while an
+        // interrupted process tree may still mutate it.
+        const interrupted = database.findUnresolvedInterruptedRunForWorktree(conversation.worktreePath);
         if (interrupted) throw apiError(409, "Resolve the interrupted run before starting more agent work", { code: "RUN_RECOVERY_REQUIRED", runId: interrupted.id });
         const body = await readJson(request);
         const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
@@ -230,12 +233,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const conversation = database.getConversation(interrupted.conversationId);
         if (!conversation) throw apiError(404, "Conversation not found");
 
-        // Every unresolved interrupted run of the conversation is verified
-        // before any decision is recorded — not only the selected one. A
-        // conversation can carry an older started run plus a newer
-        // never-started (queued) run at the crash; recovering the queued run
-        // must not schedule replacement work while the older run's process
-        // tree can still mutate the worktree.
+        // Every unresolved interrupted run of the worktree is verified before
+        // any decision is recorded — not only runs from the selected chat. A
+        // sibling conversation can carry a started run while this chat holds a
+        // never-started run; recovering either one must not schedule work while
+        // the sibling process tree can still mutate the same checkout.
         //
         // Each previously started run is re-probed regardless of its
         // restart-time classification: a detached leader can exit while
@@ -247,7 +249,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         // a recorded discard would clear the submission gate and let a new run
         // start while the original descendants may still mutate the same
         // worktree.
-        for (const pending of database.listUnresolvedInterruptedRuns(conversation.id)) {
+        for (const pending of database.listUnresolvedInterruptedRunsForWorktree(conversation.worktreePath)) {
           if (pending.recoveryClass === "never-started") continue;
           if (!(Number.isSafeInteger(pending.pid) && pending.pid > 0)) {
             throw apiError(409, "An interrupted provider process cannot be verified, so no recovery decision can be recorded yet", { code: "RECOVERY_PROCESS_UNKNOWN", runId: pending.id });
@@ -311,13 +313,12 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           return json(response, 200, resolved);
         }
 
-        // Replacement work must respect conversation order: resuming or
-        // retrying a run may not schedule its replacement while an older
-        // unresolved interrupted run still awaits a decision, or the newer
-        // run's side effects could later be overwritten or invalidated by a
-        // recovery of the older run. Discarding a never-started run stays
-        // allowed above because it schedules no work.
-        const unresolved = database.listUnresolvedInterruptedRuns(conversation.id);
+        // Replacement work must respect worktree order across conversations:
+        // resuming or retrying a run may not schedule its replacement while an
+        // older unresolved run still awaits a decision, or the newer run's
+        // side effects could later be overwritten by the older recovery.
+        // Discard remains allowed above because it schedules no work.
+        const unresolved = database.listUnresolvedInterruptedRunsForWorktree(conversation.worktreePath);
         const selected = unresolved.findIndex((candidate) => candidate.id === interrupted.id);
         if (selected > 0) {
           throw apiError(409, "Resolve the older interrupted run before resuming or retrying this one", { code: "RECOVERY_ORDER_REQUIRED", runId: unresolved[0].id });
