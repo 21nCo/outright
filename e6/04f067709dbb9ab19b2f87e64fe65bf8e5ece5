@@ -1,0 +1,29 @@
+server/agent-manager.mjs
+  s_ba56058519ffbc::t_ac8b73a5d26f37 20,215-219,300-302,319,322-336,482-485,493,560-562,566-567
+src/App.jsx
+  s_77d7bb3189c71a::t_322c75883fba17 27,261-264,275-292,320,329-332,375-376,436-437,465,474-477
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e604f067709dbb9ab19b2f87e64fe65bf8e5ece5",
+  "prompts": {},
+  "sessions": {
+    "s_77d7bb3189c71a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0b3f5-d570-7a72-b668-401efd539e3b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_ba56058519ffbc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c30c-478d-7a03-957d-9a521dfa26a9",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
