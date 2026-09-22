@@ -431,6 +431,7 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     }
     const events = state.run.provider === "claude" ? normalizeClaude(raw) : normalizeCodex(raw);
     for (const event of events) {
+      let checkpointDelta = null;
       if (event.type === "session") {
         state.run.providerSessionId = event.payload.sessionId;
         database.updateRun(state.run.id, { providerSessionId: event.payload.sessionId });
@@ -444,7 +445,7 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       }
       if (event.type === "assistant.delta") {
         appendAssistantText(state, event.payload.text, emit);
-        scheduleAssistantCheckpoint(state, event.payload.text);
+        checkpointDelta = event.payload.text;
       }
       if (event.type === "assistant.message") {
         const text = event.payload.text ?? "";
@@ -465,6 +466,10 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
         ? { ...event.payload, text: truncateUtf8(event.payload.text ?? "", MAX_ASSISTANT_EVENT_BYTES), truncated: Buffer.byteLength(event.payload.text ?? "") > MAX_ASSISTANT_EVENT_BYTES }
         : event.payload;
       emit(state.run.id, event.type, emittedPayload);
+      // Publish the data-plane delta before any checkpoint containing those
+      // bytes. The UI can then render the delta as the live suffix and let the
+      // later durable message atomically advance the prefix and clear overlap.
+      if (checkpointDelta !== null) scheduleAssistantCheckpoint(state, checkpointDelta);
     }
   }
 
@@ -721,15 +726,18 @@ export function terminateTree(child, signal, platform = process.platform, run = 
 }
 
 // Escalation after the graceful SIGTERM window. The provider is killed alone
-// whenever its pid is durably known (the launch wrapper records it), so the
+// only when its pid and immutable process identity are durably known and the
+// identity still matches immediately before signaling, so the
 // wrapper — the provider's parent — survives to reap it. A group-wide
 // SIGKILL would kill the wrapper first and leave a killed-but-unreaped
 // provider as a zombie in its process group on hosts whose PID 1 does not
 // reap orphans, which would keep every liveness probe reporting alive until
 // the termination timeout. Without a usable provider pid (an injected child
 // spawned outside the launch wrapper, or an unreadable record) the whole
-// owned group is killed as before.
-export function escalateTree(child, handshakePath, platform = process.platform, run = spawnSync, kill = process.kill) {
+// owned group is killed as before. Darwin currently has no immutable provider
+// identity (the wrapper token identifies the wrapper, not the provider), so it
+// deliberately fails closed to the still-owned process group.
+export function escalateTree(child, handshakePath, platform = process.platform, run = spawnSync, kill = process.kill, providerProcessIdentity = (pid) => defaultProviderProcessIdentity(pid, platform)) {
   if (platform === "win32") {
     terminateTree(child, "SIGKILL", platform, run, kill);
     return "group";
@@ -745,8 +753,18 @@ export function escalateTree(child, handshakePath, platform = process.platform, 
     // A malformed or tampered record must never reach POSIX kill: kill(-1,
     // "SIGKILL") would terminate every process the runtime user owns. Only a
     // safe positive pid is usable; anything else falls back to the owned
-    // process group.
-    if (record?.authorized === true && Number(record?.pid) === child.pid && Number.isSafeInteger(recorded) && recorded > 0) providerPid = recorded;
+    // process group. The recorded birth identity must also revalidate at the
+    // last possible moment so PID reuse can never redirect SIGKILL.
+    const recordedIdentity = typeof record?.providerProcessIdentity === "string" && record.providerProcessIdentity
+      ? record.providerProcessIdentity
+      : null;
+    const liveIdentity = recordedIdentity ? providerProcessIdentity(recorded) : null;
+    if (record?.authorized === true
+      && Number(record?.pid) === child.pid
+      && Number.isSafeInteger(recorded)
+      && recorded > 0
+      && recordedIdentity
+      && liveIdentity === recordedIdentity) providerPid = recorded;
   } catch { /* No (or unreadable) handshake record. */ }
   if (providerPid) {
     try {
@@ -759,6 +777,18 @@ export function escalateTree(child, handshakePath, platform = process.platform, 
   }
   try { kill(-child.pid, "SIGKILL"); } catch { /* The process group already exited. */ }
   return "group";
+}
+
+export function defaultProviderProcessIdentity(pid, platform = process.platform, readFile = readFileSync) {
+  try {
+    if (platform !== "linux") return null;
+    const bootId = readFile("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    const stat = readFile(`/proc/${pid}/stat`, "utf8");
+    const close = stat.lastIndexOf(")");
+    if (close < 0) return null;
+    const startTicks = stat.slice(close + 2).split(" ")[19];
+    return bootId && startTicks ? `linux:${bootId}:${startTicks}` : null;
+  } catch { return null; }
 }
 
 // Liveness of the provider tree: the wrapper's process group on POSIX, the

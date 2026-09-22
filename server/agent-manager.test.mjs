@@ -8,6 +8,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { buildProviderCommand, consumeBoundedLines, createAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_AUTHORIZED_CONTROL, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
+import { streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
 
 const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
 const fakeLaunchDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-agent-test-"));
@@ -306,6 +307,46 @@ test("flushes a stalled sub-threshold delta tail after the checkpoint interval",
   child.emit("close", 0, null);
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(database.getRun("run-1").status, "completed");
+});
+
+test("keeps every streamed byte in exactly one durable-prefix or live-tail owner", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const published = [];
+  const manager = createAgentManager({ database, publish: (event) => published.push(event), spawnProcess: () => child, checkpointMinBytes: 5, checkpointIntervalMs: 40 });
+  database.createRun({ ...codexRun("run-1"), provider: "claude" });
+  await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-1") });
+  published.length = 0;
+
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "A" } } }) + "\n");
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "bcde" } } }) + "\n");
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "f" } } }) + "\n");
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "g" } } }) + "\n");
+  const timerDeadline = Date.now() + 1000;
+  while (database.messages[0]?.body !== "Abcdefg" && Date.now() < timerDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(database.messages[0]?.body, "Abcdefg", "the timer advances the durable prefix");
+
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "h" } } }) + "\n");
+  child.emit("close", 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  let durableBody = "";
+  let streamingText = "";
+  let expectedBody = "";
+  const relevant = published.filter((event) => event.type === "message.created"
+    || (event.type === "run.event" && ["assistant.delta", "assistant.message"].includes(event.payload?.type)));
+  for (const event of relevant) {
+    if (event.type === "run.event" && event.payload.type === "assistant.delta") {
+      expectedBody += event.payload.payload.text ?? "";
+    }
+    if (event.type === "message.created") durableBody = event.payload.body;
+    streamingText = streamingTextAfterRuntimeEvent(streamingText, event);
+    assert.equal(`${durableBody}${streamingText}`, expectedBody, `assistant bytes are exact after ${event.type === "run.event" ? event.payload.type : event.type}`);
+  }
+  assert.equal(expectedBody, "Abcdefgh");
+  assert.equal(database.messages[0].body, expectedBody, "the terminal checkpoint remains exact");
 });
 
 test("stops checkpoint rewrites after the transcript cap is durably flushed", async () => {
@@ -1028,10 +1069,10 @@ test("the generic wrapper never runs or acknowledges after its authorized handsh
   }
 });
 
-// Escalation must target the provider alone (via the wrapper's durable
-// provider-pid record) so the wrapper survives to reap it; only without a
-// usable provider pid does it fall back to killing the whole group.
-test("escalation targets the provider alone when its pid is durably recorded", () => {
+// Escalation may target the provider alone only after the wrapper's durable
+// provider identity revalidates. Missing or stale identity falls back to the
+// still-owned group instead of risking a recycled unrelated PID.
+test("escalation targets only a provider whose durable identity still matches", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-escalate-"));
   try {
     const handshakePath = path.join(root, "run-1.json");
@@ -1039,9 +1080,18 @@ test("escalation targets the provider alone when its pid is durably recorded", (
     const kill = (pid, signal) => kills.push([pid, signal]);
     const child = { pid: 4242, kill: (signal) => kills.push(["child", signal]) };
 
-    writeFileSync(handshakePath, JSON.stringify({ pid: 4242, authorized: true, providerPid: 777 }));
-    assert.equal(escalateTree(child, handshakePath, "linux", null, kill), "provider");
+    writeFileSync(handshakePath, JSON.stringify({ pid: 4242, authorized: true, providerPid: 777, providerProcessIdentity: "linux:boot:123" }));
+    assert.equal(escalateTree(child, handshakePath, "linux", null, kill, () => "linux:boot:123"), "provider");
     assert.deepEqual(kills, [[777, "SIGKILL"]], "the provider pid is killed, never the group or the wrapper");
+
+    kills.length = 0;
+    assert.equal(escalateTree(child, handshakePath, "darwin", null, kill, () => "darwin:boot:recycled"), "group");
+    assert.deepEqual(kills, [[-4242, "SIGKILL"]], "a mismatched Darwin provider identity never signals the recycled pid");
+
+    kills.length = 0;
+    writeFileSync(handshakePath, JSON.stringify({ pid: 4242, authorized: true, providerPid: 777 }));
+    assert.equal(escalateTree(child, handshakePath, "darwin", null, kill, () => "darwin:boot:any"), "group");
+    assert.deepEqual(kills, [[-4242, "SIGKILL"]], "Darwin fails closed when no immutable provider identity was persisted");
 
     kills.length = 0;
     writeFileSync(handshakePath, JSON.stringify({ pid: 4242, authorized: false }));

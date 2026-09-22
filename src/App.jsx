@@ -24,7 +24,7 @@ import { ContextPane } from "@/components/ContextPane";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { TerminalPane } from "@/components/TerminalPane";
 import { api, connectRuntime, query } from "@/lib/runtime-api";
-import { draftAfterSubmission, isComposerSubmitKey, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, shouldReloadConversationForResolvedRun, streamingTextAfterDurableMessage } from "@/recovery-policy";
+import { draftAfterSubmission, isComposerSubmitKey, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent } from "@/recovery-policy";
 
 const MAX_RENDERED_MESSAGES = 1000;
 const MAX_STREAMING_CHARACTERS = 1024 * 1024;
@@ -165,7 +165,7 @@ export function App() {
     if (event.type === "conversation.created" || event.type === "conversation.updated") loadConversations(event.conversationId);
     if (shouldReloadConversationForResolvedRun(event, selectedConversationRef.current, selectedRecoveryRunId)) loadConversation();
     if (event.type === "message.created" && event.conversationId === selectedConversationRef.current) {
-      setStreamingText((current) => streamingTextAfterDurableMessage(current, event.payload));
+      setStreamingText((current) => streamingTextAfterRuntimeEvent(current, event));
       setConversation((current) => {
         if (!current) return current;
         const alreadyPresent = current.messages.some((message) => message.id === event.payload.id);
@@ -192,8 +192,8 @@ export function App() {
     }
     if (event.type === "run.event" && event.conversationId === selectedConversationRef.current) {
       const runEvent = event.payload;
-      if (runEvent.type === "assistant.delta") setStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(current + (runEvent.payload.text ?? "")));
-      if (runEvent.type === "assistant.message") setStreamingText("");
+      if (runEvent.type === "assistant.delta") setStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event)));
+      if (runEvent.type === "assistant.message") setStreamingText((current) => streamingTextAfterRuntimeEvent(current, event));
       if (runEvent.type.startsWith("tool.")) setRunEvents((current) => [...current, runEvent].slice(-20));
       if (["run.completed", "run.failed", "run.stopped"].includes(runEvent.type)) {
         window.setTimeout(loadConversation, 80);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { draftAfterSubmission, isComposerSubmitKey, isUnverifiableLegacyRecovery, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, shouldReloadConversationForResolvedRun, streamingTextAfterDurableMessage } from "../src/recovery-policy.js";
+import { draftAfterSubmission, isComposerSubmitKey, isUnverifiableLegacyRecovery, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, shouldReloadConversationForResolvedRun, streamingTextAfterDurableMessage, streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
 
 test("worktree recovery metadata gates sibling composers before conversation-local history", () => {
   const local = { id: "local", status: "interrupted" };
@@ -39,6 +39,9 @@ test("durable run checkpoints replace the overlapping live stream", () => {
   assert.equal(streamingTextAfterDurableMessage("duplicated answer", { role: "assistant", payload: { runId: "run-1" } }), "");
   assert.equal(streamingTextAfterDurableMessage("keep live output", { role: "user" }), "keep live output");
   assert.equal(streamingTextAfterDurableMessage("keep live output", { role: "assistant", payload: {} }), "keep live output");
+  assert.equal(streamingTextAfterRuntimeEvent("", { type: "run.event", payload: { type: "assistant.delta", payload: { text: "live tail" } } }), "live tail");
+  assert.equal(streamingTextAfterRuntimeEvent("live tail", { type: "message.created", payload: { role: "assistant", payload: { runId: "run-1" } } }), "");
+  assert.equal(streamingTextAfterRuntimeEvent("live tail", { type: "run.event", payload: { type: "assistant.message", payload: { text: "done" } } }), "");
 });
 
 test("only legacy rows without any process or worktree identity offer manual cleanup", () => {
