@@ -614,7 +614,7 @@ test("shutdown racing the running-state commit never authorizes the provider", a
   assert.deepEqual(manager.activeRuns(), []);
 });
 
-test("shutdown cleans a stale supervisor handshake after a zero-member tree proof", async () => {
+test("shutdown retains ownership when a closed supervisor leaves a stale handshake", async () => {
   const database = fakeDatabase();
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-stale-handshake-"));
   const handshakePath = path.join(root, "run-1.json");
@@ -634,18 +634,17 @@ test("shutdown cleans a stale supervisor handshake after a zero-member tree proo
       spawnProcess: () => child,
       launchDirectory: root,
       launchCommand: (command) => ({ ...command, handshakePath, ownsDescendants: true }),
-      ownedTreeMembers: () => [],
       terminationTimeoutMs: 250,
     });
     const run = database.createRun(codexRun("run-1"));
     await manager.schedule({ conversation: database.getConversation("conv-1"), run });
     writeFileSync(handshakePath, JSON.stringify({ pid: child.pid, authorized: true, processIdentity: "test:owned" }));
 
-    await manager.shutdown();
+    await assert.rejects(manager.shutdown(), /Agent process tree did not terminate/);
 
-    assert.equal(existsSync(handshakePath), false, "a stale record cannot wedge shutdown after the raw group is empty");
-    assert.equal(database.getRun(run.id).status, "stopped");
-    assert.deepEqual(manager.activeRuns(), []);
+    assert.equal(existsSync(handshakePath), true, "an empty process group cannot erase ancestry-based supervisor ownership");
+    assert.equal(database.getRun(run.id).status, "running");
+    assert.deepEqual(manager.activeRuns(), [run.id], "the run slot remains owned until the supervisor proves its complete tree is gone");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -754,7 +753,9 @@ test("the launch wrapper records durable identity before authorization and clean
     const record = JSON.parse(readFileSync(handshakePath, "utf8"));
     assert.equal(record.pid, child.pid, "the wrapper records its own pid durably before anything can execute");
     assert.equal(record.authorized, false);
-    assert.equal(record.processIdentity?.startsWith(`${process.platform}:`), true, "the handshake binds ownership to the wrapper's immutable start identity");
+    if (["linux", "darwin", "win32"].includes(process.platform)) {
+      assert.equal(record.processIdentity?.startsWith(`${process.platform}:`), true, "the handshake binds ownership to the wrapper's immutable start identity");
+    }
 
     child.stdin.end();
     await withDeadline(new Promise((resolve) => child.once("exit", resolve)), "unauthorized wrapper exit", () => { try { child.kill("SIGKILL"); } catch {} });
@@ -764,12 +765,25 @@ test("the launch wrapper records durable identity before authorization and clean
     // Authorized: the same wrapper starts the provider and passes the exit code.
     const marker2 = path.join(root, "provider-ran-2");
     const handshakePath2 = path.join(launchDirectory, "launch-run-2.json");
-    const provider2 = `require("node:fs").writeFileSync(${JSON.stringify(marker2)}, "ran");`;
+    const provider2 = `require("node:fs").writeFileSync(${JSON.stringify(marker2)}, "ran"); setTimeout(() => {}, 250);`;
     const child2 = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath2, process.execPath, "-e", provider2], { stdio: ["pipe", "ignore", "ignore"] });
     children.push(child2);
     const deadline2 = Date.now() + 10_000;
     while (!existsSync(handshakePath2) && Date.now() < deadline2) await new Promise((resolve) => setTimeout(resolve, 10));
     child2.stdin.write("go\n");
+    let authorizedRecord;
+    while (Date.now() < deadline2) {
+      try {
+        const candidate = JSON.parse(readFileSync(handshakePath2, "utf8"));
+        if (candidate.authorized) { authorizedRecord = candidate; break; }
+      } catch { /* Atomic replacement may briefly move the file. */ }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (["linux", "darwin", "win32"].includes(process.platform)) {
+      assert.equal(authorizedRecord?.providerProcessIdentity?.startsWith(`${process.platform}:`), true, "the authorized record binds the provider pid to its own boot-scoped start identity");
+    } else {
+      assert.equal(authorizedRecord?.providerProcessIdentity, undefined);
+    }
     const code = await withDeadline(new Promise((resolve) => child2.once("exit", resolve)), "authorized wrapper exit", () => { try { child2.kill("SIGKILL"); } catch {} });
     assert.equal(code, 0);
     assert.equal(existsSync(marker2), true, "the authorized wrapper starts the provider");
@@ -1033,7 +1047,7 @@ const failedHandshake = path.join(failedRoot, "run.json");
 const failedMarker = path.join(root, "provider-must-not-run");
 const failed = spawn("/tmp/agent-supervisor", [failedHandshake, process.execPath, "-e", \`require('node:fs').writeFileSync(\${JSON.stringify(failedMarker)}, 'ran')\`], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
 while (!existsSync(failedHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
-const nativeIdentitySafe = /^linux:[1-9]\\d*$/.test(JSON.parse(readFileSync(failedHandshake, "utf8")).processIdentity || "");
+const nativeIdentitySafe = /^linux:[0-9a-f-]+:[1-9]\\d*$/.test(JSON.parse(readFileSync(failedHandshake, "utf8")).processIdentity || "");
 renameSync(failedRoot, failedRoot + "-moved");
 writeFileSync(failedRoot, "blocks directory recreation");
 failed.stdin.write("go\\n");

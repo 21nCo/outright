@@ -35,27 +35,42 @@ const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 const [handshakePath, executable, ...commandArgs] = process.argv.slice(1);
 fs.mkdirSync(path.dirname(handshakePath), { recursive: true });
-const processIdentity = (() => {
+const processIdentityFor = (pid) => {
   try {
     if (process.platform === "linux") {
-      const stat = fs.readFileSync(\`/proc/\${process.pid}/stat\`, "utf8");
+      const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      const stat = fs.readFileSync(\`/proc/\${pid}/stat\`, "utf8");
       const close = stat.lastIndexOf(")");
-      return \`linux:\${stat.slice(close + 2).split(" ")[19]}\`;
+      const startTicks = close >= 0 ? stat.slice(close + 2).split(" ")[19] : "";
+      return bootId && startTicks ? \`linux:\${bootId}:\${startTicks}\` : null;
     }
     if (process.platform === "darwin") {
-      const started = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(process.pid)], { encoding: "utf8" }).trim();
-      return started ? \`darwin:\${started}\` : null;
+      const boot = execFileSync("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8" }).trim();
+      const started = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" }).trim();
+      return boot && started ? \`darwin:\${boot}:\${started}\` : null;
+    }
+    if (process.platform === "win32") {
+      const script = "$boot=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks;"
+        + "$start=(Get-Process -Id " + String(pid) + ").StartTime.ToUniversalTime().Ticks;"
+        + "Write-Output ($boot.ToString() + ':' + $start.ToString())";
+      const started = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true }).trim();
+      return started ? \`win32:\${started}\` : null;
     }
   } catch {}
   return null;
-})();
-const handshake = (authorized, providerPid) => ({
-  pid: process.pid,
-  authorized,
-  ...(providerPid ? { providerPid } : {}),
-  ...(processIdentity ? { processIdentity } : {}),
-  createdAt: new Date().toISOString(),
-});
+};
+const processIdentity = processIdentityFor(process.pid);
+const handshake = (authorized, providerPid) => {
+  const providerProcessIdentity = providerPid ? processIdentityFor(providerPid) : null;
+  return {
+    pid: process.pid,
+    authorized,
+    ...(providerPid ? { providerPid } : {}),
+    ...(processIdentity ? { processIdentity } : {}),
+    ...(providerProcessIdentity ? { providerProcessIdentity } : {}),
+    createdAt: new Date().toISOString(),
+  };
+};
 // Durable process identity BEFORE anything can execute: if the runtime dies
 // before recording this pid, the handshake file restores ownership after
 // restart.
@@ -192,7 +207,7 @@ export function defaultLaunchCommand(command, run, launchDirectory) {
   };
 }
 
-export function createAgentManager({ database, publish, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory, ownedTreeMembers = defaultGroupMembers }) {
+export function createAgentManager({ database, publish, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
   const resolvedLaunchDirectory = launchDirectory
     ?? database.launchDirectory;
   assertPrivateLaunchDirectory(resolvedLaunchDirectory);
@@ -410,7 +425,7 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
         let escalated = false;
         let groupEscalated = false;
         while (state.ownsDescendants
-          ? supervisorTreePending(state, ownedTreeMembers)
+          ? !state.closed || Boolean(state.launchHandshakePath && existsSync(state.launchHandshakePath))
           : !state.closed || processGroupAlive(state.child)) {
           const elapsed = Date.now() - started;
           if (!teardownRequested && elapsed >= terminationGraceMs) {
@@ -459,19 +474,6 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     try { state.child?.stdin?.write?.("stop\n"); } catch { /* The wrapper already exited. */ }
   }
 
-  function supervisorTreePending(state, groupMembers) {
-    if (!state.closed) return true;
-    if (!state.launchHandshakePath || !existsSync(state.launchHandshakePath)) return false;
-    const members = state.child?.pid ? groupMembers(state.child.pid) : null;
-    if (Array.isArray(members) && members.length === 0) {
-      // A supervisor that closed after reaping its tree but before unlinking
-      // the handshake must not wedge shutdown forever. The raw zero-member
-      // process-group proof is stronger than the stale file, so clean it up.
-      try { unlinkSync(state.launchHandshakePath); } catch { /* Already gone. */ }
-      return false;
-    }
-    return true;
-  }
 
   function drain() {
     if (shuttingDown) return;

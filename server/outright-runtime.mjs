@@ -12,7 +12,7 @@ import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = defaultRecoveryProcessAlive, recoveryProcessIdentity = defaultRecoveryProcessIdentity, terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationTimeoutMs = 8000 }) {
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = defaultRecoveryProcessAlive, recoveryProcessIdentity = defaultRecoveryProcessIdentity, terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000 }) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
   const database = createOutrightDatabase({ runtimeLease: true });
@@ -259,10 +259,31 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
             if (!recoveryIdentityMatches(pending, handshake, processIdentity)) {
               throw apiError(409, "The interrupted provider process identity cannot be verified, so it will not be signaled", { code: "RECOVERY_PROCESS_UNKNOWN", pid: pending.pid, runId: pending.id });
             }
-            try { await terminateRecoveryProcess(pending.pid); }
+            let terminationProven = false;
+            try { terminationProven = await terminateRecoveryProcess(pending.pid, "SIGTERM", handshake) === true; }
             catch { /* Verification below remains fail-closed. */ }
+            if (terminationProven) verdict = "exited";
+            const started = Date.now();
             const deadline = Date.now() + recoveryTerminationTimeoutMs;
+            let escalated = false;
             while (verdict === "alive" && Date.now() < deadline) {
+              if (!escalated && Date.now() - started >= recoveryTerminationGraceMs) {
+                const currentIdentity = await recoveryProcessIdentity(pending.pid);
+                if (!recoveryIdentityMatches(pending, handshake, currentIdentity)) {
+                  throw apiError(409, "The interrupted provider process identity changed before escalation, so it will not be signaled", { code: "RECOVERY_PROCESS_UNKNOWN", pid: pending.pid, runId: pending.id });
+                }
+                if (handshake?.providerPid && handshake?.providerProcessIdentity) {
+                  const providerIdentity = await recoveryProcessIdentity(handshake.providerPid);
+                  if (providerIdentity !== handshake.providerProcessIdentity) {
+                    throw apiError(409, "The interrupted provider child identity changed before escalation, so it will not be signaled", { code: "RECOVERY_PROCESS_UNKNOWN", pid: handshake.providerPid, runId: pending.id });
+                  }
+                }
+                try { terminationProven = await terminateRecoveryProcess(pending.pid, "SIGKILL", handshake) === true; }
+                catch { /* Verification below remains fail-closed. */ }
+                if (terminationProven) verdict = "exited";
+                escalated = true;
+              }
+              if (verdict !== "alive") break;
               await new Promise((resolve) => setTimeout(resolve, 50));
               verdict = recoveryVerdict(await recoveryProcessAlive(pending.pid));
             }
@@ -512,16 +533,25 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
 export function defaultRecoveryProcessIdentity(pid, platform = process.platform, readFile = readFileSync, run = spawnSync) {
   try {
     if (platform === "linux") {
+      const bootId = readFile("/proc/sys/kernel/random/boot_id", "utf8").trim();
       const stat = readFile(`/proc/${pid}/stat`, "utf8");
       const close = stat.lastIndexOf(")");
       if (close < 0) return null;
       const startTicks = stat.slice(close + 2).split(" ")[19];
-      return startTicks ? `linux:${startTicks}` : null;
+      return bootId && startTicks ? `linux:${bootId}:${startTicks}` : null;
     }
     if (platform === "darwin") {
-      const result = run("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
+      const bootResult = run("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8" });
+      const processResult = run("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
+      const boot = bootResult.status === 0 ? bootResult.stdout.trim() : "";
+      const started = processResult.status === 0 ? processResult.stdout.trim() : "";
+      return boot && started ? `darwin:${boot}:${started}` : null;
+    }
+    if (platform === "win32") {
+      const script = `$boot=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks;$start=(Get-Process -Id ${pid}).StartTime.ToUniversalTime().Ticks;Write-Output ($boot.ToString() + ':' + $start.ToString())`;
+      const result = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true });
       const started = result.status === 0 ? result.stdout.trim() : "";
-      return started ? `darwin:${started}` : null;
+      return started ? `win32:${started}` : null;
     }
   } catch { /* A missing or unreadable process is not identifiable. */ }
   return null;
@@ -535,8 +565,22 @@ function recoveryIdentityMatches(run, handshake, processIdentity) {
     && handshake.processIdentity === processIdentity;
 }
 
-export function defaultTerminateRecoveryProcess(pid) {
-  terminateTree({ pid }, "SIGTERM");
+export function defaultTerminateRecoveryProcess(pid, signal = "SIGTERM", handshake = null, platform = process.platform, run = spawnSync, kill = process.kill) {
+  if (platform === "win32") {
+    const result = run("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+    if (result.status !== 0) throw new Error("Unable to terminate the recovered Windows process tree");
+    return true;
+  }
+  if (platform === "linux" && signal === "SIGKILL") {
+    const providerPid = Number(handshake?.providerPid);
+    if (Number.isSafeInteger(providerPid) && providerPid > 0 && typeof handshake?.providerProcessIdentity === "string") {
+      kill(providerPid, "SIGKILL");
+      return false;
+    }
+    throw new Error("A verified provider identity is required for Linux recovery escalation");
+  }
+  terminateTree({ pid }, signal, platform, run, kill);
+  return false;
 }
 
 async function canonicalOf(target) {

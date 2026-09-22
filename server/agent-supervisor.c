@@ -75,6 +75,20 @@ static unsigned long long process_start_ticks(pid_t pid) {
   return start_ticks;
 }
 
+static bool process_identity(pid_t pid, char *identity, size_t identity_size) {
+  FILE *file = fopen("/proc/sys/kernel/random/boot_id", "r");
+  if (file == NULL) return false;
+  char boot_id[64];
+  bool read = fgets(boot_id, sizeof(boot_id), file) != NULL;
+  fclose(file);
+  if (!read) return false;
+  boot_id[strcspn(boot_id, "\r\n")] = '\0';
+  unsigned long long start_ticks = process_start_ticks(pid);
+  if (boot_id[0] == '\0' || start_ticks == 0) return false;
+  int written = snprintf(identity, identity_size, "linux:%s:%llu", boot_id, start_ticks);
+  return written > 0 && (size_t)written < identity_size;
+}
+
 static int ensure_parent_directory(const char *filename) {
   char *copy = strdup(filename);
   if (copy == NULL) return -1;
@@ -106,10 +120,23 @@ static int write_handshake(const char *path, bool authorized, pid_t provider_pid
   struct tm utc;
   char created_at[32] = "";
   if (gmtime_r(&wall_time, &utc) != NULL) strftime(created_at, sizeof(created_at), "%Y-%m-%dT%H:%M:%SZ", &utc);
-  unsigned long long start_ticks = process_start_ticks(getpid());
+  char identity[160];
+  if (!process_identity(getpid(), identity, sizeof(identity))) {
+    close(descriptor);
+    unlink(temporary);
+    free(temporary);
+    return -1;
+  }
+  char provider_identity[160];
+  if (authorized && !process_identity(provider_pid, provider_identity, sizeof(provider_identity))) {
+    close(descriptor);
+    unlink(temporary);
+    free(temporary);
+    return -1;
+  }
   int written = authorized
-    ? dprintf(descriptor, "{\"pid\":%ld,\"authorized\":true,\"providerPid\":%ld,\"processIdentity\":\"linux:%llu\",\"createdAt\":\"%s\"}", (long)getpid(), (long)provider_pid, start_ticks, created_at)
-    : dprintf(descriptor, "{\"pid\":%ld,\"authorized\":false,\"processIdentity\":\"linux:%llu\",\"createdAt\":\"%s\"}", (long)getpid(), start_ticks, created_at);
+    ? dprintf(descriptor, "{\"pid\":%ld,\"authorized\":true,\"providerPid\":%ld,\"processIdentity\":\"%s\",\"providerProcessIdentity\":\"%s\",\"createdAt\":\"%s\"}", (long)getpid(), (long)provider_pid, identity, provider_identity, created_at)
+    : dprintf(descriptor, "{\"pid\":%ld,\"authorized\":false,\"processIdentity\":\"%s\",\"createdAt\":\"%s\"}", (long)getpid(), identity, created_at);
   int result = 0;
   if (written < 0 || fsync(descriptor) != 0) result = -1;
   if (close(descriptor) != 0) result = -1;

@@ -6,7 +6,7 @@ import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync 
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAlive, defaultRecoveryProcessIdentity, runtimeAllowedHosts } from "./outright-runtime.mjs";
+import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAlive, defaultRecoveryProcessIdentity, defaultTerminateRecoveryProcess, runtimeAllowedHosts } from "./outright-runtime.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 
 function request(host, origin) {
@@ -205,6 +205,65 @@ test("keeps recovery blocked when an alive provider cannot be terminated", withR
   assert.equal(response.body.code, "RECOVERY_PROCESS_ACTIVE");
   assert.equal(runtime.database.getRun(run.id).recoveryDecision, null);
 }, { recoveryProcessAlive: () => true, recoveryProcessIdentity: () => "test:owned", terminateRecoveryProcess: async () => {}, recoveryTerminationTimeoutMs: 0 }));
+
+test("escalates recovery termination after the graceful signal while revalidating identity", (() => {
+  let treeVerdict = "alive";
+  const signals = [];
+  return withRuntime(async (runtime) => {
+    const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+    runtime.database.updateRun(run.id, { status: "running", pid: 4242 });
+    writeFileSync(path.join(runtime.database.launchDirectory, `${run.id}.json`), JSON.stringify({ pid: 4242, authorized: true, processIdentity: "test:owned" }));
+    runtime.database.reconcileInterruptedRuns({ probeAlive: () => true });
+
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), response);
+
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+    assert.equal(runtime.database.getRun(run.id).recoveryDecision, "discard");
+  }, {
+    recoveryProcessAlive: () => treeVerdict,
+    recoveryProcessIdentity: () => "test:owned",
+    terminateRecoveryProcess: async (_pid, signal) => {
+      signals.push(signal);
+      if (signal === "SIGKILL") treeVerdict = "exited";
+    },
+    recoveryTerminationGraceMs: 0,
+    recoveryTerminationTimeoutMs: 250,
+  });
+})());
+
+test("never escalates to a reused provider pid", (() => {
+  const signals = [];
+  return withRuntime(async (runtime) => {
+    const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+    runtime.database.updateRun(run.id, { status: "running", pid: 4242 });
+    writeFileSync(path.join(runtime.database.launchDirectory, `${run.id}.json`), JSON.stringify({
+      pid: 4242,
+      authorized: true,
+      processIdentity: "test:wrapper",
+      providerPid: 4343,
+      providerProcessIdentity: "test:original-provider",
+    }));
+    runtime.database.reconcileInterruptedRuns({ probeAlive: () => true });
+
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), response);
+
+    assert.equal(response.statusCode, 409);
+    assert.equal(response.body.code, "RECOVERY_PROCESS_UNKNOWN");
+    assert.deepEqual(signals, ["SIGTERM"], "the reused provider pid is never sent the escalation signal");
+    assert.equal(runtime.database.getRun(run.id).recoveryDecision, null);
+  }, {
+    recoveryProcessAlive: () => "alive",
+    recoveryProcessIdentity: (pid) => pid === 4242 ? "test:wrapper" : "test:reused-provider",
+    terminateRecoveryProcess: async (_pid, signal) => { signals.push(signal); },
+    recoveryTerminationGraceMs: 0,
+    recoveryTerminationTimeoutMs: 250,
+  });
+})());
 
 // A private handshake still is not enough after PID/PGID reuse: recovery must
 // compare its immutable process-start identity before sending any signal.
@@ -482,10 +541,73 @@ test("the default recovery probe is conservative per platform", async () => {
     try {
       assert.equal(defaultRecoveryProcessAlive(live.pid), "alive");
       assert.equal(defaultRecoveryProcessAlive(live.pid, "win32"), "alive");
-      assert.equal(defaultRecoveryProcessIdentity(live.pid)?.startsWith(`${process.platform}:`), true, "the current process start identity is readable on supported POSIX platforms");
+      if (["linux", "darwin"].includes(process.platform)) {
+        assert.equal(defaultRecoveryProcessIdentity(live.pid)?.startsWith(`${process.platform}:`), true, "the current process start identity is readable on supported POSIX platforms");
+      }
     } finally {
       try { process.kill(-live.pid, "SIGKILL"); } catch { /* Already gone. */ }
     }
+  }
+});
+
+test("recovery identities are boot-scoped and Windows taskkill supplies a whole-tree proof", () => {
+  const linuxFields = Array.from({ length: 20 }, (_, index) => index + 1);
+  linuxFields[19] = 424242;
+  const linuxStat = `123 (node) ${linuxFields.join(" ")}`;
+  const linuxIdentity = defaultRecoveryProcessIdentity(123, "linux", (filename) => filename.endsWith("boot_id") ? "boot-uuid\n" : linuxStat);
+  assert.equal(linuxIdentity, "linux:boot-uuid:424242");
+
+  const powershellCalls = [];
+  const run = (executable, args, options) => {
+    powershellCalls.push([executable, args, options]);
+    return { status: 0, stdout: "638940000000000000:638940001234567890\r\n" };
+  };
+  assert.equal(defaultRecoveryProcessIdentity(456, "win32", () => "", run), "win32:638940000000000000:638940001234567890");
+  assert.equal(powershellCalls[0][0], "powershell.exe");
+  assert.match(powershellCalls[0][1].at(-1), /Get-Process -Id 456/);
+
+  const taskkillCalls = [];
+  const terminated = defaultTerminateRecoveryProcess(456, "SIGTERM", null, "win32", (executable, args, options) => {
+    taskkillCalls.push([executable, args, options]);
+    return { status: 0 };
+  });
+  assert.equal(terminated, true);
+  assert.deepEqual(taskkillCalls, [["taskkill", ["/PID", "456", "/T", "/F"], { stdio: "ignore" }]]);
+
+  const kills = [];
+  assert.equal(defaultTerminateRecoveryProcess(456, "SIGKILL", { providerPid: 789, providerProcessIdentity: "linux:boot:1" }, "linux", null, (pid, signal) => kills.push([pid, signal])), false);
+  assert.deepEqual(kills, [[789, "SIGKILL"]], "Linux escalation preserves the supervisor and targets only the revalidated provider");
+});
+
+test("macOS recovery termination stops a provider that ignores SIGTERM", {
+  skip: process.platform !== "darwin",
+}, async () => {
+  const child = spawn(process.execPath, ["-e", [
+    "process.on('SIGTERM', () => {});",
+    "process.stdout.write('ready\\n');",
+    "setInterval(() => {}, 1000);",
+  ].join("\n")], {
+    detached: true,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+
+  try {
+    await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.stdout.once("data", resolve);
+    });
+    const identity = defaultRecoveryProcessIdentity(child.pid, "darwin");
+    assert.match(identity, /^darwin:/);
+
+    defaultTerminateRecoveryProcess(child.pid, "SIGTERM", null, "darwin");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(defaultRecoveryProcessAlive(child.pid, "darwin"), "alive");
+
+    defaultTerminateRecoveryProcess(child.pid, "SIGKILL", null, "darwin");
+    await new Promise((resolve) => child.once("close", resolve));
+    assert.equal(defaultRecoveryProcessAlive(child.pid, "darwin"), "exited");
+  } finally {
+    try { process.kill(-child.pid, "SIGKILL"); } catch { /* Already gone. */ }
   }
 });
 
