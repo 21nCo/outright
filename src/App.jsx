@@ -24,7 +24,7 @@ import { ContextPane } from "@/components/ContextPane";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { TerminalPane } from "@/components/TerminalPane";
 import { api, connectRuntime, query } from "@/lib/runtime-api";
-import { isComposerSubmitKey, recoveryBelongsToConversation, recoveryGate } from "@/recovery-policy";
+import { draftAfterSubmission, isComposerSubmitKey, recoveryBelongsToConversation, recoveryGate } from "@/recovery-policy";
 
 const MAX_RENDERED_MESSAGES = 1000;
 const MAX_STREAMING_CHARACTERS = 1024 * 1024;
@@ -74,6 +74,7 @@ export function App() {
   const messageViewportRef = useRef(null);
   const stickToBottomRef = useRef(true);
   const pendingPrependScrollRef = useRef(null);
+  const submissionPendingRef = useRef(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
 
   const loadBootstrap = useCallback(async (manual = false) => {
@@ -309,15 +310,17 @@ export function App() {
   }
   async function sendPrompt(event, promptOverride, targetOverride) {
     event?.preventDefault();
-    const prompt = (promptOverride ?? draft).trim();
-    if (!prompt || activeRun || interruptedRun) return;
-    let target = targetOverride ?? conversation;
-    if (!target) target = await createConversation(prompt.split(/\n/)[0].slice(0, 52));
-    if (!target || !isSelectedTarget(target)) return;
+    const submittedDraft = promptOverride ?? draft;
+    const prompt = submittedDraft.trim();
+    if (!prompt || activeRun || interruptedRun || submissionPendingRef.current) return;
+    submissionPendingRef.current = true;
     try {
+      let target = targetOverride ?? conversation;
+      if (!target) target = await createConversation(prompt.split(/\n/)[0].slice(0, 52));
+      if (!target || !isSelectedTarget(target)) return;
       const run = await api(`/api/conversations/${target.id}/runs`, { method: "POST", body: { prompt, provider: target.provider || settings.provider, model: target.model || settings.model, reasoningEffort: settings.reasoningEffort, approvalPolicy: settings.approvalPolicy } });
       if (!isSelectedTarget(target)) return;
-      setDraft(""); setStreamingText(""); setRunEvents([]);
+      setDraft((current) => draftAfterSubmission(current, submittedDraft)); setStreamingText(""); setRunEvents([]);
       setConversation((current) => {
         if (current && current.id !== target.id) return current;
         const next = current ?? { ...target, messages: [], runs: [] };
@@ -331,6 +334,7 @@ export function App() {
         setError(nextError.message);
       }
     }
+    finally { submissionPendingRef.current = false; }
   }
   async function trustAndRun() {
     const pending = pendingPrompt;

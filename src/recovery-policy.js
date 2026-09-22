@@ -6,7 +6,11 @@ export function recoveryGate(conversation) {
 }
 
 export function isComposerSubmitKey(event) {
-  return event?.key === "Enter" && !event.shiftKey && !event.isComposing;
+  return event?.key === "Enter" && !event.shiftKey && !event.isComposing && !event.repeat;
+}
+
+export function draftAfterSubmission(currentDraft, submittedDraft) {
+  return currentDraft === submittedDraft ? "" : currentDraft;
 }
 
 export function recoveryBelongsToConversation(run, conversation) {
