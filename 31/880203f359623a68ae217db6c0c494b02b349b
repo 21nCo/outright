@@ -1,0 +1,41 @@
+server/agent-manager.mjs
+  s_6126673cc0a89e::t_668166629b5646 222-227
+  s_6126673cc0a89e::t_26f9bb1e9c1baf 18-27
+server/agent-supervisor-windows.c
+  s_6126673cc0a89e::t_26f9bb1e9c1baf 20-25
+server/outright-runtime.test.mjs
+  s_6126673cc0a89e::t_8773265b6418fc 794-813
+server/ui-recovery.test.mjs
+  s_6126673cc0a89e::t_f8c1e985c0ad51 3,57-80
+  s_6126673cc0a89e::t_cc3b75acbef2da 81
+server/agent-supervisor-darwin.c
+  s_6126673cc0a89e::t_668166629b5646 131-133,136-142,156,190-201,223-247,249,331,339-347,352,363-367
+src/recovery-policy.js
+  s_6126673cc0a89e::t_f8c1e985c0ad51 37-79
+.github/workflows/ci.yml
+  s_6126673cc0a89e::t_26f9bb1e9c1baf 15-19
+server/agent-manager.test.mjs
+  s_6126673cc0a89e::t_8773265b6418fc 10,16,45-54,1070,1109,1133-1142,1144
+  s_6126673cc0a89e::t_1e325b741c3a16 1143,1145-1146
+src/App.jsx
+  s_6126673cc0a89e::t_f8c1e985c0ad51 27,79,139-140,147-149,151-154,160-163,170-173,382
+scripts/build-agent-supervisor.mjs
+  s_6126673cc0a89e::t_26f9bb1e9c1baf 1-2,13-17,25-53
+  s_6126673cc0a89e::t_14c5e6934b413e 24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "31880203f359623a68ae217db6c0c494b02b349b",
+  "prompts": {},
+  "sessions": {
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
