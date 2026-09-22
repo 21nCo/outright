@@ -21,12 +21,13 @@ export function streamingTextAfterDurableMessage(currentText, message) {
 // stream owns only the suffix after that prefix. Applying both event kinds
 // through one reducer keeps that ownership rule identical in the UI and in
 // end-to-end publication-order regressions.
-export function streamingTextAfterRuntimeEvent(currentText, event) {
+export function streamingTextAfterRuntimeEvent(currentText, event, checkpointEventSeq = 0) {
   if (event?.type === "message.created") {
     return streamingTextAfterDurableMessage(currentText, event.payload);
   }
   if (event?.type !== "run.event") return currentText;
   if (event.payload?.type === "assistant.delta") {
+    if (Number.isSafeInteger(event.payload.seq) && event.payload.seq <= checkpointEventSeq) return currentText;
     return `${currentText}${event.payload.payload?.text ?? ""}`;
   }
   if (event.payload?.type === "assistant.message") return "";

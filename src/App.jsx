@@ -75,6 +75,7 @@ export function App() {
   const stickToBottomRef = useRef(true);
   const pendingPrependScrollRef = useRef(null);
   const submissionPendingRef = useRef(false);
+  const checkpointCursorsRef = useRef(new Map());
   const [loadingEarlier, setLoadingEarlier] = useState(false);
 
   const loadBootstrap = useCallback(async (manual = false) => {
@@ -141,6 +142,7 @@ export function App() {
       if (selectedConversationRef.current !== requestedId) return;
       if (nextConversation.projectId !== selectedProjectRef.current || nextConversation.worktreeId !== selectedWorktreeRef.current) return;
       stickToBottomRef.current = true;
+      checkpointCursorsRef.current = checkpointCursors(nextConversation.messages);
       setConversation(nextConversation); setStreamingText(""); setRunEvents([]);
       window.requestAnimationFrame(() => {
         const viewport = messageViewportRef.current;
@@ -165,6 +167,7 @@ export function App() {
     if (event.type === "conversation.created" || event.type === "conversation.updated") loadConversations(event.conversationId);
     if (shouldReloadConversationForResolvedRun(event, selectedConversationRef.current, selectedRecoveryRunId)) loadConversation();
     if (event.type === "message.created" && event.conversationId === selectedConversationRef.current) {
+      recordCheckpointCursor(checkpointCursorsRef.current, event.payload);
       setStreamingText((current) => streamingTextAfterRuntimeEvent(current, event));
       setConversation((current) => {
         if (!current) return current;
@@ -192,7 +195,10 @@ export function App() {
     }
     if (event.type === "run.event" && event.conversationId === selectedConversationRef.current) {
       const runEvent = event.payload;
-      if (runEvent.type === "assistant.delta") setStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event)));
+      if (runEvent.type === "assistant.delta") {
+        const checkpointEventSeq = checkpointCursorsRef.current.get(event.runId) ?? 0;
+        setStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event, checkpointEventSeq)));
+      }
       if (runEvent.type === "assistant.message") setStreamingText((current) => streamingTextAfterRuntimeEvent(current, event));
       if (runEvent.type.startsWith("tool.")) setRunEvents((current) => [...current, runEvent].slice(-20));
       if (["run.completed", "run.failed", "run.stopped"].includes(runEvent.type)) {
@@ -505,6 +511,16 @@ function buildGroupedProjects(projects, state) { const result = state.groups.map
 function preferredWorktree(project) { return project.worktrees.find((item) => item.name === "dev" || item.path.endsWith("-dev")) ?? project.worktrees.find((item) => item.branch === "next") ?? project.worktrees[0]; }
 function compactPath(value = "") { return value.replace(/^\/Users\/[^/]+/, "~"); }
 function defaultSettings() { return { provider: "codex", model: "", reasoningEffort: "medium", approvalPolicy: "workspace-write", editor: "zed", notifications: true, maxConcurrentRuns: 3 }; }
+function recordCheckpointCursor(cursors, message) {
+  const runId = message?.payload?.runId;
+  const seq = message?.payload?.checkpointEventSeq;
+  if (typeof runId === "string" && Number.isSafeInteger(seq)) cursors.set(runId, Math.max(cursors.get(runId) ?? 0, seq));
+}
+function checkpointCursors(messages = []) {
+  const cursors = new Map();
+  for (const message of messages) recordCheckpointCursor(cursors, message);
+  return cursors;
+}
 function upsert(items, item) { return [...items.filter((entry) => entry.id !== item.id), item].sort((a, b) => a.createdAt.localeCompare(b.createdAt)); }
 function boundStreamingText(value) { return value.length > MAX_STREAMING_CHARACTERS ? `${value.slice(0, MAX_STREAMING_CHARACTERS)}${LIVE_TRUNCATION_MARKER}` : value; }
 function formatTime(value) { return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(value)); }

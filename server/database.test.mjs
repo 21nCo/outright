@@ -359,17 +359,22 @@ test("reconciliation sweeps stale handshake records but keeps live-wrapper recor
     database.updateRun(running.id, { status: "running", pid: 4242 });
     database.updateRun(exited.id, { status: "running", pid: 5353 });
     database.updateRun(finished.id, { status: "completed", finishedAt: "2026-09-21T00:00:00.000Z" });
-    const record = (runId, pid) => writeFileSync(path.join(launchDirectory, `${runId}.json`), JSON.stringify({ pid, authorized: false }));
+    const record = (runId, pid, extra = {}) => writeFileSync(path.join(launchDirectory, `${runId}.json`), JSON.stringify({ pid, authorized: false, ...extra }));
     record(launching.id, 111);
-    record(running.id, 222);
+    record(running.id, 222, { ownershipToken: "00000000-0000-4000-8000-000000000001", platformOwnershipId: "com.21n.outright.00000000-0000-4000-8000-000000000001" });
     record(exited.id, 555);
     record(finished.id, 333);
     record("run-that-never-existed", 444);
 
-    database.reconcileInterruptedRuns({ probeAlive: (pid) => pid === 4242 });
+    let runningHandshake;
+    database.reconcileInterruptedRuns({ probeAlive: (pid, handshake) => {
+      if (pid === 4242) runningHandshake = handshake;
+      return pid === 4242;
+    } });
 
     assert.equal(existsSync(path.join(launchDirectory, `${launching.id}.json`)), false, "the adopted launching record is removed");
     assert.equal(existsSync(path.join(launchDirectory, `${running.id}.json`)), true, "an alive tree's wrapper may still be live and removes its own record");
+    assert.equal(runningHandshake.platformOwnershipId, "com.21n.outright.00000000-0000-4000-8000-000000000001", "restart probing receives the durable platform owner, not only its possibly-dead wrapper pid");
     assert.equal(existsSync(path.join(launchDirectory, `${exited.id}.json`)), false, "an exited tree is proven gone, so its hard-killed wrapper's record is swept instead of leaking");
     assert.equal(existsSync(path.join(launchDirectory, `${finished.id}.json`)), false, "a terminal run's stale record is swept");
     assert.equal(existsSync(path.join(launchDirectory, "run-that-never-existed.json")), false, "a record for an unknown run is swept");
@@ -548,6 +553,27 @@ test("upserts partial transcript checkpoints and commits the final checkpoint wi
     database.finishRun(run.id, { status: "completed", finishedAt: "2026-09-21T00:00:01.000Z", exitCode: 0, pid: null }, { ...base, body: "Partial answer complete" });
     assert.equal(database.getRun(run.id).status, "completed");
     assert.deepEqual(database.listMessages(conversation.id).map((message) => message.body), ["Partial answer complete"]);
+  } finally {
+    database.close();
+  }
+});
+
+test("commits a streamed delta and its transcript cursor atomically", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Atomic stream", provider: "claude" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "claude", approvalPolicy: "read-only", prompt: "stream" });
+    const committed = database.appendRunEventWithMessage(run.id, "assistant.delta", { text: "Partial" }, {
+      id: `${run.id}:1`,
+      conversationId: conversation.id,
+      role: "assistant",
+      kind: "text",
+      body: "Partial",
+      payload: { runId: run.id, provider: "claude" },
+    });
+    assert.equal(committed.message.payload.checkpointEventSeq, committed.event.seq);
+    assert.equal(database.listMessages(conversation.id)[0].payload.checkpointEventSeq, committed.event.seq);
+    assert.equal(database.listRunEvents(run.id)[0].seq, committed.event.seq);
   } finally {
     database.close();
   }

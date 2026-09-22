@@ -314,7 +314,7 @@ export function createOutrightDatabase(options = {}) {
               adopted.push(run.id);
             }
           }
-          else if (run.pid != null) classification = normalizeProbeResult(probeAlive(run.pid));
+          else if (run.pid != null) classification = normalizeProbeResult(probeAlive(run.pid, readLaunchHandshake(launchDirectory, run.id), run));
           const result = db.prepare("UPDATE runs SET status = 'interrupted', pid = ?, finished_at = ?, recovery_class = ? WHERE id = ? AND status IN ('queued', 'running', 'launching')")
             .run(pid, finishedAt, classification, run.id);
           if (!result.changes) continue;
@@ -412,6 +412,17 @@ export function createOutrightDatabase(options = {}) {
       const result = db.prepare("INSERT INTO run_events (run_id, seq, type, payload, created_at) VALUES (?, ?, ?, ?, ?)").run(runId, seq, type, serialized, createdAt);
       db.prepare("DELETE FROM run_events WHERE run_id = ? AND seq <= ?").run(runId, seq - 2_000);
       return { id: Number(result.lastInsertRowid), runId, seq, type, payload: parseJson(serialized, null), createdAt };
+    },
+    appendRunEventWithMessage(runId, type, payload, transcriptMessage) {
+      const commit = db.transaction(() => {
+        const event = this.appendRunEvent(runId, type, payload);
+        const message = this.upsertMessage({
+          ...transcriptMessage,
+          payload: { ...transcriptMessage.payload, checkpointEventSeq: event.seq },
+        });
+        return { event, message };
+      });
+      return commit.immediate();
     },
     listRunEvents(runId, after = 0) {
       const cursor = Number.isSafeInteger(Number(after)) && Number(after) >= 0 ? Number(after) : 0;

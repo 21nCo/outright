@@ -44,6 +44,16 @@ test("durable run checkpoints replace the overlapping live stream", () => {
   assert.equal(streamingTextAfterRuntimeEvent("live tail", { type: "run.event", payload: { type: "assistant.message", payload: { text: "done" } } }), "");
 });
 
+test("a loaded checkpoint cursor discards its delayed durable delta", () => {
+  const delayed = {
+    type: "run.event",
+    runId: "run-1",
+    payload: { runId: "run-1", seq: 7, type: "assistant.delta", payload: { text: "already durable" } },
+  };
+  assert.equal(streamingTextAfterRuntimeEvent("", delayed, 7), "", "the checkpoint already owns this delta");
+  assert.equal(streamingTextAfterRuntimeEvent("", { ...delayed, payload: { ...delayed.payload, seq: 8 } }, 7), "already durable", "a later delta remains live");
+});
+
 test("only legacy rows without any process or worktree identity offer manual cleanup", () => {
   const legacy = { conversationId: "missing-owner", recoveryClass: "unknown", pid: null, worktreePath: null };
   assert.equal(isUnverifiableLegacyRecovery(legacy), true);

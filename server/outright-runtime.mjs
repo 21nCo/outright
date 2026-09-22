@@ -6,17 +6,19 @@ import path from "node:path";
 import { realpath } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { createOutrightDatabase } from "./database.mjs";
-import { createAgentManager, defaultGroupMembers, terminateTree } from "./agent-manager.mjs";
+import { AGENT_SUPERVISOR, createAgentManager, defaultGroupMembers, terminateTree } from "./agent-manager.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = defaultRecoveryProcessAlive, recoveryProcessIdentity = (pid, ownershipToken) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000 }) {
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000 }) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
   const database = createOutrightDatabase({ runtimeLease: true });
-  const reconciliation = database.reconcileInterruptedRuns();
+  const reconciliation = database.reconcileInterruptedRuns({
+    probeAlive: (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync),
+  });
   if (reconciliation.count) database.audit("runtime.runs.reconciled", { target: "runtime", ...reconciliation });
   const eventHub = createRuntimeEventHub();
   const runtimeInstanceId = randomUUID();
@@ -294,10 +296,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           if (!(Number.isSafeInteger(pending.pid) && pending.pid > 0)) {
             throw apiError(409, "An interrupted provider process cannot be verified, so no recovery decision can be recorded yet", { code: "RECOVERY_PROCESS_UNKNOWN", runId: pending.id });
           }
-          let verdict = recoveryVerdict(await recoveryProcessAlive(pending.pid));
+          const handshake = database.getLaunchHandshake(pending.id);
+          let verdict = recoveryVerdict(await recoveryProcessAlive(pending.pid, handshake));
           if (verdict === "alive") {
-            const handshake = database.getLaunchHandshake(pending.id);
-            const processIdentity = await recoveryProcessIdentity(pending.pid, handshake?.ownershipToken);
+            const processIdentity = await recoveryProcessIdentity(pending.pid, handshake?.ownershipToken, handshake?.platformOwnershipId);
             if (!recoveryIdentityMatches(pending, handshake, processIdentity)) {
               throw apiError(409, "The interrupted provider process identity cannot be verified, so it will not be signaled", { code: "RECOVERY_PROCESS_UNKNOWN", pid: pending.pid, runId: pending.id });
             }
@@ -310,7 +312,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
             let escalated = false;
             while (verdict === "alive" && Date.now() < deadline) {
               if (!escalated && Date.now() - started >= recoveryTerminationGraceMs) {
-                const currentIdentity = await recoveryProcessIdentity(pending.pid, handshake?.ownershipToken);
+                const currentIdentity = await recoveryProcessIdentity(pending.pid, handshake?.ownershipToken, handshake?.platformOwnershipId);
                 if (!recoveryIdentityMatches(pending, handshake, currentIdentity)) {
                   throw apiError(409, "The interrupted provider process identity changed before escalation, so it will not be signaled", { code: "RECOVERY_PROCESS_UNKNOWN", pid: pending.pid, runId: pending.id });
                 }
@@ -327,7 +329,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
               }
               if (verdict !== "alive") break;
               await new Promise((resolve) => setTimeout(resolve, 50));
-              verdict = recoveryVerdict(await recoveryProcessAlive(pending.pid));
+              verdict = recoveryVerdict(await recoveryProcessAlive(pending.pid, handshake));
             }
             if (verdict === "alive") {
               throw apiError(409, "The interrupted provider process did not stop, so no recovery decision was recorded", { code: "RECOVERY_PROCESS_ACTIVE", pid: pending.pid, runId: pending.id });
@@ -561,7 +563,31 @@ function recoveryVerdict(value) {
   return ["alive", "exited", "unknown"].includes(value) ? value : "unknown";
 }
 
-export function defaultRecoveryProcessAlive(pid, platform = process.platform, groupMembers = defaultGroupMembers, kill = process.kill) {
+const DARWIN_OWNERSHIP_PREFIX = "com.21n.outright.";
+
+function darwinLaunchdTarget(handshake) {
+  const ownershipToken = handshake?.ownershipToken;
+  const platformOwnershipId = handshake?.platformOwnershipId;
+  if (typeof ownershipToken !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(ownershipToken)) return null;
+  if (platformOwnershipId !== `${DARWIN_OWNERSHIP_PREFIX}${ownershipToken}`) return null;
+  const uid = process.getuid?.();
+  return Number.isInteger(uid) ? `gui/${uid}/${platformOwnershipId}` : null;
+}
+
+export function defaultRecoveryProcessAlive(pid, platform = process.platform, groupMembers = defaultGroupMembers, kill = process.kill, handshake = null, run = spawnSync) {
+  let darwinOwnershipUnknown = false;
+  if (platform === "darwin") {
+    const target = darwinLaunchdTarget(handshake);
+    if (target) {
+      const result = run(AGENT_SUPERVISOR, ["--probe", handshake.platformOwnershipId], { encoding: "utf8" });
+      const verdict = result.stdout?.trim();
+      if (["alive", "exited"].includes(verdict)) return verdict;
+      darwinOwnershipUnknown = true;
+      // The handshake is written before the platform supervisor submits its
+      // launchd job. During that short interval, a live wrapper is still a
+      // valid owner; if it is gone too, fail closed as unknown.
+    }
+  }
   if (platform === "win32") {
     // The spawned tree is not owned on Windows, so a gone leader says nothing
     // about its descendants: only a live leader is verifiable.
@@ -574,11 +600,11 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
     if (members == null) return "alive";
     return members.some((member) => member.state !== "Z") ? "alive" : "exited";
   } catch (error) {
-    return error.code === "ESRCH" ? "exited" : "unknown";
+    return error.code === "ESRCH" && !darwinOwnershipUnknown ? "exited" : "unknown";
   }
 }
 
-export function defaultRecoveryProcessIdentity(pid, platform = process.platform, readFile = readFileSync, run = spawnSync, ownershipToken = null) {
+export function defaultRecoveryProcessIdentity(pid, platform = process.platform, readFile = readFileSync, run = spawnSync, ownershipToken = null, platformOwnershipId = null) {
   try {
     if (platform === "linux") {
       const bootId = readFile("/proc/sys/kernel/random/boot_id", "utf8").trim();
@@ -591,6 +617,12 @@ export function defaultRecoveryProcessIdentity(pid, platform = process.platform,
     if (platform === "darwin") {
       if (typeof ownershipToken !== "string" || !/^[0-9a-f-]{36}$/i.test(ownershipToken)) return null;
       const bootResult = run("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8" });
+      const launchdTarget = darwinLaunchdTarget({ ownershipToken, platformOwnershipId });
+      if (launchdTarget) {
+        const launchdResult = run("/bin/launchctl", ["print", launchdTarget], { encoding: "utf8" });
+        const boot = bootResult.status === 0 ? bootResult.stdout.trim() : "";
+        if (boot && launchdResult.status === 0) return `darwin:${boot}:${ownershipToken}`;
+      }
       const processResult = run("/bin/ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
       const boot = bootResult.status === 0 ? bootResult.stdout.trim() : "";
       const command = processResult.status === 0 ? processResult.stdout.trim() : "";
@@ -627,6 +659,14 @@ export function defaultTerminateRecoveryProcess(pid, signal = "SIGTERM", handsha
       return false;
     }
     throw new Error("A verified provider identity is required for Linux recovery escalation");
+  }
+  if (platform === "darwin") {
+    const target = darwinLaunchdTarget(handshake);
+    if (target) {
+      const result = run(AGENT_SUPERVISOR, ["--terminate", handshake.platformOwnershipId], { stdio: "ignore" });
+      if (result.status !== 0) throw new Error("Unable to terminate the recovered macOS process coalition");
+      return true;
+    }
   }
   terminateTree({ pid }, signal, platform, run, kill);
   return false;

@@ -9,6 +9,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAlive, defaultRecoveryProcessIdentity, defaultTerminateRecoveryProcess, runtimeAllowedHosts } from "./outright-runtime.mjs";
 import { createOutrightDatabase } from "./database.mjs";
+import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
 
 function request(host, origin) {
   return { headers: { host, ...(origin ? { origin } : {}) } };
@@ -364,6 +365,32 @@ test("never escalates to a reused provider pid", (() => {
     terminateRecoveryProcess: async (_pid, signal) => { signals.push(signal); },
     recoveryTerminationGraceMs: 0,
     recoveryTerminationTimeoutMs: 250,
+  });
+})());
+
+test("never signals a live numeric pid whose durable wrapper identity mismatches", (() => {
+  let signals = 0;
+  return withRuntime(async (runtime) => {
+    const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+    runtime.database.updateRun(run.id, { status: "running", pid: 4242 });
+    writeFileSync(path.join(runtime.database.launchDirectory, `${run.id}.json`), JSON.stringify({
+      pid: 4242,
+      authorized: true,
+      processIdentity: "test:original-wrapper",
+    }));
+    runtime.database.reconcileInterruptedRuns({ probeAlive: () => true });
+
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), response);
+    assert.equal(response.statusCode, 409);
+    assert.equal(response.body.code, "RECOVERY_PROCESS_UNKNOWN");
+    assert.equal(signals, 0, "identity is verified before the first termination signal");
+    assert.equal(runtime.database.getRun(run.id).recoveryDecision, null);
+  }, {
+    recoveryProcessAlive: () => "alive",
+    recoveryProcessIdentity: () => "test:reused-wrapper",
+    terminateRecoveryProcess: async () => { signals += 1; },
   });
 })());
 
@@ -764,6 +791,24 @@ test("recovery identities are boot-scoped and Windows taskkill supplies a whole-
     null,
     "a recycled pid with a different ownership title is rejected",
   );
+  const platformOwnershipId = `com.21n.outright.${ownershipToken}`;
+  const launchdRun = (executable) => executable === "/usr/sbin/sysctl"
+    ? { status: 0, stdout: "{ sec = 123, usec = 456 }\n" }
+    : executable === AGENT_SUPERVISOR
+      ? { status: 0, stdout: "alive\n" }
+      : { status: 0, stdout: "active count = 1\nruns = 1\n" };
+  const launchdHandshake = { ownershipToken, platformOwnershipId };
+  assert.equal(defaultRecoveryProcessAlive(123, "darwin", () => null, () => {}, launchdHandshake, launchdRun), "alive", "the launchd job remains the ownership proof after its wrapper exits");
+  assert.equal(
+    defaultRecoveryProcessIdentity(123, "darwin", () => "", launchdRun, ownershipToken, platformOwnershipId),
+    `darwin:{ sec = 123, usec = 456 }:${ownershipToken}`,
+  );
+  const bootouts = [];
+  assert.equal(defaultTerminateRecoveryProcess(123, "SIGTERM", launchdHandshake, "darwin", (executable, args) => {
+    bootouts.push([executable, args]);
+    return { status: 0 };
+  }), true, "the coalition helper proves that every member was terminated");
+  assert.deepEqual(bootouts, [[AGENT_SUPERVISOR, ["--terminate", platformOwnershipId]]]);
 
   const powershellCalls = [];
   const run = (executable, args, options) => {

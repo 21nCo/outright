@@ -15,8 +15,8 @@ const ASSISTANT_TRUNCATION_MARKER = "\n\n[Output truncated by Outright at 1 MiB]
 // instead of once per token, while crash exposure stays bounded.
 const CHECKPOINT_MIN_BYTES = 4 * 1024;
 const CHECKPOINT_INTERVAL_MS = 500;
-const LINUX_AGENT_SUPERVISOR = process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH
-  || fileURLToPath(new URL("./bin/agent-supervisor", import.meta.url));
+export const AGENT_SUPERVISOR = process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH
+  || fileURLToPath(new URL(process.platform === "win32" ? "./bin/agent-supervisor.exe" : "./bin/agent-supervisor", import.meta.url));
 export const LAUNCH_AUTHORIZED_CONTROL = "__OUTRIGHT_LAUNCH_AUTHORIZED_V1__";
 const LAUNCH_CONTROL_FD = 3;
 
@@ -36,7 +36,8 @@ export const LAUNCH_WRAPPER_SOURCE = `
 const fs = require("node:fs");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
-const [handshakePath, ownershipToken, executable, ...commandArgs] = process.argv.slice(1);
+const [handshakePath, ownershipToken, rawPlatformOwnershipId, executable, ...commandArgs] = process.argv.slice(1);
+const platformOwnershipId = rawPlatformOwnershipId === "-" ? null : rawPlatformOwnershipId;
 fs.mkdirSync(path.dirname(handshakePath), { recursive: true });
 const ownershipTitle = \`outright-agent-\${ownershipToken}\`;
 process.title = ownershipTitle;
@@ -74,6 +75,7 @@ const handshake = (authorized, providerPid) => {
     pid: process.pid,
     authorized,
     ownershipToken,
+    ...(platformOwnershipId ? { platformOwnershipId } : {}),
     ...(providerPid ? { providerPid } : {}),
     ...(processIdentity ? { processIdentity } : {}),
     ...(providerProcessIdentity ? { providerProcessIdentity } : {}),
@@ -100,8 +102,6 @@ let providerGone = false;
 let providerResult = null;
 let teardownStarted = false;
 let completionTimer = null;
-let ownershipTimer = null;
-const knownDescendants = new Map();
 // Stay alive across group termination signals once authorized so this
 // wrapper — the provider's parent — can reap it. On hosts whose PID 1 does
 // not reap orphans, a killed-but-unreaped provider would remain a zombie in
@@ -111,70 +111,8 @@ const knownDescendants = new Map();
 const abandon = () => { try { fs.unlinkSync(handshakePath); } catch {} process.exit(0); };
 process.on("SIGTERM", () => { if (!authorized) abandon(); });
 process.on("SIGINT", () => { if (!authorized) abandon(); });
-// Snapshot parentage as well as process groups. A provider may create a new
-// session, so group membership alone is not an ownership boundary on macOS or
-// Windows. Descendants observed while their parent is alive remain owned after
-// reparenting until the process disappears.
-const processSnapshot = () => {
-  if (process.platform === "darwin") {
-    try {
-      const output = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat=,lstart="], { encoding: "utf8", detached: true });
-      return output.split("\\n").flatMap((line) => {
-        const match = line.trim().match(/^(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\S+)\\s+(.+)$/);
-        return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]), state: match[4][0], identity: match[5] }] : [];
-      });
-    } catch { return null; }
-  }
-  if (process.platform === "win32") {
-    try {
-      const script = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate | ConvertTo-Json -Compress";
-      const output = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true }).trim();
-      if (!output) return [];
-      const rows = JSON.parse(output);
-      return (Array.isArray(rows) ? rows : [rows]).map((row) => ({ pid: Number(row.ProcessId), ppid: Number(row.ParentProcessId), pgid: null, state: "R", identity: String(row.CreationDate ?? "") }));
-    } catch { return null; }
-  }
-  let entries;
-  try { entries = fs.readdirSync("/proc"); } catch { return null; }
-  const processes = [];
-  for (const entry of entries) {
-    if (!/^\\d+$/.test(entry)) continue;
-    let stat;
-    try { stat = fs.readFileSync(\`/proc/\${entry}/stat\`, "utf8"); } catch { continue; }
-    const close = stat.lastIndexOf(")");
-    if (close < 0) continue;
-    const fields = stat.slice(close + 2).split(" ");
-    processes.push({ pid: Number(entry), ppid: Number(fields[1]), pgid: Number(fields[2]), state: fields[0], identity: fields[19] });
-  }
-  return processes;
-};
-const groupMembers = (pgid) => {
-  const processes = processSnapshot();
-  if (processes == null) return null;
-  const live = new Map(processes.map((entry) => [entry.pid, entry.identity]));
-  for (const [pid, identity] of knownDescendants) if (live.get(pid) !== identity) knownDescendants.delete(pid);
-  const owned = new Set([process.pid, ...knownDescendants.keys()]);
-  if (provider?.pid) owned.add(provider.pid);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const entry of processes) {
-      if (entry.pid === process.pid || owned.has(entry.pid)) continue;
-      // ps/PowerShell is a short-lived direct child of the wrapper. It runs
-      // outside the owned group and must not make its own snapshot look busy.
-      if (entry.ppid === process.pid && entry.pid !== provider?.pid && entry.pgid !== pgid && !knownDescendants.has(entry.pid)) continue;
-      if (entry.pgid === pgid || owned.has(entry.ppid)) {
-        owned.add(entry.pid);
-        knownDescendants.set(entry.pid, entry.identity);
-        changed = true;
-      }
-    }
-  }
-  return processes.filter((entry) => entry.pid === process.pid || owned.has(entry.pid));
-};
 const finish = (code, signal) => {
   if (completionTimer) clearTimeout(completionTimer);
-  if (ownershipTimer) clearInterval(ownershipTimer);
   try { fs.unlinkSync(handshakePath); } catch {}
   if (signal) {
     // Re-raise the provider's termination signal so the runtime reports the
@@ -188,62 +126,18 @@ const finish = (code, signal) => {
   } else process.exit(code ?? 0);
 };
 const finishWhenOwnedGroupIsEmpty = () => {
-  const members = groupMembers(process.pid);
-  if (members == null) {
-    // Losing visibility must not discard the only durable owner while an
-    // escaped descendant may still be running on either supported platform.
-    completionTimer = setTimeout(finishWhenOwnedGroupIsEmpty, 50);
-    return;
-  }
-  const activeDescendants = members.filter((member) => member.pid !== process.pid && member.state !== "Z");
-  if (activeDescendants.length > 0) {
-    completionTimer = setTimeout(finishWhenOwnedGroupIsEmpty, 50);
-    return;
-  }
+  // The child is the platform supervisor. It closes only after its OS-owned
+  // boundary (a launchd job or Windows Job Object) is empty.
   finish(providerResult?.code, providerResult?.signal);
 };
-// Ordered teardown (runtime "stop" command). The provider's descendants are
-// SIGKILLed FIRST, while their parent — the provider — is still alive to reap
-// them; only once the group holds no other member is the provider itself
-// killed, and this wrapper — its parent — reaps it. Any other order leaks:
-// killing the provider first orphans its descendants, and on a host whose
-// PID 1 does not reap they linger forever as unreaped zombies holding the
-// process group, accumulating one process-table entry per stop. The sweep is
-// bounded: if a member never disappears, the provider is killed anyway and
-// the runtime's group-wide fallback applies.
-const teardownBudgetMs = 750;
+// Runtime stop asks the platform supervisor to terminate its owned tree.
+// The supervisor remains alive until the kernel boundary is empty, so this
+// wrapper never guesses from sampled PIDs or process groups.
 const teardown = () => {
   if (teardownStarted || !provider) return;
   teardownStarted = true;
-  const deadline = Date.now() + teardownBudgetMs;
-  const killProvider = () => { if (!providerGone) { try { process.kill(provider.pid, "SIGKILL"); } catch { /* Already gone. */ } } };
-  const killOwned = (pid) => {
-    try {
-      if (process.platform === "win32") execFileSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-      else process.kill(pid, "SIGKILL");
-    } catch { /* Already gone. */ }
-  };
-  const sweep = () => {
-    const members = groupMembers(process.pid);
-    if (members == null) {
-      if (!providerGone && process.platform === "win32") killOwned(provider.pid);
-      else killProvider();
-      setTimeout(sweep, 50);
-      return;
-    }
-    const outstanding = members.filter((member) => member.pid !== process.pid && member.pid !== provider.pid && member.state !== "Z");
-    if (outstanding.length === 0) {
-      if (providerGone) finishWhenOwnedGroupIsEmpty();
-      else killProvider();
-      return;
-    }
-    if (Date.now() >= deadline) { killProvider(); return; }
-    for (const member of outstanding) {
-      killOwned(member.pid);
-    }
-    setTimeout(sweep, 50);
-  };
-  sweep();
+  if (providerGone) finishWhenOwnedGroupIsEmpty();
+  else try { provider.kill("SIGTERM"); } catch { /* Already gone. */ }
 };
 process.stdin.setEncoding("utf8");
 let commandBuffer = "";
@@ -267,12 +161,6 @@ process.stdin.on("data", (chunk) => {
       }
       const { spawn } = require("node:child_process");
       provider = spawn(executable, commandArgs, { stdio: ["ignore", "inherit", "inherit"] });
-      // Observe parentage continuously while it is still available. This is
-      // what keeps ownership when a descendant calls setsid() and later gets
-      // reparented after the provider exits.
-      groupMembers(process.pid);
-      ownershipTimer = setInterval(() => { groupMembers(process.pid); }, 10);
-      ownershipTimer.unref?.();
       // Durable provider identity: escalation targets the provider alone so this
       // wrapper — the provider's parent — survives to reap it. Without this, a
       // group-wide SIGKILL kills the wrapper first and a killed-but-unreaped
@@ -307,22 +195,31 @@ process.stdin.on("end", () => { if (!authorized) { try { fs.unlinkSync(handshake
 export function defaultLaunchCommand(command, run, launchDirectory) {
   const handshakePath = path.join(launchDirectory, `${run.id}.json`);
   if (process.platform === "linux") {
-    if (!existsSync(LINUX_AGENT_SUPERVISOR)) {
+    if (!existsSync(AGENT_SUPERVISOR)) {
       throw new Error("Linux agent supervision is unavailable; install a C compiler and run npm run build:supervisor");
     }
     return {
-      executable: LINUX_AGENT_SUPERVISOR,
+      executable: AGENT_SUPERVISOR,
       args: [handshakePath, command.executable, ...command.args],
       display: command.display,
       handshakePath,
       ownsDescendants: true,
     };
   }
+  if (!["darwin", "win32"].includes(process.platform) || !existsSync(AGENT_SUPERVISOR)) {
+    throw new Error(`${process.platform} agent supervision is unavailable; install a C compiler and run npm run build:supervisor`);
+  }
+  const ownershipToken = randomUUID();
+  const platformOwnershipId = process.platform === "darwin" ? `com.21n.outright.${ownershipToken}` : "-";
+  const supervisorArgs = process.platform === "darwin"
+    ? [platformOwnershipId, command.executable, ...command.args]
+    : [command.executable, ...command.args];
   return {
     executable: process.execPath,
-    args: ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, randomUUID(), command.executable, ...command.args],
+    args: ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, ownershipToken, platformOwnershipId, AGENT_SUPERVISOR, ...supervisorArgs],
     display: command.display,
     handshakePath,
+    ownsDescendants: true,
   };
 }
 
@@ -511,12 +408,12 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       const emittedPayload = ["assistant.delta", "assistant.message"].includes(event.type)
         ? { ...event.payload, text: truncateUtf8(event.payload.text ?? "", MAX_ASSISTANT_EVENT_BYTES), truncated: Buffer.byteLength(event.payload.text ?? "") > MAX_ASSISTANT_EVENT_BYTES }
         : event.payload;
-      if (checkpointDelta !== null) scheduleAssistantCheckpoint(state, checkpointDelta);
-      // A due checkpoint is committed before its corresponding durable delta
-      // event. If the process crashes at either boundary, recovery sees at
-      // least the checkpoint prefix. Intermediate checkpoints stay silent so
-      // the live UI owns each streamed byte exactly once via assistant.delta.
-      emit(state.run.id, event.type, emittedPayload);
+      if (checkpointDelta !== null && scheduleAssistantCheckpoint(state, checkpointDelta)) {
+        emitAssistantDeltaWithCheckpoint(state, emittedPayload);
+        continue;
+      }
+      const emitted = emit(state.run.id, event.type, emittedPayload);
+      if (event.type === "assistant.delta") state.lastAssistantDeltaSeq = emitted.seq;
     }
   }
 
@@ -688,14 +585,14 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
   // deltas no longer trigger rewrites — write amplification stays bounded even
   // past the cap.
   function scheduleAssistantCheckpoint(state, deltaText) {
-    if (state.checkpointHalted) return;
-    if (!state.assistantBytes) return;
+    if (state.checkpointHalted) return false;
+    if (!state.assistantBytes) return false;
     state.checkpointPendingBytes = (state.checkpointPendingBytes ?? 0) + Buffer.byteLength(deltaText ?? "");
     if (state.assistantTruncated || state.checkpointPendingBytes >= checkpointMinBytes || Date.now() - (state.lastCheckpointAt ?? 0) >= checkpointIntervalMs) {
-      persistAssistantCheckpoint(state);
-      return;
+      return true;
     }
     armCheckpointTimer(state);
+    return false;
   }
 
   function armCheckpointTimer(state) {
@@ -731,6 +628,22 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     const stored = database.upsertMessage(message);
     if (publishEvent) publish({ type: "message.created", conversationId: state.conversation.id, payload: stored });
     return stored;
+  }
+
+  function emitAssistantDeltaWithCheckpoint(state, payload) {
+    clearCheckpointTimer(state);
+    state.checkpointPendingBytes = 0;
+    state.lastCheckpointAt = Date.now();
+    const message = pendingAssistantMessage(state);
+    if (!message) return emit(state.run.id, "assistant.delta", payload);
+    if (state.assistantTruncated) state.checkpointHalted = true;
+    // The delta event and the transcript prefix that already contains it are
+    // one SQLite commit. The message records the event cursor, so a page load
+    // racing publication can discard that already-durable delta exactly once.
+    const committed = database.appendRunEventWithMessage(state.run.id, "assistant.delta", payload, message);
+    state.lastAssistantDeltaSeq = committed.event.seq;
+    publish({ type: "run.event", conversationId: state.conversation.id, runId: state.run.id, payload: committed.event });
+    return committed.event;
   }
 
   function emit(runId, type, payload) {
@@ -972,7 +885,12 @@ function pendingAssistantMessage(state) {
     role: "assistant",
     kind: "text",
     body: `${body}${state.assistantTruncated ? ASSISTANT_TRUNCATION_MARKER : ""}`,
-    payload: { runId: state.run.id, provider: state.run.provider, truncated: state.assistantTruncated },
+    payload: {
+      runId: state.run.id,
+      provider: state.run.provider,
+      truncated: state.assistantTruncated,
+      ...(Number.isSafeInteger(state.lastAssistantDeltaSeq) ? { checkpointEventSeq: state.lastAssistantDeltaSeq } : {}),
+    },
   };
 }
 

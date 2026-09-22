@@ -13,7 +13,14 @@ import { streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
 const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
 const fakeLaunchDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-agent-test-"));
 const WRAPPER_OWNERSHIP_TOKEN = "00000000-0000-4000-8000-000000000001";
-const wrapperArgs = (handshakePath, ...providerArgs) => ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, WRAPPER_OWNERSHIP_TOKEN, ...providerArgs];
+const platformSupervisor = fileURLToPath(new URL(process.platform === "win32" ? "./bin/agent-supervisor.exe" : "./bin/agent-supervisor", import.meta.url));
+const wrapperArgs = (handshakePath, ...providerArgs) => [
+  "-e", LAUNCH_WRAPPER_SOURCE, handshakePath, WRAPPER_OWNERSHIP_TOKEN,
+  process.platform === "darwin" ? `com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}` : "-",
+  ...(["darwin", "win32"].includes(process.platform) ? [platformSupervisor] : []),
+  ...(process.platform === "darwin" ? [`com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}`] : []),
+  ...providerArgs,
+];
 test.after(() => rmSync(fakeLaunchDirectory, { recursive: true, force: true }));
 
 function fakeChild({ autoAcknowledge = true } = {}) {
@@ -74,6 +81,14 @@ function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/
       return { run: runs.get(id), message };
     },
     appendRunEvent: (runId, type, payload) => ({ id: messages.length + 1, runId, seq: 1, type, payload, createdAt: "" }),
+    appendRunEventWithMessage: (runId, type, payload, transcriptMessage) => {
+      const event = { id: messages.length + 1, runId, seq: 1, type, payload, createdAt: "" };
+      const message = { ...transcriptMessage, payload: { ...transcriptMessage.payload, checkpointEventSeq: event.seq } };
+      const index = messages.findIndex((item) => item.id === message.id);
+      if (index >= 0) messages[index] = message;
+      else messages.push(message);
+      return { event, message };
+    },
     audit: () => {},
   };
 }
@@ -316,6 +331,11 @@ test("keeps every streamed byte in exactly one durable-prefix or live-tail owner
   database.upsertMessage = (message) => {
     operations.push(`persist:${message.body}`);
     return originalUpsert(message);
+  };
+  const originalAtomicCheckpoint = database.appendRunEventWithMessage.bind(database);
+  database.appendRunEventWithMessage = (runId, type, payload, message) => {
+    operations.push(`persist:${message.body}`);
+    return originalAtomicCheckpoint(runId, type, payload, message);
   };
   const child = fakeChild();
   const published = [];
@@ -934,6 +954,7 @@ test("the launch wrapper records durable identity before authorization and clean
   const handshakePath = path.join(launchDirectory, `${runId}.json`);
   const provider = `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");`;
   const children = [];
+  let detachedDescendantPid = null;
   // Fail fast with cleanup instead of hanging until the suite timeout leaks
   // processes and temp directories.
   const withDeadline = async (promise, label, kill = () => {}) => {
@@ -976,6 +997,7 @@ test("the launch wrapper records durable identity before authorization and clean
     const provider2 = `require("node:fs").writeFileSync(${JSON.stringify(marker2)}, "ran"); setTimeout(() => {}, 250);`;
     const child2 = spawn(process.execPath, wrapperArgs(handshakePath2, process.execPath, "-e", provider2), { detached: process.platform !== "win32", stdio: ["pipe", "pipe", "ignore", "pipe"] });
     children.push(child2);
+    const child2Exited = new Promise((resolve) => child2.once("exit", resolve));
     const deadline2 = Date.now() + 10_000;
     while (!existsSync(handshakePath2) && Date.now() < deadline2) await new Promise((resolve) => setTimeout(resolve, 10));
     const authorizationAcknowledged = once(child2.stdio[3], "data");
@@ -995,7 +1017,7 @@ test("the launch wrapper records durable identity before authorization and clean
     } else {
       assert.equal(authorizedRecord?.providerProcessIdentity, undefined);
     }
-    const code = await withDeadline(new Promise((resolve) => child2.once("exit", resolve)), "authorized wrapper exit", () => { try { child2.kill("SIGKILL"); } catch {} });
+    const code = await withDeadline(child2Exited, "authorized wrapper exit", () => { try { child2.kill("SIGKILL"); } catch {} });
     assert.equal(code, 0);
     assert.equal(existsSync(marker2), true, "the authorized wrapper starts the provider");
     assert.equal(existsSync(handshakePath2), false, "the handshake record is cleaned up after completion");
@@ -1013,26 +1035,69 @@ test("the launch wrapper records durable identity before authorization and clean
         `const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendantSource)}], { detached: true, stdio: "ignore" });`,
         `require("node:fs").writeFileSync(${JSON.stringify(descendantMarker)}, String(child.pid));`,
         `child.unref();`,
-        `setTimeout(() => {}, 75);`,
       ].join("\n");
       const child4 = spawn(process.execPath, wrapperArgs(handshakePath4, process.execPath, "-e", provider4), {
         detached: true,
         stdio: ["pipe", "ignore", "ignore", "pipe"],
       });
       children.push(child4);
+      const child4Exited = new Promise((resolve) => child4.once("exit", resolve));
       const deadline4 = Date.now() + 10_000;
       while (!existsSync(handshakePath4) && Date.now() < deadline4) await new Promise((resolve) => setTimeout(resolve, 10));
       child4.stdin.write("go\n");
       while (!existsSync(descendantMarker) && Date.now() < deadline4) await new Promise((resolve) => setTimeout(resolve, 10));
       const descendantPid = Number(readFileSync(descendantMarker, "utf8"));
+      detachedDescendantPid = descendantPid;
       await new Promise((resolve) => setTimeout(resolve, 150));
-      assert.equal(child4.exitCode, null, "the wrapper remains alive after the provider exits while a detached descendant is active");
+      assert.equal(child4.exitCode, null, "the wrapper retains the kernel coalition while a detached descendant is active");
       assert.equal(existsSync(handshakePath4), true, "the durable ownership record remains available for crash recovery");
-
       child4.stdin.write("stop\n");
-      await withDeadline(new Promise((resolve) => child4.once("exit", resolve)), "background descendant teardown", () => { try { process.kill(-child4.pid, "SIGKILL"); } catch {} });
-      assert.equal(existsSync(handshakePath4), false, "the wrapper removes ownership only after the group is empty");
-      assert.throws(() => process.kill(descendantPid, 0), { code: "ESRCH" }, "the background descendant is gone before ownership is released");
+      await withDeadline(child4Exited, "background descendant teardown", () => {
+        try { process.kill(-child4.pid, "SIGKILL"); } catch {}
+        try { process.kill(descendantPid, "SIGKILL"); } catch {}
+      });
+      assert.equal(existsSync(handshakePath4), false, "the wrapper removes ownership only after the process coalition is empty");
+      assert.throws(() => process.kill(descendantPid, 0), { code: "ESRCH" }, "the coalition helper kills an immediately detached descendant before ownership is released");
+      detachedDescendantPid = null;
+
+      // A hard crash can kill both wrapper and supervisor before either runs
+      // cleanup. The launchd label and resource coalition in the handshake
+      // must still let the restarted runtime prove and terminate the escaped
+      // descendant without relying on its former parent pid.
+      const descendantMarker5 = path.join(root, "background-descendant-after-crash");
+      const handshakePath5 = path.join(launchDirectory, "launch-run-5.json");
+      const provider5 = [
+        `const { spawn } = require("node:child_process");`,
+        `const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendantSource)}], { detached: true, stdio: "ignore" });`,
+        `require("node:fs").writeFileSync(${JSON.stringify(descendantMarker5)}, String(child.pid));`,
+        `child.unref();`,
+      ].join("\n");
+      const child5 = spawn(process.execPath, wrapperArgs(handshakePath5, process.execPath, "-e", provider5), {
+        detached: true,
+        stdio: ["pipe", "ignore", "ignore", "pipe"],
+      });
+      children.push(child5);
+      const child5Exited = new Promise((resolve) => child5.once("exit", resolve));
+      const handshakeDeadline5 = Date.now() + 10_000;
+      while (!existsSync(handshakePath5) && Date.now() < handshakeDeadline5) await new Promise((resolve) => setTimeout(resolve, 10));
+      const acknowledged5 = once(child5.stdio[3], "data");
+      child5.stdin.write("go\n");
+      await withDeadline(acknowledged5, "crash-recovery authorization acknowledgement");
+      const deadline5 = Date.now() + 10_000;
+      while (!existsSync(descendantMarker5) && Date.now() < deadline5) await new Promise((resolve) => setTimeout(resolve, 10));
+      const descendantPid5 = Number(readFileSync(descendantMarker5, "utf8"));
+      detachedDescendantPid = descendantPid5;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      process.kill(-child5.pid, "SIGKILL");
+      await withDeadline(child5Exited, "hard-killed wrapper exit");
+      assert.equal(existsSync(handshakePath5), true, "a hard crash leaves the durable coalition identity for restart recovery");
+      const label = `com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}`;
+      const probe = spawnSync(platformSupervisor, ["--probe", label], { encoding: "utf8" });
+      assert.equal(probe.stdout.trim(), "alive", "recovery finds the detached process through its kernel coalition");
+      const terminated = spawnSync(platformSupervisor, ["--terminate", label], { encoding: "utf8" });
+      assert.equal(terminated.status, 0, `coalition recovery failed: ${terminated.stderr}`);
+      assert.throws(() => process.kill(descendantPid5, 0), { code: "ESRCH" }, "recovery empties the crashed job's coalition");
+      detachedDescendantPid = null;
     }
 
     // Pipe writes may be coalesced. A stop command arriving in the same chunk
@@ -1048,7 +1113,9 @@ test("the launch wrapper records durable identity before authorization and clean
     await withDeadline(new Promise((resolve) => child3.once("exit", resolve)), "coalesced authorization and stop", () => { try { child3.kill("SIGKILL"); } catch {} });
     assert.equal(existsSync(handshakePath3), false, "the coalesced stop command tears down the authorized provider");
   } finally {
+    if (detachedDescendantPid) { try { process.kill(detachedDescendantPid, "SIGKILL"); } catch { /* Already gone. */ } }
     for (const child of children) { try { child.kill("SIGKILL"); } catch { /* Already gone. */ } }
+    if (process.platform === "darwin") spawnSync("/bin/launchctl", ["bootout", `gui/${process.getuid()}/com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}`], { stdio: "ignore" });
     rmSync(root, { recursive: true, force: true });
   }
 });
