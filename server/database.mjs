@@ -236,6 +236,9 @@ export function createOutrightDatabase(options = {}) {
         output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision
         FROM runs WHERE conversation_id = ? AND status = 'interrupted' AND recovery_decision IS NULL ORDER BY created_at, rowid LIMIT 1`).get(conversationId);
     },
+    getLaunchHandshake(runId) {
+      return readLaunchHandshake(launchDirectory, runId);
+    },
     // Crash-consistent restart reconciliation: queued/running rows belong to a
     // dead runtime, so none of them can ever finish under this process. Mark
     // them "interrupted" with a best-effort process classification instead of

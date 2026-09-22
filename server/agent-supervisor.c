@@ -42,6 +42,39 @@ static void sleep_ms(int milliseconds) {
   while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
 }
 
+static unsigned long long process_start_ticks(pid_t pid) {
+  char filename[64];
+  snprintf(filename, sizeof(filename), "/proc/%ld/stat", (long)pid);
+  FILE *file = fopen(filename, "r");
+  if (file == NULL) return 0;
+  char line[4096];
+  unsigned long long start_ticks = 0;
+  if (fgets(line, sizeof(line), file) != NULL) {
+    char *close = strrchr(line, ')');
+    char *cursor = close == NULL ? NULL : close + 2;
+    // /proc/PID/stat field 22 is the immutable process start time in clock
+    // ticks. The text after comm begins at field 3, so skip fields 3..21.
+    for (int field = 3; cursor != NULL && field <= 22; field++) {
+      while (*cursor == ' ') cursor++;
+      char *end = cursor;
+      while (*end != '\0' && *end != ' ' && *end != '\n') end++;
+      if (field == 22) {
+        char saved = *end;
+        *end = '\0';
+        char *parsed_end = NULL;
+        errno = 0;
+        start_ticks = strtoull(cursor, &parsed_end, 10);
+        if (errno != 0 || parsed_end == cursor || *parsed_end != '\0') start_ticks = 0;
+        *end = saved;
+        break;
+      }
+      cursor = end;
+    }
+  }
+  fclose(file);
+  return start_ticks;
+}
+
 static int ensure_parent_directory(const char *filename) {
   char *copy = strdup(filename);
   if (copy == NULL) return -1;
@@ -73,9 +106,10 @@ static int write_handshake(const char *path, bool authorized, pid_t provider_pid
   struct tm utc;
   char created_at[32] = "";
   if (gmtime_r(&wall_time, &utc) != NULL) strftime(created_at, sizeof(created_at), "%Y-%m-%dT%H:%M:%SZ", &utc);
+  unsigned long long start_ticks = process_start_ticks(getpid());
   int written = authorized
-    ? dprintf(descriptor, "{\"pid\":%ld,\"authorized\":true,\"providerPid\":%ld,\"createdAt\":\"%s\"}", (long)getpid(), (long)provider_pid, created_at)
-    : dprintf(descriptor, "{\"pid\":%ld,\"authorized\":false,\"createdAt\":\"%s\"}", (long)getpid(), created_at);
+    ? dprintf(descriptor, "{\"pid\":%ld,\"authorized\":true,\"providerPid\":%ld,\"processIdentity\":\"linux:%llu\",\"createdAt\":\"%s\"}", (long)getpid(), (long)provider_pid, start_ticks, created_at)
+    : dprintf(descriptor, "{\"pid\":%ld,\"authorized\":false,\"processIdentity\":\"linux:%llu\",\"createdAt\":\"%s\"}", (long)getpid(), start_ticks, created_at);
   int result = 0;
   if (written < 0 || fsync(descriptor) != 0) result = -1;
   if (close(descriptor) != 0) result = -1;

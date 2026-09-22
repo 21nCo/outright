@@ -6,7 +6,7 @@ import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync 
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAlive, runtimeAllowedHosts } from "./outright-runtime.mjs";
+import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAlive, defaultRecoveryProcessIdentity, runtimeAllowedHosts } from "./outright-runtime.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 
 function request(host, origin) {
@@ -122,12 +122,13 @@ test("holds an exclusive runtime lease before startup reconciliation", async () 
   process.env.OUTRIGHT_DATA_DIR = dataDirectory;
   let first;
   let replacement;
+  let unexpected;
   try {
     first = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
     const conversation = first.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Lease", provider: "codex" });
     const queued = first.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "still owned" });
     assert.throws(
-      () => createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" }),
+      () => { unexpected = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" }); },
       (error) => error?.code === "OUTRIGHT_RUNTIME_LEASE_HELD",
     );
     assert.equal(first.database.getRun(queued.id).status, "queued", "the rejected runtime must not reconcile the live owner's queue");
@@ -137,6 +138,7 @@ test("holds an exclusive runtime lease before startup reconciliation", async () 
   } finally {
     await first?.shutdown();
     await replacement?.shutdown();
+    await unexpected?.shutdown();
     if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
     rmSync(dataDirectory, { recursive: true, force: true });
   }
@@ -175,6 +177,7 @@ test("terminates an alive recovered provider before recording the recovery decis
     const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
     const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
     runtime.database.updateRun(run.id, { status: "running", pid: 4242 });
+    writeFileSync(path.join(runtime.database.launchDirectory, `${run.id}.json`), JSON.stringify({ pid: 4242, authorized: true, processIdentity: "test:owned" }));
     runtime.database.reconcileInterruptedRuns({ probeAlive: () => true });
 
     const response = responseCapture();
@@ -184,6 +187,7 @@ test("terminates an alive recovered provider before recording the recovery decis
     assert.equal(runtime.database.getRun(run.id).recoveryDecision, "discard");
   }, {
     recoveryProcessAlive: () => treeVerdict,
+    recoveryProcessIdentity: () => "test:owned",
     terminateRecoveryProcess: async (pid) => { terminatedPid = pid; treeVerdict = "exited"; },
   });
 })());
@@ -192,6 +196,7 @@ test("keeps recovery blocked when an alive provider cannot be terminated", withR
   const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
   const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
   runtime.database.updateRun(run.id, { status: "running", pid: 4242 });
+  writeFileSync(path.join(runtime.database.launchDirectory, `${run.id}.json`), JSON.stringify({ pid: 4242, authorized: true, processIdentity: "test:owned" }));
   runtime.database.reconcileInterruptedRuns({ probeAlive: () => true });
 
   const response = responseCapture();
@@ -199,11 +204,11 @@ test("keeps recovery blocked when an alive provider cannot be terminated", withR
   assert.equal(response.statusCode, 409);
   assert.equal(response.body.code, "RECOVERY_PROCESS_ACTIVE");
   assert.equal(runtime.database.getRun(run.id).recoveryDecision, null);
-}, { recoveryProcessAlive: () => true, terminateRecoveryProcess: async () => {}, recoveryTerminationTimeoutMs: 0 }));
+}, { recoveryProcessAlive: () => true, recoveryProcessIdentity: () => "test:owned", terminateRecoveryProcess: async () => {}, recoveryTerminationTimeoutMs: 0 }));
 
-// Regression: an exited leader with a live descendant was classified exited
-// at restart and could then bypass the recovery process guard entirely.
-test("terminates a live recovered process group whose leader already exited", { skip: process.platform === "win32" }, withRuntime(async (runtime) => {
+// A private handshake still is not enough after PID/PGID reuse: recovery must
+// compare its immutable process-start identity before sending any signal.
+test("never signals a reused process group whose durable identity no longer matches", { skip: process.platform === "win32" }, withRuntime(async (runtime) => {
   const descendant = "setInterval(() => {}, 1000);";
   const leader = `const {spawn} = require("node:child_process"); spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], {stdio: "ignore"}); process.exit(0);`;
   const child = spawn(process.execPath, ["-e", leader], { detached: true, stdio: "ignore" });
@@ -224,6 +229,7 @@ test("terminates a live recovered process group whose leader already exited", { 
     const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
     const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
     runtime.database.updateRun(run.id, { status: "running", pid });
+    writeFileSync(path.join(runtime.database.launchDirectory, `${run.id}.json`), JSON.stringify({ pid, authorized: true, processIdentity: "linux:original-owner" }));
     // Stale restart classification: the leader had already exited by the time
     // the restart probe ran, but the descendant still holds the process group.
     runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
@@ -231,13 +237,14 @@ test("terminates a live recovered process group whose leader already exited", { 
 
     const response = responseCapture();
     await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), response);
-    assert.equal(response.statusCode, 200);
-    assert.equal(runtime.database.getRun(run.id).recoveryDecision, "discard");
-    assert.throws(() => process.kill(-pid, 0), { code: "ESRCH" });
+    assert.equal(response.statusCode, 409);
+    assert.equal(response.body.code, "RECOVERY_PROCESS_UNKNOWN");
+    assert.equal(runtime.database.getRun(run.id).recoveryDecision, null);
+    assert.doesNotThrow(() => process.kill(-pid, 0), "the mismatched process group is never signaled");
   } finally {
     try { process.kill(-pid, "SIGKILL"); } catch { /* Already gone. */ }
   }
-}));
+}, { recoveryProcessIdentity: () => "linux:reused-owner" }));
 
 // Regression (platform-injectable): on platforms without owned process trees
 // (Windows), a gone leader with a possibly live descendant cannot be verified
@@ -475,6 +482,7 @@ test("the default recovery probe is conservative per platform", async () => {
     try {
       assert.equal(defaultRecoveryProcessAlive(live.pid), "alive");
       assert.equal(defaultRecoveryProcessAlive(live.pid, "win32"), "alive");
+      assert.equal(defaultRecoveryProcessIdentity(live.pid)?.startsWith(`${process.platform}:`), true, "the current process start identity is readable on supported POSIX platforms");
     } finally {
       try { process.kill(-live.pid, "SIGKILL"); } catch { /* Already gone. */ }
     }

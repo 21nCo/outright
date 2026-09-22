@@ -32,12 +32,34 @@ const LINUX_AGENT_SUPERVISOR = process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH
 export const LAUNCH_WRAPPER_SOURCE = `
 const fs = require("node:fs");
 const path = require("node:path");
+const { execFileSync } = require("node:child_process");
 const [handshakePath, executable, ...commandArgs] = process.argv.slice(1);
 fs.mkdirSync(path.dirname(handshakePath), { recursive: true });
+const processIdentity = (() => {
+  try {
+    if (process.platform === "linux") {
+      const stat = fs.readFileSync(\`/proc/\${process.pid}/stat\`, "utf8");
+      const close = stat.lastIndexOf(")");
+      return \`linux:\${stat.slice(close + 2).split(" ")[19]}\`;
+    }
+    if (process.platform === "darwin") {
+      const started = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(process.pid)], { encoding: "utf8" }).trim();
+      return started ? \`darwin:\${started}\` : null;
+    }
+  } catch {}
+  return null;
+})();
+const handshake = (authorized, providerPid) => ({
+  pid: process.pid,
+  authorized,
+  ...(providerPid ? { providerPid } : {}),
+  ...(processIdentity ? { processIdentity } : {}),
+  createdAt: new Date().toISOString(),
+});
 // Durable process identity BEFORE anything can execute: if the runtime dies
 // before recording this pid, the handshake file restores ownership after
 // restart.
-fs.writeFileSync(handshakePath, JSON.stringify({ pid: process.pid, authorized: false, createdAt: new Date().toISOString() }));
+fs.writeFileSync(handshakePath, JSON.stringify(handshake(false)));
 let authorized = false;
 let provider = null;
 let providerGone = false;
@@ -116,7 +138,7 @@ process.stdin.on("data", (chunk) => {
       // group-wide SIGKILL kills the wrapper first and a killed-but-unreaped
       // provider lingers as a zombie in its process group on hosts whose PID 1
       // does not reap orphans.
-      try { fs.writeFileSync(handshakePath, JSON.stringify({ pid: process.pid, authorized: true, providerPid: provider.pid, createdAt: new Date().toISOString() })); } catch { /* The record was swept; nothing needs escalation identity. */ }
+      try { fs.writeFileSync(handshakePath, JSON.stringify(handshake(true, provider.pid))); } catch { /* The record was swept; nothing needs escalation identity. */ }
       const finish = (code) => { try { fs.unlinkSync(handshakePath); } catch {} process.exit(code); };
       provider.on("error", (error) => { console.error(String((error && error.message) || error)); finish(127); });
       provider.on("close", (code, signal) => {
@@ -170,7 +192,7 @@ export function defaultLaunchCommand(command, run, launchDirectory) {
   };
 }
 
-export function createAgentManager({ database, publish, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
+export function createAgentManager({ database, publish, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory, ownedTreeMembers = defaultGroupMembers }) {
   const resolvedLaunchDirectory = launchDirectory
     ?? database.launchDirectory;
   assertPrivateLaunchDirectory(resolvedLaunchDirectory);
@@ -376,11 +398,19 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       await state.launch;
       if (state.child) {
         const started = Date.now();
+        // Do not depend on the first process-group SIGTERM winning the spawn /
+        // setsid race. The supervisor command is the authoritative teardown
+        // request and is safe when cancellation kept it unauthorized. Generic
+        // wrappers retain the configured graceful window below.
         let teardownRequested = false;
+        if (state.ownsDescendants) {
+          requestWrapperTeardown(state);
+          teardownRequested = true;
+        }
         let escalated = false;
         let groupEscalated = false;
         while (state.ownsDescendants
-          ? !state.closed || Boolean(state.launchHandshakePath && existsSync(state.launchHandshakePath))
+          ? supervisorTreePending(state, ownedTreeMembers)
           : !state.closed || processGroupAlive(state.child)) {
           const elapsed = Date.now() - started;
           if (!teardownRequested && elapsed >= terminationGraceMs) {
@@ -427,6 +457,20 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
   // the escalation fallbacks in stop() still apply.
   function requestWrapperTeardown(state) {
     try { state.child?.stdin?.write?.("stop\n"); } catch { /* The wrapper already exited. */ }
+  }
+
+  function supervisorTreePending(state, groupMembers) {
+    if (!state.closed) return true;
+    if (!state.launchHandshakePath || !existsSync(state.launchHandshakePath)) return false;
+    const members = state.child?.pid ? groupMembers(state.child.pid) : null;
+    if (Array.isArray(members) && members.length === 0) {
+      // A supervisor that closed after reaping its tree but before unlinking
+      // the handshake must not wedge shutdown forever. The raw zero-member
+      // process-group proof is stronger than the stale file, so clean it up.
+      try { unlinkSync(state.launchHandshakePath); } catch { /* Already gone. */ }
+      return false;
+    }
+    return true;
   }
 
   function drain() {

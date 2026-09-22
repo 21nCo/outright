@@ -614,6 +614,43 @@ test("shutdown racing the running-state commit never authorizes the provider", a
   assert.deepEqual(manager.activeRuns(), []);
 });
 
+test("shutdown cleans a stale supervisor handshake after a zero-member tree proof", async () => {
+  const database = fakeDatabase();
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-stale-handshake-"));
+  const handshakePath = path.join(root, "run-1.json");
+  const child = fakeChild();
+  child.pid = 4242;
+  child.stdin = new PassThrough();
+  const originalWrite = child.stdin.write.bind(child.stdin);
+  child.stdin.write = (chunk) => {
+    const written = originalWrite(chunk);
+    if (String(chunk) === "stop\n") setImmediate(() => child.emit("close", null, "SIGTERM"));
+    return written;
+  };
+  try {
+    const manager = createAgentManager({
+      database,
+      publish: () => {},
+      spawnProcess: () => child,
+      launchDirectory: root,
+      launchCommand: (command) => ({ ...command, handshakePath, ownsDescendants: true }),
+      ownedTreeMembers: () => [],
+      terminationTimeoutMs: 250,
+    });
+    const run = database.createRun(codexRun("run-1"));
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+    writeFileSync(handshakePath, JSON.stringify({ pid: child.pid, authorized: true, processIdentity: "test:owned" }));
+
+    await manager.shutdown();
+
+    assert.equal(existsSync(handshakePath), false, "a stale record cannot wedge shutdown after the raw group is empty");
+    assert.equal(database.getRun(run.id).status, "stopped");
+    assert.deepEqual(manager.activeRuns(), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("publishes durable assistant messages before the terminal run event", async () => {
   const database = fakeDatabase();
   const child = fakeChild();
@@ -717,6 +754,7 @@ test("the launch wrapper records durable identity before authorization and clean
     const record = JSON.parse(readFileSync(handshakePath, "utf8"));
     assert.equal(record.pid, child.pid, "the wrapper records its own pid durably before anything can execute");
     assert.equal(record.authorized, false);
+    assert.equal(record.processIdentity?.startsWith(`${process.platform}:`), true, "the handshake binds ownership to the wrapper's immutable start identity");
 
     child.stdin.end();
     await withDeadline(new Promise((resolve) => child.once("exit", resolve)), "unauthorized wrapper exit", () => { try { child.kill("SIGKILL"); } catch {} });
@@ -995,6 +1033,7 @@ const failedHandshake = path.join(failedRoot, "run.json");
 const failedMarker = path.join(root, "provider-must-not-run");
 const failed = spawn("/tmp/agent-supervisor", [failedHandshake, process.execPath, "-e", \`require('node:fs').writeFileSync(\${JSON.stringify(failedMarker)}, 'ran')\`], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
 while (!existsSync(failedHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
+const nativeIdentitySafe = /^linux:[1-9]\\d*$/.test(JSON.parse(readFileSync(failedHandshake, "utf8")).processIdentity || "");
 renameSync(failedRoot, failedRoot + "-moved");
 writeFileSync(failedRoot, "blocks directory recreation");
 failed.stdin.write("go\\n");
@@ -1126,10 +1165,10 @@ try {
   outcome.membersAfterShutdown = groupMembers(second.child.pid);
   outcome.descendantAfterShutdown = processInfo(second.descendantPid);
 } catch (error) { outcome.shutdownError = String(error && error.message); }
-const clean = authorizationSafe && coalescedSafe && stdinSafe && cloneSafe && signalSafe && foreignUidSafe && !outcome.stopError && !outcome.shutdownError
+const clean = nativeIdentitySafe && authorizationSafe && coalescedSafe && stdinSafe && cloneSafe && signalSafe && foreignUidSafe && !outcome.stopError && !outcome.shutdownError
   && outcome.membersAfterStop.length === 0 && outcome.membersAfterShutdown.length === 0
   && outcome.descendantAfterStop == null && outcome.descendantAfterShutdown == null;
-console.log("RESULT " + JSON.stringify({ authorizationSafe, coalescedSafe, stdinSafe, cloneSafe, signalSafe, foreignUidSafe, ...outcome, clean }));
+console.log("RESULT " + JSON.stringify({ nativeIdentitySafe, authorizationSafe, coalescedSafe, stdinSafe, cloneSafe, signalSafe, foreignUidSafe, ...outcome, clean }));
 process.exit(clean ? 0 : 1);
 `;
   const repo = fileURLToPath(new URL("..", import.meta.url));

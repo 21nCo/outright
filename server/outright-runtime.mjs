@@ -1,5 +1,7 @@
 import { WebSocketServer } from "ws";
 import chokidar from "chokidar";
+import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { realpath } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
@@ -10,7 +12,7 @@ import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = defaultRecoveryProcessAlive, terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationTimeoutMs = 8000 }) {
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = defaultRecoveryProcessAlive, recoveryProcessIdentity = defaultRecoveryProcessIdentity, terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationTimeoutMs = 8000 }) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
   const database = createOutrightDatabase({ runtimeLease: true });
@@ -252,6 +254,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           }
           let verdict = recoveryVerdict(await recoveryProcessAlive(pending.pid));
           if (verdict === "alive") {
+            const handshake = database.getLaunchHandshake(pending.id);
+            const processIdentity = await recoveryProcessIdentity(pending.pid);
+            if (!recoveryIdentityMatches(pending, handshake, processIdentity)) {
+              throw apiError(409, "The interrupted provider process identity cannot be verified, so it will not be signaled", { code: "RECOVERY_PROCESS_UNKNOWN", pid: pending.pid, runId: pending.id });
+            }
             try { await terminateRecoveryProcess(pending.pid); }
             catch { /* Verification below remains fail-closed. */ }
             const deadline = Date.now() + recoveryTerminationTimeoutMs;
@@ -500,6 +507,32 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
   } catch (error) {
     return error.code === "ESRCH" ? "exited" : "unknown";
   }
+}
+
+export function defaultRecoveryProcessIdentity(pid, platform = process.platform, readFile = readFileSync, run = spawnSync) {
+  try {
+    if (platform === "linux") {
+      const stat = readFile(`/proc/${pid}/stat`, "utf8");
+      const close = stat.lastIndexOf(")");
+      if (close < 0) return null;
+      const startTicks = stat.slice(close + 2).split(" ")[19];
+      return startTicks ? `linux:${startTicks}` : null;
+    }
+    if (platform === "darwin") {
+      const result = run("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
+      const started = result.status === 0 ? result.stdout.trim() : "";
+      return started ? `darwin:${started}` : null;
+    }
+  } catch { /* A missing or unreadable process is not identifiable. */ }
+  return null;
+}
+
+function recoveryIdentityMatches(run, handshake, processIdentity) {
+  return handshake?.authorized === true
+    && handshake.pid === run.pid
+    && typeof handshake.processIdentity === "string"
+    && handshake.processIdentity.length > 0
+    && handshake.processIdentity === processIdentity;
 }
 
 export function defaultTerminateRecoveryProcess(pid) {
