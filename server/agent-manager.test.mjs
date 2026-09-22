@@ -311,9 +311,18 @@ test("flushes a stalled sub-threshold delta tail after the checkpoint interval",
 
 test("keeps every streamed byte in exactly one durable-prefix or live-tail owner", async () => {
   const database = fakeDatabase();
+  const operations = [];
+  const originalUpsert = database.upsertMessage.bind(database);
+  database.upsertMessage = (message) => {
+    operations.push(`persist:${message.body}`);
+    return originalUpsert(message);
+  };
   const child = fakeChild();
   const published = [];
-  const manager = createAgentManager({ database, publish: (event) => published.push(event), spawnProcess: () => child, checkpointMinBytes: 5, checkpointIntervalMs: 40 });
+  const manager = createAgentManager({ database, publish: (event) => {
+    published.push(event);
+    if (event.type === "run.event" && event.payload?.type === "assistant.delta") operations.push(`delta:${event.payload.payload.text}`);
+  }, spawnProcess: () => child, checkpointMinBytes: 5, checkpointIntervalMs: 40 });
   database.createRun({ ...codexRun("run-1"), provider: "claude" });
   await manager.schedule({ conversation: { id: "conv-1", worktreePath: "/tmp/project" }, run: database.getRun("run-1") });
   published.length = 0;
@@ -327,6 +336,8 @@ test("keeps every streamed byte in exactly one durable-prefix or live-tail owner
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.equal(database.messages[0]?.body, "Abcdefg", "the timer advances the durable prefix");
+  assert.deepEqual(operations.slice(0, 2), ["persist:A", "delta:A"], "a due checkpoint commits before its durable delta event");
+  assert.equal(published.some((event) => event.type === "message.created"), false, "intermediate checkpoints do not duplicate live deltas in the UI");
 
   child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "h" } } }) + "\n");
   child.emit("close", 0, null);
@@ -937,7 +948,7 @@ test("the launch wrapper records durable identity before authorization and clean
   try {
     // Spawn the wrapper exactly as the runtime does, but never authorize:
     // closing stdin must exit it without running the provider.
-    const child = spawn(process.execPath, wrapperArgs(handshakePath, process.execPath, "-e", provider), { stdio: ["pipe", "ignore", "ignore", "pipe"] });
+    const child = spawn(process.execPath, wrapperArgs(handshakePath, process.execPath, "-e", provider), { detached: process.platform !== "win32", stdio: ["pipe", "ignore", "ignore", "pipe"] });
     children.push(child);
     const deadline = Date.now() + 10_000;
     while (!existsSync(handshakePath) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -963,7 +974,7 @@ test("the launch wrapper records durable identity before authorization and clean
     const marker2 = path.join(root, "provider-ran-2");
     const handshakePath2 = path.join(launchDirectory, "launch-run-2.json");
     const provider2 = `require("node:fs").writeFileSync(${JSON.stringify(marker2)}, "ran"); setTimeout(() => {}, 250);`;
-    const child2 = spawn(process.execPath, wrapperArgs(handshakePath2, process.execPath, "-e", provider2), { stdio: ["pipe", "pipe", "ignore", "pipe"] });
+    const child2 = spawn(process.execPath, wrapperArgs(handshakePath2, process.execPath, "-e", provider2), { detached: process.platform !== "win32", stdio: ["pipe", "pipe", "ignore", "pipe"] });
     children.push(child2);
     const deadline2 = Date.now() + 10_000;
     while (!existsSync(handshakePath2) && Date.now() < deadline2) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -999,9 +1010,10 @@ test("the launch wrapper records durable identity before authorization and clean
       const descendantSource = `process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);`;
       const provider4 = [
         `const { spawn } = require("node:child_process");`,
-        `const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendantSource)}], { stdio: "ignore" });`,
+        `const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendantSource)}], { detached: true, stdio: "ignore" });`,
         `require("node:fs").writeFileSync(${JSON.stringify(descendantMarker)}, String(child.pid));`,
         `child.unref();`,
+        `setTimeout(() => {}, 75);`,
       ].join("\n");
       const child4 = spawn(process.execPath, wrapperArgs(handshakePath4, process.execPath, "-e", provider4), {
         detached: true,
@@ -1014,7 +1026,7 @@ test("the launch wrapper records durable identity before authorization and clean
       while (!existsSync(descendantMarker) && Date.now() < deadline4) await new Promise((resolve) => setTimeout(resolve, 10));
       const descendantPid = Number(readFileSync(descendantMarker, "utf8"));
       await new Promise((resolve) => setTimeout(resolve, 150));
-      assert.equal(child4.exitCode, null, "the wrapper remains alive after the provider exits while a descendant is active");
+      assert.equal(child4.exitCode, null, "the wrapper remains alive after the provider exits while a detached descendant is active");
       assert.equal(existsSync(handshakePath4), true, "the durable ownership record remains available for crash recovery");
 
       child4.stdin.write("stop\n");
@@ -1028,7 +1040,7 @@ test("the launch wrapper records durable identity before authorization and clean
     // early return after "go".
     const handshakePath3 = path.join(launchDirectory, "launch-run-3.json");
     const provider3 = `process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);`;
-    const child3 = spawn(process.execPath, wrapperArgs(handshakePath3, process.execPath, "-e", provider3), { stdio: ["pipe", "ignore", "ignore", "pipe"] });
+    const child3 = spawn(process.execPath, wrapperArgs(handshakePath3, process.execPath, "-e", provider3), { detached: process.platform !== "win32", stdio: ["pipe", "ignore", "ignore", "pipe"] });
     children.push(child3);
     const deadline3 = Date.now() + 10_000;
     while (!existsSync(handshakePath3) && Date.now() < deadline3) await new Promise((resolve) => setTimeout(resolve, 10));

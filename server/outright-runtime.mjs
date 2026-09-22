@@ -287,7 +287,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         // start while the original descendants may still mutate the same
         // worktree.
         for (const pending of database.listUnresolvedInterruptedRunsForWorktree(interrupted.worktreePath)) {
-          if (pending.recoveryClass === "never-started") continue;
+          // Both classes are durable proofs made during restart reconciliation.
+          // Re-probing an exited row later would let an unrelated process that
+          // reused the PID turn a settled fact back into an unknown/alive gate.
+          if (["never-started", "exited"].includes(pending.recoveryClass)) continue;
           if (!(Number.isSafeInteger(pending.pid) && pending.pid > 0)) {
             throw apiError(409, "An interrupted provider process cannot be verified, so no recovery decision can be recorded yet", { code: "RECOVERY_PROCESS_UNKNOWN", runId: pending.id });
           }

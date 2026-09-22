@@ -367,45 +367,30 @@ test("never escalates to a reused provider pid", (() => {
   });
 })());
 
-// A private handshake still is not enough after PID/PGID reuse: recovery must
-// compare its immutable process-start identity before sending any signal.
-test("never signals a reused process group whose durable identity no longer matches", { skip: process.platform === "win32" }, withRuntime(async (runtime) => {
-  const descendant = "setInterval(() => {}, 1000);";
-  const leader = `const {spawn} = require("node:child_process"); spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], {stdio: "ignore"}); process.exit(0);`;
-  const child = spawn(process.execPath, ["-e", leader], { detached: true, stdio: "ignore" });
-  const pid = child.pid;
-  child.once("exit", () => {});
-  try {
-    // Wait until the leader is gone while the descendant holds its group.
-    await new Promise((resolve) => {
-      const started = Date.now();
-      (function probe() {
-        try { process.kill(pid, 0); }
-        catch { return resolve(); }
-        if (Date.now() - started > 5000) return resolve();
-        setTimeout(probe, 25);
-      })();
-    });
-    assert.doesNotThrow(() => process.kill(-pid, 0), "the descendant must hold the leader's process group");
+// A restart-time exited verdict is a durable fact. Re-probing that numeric PID
+// later would let an unrelated process reuse turn the row back into a gate or,
+// worse, become a signal target.
+test("does not re-probe or signal a run durably classified exited", (() => {
+  let probes = 0;
+  let signals = 0;
+  return withRuntime(async (runtime) => {
     const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
     const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
-    runtime.database.updateRun(run.id, { status: "running", pid });
-    writeFileSync(path.join(runtime.database.launchDirectory, `${run.id}.json`), JSON.stringify({ pid, authorized: true, processIdentity: "linux:original-owner" }));
-    // Stale restart classification: the leader had already exited by the time
-    // the restart probe ran, but the descendant still holds the process group.
+    runtime.database.updateRun(run.id, { status: "running", pid: 424242 });
     runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
     assert.equal(runtime.database.getRun(run.id).recoveryClass, "exited");
 
     const response = responseCapture();
     await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), response);
-    assert.equal(response.statusCode, 409);
-    assert.equal(response.body.code, "RECOVERY_PROCESS_UNKNOWN");
-    assert.equal(runtime.database.getRun(run.id).recoveryDecision, null);
-    assert.doesNotThrow(() => process.kill(-pid, 0), "the mismatched process group is never signaled");
-  } finally {
-    try { process.kill(-pid, "SIGKILL"); } catch { /* Already gone. */ }
-  }
-}, { recoveryProcessIdentity: () => "linux:reused-owner" }));
+    assert.equal(response.statusCode, 200);
+    assert.equal(runtime.database.getRun(run.id).recoveryDecision, "discard");
+    assert.equal(probes, 0, "a reused numeric PID cannot overwrite the durable exited proof");
+    assert.equal(signals, 0, "a reused numeric PID is never signaled");
+  }, {
+    recoveryProcessAlive: () => { probes += 1; return "alive"; },
+    terminateRecoveryProcess: async () => { signals += 1; },
+  });
+})());
 
 // Regression (platform-injectable): on platforms without owned process trees
 // (Windows), a gone leader with a possibly live descendant cannot be verified
@@ -418,6 +403,7 @@ test("blocks replacement work when the process tree cannot be verified", withRun
   const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
   runtime.database.updateRun(run.id, { status: "running", pid: 424242 });
   runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+  runtime.database.updateRun(run.id, { recoveryClass: "unknown" });
 
   for (const policy of ["resume-session", "retry", "discard"]) {
     const blocked = responseCapture();
@@ -443,6 +429,7 @@ test("a discard on an unknown process tree cannot be followed by a newly schedul
   const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
   runtime.database.updateRun(run.id, { status: "running", pid: 424242 });
   runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+  runtime.database.updateRun(run.id, { recoveryClass: "unknown" });
 
   // Tree still unverifiable: discard is rejected outright.
   const discardBlocked = responseCapture();

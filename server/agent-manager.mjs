@@ -100,6 +100,8 @@ let providerGone = false;
 let providerResult = null;
 let teardownStarted = false;
 let completionTimer = null;
+let ownershipTimer = null;
+const knownDescendants = new Map();
 // Stay alive across group termination signals once authorized so this
 // wrapper — the provider's parent — can reap it. On hosts whose PID 1 does
 // not reap orphans, a killed-but-unreaped provider would remain a zombie in
@@ -109,26 +111,32 @@ let completionTimer = null;
 const abandon = () => { try { fs.unlinkSync(handshakePath); } catch {} process.exit(0); };
 process.on("SIGTERM", () => { if (!authorized) abandon(); });
 process.on("SIGINT", () => { if (!authorized) abandon(); });
-// Enumerates the members of this wrapper's process group. Linux uses /proc;
-// macOS uses ps so the wrapper can retain its durable ownership record after
-// the provider exits while a background descendant is still running.
-const groupMembers = (pgid) => {
+// Snapshot parentage as well as process groups. A provider may create a new
+// session, so group membership alone is not an ownership boundary on macOS or
+// Windows. Descendants observed while their parent is alive remain owned after
+// reparenting until the process disappears.
+const processSnapshot = () => {
   if (process.platform === "darwin") {
     try {
-      // Keep the inspection helper out of the owned group; otherwise each ps
-      // invocation observes itself as a live descendant and the group can
-      // never reach the empty proof.
-      const output = execFileSync("/bin/ps", ["-axo", "pid=,pgid=,stat="], { encoding: "utf8", detached: true });
+      const output = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat=,lstart="], { encoding: "utf8", detached: true });
       return output.split("\\n").flatMap((line) => {
-        const match = line.trim().match(/^(\\d+)\\s+(\\d+)\\s+(\\S+)/);
-        if (!match || Number(match[2]) !== pgid) return [];
-        return [{ pid: Number(match[1]), state: match[3][0] }];
+        const match = line.trim().match(/^(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\S+)\\s+(.+)$/);
+        return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]), state: match[4][0], identity: match[5] }] : [];
       });
+    } catch { return null; }
+  }
+  if (process.platform === "win32") {
+    try {
+      const script = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate | ConvertTo-Json -Compress";
+      const output = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true }).trim();
+      if (!output) return [];
+      const rows = JSON.parse(output);
+      return (Array.isArray(rows) ? rows : [rows]).map((row) => ({ pid: Number(row.ProcessId), ppid: Number(row.ParentProcessId), pgid: null, state: "R", identity: String(row.CreationDate ?? "") }));
     } catch { return null; }
   }
   let entries;
   try { entries = fs.readdirSync("/proc"); } catch { return null; }
-  const members = [];
+  const processes = [];
   for (const entry of entries) {
     if (!/^\\d+$/.test(entry)) continue;
     let stat;
@@ -136,12 +144,37 @@ const groupMembers = (pgid) => {
     const close = stat.lastIndexOf(")");
     if (close < 0) continue;
     const fields = stat.slice(close + 2).split(" ");
-    if (Number(fields[2]) === pgid) members.push({ pid: Number(entry), state: fields[0] });
+    processes.push({ pid: Number(entry), ppid: Number(fields[1]), pgid: Number(fields[2]), state: fields[0], identity: fields[19] });
   }
-  return members;
+  return processes;
+};
+const groupMembers = (pgid) => {
+  const processes = processSnapshot();
+  if (processes == null) return null;
+  const live = new Map(processes.map((entry) => [entry.pid, entry.identity]));
+  for (const [pid, identity] of knownDescendants) if (live.get(pid) !== identity) knownDescendants.delete(pid);
+  const owned = new Set([process.pid, ...knownDescendants.keys()]);
+  if (provider?.pid) owned.add(provider.pid);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const entry of processes) {
+      if (entry.pid === process.pid || owned.has(entry.pid)) continue;
+      // ps/PowerShell is a short-lived direct child of the wrapper. It runs
+      // outside the owned group and must not make its own snapshot look busy.
+      if (entry.ppid === process.pid && entry.pid !== provider?.pid && entry.pgid !== pgid && !knownDescendants.has(entry.pid)) continue;
+      if (entry.pgid === pgid || owned.has(entry.ppid)) {
+        owned.add(entry.pid);
+        knownDescendants.set(entry.pid, entry.identity);
+        changed = true;
+      }
+    }
+  }
+  return processes.filter((entry) => entry.pid === process.pid || owned.has(entry.pid));
 };
 const finish = (code, signal) => {
   if (completionTimer) clearTimeout(completionTimer);
+  if (ownershipTimer) clearInterval(ownershipTimer);
   try { fs.unlinkSync(handshakePath); } catch {}
   if (signal) {
     // Re-raise the provider's termination signal so the runtime reports the
@@ -157,13 +190,9 @@ const finish = (code, signal) => {
 const finishWhenOwnedGroupIsEmpty = () => {
   const members = groupMembers(process.pid);
   if (members == null) {
-    // On macOS, losing process-group visibility must not discard the only
-    // durable ownership token while descendants may still be running.
-    if (process.platform === "darwin") {
-      completionTimer = setTimeout(finishWhenOwnedGroupIsEmpty, 50);
-      return;
-    }
-    finish(providerResult?.code, providerResult?.signal);
+    // Losing visibility must not discard the only durable owner while an
+    // escaped descendant may still be running on either supported platform.
+    completionTimer = setTimeout(finishWhenOwnedGroupIsEmpty, 50);
     return;
   }
   const activeDescendants = members.filter((member) => member.pid !== process.pid && member.state !== "Z");
@@ -188,9 +217,20 @@ const teardown = () => {
   teardownStarted = true;
   const deadline = Date.now() + teardownBudgetMs;
   const killProvider = () => { if (!providerGone) { try { process.kill(provider.pid, "SIGKILL"); } catch { /* Already gone. */ } } };
+  const killOwned = (pid) => {
+    try {
+      if (process.platform === "win32") execFileSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+      else process.kill(pid, "SIGKILL");
+    } catch { /* Already gone. */ }
+  };
   const sweep = () => {
     const members = groupMembers(process.pid);
-    if (members == null) { killProvider(); return; }
+    if (members == null) {
+      if (!providerGone && process.platform === "win32") killOwned(provider.pid);
+      else killProvider();
+      setTimeout(sweep, 50);
+      return;
+    }
     const outstanding = members.filter((member) => member.pid !== process.pid && member.pid !== provider.pid && member.state !== "Z");
     if (outstanding.length === 0) {
       if (providerGone) finishWhenOwnedGroupIsEmpty();
@@ -199,7 +239,7 @@ const teardown = () => {
     }
     if (Date.now() >= deadline) { killProvider(); return; }
     for (const member of outstanding) {
-      try { process.kill(member.pid, "SIGKILL"); } catch { /* Already gone. */ }
+      killOwned(member.pid);
     }
     setTimeout(sweep, 50);
   };
@@ -227,6 +267,12 @@ process.stdin.on("data", (chunk) => {
       }
       const { spawn } = require("node:child_process");
       provider = spawn(executable, commandArgs, { stdio: ["ignore", "inherit", "inherit"] });
+      // Observe parentage continuously while it is still available. This is
+      // what keeps ownership when a descendant calls setsid() and later gets
+      // reparented after the provider exits.
+      groupMembers(process.pid);
+      ownershipTimer = setInterval(() => { groupMembers(process.pid); }, 10);
+      ownershipTimer.unref?.();
       // Durable provider identity: escalation targets the provider alone so this
       // wrapper — the provider's parent — survives to reap it. Without this, a
       // group-wide SIGKILL kills the wrapper first and a killed-but-unreaped
@@ -452,24 +498,25 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
         if (state.assistantBytes && !text.startsWith(assistantBody(state))) {
           // A completed message that does not extend the accumulated deltas
           // starts a new segment; archive the prior one first.
-          archiveAssistant(state, persistAssistantCheckpoint);
+          archiveAssistant(state, (current) => persistAssistantCheckpoint(current, { publishEvent: true }));
         }
         replaceAssistantText(state, text, emit);
-        archiveAssistant(state, persistAssistantCheckpoint);
+        archiveAssistant(state, (current) => persistAssistantCheckpoint(current, { publishEvent: true }));
       }
       if (["tool.started", "tool.completed"].includes(event.type)) {
-        archiveAssistant(state, persistAssistantCheckpoint);
+        archiveAssistant(state, (current) => persistAssistantCheckpoint(current, { publishEvent: true }));
         persistTranscriptItem(state, { kind: "tool", body: toolTranscriptLabel(event), payload: { item: event.payload.item ?? null } });
       }
       if (event.type === "usage") database.updateRun(state.run.id, event.payload);
       const emittedPayload = ["assistant.delta", "assistant.message"].includes(event.type)
         ? { ...event.payload, text: truncateUtf8(event.payload.text ?? "", MAX_ASSISTANT_EVENT_BYTES), truncated: Buffer.byteLength(event.payload.text ?? "") > MAX_ASSISTANT_EVENT_BYTES }
         : event.payload;
-      emit(state.run.id, event.type, emittedPayload);
-      // Publish the data-plane delta before any checkpoint containing those
-      // bytes. The UI can then render the delta as the live suffix and let the
-      // later durable message atomically advance the prefix and clear overlap.
       if (checkpointDelta !== null) scheduleAssistantCheckpoint(state, checkpointDelta);
+      // A due checkpoint is committed before its corresponding durable delta
+      // event. If the process crashes at either boundary, recovery sees at
+      // least the checkpoint prefix. Intermediate checkpoints stay silent so
+      // the live UI owns each streamed byte exactly once via assistant.delta.
+      emit(state.run.id, event.type, emittedPayload);
     }
   }
 
@@ -672,7 +719,7 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     state.checkpointTimer = null;
   }
 
-  function persistAssistantCheckpoint(state) {
+  function persistAssistantCheckpoint(state, { publishEvent = false } = {}) {
     clearCheckpointTimer(state);
     state.checkpointPendingBytes = 0;
     state.lastCheckpointAt = Date.now();
@@ -682,7 +729,7 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     // beyond the cap must not schedule further rewrites of the same body.
     if (state.assistantTruncated) state.checkpointHalted = true;
     const stored = database.upsertMessage(message);
-    publish({ type: "message.created", conversationId: state.conversation.id, payload: stored });
+    if (publishEvent) publish({ type: "message.created", conversationId: state.conversation.id, payload: stored });
     return stored;
   }
 
