@@ -1,0 +1,18 @@
+server/ui-recovery.test.mjs
+  h_a39f9495f9ec1d 3,13-24,27,32-36
+src/App.jsx
+  h_a39f9495f9ec1d 27,77,313-316,318-320,323,337
+src/recovery-policy.js
+  h_a39f9495f9ec1d 9-13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d83a9d32ad5d36cd4168a77b0211e984376dd75e",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
