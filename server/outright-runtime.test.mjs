@@ -884,6 +884,17 @@ test("recovery identities are boot-scoped and Windows taskkill supplies a whole-
       "unknown",
       "an identity-matched gated supervisor can still submit after its wrapper exits",
     );
+    const failedSupervisorProbe = (executable) => executable === AGENT_SUPERVISOR
+      ? { status: 3, stdout: "absent\n" }
+      : { status: 1, stdout: "" };
+    assert.equal(
+      defaultRecoveryProcessAlive(123, "darwin", () => null, (pid) => {
+        if (pid === 456) return;
+        throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      }, missingJobHandshake, failedSupervisorProbe),
+      "unknown",
+      "a failed supervisor identity probe is uncertainty, not proof of exit",
+    );
     assert.equal(
       defaultRecoveryProcessAlive(123, "darwin", () => null, () => {}, missingJobHandshake, (executable) => executable === AGENT_SUPERVISOR
         ? { status: 3, stdout: "exited\n" }

@@ -605,6 +605,10 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
           : null;
         if (!Number.isSafeInteger(supervisorPid) || supervisorPid <= 0 || !supervisorIdentity) return "unknown";
         const liveSupervisorIdentity = defaultRecoveryProviderProcessIdentity(supervisorPid, platform, run);
+        if (liveSupervisorIdentity == null) {
+          try { kill(supervisorPid, 0); return "unknown"; }
+          catch (error) { return error.code === "ESRCH" ? "exited" : "unknown"; }
+        }
         return liveSupervisorIdentity === supervisorIdentity ? "unknown" : "exited";
       }
       darwinOwnershipUnknown = true;

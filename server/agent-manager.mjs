@@ -195,18 +195,28 @@ process.stdin.on("data", (chunk) => {
         // Other platforms retain the durable wrapper identity even if the
         // optional provider-only escalation identity could not be persisted.
       }
-      if (darwinLaunch) provider.stdio[3].end("go\\n");
       provider.on("error", (error) => { console.error(String((error && error.message) || error)); finish(127); });
       provider.on("close", (code, signal) => {
         providerGone = true;
         providerResult = { code, signal };
         finishWhenOwnedGroupIsEmpty();
       });
-      // Keep launch ownership control off provider stdout. Providers may emit
-      // arbitrary bytes (including unterminated prefixes or the control token
-      // itself), so only the manager-owned fd 3 can acknowledge authorization.
-      try { fs.writeSync(${LAUNCH_CONTROL_FD}, ${JSON.stringify(LAUNCH_AUTHORIZED_CONTROL)} + "\\n"); }
-      catch { teardown(); }
+      const acknowledgeLaunch = () => {
+        // Keep launch ownership control off provider stdout. Providers may
+        // emit arbitrary bytes, so only the manager-owned fd 3 can acknowledge.
+        try { fs.writeSync(${LAUNCH_CONTROL_FD}, ${JSON.stringify(LAUNCH_AUTHORIZED_CONTROL)} + "\\n"); }
+        catch { teardown(); }
+      };
+      if (darwinLaunch) {
+        const gate = provider.stdio[3];
+        let gateFailed = false;
+        gate.once("error", (error) => {
+          gateFailed = true;
+          console.error(String((error && error.message) || error));
+          teardown();
+        });
+        gate.end("go\\n", () => { if (!gateFailed) acknowledgeLaunch(); });
+      } else acknowledgeLaunch();
       continue;
     }
     if (command === "stop") {
