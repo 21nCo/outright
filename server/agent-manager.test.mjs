@@ -789,6 +789,40 @@ test("the launch wrapper records durable identity before authorization and clean
     assert.equal(existsSync(marker2), true, "the authorized wrapper starts the provider");
     assert.equal(existsSync(handshakePath2), false, "the handshake record is cleaned up after completion");
 
+    if (process.platform === "darwin") {
+      // A provider can exit after launching a background descendant. The
+      // wrapper is the durable process-group identity on macOS, so it must
+      // retain its handshake until that descendant is gone rather than making
+      // restart recovery permanently unverifiable.
+      const descendantMarker = path.join(root, "background-descendant");
+      const handshakePath4 = path.join(launchDirectory, "launch-run-4.json");
+      const descendantSource = `process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);`;
+      const provider4 = [
+        `const { spawn } = require("node:child_process");`,
+        `const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendantSource)}], { stdio: "ignore" });`,
+        `require("node:fs").writeFileSync(${JSON.stringify(descendantMarker)}, String(child.pid));`,
+        `child.unref();`,
+      ].join("\n");
+      const child4 = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath4, process.execPath, "-e", provider4], {
+        detached: true,
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+      children.push(child4);
+      const deadline4 = Date.now() + 10_000;
+      while (!existsSync(handshakePath4) && Date.now() < deadline4) await new Promise((resolve) => setTimeout(resolve, 10));
+      child4.stdin.write("go\n");
+      while (!existsSync(descendantMarker) && Date.now() < deadline4) await new Promise((resolve) => setTimeout(resolve, 10));
+      const descendantPid = Number(readFileSync(descendantMarker, "utf8"));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(child4.exitCode, null, "the wrapper remains alive after the provider exits while a descendant is active");
+      assert.equal(existsSync(handshakePath4), true, "the durable ownership record remains available for crash recovery");
+
+      child4.stdin.write("stop\n");
+      await withDeadline(new Promise((resolve) => child4.once("exit", resolve)), "background descendant teardown", () => { try { process.kill(-child4.pid, "SIGKILL"); } catch {} });
+      assert.equal(existsSync(handshakePath4), false, "the wrapper removes ownership only after the group is empty");
+      assert.throws(() => process.kill(descendantPid, 0), { code: "ESRCH" }, "the background descendant is gone before ownership is released");
+    }
+
     // Pipe writes may be coalesced. A stop command arriving in the same chunk
     // as authorization must still be consumed instead of being dropped by an
     // early return after "go".

@@ -78,7 +78,9 @@ fs.writeFileSync(handshakePath, JSON.stringify(handshake(false)));
 let authorized = false;
 let provider = null;
 let providerGone = false;
+let providerResult = null;
 let teardownStarted = false;
+let completionTimer = null;
 // Stay alive across group termination signals once authorized so this
 // wrapper — the provider's parent — can reap it. On hosts whose PID 1 does
 // not reap orphans, a killed-but-unreaped provider would remain a zombie in
@@ -88,10 +90,23 @@ let teardownStarted = false;
 const abandon = () => { try { fs.unlinkSync(handshakePath); } catch {} process.exit(0); };
 process.on("SIGTERM", () => { if (!authorized) abandon(); });
 process.on("SIGINT", () => { if (!authorized) abandon(); });
-// Enumerates the members of this wrapper's process group from /proc, or
-// returns null when /proc is unavailable (non-Linux hosts); teardown then
-// degrades to killing the provider alone.
+// Enumerates the members of this wrapper's process group. Linux uses /proc;
+// macOS uses ps so the wrapper can retain its durable ownership record after
+// the provider exits while a background descendant is still running.
 const groupMembers = (pgid) => {
+  if (process.platform === "darwin") {
+    try {
+      // Keep the inspection helper out of the owned group; otherwise each ps
+      // invocation observes itself as a live descendant and the group can
+      // never reach the empty proof.
+      const output = execFileSync("/bin/ps", ["-axo", "pid=,pgid=,stat="], { encoding: "utf8", detached: true });
+      return output.split("\\n").flatMap((line) => {
+        const match = line.trim().match(/^(\\d+)\\s+(\\d+)\\s+(\\S+)/);
+        if (!match || Number(match[2]) !== pgid) return [];
+        return [{ pid: Number(match[1]), state: match[3][0] }];
+      });
+    } catch { return null; }
+  }
   let entries;
   try { entries = fs.readdirSync("/proc"); } catch { return null; }
   const members = [];
@@ -106,6 +121,39 @@ const groupMembers = (pgid) => {
   }
   return members;
 };
+const finish = (code, signal) => {
+  if (completionTimer) clearTimeout(completionTimer);
+  try { fs.unlinkSync(handshakePath); } catch {}
+  if (signal) {
+    // Re-raise the provider's termination signal so the runtime reports the
+    // accurate "stopped by signal" cause instead of a generic 137 — except
+    // SIGUSR1, which Node reserves for its debugger.
+    process.removeAllListeners("SIGTERM");
+    process.removeAllListeners("SIGINT");
+    if (signal === "SIGUSR1") process.exit(137);
+    try { process.kill(process.pid, signal); }
+    catch { process.exit(137); }
+  } else process.exit(code ?? 0);
+};
+const finishWhenOwnedGroupIsEmpty = () => {
+  const members = groupMembers(process.pid);
+  if (members == null) {
+    // On macOS, losing process-group visibility must not discard the only
+    // durable ownership token while descendants may still be running.
+    if (process.platform === "darwin") {
+      completionTimer = setTimeout(finishWhenOwnedGroupIsEmpty, 50);
+      return;
+    }
+    finish(providerResult?.code, providerResult?.signal);
+    return;
+  }
+  const activeDescendants = members.filter((member) => member.pid !== process.pid && member.state !== "Z");
+  if (activeDescendants.length > 0) {
+    completionTimer = setTimeout(finishWhenOwnedGroupIsEmpty, 50);
+    return;
+  }
+  finish(providerResult?.code, providerResult?.signal);
+};
 // Ordered teardown (runtime "stop" command). The provider's descendants are
 // SIGKILLed FIRST, while their parent — the provider — is still alive to reap
 // them; only once the group holds no other member is the provider itself
@@ -117,19 +165,21 @@ const groupMembers = (pgid) => {
 // the runtime's group-wide fallback applies.
 const teardownBudgetMs = 750;
 const teardown = () => {
-  if (teardownStarted || !provider || providerGone) return;
+  if (teardownStarted || !provider) return;
   teardownStarted = true;
   const deadline = Date.now() + teardownBudgetMs;
   const killProvider = () => { if (!providerGone) { try { process.kill(provider.pid, "SIGKILL"); } catch { /* Already gone. */ } } };
   const sweep = () => {
-    if (providerGone) return;
     const members = groupMembers(process.pid);
     if (members == null) { killProvider(); return; }
-    const outstanding = members.filter((member) => member.pid !== process.pid && member.pid !== provider.pid);
-    if (outstanding.length === 0 || Date.now() >= deadline) { killProvider(); return; }
+    const outstanding = members.filter((member) => member.pid !== process.pid && member.pid !== provider.pid && member.state !== "Z");
+    if (outstanding.length === 0) {
+      if (providerGone) finishWhenOwnedGroupIsEmpty();
+      else killProvider();
+      return;
+    }
+    if (Date.now() >= deadline) { killProvider(); return; }
     for (const member of outstanding) {
-      // A zombie is already dead; its parent simply has not reaped it yet.
-      if (member.state === "Z") continue;
       try { process.kill(member.pid, "SIGKILL"); } catch { /* Already gone. */ }
     }
     setTimeout(sweep, 50);
@@ -154,22 +204,11 @@ process.stdin.on("data", (chunk) => {
       // provider lingers as a zombie in its process group on hosts whose PID 1
       // does not reap orphans.
       try { fs.writeFileSync(handshakePath, JSON.stringify(handshake(true, provider.pid))); } catch { /* The record was swept; nothing needs escalation identity. */ }
-      const finish = (code) => { try { fs.unlinkSync(handshakePath); } catch {} process.exit(code); };
       provider.on("error", (error) => { console.error(String((error && error.message) || error)); finish(127); });
       provider.on("close", (code, signal) => {
         providerGone = true;
-        try { fs.unlinkSync(handshakePath); } catch {}
-        if (signal) {
-          // Re-raise the provider's termination signal so the runtime reports
-          // the accurate "stopped by signal" cause instead of a generic 137 —
-          // except SIGUSR1, which Node reserves for its debugger: re-raising it
-          // would start the inspector instead of terminating this wrapper.
-          process.removeAllListeners("SIGTERM");
-          process.removeAllListeners("SIGINT");
-          if (signal === "SIGUSR1") process.exit(137);
-          try { process.kill(process.pid, signal); }
-          catch { process.exit(137); }
-        } else process.exit(code ?? 0);
+        providerResult = { code, signal };
+        finishWhenOwnedGroupIsEmpty();
       });
       continue;
     }
