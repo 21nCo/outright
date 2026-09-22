@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { draftAfterSubmission, isComposerSubmitKey, isUnverifiableLegacyRecovery, recoveryBelongsToConversation, recoveryGate, streamingTextAfterDurableMessage } from "../src/recovery-policy.js";
+import { draftAfterSubmission, isComposerSubmitKey, isUnverifiableLegacyRecovery, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, shouldReloadConversationForResolvedRun, streamingTextAfterDurableMessage } from "../src/recovery-policy.js";
 
 test("worktree recovery metadata gates sibling composers before conversation-local history", () => {
   const local = { id: "local", status: "interrupted" };
@@ -42,8 +42,20 @@ test("durable run checkpoints replace the overlapping live stream", () => {
 });
 
 test("only legacy rows without any process or worktree identity offer manual cleanup", () => {
-  assert.equal(isUnverifiableLegacyRecovery({ recoveryClass: "unknown", pid: null, worktreePath: null }), true);
+  const legacy = { conversationId: "missing-owner", recoveryClass: "unknown", pid: null, worktreePath: null };
+  assert.equal(isUnverifiableLegacyRecovery(legacy), true);
   assert.equal(isUnverifiableLegacyRecovery({ recoveryClass: "unknown", pid: 42, worktreePath: null }), false);
   assert.equal(isUnverifiableLegacyRecovery({ recoveryClass: "unknown", pid: null, worktreePath: "/tmp/tree" }), false);
   assert.equal(isUnverifiableLegacyRecovery({ recoveryClass: "never-started", pid: null, worktreePath: null }), false);
+  assert.equal(recoveryNoticeAction(legacy, { id: "visible-sibling" }), "discard-unverifiable", "manual cleanup stays available when the owner target cannot be opened");
+  assert.equal(recoveryNoticeAction(legacy, { id: "missing-owner" }), "discard-unverifiable");
+  assert.equal(recoveryNoticeAction({ conversationId: "owner", recoveryClass: "exited" }, { id: "visible-sibling" }), "open-recovery");
+});
+
+test("resolved worktree recovery refreshes both its owner and gated sibling chats", () => {
+  const event = { type: "run.resolved", conversationId: "owner", runId: "run-1" };
+  assert.equal(shouldReloadConversationForResolvedRun(event, "owner", null), true);
+  assert.equal(shouldReloadConversationForResolvedRun(event, "visible-sibling", "run-1"), true);
+  assert.equal(shouldReloadConversationForResolvedRun(event, "visible-sibling", "another-run"), false);
+  assert.equal(shouldReloadConversationForResolvedRun({ ...event, type: "run.event" }, "owner", "run-1"), false);
 });

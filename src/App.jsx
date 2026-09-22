@@ -24,7 +24,7 @@ import { ContextPane } from "@/components/ContextPane";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { TerminalPane } from "@/components/TerminalPane";
 import { api, connectRuntime, query } from "@/lib/runtime-api";
-import { draftAfterSubmission, isComposerSubmitKey, isUnverifiableLegacyRecovery, recoveryBelongsToConversation, recoveryGate, streamingTextAfterDurableMessage } from "@/recovery-policy";
+import { draftAfterSubmission, isComposerSubmitKey, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, shouldReloadConversationForResolvedRun, streamingTextAfterDurableMessage } from "@/recovery-policy";
 
 const MAX_RENDERED_MESSAGES = 1000;
 const MAX_STREAMING_CHARACTERS = 1024 * 1024;
@@ -150,6 +150,7 @@ export function App() {
     catch (nextError) { setError(nextError.message); }
   }, [selectedConversationId, conversations]);
   useEffect(() => { loadConversation(); }, [loadConversation]);
+  const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
   const handleRuntimeEvent = useCallback((event) => {
     setRuntimeEvent(event);
@@ -162,7 +163,7 @@ export function App() {
       loadConversation();
     }
     if (event.type === "conversation.created" || event.type === "conversation.updated") loadConversations(event.conversationId);
-    if (event.type === "run.resolved" && event.conversationId === selectedConversationRef.current) loadConversation();
+    if (shouldReloadConversationForResolvedRun(event, selectedConversationRef.current, selectedRecoveryRunId)) loadConversation();
     if (event.type === "message.created" && event.conversationId === selectedConversationRef.current) {
       setStreamingText((current) => streamingTextAfterDurableMessage(current, event.payload));
       setConversation((current) => {
@@ -199,7 +200,7 @@ export function App() {
         if (document.hidden && settings.notifications && Notification.permission === "granted") new Notification(`Outright run ${runEvent.type.split(".")[1]}`, { body: conversation?.title ?? "Agent run" });
       }
     }
-  }, [loadConversation, loadConversations, settings.notifications, conversation?.title]);
+  }, [loadConversation, loadConversations, settings.notifications, conversation?.title, selectedRecoveryRunId]);
   runtimeHandlerRef.current = handleRuntimeEvent;
 
   useEffect(() => {
@@ -480,8 +481,16 @@ function RecoveryNotice({ run, conversation, recoveryConversation, onOpenRecover
   const ownsRecovery = recoveryBelongsToConversation(run, conversation);
   const owner = ownsRecovery ? conversation : recoveryConversation;
   const sessionId = run.providerSessionId || (owner?.provider === run.provider ? owner?.providerSessionId : null);
-  const manualLegacyCleanup = isUnverifiableLegacyRecovery(run);
-  return <div className="recovery-notice" role="alert"><WarningCircle weight="fill" /><div className="recovery-copy"><strong>{ownsRecovery ? "Run interrupted by a runtime restart" : `Recovery required in ${owner?.title ?? "another chat"}`}</strong><p>{ownsRecovery ? `Reconciliation found ${classCopy}. Review the preserved partial output above, then choose how to continue before anything is retried.` : "Another chat in this worktree owns an interrupted run. Open it to inspect the preserved output and choose an explicit continuation policy."}</p></div><div className="recovery-actions">{ownsRecovery ? manualLegacyCleanup ? <Button size="sm" variant="destructive" onClick={() => onResolve(run, "discard-unverifiable")}>Discard legacy record</Button> : <><Button size="sm" disabled={!sessionId} onClick={() => onResolve(run, "resume-session")}><ArrowsClockwise />Resume session</Button><Button size="sm" variant="outline" onClick={() => onResolve(run, "retry")}>Retry from scratch</Button><Button size="sm" variant="ghost" onClick={() => onResolve(run, "discard")}>Discard</Button></> : <Button size="sm" onClick={onOpenRecovery}><ChatCircle />Open recovery chat</Button>}</div></div>;
+  const action = recoveryNoticeAction(run, conversation);
+  const title = action === "discard-unverifiable"
+    ? "Unverifiable legacy recovery requires cleanup"
+    : ownsRecovery ? "Run interrupted by a runtime restart" : `Recovery required in ${owner?.title ?? "another chat"}`;
+  const copy = action === "discard-unverifiable"
+    ? "Outright cannot verify this legacy provider or its original worktree. After checking outside Outright that it is no longer running, discard only this recovery record to release its gate."
+    : ownsRecovery
+      ? `Reconciliation found ${classCopy}. Review the preserved partial output above, then choose how to continue before anything is retried.`
+      : "Another chat in this worktree owns an interrupted run. Open it to inspect the preserved output and choose an explicit continuation policy.";
+  return <div className="recovery-notice" role="alert"><WarningCircle weight="fill" /><div className="recovery-copy"><strong>{title}</strong><p>{copy}</p></div><div className="recovery-actions">{action === "discard-unverifiable" ? <Button size="sm" variant="destructive" onClick={() => onResolve(run, "discard-unverifiable")}>Discard legacy record</Button> : action === "owner" ? <><Button size="sm" disabled={!sessionId} onClick={() => onResolve(run, "resume-session")}><ArrowsClockwise />Resume session</Button><Button size="sm" variant="outline" onClick={() => onResolve(run, "retry")}>Retry from scratch</Button><Button size="sm" variant="ghost" onClick={() => onResolve(run, "discard")}>Discard</Button></> : <Button size="sm" onClick={onOpenRecovery}><ChatCircle />Open recovery chat</Button>}</div></div>;
 }
 function ToolActivity({ events }) { if (!events.length) return null; return <div className="tool-activity">{events.slice(-4).map((event) => <div key={event.id}><CheckCircle /><span>{toolLabel(event)}</span></div>)}</div>; }
 function EmptyChat({ worktree, onCreate }) { return <div className="empty-chat"><ChatCircle size={29} /><h2>Start in {worktree.name}</h2><p>Create a durable conversation, then run Codex or Claude directly in this worktree.</p><Button onClick={onCreate}><Plus />New chat</Button></div>; }

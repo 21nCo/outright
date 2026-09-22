@@ -79,11 +79,17 @@ function seedLegacyUnknownTargetDatabase(filename) {
   legacy.close();
 }
 
-function seedLegacyRunningUnknownTargetDatabase(filename) {
+function seedLegacyRunningUnknownTargetDatabase(filename, { secondRun = false } = {}) {
   seedLegacyUnknownTargetDatabase(filename);
   const legacy = new Database(filename);
   legacy.prepare("UPDATE runs SET status = 'running', started_at = ?, recovery_class = NULL WHERE id = 'legacy-interrupted'")
     .run("2026-09-21T00:01:00.000Z");
+  if (secondRun) {
+    legacy.exec(`
+      INSERT INTO conversations VALUES ('other-legacy-conversation', 'removed-project', 'removed-tree', '/tmp/removed-target', 'Other legacy recovery', 'codex', '', NULL, 0, 0, 0, '2026-09-21T00:02:00.000Z', '2026-09-21T00:02:00.000Z');
+      INSERT INTO runs VALUES ('other-legacy-interrupted', 'other-legacy-conversation', 'codex', '', 'medium', 'read-only', 'other half done', 'running', NULL, NULL, '2026-09-21T00:02:00.000Z', '2026-09-21T00:03:00.000Z', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    `);
+  }
   legacy.close();
 }
 
@@ -178,7 +184,7 @@ test("legacy running rows without process ownership require explicit bounded cle
   const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
   let runtime;
   try {
-    seedLegacyRunningUnknownTargetDatabase(path.join(dataDirectory, "outright.db"));
+    seedLegacyRunningUnknownTargetDatabase(path.join(dataDirectory, "outright.db"), { secondRun: true });
     process.env.OUTRIGHT_DATA_DIR = dataDirectory;
     runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
     const legacy = runtime.database.getRun("legacy-interrupted");
@@ -203,6 +209,8 @@ test("legacy running rows without process ownership require explicit bounded cle
     assert.equal(cleanup.body.status, "failed");
     assert.equal(cleanup.body.recoveryDecision, "discard-unverifiable");
     assert.equal(runtime.database.listRuns("legacy-conversation").length, 1, "manual cleanup never schedules replacement work");
+    assert.equal(runtime.database.getRun("other-legacy-interrupted").recoveryDecision, null, "cleanup resolves only the confirmed legacy row");
+    assert.equal(runtime.database.findUnresolvedInterruptedRunForWorktree("/tmp/any-visible-worktree").id, "other-legacy-interrupted", "another unknown legacy row keeps the global gate closed");
   } finally {
     await runtime?.shutdown();
     if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
@@ -736,7 +744,7 @@ test("the default recovery probe is conservative per platform", async () => {
       assert.equal(defaultRecoveryProcessAlive(live.pid), "alive");
       assert.equal(defaultRecoveryProcessAlive(live.pid, "win32"), "alive");
       if (process.platform === "linux") {
-        assert.equal(defaultRecoveryProcessIdentity(live.pid)?.startsWith(`${process.platform}:`), true, "the current process start identity is readable on supported POSIX platforms");
+        assert.equal(defaultRecoveryProcessIdentity(live.pid)?.startsWith("linux:"), true, "the current process start identity is readable on Linux");
       }
     } finally {
       try { process.kill(-live.pid, "SIGKILL"); } catch { /* Already gone. */ }
@@ -751,6 +759,8 @@ test("recovery identities are boot-scoped and Windows taskkill supplies a whole-
   const linuxIdentity = defaultRecoveryProcessIdentity(123, "linux", (filename) => filename.endsWith("boot_id") ? "boot-uuid\n" : linuxStat);
   assert.equal(linuxIdentity, "linux:boot-uuid:424242");
 
+  // Darwin ownership is covered with injected sysctl and ps results because a
+  // live generic wrapper token is required; tokenless live processes fail closed.
   const ownershipToken = "00000000-0000-4000-8000-000000000001";
   const darwinRun = (executable) => executable === "/usr/sbin/sysctl"
     ? { status: 0, stdout: "{ sec = 123, usec = 456 }\n" }
