@@ -1028,8 +1028,9 @@ test("the launch wrapper records durable identity before authorization and clean
       } catch { /* Atomic replacement may briefly move the file. */ }
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    if (["linux", "win32"].includes(process.platform)) {
-      assert.equal(authorizedRecord?.providerProcessIdentity?.startsWith(`${process.platform}:`), true, "the authorized record binds the provider pid to its own boot-scoped start identity");
+    if (["linux", "darwin", "win32"].includes(process.platform)) {
+      const identityPrefix = process.platform === "darwin" ? "darwin-process:" : `${process.platform}:`;
+      assert.equal(authorizedRecord?.providerProcessIdentity?.startsWith(identityPrefix), true, "the authorized record binds the provider pid to its own boot-scoped start identity");
     } else {
       assert.equal(authorizedRecord?.providerProcessIdentity, undefined);
     }

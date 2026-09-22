@@ -15,5 +15,11 @@ const result = spawnSync(process.execPath, ["--test", "--test-timeout=300000", .
   timeout: 600_000,
   killSignal: "SIGKILL",
 });
-if (result.error) throw result.error;
-process.exitCode = result.status ?? 1;
+if (result.error?.code === "ETIMEDOUT" || result.error?.killed || result.signal === "SIGKILL") {
+  console.error("Test suite timed out after 600 seconds");
+  process.exitCode = 1;
+} else if (result.error) {
+  throw result.error;
+} else {
+  process.exitCode = result.status ?? 1;
+}

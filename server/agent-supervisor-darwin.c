@@ -24,6 +24,26 @@ typedef int (*coalition_pid_list_fn)(uint64_t coalition_id, void *buffer, size_t
 static volatile sig_atomic_t stop_requested = 0;
 static void request_stop(int signal_number) { (void)signal_number; stop_requested = 1; }
 
+static bool launch_authorized(void) {
+  const char *raw_fd = getenv("OUTRIGHT_LAUNCH_GATE_FD");
+  if (raw_fd == NULL) return true;
+  char *end = NULL;
+  long descriptor = strtol(raw_fd, &end, 10);
+  unsetenv("OUTRIGHT_LAUNCH_GATE_FD");
+  if (end == raw_fd || *end != '\0' || descriptor < 3 || descriptor > 1024) return false;
+  char authorization[3];
+  size_t used = 0;
+  while (used < sizeof(authorization)) {
+    ssize_t count = read((int)descriptor, authorization + used, sizeof(authorization) - used);
+    if (count > 0) { used += (size_t)count; continue; }
+    if (count < 0 && errno == EINTR) continue;
+    close((int)descriptor);
+    return false;
+  }
+  close((int)descriptor);
+  return memcmp(authorization, "go\n", sizeof(authorization)) == 0;
+}
+
 static int wait_for(pid_t pid) {
   int status = 0;
   while (waitpid(pid, &status, 0) < 0) {
@@ -285,6 +305,7 @@ int main(int argc, char **argv) {
     dprintf(STDERR_FILENO, "Usage: %s LABEL EXECUTABLE [ARG...]\n", argv[0]);
     return 64;
   }
+  if (!launch_authorized()) return 75;
 
   struct sigaction action;
   memset(&action, 0, sizeof(action));

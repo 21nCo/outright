@@ -45,7 +45,7 @@ test("reviews, stages, commits, creates, and safely removes discovered worktrees
   }
 });
 
-test("parses filenames with spaces, quotes, and renames from NUL porcelain output", async () => {
+test("parses portable filenames and supported quote characters from NUL porcelain output", async () => {
   const scanRoot = await mkdtemp(path.join(os.tmpdir(), "outright-git-spaces-"));
   const rawRepository = path.join(scanRoot, "project");
   try {
@@ -73,9 +73,12 @@ test("parses filenames with spaces, quotes, and renames from NUL porcelain outpu
     assert.equal(renamed.path, "renamed file.txt");
     assert.equal(renamed.originalPath, "hello world.txt");
 
-    await writeFile(path.join(repository, `quoted "name".txt`), "q\n");
-    status = await service.status(repository);
-    assert.ok(status.files.some((file) => file.path === `quoted "name".txt`));
+    // Windows filesystems reject double quotes before Git can observe them.
+    if (process.platform !== "win32") {
+      await writeFile(path.join(repository, `quoted "name".txt`), "q\n");
+      status = await service.status(repository);
+      assert.ok(status.files.some((file) => file.path === `quoted "name".txt`));
+    }
   } finally {
     await rm(scanRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }

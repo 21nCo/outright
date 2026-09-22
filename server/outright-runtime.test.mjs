@@ -844,11 +844,18 @@ test("recovery identities are boot-scoped and Windows taskkill supplies a whole-
     assert.deepEqual(bootouts, [[AGENT_SUPERVISOR, ["--terminate", platformOwnershipId]]]);
 
     const wrapperIdentity = `darwin:{ sec = 123, usec = 456 }:${ownershipToken}`;
-    const missingJobHandshake = { ...launchdHandshake, processIdentity: wrapperIdentity };
-    const missingJobRun = (executable) => {
+    const supervisorIdentity = "darwin-process:{ sec = 123, usec = 456 }:Mon Sep 22 01:02:03 2026";
+    const missingJobHandshake = {
+      ...launchdHandshake,
+      processIdentity: wrapperIdentity,
+      providerPid: 456,
+      providerProcessIdentity: supervisorIdentity,
+    };
+    const missingJobRun = (executable, args = []) => {
       if (executable === AGENT_SUPERVISOR) return { status: 3, stdout: "absent\n" };
       if (executable === "/usr/sbin/sysctl") return { status: 0, stdout: "{ sec = 123, usec = 456 }\n" };
       if (executable === "/bin/launchctl") return { status: 3, stdout: "" };
+      if (args.includes("lstart=")) return { status: 0, stdout: "Mon Sep 22 01:02:03 2026\n" };
       return { status: 0, stdout: `outright-agent-${ownershipToken}\n` };
     };
     assert.equal(
@@ -865,6 +872,17 @@ test("recovery identities are boot-scoped and Windows taskkill supplies a whole-
       defaultRecoveryProcessAlive(123, "darwin", () => null, () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); }, missingJobHandshake, deadWrapperRun),
       "exited",
       "an absent job and absent wrapper together prove the unique launch owner exited",
+    );
+    const liveSupervisorRun = (executable, args = []) => {
+      if (executable === AGENT_SUPERVISOR) return { status: 3, stdout: "absent\n" };
+      if (executable === "/usr/sbin/sysctl") return { status: 0, stdout: "{ sec = 123, usec = 456 }\n" };
+      if (args.includes("lstart=")) return { status: 0, stdout: "Mon Sep 22 01:02:03 2026\n" };
+      return { status: 3, stdout: "" };
+    };
+    assert.equal(
+      defaultRecoveryProcessAlive(123, "darwin", () => null, () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); }, missingJobHandshake, liveSupervisorRun),
+      "unknown",
+      "an identity-matched gated supervisor can still submit after its wrapper exits",
     );
     assert.equal(
       defaultRecoveryProcessAlive(123, "darwin", () => null, () => {}, missingJobHandshake, (executable) => executable === AGENT_SUPERVISOR

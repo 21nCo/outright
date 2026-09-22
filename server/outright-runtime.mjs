@@ -594,8 +594,18 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
           pid, platform, readFileSync, run, handshake.ownershipToken, handshake.platformOwnershipId,
         );
         if (wrapperIdentity === handshake.processIdentity) return "unknown";
-        try { kill(pid, 0); return "unknown"; }
-        catch (error) { return error.code === "ESRCH" ? "exited" : "unknown"; }
+        // The gated native supervisor is durably identified before it can
+        // submit the launchd job. While that exact process is alive it may
+        // still submit, so fail closed. Once its boot-scoped identity no
+        // longer matches, an absent unique job proves that no launch owner
+        // remains, even if the wrapper pid has since been reused.
+        const supervisorPid = Number(handshake.providerPid);
+        const supervisorIdentity = typeof handshake.providerProcessIdentity === "string"
+          ? handshake.providerProcessIdentity
+          : null;
+        if (!Number.isSafeInteger(supervisorPid) || supervisorPid <= 0 || !supervisorIdentity) return "unknown";
+        const liveSupervisorIdentity = defaultRecoveryProviderProcessIdentity(supervisorPid, platform, run);
+        return liveSupervisorIdentity === supervisorIdentity ? "unknown" : "exited";
       }
       darwinOwnershipUnknown = true;
       // The handshake is written before the platform supervisor submits its
@@ -617,6 +627,17 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
   } catch (error) {
     return error.code === "ESRCH" && !darwinOwnershipUnknown ? "exited" : "unknown";
   }
+}
+
+export function defaultRecoveryProviderProcessIdentity(pid, platform = process.platform, run = spawnSync) {
+  if (platform !== "darwin") return null;
+  try {
+    const boot = run("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8" });
+    const started = run("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
+    return boot.status === 0 && started.status === 0 && started.stdout.trim()
+      ? `darwin-process:${boot.stdout.trim()}:${started.stdout.trim()}`
+      : null;
+  } catch { return null; }
 }
 
 export function defaultRecoveryProcessIdentity(pid, platform = process.platform, readFile = readFileSync, run = spawnSync, ownershipToken = null, platformOwnershipId = null) {

@@ -59,8 +59,11 @@ const processIdentityFor = (pid, expectedOwnershipToken = null) => {
       return bootId && startTicks ? \`linux:\${bootId}:\${startTicks}\` : null;
     }
     if (process.platform === "darwin") {
-      if (!expectedOwnershipToken) return null;
       const boot = execFileSync("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8" }).trim();
+      if (!expectedOwnershipToken) {
+        const started = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" }).trim();
+        return boot && started ? \`darwin-process:\${boot}:\${started}\` : null;
+      }
       const command = execFileSync("/bin/ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" }).trim();
       return boot && command === \`outright-agent-\${expectedOwnershipToken}\`
         ? \`darwin:\${boot}:\${expectedOwnershipToken}\`
@@ -157,24 +160,42 @@ process.stdin.on("data", (chunk) => {
     const command = rawCommand.trim();
     if (!authorized && command === "go") {
       authorized = true;
-      // Authorization is durable before the provider can execute. If this
-      // ownership rewrite fails, fail the launch without ever spawning the
-      // provider; acknowledging an identity-less launch would make restart
-      // recovery unable to signal or safely release it.
-      try { writeHandshake(handshake(true)); }
-      catch (error) {
-        console.error(String((error && error.message) || error));
-        try { fs.unlinkSync(handshakePath); } catch {}
-        process.exit(127);
-      }
       const { spawn } = require("node:child_process");
-      provider = spawn(executable, commandArgs, { stdio: ["ignore", "inherit", "inherit"] });
+      const darwinLaunch = process.platform === "darwin";
+      if (!darwinLaunch) {
+        // On platforms whose child is the provider itself, authorization must
+        // be durable before spawn because execution begins immediately.
+        try { writeHandshake(handshake(true)); }
+        catch (error) {
+          console.error(String((error && error.message) || error));
+          try { fs.unlinkSync(handshakePath); } catch {}
+          process.exit(127);
+        }
+      }
+      // The macOS supervisor receives a private launch gate. It cannot submit
+      // the launchd job until its pid and boot-scoped identity are durable, so
+      // restart recovery never mistakes the pre-submit race for an exited run.
+      provider = spawn(executable, commandArgs, darwinLaunch
+        ? { stdio: ["ignore", "inherit", "inherit", "pipe"], env: { ...process.env, OUTRIGHT_LAUNCH_GATE_FD: "3" } }
+        : { stdio: ["ignore", "inherit", "inherit"] });
       // Durable provider identity: escalation targets the provider alone so this
       // wrapper — the provider's parent — survives to reap it. Without this, a
       // group-wide SIGKILL kills the wrapper first and a killed-but-unreaped
       // provider lingers as a zombie in its process group on hosts whose PID 1
       // does not reap orphans.
-      try { writeHandshake(handshake(true, provider.pid)); } catch { /* The durable wrapper identity still owns recovery; provider-only escalation becomes unavailable. */ }
+      try { writeHandshake(handshake(true, provider.pid)); }
+      catch (error) {
+        if (darwinLaunch) {
+          try { provider.stdio[3].destroy(); } catch {}
+          try { provider.kill("SIGKILL"); } catch {}
+          console.error(String((error && error.message) || error));
+          try { fs.unlinkSync(handshakePath); } catch {}
+          process.exit(127);
+        }
+        // Other platforms retain the durable wrapper identity even if the
+        // optional provider-only escalation identity could not be persisted.
+      }
+      if (darwinLaunch) provider.stdio[3].end("go\\n");
       provider.on("error", (error) => { console.error(String((error && error.message) || error)); finish(127); });
       provider.on("close", (code, signal) => {
         providerGone = true;

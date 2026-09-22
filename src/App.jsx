@@ -136,15 +136,18 @@ export function App() {
   useEffect(() => { if (selectedConversationId) localStorage.setItem("outright.selected-conversation", selectedConversationId); }, [selectedConversationId]);
   const loadConversation = useCallback(async () => {
     if (!selectedConversationId || !conversations.some((item) => item.id === selectedConversationId)) {
+      pendingConversationLoadRef.current?.controller?.abort();
       pendingConversationLoadRef.current = null;
       setConversation(null);
       return;
     }
     const requestedId = selectedConversationId;
-    const pendingLoad = { conversationId: requestedId, events: [], eventBytes: 0, overflowed: false };
+    pendingConversationLoadRef.current?.controller?.abort();
+    const controller = new AbortController();
+    const pendingLoad = { conversationId: requestedId, events: [], eventBytes: 0, overflowed: false, controller };
     pendingConversationLoadRef.current = pendingLoad;
     try {
-      const nextConversation = await api(`/api/conversations/${requestedId}`);
+      const nextConversation = await api(`/api/conversations/${requestedId}`, { signal: controller.signal });
       // Stale responses from an earlier selection are discarded before they
       // can associate the composer or execution state with the wrong worktree.
       if (selectedConversationRef.current !== requestedId) return;
@@ -173,7 +176,7 @@ export function App() {
     }
     catch (nextError) {
       if (pendingConversationLoadRef.current === pendingLoad) pendingConversationLoadRef.current = null;
-      setError(nextError.message);
+      if (nextError.name !== "AbortError") setError(nextError.message);
     }
   }, [selectedConversationId, conversations]);
   useEffect(() => { loadConversation(); }, [loadConversation]);
@@ -187,7 +190,8 @@ export function App() {
       // Discard the stale response and immediately request a newer bounded
       // snapshot. Clearing first ensures subsequent events cannot grow the
       // overflowing buffer while the microtask schedules its replacement.
-      pendingConversationLoadRef.current = null;
+      pendingLoad.controller.abort();
+      if (pendingConversationLoadRef.current === pendingLoad) pendingConversationLoadRef.current = null;
       queueMicrotask(loadConversation);
     }
     if (event.type === "projects.changed") {
