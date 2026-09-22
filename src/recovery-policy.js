@@ -117,7 +117,7 @@ export function recoveryNoticeAction(run, conversation) {
 }
 
 export function shouldReloadConversationForResolvedRun(event, selectedConversationId, interruptedRunId) {
-  if (event?.type !== "run.resolved") return false;
+  if (!["run.resolved", "run.recovery-updated"].includes(event?.type)) return false;
   return event.conversationId === selectedConversationId
     || Boolean(event.runId && event.runId === interruptedRunId);
 }

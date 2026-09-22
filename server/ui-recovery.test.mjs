@@ -117,4 +117,7 @@ test("resolved worktree recovery refreshes both its owner and gated sibling chat
   assert.equal(shouldReloadConversationForResolvedRun(event, "visible-sibling", "run-1"), true);
   assert.equal(shouldReloadConversationForResolvedRun(event, "visible-sibling", "another-run"), false);
   assert.equal(shouldReloadConversationForResolvedRun({ ...event, type: "run.event" }, "owner", "run-1"), false);
+  const classified = { ...event, type: "run.recovery-updated" };
+  assert.equal(shouldReloadConversationForResolvedRun(classified, "owner", null), true);
+  assert.equal(shouldReloadConversationForResolvedRun(classified, "visible-sibling", "run-1"), true);
 });

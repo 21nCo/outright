@@ -842,6 +842,37 @@ test("recovery identities are boot-scoped and Windows taskkill supplies a whole-
       return { status: 0 };
     }), true, "the coalition helper proves that every member was terminated");
     assert.deepEqual(bootouts, [[AGENT_SUPERVISOR, ["--terminate", platformOwnershipId]]]);
+
+    const wrapperIdentity = `darwin:{ sec = 123, usec = 456 }:${ownershipToken}`;
+    const missingJobHandshake = { ...launchdHandshake, processIdentity: wrapperIdentity };
+    const missingJobRun = (executable) => {
+      if (executable === AGENT_SUPERVISOR) return { status: 3, stdout: "absent\n" };
+      if (executable === "/usr/sbin/sysctl") return { status: 0, stdout: "{ sec = 123, usec = 456 }\n" };
+      if (executable === "/bin/launchctl") return { status: 3, stdout: "" };
+      return { status: 0, stdout: `outright-agent-${ownershipToken}\n` };
+    };
+    assert.equal(
+      defaultRecoveryProcessAlive(123, "darwin", () => null, () => {}, missingJobHandshake, missingJobRun),
+      "unknown",
+      "an authorized live wrapper with no launchd job is an unresolved launch, never an exited tree",
+    );
+    const deadWrapperRun = (executable) => executable === AGENT_SUPERVISOR
+      ? { status: 3, stdout: "absent\n" }
+      : executable === "/usr/sbin/sysctl"
+        ? { status: 0, stdout: "{ sec = 123, usec = 456 }\n" }
+        : { status: 3, stdout: "" };
+    assert.equal(
+      defaultRecoveryProcessAlive(123, "darwin", () => null, () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); }, missingJobHandshake, deadWrapperRun),
+      "exited",
+      "an absent job and absent wrapper together prove the unique launch owner exited",
+    );
+    assert.equal(
+      defaultRecoveryProcessAlive(123, "darwin", () => null, () => {}, missingJobHandshake, (executable) => executable === AGENT_SUPERVISOR
+        ? { status: 3, stdout: "exited\n" }
+        : { status: 1, stdout: "" }),
+      "exited",
+      "an existing job with an empty coalition is a direct kernel exit proof",
+    );
   }
 
   const powershellCalls = [];

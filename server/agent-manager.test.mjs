@@ -1018,7 +1018,7 @@ test("the launch wrapper records durable identity before authorization and clean
       const outputPipes = ["stdout", "stderr"].map((stream) => `/tmp/outright-agent-com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}-${stream}.fifo`);
       const pipeDeadline = Date.now() + 5_000;
       while (!outputPipes.every(existsSync) && Date.now() < pipeDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
-      assert.equal(outputPipes.every((filename) => lstatSync(filename).isFIFO()), true, "provider output uses kernel-bounded pipes rather than disk spools");
+      assert.equal(outputPipes.every((filename) => existsSync(filename) && lstatSync(filename).isFIFO()), true, "provider output uses kernel-bounded pipes rather than disk spools");
     }
     let authorizedRecord;
     while (Date.now() < deadline2) {
@@ -1132,6 +1132,11 @@ test("the launch wrapper records durable identity before authorization and clean
     child3.stdin.write("go\nstop\n");
     await withDeadline(new Promise((resolve) => child3.once("exit", resolve)), "coalesced authorization and stop", () => { try { child3.kill("SIGKILL"); } catch {} });
     assert.equal(existsSync(handshakePath3), false, "the coalesced stop command tears down the authorized provider");
+    if (process.platform === "darwin") {
+      const absent = spawnSync(platformSupervisor, ["--probe", `com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}`], { encoding: "utf8" });
+      assert.equal(absent.status, 3);
+      assert.equal(absent.stdout.trim(), "absent", "a missing launchd job is distinct from an existing empty coalition");
+    }
   } finally {
     if (detachedDescendantPid) { try { process.kill(detachedDescendantPid, "SIGKILL"); } catch { /* Already gone. */ } }
     for (const child of children) { try { child.kill("SIGKILL"); } catch { /* Already gone. */ } }

@@ -184,9 +184,11 @@ export function App() {
     const pendingLoad = pendingConversationLoadRef.current;
     if (["message.created", "run.event"].includes(event.type)
       && bufferConversationRuntimeEvent(pendingLoad, event, MAX_PENDING_RUNTIME_EVENT_BYTES) === "overflow") {
-      // Keep the already-live React state and discard the stale HTTP response.
-      // Terminal events schedule a fresh bounded snapshot after the run ends.
+      // Discard the stale response and immediately request a newer bounded
+      // snapshot. Clearing first ensures subsequent events cannot grow the
+      // overflowing buffer while the microtask schedules its replacement.
       pendingConversationLoadRef.current = null;
+      queueMicrotask(loadConversation);
     }
     if (event.type === "projects.changed") {
       const payload = event.payload.projects ? event.payload : { projects: event.payload };

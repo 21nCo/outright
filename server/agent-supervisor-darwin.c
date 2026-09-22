@@ -224,7 +224,7 @@ static int control_existing_job(const char *mode, const char *label) {
   if (state_result == SERVICE_MISSING) {
     cleanup_output_pipes(label);
     free(target);
-    dprintf(STDOUT_FILENO, "exited\n");
+    dprintf(STDOUT_FILENO, "%s\n", strcmp(mode, "--probe") == 0 ? "absent" : "exited");
     return strcmp(mode, "--probe") == 0 ? 3 : 0;
   }
   if (state_result != SERVICE_OK || state.resource_coalition_id == 0) {

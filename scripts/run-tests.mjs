@@ -10,6 +10,10 @@ const tests = directories.flatMap((directory) => readdirSync(path.join(root, dir
   .sort()
   .map((name) => path.join(root, directory, name)));
 
-const result = spawnSync(process.execPath, ["--test", ...tests], { stdio: "inherit" });
+const result = spawnSync(process.execPath, ["--test", "--test-timeout=300000", ...tests], {
+  stdio: "inherit",
+  timeout: 600_000,
+  killSignal: "SIGKILL",
+});
 if (result.error) throw result.error;
 process.exitCode = result.status ?? 1;

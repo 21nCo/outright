@@ -344,6 +344,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           // from the leader pid alone. Keep the pid: validation failures must
           // leave the run retryable without discarding its process identity.
           const verified = database.updateRun(pending.id, { recoveryClass: "exited" });
+          publish({ type: "run.recovery-updated", conversationId: verified.conversationId, runId: verified.id, payload: verified });
           if (pending.id === interrupted.id) interrupted = verified;
         }
 
@@ -582,6 +583,20 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
       const result = run(AGENT_SUPERVISOR, ["--probe", handshake.platformOwnershipId], { encoding: "utf8" });
       const verdict = result.stdout?.trim();
       if (["alive", "exited"].includes(verdict)) return verdict;
+      if (verdict === "absent") {
+        // A unique launchd label can be absent briefly after the authorized
+        // wrapper has spawned its supervisor but before launchctl submit has
+        // completed. The matching wrapper proves that launch is still in
+        // progress, but there is not yet a kernel boundary that recovery can
+        // terminate, so keep the run unresolved until the job appears or the
+        // wrapper exits. A live mismatched/reused pid also fails closed.
+        const wrapperIdentity = defaultRecoveryProcessIdentity(
+          pid, platform, readFileSync, run, handshake.ownershipToken, handshake.platformOwnershipId,
+        );
+        if (wrapperIdentity === handshake.processIdentity) return "unknown";
+        try { kill(pid, 0); return "unknown"; }
+        catch (error) { return error.code === "ESRCH" ? "exited" : "unknown"; }
+      }
       darwinOwnershipUnknown = true;
       // The handshake is written before the platform supervisor submits its
       // launchd job. During that short interval, a live wrapper is still a

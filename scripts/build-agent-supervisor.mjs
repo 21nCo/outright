@@ -25,9 +25,15 @@ if (["linux", "darwin", "win32"].includes(process.platform)) {
   if (process.platform !== "win32" || !existsSync(output)) {
     let compiler = process.env.CC || (useXcode ? xcodeCompiler : "cc");
     let compilerArgs = [...(useXcode ? ["-isysroot", xcodeSdk] : []), "-O2", "-std=c11", "-Wall", "-Wextra", source, "-o", temporary];
+    let compilerScript = null;
     if (process.platform === "win32") {
-      const vswhere = String.raw`C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe`;
-      const commandInterpreter = String.raw`C:\Windows\System32\cmd.exe`;
+      const programFiles = process.env["ProgramFiles(x86)"] || String.raw`C:\Program Files (x86)`;
+      const systemRoot = process.env.SystemRoot || String.raw`C:\Windows`;
+      const vswhere = path.join(programFiles, "Microsoft Visual Studio", "Installer", "vswhere.exe");
+      const commandInterpreter = path.join(systemRoot, "System32", "cmd.exe");
+      if (!path.win32.isAbsolute(vswhere) || !path.win32.isAbsolute(commandInterpreter)) {
+        throw new Error("Windows build-tool roots must be absolute paths");
+      }
       const installation = existsSync(vswhere)
         ? spawnSync(vswhere, ["-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"], { encoding: "utf8" }).stdout?.trim()
         : "";
@@ -36,9 +42,22 @@ if (["linux", "darwin", "win32"].includes(process.platform)) {
         throw new Error("Unable to find the Visual C++ build tools; install the Desktop development with C++ workload");
       }
       compiler = commandInterpreter;
-      compilerArgs = ["/d", "/s", "/c", `call "${environment}" >nul && "%VCToolsInstallDir%bin\\Hostx64\\x64\\cl.exe" /nologo /O2 /W4 "${source}" /Fe:"${temporary}"`];
+      // Keep vcvars invocation out of cmd.exe's /S nested-quote parser. A
+      // temporary batch file lets cmd parse each quoted path exactly once and
+      // preserves the environment that vcvars establishes for cl.exe.
+      compilerScript = `${temporary}.cmd`;
+      writeFileSync(compilerScript, [
+        "@echo off",
+        `call "${environment}" >nul`,
+        "if errorlevel 1 exit /b %errorlevel%",
+        `"%VCToolsInstallDir%bin\\Hostx64\\x64\\cl.exe" /nologo /O2 /W4 "${source}" /Fe:"${temporary}"`,
+        "exit /b %errorlevel%",
+        "",
+      ].join("\r\n"));
+      compilerArgs = ["/d", "/c", compilerScript];
     }
     const result = spawnSync(compiler, compilerArgs, { encoding: "utf8" });
+    if (compilerScript) rmSync(compilerScript, { force: true });
     if (result.status !== 0) {
       rmSync(temporary, { force: true });
       const details = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
