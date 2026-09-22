@@ -1,0 +1,38 @@
+server/outright-runtime.test.mjs
+  s_6126673cc0a89e::t_a7ed4206be52e0 847-854,858,876-885
+  s_6126673cc0a89e::t_a516c644b6bcb2 886
+scripts/run-tests.mjs
+  s_6126673cc0a89e::t_8f9cf551452cc9 18-20
+  s_6126673cc0a89e::t_0f9a958b874d6a 21-25
+server/agent-manager.test.mjs
+  s_6126673cc0a89e::t_6cf3d29dbeab0d 1031-1033
+server/git-service.test.mjs
+  s_6126673cc0a89e::t_6a76f0a0adb3fe 48,76-81
+server/agent-supervisor-darwin.c
+  s_6126673cc0a89e::t_8f9cf551452cc9 27-46,308
+server/agent-manager.mjs
+  s_6126673cc0a89e::t_6df8a7a4d2df4f 165-174
+  s_6126673cc0a89e::t_4b236b99314411 198
+  s_6126673cc0a89e::t_01961419917f6e 63-66,164,175-180,186-197
+server/outright-runtime.mjs
+  s_6126673cc0a89e::t_d03fb8f1b8a2cf 597-608,632-640
+  s_6126673cc0a89e::t_8b62c1c2f915eb 641-642
+src/App.jsx
+  s_6126673cc0a89e::t_8f9cf551452cc9 139,145-147,150,179,193-194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8f239771927659a507e8c4204dd9f65386f4849a",
+  "prompts": {},
+  "sessions": {
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
