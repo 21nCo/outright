@@ -338,13 +338,13 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           if (verdict !== "exited") {
             throw apiError(409, "An interrupted provider process cannot be verified, so no recovery decision can be recorded yet", { code: "RECOVERY_PROCESS_UNKNOWN", pid: pending.pid, runId: pending.id });
           }
-          if (pending.id === interrupted.id) {
-            // Record the verified-exited classification but keep the pid: a
-            // later validation failure (unavailable provider, missing
-            // resumable session) must leave the run retryable, not strip its
-            // only process identity and permanently reject it as unknown.
-            interrupted = database.updateRun(interrupted.id, { recoveryClass: "exited" });
-          }
+          // Persist every proof established by this pass, including sibling
+          // conversations. On Windows the Job Object handle disappears after
+          // termination, so a later request cannot reconstruct that proof
+          // from the leader pid alone. Keep the pid: validation failures must
+          // leave the run retryable without discarding its process identity.
+          const verified = database.updateRun(pending.id, { recoveryClass: "exited" });
+          if (pending.id === interrupted.id) interrupted = verified;
         }
 
         if (policy === "discard") {

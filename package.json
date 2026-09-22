@@ -13,7 +13,7 @@
     "build": "vite build && node scripts/prepare-sites-build.mjs",
     "start": "node server/standalone.mjs",
     "preview": "vite preview",
-    "test": "node --test server/*.test.mjs automation/hermes/*.test.mjs",
+    "test": "node scripts/run-tests.mjs",
     "test:sites": "node --test tests/sites-worker.test.mjs"
   },
   "dependencies": {

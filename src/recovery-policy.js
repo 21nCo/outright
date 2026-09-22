@@ -49,21 +49,45 @@ export function checkpointCursors(messages = [], initial = new Map()) {
   return cursors;
 }
 
+export function isStaleCheckpointMessage(cursors, message) {
+  const runId = message?.payload?.runId;
+  const seq = message?.payload?.checkpointEventSeq;
+  return typeof runId === "string" && Number.isSafeInteger(seq)
+    && cursors.has(runId) && seq <= cursors.get(runId);
+}
+
+export function upsertRuntimeMessage(messages, message) {
+  return [...messages.filter((entry) => entry.id !== message.id), message]
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+}
+
 // HTTP snapshots and websocket events travel over independent connections.
 // Events captured while a conversation request is in flight are replayed over
 // its durable snapshot before React sees either state, so a late response can
 // neither roll back a checkpoint cursor nor erase a newer live tail.
-export function replayConversationEvents(snapshotMessages = [], events = []) {
+export function bufferConversationRuntimeEvent(pendingLoad, event, maxBytes) {
+  if (!pendingLoad || pendingLoad.conversationId !== event?.conversationId) return "ignored";
+  const eventBytes = JSON.stringify(event).length * 2;
+  if (pendingLoad.eventBytes + eventBytes > maxBytes) {
+    pendingLoad.overflowed = true;
+    return "overflow";
+  }
+  pendingLoad.eventBytes += eventBytes;
+  pendingLoad.events.push(event);
+  return "buffered";
+}
+
+export function replayConversationEvents(snapshotMessages = [], events = [], maxMessages = Number.POSITIVE_INFINITY) {
   let messages = [...snapshotMessages];
   const cursors = checkpointCursors(messages);
   let streamingText = "";
   let runEvents = [];
   for (const event of events) {
     if (event?.type === "message.created") {
+      if (isStaleCheckpointMessage(cursors, event.payload)) continue;
       recordCheckpointCursor(cursors, event.payload);
       streamingText = streamingTextAfterRuntimeEvent(streamingText, event);
-      messages = [...messages.filter((message) => message.id !== event.payload.id), event.payload]
-        .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+      messages = upsertRuntimeMessage(messages, event.payload);
       continue;
     }
     if (event?.type !== "run.event") continue;
@@ -74,7 +98,9 @@ export function replayConversationEvents(snapshotMessages = [], events = []) {
     }
     if (event.payload?.type?.startsWith("tool.")) runEvents = [...runEvents, event.payload].slice(-20);
   }
-  return { messages, cursors, streamingText, runEvents };
+  const dropped = Math.max(0, messages.length - maxMessages);
+  if (dropped) messages = messages.slice(-maxMessages);
+  return { messages, cursors, streamingText, runEvents, dropped };
 }
 
 export function isUnverifiableLegacyRecovery(run) {

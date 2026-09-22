@@ -588,6 +588,38 @@ test("recovery verifies unresolved runs from sibling conversations on the worktr
   assert.equal(runtime.database.getRun(selected.id).recoveryDecision, null, "the selected decision stays pending while sibling ownership is uncertain");
 }));
 
+test("persists verified exit proofs for every sibling before resolving the selected run", (() => {
+  const live = new Set([424201, 424202]);
+  let probes = 0;
+  return withRuntime(async (runtime) => {
+    const first = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/shared-owned-tree", title: "First", provider: "codex" });
+    const sibling = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/shared-owned-tree", title: "Sibling", provider: "codex" });
+    const older = runtime.database.createRun({ conversationId: first.id, provider: "codex", approvalPolicy: "read-only", prompt: "older active run" });
+    const selected = runtime.database.createRun({ conversationId: sibling.id, provider: "codex", approvalPolicy: "read-only", prompt: "selected active run" });
+    for (const [run, pid] of [[older, 424201], [selected, 424202]]) {
+      runtime.database.updateRun(run.id, { status: "running", pid });
+      writeFileSync(path.join(runtime.database.launchDirectory, `${run.id}.json`), JSON.stringify({ pid, authorized: true, processIdentity: `test:${pid}` }));
+    }
+    runtime.database.reconcileInterruptedRuns({ probeAlive: () => true });
+
+    const selectedDiscard = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${selected.id}/resume`, { policy: "discard" }), selectedDiscard);
+    assert.equal(selectedDiscard.statusCode, 200);
+    assert.equal(runtime.database.getRun(older.id).recoveryClass, "exited", "the sibling's termination proof is durable before its own decision");
+    assert.equal(runtime.database.getRun(selected.id).recoveryClass, "exited");
+    const probesAfterFirstDecision = probes;
+
+    const olderDiscard = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${older.id}/resume`, { policy: "discard" }), olderDiscard);
+    assert.equal(olderDiscard.statusCode, 200);
+    assert.equal(probes, probesAfterFirstDecision, "the later decision does not need a vanished platform ownership object");
+  }, {
+    recoveryProcessAlive: (pid) => { probes += 1; return live.has(pid) ? "alive" : "unknown"; },
+    recoveryProcessIdentity: (pid) => `test:${pid}`,
+    terminateRecoveryProcess: async (pid) => { live.delete(pid); return true; },
+  });
+})());
+
 // Regression: recovery used to validate only the selected interrupted run, so a
 // conversation holding an older started run plus a newer queued run could
 // schedule the queued run's replacement work while the older run's process

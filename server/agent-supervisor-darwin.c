@@ -90,6 +90,31 @@ static bool valid_label(const char *label) {
   return true;
 }
 
+static bool output_pipe_path(char *path, size_t capacity, const char *label, const char *stream) {
+  int written = snprintf(path, capacity, "/tmp/outright-agent-%s-%s.fifo", label, stream);
+  return written > 0 && (size_t)written < capacity;
+}
+
+static void cleanup_output_pipe(const char *label, const char *stream) {
+  char path[256];
+  struct stat details;
+  if (!output_pipe_path(path, sizeof(path), label, stream)) return;
+  if (lstat(path, &details) == 0 && S_ISFIFO(details.st_mode) && details.st_uid == getuid()) unlink(path);
+}
+
+static void cleanup_output_pipes(const char *label) {
+  cleanup_output_pipe(label, "stdout");
+  cleanup_output_pipe(label, "stderr");
+}
+
+static int create_output_pipe(char *path, size_t capacity, const char *label, const char *stream) {
+  if (!output_pipe_path(path, capacity, label, stream) || mkfifo(path, 0600) != 0) return -1;
+  int fd = open(path, O_RDONLY | O_NONBLOCK);
+  if (fd < 0) { unlink(path); return -1; }
+  fcntl(fd, F_SETFD, FD_CLOEXEC);
+  return fd;
+}
+
 static char *service_target(const char *label) {
   size_t capacity = strlen(label) + 32;
   char *target = calloc(capacity, 1);
@@ -98,15 +123,18 @@ static char *service_target(const char *label) {
 }
 
 static void relay(int fd, int destination) {
-  for (;;) {
+  size_t relayed = 0;
+  const size_t relay_budget = 256 * 1024;
+  while (relayed < relay_budget) {
     char buffer[8192];
-    ssize_t count = read(fd, buffer, sizeof(buffer));
+    size_t remaining = relay_budget - relayed;
+    ssize_t count = read(fd, buffer, remaining < sizeof(buffer) ? remaining : sizeof(buffer));
     if (count > 0) {
       ssize_t written = 0;
       while (written < count) {
         ssize_t next = write(destination, buffer + written, (size_t)(count - written));
-        if (next > 0) { written += next; continue; }
-        if (next < 0 && errno == EINTR) continue;
+        if (next > 0) { written += next; relayed += (size_t)next; continue; }
+        if (next < 0 && errno == EINTR && !stop_requested) continue;
         return;
       }
       continue;
@@ -131,7 +159,7 @@ typedef struct {
 typedef enum { SERVICE_OK, SERVICE_MISSING, SERVICE_ERROR } service_result;
 
 static service_result read_state(const char *target, service_state *state) {
-  char output[65536];
+  char output[65536] = { 0 };
   char *arguments[] = { "launchctl", "print", (char *)target, NULL };
   int status = run_launchctl(arguments, output, sizeof(output));
   if (status != 0) {
@@ -194,6 +222,7 @@ static int control_existing_job(const char *mode, const char *label) {
   }
   service_result state_result = read_state(target, &state);
   if (state_result == SERVICE_MISSING) {
+    cleanup_output_pipes(label);
     free(target);
     dprintf(STDOUT_FILENO, "exited\n");
     return strcmp(mode, "--probe") == 0 ? 3 : 0;
@@ -208,11 +237,13 @@ static int control_existing_job(const char *mode, const char *label) {
   if (strcmp(mode, "--probe") == 0) {
     free(target);
     if (count < 0) { dprintf(STDOUT_FILENO, "unknown\n"); return 4; }
+    if (count == 0) cleanup_output_pipes(label);
     dprintf(STDOUT_FILENO, "%s\n", count > 0 ? "alive" : "exited");
     return count > 0 ? 0 : 3;
   }
   if (strcmp(mode, "--terminate") == 0) {
     bool terminated = count == 0 ? (bootout(target), true) : terminate_coalition(target, state.resource_coalition_id);
+    if (terminated) cleanup_output_pipes(label);
     free(target);
     return terminated ? 0 : 5;
   }
@@ -263,10 +294,15 @@ int main(int argc, char **argv) {
   sigaction(SIGINT, &action, NULL);
   signal(SIGPIPE, SIG_IGN);
 
-  char stdout_path[] = "/tmp/outright-agent-stdout-XXXXXX";
-  char stderr_path[] = "/tmp/outright-agent-stderr-XXXXXX";
-  int stdout_fd = mkstemp(stdout_path);
-  int stderr_fd = mkstemp(stderr_path);
+  // launchd writes provider output into kernel-bounded FIFOs. The supervisor
+  // relays them to its inherited pipes; if downstream stops reading, normal
+  // pipe backpressure reaches the provider instead of growing files in /tmp
+  // without limit. Paths are tied to the validated, unique ownership label so
+  // restart recovery can safely reclaim them after a hard crash.
+  char stdout_path[256];
+  char stderr_path[256];
+  int stdout_fd = create_output_pipe(stdout_path, sizeof(stdout_path), argv[1], "stdout");
+  int stderr_fd = create_output_pipe(stderr_path, sizeof(stderr_path), argv[1], "stderr");
   if (stdout_fd < 0 || stderr_fd < 0) {
     if (stdout_fd >= 0) { close(stdout_fd); unlink(stdout_path); }
     if (stderr_fd >= 0) { close(stderr_fd); unlink(stderr_path); }

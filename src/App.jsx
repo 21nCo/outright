@@ -24,10 +24,11 @@ import { ContextPane } from "@/components/ContextPane";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { TerminalPane } from "@/components/TerminalPane";
 import { api, connectRuntime, query } from "@/lib/runtime-api";
-import { checkpointCursors, draftAfterSubmission, isComposerSubmitKey, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent } from "@/recovery-policy";
+import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "@/recovery-policy";
 
 const MAX_RENDERED_MESSAGES = 1000;
 const MAX_STREAMING_CHARACTERS = 1024 * 1024;
+const MAX_PENDING_RUNTIME_EVENT_BYTES = 2 * 1024 * 1024;
 const LIVE_TRUNCATION_MARKER = "\n\n[Live output truncated]";
 
 export function App() {
@@ -134,9 +135,13 @@ export function App() {
   useEffect(() => { if (selectedWorktreeId) localStorage.setItem("outright.selected-worktree", selectedWorktreeId); }, [selectedWorktreeId]);
   useEffect(() => { if (selectedConversationId) localStorage.setItem("outright.selected-conversation", selectedConversationId); }, [selectedConversationId]);
   const loadConversation = useCallback(async () => {
-    if (!selectedConversationId || !conversations.some((item) => item.id === selectedConversationId)) { setConversation(null); return; }
+    if (!selectedConversationId || !conversations.some((item) => item.id === selectedConversationId)) {
+      pendingConversationLoadRef.current = null;
+      setConversation(null);
+      return;
+    }
     const requestedId = selectedConversationId;
-    const pendingLoad = { conversationId: requestedId, events: [] };
+    const pendingLoad = { conversationId: requestedId, events: [], eventBytes: 0, overflowed: false };
     pendingConversationLoadRef.current = pendingLoad;
     try {
       const nextConversation = await api(`/api/conversations/${requestedId}`);
@@ -146,10 +151,19 @@ export function App() {
       if (nextConversation.projectId !== selectedProjectRef.current || nextConversation.worktreeId !== selectedWorktreeRef.current) return;
       if (pendingConversationLoadRef.current !== pendingLoad) return;
       pendingConversationLoadRef.current = null;
-      const replayed = replayConversationEvents(nextConversation.messages, pendingLoad.events);
+      const replayed = replayConversationEvents(nextConversation.messages, pendingLoad.events, MAX_RENDERED_MESSAGES);
       stickToBottomRef.current = true;
       checkpointCursorsRef.current = replayed.cursors;
-      setConversation({ ...nextConversation, messages: replayed.messages });
+      setConversation({
+        ...nextConversation,
+        messages: replayed.messages,
+        messagePage: {
+          ...nextConversation.messagePage,
+          hasMore: Boolean(nextConversation.messagePage?.hasMore || replayed.dropped),
+          olderCount: (nextConversation.messagePage?.olderCount ?? 0) + replayed.dropped,
+          beforeId: replayed.messages[0]?.id ?? null,
+        },
+      });
       setStreamingText(boundStreamingText(replayed.streamingText));
       setRunEvents(replayed.runEvents);
       window.requestAnimationFrame(() => {
@@ -168,8 +182,11 @@ export function App() {
   const handleRuntimeEvent = useCallback((event) => {
     setRuntimeEvent(event);
     const pendingLoad = pendingConversationLoadRef.current;
-    if (pendingLoad?.conversationId === event.conversationId && ["message.created", "run.event"].includes(event.type)) {
-      pendingLoad.events.push(event);
+    if (["message.created", "run.event"].includes(event.type)
+      && bufferConversationRuntimeEvent(pendingLoad, event, MAX_PENDING_RUNTIME_EVENT_BYTES) === "overflow") {
+      // Keep the already-live React state and discard the stale HTTP response.
+      // Terminal events schedule a fresh bounded snapshot after the run ends.
+      pendingConversationLoadRef.current = null;
     }
     if (event.type === "projects.changed") {
       const payload = event.payload.projects ? event.payload : { projects: event.payload };
@@ -182,6 +199,7 @@ export function App() {
     if (event.type === "conversation.created" || event.type === "conversation.updated") loadConversations(event.conversationId);
     if (shouldReloadConversationForResolvedRun(event, selectedConversationRef.current, selectedRecoveryRunId)) loadConversation();
     if (event.type === "message.created" && event.conversationId === selectedConversationRef.current) {
+      if (isStaleCheckpointMessage(checkpointCursorsRef.current, event.payload)) return;
       recordCheckpointCursor(checkpointCursorsRef.current, event.payload);
       setStreamingText((current) => streamingTextAfterRuntimeEvent(current, event));
       setConversation((current) => {
@@ -192,7 +210,7 @@ export function App() {
           ...current,
           messagePage: { ...current.messagePage, total, newerCount: (current.messagePage.newerCount ?? 0) + (alreadyPresent ? 0 : 1) },
         };
-        const merged = upsert(current.messages, event.payload);
+        const merged = upsertRuntimeMessage(current.messages, event.payload);
         const dropped = Math.max(0, merged.length - MAX_RENDERED_MESSAGES);
         const messages = merged.slice(-MAX_RENDERED_MESSAGES);
         return {
@@ -527,7 +545,6 @@ function buildGroupedProjects(projects, state) { const result = state.groups.map
 function preferredWorktree(project) { return project.worktrees.find((item) => item.name === "dev" || item.path.endsWith("-dev")) ?? project.worktrees.find((item) => item.branch === "next") ?? project.worktrees[0]; }
 function compactPath(value = "") { return value.replace(/^\/Users\/[^/]+/, "~"); }
 function defaultSettings() { return { provider: "codex", model: "", reasoningEffort: "medium", approvalPolicy: "workspace-write", editor: "zed", notifications: true, maxConcurrentRuns: 3 }; }
-function upsert(items, item) { return [...items.filter((entry) => entry.id !== item.id), item].sort((a, b) => a.createdAt.localeCompare(b.createdAt)); }
 function boundStreamingText(value) { return value.length > MAX_STREAMING_CHARACTERS ? `${value.slice(0, MAX_STREAMING_CHARACTERS)}${LIVE_TRUNCATION_MARKER}` : value; }
 function formatTime(value) { return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(value)); }
 function runSummary(run) { const tokens = Number(run.inputTokens ?? 0) + Number(run.outputTokens ?? 0); return `${run.status}${tokens ? ` · ${tokens.toLocaleString()} tokens` : ""}${run.costUsd != null ? ` · $${Number(run.costUsd).toFixed(3)}` : ""}`; }

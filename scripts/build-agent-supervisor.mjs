@@ -6,9 +6,10 @@ import { fileURLToPath } from "node:url";
 
 if (["linux", "darwin", "win32"].includes(process.platform)) {
   const root = fileURLToPath(new URL("..", import.meta.url));
-  const source = path.join(root, "server", process.platform === "darwin"
-    ? "agent-supervisor-darwin.c"
-    : process.platform === "win32" ? "agent-supervisor-windows.c" : "agent-supervisor.c");
+  let sourceName = "agent-supervisor.c";
+  if (process.platform === "darwin") sourceName = "agent-supervisor-darwin.c";
+  if (process.platform === "win32") sourceName = "agent-supervisor-windows.c";
+  const source = path.join(root, "server", sourceName);
   const outputDirectory = path.join(root, "server", "bin");
   const windowsDigest = process.platform === "win32"
     ? createHash("sha256").update(readFileSync(source)).digest("hex").slice(0, 16)
@@ -25,26 +26,24 @@ if (["linux", "darwin", "win32"].includes(process.platform)) {
     let compiler = process.env.CC || (useXcode ? xcodeCompiler : "cc");
     let compilerArgs = [...(useXcode ? ["-isysroot", xcodeSdk] : []), "-O2", "-std=c11", "-Wall", "-Wextra", source, "-o", temporary];
     if (process.platform === "win32") {
-      compiler = process.env.CC || "cl";
-      compilerArgs = ["/nologo", "/O2", "/W4", source, `/Fe:${temporary}`];
-      if (!process.env.CC && spawnSync("where.exe", ["cl.exe"], { stdio: "ignore" }).status !== 0) {
-        const vswhere = path.join(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)", "Microsoft Visual Studio", "Installer", "vswhere.exe");
-        const installation = existsSync(vswhere)
-          ? spawnSync(vswhere, ["-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"], { encoding: "utf8" }).stdout?.trim()
-          : "";
-        const environment = installation ? path.join(installation, "VC", "Auxiliary", "Build", "vcvars64.bat") : "";
-        if (!environment || !existsSync(environment)) {
-          throw new Error("Unable to find the Visual C++ build tools; install the Desktop development with C++ workload or set CC");
-        }
-        compiler = "cmd.exe";
-        compilerArgs = ["/d", "/s", "/c", `call "${environment}" >nul && cl /nologo /O2 /W4 "${source}" /Fe:"${temporary}"`];
+      const vswhere = String.raw`C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe`;
+      const commandInterpreter = String.raw`C:\Windows\System32\cmd.exe`;
+      const installation = existsSync(vswhere)
+        ? spawnSync(vswhere, ["-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"], { encoding: "utf8" }).stdout?.trim()
+        : "";
+      const environment = installation ? path.join(installation, "VC", "Auxiliary", "Build", "vcvars64.bat") : "";
+      if (!environment || !existsSync(environment)) {
+        throw new Error("Unable to find the Visual C++ build tools; install the Desktop development with C++ workload");
       }
+      compiler = commandInterpreter;
+      compilerArgs = ["/d", "/s", "/c", `call "${environment}" >nul && "%VCToolsInstallDir%bin\\Hostx64\\x64\\cl.exe" /nologo /O2 /W4 "${source}" /Fe:"${temporary}"`];
     }
     const result = spawnSync(compiler, compilerArgs, { encoding: "utf8" });
     if (result.status !== 0) {
       rmSync(temporary, { force: true });
       const details = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
-      throw new Error(`Unable to build the ${process.platform} agent supervisor with ${compiler}${details ? `:\n${details}` : ""}`);
+      const detailSuffix = details ? `:\n${details}` : "";
+      throw new Error(`Unable to build the ${process.platform} agent supervisor with ${compiler}${detailSuffix}`);
     }
     chmodSync(temporary, 0o755);
     renameSync(temporary, output);

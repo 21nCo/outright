@@ -220,8 +220,9 @@ export function defaultLaunchCommand(command, run, launchDirectory) {
   const ownershipToken = randomUUID();
   const platformOwnershipId = process.platform === "darwin" ? `com.21n.outright.${ownershipToken}` : "-";
   if (process.platform === "darwin") {
-    const capability = spawnSync(AGENT_SUPERVISOR, ["--self-test", platformOwnershipId], { encoding: "utf8" });
-    if (capability.status !== 0 || capability.stdout.trim() !== "supported") {
+    const capability = spawnSync(AGENT_SUPERVISOR, ["--self-test", platformOwnershipId], { encoding: "utf8", timeout: 5000, killSignal: "SIGKILL" });
+    if (capability.status !== 0 || capability.stdout?.trim() !== "supported") {
+      spawnSync(AGENT_SUPERVISOR, ["--terminate", platformOwnershipId], { stdio: "ignore", timeout: 1000, killSignal: "SIGKILL" });
       throw new Error("macOS agent supervision is unavailable because its kernel ownership contract could not be verified");
     }
   }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isUnverifiableLegacyRecovery, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterDurableMessage, streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
+import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, isUnverifiableLegacyRecovery, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterDurableMessage, streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
 
 test("worktree recovery metadata gates sibling composers before conversation-local history", () => {
   const local = { id: "local", status: "interrupted" };
@@ -67,6 +67,12 @@ test("conversation loads replay websocket events over a monotonic durable snapsh
   assert.equal(checkpointed.streamingText, "", "a websocket checkpoint consumes its overlapping live tail");
   assert.equal(checkpointed.cursors.get("run-1"), 8);
   assert.deepEqual(checkpointed.messages, [advanced]);
+
+  const delayedCheckpoint = { type: "message.created", payload: checkpoint };
+  const newerSnapshot = replayConversationEvents([advanced], [delayedCheckpoint, newer]);
+  assert.deepEqual(newerSnapshot.messages, [advanced], "a delayed websocket checkpoint cannot replace the newer HTTP body");
+  assert.equal(newerSnapshot.streamingText, "", "the newer HTTP cursor suppresses both its stale checkpoint and already-durable delta");
+  assert.equal(isStaleCheckpointMessage(newerSnapshot.cursors, checkpoint), true);
 });
 
 test("checkpoint cursors loaded from older pages only advance", () => {
@@ -77,6 +83,21 @@ test("checkpoint cursors loaded from older pages only advance", () => {
   ], current);
   assert.equal(merged.get("run-1"), 9);
   assert.equal(merged.get("run-2"), 3);
+});
+
+test("conversation replay and its in-flight event buffer remain bounded", () => {
+  const messages = Array.from({ length: 5 }, (_, index) => ({ id: `message-${index}`, role: "user", createdAt: `2026-09-22T00:00:0${index}Z` }));
+  const replayed = replayConversationEvents(messages, [], 3);
+  assert.deepEqual(replayed.messages.map((message) => message.id), ["message-2", "message-3", "message-4"]);
+  assert.equal(replayed.dropped, 2);
+
+  const pending = { conversationId: "conversation-1", events: [], eventBytes: 0, overflowed: false };
+  const event = { type: "run.event", conversationId: "conversation-1", payload: { type: "assistant.delta", payload: { text: "some streamed text" } } };
+  assert.equal(bufferConversationRuntimeEvent(pending, event, 1000), "buffered");
+  assert.equal(bufferConversationRuntimeEvent(pending, event, pending.eventBytes), "overflow");
+  assert.equal(pending.overflowed, true);
+  assert.equal(pending.events.length, 1, "overflow never grows the retained event list");
+  assert.equal(bufferConversationRuntimeEvent(pending, { ...event, conversationId: "another" }, 1000), "ignored");
 });
 
 test("only legacy rows without any process or worktree identity offer manual cleanup", () => {

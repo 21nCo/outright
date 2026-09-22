@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -1004,7 +1004,7 @@ test("the launch wrapper records durable identity before authorization and clean
     // Authorized: the same wrapper starts the provider and passes the exit code.
     const marker2 = path.join(root, "provider-ran-2");
     const handshakePath2 = path.join(launchDirectory, "launch-run-2.json");
-    const provider2 = `require("node:fs").writeFileSync(${JSON.stringify(marker2)}, "ran"); setTimeout(() => {}, 250);`;
+    const provider2 = `require("node:fs").writeFileSync(${JSON.stringify(marker2)}, "ran"); setTimeout(() => {}, 750);`;
     const child2 = spawn(process.execPath, wrapperArgs(handshakePath2, process.execPath, "-e", provider2), { detached: process.platform !== "win32", stdio: ["pipe", "pipe", "ignore", "pipe"] });
     children.push(child2);
     const child2Exited = new Promise((resolve) => child2.once("exit", resolve));
@@ -1014,6 +1014,12 @@ test("the launch wrapper records durable identity before authorization and clean
     child2.stdin.write("go\n");
     const [controlOutput] = await withDeadline(authorizationAcknowledged, "generic wrapper authorization acknowledgement");
     assert.equal(controlOutput.toString(), `${LAUNCH_AUTHORIZED_CONTROL}\n`, "the generic wrapper acknowledges only after it owns the authorized provider");
+    if (process.platform === "darwin") {
+      const outputPipes = ["stdout", "stderr"].map((stream) => `/tmp/outright-agent-com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}-${stream}.fifo`);
+      const pipeDeadline = Date.now() + 5_000;
+      while (!outputPipes.every(existsSync) && Date.now() < pipeDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(outputPipes.every((filename) => lstatSync(filename).isFIFO()), true, "provider output uses kernel-bounded pipes rather than disk spools");
+    }
     let authorizedRecord;
     while (Date.now() < deadline2) {
       try {
@@ -1031,6 +1037,10 @@ test("the launch wrapper records durable identity before authorization and clean
     assert.equal(code, 0);
     assert.equal(existsSync(marker2), true, "the authorized wrapper starts the provider");
     assert.equal(existsSync(handshakePath2), false, "the handshake record is cleaned up after completion");
+    if (process.platform === "darwin") {
+      assert.equal(existsSync(`/tmp/outright-agent-com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}-stdout.fifo`), false);
+      assert.equal(existsSync(`/tmp/outright-agent-com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}-stderr.fifo`), false);
+    }
 
     if (process.platform === "darwin") {
       // A provider can exit after launching a background descendant. The
