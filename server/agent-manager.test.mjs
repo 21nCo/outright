@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -11,6 +11,8 @@ import { buildProviderCommand, consumeBoundedLines, createAgentManager, defaultG
 
 const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
 const fakeLaunchDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-agent-test-"));
+const WRAPPER_OWNERSHIP_TOKEN = "00000000-0000-4000-8000-000000000001";
+const wrapperArgs = (handshakePath, ...providerArgs) => ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, WRAPPER_OWNERSHIP_TOKEN, ...providerArgs];
 test.after(() => rmSync(fakeLaunchDirectory, { recursive: true, force: true }));
 
 function fakeChild({ autoAcknowledge = true } = {}) {
@@ -166,6 +168,27 @@ test("serializes runs per conversation even with free global capacity", async ()
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(manager.activeRuns(), ["run-2"]);
   assert.equal(children.length, 2);
+});
+
+test("serializes runs across conversations that share a worktree", async () => {
+  const database = fakeDatabase();
+  database.updateConversation("conv-2", { id: "conv-2", worktreePath: "/tmp/project" });
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  database.createRun(codexRun("run-1"));
+  database.createRun({ ...codexRun("run-2"), conversationId: "conv-2" });
+
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun("run-1") });
+  const second = manager.schedule({ conversation: database.getConversation("conv-2"), run: database.getRun("run-2") });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(manager.activeRuns(), ["run-1"]);
+  assert.equal(children.length, 1, "the second worktree writer remains queued even with global capacity");
+
+  children[0].emit("close", 0, null);
+  await second;
+  assert.deepEqual(manager.activeRuns(), ["run-2"]);
+  assert.equal(children.length, 2);
+  children[1].emit("close", 0, null);
 });
 
 test("persists ordered transcript items instead of one accumulated answer", async () => {
@@ -873,13 +896,19 @@ test("the launch wrapper records durable identity before authorization and clean
   try {
     // Spawn the wrapper exactly as the runtime does, but never authorize:
     // closing stdin must exit it without running the provider.
-    const child = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, process.execPath, "-e", provider], { stdio: ["pipe", "ignore", "ignore", "pipe"] });
+    const child = spawn(process.execPath, wrapperArgs(handshakePath, process.execPath, "-e", provider), { stdio: ["pipe", "ignore", "ignore", "pipe"] });
     children.push(child);
     const deadline = Date.now() + 10_000;
     while (!existsSync(handshakePath) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
     const record = JSON.parse(readFileSync(handshakePath, "utf8"));
     assert.equal(record.pid, child.pid, "the wrapper records its own pid durably before anything can execute");
     assert.equal(record.authorized, false);
+    assert.equal(record.ownershipToken, WRAPPER_OWNERSHIP_TOKEN);
+    if (process.platform === "darwin") {
+      const command = spawnSync("/bin/ps", ["-o", "command=", "-p", String(child.pid)], { encoding: "utf8" });
+      assert.equal(command.status, 0);
+      assert.equal(command.stdout.trim(), `outright-agent-${WRAPPER_OWNERSHIP_TOKEN}`, "the live macOS wrapper proves possession of the handshake token");
+    }
     if (["linux", "darwin", "win32"].includes(process.platform)) {
       assert.equal(record.processIdentity?.startsWith(`${process.platform}:`), true, "the handshake binds ownership to the wrapper's immutable start identity");
     }
@@ -893,7 +922,7 @@ test("the launch wrapper records durable identity before authorization and clean
     const marker2 = path.join(root, "provider-ran-2");
     const handshakePath2 = path.join(launchDirectory, "launch-run-2.json");
     const provider2 = `require("node:fs").writeFileSync(${JSON.stringify(marker2)}, "ran"); setTimeout(() => {}, 250);`;
-    const child2 = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath2, process.execPath, "-e", provider2], { stdio: ["pipe", "pipe", "ignore", "pipe"] });
+    const child2 = spawn(process.execPath, wrapperArgs(handshakePath2, process.execPath, "-e", provider2), { stdio: ["pipe", "pipe", "ignore", "pipe"] });
     children.push(child2);
     const deadline2 = Date.now() + 10_000;
     while (!existsSync(handshakePath2) && Date.now() < deadline2) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -909,7 +938,7 @@ test("the launch wrapper records durable identity before authorization and clean
       } catch { /* Atomic replacement may briefly move the file. */ }
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    if (["linux", "darwin", "win32"].includes(process.platform)) {
+    if (["linux", "win32"].includes(process.platform)) {
       assert.equal(authorizedRecord?.providerProcessIdentity?.startsWith(`${process.platform}:`), true, "the authorized record binds the provider pid to its own boot-scoped start identity");
     } else {
       assert.equal(authorizedRecord?.providerProcessIdentity, undefined);
@@ -933,7 +962,7 @@ test("the launch wrapper records durable identity before authorization and clean
         `require("node:fs").writeFileSync(${JSON.stringify(descendantMarker)}, String(child.pid));`,
         `child.unref();`,
       ].join("\n");
-      const child4 = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath4, process.execPath, "-e", provider4], {
+      const child4 = spawn(process.execPath, wrapperArgs(handshakePath4, process.execPath, "-e", provider4), {
         detached: true,
         stdio: ["pipe", "ignore", "ignore", "pipe"],
       });
@@ -958,7 +987,7 @@ test("the launch wrapper records durable identity before authorization and clean
     // early return after "go".
     const handshakePath3 = path.join(launchDirectory, "launch-run-3.json");
     const provider3 = `process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);`;
-    const child3 = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath3, process.execPath, "-e", provider3], { stdio: ["pipe", "ignore", "ignore", "pipe"] });
+    const child3 = spawn(process.execPath, wrapperArgs(handshakePath3, process.execPath, "-e", provider3), { stdio: ["pipe", "ignore", "ignore", "pipe"] });
     children.push(child3);
     const deadline3 = Date.now() + 10_000;
     while (!existsSync(handshakePath3) && Date.now() < deadline3) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -967,6 +996,34 @@ test("the launch wrapper records durable identity before authorization and clean
     assert.equal(existsSync(handshakePath3), false, "the coalesced stop command tears down the authorized provider");
   } finally {
     for (const child of children) { try { child.kill("SIGKILL"); } catch { /* Already gone. */ } }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the generic wrapper never runs or acknowledges after its authorized handshake rewrite fails", { timeout: 15000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-wrapper-handshake-failure-"));
+  const handshakePath = path.join(root, "launch.json");
+  const marker = path.join(root, "provider-ran");
+  const provider = `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");`;
+  const child = spawn(process.execPath, wrapperArgs(handshakePath, process.execPath, "-e", provider), { stdio: ["pipe", "ignore", "pipe", "pipe"] });
+  try {
+    const deadline = Date.now() + 10_000;
+    while (!existsSync(handshakePath) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(JSON.parse(readFileSync(handshakePath, "utf8")).authorized, false);
+    rmSync(handshakePath);
+    mkdirSync(handshakePath);
+
+    let acknowledgement = "";
+    child.stdio[3].setEncoding("utf8");
+    child.stdio[3].on("data", (chunk) => { acknowledgement += chunk; });
+    child.stdin.end("go\n");
+    const [code] = await once(child, "close");
+
+    assert.equal(code, 127);
+    assert.equal(acknowledgement, "", "authorization is never acknowledged without a durable authorized record");
+    assert.equal(existsSync(marker), false, "the provider cannot execute after the ownership rewrite fails");
+  } finally {
+    try { child.kill("SIGKILL"); } catch { /* Already gone. */ }
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -1063,7 +1120,7 @@ test("wrapper teardown kills the provider and the wrapper reaps it", { skip: pro
     // mismatched path would silently fall back to the group-wide kill.
     launchDirectory: root,
     spawnProcess: () => {
-      child = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, process.execPath, "-e", provider], { detached: true, stdio: ["pipe", "pipe", "pipe", "pipe"] });
+      child = spawn(process.execPath, wrapperArgs(handshakePath, process.execPath, "-e", provider), { detached: true, stdio: ["pipe", "pipe", "pipe", "pipe"] });
       return child;
     },
   });

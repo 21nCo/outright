@@ -12,7 +12,7 @@ import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = defaultRecoveryProcessAlive, recoveryProcessIdentity = defaultRecoveryProcessIdentity, terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000 }) {
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = defaultRecoveryProcessAlive, recoveryProcessIdentity = (pid, ownershipToken) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000 }) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
   const database = createOutrightDatabase({ runtimeLease: true });
@@ -246,9 +246,29 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (interrupted.status !== "interrupted" || interrupted.recoveryDecision) throw apiError(409, "Run is not waiting for a recovery decision");
         const body = await readJson(request);
         const policy = body.policy;
-        if (!["discard", "resume-session", "retry"].includes(policy)) throw apiError(400, "Recovery policy must be discard, resume-session, or retry");
+        if (!["discard", "discard-unverifiable", "resume-session", "retry"].includes(policy)) throw apiError(400, "Recovery policy must be discard, discard-unverifiable, resume-session, or retry");
         const conversation = database.getConversation(interrupted.conversationId);
         if (!conversation) throw apiError(404, "Conversation not found");
+
+        // Databases created before durable process ownership can contain a
+        // running row with neither pid nor immutable launch worktree. There is
+        // no process tree the runtime can verify or signal, so ordinary
+        // recovery stays fail-closed. The operator can explicitly acknowledge
+        // that legacy uncertainty and discard only that row; no replacement
+        // work is scheduled, and any remaining legacy rows keep the global
+        // recovery gate closed.
+        if (policy === "discard-unverifiable") {
+          const legacyUnverifiable = interrupted.recoveryClass === "unknown"
+            && !(Number.isSafeInteger(interrupted.pid) && interrupted.pid > 0)
+            && !interrupted.worktreePath;
+          if (!legacyUnverifiable) throw apiError(409, "Only a legacy run without process or worktree identity can use manual cleanup", { code: "RECOVERY_MANUAL_CLEANUP_UNAVAILABLE", runId: interrupted.id });
+          if (body.confirmation !== interrupted.id) throw apiError(400, "Exact run id confirmation is required for unverifiable legacy cleanup", { code: "RECOVERY_CONFIRMATION_REQUIRED", runId: interrupted.id });
+          const resolved = database.resolveInterruptedRun(interrupted.id, policy);
+          if (!resolved) throw apiError(409, "Run is not waiting for a recovery decision");
+          database.audit("agent.run.recovery.discard-unverifiable", { target: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
+          publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: resolved });
+          return json(response, 200, resolved);
+        }
 
         // Every unresolved interrupted run of the worktree is verified before
         // any decision is recorded — not only runs from the selected chat. A
@@ -274,7 +294,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           let verdict = recoveryVerdict(await recoveryProcessAlive(pending.pid));
           if (verdict === "alive") {
             const handshake = database.getLaunchHandshake(pending.id);
-            const processIdentity = await recoveryProcessIdentity(pending.pid);
+            const processIdentity = await recoveryProcessIdentity(pending.pid, handshake?.ownershipToken);
             if (!recoveryIdentityMatches(pending, handshake, processIdentity)) {
               throw apiError(409, "The interrupted provider process identity cannot be verified, so it will not be signaled", { code: "RECOVERY_PROCESS_UNKNOWN", pid: pending.pid, runId: pending.id });
             }
@@ -287,7 +307,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
             let escalated = false;
             while (verdict === "alive" && Date.now() < deadline) {
               if (!escalated && Date.now() - started >= recoveryTerminationGraceMs) {
-                const currentIdentity = await recoveryProcessIdentity(pending.pid);
+                const currentIdentity = await recoveryProcessIdentity(pending.pid, handshake?.ownershipToken);
                 if (!recoveryIdentityMatches(pending, handshake, currentIdentity)) {
                   throw apiError(409, "The interrupted provider process identity changed before escalation, so it will not be signaled", { code: "RECOVERY_PROCESS_UNKNOWN", pid: pending.pid, runId: pending.id });
                 }
@@ -555,7 +575,7 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
   }
 }
 
-export function defaultRecoveryProcessIdentity(pid, platform = process.platform, readFile = readFileSync, run = spawnSync) {
+export function defaultRecoveryProcessIdentity(pid, platform = process.platform, readFile = readFileSync, run = spawnSync, ownershipToken = null) {
   try {
     if (platform === "linux") {
       const bootId = readFile("/proc/sys/kernel/random/boot_id", "utf8").trim();
@@ -566,11 +586,12 @@ export function defaultRecoveryProcessIdentity(pid, platform = process.platform,
       return bootId && startTicks ? `linux:${bootId}:${startTicks}` : null;
     }
     if (platform === "darwin") {
+      if (typeof ownershipToken !== "string" || !/^[0-9a-f-]{36}$/i.test(ownershipToken)) return null;
       const bootResult = run("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8" });
-      const processResult = run("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
+      const processResult = run("/bin/ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
       const boot = bootResult.status === 0 ? bootResult.stdout.trim() : "";
-      const started = processResult.status === 0 ? processResult.stdout.trim() : "";
-      return boot && started ? `darwin:${boot}:${started}` : null;
+      const command = processResult.status === 0 ? processResult.stdout.trim() : "";
+      return boot && command === `outright-agent-${ownershipToken}` ? `darwin:${boot}:${ownershipToken}` : null;
     }
     if (platform === "win32") {
       const script = `$boot=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks;$start=(Get-Process -Id ${pid}).StartTime.ToUniversalTime().Ticks;Write-Output ($boot.ToString() + ':' + $start.ToString())`;

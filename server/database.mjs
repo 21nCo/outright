@@ -338,13 +338,18 @@ export function createOutrightDatabase(options = {}) {
     },
     // Records the operator's explicit continuation decision exactly once.
     // Discard fails the run; resume/retry keep it interrupted for the record
-    // while the replacement run carries the work forward.
+    // while the replacement run carries the work forward. The distinct
+    // unverifiable decision preserves that an operator explicitly cleared a
+    // legacy row whose process ownership could not be reconstructed.
     resolveInterruptedRun(id, decision) {
       const run = this.getRun(id);
-      if (!run || !["discard", "resume-session", "retry"].includes(decision)) return null;
+      if (!run || !["discard", "discard-unverifiable", "resume-session", "retry"].includes(decision)) return null;
       if (run.status !== "interrupted" || run.recoveryDecision) return null;
-      const status = decision === "discard" ? "failed" : "interrupted";
-      const error = decision === "discard" ? "Discarded after restart recovery review" : null;
+      const discarded = decision === "discard" || decision === "discard-unverifiable";
+      const status = discarded ? "failed" : "interrupted";
+      const error = decision === "discard-unverifiable"
+        ? "Discarded after explicit acknowledgement of unverifiable legacy recovery"
+        : decision === "discard" ? "Discarded after restart recovery review" : null;
       const stamp = now();
       const resolve = db.transaction(() => {
         const result = db.prepare("UPDATE runs SET recovery_decision = ?, status = ?, error = ?, finished_at = ? WHERE id = ? AND status = 'interrupted' AND recovery_decision IS NULL")

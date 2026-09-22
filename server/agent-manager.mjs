@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,9 +36,11 @@ export const LAUNCH_WRAPPER_SOURCE = `
 const fs = require("node:fs");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
-const [handshakePath, executable, ...commandArgs] = process.argv.slice(1);
+const [handshakePath, ownershipToken, executable, ...commandArgs] = process.argv.slice(1);
 fs.mkdirSync(path.dirname(handshakePath), { recursive: true });
-const processIdentityFor = (pid) => {
+const ownershipTitle = \`outright-agent-\${ownershipToken}\`;
+process.title = ownershipTitle;
+const processIdentityFor = (pid, expectedOwnershipToken = null) => {
   try {
     if (process.platform === "linux") {
       const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
@@ -47,9 +50,12 @@ const processIdentityFor = (pid) => {
       return bootId && startTicks ? \`linux:\${bootId}:\${startTicks}\` : null;
     }
     if (process.platform === "darwin") {
+      if (!expectedOwnershipToken) return null;
       const boot = execFileSync("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8" }).trim();
-      const started = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" }).trim();
-      return boot && started ? \`darwin:\${boot}:\${started}\` : null;
+      const command = execFileSync("/bin/ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" }).trim();
+      return boot && command === \`outright-agent-\${expectedOwnershipToken}\`
+        ? \`darwin:\${boot}:\${expectedOwnershipToken}\`
+        : null;
     }
     if (process.platform === "win32") {
       const script = "$boot=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks;"
@@ -61,22 +67,33 @@ const processIdentityFor = (pid) => {
   } catch {}
   return null;
 };
-const processIdentity = processIdentityFor(process.pid);
+const processIdentity = processIdentityFor(process.pid, ownershipToken);
 const handshake = (authorized, providerPid) => {
   const providerProcessIdentity = providerPid ? processIdentityFor(providerPid) : null;
   return {
     pid: process.pid,
     authorized,
+    ownershipToken,
     ...(providerPid ? { providerPid } : {}),
     ...(processIdentity ? { processIdentity } : {}),
     ...(providerProcessIdentity ? { providerProcessIdentity } : {}),
     createdAt: new Date().toISOString(),
   };
 };
+const writeHandshake = (record) => {
+  const temporaryPath = \`\${handshakePath}.\${process.pid}.tmp\`;
+  try {
+    fs.writeFileSync(temporaryPath, JSON.stringify(record), { mode: 0o600 });
+    fs.renameSync(temporaryPath, handshakePath);
+  } catch (error) {
+    try { fs.unlinkSync(temporaryPath); } catch {}
+    throw error;
+  }
+};
 // Durable process identity BEFORE anything can execute: if the runtime dies
 // before recording this pid, the handshake file restores ownership after
 // restart.
-fs.writeFileSync(handshakePath, JSON.stringify(handshake(false)));
+writeHandshake(handshake(false));
 let authorized = false;
 let provider = null;
 let providerGone = false;
@@ -198,6 +215,16 @@ process.stdin.on("data", (chunk) => {
     const command = rawCommand.trim();
     if (!authorized && command === "go") {
       authorized = true;
+      // Authorization is durable before the provider can execute. If this
+      // ownership rewrite fails, fail the launch without ever spawning the
+      // provider; acknowledging an identity-less launch would make restart
+      // recovery unable to signal or safely release it.
+      try { writeHandshake(handshake(true)); }
+      catch (error) {
+        console.error(String((error && error.message) || error));
+        try { fs.unlinkSync(handshakePath); } catch {}
+        process.exit(127);
+      }
       const { spawn } = require("node:child_process");
       provider = spawn(executable, commandArgs, { stdio: ["ignore", "inherit", "inherit"] });
       // Durable provider identity: escalation targets the provider alone so this
@@ -205,7 +232,7 @@ process.stdin.on("data", (chunk) => {
       // group-wide SIGKILL kills the wrapper first and a killed-but-unreaped
       // provider lingers as a zombie in its process group on hosts whose PID 1
       // does not reap orphans.
-      try { fs.writeFileSync(handshakePath, JSON.stringify(handshake(true, provider.pid))); } catch { /* The record was swept; nothing needs escalation identity. */ }
+      try { writeHandshake(handshake(true, provider.pid)); } catch { /* The durable wrapper identity still owns recovery; provider-only escalation becomes unavailable. */ }
       provider.on("error", (error) => { console.error(String((error && error.message) || error)); finish(127); });
       provider.on("close", (code, signal) => {
         providerGone = true;
@@ -247,7 +274,7 @@ export function defaultLaunchCommand(command, run, launchDirectory) {
   }
   return {
     executable: process.execPath,
-    args: ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, command.executable, ...command.args],
+    args: ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, randomUUID(), command.executable, ...command.args],
     display: command.display,
     handshakePath,
   };
@@ -548,7 +575,12 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     if (shuttingDown) return;
     const max = database.getSettings().maxConcurrentRuns;
     while (active.size < max && queue.length) {
-      const index = queue.findIndex((entry) => ![...active.values()].some((state) => state.conversation.id === entry.run.conversationId));
+      const index = queue.findIndex((entry) => ![...active.values()].some((state) => {
+        const activeWorktree = state.run.worktreePath ?? state.conversation.worktreePath;
+        const queuedWorktree = entry.run.worktreePath ?? entry.conversation.worktreePath;
+        return state.conversation.id === entry.run.conversationId
+          || (activeWorktree && queuedWorktree && activeWorktree === queuedWorktree);
+      }));
       if (index < 0) return;
       const entry = queue.splice(index, 1)[0];
       const state = { ...entry, assistantSegments: [], assistantBytes: 0, assistantTruncated: false, assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, stderr: "", stopped: false, checkpointPendingBytes: 0, lastCheckpointAt: 0, checkpointTimer: null, checkpointHalted: false };

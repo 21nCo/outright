@@ -24,7 +24,7 @@ import { ContextPane } from "@/components/ContextPane";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { TerminalPane } from "@/components/TerminalPane";
 import { api, connectRuntime, query } from "@/lib/runtime-api";
-import { draftAfterSubmission, isComposerSubmitKey, recoveryBelongsToConversation, recoveryGate } from "@/recovery-policy";
+import { draftAfterSubmission, isComposerSubmitKey, isUnverifiableLegacyRecovery, recoveryBelongsToConversation, recoveryGate, streamingTextAfterDurableMessage } from "@/recovery-policy";
 
 const MAX_RENDERED_MESSAGES = 1000;
 const MAX_STREAMING_CHARACTERS = 1024 * 1024;
@@ -164,6 +164,7 @@ export function App() {
     if (event.type === "conversation.created" || event.type === "conversation.updated") loadConversations(event.conversationId);
     if (event.type === "run.resolved" && event.conversationId === selectedConversationRef.current) loadConversation();
     if (event.type === "message.created" && event.conversationId === selectedConversationRef.current) {
+      setStreamingText((current) => streamingTextAfterDurableMessage(current, event.payload));
       setConversation((current) => {
         if (!current) return current;
         const alreadyPresent = current.messages.some((message) => message.id === event.payload.id);
@@ -191,7 +192,7 @@ export function App() {
     if (event.type === "run.event" && event.conversationId === selectedConversationRef.current) {
       const runEvent = event.payload;
       if (runEvent.type === "assistant.delta") setStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(current + (runEvent.payload.text ?? "")));
-      if (runEvent.type === "assistant.message") setStreamingText(boundStreamingText(runEvent.payload.text ?? ""));
+      if (runEvent.type === "assistant.message") setStreamingText("");
       if (runEvent.type.startsWith("tool.")) setRunEvents((current) => [...current, runEvent].slice(-20));
       if (["run.completed", "run.failed", "run.stopped"].includes(runEvent.type)) {
         window.setTimeout(loadConversation, 80);
@@ -266,7 +267,8 @@ export function App() {
 
   async function resolveRecovery(run, policy) {
     try {
-      await api(`/api/runs/${run.id}/resume`, { method: "POST", body: { policy } });
+      if (policy === "discard-unverifiable" && !window.confirm("Only continue after you have verified outside Outright that the legacy provider is no longer running. Discard this unverifiable recovery record?")) return;
+      await api(`/api/runs/${run.id}/resume`, { method: "POST", body: { policy, ...(policy === "discard-unverifiable" ? { confirmation: run.id } : {}) } });
       await loadConversation();
     } catch (nextError) {
       setError(nextError.payload?.code === "NO_PROVIDER_SESSION" ? "No provider session is available to resume" : nextError.message);
@@ -478,7 +480,8 @@ function RecoveryNotice({ run, conversation, recoveryConversation, onOpenRecover
   const ownsRecovery = recoveryBelongsToConversation(run, conversation);
   const owner = ownsRecovery ? conversation : recoveryConversation;
   const sessionId = run.providerSessionId || (owner?.provider === run.provider ? owner?.providerSessionId : null);
-  return <div className="recovery-notice" role="alert"><WarningCircle weight="fill" /><div className="recovery-copy"><strong>{ownsRecovery ? "Run interrupted by a runtime restart" : `Recovery required in ${owner?.title ?? "another chat"}`}</strong><p>{ownsRecovery ? `Reconciliation found ${classCopy}. Review the preserved partial output above, then choose how to continue before anything is retried.` : "Another chat in this worktree owns an interrupted run. Open it to inspect the preserved output and choose an explicit continuation policy."}</p></div><div className="recovery-actions">{ownsRecovery ? <><Button size="sm" disabled={!sessionId} onClick={() => onResolve(run, "resume-session")}><ArrowsClockwise />Resume session</Button><Button size="sm" variant="outline" onClick={() => onResolve(run, "retry")}>Retry from scratch</Button><Button size="sm" variant="ghost" onClick={() => onResolve(run, "discard")}>Discard</Button></> : <Button size="sm" onClick={onOpenRecovery}><ChatCircle />Open recovery chat</Button>}</div></div>;
+  const manualLegacyCleanup = isUnverifiableLegacyRecovery(run);
+  return <div className="recovery-notice" role="alert"><WarningCircle weight="fill" /><div className="recovery-copy"><strong>{ownsRecovery ? "Run interrupted by a runtime restart" : `Recovery required in ${owner?.title ?? "another chat"}`}</strong><p>{ownsRecovery ? `Reconciliation found ${classCopy}. Review the preserved partial output above, then choose how to continue before anything is retried.` : "Another chat in this worktree owns an interrupted run. Open it to inspect the preserved output and choose an explicit continuation policy."}</p></div><div className="recovery-actions">{ownsRecovery ? manualLegacyCleanup ? <Button size="sm" variant="destructive" onClick={() => onResolve(run, "discard-unverifiable")}>Discard legacy record</Button> : <><Button size="sm" disabled={!sessionId} onClick={() => onResolve(run, "resume-session")}><ArrowsClockwise />Resume session</Button><Button size="sm" variant="outline" onClick={() => onResolve(run, "retry")}>Retry from scratch</Button><Button size="sm" variant="ghost" onClick={() => onResolve(run, "discard")}>Discard</Button></> : <Button size="sm" onClick={onOpenRecovery}><ChatCircle />Open recovery chat</Button>}</div></div>;
 }
 function ToolActivity({ events }) { if (!events.length) return null; return <div className="tool-activity">{events.slice(-4).map((event) => <div key={event.id}><CheckCircle /><span>{toolLabel(event)}</span></div>)}</div>; }
 function EmptyChat({ worktree, onCreate }) { return <div className="empty-chat"><ChatCircle size={29} /><h2>Start in {worktree.name}</h2><p>Create a durable conversation, then run Codex or Claude directly in this worktree.</p><Button onClick={onCreate}><Plus />New chat</Button></div>; }

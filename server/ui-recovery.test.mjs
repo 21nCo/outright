@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { draftAfterSubmission, isComposerSubmitKey, recoveryBelongsToConversation, recoveryGate } from "../src/recovery-policy.js";
+import { draftAfterSubmission, isComposerSubmitKey, isUnverifiableLegacyRecovery, recoveryBelongsToConversation, recoveryGate, streamingTextAfterDurableMessage } from "../src/recovery-policy.js";
 
 test("worktree recovery metadata gates sibling composers before conversation-local history", () => {
   const local = { id: "local", status: "interrupted" };
@@ -33,4 +33,17 @@ test("keyboard submission recognizes plain Enter but preserves Shift+Enter and c
 test("a completed submission only clears the draft that was submitted", () => {
   assert.equal(draftAfterSubmission("submitted prompt", "submitted prompt"), "");
   assert.equal(draftAfterSubmission("newer prompt", "submitted prompt"), "newer prompt");
+});
+
+test("durable run checkpoints replace the overlapping live stream", () => {
+  assert.equal(streamingTextAfterDurableMessage("duplicated answer", { role: "assistant", payload: { runId: "run-1" } }), "");
+  assert.equal(streamingTextAfterDurableMessage("keep live output", { role: "user" }), "keep live output");
+  assert.equal(streamingTextAfterDurableMessage("keep live output", { role: "assistant", payload: {} }), "keep live output");
+});
+
+test("only legacy rows without any process or worktree identity offer manual cleanup", () => {
+  assert.equal(isUnverifiableLegacyRecovery({ recoveryClass: "unknown", pid: null, worktreePath: null }), true);
+  assert.equal(isUnverifiableLegacyRecovery({ recoveryClass: "unknown", pid: 42, worktreePath: null }), false);
+  assert.equal(isUnverifiableLegacyRecovery({ recoveryClass: "unknown", pid: null, worktreePath: "/tmp/tree" }), false);
+  assert.equal(isUnverifiableLegacyRecovery({ recoveryClass: "never-started", pid: null, worktreePath: null }), false);
 });

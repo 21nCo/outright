@@ -79,6 +79,14 @@ function seedLegacyUnknownTargetDatabase(filename) {
   legacy.close();
 }
 
+function seedLegacyRunningUnknownTargetDatabase(filename) {
+  seedLegacyUnknownTargetDatabase(filename);
+  const legacy = new Database(filename);
+  legacy.prepare("UPDATE runs SET status = 'running', started_at = ?, recovery_class = NULL WHERE id = 'legacy-interrupted'")
+    .run("2026-09-21T00:01:00.000Z");
+  legacy.close();
+}
+
 // A full harness with a real discovered, trusted git worktree and a fake
 // provider CLI on PATH, so successful submissions and replacement runs can be
 // exercised end-to-end through the HTTP surface. POSIX-only: the fake provider
@@ -158,6 +166,43 @@ test("legacy runs without a trustworthy target reject replacement work but allow
     await runtime.handleRequest(requestStream("POST", "/api/runs/legacy-interrupted/resume", { policy: "discard" }), discard);
     assert.equal(discard.statusCode, 200);
     assert.equal(discard.body.recoveryDecision, "discard");
+  } finally {
+    await runtime?.shutdown();
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+test("legacy running rows without process ownership require explicit bounded cleanup", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-legacy-running-runtime-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  let runtime;
+  try {
+    seedLegacyRunningUnknownTargetDatabase(path.join(dataDirectory, "outright.db"));
+    process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    const legacy = runtime.database.getRun("legacy-interrupted");
+    assert.equal(legacy.status, "interrupted");
+    assert.equal(legacy.recoveryClass, "unknown");
+    assert.equal(legacy.pid, null);
+    assert.equal(legacy.worktreePath, null);
+
+    const ordinaryDiscard = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/runs/legacy-interrupted/resume", { policy: "discard" }), ordinaryDiscard);
+    assert.equal(ordinaryDiscard.statusCode, 409);
+    assert.equal(ordinaryDiscard.body.code, "RECOVERY_PROCESS_UNKNOWN");
+
+    const unconfirmed = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/runs/legacy-interrupted/resume", { policy: "discard-unverifiable" }), unconfirmed);
+    assert.equal(unconfirmed.statusCode, 400);
+    assert.equal(unconfirmed.body.code, "RECOVERY_CONFIRMATION_REQUIRED");
+
+    const cleanup = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/runs/legacy-interrupted/resume", { policy: "discard-unverifiable", confirmation: "legacy-interrupted" }), cleanup);
+    assert.equal(cleanup.statusCode, 200);
+    assert.equal(cleanup.body.status, "failed");
+    assert.equal(cleanup.body.recoveryDecision, "discard-unverifiable");
+    assert.equal(runtime.database.listRuns("legacy-conversation").length, 1, "manual cleanup never schedules replacement work");
   } finally {
     await runtime?.shutdown();
     if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
@@ -690,7 +735,7 @@ test("the default recovery probe is conservative per platform", async () => {
     try {
       assert.equal(defaultRecoveryProcessAlive(live.pid), "alive");
       assert.equal(defaultRecoveryProcessAlive(live.pid, "win32"), "alive");
-      if (["linux", "darwin"].includes(process.platform)) {
+      if (process.platform === "linux") {
         assert.equal(defaultRecoveryProcessIdentity(live.pid)?.startsWith(`${process.platform}:`), true, "the current process start identity is readable on supported POSIX platforms");
       }
     } finally {
@@ -705,6 +750,23 @@ test("recovery identities are boot-scoped and Windows taskkill supplies a whole-
   const linuxStat = `123 (node) ${linuxFields.join(" ")}`;
   const linuxIdentity = defaultRecoveryProcessIdentity(123, "linux", (filename) => filename.endsWith("boot_id") ? "boot-uuid\n" : linuxStat);
   assert.equal(linuxIdentity, "linux:boot-uuid:424242");
+
+  const ownershipToken = "00000000-0000-4000-8000-000000000001";
+  const darwinRun = (executable) => executable === "/usr/sbin/sysctl"
+    ? { status: 0, stdout: "{ sec = 123, usec = 456 }\n" }
+    : { status: 0, stdout: `outright-agent-${ownershipToken}\n` };
+  assert.equal(
+    defaultRecoveryProcessIdentity(123, "darwin", () => "", darwinRun, ownershipToken),
+    `darwin:{ sec = 123, usec = 456 }:${ownershipToken}`,
+  );
+  assert.equal(defaultRecoveryProcessIdentity(123, "darwin", () => "", darwinRun), null, "tokenless legacy Darwin handshakes fail closed");
+  assert.equal(
+    defaultRecoveryProcessIdentity(123, "darwin", () => "", (executable) => executable === "/usr/sbin/sysctl"
+      ? { status: 0, stdout: "{ sec = 123, usec = 456 }\n" }
+      : { status: 0, stdout: "outright-agent-another-owner\n" }, ownershipToken),
+    null,
+    "a recycled pid with a different ownership title is rejected",
+  );
 
   const powershellCalls = [];
   const run = (executable, args, options) => {
@@ -745,9 +807,6 @@ test("macOS recovery termination stops a provider that ignores SIGTERM", {
       child.once("error", reject);
       child.stdout.once("data", resolve);
     });
-    const identity = defaultRecoveryProcessIdentity(child.pid, "darwin");
-    assert.match(identity, /^darwin:/);
-
     defaultTerminateRecoveryProcess(child.pid, "SIGTERM", null, "darwin");
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(defaultRecoveryProcessAlive(child.pid, "darwin"), "alive");
