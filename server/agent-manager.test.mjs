@@ -18,11 +18,12 @@ function fakeChild({ autoAcknowledge = true } = {}) {
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
   child.stdin = new PassThrough();
+  child.stdio = [child.stdin, child.stdout, child.stderr, new PassThrough()];
   const write = child.stdin.write.bind(child.stdin);
   child.stdin.write = (chunk, ...args) => {
     const written = write(chunk, ...args);
     if (autoAcknowledge && String(chunk).includes("go\n")) {
-      queueMicrotask(() => child.stdout.write(`${LAUNCH_AUTHORIZED_CONTROL}\n`));
+      queueMicrotask(() => child.stdio[3].write(`${LAUNCH_AUTHORIZED_CONTROL}\n`));
     }
     return written;
   };
@@ -45,7 +46,11 @@ function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/
     getConversation: (id) => conversations.get(id),
     updateConversation: (id, patch) => conversations.set(id, { ...conversations.get(id), ...patch }),
     getRun: (id) => runs.get(id) ?? null,
-    createRun: (run) => { runs.set(run.id, run); return run; },
+    createRun: (run) => {
+      const stored = { ...run, worktreePath: run.worktreePath ?? conversations.get(run.conversationId)?.worktreePath };
+      runs.set(run.id, stored);
+      return stored;
+    },
     updateRun: (id, patch) => { runs.set(id, { ...runs.get(id), ...patch }); return runs.get(id); },
     addMessage: (input) => { messages.push(input); return input; },
     upsertMessage: (input) => {
@@ -427,10 +432,35 @@ for (const change of ["move", "revoke", "mismatch"]) {
     await turn();
     assert.equal(children.length, 1, "the queued run must not spawn");
     assert.equal(database.getRun("queued").status, "failed");
-    assert.match(database.getRun("queued").error, /trust|identity/);
+    assert.match(database.getRun("queued").error, /trust|identity|target changed/);
     assert.deepEqual(manager.activeRuns(), []);
   });
 }
+
+test("queued runs cannot retarget even when both worktrees independently validate", async () => {
+  const database = fakeDatabase({ id: "conv-1", projectId: "A", worktreeId: "A", worktreePath: "/tmp/A" });
+  database.getSettings = () => ({ maxConcurrentRuns: 1 });
+  const children = [];
+  const manager = createAgentManager({
+    database,
+    publish: () => {},
+    validateConversation: async () => () => {},
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; },
+  });
+  const first = database.createRun(codexRun("first"));
+  const queued = database.createRun(codexRun("queued"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: first });
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: queued });
+
+  database.updateConversation("conv-1", { projectId: "B", worktreeId: "B", worktreePath: "/tmp/B" });
+  children[0].emit("close", 0, null);
+  await turn();
+
+  assert.equal(children.length, 1, "the queued run never spawns in the new valid target");
+  assert.equal(database.getRun("queued").worktreePath, "/tmp/A");
+  assert.equal(database.getRun("queued").status, "failed");
+  assert.match(database.getRun("queued").error, /target changed/);
+});
 
 test("validation reserves capacity and cancellation prevents a late spawn", async () => {
   const database = fakeDatabase();
@@ -476,8 +506,8 @@ for (const action of ["stop", "shutdown"]) {
       launchCommand: (command) => ({ ...command, ownsDescendants: false }),
       spawnProcess: () => {
         const descendant = `process.on("SIGTERM", () => {}); process.send("ready"); setInterval(() => {}, 1000);`;
-        const parent = `const {spawn} = require("node:child_process"); const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], {stdio:["ignore","ignore","ignore","ipc"]}); process.stdout.write(${JSON.stringify(`${LAUNCH_AUTHORIZED_CONTROL}\n`)}); child.once("message", () => setTimeout(() => process.stdout.write("ready\\n"), 10)); setInterval(() => {}, 1000);`;
-        child = spawn(process.execPath, ["-e", parent], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+        const parent = `const fs = require("node:fs"); const {spawn} = require("node:child_process"); const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], {stdio:["ignore","ignore","ignore","ipc"]}); fs.writeSync(3, ${JSON.stringify(`${LAUNCH_AUTHORIZED_CONTROL}\n`)}); child.once("message", () => setTimeout(() => process.stdout.write("ready\\n"), 10)); setInterval(() => {}, 1000);`;
+        child = spawn(process.execPath, ["-e", parent], { detached: true, stdio: ["ignore", "pipe", "pipe", "pipe"] });
         return child;
       },
     });
@@ -579,10 +609,58 @@ test("schedule waits for the launch owner to acknowledge durable authorization",
   assert.equal(settled, false, "a one-way go write is not proof that the launch owner authorized the provider");
   assert.equal(database.getRun(run.id).status, "running");
 
-  child.stdout.write(`${LAUNCH_AUTHORIZED_CONTROL}\n`);
+  child.stdio[3].write(`${LAUNCH_AUTHORIZED_CONTROL}\n`);
   await scheduled;
   assert.equal(settled, true);
   child.emit("close", 0, null);
+});
+
+test("provider stdout cannot merge with or forge launch authorization", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild({ autoAcknowledge: false });
+  const published = [];
+  const manager = createAgentManager({ database, publish: (event) => published.push(event), spawnProcess: () => child });
+  const run = database.createRun(codexRun("run-1"));
+  let settled = false;
+  const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run }).then(() => { settled = true; });
+
+  child.stdout.write(`provider-prefix${LAUNCH_AUTHORIZED_CONTROL}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "provider data-plane output is never accepted as launch control");
+  assert.equal(published.some((event) => event.payload?.payload?.text?.includes("provider-prefix")), true, "the merged line remains ordinary provider output");
+
+  child.stdio[3].write(`${LAUNCH_AUTHORIZED_CONTROL}\n`);
+  await scheduled;
+  child.emit("close", 0, null);
+});
+
+test("shutdown is bounded when authorization acknowledgement never arrives", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild({ autoAcknowledge: false });
+  const writes = [];
+  const originalWrite = child.stdin.write.bind(child.stdin);
+  child.stdin.write = (chunk, ...args) => {
+    writes.push(String(chunk));
+    const written = originalWrite(chunk, ...args);
+    if (String(chunk) === "stop\n") setImmediate(() => child.emit("close", null, "SIGTERM"));
+    return written;
+  };
+  const manager = createAgentManager({
+    database,
+    publish: () => {},
+    spawnProcess: () => child,
+    launchCommand: (command) => ({ ...command, ownsDescendants: true }),
+    terminationTimeoutMs: 250,
+  });
+  const run = database.createRun(codexRun("run-1"));
+  const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  const deadline = Date.now() + 1000;
+  while (!writes.includes("go\n") && Date.now() < deadline) await new Promise((resolve) => setImmediate(resolve));
+
+  await Promise.all([scheduled, manager.shutdown()]);
+  assert.equal(writes.includes("stop\n"), true, "teardown is requested without waiting for the missing acknowledgement");
+  assert.equal(database.getRun(run.id).status, "stopped");
+  assert.deepEqual(manager.activeRuns(), []);
 });
 
 test("shutdown between the authorization write and owner acknowledgement still completes", async () => {
@@ -795,7 +873,7 @@ test("the launch wrapper records durable identity before authorization and clean
   try {
     // Spawn the wrapper exactly as the runtime does, but never authorize:
     // closing stdin must exit it without running the provider.
-    const child = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, process.execPath, "-e", provider], { stdio: ["pipe", "ignore", "ignore"] });
+    const child = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, process.execPath, "-e", provider], { stdio: ["pipe", "ignore", "ignore", "pipe"] });
     children.push(child);
     const deadline = Date.now() + 10_000;
     while (!existsSync(handshakePath) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -815,11 +893,11 @@ test("the launch wrapper records durable identity before authorization and clean
     const marker2 = path.join(root, "provider-ran-2");
     const handshakePath2 = path.join(launchDirectory, "launch-run-2.json");
     const provider2 = `require("node:fs").writeFileSync(${JSON.stringify(marker2)}, "ran"); setTimeout(() => {}, 250);`;
-    const child2 = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath2, process.execPath, "-e", provider2], { stdio: ["pipe", "pipe", "ignore"] });
+    const child2 = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath2, process.execPath, "-e", provider2], { stdio: ["pipe", "pipe", "ignore", "pipe"] });
     children.push(child2);
     const deadline2 = Date.now() + 10_000;
     while (!existsSync(handshakePath2) && Date.now() < deadline2) await new Promise((resolve) => setTimeout(resolve, 10));
-    const authorizationAcknowledged = once(child2.stdout, "data");
+    const authorizationAcknowledged = once(child2.stdio[3], "data");
     child2.stdin.write("go\n");
     const [controlOutput] = await withDeadline(authorizationAcknowledged, "generic wrapper authorization acknowledgement");
     assert.equal(controlOutput.toString(), `${LAUNCH_AUTHORIZED_CONTROL}\n`, "the generic wrapper acknowledges only after it owns the authorized provider");
@@ -857,7 +935,7 @@ test("the launch wrapper records durable identity before authorization and clean
       ].join("\n");
       const child4 = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath4, process.execPath, "-e", provider4], {
         detached: true,
-        stdio: ["pipe", "ignore", "ignore"],
+        stdio: ["pipe", "ignore", "ignore", "pipe"],
       });
       children.push(child4);
       const deadline4 = Date.now() + 10_000;
@@ -880,7 +958,7 @@ test("the launch wrapper records durable identity before authorization and clean
     // early return after "go".
     const handshakePath3 = path.join(launchDirectory, "launch-run-3.json");
     const provider3 = `process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);`;
-    const child3 = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath3, process.execPath, "-e", provider3], { stdio: ["pipe", "ignore", "ignore"] });
+    const child3 = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath3, process.execPath, "-e", provider3], { stdio: ["pipe", "ignore", "ignore", "pipe"] });
     children.push(child3);
     const deadline3 = Date.now() + 10_000;
     while (!existsSync(handshakePath3) && Date.now() < deadline3) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -985,7 +1063,7 @@ test("wrapper teardown kills the provider and the wrapper reaps it", { skip: pro
     // mismatched path would silently fall back to the group-wide kill.
     launchDirectory: root,
     spawnProcess: () => {
-      child = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, process.execPath, "-e", provider], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+      child = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, process.execPath, "-e", provider], { detached: true, stdio: ["pipe", "pipe", "pipe", "pipe"] });
       return child;
     },
   });
@@ -1046,7 +1124,7 @@ test("stop and shutdown leave no provider-tree members on a non-reaping PID 1", 
   const script = `
 import { pathToFileURL } from "node:url";
 const { spawn, spawnSync } = await import("node:child_process");
-const { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, writeFileSync } = await import("node:fs");
+const { existsSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, renameSync, writeFileSync } = await import("node:fs");
 const os = await import("node:os");
 const path = await import("node:path");
 const manager = await import(pathToFileURL("/app/server/agent-manager.mjs"));
@@ -1091,7 +1169,7 @@ const agent = manager.createAgentManager({
     return manager.defaultLaunchCommand({ executable: process.execPath, args: ["-e", provider], display: "test provider" }, run, directory);
   },
   spawnProcess: (executable, args) => {
-    const child = spawn(executable, args, { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(executable, args, { detached: true, stdio: ["pipe", "pipe", "pipe", "pipe"] });
     children.set(path.basename(args[0], ".json"), child);
     return child;
   },
@@ -1131,7 +1209,7 @@ const waitForExit = (child, label) => Promise.race([
 const failedRoot = path.join(root, "failed-authorization");
 const failedHandshake = path.join(failedRoot, "run.json");
 const failedMarker = path.join(root, "provider-must-not-run");
-const failed = spawn("/tmp/agent-supervisor", [failedHandshake, process.execPath, "-e", \`require('node:fs').writeFileSync(\${JSON.stringify(failedMarker)}, 'ran')\`], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+const failed = spawn("/tmp/agent-supervisor", [failedHandshake, process.execPath, "-e", \`require('node:fs').writeFileSync(\${JSON.stringify(failedMarker)}, 'ran')\`], { detached: true, stdio: ["pipe", "pipe", "pipe", "pipe"] });
 while (!existsSync(failedHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
 const nativeIdentitySafe = /^linux:[0-9a-f-]+:[1-9]\\d*$/.test(JSON.parse(readFileSync(failedHandshake, "utf8")).processIdentity || "");
 renameSync(failedRoot, failedRoot + "-moved");
@@ -1143,7 +1221,7 @@ const authorizationSafe = failedExit.code === 75 && !existsSync(failedMarker) &&
 // The native command parser, like the JS fallback, must consume both commands
 // when a pipe write delivers go and stop in one chunk.
 const coalescedHandshake = path.join(root, "coalesced.json");
-const coalesced = spawn("/tmp/agent-supervisor", [coalescedHandshake, process.execPath, "-e", "process.on('SIGTERM', () => {}); while (true) {}"], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+const coalesced = spawn("/tmp/agent-supervisor", [coalescedHandshake, process.execPath, "-e", "process.on('SIGTERM', () => {}); while (true) {}"], { detached: true, stdio: ["pipe", "pipe", "pipe", "pipe"] });
 while (!existsSync(coalescedHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
 coalesced.stdin.write("go\\nstop\\n");
 await waitForExit(coalesced, "coalesced native commands");
@@ -1155,11 +1233,31 @@ const coalescedSafe = groupMembers(coalesced.pid).length === 0;
 const stdinHandshake = path.join(root, "stdin.json");
 const stdinMarker = path.join(root, "stdin-marker");
 const stdinProvider = \`const fs = require('node:fs'); fs.writeFileSync(\${JSON.stringify(stdinMarker)}, fs.readFileSync(0, 'utf8'));\`;
-const stdinChild = spawn("/tmp/agent-supervisor", [stdinHandshake, process.execPath, "-e", stdinProvider], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+const stdinChild = spawn("/tmp/agent-supervisor", [stdinHandshake, process.execPath, "-e", stdinProvider], { detached: true, stdio: ["pipe", "pipe", "pipe", "pipe"] });
 while (!existsSync(stdinHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
 stdinChild.stdin.write("go\\n");
 const stdinExit = await waitForExit(stdinChild, "provider stdin isolation");
 const stdinSafe = stdinExit.code === 0 && readFileSync(stdinMarker, "utf8") === "" && groupMembers(stdinChild.pid).length === 0;
+
+// fd 3 is launch-owner control, not provider data. The provider must observe
+// it closed while the manager still receives the supervisor's acknowledgement.
+const controlHandshake = path.join(root, "control.json");
+const controlMarker = path.join(root, "control-marker");
+const controlProvider = \`const fs = require('node:fs'); let target = 'closed'; try { target = fs.readlinkSync('/proc/self/fd/3'); } catch {} fs.writeFileSync(\${JSON.stringify(controlMarker)}, target);\`;
+const controlChild = spawn("/tmp/agent-supervisor", [controlHandshake, process.execPath, "-e", controlProvider], { detached: true, stdio: ["pipe", "pipe", "pipe", "pipe"] });
+while (!existsSync(controlHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
+const ownerControlTarget = readlinkSync(\`/proc/\${controlChild.pid}/fd/3\`);
+const controlAck = Promise.race([
+  new Promise((resolve) => controlChild.stdio[3].once("data", (chunk) => resolve(chunk.toString()))),
+  new Promise((resolve) => setTimeout(() => resolve("timeout"), 10000)),
+]);
+controlChild.stdin.write("go\\n");
+const [controlOutput, controlExit] = await Promise.all([controlAck, waitForExit(controlChild, "provider control isolation")]);
+const controlMarkerValue = readFileSync(controlMarker, "utf8");
+const controlFdSafe = controlExit.code === 0
+  && controlOutput === manager.LAUNCH_AUTHORIZED_CONTROL + "\\n"
+  && controlMarkerValue !== ownerControlTarget
+  && groupMembers(controlChild.pid).length === 0;
 
 // Linux clone children created without a SIGCHLD exit signal require __WALL
 // for waitpid/waitid. The supervisor must reap an adopted clone child before
@@ -1183,7 +1281,7 @@ writeFileSync(cloneSourcePath, [
 const cloneBuild = spawnSync("cc", [cloneSourcePath, "-O2", "-o", cloneProvider], { encoding: "utf8" });
 if (cloneBuild.status !== 0) throw new Error("clone helper failed to compile: " + cloneBuild.stderr);
 const cloneHandshake = path.join(root, "clone.json");
-const cloned = spawn("/tmp/agent-supervisor", [cloneHandshake, cloneProvider], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+const cloned = spawn("/tmp/agent-supervisor", [cloneHandshake, cloneProvider], { detached: true, stdio: ["pipe", "pipe", "pipe", "pipe"] });
 while (!existsSync(cloneHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
 cloned.stdin.write("go\\n");
 cloned.stdin.end();
@@ -1201,7 +1299,7 @@ const signalProvider = [
   \`spawn(process.execPath, ['-e', process.env.DESCENDANT], { detached: true, stdio: 'ignore', env: { ...process.env, READY: \${JSON.stringify(signalReady)} } });\`,
   "while (true) {}",
 ].join(" ");
-const signaled = spawn("/tmp/agent-supervisor", [signalHandshake, process.execPath, "-e", signalProvider], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+const signaled = spawn("/tmp/agent-supervisor", [signalHandshake, process.execPath, "-e", signalProvider], { detached: true, stdio: ["pipe", "pipe", "pipe", "pipe"] });
 while (!existsSync(signalHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
 signaled.stdin.write("go\\n");
 while (!existsSync(signalReady)) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1223,7 +1321,7 @@ const foreignProvider = [
   \`spawn(process.execPath, ['-e', \${JSON.stringify(foreignDescendant)}], { detached: true, stdio: 'ignore' });\`,
   "while (true) {}",
 ].join(" ");
-const foreign = spawn("/tmp/agent-supervisor", [foreignHandshake, process.execPath, "-e", foreignProvider], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+const foreign = spawn("/tmp/agent-supervisor", [foreignHandshake, process.execPath, "-e", foreignProvider], { detached: true, stdio: ["pipe", "pipe", "pipe", "pipe"] });
 while (!existsSync(foreignHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
 foreign.stdin.write("go\\n");
 const foreignReadyDeadline = Date.now() + 10000;
@@ -1265,10 +1363,10 @@ try {
   outcome.membersAfterShutdown = groupMembers(second.child.pid);
   outcome.descendantAfterShutdown = processInfo(second.descendantPid);
 } catch (error) { outcome.shutdownError = String(error && error.message); }
-const clean = nativeIdentitySafe && authorizationSafe && coalescedSafe && stdinSafe && cloneSafe && signalSafe && foreignUidSafe && !outcome.stopError && !outcome.shutdownError
+const clean = nativeIdentitySafe && authorizationSafe && coalescedSafe && stdinSafe && controlFdSafe && cloneSafe && signalSafe && foreignUidSafe && !outcome.stopError && !outcome.shutdownError
   && outcome.membersAfterStop.length === 0 && outcome.membersAfterShutdown.length === 0
   && outcome.descendantAfterStop == null && outcome.descendantAfterShutdown == null;
-console.log("RESULT " + JSON.stringify({ nativeIdentitySafe, authorizationSafe, coalescedSafe, stdinSafe, cloneSafe, signalSafe, foreignUidSafe, ...outcome, clean }));
+console.log("RESULT " + JSON.stringify({ nativeIdentitySafe, authorizationSafe, coalescedSafe, stdinSafe, controlFdSafe, controlOutput, controlExit, controlMarkerValue, ownerControlTarget, cloneSafe, signalSafe, foreignUidSafe, ...outcome, clean }));
 process.exit(clean ? 0 : 1);
 `;
   const repo = fileURLToPath(new URL("..", import.meta.url));
@@ -1296,6 +1394,7 @@ process.exit(clean ? 0 : 1);
   assert.equal(payload.authorizationSafe, true, "a failed authorized-handshake write must not release provider execution");
   assert.equal(payload.coalescedSafe, true, "coalesced native go/stop commands must tear down the provider");
   assert.equal(payload.stdinSafe, true, "provider stdin must be isolated from the supervisor control pipe");
+  assert.equal(payload.controlFdSafe, true, `provider code must not inherit or forge the launch-owner control channel: ${JSON.stringify(payload)}`);
   assert.equal(payload.cloneSafe, true, "clone children without SIGCHLD must be reaped before ownership is released");
   assert.equal(payload.signalSafe, true, "SIGTERM after a runtime disconnect must reap the complete provider tree");
   assert.equal(payload.foreignUidSafe, true, "credential changes must not remove descendants from the ownership proof");

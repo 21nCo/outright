@@ -159,12 +159,25 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const conversation = database.getConversation(conversationMatch[1]);
         if (!conversation) throw apiError(404, "Conversation not found");
         const messagePage = database.listMessagePage(conversation.id, { limit: 200 });
+        const worktreeInterruptedRun = database.findUnresolvedInterruptedRunForWorktree(conversation.worktreePath) ?? null;
+        const recoveryConversation = worktreeInterruptedRun ? database.getConversation(worktreeInterruptedRun.conversationId) : null;
         return json(response, 200, {
           ...conversation,
           messages: messagePage.messages,
           messagePage: messagePage.page,
           runs: database.listRuns(conversation.id),
           oldestInterruptedRun: database.findUnresolvedInterruptedRun(conversation.id) ?? null,
+          worktreeInterruptedRun,
+          recoveryConversation: recoveryConversation ? {
+            id: recoveryConversation.id,
+            title: recoveryConversation.title,
+            projectId: recoveryConversation.projectId,
+            worktreeId: recoveryConversation.worktreeId,
+            worktreePath: recoveryConversation.worktreePath,
+            archived: Boolean(recoveryConversation.archived),
+            provider: recoveryConversation.provider,
+            providerSessionId: recoveryConversation.providerSessionId,
+          } : null,
         });
       }
       if (conversationMatch && request.method === "PATCH") {
@@ -185,6 +198,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (conversationMoveMatch && request.method === "POST") {
         if (!database.getConversation(conversationMoveMatch[1])) throw apiError(404, "Conversation not found");
         const body = await readJson(request);
+        const unresolved = database.listUnresolvedInterruptedRuns(conversationMoveMatch[1]);
+        if (unresolved.some((run) => !run.worktreePath || run.worktreePath !== body.worktreePath)) {
+          throw apiError(409, "Resolve the interrupted run before moving this conversation away from its recovery worktree", { code: "RUN_RECOVERY_REQUIRED" });
+        }
         const { worktreePath: destinationPath } = await resolveWorktreeTarget(body);
         const conversation = database.moveConversation(conversationMoveMatch[1], { projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath });
         database.audit("conversation.moved", { target: conversation.id, projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath });
@@ -212,7 +229,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (!providerInfo?.available) throw apiError(409, `${provider} CLI is not available`);
         const userMessage = database.addMessage({ conversationId: conversation.id, role: "user", kind: "text", body: prompt });
         publish({ type: "message.created", conversationId: conversation.id, payload: userMessage });
-        const run = database.createRun({ conversationId: conversation.id, provider, model: body.model ?? conversation.model ?? settings.model, reasoningEffort: body.reasoningEffort || settings.reasoningEffort, approvalPolicy: body.approvalPolicy || settings.approvalPolicy, prompt });
+        const run = database.createRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, provider, model: body.model ?? conversation.model ?? settings.model, reasoningEffort: body.reasoningEffort || settings.reasoningEffort, approvalPolicy: body.approvalPolicy || settings.approvalPolicy, prompt });
         return json(response, 202, await agents.schedule({ conversation: database.getConversation(conversation.id), run }));
       }
       const runMatch = url.pathname.match(/^\/api\/runs\/([^/]+)$/);
@@ -249,7 +266,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         // a recorded discard would clear the submission gate and let a new run
         // start while the original descendants may still mutate the same
         // worktree.
-        for (const pending of database.listUnresolvedInterruptedRunsForWorktree(conversation.worktreePath)) {
+        for (const pending of database.listUnresolvedInterruptedRunsForWorktree(interrupted.worktreePath)) {
           if (pending.recoveryClass === "never-started") continue;
           if (!(Number.isSafeInteger(pending.pid) && pending.pid > 0)) {
             throw apiError(409, "An interrupted provider process cannot be verified, so no recovery decision can be recorded yet", { code: "RECOVERY_PROCESS_UNKNOWN", runId: pending.id });
@@ -318,10 +335,17 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         // older unresolved run still awaits a decision, or the newer run's
         // side effects could later be overwritten by the older recovery.
         // Discard remains allowed above because it schedules no work.
-        const unresolved = database.listUnresolvedInterruptedRunsForWorktree(conversation.worktreePath);
+        const unresolved = database.listUnresolvedInterruptedRunsForWorktree(interrupted.worktreePath);
         const selected = unresolved.findIndex((candidate) => candidate.id === interrupted.id);
         if (selected > 0) {
           throw apiError(409, "Resolve the older interrupted run before resuming or retrying this one", { code: "RECOVERY_ORDER_REQUIRED", runId: unresolved[0].id });
+        }
+
+        if (!interrupted.worktreePath) {
+          throw apiError(409, "This legacy run has no trustworthy launch worktree; discard it after process verification instead", { code: "RECOVERY_TARGET_UNKNOWN", runId: interrupted.id });
+        }
+        if (conversation.worktreePath !== interrupted.worktreePath) {
+          throw apiError(409, "The conversation target changed after this run started; move it back before resuming or retrying", { code: "RECOVERY_TARGET_CHANGED", runId: interrupted.id, worktreePath: interrupted.worktreePath });
         }
 
         // Resumed and retried runs revalidate worktree identity and trust at

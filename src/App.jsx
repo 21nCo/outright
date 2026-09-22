@@ -24,6 +24,7 @@ import { ContextPane } from "@/components/ContextPane";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { TerminalPane } from "@/components/TerminalPane";
 import { api, connectRuntime, query } from "@/lib/runtime-api";
+import { isComposerSubmitKey, recoveryBelongsToConversation, recoveryGate } from "@/recovery-policy";
 
 const MAX_RENDERED_MESSAGES = 1000;
 const MAX_STREAMING_CHARACTERS = 1024 * 1024;
@@ -257,10 +258,10 @@ export function App() {
 
   const activeRun = conversation?.runs?.find((run) => ["queued", "launching", "running"].includes(run.status));
   const latestRun = conversation?.runs?.[0];
-  // The dedicated value remains correct even when the oldest unresolved run
-  // falls outside the capped newest-first run history.
-  const interruptedRun = conversation?.oldestInterruptedRun
-    ?? conversation?.runs?.filter((run) => run.status === "interrupted" && !run.recoveryDecision).at(-1);
+  // Worktree-wide recovery metadata gates sibling chats before submission;
+  // the conversation-local values remain fallbacks for older runtimes.
+  const interruptedRun = recoveryGate(conversation);
+  const recoveryConversation = conversation?.recoveryConversation ?? null;
 
   async function resolveRecovery(run, policy) {
     try {
@@ -269,6 +270,24 @@ export function App() {
     } catch (nextError) {
       setError(nextError.payload?.code === "NO_PROVIDER_SESSION" ? "No provider session is available to resume" : nextError.message);
     }
+  }
+
+  async function openRecoveryConversation() {
+    if (!recoveryConversation?.id) return;
+    try {
+      if (recoveryConversation.archived) {
+        await api(`/api/conversations/${recoveryConversation.id}`, { method: "PATCH", body: { archived: false } });
+      }
+      if (recoveryConversation.projectId === selectedProjectRef.current && recoveryConversation.worktreeId === selectedWorktreeRef.current) {
+        await loadConversations(recoveryConversation.id);
+        return;
+      }
+      const ownerProject = bootstrap?.projects.find((item) => item.id === recoveryConversation.projectId);
+      const ownerWorktree = ownerProject?.worktrees.find((item) => item.id === recoveryConversation.worktreeId);
+      if (!ownerProject || !ownerWorktree) throw new Error("The recovery chat worktree is no longer available");
+      pendingConversationRef.current = recoveryConversation.id;
+      await chooseProject(ownerProject, ownerWorktree);
+    } catch (nextError) { setError(nextError.message); }
   }
 
   async function chooseProject(nextProject, explicitWorktree) {
@@ -295,10 +314,10 @@ export function App() {
     let target = targetOverride ?? conversation;
     if (!target) target = await createConversation(prompt.split(/\n/)[0].slice(0, 52));
     if (!target || !isSelectedTarget(target)) return;
-    setDraft(""); setStreamingText(""); setRunEvents([]);
     try {
       const run = await api(`/api/conversations/${target.id}/runs`, { method: "POST", body: { prompt, provider: target.provider || settings.provider, model: target.model || settings.model, reasoningEffort: settings.reasoningEffort, approvalPolicy: settings.approvalPolicy } });
       if (!isSelectedTarget(target)) return;
+      setDraft(""); setStreamingText(""); setRunEvents([]);
       setConversation((current) => {
         if (current && current.id !== target.id) return current;
         const next = current ?? { ...target, messages: [], runs: [] };
@@ -307,7 +326,10 @@ export function App() {
     } catch (nextError) {
       if (!isSelectedTarget(target)) return;
       if (nextError.payload?.code === "PROJECT_TRUST_REQUIRED") { setPendingPrompt({ prompt, target }); setTrustRequest(nextError.payload.project); }
-      else setError(nextError.message);
+      else {
+        if (nextError.payload?.code === "RUN_RECOVERY_REQUIRED") await loadConversation();
+        setError(nextError.message);
+      }
     }
   }
   async function trustAndRun() {
@@ -350,8 +372,8 @@ export function App() {
   async function createGroup(event) { event.preventDefault(); try { await api("/api/groups", { method: "POST", body: { name: newGroupName } }); setNewGroupName(""); setNewGroupOpen(false); await refreshGroups(); setToast("Project group created"); } catch (nextError) { setError(nextError.message); } }
   async function refreshGroups() { const projectGroups = await api("/api/groups"); setBootstrap((current) => ({ ...current, projectGroups })); }
   async function moveProject(projectId, groupId) { try { const projectGroups = await api("/api/project-memberships", { method: "PUT", body: { projectId, groupId } }); setBootstrap((current) => ({ ...current, projectGroups })); setToast("Project group updated"); } catch (nextError) { setError(nextError.message); } }
-  async function updateConversation(patch) { try { const updated = await api(`/api/conversations/${conversation.id}`, { method: "PATCH", body: patch }); setConversation((current) => ({ ...current, ...updated })); await loadConversations(updated.id); return updated; } catch (nextError) { setError(nextError.message); } }
-  async function archiveConversation() { await updateConversation({ archived: true }); setSelectedConversationId(""); setManageChatOpen(false); }
+  async function updateConversation(patch) { try { const updated = await api(`/api/conversations/${conversation.id}`, { method: "PATCH", body: patch }); setConversation((current) => ({ ...current, ...updated })); await loadConversations(updated.id); return updated; } catch (nextError) { setError(nextError.message); return null; } }
+  async function archiveConversation() { const updated = await updateConversation({ archived: true }); if (!updated) return; setSelectedConversationId(""); setManageChatOpen(false); }
   async function saveChatSettings(event) {
     event.preventDefault();
     const { destination, ...patch } = chatDraft;
@@ -411,8 +433,8 @@ export function App() {
         <section className="conversation-pane">
           <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} onManage={openManageChat} />
           <ScrollArea className="message-scroll" viewportRef={messageViewportRef}><div className="message-column">{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? conversation.messages.map((message) => <Message key={message.id} message={message} />) : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}{conversation?.messagePage?.hasLater && <button className="history-return" onClick={loadConversation}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button>}</div></ScrollArea>
-          {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} onResolve={resolveRecovery} />}
-          <form className="composer" onSubmit={sendPrompt}><textarea aria-label="Message the agent" disabled={Boolean(interruptedRun)} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={setDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running"><span className="status-dot demo" />Agent is {activeRun.status}</span> : interruptedRun ? <span className="send-hint running"><WarningCircle />Recovery decision required</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop agent"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun)} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
+          {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}
+          <form className="composer" onSubmit={sendPrompt}><textarea aria-label="Message the agent" disabled={Boolean(interruptedRun)} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={setDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running"><span className="status-dot demo" />Agent is {activeRun.status}</span> : interruptedRun ? <span className="send-hint running"><WarningCircle />Recovery decision required</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop agent"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun)} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
         </section>
         {inspector && <aside className="inspector"><header><nav aria-label="Inspector panels"><button className={inspector === "changes" ? "is-active" : ""} aria-pressed={inspector === "changes"} onClick={() => setInspector("changes")}><GitDiff />Changes</button><button className={inspector === "terminal" ? "is-active" : ""} aria-pressed={inspector === "terminal"} onClick={() => setInspector("terminal")}><TerminalWindow />Terminal</button><button className={inspector === "context" ? "is-active" : ""} aria-pressed={inspector === "context"} onClick={() => setInspector("context")}><TreeStructure />Context</button></nav><Button variant="ghost" size="icon-xs" onClick={() => setInspector(null)} aria-label="Close inspector"><X /></Button></header><div className="inspector-body">{inspector === "changes" && <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />}{inspector === "terminal" && <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} sendRuntime={sendRuntime} onError={handleError} />}{inspector === "context" && <ContextPane worktree={worktree} settings={settings} onError={handleError} />}</div></aside>}
       </div>
@@ -440,7 +462,7 @@ function StreamingMessage({ text, events }) { return <article className="message
 function RunningMessage({ run, events }) { return <article className="message is-agent is-streaming"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" /></div><p className="thinking-copy">{run.status === "queued" ? "Waiting for an execution slot…" : "Working in this worktree…"}</p><ToolActivity events={events} /></div></article>; }
 // Interrupted runs surface here until the operator picks a continuation
 // policy; the preserved partial output stays visible above the notice.
-function RecoveryNotice({ run, conversation, onResolve }) {
+function RecoveryNotice({ run, conversation, recoveryConversation, onOpenRecovery, onResolve }) {
   const classCopy = {
     "never-started": "it was still queued, so no provider process started and no side effects happened",
     exited: "its provider process exited during the restart; partial side effects may exist in the worktree",
@@ -449,8 +471,10 @@ function RecoveryNotice({ run, conversation, onResolve }) {
   }[run.recoveryClass ?? "unknown"];
   // `||`, not `??`: an empty-string conversation session must not hide a
   // session still recorded on the interrupted run.
-  const sessionId = run.providerSessionId || (conversation?.provider === run.provider ? conversation?.providerSessionId : null);
-  return <div className="recovery-notice" role="alert"><WarningCircle weight="fill" /><div className="recovery-copy"><strong>Run interrupted by a runtime restart</strong><p>Reconciliation found {classCopy}. Review the preserved partial output above, then choose how to continue before anything is retried.</p></div><div className="recovery-actions"><Button size="sm" disabled={!sessionId} onClick={() => onResolve(run, "resume-session")}><ArrowsClockwise />Resume session</Button><Button size="sm" variant="outline" onClick={() => onResolve(run, "retry")}>Retry from scratch</Button><Button size="sm" variant="ghost" onClick={() => onResolve(run, "discard")}>Discard</Button></div></div>;
+  const ownsRecovery = recoveryBelongsToConversation(run, conversation);
+  const owner = ownsRecovery ? conversation : recoveryConversation;
+  const sessionId = run.providerSessionId || (owner?.provider === run.provider ? owner?.providerSessionId : null);
+  return <div className="recovery-notice" role="alert"><WarningCircle weight="fill" /><div className="recovery-copy"><strong>{ownsRecovery ? "Run interrupted by a runtime restart" : `Recovery required in ${owner?.title ?? "another chat"}`}</strong><p>{ownsRecovery ? `Reconciliation found ${classCopy}. Review the preserved partial output above, then choose how to continue before anything is retried.` : "Another chat in this worktree owns an interrupted run. Open it to inspect the preserved output and choose an explicit continuation policy."}</p></div><div className="recovery-actions">{ownsRecovery ? <><Button size="sm" disabled={!sessionId} onClick={() => onResolve(run, "resume-session")}><ArrowsClockwise />Resume session</Button><Button size="sm" variant="outline" onClick={() => onResolve(run, "retry")}>Retry from scratch</Button><Button size="sm" variant="ghost" onClick={() => onResolve(run, "discard")}>Discard</Button></> : <Button size="sm" onClick={onOpenRecovery}><ChatCircle />Open recovery chat</Button>}</div></div>;
 }
 function ToolActivity({ events }) { if (!events.length) return null; return <div className="tool-activity">{events.slice(-4).map((event) => <div key={event.id}><CheckCircle /><span>{toolLabel(event)}</span></div>)}</div>; }
 function EmptyChat({ worktree, onCreate }) { return <div className="empty-chat"><ChatCircle size={29} /><h2>Start in {worktree.name}</h2><p>Create a durable conversation, then run Codex or Claude directly in this worktree.</p><Button onClick={onCreate}><Plus />New chat</Button></div>; }

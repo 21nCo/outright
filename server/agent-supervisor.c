@@ -24,6 +24,7 @@
 #define INPUT_CAPACITY 4096
 #define TEARDOWN_BUDGET_MS 750
 #define AUTHORIZED_CONTROL "__OUTRIGHT_LAUNCH_AUTHORIZED_V1__"
+#define CONTROL_FD 3
 
 static volatile sig_atomic_t termination_requested = 0;
 
@@ -323,6 +324,10 @@ static int authorize_provider(char **provider_argv, const char *handshake_path, 
     do { received = read(authorization_pipe[0], &authorization, 1); } while (received < 0 && errno == EINTR);
     close(authorization_pipe[0]);
     if (received != 1 || authorization != '1') _exit(126);
+    // fd 3 belongs exclusively to the launch owner. Close it before exec so
+    // arbitrary provider code cannot forge acknowledgements or keep the
+    // manager's control channel open after the supervisor exits.
+    close(CONTROL_FD);
     int null_input = open("/dev/null", O_RDONLY);
     if (null_input < 0 || dup2(null_input, STDIN_FILENO) < 0) _exit(126);
     if (null_input != STDIN_FILENO) close(null_input);
@@ -446,10 +451,11 @@ int main(int argc, char **argv) {
             }
             authorized = true;
             // Acknowledge only after the provider identity is durable and the
-            // authorization byte has been delivered. If the manager's output
-            // pipe is gone, tear the owned tree down instead of running work
-            // that no runtime has observed as scheduled.
-            if (dprintf(STDOUT_FILENO, "%s\n", AUTHORIZED_CONTROL) < 0 && !stopping) {
+            // authorization byte has been delivered. Keep control on fd 3 so
+            // arbitrary provider stdout can never merge with or forge it. If
+            // the manager pipe is gone, tear the owned tree down instead of
+            // running work no runtime observed as scheduled.
+            if (dprintf(CONTROL_FD, "%s\n", AUTHORIZED_CONTROL) < 0 && !stopping) {
               stopping = true;
               stop_requested = true;
               teardown_deadline = monotonic_ms() + TEARDOWN_BUDGET_MS;

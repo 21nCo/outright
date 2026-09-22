@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import Database from "better-sqlite3";
 import { Readable } from "node:stream";
 import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -55,6 +56,27 @@ function withRuntime(fn, options = {}) {
       rmSync(dataDirectory, { recursive: true, force: true });
     }
   };
+}
+
+function seedLegacyUnknownTargetDatabase(filename) {
+  const legacy = new Database(filename);
+  legacy.exec(`
+    CREATE TABLE conversations (
+      id TEXT PRIMARY KEY, project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, worktree_path TEXT NOT NULL,
+      title TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', provider_session_id TEXT, tab_position INTEGER NOT NULL DEFAULT 0,
+      archived INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT 'medium', approval_policy TEXT NOT NULL, prompt TEXT NOT NULL,
+      status TEXT NOT NULL, pid INTEGER, provider_session_id TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+      exit_code INTEGER, error TEXT, cost_usd REAL, input_tokens INTEGER, output_tokens INTEGER,
+      recovery_class TEXT, recovery_decision TEXT
+    );
+    INSERT INTO conversations VALUES ('legacy-conversation', 'project-1', 'tree-1', '/tmp/current-target', 'Legacy recovery', 'codex', '', NULL, 0, 0, 0, '2026-09-21T00:00:00.000Z', '2026-09-21T00:00:00.000Z');
+    INSERT INTO runs VALUES ('legacy-interrupted', 'legacy-conversation', 'codex', '', 'medium', 'read-only', 'half done', 'interrupted', NULL, NULL, '2026-09-21T00:00:00.000Z', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'never-started', NULL);
+  `);
+  legacy.close();
 }
 
 // A full harness with a real discovered, trusted git worktree and a fake
@@ -115,6 +137,33 @@ test("reconciles runs at startup and resolves discard decisions through the API"
   await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), repeat);
   assert.equal(repeat.statusCode, 409, "decisions are final");
 }));
+
+test("legacy runs without a trustworthy target reject replacement work but allow discard", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-legacy-runtime-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  let runtime;
+  try {
+    seedLegacyUnknownTargetDatabase(path.join(dataDirectory, "outright.db"));
+    process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    assert.equal(runtime.database.getRun("legacy-interrupted").worktreePath, null);
+
+    const retry = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/runs/legacy-interrupted/resume", { policy: "retry" }), retry);
+    assert.equal(retry.statusCode, 409);
+    assert.equal(retry.body.code, "RECOVERY_TARGET_UNKNOWN");
+    assert.equal(runtime.database.getRun("legacy-interrupted").recoveryDecision, null);
+
+    const discard = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/runs/legacy-interrupted/resume", { policy: "discard" }), discard);
+    assert.equal(discard.statusCode, 200);
+    assert.equal(discard.body.recoveryDecision, "discard");
+  } finally {
+    await runtime?.shutdown();
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
 
 test("holds an exclusive runtime lease before startup reconciliation", async () => {
   const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-lease-"));
@@ -379,6 +428,21 @@ test("an interrupted run gates every conversation targeting the same worktree", 
   const interrupted = runtime.database.createRun({ conversationId: first.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
   runtime.database.updateRun(interrupted.id, { status: "interrupted", recoveryClass: "unknown" });
 
+  const loadedSibling = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `/api/conversations/${sibling.id}`), loadedSibling);
+  assert.equal(loadedSibling.statusCode, 200);
+  assert.equal(loadedSibling.body.worktreeInterruptedRun.id, interrupted.id, "sibling chats receive the worktree-wide recovery gate before submission");
+  assert.deepEqual(loadedSibling.body.recoveryConversation, {
+    id: first.id,
+    title: "First",
+    projectId: "project-1",
+    worktreeId: "tree-1",
+    worktreePath: "/tmp/shared-tree",
+    archived: false,
+    provider: "codex",
+    providerSessionId: null,
+  }, "the UI can route to the visible chat that owns recovery");
+
   const blocked = responseCapture();
   await runtime.handleRequest(requestStream("POST", `/api/conversations/${sibling.id}/runs`, { prompt: "start from another chat" }), blocked);
   assert.equal(blocked.statusCode, 409);
@@ -388,6 +452,57 @@ test("an interrupted run gates every conversation targeting the same worktree", 
   const unrelated = responseCapture();
   await runtime.handleRequest(requestStream("POST", `/api/conversations/${other.id}/runs`, { prompt: "different checkout" }), unrelated);
   assert.notEqual(unrelated.body.code, "RUN_RECOVERY_REQUIRED", "a different worktree is not recovery-gated by this run");
+}));
+
+test("unresolved recovery cannot be moved or archived away from its original worktree gate", withRuntime(async (runtime) => {
+  const owner = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/original-tree", title: "Owner", provider: "codex" });
+  const originalSibling = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/original-tree", title: "Original sibling", provider: "codex" });
+  const destination = runtime.database.createConversation({ projectId: "project-2", worktreeId: "tree-2", worktreePath: "/tmp/destination-tree", title: "Destination", provider: "codex" });
+  const interrupted = runtime.database.createRun({ conversationId: owner.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+  runtime.database.updateRun(interrupted.id, { status: "interrupted", recoveryClass: "never-started" });
+
+  const moved = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/conversations/${owner.id}/move`, { projectId: "project-2", worktreeId: "tree-2", worktreePath: "/tmp/destination-tree" }), moved);
+  assert.equal(moved.statusCode, 409);
+  assert.match(moved.body.error, /before moving/);
+  assert.equal(runtime.database.getConversation(owner.id).worktreePath, "/tmp/original-tree");
+  assert.equal(runtime.database.getRun(interrupted.id).worktreePath, "/tmp/original-tree");
+
+  const archived = responseCapture();
+  await runtime.handleRequest(requestStream("PATCH", `/api/conversations/${owner.id}`, { archived: true }), archived);
+  assert.equal(archived.statusCode, 409);
+  assert.match(archived.body.error, /before archiving/);
+  assert.equal(runtime.database.getConversation(owner.id).archived, 0);
+
+  const originalBlocked = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/conversations/${originalSibling.id}/runs`, { prompt: "must stay blocked" }), originalBlocked);
+  assert.equal(originalBlocked.statusCode, 409);
+  assert.equal(originalBlocked.body.runId, interrupted.id);
+
+  const destinationSubmission = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/conversations/${destination.id}/runs`, { prompt: "independent destination" }), destinationSubmission);
+  assert.notEqual(destinationSubmission.body.code, "RUN_RECOVERY_REQUIRED", "the unresolved run never transfers its gate to the destination");
+}));
+
+test("archived legacy recovery owners can be surfaced and unarchived from a sibling chat", withRuntime(async (runtime) => {
+  const owner = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/archived-recovery", title: "Archived owner", provider: "codex" });
+  runtime.database.updateConversation(owner.id, { archived: true });
+  const sibling = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/archived-recovery", title: "Visible sibling", provider: "codex" });
+  const interrupted = runtime.database.createRun({ conversationId: owner.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+  runtime.database.updateRun(interrupted.id, { status: "interrupted", recoveryClass: "never-started" });
+
+  const loadedSibling = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `/api/conversations/${sibling.id}`), loadedSibling);
+  assert.equal(loadedSibling.statusCode, 200);
+  assert.equal(loadedSibling.body.worktreeInterruptedRun.id, interrupted.id);
+  assert.equal(loadedSibling.body.recoveryConversation.id, owner.id);
+  assert.equal(loadedSibling.body.recoveryConversation.archived, true);
+
+  const unarchived = responseCapture();
+  await runtime.handleRequest(requestStream("PATCH", `/api/conversations/${owner.id}`, { archived: false }), unarchived);
+  assert.equal(unarchived.statusCode, 200);
+  assert.equal(unarchived.body.archived, 0);
+  assert.equal(runtime.database.listConversations({ projectId: "project-1", worktreeId: "tree-1" }).some((item) => item.id === owner.id), true);
 }));
 
 test("recovery verifies unresolved runs from sibling conversations on the worktree", withRuntime(async (runtime) => {

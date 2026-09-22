@@ -34,6 +34,81 @@ test("persists settings, groups, conversations, messages, runs, and search", () 
   }
 });
 
+test("runs retain immutable worktree ownership and unresolved recovery blocks move or archive", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/original", title: "Recovery owner", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+    database.updateRun(run.id, { status: "interrupted", recoveryClass: "never-started" });
+
+    assert.equal(database.getRun(run.id).worktreePath, "/tmp/original");
+    assert.throws(
+      () => database.moveConversation(conversation.id, { projectId: "project-2", worktreeId: "tree-2", worktreePath: "/tmp/destination" }),
+      (error) => error?.statusCode === 409 && /before moving/.test(error.message),
+    );
+    assert.throws(
+      () => database.updateConversation(conversation.id, { archived: true }),
+      (error) => error?.statusCode === 409 && /before archiving/.test(error.message),
+    );
+    assert.throws(
+      () => database.updateConversation(conversation.id, { archived: 1 }),
+      (error) => error?.statusCode === 400 && /must be a boolean/.test(error.message),
+    );
+    assert.equal(database.getConversation(conversation.id).worktreePath, "/tmp/original");
+    assert.equal(database.getConversation(conversation.id).archived, 0);
+    assert.equal(database.findUnresolvedInterruptedRunForWorktree("/tmp/original").id, run.id);
+    assert.equal(database.findUnresolvedInterruptedRunForWorktree("/tmp/destination"), undefined);
+
+    database.resolveInterruptedRun(run.id, "discard");
+    database.moveConversation(conversation.id, { projectId: "project-2", worktreeId: "tree-2", worktreePath: "/tmp/destination" });
+    assert.equal(database.getRun(run.id).worktreePath, "/tmp/original", "moving the chat never rewrites the run's launch identity");
+
+    const historicallyMoved = database.createConversation({ projectId: "project-2", worktreeId: "tree-2", worktreePath: "/tmp/destination", title: "Moved during execution", provider: "codex" });
+    const originalRun = database.createRun({ conversationId: historicallyMoved.id, worktreePath: "/tmp/original", provider: "codex", approvalPolicy: "read-only", prompt: "started before move" });
+    database.updateRun(originalRun.id, { status: "interrupted", recoveryClass: "never-started" });
+    const restored = database.moveConversation(historicallyMoved.id, { projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/original" });
+    assert.equal(restored.worktreePath, "/tmp/original", "an unresolved owner may move back to its immutable recovery target");
+  } finally {
+    database.close();
+  }
+});
+
+test("legacy unresolved runs with unknown launch targets gate every worktree conservatively", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-legacy-run-target-"));
+  const filename = path.join(root, "outright.db");
+  const legacy = new Database(filename);
+  legacy.exec(`
+    CREATE TABLE conversations (
+      id TEXT PRIMARY KEY, project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, worktree_path TEXT NOT NULL,
+      title TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', provider_session_id TEXT, tab_position INTEGER NOT NULL DEFAULT 0,
+      archived INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT 'medium', approval_policy TEXT NOT NULL, prompt TEXT NOT NULL,
+      status TEXT NOT NULL, pid INTEGER, provider_session_id TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+      exit_code INTEGER, error TEXT, cost_usd REAL, input_tokens INTEGER, output_tokens INTEGER,
+      recovery_class TEXT, recovery_decision TEXT
+    );
+    INSERT INTO conversations VALUES ('legacy-conversation', 'project-2', 'tree-2', '/tmp/current-target', 'Legacy recovery', 'codex', '', NULL, 0, 0, 0, '2026-09-21T00:00:00.000Z', '2026-09-21T00:00:00.000Z');
+    INSERT INTO runs VALUES ('legacy-interrupted', 'legacy-conversation', 'codex', '', 'medium', 'read-only', 'half done', 'interrupted', NULL, NULL, '2026-09-21T00:00:00.000Z', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'never-started', NULL);
+    INSERT INTO runs VALUES ('legacy-completed', 'legacy-conversation', 'codex', '', 'medium', 'read-only', 'done', 'completed', NULL, NULL, '2026-09-20T00:00:00.000Z', NULL, '2026-09-20T00:01:00.000Z', 0, NULL, NULL, NULL, NULL, NULL, NULL);
+  `);
+  legacy.close();
+
+  let database;
+  try {
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.getRun("legacy-interrupted").worktreePath, null, "migration must not guess a mutable conversation target for unresolved work");
+    assert.equal(database.getRun("legacy-completed").worktreePath, "/tmp/current-target", "terminal history may use the current conversation target");
+    assert.equal(database.findUnresolvedInterruptedRunForWorktree("/tmp/original-unknown").id, "legacy-interrupted");
+    assert.equal(database.findUnresolvedInterruptedRunForWorktree("/tmp/current-target").id, "legacy-interrupted");
+  } finally {
+    database?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("resolves a relative data directory to a stable absolute launch path", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-relative-data-"));
   const dataDirectory = path.relative(process.cwd(), path.join(root, "data"));

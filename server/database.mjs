@@ -135,6 +135,12 @@ export function createOutrightDatabase(options = {}) {
       return this.getConversation(id);
     },
     updateConversation(id, patch) {
+      if (patch.archived !== undefined && typeof patch.archived !== "boolean") {
+        throw databaseError(400, "Conversation archived state must be a boolean");
+      }
+      if (patch.archived === true && this.findUnresolvedInterruptedRun(id)) {
+        throw databaseError(409, "Resolve the interrupted run before archiving this conversation");
+      }
       const fields = [];
       const values = [];
       for (const [key, column] of Object.entries({ title: "title", provider: "provider", model: "model", archived: "archived", pinned: "pinned", providerSessionId: "provider_session_id", tabPosition: "tab_position" })) {
@@ -150,6 +156,10 @@ export function createOutrightDatabase(options = {}) {
       return this.getConversation(id);
     },
     moveConversation(id, destination) {
+      const unresolved = this.listUnresolvedInterruptedRuns(id);
+      if (unresolved.some((run) => !run.worktreePath || run.worktreePath !== destination.worktreePath)) {
+        throw databaseError(409, "Resolve the interrupted run before moving this conversation away from its recovery worktree");
+      }
       const position = db.prepare("SELECT COALESCE(MAX(tab_position), -1) + 1 AS position FROM conversations WHERE project_id = ? AND worktree_id = ?").get(destination.projectId, destination.worktreeId).position;
       db.prepare("UPDATE conversations SET project_id = ?, worktree_id = ?, worktree_path = ?, tab_position = ?, updated_at = ? WHERE id = ?")
         .run(destination.projectId, destination.worktreeId, destination.worktreePath, position, now(), id);
@@ -204,59 +214,61 @@ export function createOutrightDatabase(options = {}) {
     },
     createRun(input) {
       const run = { id: randomUUID(), status: "queued", createdAt: now(), ...input };
-      db.prepare(`INSERT INTO runs (id, conversation_id, provider, model, reasoning_effort, approval_policy, prompt, status, provider_session_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(run.id, run.conversationId, run.provider, run.model ?? "", run.reasoningEffort ?? "medium", run.approvalPolicy, run.prompt, run.status, run.providerSessionId ?? null, run.createdAt);
+      const worktreePath = run.worktreePath ?? this.getConversation(run.conversationId)?.worktreePath;
+      if (!worktreePath) throw databaseError(400, "Run worktree path is required");
+      db.prepare(`INSERT INTO runs (id, conversation_id, worktree_path, provider, model, reasoning_effort, approval_policy, prompt, status, provider_session_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(run.id, run.conversationId, worktreePath, run.provider, run.model ?? "", run.reasoningEffort ?? "medium", run.approvalPolicy, run.prompt, run.status, run.providerSessionId ?? null, run.createdAt);
       return this.getRun(run.id);
     },
     getRun(id) {
-      return db.prepare(`SELECT id, conversation_id AS conversationId, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
+      return db.prepare(`SELECT id, conversation_id AS conversationId, worktree_path AS worktreePath, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
         prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
         finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
         output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision FROM runs WHERE id = ?`).get(id);
     },
     listRuns(conversationId, limit = 200) {
       const boundedLimit = Math.max(1, Math.min(500, Number(limit) || 200));
-      return db.prepare(`SELECT id, conversation_id AS conversationId, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
+      return db.prepare(`SELECT id, conversation_id AS conversationId, worktree_path AS worktreePath, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
         prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
         finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
         output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision FROM runs WHERE conversation_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(conversationId, boundedLimit);
     },
     listUnresolvedInterruptedRuns(conversationId) {
-      return db.prepare(`SELECT id, conversation_id AS conversationId, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
+      return db.prepare(`SELECT id, conversation_id AS conversationId, worktree_path AS worktreePath, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
         prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
         finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
         output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision
         FROM runs WHERE conversation_id = ? AND status = 'interrupted' AND recovery_decision IS NULL ORDER BY created_at, rowid`).all(conversationId);
     },
     findUnresolvedInterruptedRun(conversationId) {
-      return db.prepare(`SELECT id, conversation_id AS conversationId, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
+      return db.prepare(`SELECT id, conversation_id AS conversationId, worktree_path AS worktreePath, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
         prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
         finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
         output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision
         FROM runs WHERE conversation_id = ? AND status = 'interrupted' AND recovery_decision IS NULL ORDER BY created_at, rowid LIMIT 1`).get(conversationId);
     },
     listUnresolvedInterruptedRunsForWorktree(worktreePath) {
-      return db.prepare(`SELECT runs.id, runs.conversation_id AS conversationId, runs.provider, runs.model,
+      return db.prepare(`SELECT runs.id, runs.conversation_id AS conversationId, runs.worktree_path AS worktreePath, runs.provider, runs.model,
         runs.reasoning_effort AS reasoningEffort, runs.approval_policy AS approvalPolicy, runs.prompt, runs.status, runs.pid,
         runs.provider_session_id AS providerSessionId, runs.created_at AS createdAt, runs.started_at AS startedAt,
         runs.finished_at AS finishedAt, runs.exit_code AS exitCode, runs.error, runs.cost_usd AS costUsd,
         runs.input_tokens AS inputTokens, runs.output_tokens AS outputTokens, runs.recovery_class AS recoveryClass,
         runs.recovery_decision AS recoveryDecision
-        FROM runs JOIN conversations ON conversations.id = runs.conversation_id
-        WHERE conversations.worktree_path = ? AND runs.status = 'interrupted' AND runs.recovery_decision IS NULL
-        ORDER BY runs.created_at, runs.rowid`).all(worktreePath);
+        FROM runs
+        WHERE (runs.worktree_path = ? OR runs.worktree_path IS NULL) AND runs.status = 'interrupted' AND runs.recovery_decision IS NULL
+        ORDER BY CASE WHEN runs.worktree_path IS NULL THEN 0 ELSE 1 END, runs.created_at, runs.rowid`).all(worktreePath);
     },
     findUnresolvedInterruptedRunForWorktree(worktreePath) {
-      return db.prepare(`SELECT runs.id, runs.conversation_id AS conversationId, runs.provider, runs.model,
+      return db.prepare(`SELECT runs.id, runs.conversation_id AS conversationId, runs.worktree_path AS worktreePath, runs.provider, runs.model,
         runs.reasoning_effort AS reasoningEffort, runs.approval_policy AS approvalPolicy, runs.prompt, runs.status, runs.pid,
         runs.provider_session_id AS providerSessionId, runs.created_at AS createdAt, runs.started_at AS startedAt,
         runs.finished_at AS finishedAt, runs.exit_code AS exitCode, runs.error, runs.cost_usd AS costUsd,
         runs.input_tokens AS inputTokens, runs.output_tokens AS outputTokens, runs.recovery_class AS recoveryClass,
         runs.recovery_decision AS recoveryDecision
-        FROM runs JOIN conversations ON conversations.id = runs.conversation_id
-        WHERE conversations.worktree_path = ? AND runs.status = 'interrupted' AND runs.recovery_decision IS NULL
-        ORDER BY runs.created_at, runs.rowid LIMIT 1`).get(worktreePath);
+        FROM runs
+        WHERE (runs.worktree_path = ? OR runs.worktree_path IS NULL) AND runs.status = 'interrupted' AND runs.recovery_decision IS NULL
+        ORDER BY CASE WHEN runs.worktree_path IS NULL THEN 0 ELSE 1 END, runs.created_at, runs.rowid LIMIT 1`).get(worktreePath);
     },
     getLaunchHandshake(runId) {
       return readLaunchHandshake(launchDirectory, runId);
@@ -358,6 +370,7 @@ export function createOutrightDatabase(options = {}) {
         }
         const run = this.createRun({
           conversationId: interrupted.conversationId,
+          worktreePath: interrupted.worktreePath,
           provider: interrupted.provider,
           model: interrupted.model,
           reasoningEffort: interrupted.reasoningEffort,
@@ -451,7 +464,7 @@ function migrate(db) {
     CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation_id, created_at);
     CREATE TABLE IF NOT EXISTS runs (
       id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-      provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT 'medium', approval_policy TEXT NOT NULL, prompt TEXT NOT NULL,
+      worktree_path TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT 'medium', approval_policy TEXT NOT NULL, prompt TEXT NOT NULL,
       status TEXT NOT NULL, pid INTEGER, provider_session_id TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
       exit_code INTEGER, error TEXT, cost_usd REAL, input_tokens INTEGER, output_tokens INTEGER,
       recovery_class TEXT, recovery_decision TEXT
@@ -470,6 +483,15 @@ function migrate(db) {
   try { db.exec("ALTER TABLE runs ADD COLUMN pid INTEGER"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN recovery_class TEXT"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN recovery_decision TEXT"); } catch { /* Already migrated. */ }
+  try { db.exec("ALTER TABLE runs ADD COLUMN worktree_path TEXT"); } catch { /* Already migrated. */ }
+  // Terminal legacy rows no longer own execution and can use the
+  // conversation's current target for history display. A pending or
+  // interrupted legacy row may have started before its conversation moved;
+  // leave that target unknown so it gates every worktree until recovery is
+  // resolved instead of guessing a path that could release the real checkout.
+  db.exec(`UPDATE runs SET worktree_path = (SELECT worktree_path FROM conversations WHERE conversations.id = runs.conversation_id)
+    WHERE worktree_path IS NULL AND status IN ('completed', 'failed', 'stopped')`);
+  db.exec("CREATE INDEX IF NOT EXISTS runs_worktree_recovery ON runs(worktree_path, status, recovery_decision, created_at)");
 }
 
 function conversationColumns() {

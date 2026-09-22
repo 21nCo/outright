@@ -17,6 +17,7 @@ const CHECKPOINT_INTERVAL_MS = 500;
 const LINUX_AGENT_SUPERVISOR = process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH
   || fileURLToPath(new URL("./bin/agent-supervisor", import.meta.url));
 export const LAUNCH_AUTHORIZED_CONTROL = "__OUTRIGHT_LAUNCH_AUTHORIZED_V1__";
+const LAUNCH_CONTROL_FD = 3;
 
 // Crash-safe launch handshake. The provider is never spawned directly: this
 // tiny wrapper records its own process identity durably, then waits for the
@@ -211,11 +212,11 @@ process.stdin.on("data", (chunk) => {
         providerResult = { code, signal };
         finishWhenOwnedGroupIsEmpty();
       });
-      // The manager must not report the run as scheduled until the launch
-      // owner confirms that it consumed authorization after persisting the
-      // provider identity. This line is intercepted and never exposed as
-      // provider output.
-      process.stdout.write(${JSON.stringify(LAUNCH_AUTHORIZED_CONTROL)} + "\\n");
+      // Keep launch ownership control off provider stdout. Providers may emit
+      // arbitrary bytes (including unterminated prefixes or the control token
+      // itself), so only the manager-owned fd 3 can acknowledge authorization.
+      try { fs.writeSync(${LAUNCH_CONTROL_FD}, ${JSON.stringify(LAUNCH_AUTHORIZED_CONTROL)} + "\\n"); }
+      catch { teardown(); }
       continue;
     }
     if (command === "stop") {
@@ -296,7 +297,9 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     const child = spawnProcess(launch.executable, launch.args, {
       cwd: conversation.worktreePath,
       env: sanitizedEnvironment(process.env),
-      stdio: ["pipe", "pipe", "pipe"],
+      // fd 3 is a manager-only launch-control channel. The provider inherits
+      // stdout/stderr from its owner but never inherits this descriptor.
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
       // Own process group on POSIX so descendants can be terminated together.
       detached: process.platform !== "win32",
     });
@@ -313,16 +316,24 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     const launchAuthorized = new Promise((resolve) => { resolveLaunchAuthorized = resolve; });
     consumeBoundedLines(child.stdout, {
       maxLineBytes: MAX_PROVIDER_LINE_BYTES,
-      onLine: (line) => {
-        if (line === LAUNCH_AUTHORIZED_CONTROL) {
-          state.launchAuthorized = true;
-          resolveLaunchAuthorized();
-          return;
-        }
-        handleProviderLine(state, line);
-      },
+      onLine: (line) => handleProviderLine(state, line),
       onOverflow: () => emit(run.id, "process.output_truncated", { stream: "stdout", maxBytes: MAX_PROVIDER_LINE_BYTES }),
     });
+    const control = child.stdio?.[LAUNCH_CONTROL_FD];
+    if (!control) {
+      state.processError = new Error("Launch owner control channel is unavailable");
+    } else {
+      consumeBoundedLines(control, {
+        maxLineBytes: 256,
+        onLine: (line) => {
+          if (line !== LAUNCH_AUTHORIZED_CONTROL) return;
+          state.launchAuthorized = true;
+          resolveLaunchAuthorized();
+        },
+        onOverflow: () => { state.processError ??= new Error("Launch owner control message was malformed"); },
+      });
+      control.on?.("error", (error) => { state.processError ??= error; });
+    }
     child.stderr.on("data", (chunk) => {
       const text = chunk.toString();
       state.stderr = `${state.stderr}${text}`.slice(-16_000);
@@ -468,19 +479,18 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     state.stopped = true;
     // Keep the capacity reservation until both validation and tree shutdown end.
     if (state.child) terminateTree(state.child, "SIGTERM");
+    // Cancellation must not wait for an acknowledgement that may never arrive.
+    // stdin ordering guarantees a post-authorization stop follows "go", while
+    // an unauthorized owner treats stop/end as abandonment.
+    if (state.child && state.ownsDescendants) requestWrapperTeardown(state);
     state.stopping = (async () => {
-      await state.launch;
       if (state.child) {
         const started = Date.now();
         // Do not depend on the first process-group SIGTERM winning the spawn /
         // setsid race. The supervisor command is the authoritative teardown
         // request and is safe when cancellation kept it unauthorized. Generic
         // wrappers retain the configured graceful window below.
-        let teardownRequested = false;
-        if (state.ownsDescendants) {
-          requestWrapperTeardown(state);
-          teardownRequested = true;
-        }
+        let teardownRequested = Boolean(state.ownsDescendants);
         let escalated = false;
         let groupEscalated = false;
         while (state.ownsDescendants
@@ -547,10 +557,14 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
         try {
           const fresh = database.getConversation(entry.run.conversationId);
           if (!fresh) throw new Error("Conversation no longer exists");
+          if (entry.run.worktreePath && fresh.worktreePath !== entry.run.worktreePath) {
+            throw new Error("Conversation target changed after this run was queued; submit again");
+          }
           const authorize = await validateConversation(fresh);
           if (state.stopped || shuttingDown) return;
           const current = database.getConversation(fresh.id);
-          if (!current || ["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== fresh[key])) {
+          if (!current || ["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== fresh[key])
+            || (entry.run.worktreePath && current.worktreePath !== entry.run.worktreePath)) {
             throw new Error("Conversation target changed while preparing the run; submit again");
           }
           // Recheck mutable trust synchronously immediately before spawning.
