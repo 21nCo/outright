@@ -17,7 +17,12 @@ static wchar_t *quote_argument(const wchar_t *value) {
     if (character == L'\\') { slashes++; continue; }
     if (character == L'"' || character == L'\0') {
       for (size_t index = 0; index < slashes * 2; index++) *out++ = L'\\';
-      if (character == L'"') *out++ = L'"';
+      if (character == L'"') {
+        // CommandLineToArgvW/CRT parsing requires 2n+1 backslashes before an
+        // embedded quote. The extra slash preserves the quote as data.
+        *out++ = L'\\';
+        *out++ = L'"';
+      }
       slashes = 0;
       if (character == L'\0') break;
       continue;

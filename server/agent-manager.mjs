@@ -15,8 +15,16 @@ const ASSISTANT_TRUNCATION_MARKER = "\n\n[Output truncated by Outright at 1 MiB]
 // instead of once per token, while crash exposure stays bounded.
 const CHECKPOINT_MIN_BYTES = 4 * 1024;
 const CHECKPOINT_INTERVAL_MS = 500;
-export const AGENT_SUPERVISOR = process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH
-  || fileURLToPath(new URL(process.platform === "win32" ? "./bin/agent-supervisor.exe" : "./bin/agent-supervisor", import.meta.url));
+function defaultAgentSupervisorPath() {
+  if (process.platform !== "win32") return fileURLToPath(new URL("./bin/agent-supervisor", import.meta.url));
+  const manifest = JSON.parse(readFileSync(fileURLToPath(new URL("./bin/agent-supervisor.json", import.meta.url)), "utf8"));
+  if (typeof manifest.filename !== "string" || !/^agent-supervisor-[0-9a-f]{16}\.exe$/.test(manifest.filename)) {
+    throw new Error("Windows agent supervisor manifest is invalid");
+  }
+  return fileURLToPath(new URL(`./bin/${manifest.filename}`, import.meta.url));
+}
+
+export const AGENT_SUPERVISOR = process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH || defaultAgentSupervisorPath();
 export const LAUNCH_AUTHORIZED_CONTROL = "__OUTRIGHT_LAUNCH_AUTHORIZED_V1__";
 const LAUNCH_CONTROL_FD = 3;
 
@@ -211,6 +219,12 @@ export function defaultLaunchCommand(command, run, launchDirectory) {
   }
   const ownershipToken = randomUUID();
   const platformOwnershipId = process.platform === "darwin" ? `com.21n.outright.${ownershipToken}` : "-";
+  if (process.platform === "darwin") {
+    const capability = spawnSync(AGENT_SUPERVISOR, ["--self-test", platformOwnershipId], { encoding: "utf8" });
+    if (capability.status !== 0 || capability.stdout.trim() !== "supported") {
+      throw new Error("macOS agent supervision is unavailable because its kernel ownership contract could not be verified");
+    }
+  }
   const supervisorArgs = process.platform === "darwin"
     ? [platformOwnershipId, command.executable, ...command.args]
     : [command.executable, ...command.args];

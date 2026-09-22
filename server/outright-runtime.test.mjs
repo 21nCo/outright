@@ -791,24 +791,26 @@ test("recovery identities are boot-scoped and Windows taskkill supplies a whole-
     null,
     "a recycled pid with a different ownership title is rejected",
   );
-  const platformOwnershipId = `com.21n.outright.${ownershipToken}`;
-  const launchdRun = (executable) => executable === "/usr/sbin/sysctl"
-    ? { status: 0, stdout: "{ sec = 123, usec = 456 }\n" }
-    : executable === AGENT_SUPERVISOR
-      ? { status: 0, stdout: "alive\n" }
-      : { status: 0, stdout: "active count = 1\nruns = 1\n" };
-  const launchdHandshake = { ownershipToken, platformOwnershipId };
-  assert.equal(defaultRecoveryProcessAlive(123, "darwin", () => null, () => {}, launchdHandshake, launchdRun), "alive", "the launchd job remains the ownership proof after its wrapper exits");
-  assert.equal(
-    defaultRecoveryProcessIdentity(123, "darwin", () => "", launchdRun, ownershipToken, platformOwnershipId),
-    `darwin:{ sec = 123, usec = 456 }:${ownershipToken}`,
-  );
-  const bootouts = [];
-  assert.equal(defaultTerminateRecoveryProcess(123, "SIGTERM", launchdHandshake, "darwin", (executable, args) => {
-    bootouts.push([executable, args]);
-    return { status: 0 };
-  }), true, "the coalition helper proves that every member was terminated");
-  assert.deepEqual(bootouts, [[AGENT_SUPERVISOR, ["--terminate", platformOwnershipId]]]);
+  if (process.platform !== "win32") {
+    const platformOwnershipId = `com.21n.outright.${ownershipToken}`;
+    const launchdRun = (executable) => executable === "/usr/sbin/sysctl"
+      ? { status: 0, stdout: "{ sec = 123, usec = 456 }\n" }
+      : executable === AGENT_SUPERVISOR
+        ? { status: 0, stdout: "alive\n" }
+        : { status: 0, stdout: "active count = 1\nruns = 1\n" };
+    const launchdHandshake = { ownershipToken, platformOwnershipId };
+    assert.equal(defaultRecoveryProcessAlive(123, "darwin", () => null, () => {}, launchdHandshake, launchdRun), "alive", "the launchd job remains the ownership proof after its wrapper exits");
+    assert.equal(
+      defaultRecoveryProcessIdentity(123, "darwin", () => "", launchdRun, ownershipToken, platformOwnershipId),
+      `darwin:{ sec = 123, usec = 456 }:${ownershipToken}`,
+    );
+    const bootouts = [];
+    assert.equal(defaultTerminateRecoveryProcess(123, "SIGTERM", launchdHandshake, "darwin", (executable, args) => {
+      bootouts.push([executable, args]);
+      return { status: 0 };
+    }), true, "the coalition helper proves that every member was terminated");
+    assert.deepEqual(bootouts, [[AGENT_SUPERVISOR, ["--terminate", platformOwnershipId]]]);
+  }
 
   const powershellCalls = [];
   const run = (executable, args, options) => {

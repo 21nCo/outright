@@ -128,10 +128,18 @@ typedef struct {
   uint64_t resource_coalition_id;
 } service_state;
 
-static bool read_state(const char *target, service_state *state) {
+typedef enum { SERVICE_OK, SERVICE_MISSING, SERVICE_ERROR } service_result;
+
+static service_result read_state(const char *target, service_state *state) {
   char output[65536];
   char *arguments[] = { "launchctl", "print", (char *)target, NULL };
-  if (run_launchctl(arguments, output, sizeof(output)) != 0) return false;
+  int status = run_launchctl(arguments, output, sizeof(output));
+  if (status != 0) {
+    if (strstr(output, "Could not find service") != NULL
+      || strstr(output, "Could not find specified service") != NULL
+      || strstr(output, "service not found") != NULL) return SERVICE_MISSING;
+    return SERVICE_ERROR;
+  }
   state->active = -1;
   state->runs = -1;
   state->exit_code = 1;
@@ -145,7 +153,7 @@ static bool read_state(const char *target, service_state *state) {
     else if ((value = strstr(line, "runs = ")) != NULL) state->runs = atoi(value + 7);
     else if ((value = strstr(line, "last exit code = ")) != NULL) state->exit_code = atoi(value + 17);
   }
-  return state->active >= 0;
+  return state->active >= 0 ? SERVICE_OK : SERVICE_ERROR;
 }
 
 static int coalition_members(uint64_t coalition_id, pid_t *pids, size_t capacity) {
@@ -179,7 +187,18 @@ static int control_existing_job(const char *mode, const char *label) {
   if (!valid_label(label)) return 64;
   char *target = service_target(label);
   service_state state;
-  if (target == NULL || !read_state(target, &state) || state.resource_coalition_id == 0) {
+  if (target == NULL) {
+    free(target);
+    dprintf(STDOUT_FILENO, "unknown\n");
+    return 4;
+  }
+  service_result state_result = read_state(target, &state);
+  if (state_result == SERVICE_MISSING) {
+    free(target);
+    dprintf(STDOUT_FILENO, "exited\n");
+    return strcmp(mode, "--probe") == 0 ? 3 : 0;
+  }
+  if (state_result != SERVICE_OK || state.resource_coalition_id == 0) {
     free(target);
     dprintf(STDOUT_FILENO, "unknown\n");
     return 4;
@@ -201,7 +220,33 @@ static int control_existing_job(const char *mode, const char *label) {
   return 64;
 }
 
+static int self_test(const char *label) {
+  if (!valid_label(label)) return 64;
+  char *target = service_target(label);
+  if (target == NULL) return 70;
+  char *arguments[] = { "launchctl", "submit", "-l", (char *)label, "--", "/bin/sleep", "5", NULL };
+  if (run_launchctl(arguments, NULL, 0) != 0) { free(target); return 71; }
+  int result = 72;
+  for (int attempt = 0; attempt < 100; attempt++) {
+    service_state state;
+    if (read_state(target, &state) == SERVICE_OK && state.resource_coalition_id != 0) {
+      pid_t pids[32];
+      if (coalition_members(state.resource_coalition_id, pids, sizeof(pids) / sizeof(pids[0])) > 0) {
+        result = terminate_coalition(target, state.resource_coalition_id) ? 0 : 73;
+        break;
+      }
+    }
+    struct timespec delay = { .tv_sec = 0, .tv_nsec = 20 * 1000 * 1000 };
+    nanosleep(&delay, NULL);
+  }
+  bootout(target);
+  free(target);
+  if (result == 0) dprintf(STDOUT_FILENO, "supported\n");
+  return result;
+}
+
 int main(int argc, char **argv) {
+  if (argc == 3 && strcmp(argv[1], "--self-test") == 0) return self_test(argv[2]);
   if (argc == 3 && (strcmp(argv[1], "--probe") == 0 || strcmp(argv[1], "--terminate") == 0)) {
     return control_existing_job(argv[1], argv[2]);
   }
@@ -283,6 +328,7 @@ int main(int argc, char **argv) {
   bool stopping = false;
   uint64_t coalition_id = 0;
   int provider_exit_code = 1;
+  int state_failures = 0;
   for (;;) {
     relay(stdout_fd, STDOUT_FILENO);
     relay(stderr_fd, STDERR_FILENO);
@@ -290,12 +336,20 @@ int main(int argc, char **argv) {
       stopping = true;
     }
     service_state state;
-    if (!read_state(target, &state)) {
-      if (stopping && coalition_id != 0 && terminate_coalition(target, coalition_id)) { result = 137; break; }
+    service_result state_result = read_state(target, &state);
+    if (state_result != SERVICE_OK) {
+      state_failures++;
+      if (coalition_id != 0 && terminate_coalition(target, coalition_id)) { result = stopping ? 137 : 70; break; }
+      if (state_failures >= 50) {
+        bootout(target);
+        result = stopping ? 137 : 70;
+        break;
+      }
       struct timespec delay = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
       nanosleep(&delay, NULL);
       continue;
     }
+    state_failures = 0;
     if (state.resource_coalition_id != 0) coalition_id = state.resource_coalition_id;
     if (state.runs >= 1 && state.active == 0) provider_exit_code = state.exit_code;
     if (stopping) {
@@ -306,6 +360,11 @@ int main(int argc, char **argv) {
     }
     pid_t pids[1024];
     int member_count = coalition_members(coalition_id, pids, sizeof(pids) / sizeof(pids[0]));
+    if (member_count < 0) {
+      bootout(target);
+      result = 70;
+      break;
+    }
     if (state.runs >= 1 && state.active == 0 && member_count == 0) {
       result = provider_exit_code;
       bootout(target);

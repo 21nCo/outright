@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { draftAfterSubmission, isComposerSubmitKey, isUnverifiableLegacyRecovery, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, shouldReloadConversationForResolvedRun, streamingTextAfterDurableMessage, streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
+import { checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isUnverifiableLegacyRecovery, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterDurableMessage, streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
 
 test("worktree recovery metadata gates sibling composers before conversation-local history", () => {
   const local = { id: "local", status: "interrupted" };
@@ -52,6 +52,31 @@ test("a loaded checkpoint cursor discards its delayed durable delta", () => {
   };
   assert.equal(streamingTextAfterRuntimeEvent("", delayed, 7), "", "the checkpoint already owns this delta");
   assert.equal(streamingTextAfterRuntimeEvent("", { ...delayed, payload: { ...delayed.payload, seq: 8 } }, 7), "already durable", "a later delta remains live");
+});
+
+test("conversation loads replay websocket events over a monotonic durable snapshot", () => {
+  const checkpoint = { id: "message-1", role: "assistant", createdAt: "2026-09-22T00:00:00Z", payload: { runId: "run-1", checkpointEventSeq: 7 } };
+  const delayed = { type: "run.event", runId: "run-1", payload: { runId: "run-1", seq: 7, type: "assistant.delta", payload: { text: "durable" } } };
+  const newer = { type: "run.event", runId: "run-1", payload: { runId: "run-1", seq: 8, type: "assistant.delta", payload: { text: " live" } } };
+  const replayed = replayConversationEvents([checkpoint], [delayed, newer]);
+  assert.equal(replayed.streamingText, " live", "a late HTTP response keeps only the websocket tail after its checkpoint");
+  assert.equal(replayed.cursors.get("run-1"), 7);
+
+  const advanced = { ...checkpoint, payload: { ...checkpoint.payload, checkpointEventSeq: 8 }, body: "durable live" };
+  const checkpointed = replayConversationEvents([checkpoint], [newer, { type: "message.created", payload: advanced }]);
+  assert.equal(checkpointed.streamingText, "", "a websocket checkpoint consumes its overlapping live tail");
+  assert.equal(checkpointed.cursors.get("run-1"), 8);
+  assert.deepEqual(checkpointed.messages, [advanced]);
+});
+
+test("checkpoint cursors loaded from older pages only advance", () => {
+  const current = new Map([["run-1", 9]]);
+  const merged = checkpointCursors([
+    { payload: { runId: "run-1", checkpointEventSeq: 4 } },
+    { payload: { runId: "run-2", checkpointEventSeq: 3 } },
+  ], current);
+  assert.equal(merged.get("run-1"), 9);
+  assert.equal(merged.get("run-2"), 3);
 });
 
 test("only legacy rows without any process or worktree identity offer manual cleanup", () => {

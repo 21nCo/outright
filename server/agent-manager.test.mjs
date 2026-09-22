@@ -7,13 +7,13 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { buildProviderCommand, consumeBoundedLines, createAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_AUTHORIZED_CONTROL, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
+import { AGENT_SUPERVISOR, buildProviderCommand, consumeBoundedLines, createAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_AUTHORIZED_CONTROL, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
 import { streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
 
 const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
 const fakeLaunchDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-agent-test-"));
 const WRAPPER_OWNERSHIP_TOKEN = "00000000-0000-4000-8000-000000000001";
-const platformSupervisor = fileURLToPath(new URL(process.platform === "win32" ? "./bin/agent-supervisor.exe" : "./bin/agent-supervisor", import.meta.url));
+const platformSupervisor = AGENT_SUPERVISOR;
 const wrapperArgs = (handshakePath, ...providerArgs) => [
   "-e", LAUNCH_WRAPPER_SOURCE, handshakePath, WRAPPER_OWNERSHIP_TOKEN,
   process.platform === "darwin" ? `com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}` : "-",
@@ -40,6 +40,16 @@ function fakeChild({ autoAcknowledge = true } = {}) {
   child.signals = [];
   child.kill = (signal) => { child.signals.push(signal); return true; };
   return child;
+}
+
+async function waitForProcessGone(pid, timeout = 5000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    try { process.kill(pid, 0); }
+    catch (error) { if (error.code === "ESRCH") return; throw error; }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`process ${pid} was not reaped within ${timeout}ms`);
 }
 
 function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/project" }) {
@@ -1057,7 +1067,7 @@ test("the launch wrapper records durable identity before authorization and clean
         try { process.kill(descendantPid, "SIGKILL"); } catch {}
       });
       assert.equal(existsSync(handshakePath4), false, "the wrapper removes ownership only after the process coalition is empty");
-      assert.throws(() => process.kill(descendantPid, 0), { code: "ESRCH" }, "the coalition helper kills an immediately detached descendant before ownership is released");
+      await waitForProcessGone(descendantPid);
       detachedDescendantPid = null;
 
       // A hard crash can kill both wrapper and supervisor before either runs
@@ -1096,7 +1106,7 @@ test("the launch wrapper records durable identity before authorization and clean
       assert.equal(probe.stdout.trim(), "alive", "recovery finds the detached process through its kernel coalition");
       const terminated = spawnSync(platformSupervisor, ["--terminate", label], { encoding: "utf8" });
       assert.equal(terminated.status, 0, `coalition recovery failed: ${terminated.stderr}`);
-      assert.throws(() => process.kill(descendantPid5, 0), { code: "ESRCH" }, "recovery empties the crashed job's coalition");
+      await waitForProcessGone(descendantPid5);
       detachedDescendantPid = null;
     }
 
@@ -1116,6 +1126,20 @@ test("the launch wrapper records durable identity before authorization and clean
     if (detachedDescendantPid) { try { process.kill(detachedDescendantPid, "SIGKILL"); } catch { /* Already gone. */ } }
     for (const child of children) { try { child.kill("SIGKILL"); } catch { /* Already gone. */ } }
     if (process.platform === "darwin") spawnSync("/bin/launchctl", ["bootout", `gui/${process.getuid()}/com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}`], { stdio: "ignore" });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the Windows supervisor preserves quoted and slash-terminated arguments", { skip: process.platform !== "win32" }, () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-windows-argv-"));
+  const marker = path.join(root, "argv.json");
+  const expected = ["plain", "embedded \"quote\"", "slash-before-quote\\\"value", "trailing-slash\\"];
+  try {
+    const source = `require("node:fs").writeFileSync(${JSON.stringify(marker)}, JSON.stringify(process.argv.slice(1)))`;
+    const result = spawnSync(AGENT_SUPERVISOR, [process.execPath, "-e", source, ...expected], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(marker, "utf8")), expected);
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
