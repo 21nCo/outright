@@ -1,0 +1,24 @@
+server/agent-manager.mjs
+  s_6126673cc0a89e::t_3ac0ac2e9e0e63 204-219
+server/outright-runtime.mjs
+  s_6126673cc0a89e::t_1379f63464b0d1 608-611
+server/outright-runtime.test.mjs
+  s_6126673cc0a89e::t_1379f63464b0d1 891-894
+  s_6126673cc0a89e::t_3ac0ac2e9e0e63 887-890,895-897
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f7fc434af3eb848a35150b010dd4c866bf115e11",
+  "prompts": {},
+  "sessions": {
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
