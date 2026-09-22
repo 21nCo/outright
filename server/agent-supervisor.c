@@ -17,6 +17,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef __WALL
+#define __WALL 0x40000000
+#endif
+
 #define INPUT_CAPACITY 4096
 #define TEARDOWN_BUDGET_MS 750
 
@@ -205,7 +209,7 @@ static process_snapshot inspect_owned_tree(pid_t supervisor_pid, pid_t provider_
 static void reap_children(pid_t provider_pid, bool *provider_reaped, int *provider_status) {
   for (;;) {
     int status = 0;
-    pid_t reaped = waitpid(-1, &status, WNOHANG);
+    pid_t reaped = waitpid(-1, &status, WNOHANG | __WALL);
     if (reaped <= 0) return;
     if (reaped == provider_pid) {
       *provider_reaped = true;
@@ -220,7 +224,7 @@ static bool no_children_remaining(void) {
   for (;;) {
     // WNOWAIT proves whether an adopted/live child still exists without
     // consuming a provider status that reap_children() must preserve.
-    if (waitid(P_ALL, 0, &info, WEXITED | WNOHANG | WNOWAIT) == 0) return false;
+    if (waitid(P_ALL, 0, &info, WEXITED | WNOHANG | WNOWAIT | __WALL) == 0) return false;
     if (errno == EINTR) continue;
     return errno == ECHILD;
   }

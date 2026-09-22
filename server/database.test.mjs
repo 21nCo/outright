@@ -34,6 +34,20 @@ test("persists settings, groups, conversations, messages, runs, and search", () 
   }
 });
 
+test("resolves a relative data directory to a stable absolute launch path", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-relative-data-"));
+  const dataDirectory = path.relative(process.cwd(), path.join(root, "data"));
+  const database = createOutrightDatabase({ dataDirectory });
+  try {
+    assert.equal(path.isAbsolute(database.filename), true);
+    assert.equal(path.isAbsolute(database.launchDirectory), true);
+    assert.equal(database.launchDirectory, path.join(root, "data", "launches"));
+  } finally {
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("reconciles queued and running work as interrupted after a runtime restart", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

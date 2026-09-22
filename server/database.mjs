@@ -29,9 +29,9 @@ const SETTING_RULES = {
 };
 
 export function createOutrightDatabase(options = {}) {
-  const dataDirectory = options.dataDirectory
+  const dataDirectory = path.resolve(options.dataDirectory
     ?? process.env.OUTRIGHT_DATA_DIR
-    ?? path.join(os.homedir(), ".outright");
+    ?? path.join(os.homedir(), ".outright"));
   mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
   const filename = options.filename ?? path.join(dataDirectory, "outright.db");
   // Launch handshake records live next to the database: the launch wrapper
@@ -39,8 +39,8 @@ export function createOutrightDatabase(options = {}) {
   // authorize the provider to run, so a crash between spawning and recording
   // the pid never loses process ownership. When an explicit filename outside
   // the data directory is used, the records follow that file instead.
-  const launchDirectory = options.launchDirectory
-    ?? (filename && path.isAbsolute(filename) ? path.join(path.dirname(filename), "launches") : path.join(dataDirectory, "launches"));
+  const launchDirectory = path.resolve(options.launchDirectory
+    ?? (filename && path.isAbsolute(filename) ? path.join(path.dirname(filename), "launches") : path.join(dataDirectory, "launches")));
   // An explicit filename may live outside the data directory; its parent must
   // exist for the database (and the launch records beside it) to open.
   if (filename && path.isAbsolute(filename)) mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });

@@ -168,7 +168,27 @@ test("blocks direct run submission until the interrupted run has a recovery deci
   assert.equal(runtime.database.findUnresolvedInterruptedRun(conversation.id), undefined);
 }));
 
-test("does not resolve an alive recovered provider while it can still mutate the worktree", withRuntime(async (runtime) => {
+test("terminates an alive recovered provider before recording the recovery decision", (() => {
+  let treeVerdict = "alive";
+  let terminatedPid = null;
+  return withRuntime(async (runtime) => {
+    const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+    runtime.database.updateRun(run.id, { status: "running", pid: 4242 });
+    runtime.database.reconcileInterruptedRuns({ probeAlive: () => true });
+
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), response);
+    assert.equal(response.statusCode, 200);
+    assert.equal(terminatedPid, 4242);
+    assert.equal(runtime.database.getRun(run.id).recoveryDecision, "discard");
+  }, {
+    recoveryProcessAlive: () => treeVerdict,
+    terminateRecoveryProcess: async (pid) => { terminatedPid = pid; treeVerdict = "exited"; },
+  });
+})());
+
+test("keeps recovery blocked when an alive provider cannot be terminated", withRuntime(async (runtime) => {
   const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
   const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
   runtime.database.updateRun(run.id, { status: "running", pid: 4242 });
@@ -179,11 +199,11 @@ test("does not resolve an alive recovered provider while it can still mutate the
   assert.equal(response.statusCode, 409);
   assert.equal(response.body.code, "RECOVERY_PROCESS_ACTIVE");
   assert.equal(runtime.database.getRun(run.id).recoveryDecision, null);
-}, { recoveryProcessAlive: () => true }));
+}, { recoveryProcessAlive: () => true, terminateRecoveryProcess: async () => {}, recoveryTerminationTimeoutMs: 0 }));
 
 // Regression: an exited leader with a live descendant was classified exited
 // at restart and could then bypass the recovery process guard entirely.
-test("re-probes the process group of an exited-classified run before recovery", { skip: process.platform === "win32" }, withRuntime(async (runtime) => {
+test("terminates a live recovered process group whose leader already exited", { skip: process.platform === "win32" }, withRuntime(async (runtime) => {
   const descendant = "setInterval(() => {}, 1000);";
   const leader = `const {spawn} = require("node:child_process"); spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], {stdio: "ignore"}); process.exit(0);`;
   const child = spawn(process.execPath, ["-e", leader], { detached: true, stdio: "ignore" });
@@ -211,9 +231,9 @@ test("re-probes the process group of an exited-classified run before recovery", 
 
     const response = responseCapture();
     await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), response);
-    assert.equal(response.statusCode, 409);
-    assert.equal(response.body.code, "RECOVERY_PROCESS_ACTIVE");
-    assert.equal(runtime.database.getRun(run.id).recoveryDecision, null);
+    assert.equal(response.statusCode, 200);
+    assert.equal(runtime.database.getRun(run.id).recoveryDecision, "discard");
+    assert.throws(() => process.kill(-pid, 0), { code: "ESRCH" });
   } finally {
     try { process.kill(-pid, "SIGKILL"); } catch { /* Already gone. */ }
   }
@@ -291,7 +311,7 @@ test("a discard on an unknown process tree cannot be followed by a newly schedul
 // schedule the queued run's replacement work while the older run's process
 // tree was still live or unverifiable and mutating the same worktree.
 test("blocks recovery of a newer run while an older interrupted run is unresolved", (() => {
-  let treeVerdict = "alive";
+  let treeVerdict = "unknown";
   return withRuntime(async (runtime) => {
     const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
     const older = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "started before the crash" });
@@ -302,21 +322,14 @@ test("blocks recovery of a newer run while an older interrupted run is unresolve
     assert.equal(runtime.database.getRun(newer.id).recoveryClass, "never-started");
 
     // The UI selects the newest interrupted run first. While the older run's
-    // tree is live, every policy for the newer run stays blocked.
+    // tree cannot be verified, every policy for the newer run stays blocked.
     const blocked = responseCapture();
     await runtime.handleRequest(requestStream("POST", `/api/runs/${newer.id}/resume`, { policy: "discard" }), blocked);
     assert.equal(blocked.statusCode, 409);
-    assert.equal(blocked.body.code, "RECOVERY_PROCESS_ACTIVE");
+    assert.equal(blocked.body.code, "RECOVERY_PROCESS_UNKNOWN");
     assert.equal(runtime.database.getRun(newer.id).recoveryDecision, null);
     assert.equal(runtime.database.getRun(older.id).recoveryDecision, null);
     assert.deepEqual(runtime.database.listRuns(conversation.id).filter((candidate) => candidate.status === "queued"), [], "no replacement run may be scheduled");
-
-    // An unverifiable older tree blocks the newer run just the same.
-    treeVerdict = "unknown";
-    const unknownTree = responseCapture();
-    await runtime.handleRequest(requestStream("POST", `/api/runs/${newer.id}/resume`, { policy: "retry" }), unknownTree);
-    assert.equal(unknownTree.statusCode, 409);
-    assert.equal(unknownTree.body.code, "RECOVERY_PROCESS_UNKNOWN");
 
     // Only once the older tree is verifiably exited may the newer run be
     // resolved — and the older run itself still awaits its own decision.
@@ -455,6 +468,8 @@ test("the default recovery probe is conservative per platform", async () => {
   assert.equal(defaultRecoveryProcessAlive(pid, "win32"), "unknown", "a gone leader is unverifiable on win32");
   assert.equal(defaultRecoveryProcessAlive(process.pid, "win32"), "alive");
   if (process.platform !== "win32") {
+    assert.equal(defaultRecoveryProcessAlive(1234, "linux", () => [{ pid: 1234, state: "Z" }], () => {}), "exited", "a zombie-only group cannot mutate the worktree");
+    assert.equal(defaultRecoveryProcessAlive(1234, "linux", () => [{ pid: 1234, state: "Z" }, { pid: 1235, state: "S" }], () => {}), "alive", "any non-zombie group member keeps recovery blocked");
     assert.equal(defaultRecoveryProcessAlive(pid), "exited", "a fully dead detached group is exited on POSIX");
     const live = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore", detached: true });
     try {

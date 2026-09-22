@@ -219,6 +219,10 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       detached: process.platform !== "win32",
     });
     state.child = child;
+    // A broken authorization pipe reports EPIPE asynchronously. Consume that
+    // stream error so a wrapper that exits during the persistence window fails
+    // through the ordinary child close/error path instead of crashing Node.
+    child.stdin?.on?.("error", (error) => { state.processError ??= error; });
     state.launchHandshakePath = launch.handshakePath;
     state.ownsDescendants = Boolean(launch.ownsDescendants);
     let resolveChildClosed;
@@ -296,7 +300,13 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       if (event.type === "session") {
         state.run.providerSessionId = event.payload.sessionId;
         database.updateRun(state.run.id, { providerSessionId: event.payload.sessionId });
-        database.updateConversation(state.conversation.id, { providerSessionId: event.payload.sessionId });
+        // A recovered run keeps its immutable provider, while the conversation
+        // may have since switched providers. Preserve the run-local session but
+        // never replace another provider's conversation-level resume token.
+        const currentConversation = database.getConversation(state.conversation.id);
+        if (currentConversation?.provider === state.run.provider) {
+          database.updateConversation(state.conversation.id, { providerSessionId: event.payload.sessionId });
+        }
       }
       if (event.type === "assistant.delta") {
         appendAssistantText(state, event.payload.text, emit);
@@ -845,11 +855,40 @@ function assertPrivateLaunchDirectory(directory) {
   if (stat.isSymbolicLink() || !stat.isDirectory() || wrongOwner) {
     throw new Error("Launch directory must be a private, non-symlink directory owned by the runtime user");
   }
-  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+  if (process.platform === "win32") {
+    hardenWindowsLaunchDirectory(directory);
+    return;
+  }
+  if ((stat.mode & 0o077) !== 0) {
     chmodSync(directory, 0o700);
     stat = lstatSync(directory);
   }
-  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) throw new Error("Launch directory must not grant group or other permissions");
+  if ((stat.mode & 0o077) !== 0) throw new Error("Launch directory must not grant group or other permissions");
+}
+
+export function hardenWindowsLaunchDirectory(directory, run = spawnSync, environment = process.env) {
+  const account = environment.USERNAME
+    ? [environment.USERDOMAIN, environment.USERNAME].filter(Boolean).join("\\")
+    : null;
+  if (!account) throw new Error("A Windows account is required to secure the launch directory");
+  const fullControl = "(OI)(CI)F";
+  const result = run("icacls", [
+    directory,
+    "/inheritance:r",
+    "/grant:r",
+    `${account}:${fullControl}`,
+    `*S-1-5-18:${fullControl}`,
+    `*S-1-5-32-544:${fullControl}`,
+    "/remove:g",
+    "*S-1-1-0",
+    "*S-1-5-11",
+    "*S-1-5-32-545",
+    "/C",
+    "/Q",
+  ], { stdio: "ignore" });
+  if (result.error || result.status !== 0) {
+    throw new Error("Unable to secure the Windows launch directory ACL", { cause: result.error });
+  }
 }
 
 function detectProvider(id, label, versionArgs, models) {

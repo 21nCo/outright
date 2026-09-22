@@ -7,9 +7,11 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { buildProviderCommand, consumeBoundedLines, createAgentManager, defaultGroupMembers, escalateTree, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
+import { buildProviderCommand, consumeBoundedLines, createAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
 
 const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
+const fakeLaunchDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-agent-test-"));
+test.after(() => rmSync(fakeLaunchDirectory, { recursive: true, force: true }));
 
 function fakeChild() {
   const child = new PassThrough();
@@ -26,7 +28,7 @@ function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/
   const runs = new Map();
   const conversations = new Map([[initialConversation.id, initialConversation]]);
   return {
-    launchDirectory: mkdtempSync(path.join(os.tmpdir(), "outright-agent-test-")),
+    launchDirectory: fakeLaunchDirectory,
     messages,
     finishes,
     runs,
@@ -92,6 +94,33 @@ test("normalizes Codex and Claude streaming records", () => {
   assert.deepEqual(normalizeCodex({ type: "item.completed", item: { type: "agent_message", text: "done" } })[0], { type: "assistant.message", payload: { text: "done" } });
   assert.deepEqual(normalizeClaude({ type: "stream_event", event: { delta: { type: "text_delta", text: "hello" } } })[0], { type: "assistant.delta", payload: { text: "hello" } });
   assert.equal(normalizeClaude({ type: "result", result: "finished", total_cost_usd: 0.01, usage: { input_tokens: 2, output_tokens: 3 } }).at(-1).payload.costUsd, 0.01);
+});
+
+test("keeps recovered session ids run-local when the conversation switched providers", async () => {
+  const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "claude", providerSessionId: "claude-session" });
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  const run = database.createRun(codexRun("run-1"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+
+  child.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "codex-session" }) + "\n");
+  assert.equal(database.getRun(run.id).providerSessionId, "codex-session");
+  assert.equal(database.getConversation("conv-1").providerSessionId, "claude-session");
+  child.emit("close", 0, null);
+});
+
+test("handles asynchronous authorization-pipe errors without an uncaught stream error", async () => {
+  const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex" });
+  const child = fakeChild();
+  child.stdin = new PassThrough();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  const run = database.createRun(codexRun("run-1"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+
+  assert.doesNotThrow(() => child.stdin.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" })));
+  child.emit("close", 1, null);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(database.getRun(run.id).status, "failed");
 });
 
 test("discards oversized provider lines and resumes at the next record", async () => {
@@ -627,6 +656,36 @@ test("windows termination tears down the provider tree with taskkill", () => {
   assert.deepEqual(signals, ["SIGTERM"], "a pid-less child falls back to child.kill");
 });
 
+test("windows launch ACLs remove inherited broad access before handshakes are written", () => {
+  const calls = [];
+  hardenWindowsLaunchDirectory("C:\\Users\\owner\\AppData\\Local\\Outright\\launches", (...args) => {
+    calls.push(args);
+    return { status: 0 };
+  }, { USERDOMAIN: "WORKSTATION", USERNAME: "owner" });
+  assert.deepEqual(calls, [[
+    "icacls",
+    [
+      "C:\\Users\\owner\\AppData\\Local\\Outright\\launches",
+      "/inheritance:r",
+      "/grant:r",
+      "WORKSTATION\\owner:(OI)(CI)F",
+      "*S-1-5-18:(OI)(CI)F",
+      "*S-1-5-32-544:(OI)(CI)F",
+      "/remove:g",
+      "*S-1-1-0",
+      "*S-1-5-11",
+      "*S-1-5-32-545",
+      "/C",
+      "/Q",
+    ],
+    { stdio: "ignore" },
+  ]]);
+  assert.throws(
+    () => hardenWindowsLaunchDirectory("C:\\launches", () => ({ status: 5 }), { USERNAME: "owner" }),
+    /Unable to secure/,
+  );
+});
+
 // The real launch wrapper must durably record its own pid and only start the
 // provider after the runtime's authorization byte.
 test("the launch wrapper records durable identity before authorization and cleans up on exit", { timeout: 20000 }, async () => {
@@ -848,7 +907,7 @@ test("stop and shutdown leave no provider-tree members on a non-reaping PID 1", 
   const descendant = "process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(process.env.READY, String(process.pid)); setInterval(() => {}, 1000);";
   const script = `
 import { pathToFileURL } from "node:url";
-const { spawn } = await import("node:child_process");
+const { spawn, spawnSync } = await import("node:child_process");
 const { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, writeFileSync } = await import("node:fs");
 const os = await import("node:os");
 const path = await import("node:path");
@@ -963,6 +1022,35 @@ stdinChild.stdin.write("go\\n");
 const stdinExit = await waitForExit(stdinChild, "provider stdin isolation");
 const stdinSafe = stdinExit.code === 0 && readFileSync(stdinMarker, "utf8") === "" && groupMembers(stdinChild.pid).length === 0;
 
+// Linux clone children created without a SIGCHLD exit signal require __WALL
+// for waitpid/waitid. The supervisor must reap an adopted clone child before
+// it releases ownership, rather than hanging forever on its zombie.
+const cloneSourcePath = path.join(root, "clone-provider.c");
+const cloneProvider = path.join(root, "clone-provider");
+writeFileSync(cloneSourcePath, [
+  "#define _GNU_SOURCE",
+  "#include <sched.h>",
+  "#include <stdlib.h>",
+  "#include <unistd.h>",
+  "static int clone_child(void *unused) { (void)unused; usleep(200000); return 0; }",
+  "int main(void) {",
+  "  const size_t size = 1024 * 1024;",
+  "  char *stack = malloc(size);",
+  "  if (!stack) return 2;",
+  "  if (clone(clone_child, stack + size, 0, NULL) < 0) return 3;",
+  "  return 0;",
+  "}",
+].join("\\n"));
+const cloneBuild = spawnSync("cc", [cloneSourcePath, "-O2", "-o", cloneProvider], { encoding: "utf8" });
+if (cloneBuild.status !== 0) throw new Error("clone helper failed to compile: " + cloneBuild.stderr);
+const cloneHandshake = path.join(root, "clone.json");
+const cloned = spawn("/tmp/agent-supervisor", [cloneHandshake, cloneProvider], { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+while (!existsSync(cloneHandshake)) await new Promise((resolve) => setTimeout(resolve, 10));
+cloned.stdin.write("go\\n");
+cloned.stdin.end();
+const cloneExit = await waitForExit(cloned, "clone child reaping");
+const cloneSafe = cloneExit.code === 0 && !existsSync(cloneHandshake) && groupMembers(cloned.pid).length === 0;
+
 // After a runtime crash closes the control pipe, an operator must still be
 // able to terminate the authorized supervisor with SIGTERM. It must retain
 // subreaper ownership until an escaped descendant is gone and reaped.
@@ -1038,10 +1126,10 @@ try {
   outcome.membersAfterShutdown = groupMembers(second.child.pid);
   outcome.descendantAfterShutdown = processInfo(second.descendantPid);
 } catch (error) { outcome.shutdownError = String(error && error.message); }
-const clean = authorizationSafe && coalescedSafe && stdinSafe && signalSafe && foreignUidSafe && !outcome.stopError && !outcome.shutdownError
+const clean = authorizationSafe && coalescedSafe && stdinSafe && cloneSafe && signalSafe && foreignUidSafe && !outcome.stopError && !outcome.shutdownError
   && outcome.membersAfterStop.length === 0 && outcome.membersAfterShutdown.length === 0
   && outcome.descendantAfterStop == null && outcome.descendantAfterShutdown == null;
-console.log("RESULT " + JSON.stringify({ authorizationSafe, coalescedSafe, stdinSafe, signalSafe, foreignUidSafe, ...outcome, clean }));
+console.log("RESULT " + JSON.stringify({ authorizationSafe, coalescedSafe, stdinSafe, cloneSafe, signalSafe, foreignUidSafe, ...outcome, clean }));
 process.exit(clean ? 0 : 1);
 `;
   const repo = fileURLToPath(new URL("..", import.meta.url));
@@ -1069,6 +1157,7 @@ process.exit(clean ? 0 : 1);
   assert.equal(payload.authorizationSafe, true, "a failed authorized-handshake write must not release provider execution");
   assert.equal(payload.coalescedSafe, true, "coalesced native go/stop commands must tear down the provider");
   assert.equal(payload.stdinSafe, true, "provider stdin must be isolated from the supervisor control pipe");
+  assert.equal(payload.cloneSafe, true, "clone children without SIGCHLD must be reaped before ownership is released");
   assert.equal(payload.signalSafe, true, "SIGTERM after a runtime disconnect must reap the complete provider tree");
   assert.equal(payload.foreignUidSafe, true, "credential changes must not remove descendants from the ownership proof");
   assert.equal(payload.stopError, undefined, `stop did not resolve: ${payload.stopError}`);

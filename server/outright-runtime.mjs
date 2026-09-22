@@ -4,13 +4,13 @@ import path from "node:path";
 import { realpath } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { createOutrightDatabase } from "./database.mjs";
-import { createAgentManager } from "./agent-manager.mjs";
+import { createAgentManager, defaultGroupMembers, terminateTree } from "./agent-manager.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = defaultRecoveryProcessAlive }) {
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = defaultRecoveryProcessAlive, terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationTimeoutMs = 8000 }) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
   const database = createOutrightDatabase({ runtimeLease: true });
@@ -250,9 +250,18 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           if (!(Number.isSafeInteger(pending.pid) && pending.pid > 0)) {
             throw apiError(409, "An interrupted provider process cannot be verified, so no recovery decision can be recorded yet", { code: "RECOVERY_PROCESS_UNKNOWN", runId: pending.id });
           }
-          const verdict = recoveryVerdict(await recoveryProcessAlive(pending.pid));
+          let verdict = recoveryVerdict(await recoveryProcessAlive(pending.pid));
           if (verdict === "alive") {
-            throw apiError(409, "An interrupted provider process is still active; stop it before choosing a recovery policy", { code: "RECOVERY_PROCESS_ACTIVE", pid: pending.pid, runId: pending.id });
+            try { await terminateRecoveryProcess(pending.pid); }
+            catch { /* Verification below remains fail-closed. */ }
+            const deadline = Date.now() + recoveryTerminationTimeoutMs;
+            while (verdict === "alive" && Date.now() < deadline) {
+              await new Promise((resolve) => setTimeout(resolve, 50));
+              verdict = recoveryVerdict(await recoveryProcessAlive(pending.pid));
+            }
+            if (verdict === "alive") {
+              throw apiError(409, "The interrupted provider process did not stop, so no recovery decision was recorded", { code: "RECOVERY_PROCESS_ACTIVE", pid: pending.pid, runId: pending.id });
+            }
           }
           if (verdict !== "exited") {
             throw apiError(409, "An interrupted provider process cannot be verified, so no recovery decision can be recorded yet", { code: "RECOVERY_PROCESS_UNKNOWN", pid: pending.pid, runId: pending.id });
@@ -476,19 +485,25 @@ function recoveryVerdict(value) {
   return ["alive", "exited", "unknown"].includes(value) ? value : "unknown";
 }
 
-export function defaultRecoveryProcessAlive(pid, platform = process.platform) {
+export function defaultRecoveryProcessAlive(pid, platform = process.platform, groupMembers = defaultGroupMembers, kill = process.kill) {
   if (platform === "win32") {
     // The spawned tree is not owned on Windows, so a gone leader says nothing
     // about its descendants: only a live leader is verifiable.
-    try { process.kill(pid, 0); return "alive"; }
+    try { kill(pid, 0); return "alive"; }
     catch { return "unknown"; }
   }
   try {
-    process.kill(-pid, 0);
-    return "alive";
+    kill(-pid, 0);
+    const members = groupMembers(pid);
+    if (members == null) return "alive";
+    return members.some((member) => member.state !== "Z") ? "alive" : "exited";
   } catch (error) {
     return error.code === "ESRCH" ? "exited" : "unknown";
   }
+}
+
+export function defaultTerminateRecoveryProcess(pid) {
+  terminateTree({ pid }, "SIGTERM");
 }
 
 async function canonicalOf(target) {
