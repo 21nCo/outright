@@ -1,0 +1,19 @@
+server/agent-manager.test.mjs
+  s_09d76f6214482d::t_23e6ee895726e7 10,16,20-28,479,567-611,818,822,824-825
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "853a02df0aa9879e490a3844351add518746fab4",
+  "prompts": {},
+  "sessions": {
+    "s_09d76f6214482d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c79a-6436-7a73-8c7a-d61e403fdf02",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
