@@ -314,8 +314,8 @@ export function App() {
     const prompt = submittedDraft.trim();
     if (!prompt || activeRun || interruptedRun || submissionPendingRef.current) return;
     submissionPendingRef.current = true;
+    let target = targetOverride ?? conversation;
     try {
-      let target = targetOverride ?? conversation;
       if (!target) target = await createConversation(prompt.split(/\n/)[0].slice(0, 52));
       if (!target || !isSelectedTarget(target)) return;
       const run = await api(`/api/conversations/${target.id}/runs`, { method: "POST", body: { prompt, provider: target.provider || settings.provider, model: target.model || settings.model, reasoningEffort: settings.reasoningEffort, approvalPolicy: settings.approvalPolicy } });
