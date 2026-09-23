@@ -1,0 +1,27 @@
+src/App.jsx
+  s_28d4128c7417df::t_c2e14903116533 81,293-295,309,323-335,426-427,431-436,459,461-462,464,609-610,618
+src/components/CommandPalette.jsx
+  s_28d4128c7417df::t_1286408eb3628b 3,10-11,17,19,21-22,24,34,62-64
+src/styles.css
+  s_28d4128c7417df::t_cd904eaf22b0b2 469,555-557
+tests/fixtures/stubborn-child.mjs
+  s_28d4128c7417df::t_3f30b08f17e2e3 1-3
+tests/ui-races.test.mjs
+  s_28d4128c7417df::t_fd55de25c6b331 2,12-13,55-78,80-84,124-127,131-161,166,170-171,196-197,203,208-210,224,226,229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8b496d0059ada447dbae70817c9e88976c5f595c",
+  "prompts": {},
+  "sessions": {
+    "s_28d4128c7417df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1c1c580e-3b46-4699-b932-7f146605890c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
