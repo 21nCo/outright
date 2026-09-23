@@ -1,0 +1,18 @@
+accessibility-qa.md
+  h_a39f9495f9ec1d 10,16,19,24
+src/App.jsx
+  h_a39f9495f9ec1d 48,79,82-83,225-232,236,239-248,250-269,271,273-279,329,331-342,486,493,495-496,504,541
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 15,33,116-200,209-211,220
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "92d8716b9469df2584cc0b05aa7a21cddea05d69",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
