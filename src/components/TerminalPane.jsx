@@ -28,6 +28,10 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   const mountedRef = useRef(false);
   const queuedReconnectRef = useRef(null);
   const terminalsRef = useRef([]);
+  const worktreeNameRef = useRef(worktree.name);
+  const onErrorRef = useRef(onError);
+  worktreeNameRef.current = worktree.name;
+  onErrorRef.current = onError;
   const [terminals, setTerminals] = useState([]);
   const [activeId, setActiveId] = useState("");
   const [loading, setLoading] = useState(true);
@@ -164,15 +168,15 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
         if (cancelled || token !== reconcileTokenRef.current) return;
         const matching = all.filter((terminal) => terminal.cwd === worktree.path);
         let terminal = matching.find((item) => item.status === "running");
-        if (!terminal) terminal = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: worktree.name, cols: 100, rows: 30 } });
+        if (!terminal) terminal = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: worktreeNameRef.current, cols: 100, rows: 30 } });
         if (cancelled || token !== reconcileTokenRef.current) return;
         stageTerminals([...matching.filter((item) => item.id !== terminal.id), terminal]);
         await activateTerminal(terminal, token);
-      } catch (error) { if (!cancelled && token === reconcileTokenRef.current) { recoverSelection(); onError(error); } }
+      } catch (error) { if (!cancelled && token === reconcileTokenRef.current) { recoverSelection(); onErrorRef.current(error); } }
       finally { if (!cancelled && token === reconcileTokenRef.current) { loadingRef.current = false; setLoading(false); } }
     })();
     return () => { cancelled = true; mountedRef.current = false; ++reconcileTokenRef.current; queuedReconnectRef.current = null; pendingOutputRef.current = null; activeIdRef.current = ""; displayedCursorRef.current = 0; };
-  }, [worktree.id, worktree.name, worktree.path, onError]);
+  }, [worktree.id, worktree.path]);
 
   useEffect(() => {
     if (runtimeEvent?.type === "terminal.output") {
@@ -213,7 +217,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       if (mutationRef.current || reconcilingRef.current) queuedReconnectRef.current = runtimeEvent.payload;
       else reconcileConnection(runtimeEvent.payload);
     }
-  }, [runtimeEvent, onError, worktree.name, worktree.path]);
+  }, [runtimeEvent, worktree.path]);
 
   function reconcileConnection(payload, refresh = false) {
     if (!mountedRef.current) return;
@@ -225,12 +229,12 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       if (token !== reconcileTokenRef.current) return;
       const matching = all.filter((terminal) => terminal.cwd === worktree.path);
       let terminal = matching.find((item) => item.id === previousId && item.status === "running") ?? matching.find((item) => item.status === "running");
-      if (!terminal) terminal = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: worktree.name, cols: 100, rows: 30 } });
+      if (!terminal) terminal = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: worktreeNameRef.current, cols: 100, rows: 30 } });
       if (token !== reconcileTokenRef.current) return;
       stageTerminals([...matching.filter((item) => item.id !== terminal.id), terminal]);
       await activateTerminal(terminal, token);
     };
-    reconcile().catch((error) => { if (token === reconcileTokenRef.current) { recoverSelection(); onError(error); } }).finally(() => {
+    reconcile().catch((error) => { if (token === reconcileTokenRef.current) { recoverSelection(); onErrorRef.current(error); } }).finally(() => {
       reconcilingRef.current = false;
       if (mountedRef.current && token === reconcileTokenRef.current) {
         loadingRef.current = false;
@@ -262,11 +266,11 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     const wasAwaitingFit = awaitingVisibleFitRef.current;
     const token = beginSelection();
     try {
-      const terminal = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: `${worktree.name} ${terminals.length + 1}` } });
+      const terminal = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: `${worktreeNameRef.current} ${terminals.length + 1}` } });
       if (token !== reconcileTokenRef.current) return;
       stageTerminals([...terminals, terminal]);
       await activateTerminal(terminal, token);
-    } catch (error) { if (token === reconcileTokenRef.current) { recoverSelection(wasReady, wasAwaitingFit); onError(error); } }
+    } catch (error) { if (token === reconcileTokenRef.current) { recoverSelection(wasReady, wasAwaitingFit); onErrorRef.current(error); } }
     finally { finishMutation(token); }
   }
 
@@ -285,7 +289,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       let next = remaining.find((item) => item.id === previousId) ?? remaining[0];
       stageTerminals(remaining);
       if (!next) {
-        next = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: worktree.name } });
+        next = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: worktreeNameRef.current } });
         remaining.push(next);
       }
       if (token !== reconcileTokenRef.current) return;
@@ -297,7 +301,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
         });
       }
       await activateTerminal(next, token);
-    } catch (error) { if (token === reconcileTokenRef.current) { recoverSelection(wasReady, wasAwaitingFit); onError(error); } }
+    } catch (error) { if (token === reconcileTokenRef.current) { recoverSelection(wasReady, wasAwaitingFit); onErrorRef.current(error); } }
     finally { finishMutation(token); }
   }
 
@@ -314,7 +318,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
         if (document.activeElement?.dataset.tabId === terminal.id) {
           document.getElementById(domId("terminal-tab", activeIdRef.current))?.focus({ preventScroll: true });
         }
-        onError(error);
+        onErrorRef.current(error);
       }
     }
     finally { if (token === reconcileTokenRef.current) { loadingRef.current = false; setLoading(false); } }

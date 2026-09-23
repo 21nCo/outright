@@ -389,6 +389,48 @@ async function terminalReconnectMutationRegression() {
   assert(errors.length === 0, "Reconnect mutation reported an error");
 }
 
+async function terminalSamePaneRestartRegression() {
+  root.render(null);
+  await settle();
+  const creating = deferred();
+  const deleting = deferred();
+  let all = [terminal("A")];
+  let lists = 0;
+  let posts = 0;
+  const errors = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") { posts += 1; return creating.promise; }
+    if (url.pathname === "/api/terminals") { lists += 1; return response({ terminals: all }); }
+    if (options.method === "DELETE") return deleting.promise;
+    return response({ buffer: "Running\r\n", status: "running" });
+  };
+  const show = (name, event = null) => root.render(<TerminalPane worktree={{ ...projects[0].worktrees[0], name }} runtimeEvent={event} onError={(error) => errors.push(error)} sendRuntime={() => {}} />);
+  show("A");
+  await until(() => terminalReady("Terminal A"), "terminal before same-pane restart");
+  host.querySelector('[aria-label="New terminal"]').click();
+  await until(() => posts === 1, "pending create before same-pane restart");
+  show("A renamed");
+  await settle();
+  if (lists > 1) await until(() => terminalReady("Terminal A"), "stale list fetched before create settled");
+  show("A renamed", { type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [terminal("A")] } });
+  await settle();
+  all = [terminal("A"), terminal("A2")];
+  creating.resolve(response(terminal("A2")));
+  await until(() => lists >= 2 && host.querySelector('[data-tab-id="term-A2"]'), "authoritative list after same-pane mutation and reconnect");
+  await until(() => host.querySelector('.terminal-tabs[aria-busy="false"]'), "ready after same-pane creation");
+  host.querySelector('[aria-label="Close terminal Terminal A2"]').click();
+  await until(() => host.querySelector('.terminal-tabs[aria-busy="true"]'), "pending delete before same-pane restart");
+  show("A renamed again");
+  await settle();
+  const beforeDeleteReconcile = lists;
+  show("A renamed again", { type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [terminal("A"), terminal("A2")] } });
+  await settle();
+  all = [terminal("A")];
+  deleting.resolve(response({}));
+  await until(() => lists > beforeDeleteReconcile && !host.querySelector('[data-tab-id="term-A2"]'), "authoritative list after same-pane deletion and reconnect");
+  assert(posts === 1 && errors.length === 0, "Same-pane restart created a ghost terminal or surfaced an error");
+}
+
 async function terminalReconnectOwnershipRegression() {
   root.render(null);
   await settle();
@@ -846,6 +888,8 @@ try {
   results.textContent += "PASS: candidate and active exits survive failed activation and fresh running reacquisition\n";
   await terminalReconnectMutationRegression();
   results.textContent += "PASS: reconnect refreshes authoritative terminals after pending create and delete\n";
+  await terminalSamePaneRestartRegression();
+  results.textContent += "PASS: same-pane restart drains reconnect after pending mutation\n";
   await terminalReconnectOwnershipRegression();
   results.textContent += "PASS: overlapping reconnects coalesce and unmount discards queued work\n";
   await terminalBackgroundActivationRegression();
@@ -862,7 +906,7 @@ try {
   results.textContent += "PASS: create, close and reconnect failures preserve terminal tab ownership\n";
   const phoneRan = await recoveryActionsRegression();
   results.textContent += phoneRan ? "PASS: phone-width recovery decisions remain inside the viewport\n" : "SKIP: phone geometry requires a narrow viewport\n";
-  results.textContent += `${17 + Number(responsiveRan) + Number(phoneRan)} interaction regressions passed`;
+  results.textContent += `${18 + Number(responsiveRan) + Number(phoneRan)} interaction regressions passed`;
   document.title = "PASS — Outright interaction regressions";
 } catch (error) {
   results.textContent += `\nFAIL: ${error.stack}`;

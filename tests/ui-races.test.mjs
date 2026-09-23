@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import WebSocket from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -45,7 +45,7 @@ async function waitForServer(url, child, logs) {
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`Vite exited before the UI harness loaded:\n${logs()}`);
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
       if (response.ok) return;
     } catch { /* Vite is still starting. */ }
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -166,6 +166,16 @@ function posixGroupDiagnostic(child) {
   return result.stdout.split("\n").filter((line) => Number(line.trim().split(/\s+/)[2]) === child.pid).join(" | ");
 }
 
+function liveProfileHelpers(child) {
+  if (!child.profile || process.platform === "win32") return [];
+  const result = spawnSync("ps", ["-e", "-o", "pid=,stat=,command="], { encoding: "utf8", timeout: 5_000 });
+  if (result.status !== 0) throw new Error(`Cannot inspect Chrome profile processes: ${result.stderr || result.error}`);
+  const profileArg = `--user-data-dir=${child.profile}`;
+  return result.stdout.split("\n").map((line) => line.trim().match(/^(\d+)\s+(\S+)\s+(.*)$/))
+    .filter((match) => match && !match[2].startsWith("Z") && match[3].includes(profileArg))
+    .map((match) => Number(match[1]));
+}
+
 function terminateOwnedChromeHelpers(child, signal) {
   if (!child.profile) return false;
   // The profile is a freshly created, private path passed only to this Chrome
@@ -192,9 +202,8 @@ function terminateTree(child, signal) {
   try { process.kill(-child.pid, signal); }
   catch (error) {
     if (error.code === "ESRCH") {
-      // Chrome helpers may leave the launcher's group while inheriting its
-      // pipes. The private profile remains a stronger ownership identifier.
-      if (!pipesClosed(child)) terminateOwnedChromeHelpers(child, signal);
+      // Helpers can leave the launcher group even with file-backed output.
+      terminateOwnedChromeHelpers(child, signal);
       return;
     }
     if (error.code !== "EPERM") throw error;
@@ -206,18 +215,18 @@ function terminateTree(child, signal) {
     else if (!pipesClosed(child) && !profileOwned) throw error;
     return;
   }
-  if (child.profile && !pipesClosed(child)) terminateOwnedChromeHelpers(child, signal);
+  terminateOwnedChromeHelpers(child, signal);
 }
 
 function treeGone(child) {
   if (process.platform === "win32") return hasExited(child) && liveWindowsOwned(child).length === 0 && pipesClosed(child);
   try { process.kill(-child.pid, 0); }
   catch (error) {
-    if (error.code === "ESRCH") return hasExited(child) && pipesClosed(child);
+    if (error.code === "ESRCH") return hasExited(child) && pipesClosed(child) && liveProfileHelpers(child).length === 0;
     if (error.code !== "EPERM") throw error;
     return false; // Permission denial cannot prove that the group is gone.
   }
-  return hasExited(child) && pipesClosed(child) && !livePosixGroup(child);
+  return hasExited(child) && pipesClosed(child) && !livePosixGroup(child) && liveProfileHelpers(child).length === 0;
 }
 
 async function waitForTree(child, timeout) {
@@ -272,10 +281,14 @@ function connectDevTools(url) {
     socket.once("open", () => resolve({
       socket,
       onEvent(handler) { eventHandler = handler; },
-      send(method, params = {}) {
+      send(method, params = {}, timeout = 10_000) {
         return new Promise((done, fail) => {
           const id = ++sequence;
-          pending.set(id, { done, fail });
+          const timer = setTimeout(() => {
+            pending.delete(id);
+            fail(new Error(`Timed out waiting for DevTools ${method}`));
+          }, timeout);
+          pending.set(id, { done, fail, timer });
           socket.send(JSON.stringify({ id, method, params }));
         });
       },
@@ -284,13 +297,14 @@ function connectDevTools(url) {
       const payload = JSON.parse(message);
       if (!payload.id) { eventHandler(payload); return; }
       if (!pending.has(payload.id)) return;
-      const { done, fail } = pending.get(payload.id);
+      const { done, fail, timer } = pending.get(payload.id);
       pending.delete(payload.id);
+      clearTimeout(timer);
       if (payload.error) fail(new Error(payload.error.message));
       else done(payload.result);
     });
     socket.on("close", () => {
-      for (const { fail } of pending.values()) fail(new Error("DevTools connection closed"));
+      for (const { fail, timer } of pending.values()) { clearTimeout(timer); fail(new Error("DevTools connection closed")); }
       pending.clear();
     });
   });
@@ -304,13 +318,26 @@ async function closeDevTools(devtools) {
       new Promise((resolve) => setTimeout(resolve, 1_000)),
     ]);
   } catch { /* Forced process cleanup below remains authoritative. */ }
-  if (devtools.socket.readyState >= WebSocket.CLOSING) return;
+  if (devtools.socket.readyState === WebSocket.CLOSED) return;
   await Promise.race([
     new Promise((resolve) => devtools.socket.once("close", resolve)),
     new Promise((resolve) => setTimeout(resolve, 1_000)),
   ]);
-  if (devtools.socket.readyState < WebSocket.CLOSING) devtools.socket.close();
+  if (devtools.socket.readyState !== WebSocket.CLOSED) devtools.socket.terminate();
 }
+
+test("a silent DevTools request fails within its bound", { timeout: 5_000 }, async () => {
+  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await new Promise((resolve) => server.once("listening", resolve));
+  let devtools;
+  try {
+    devtools = await connectDevTools(`ws://127.0.0.1:${server.address().port}`);
+    await assert.rejects(devtools.send("Page.enable", {}, 25), /Timed out waiting for DevTools Page.enable/);
+  } finally {
+    devtools?.socket.terminate();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
 
 test("process cleanup terminates the tree and waits for pipe close", { timeout: 20_000 }, async () => {
   const child = spawn(process.execPath, [stubbornChild], {
@@ -342,6 +369,31 @@ test("private-profile fallback signals only its owned process", { skip: process.
     assert(await waitForTree(child, 5_000), "Profile-owned process survived atomic command-line matching");
   } finally {
     await stop(child);
+    rmSync(profile, { recursive: true, force: true });
+  }
+});
+
+test("normal stop reaps an escaped profile helper with file-backed output", { skip: process.platform === "win32", timeout: 20_000 }, async () => {
+  const profile = mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
+  const logFd = openSync(path.join(profile, "chrome.log"), "w");
+  let launcher;
+  let helper;
+  try {
+    launcher = spawn(process.execPath, [stubbornChild, `--user-data-dir=${profile}`], {
+      cwd: root, detached: true, stdio: ["ignore", logFd, logFd],
+    });
+    helper = spawn(process.execPath, [stubbornChild, `--user-data-dir=${profile}`], {
+      cwd: root, detached: true, stdio: ["ignore", logFd, logFd],
+    });
+    launcher.profile = profile;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(hasExited(helper), false, "Fixture helper exited before cleanup");
+    await stop(launcher);
+    assert(await waitForExit(helper, 3_000), "Normal stop left the profile-owned helper alive outside the launcher group");
+  } finally {
+    closeSync(logFd);
+    if (helper && !hasExited(helper)) { helper.kill("SIGKILL"); await waitForExit(helper, 3_000); }
+    await stop(launcher);
     rmSync(profile, { recursive: true, force: true });
   }
 });
@@ -557,7 +609,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
     }
     await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, logs, diagnostic);
     snapshotWindowsTree(browser);
-    const targetResponse = await fetch(`http://127.0.0.1:${debugPort}/json/new?${encodeURIComponent("about:blank")}`, { method: "PUT" });
+    const targetResponse = await fetch(`http://127.0.0.1:${debugPort}/json/new?${encodeURIComponent("about:blank")}`, { method: "PUT", signal: AbortSignal.timeout(10_000) });
     if (!targetResponse.ok) throw new Error(await targetResponse.text());
     const target = await targetResponse.json();
     devtools = await connectDevTools(target.webSocketDebuggerUrl);
@@ -620,7 +672,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     assert.match(state?.title ?? "", /^PASS/, state?.text || logs());
-    assert.match(state.text, /19 interaction regressions passed/);
+    assert.match(state.text, /20 interaction regressions passed/);
     if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
   } catch (error) {
     failure = error;

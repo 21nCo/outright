@@ -8,12 +8,12 @@ The required `npm test` browser regression suite needs Google Chrome or Chromium
 set `CHROME_PATH` to the executable on machines without a standard installation.
 Missing Chrome fails the suite rather than silently dropping the interaction checks.
 
-- `npm test`: 157 passed, 1 platform skip on macOS, including keyboard tab navigation, safe DOM IDs, semantic roles, terminal screen-reader mode, live regions, responsive fallbacks, and headless browser interactions.
+- `npm test`: 159 passed, 1 platform skip on macOS, including keyboard tab navigation, safe DOM IDs, semantic roles, terminal screen-reader mode, live regions, responsive fallbacks, and headless browser interactions.
 - `npm run build`: production client/server/Sites artifacts built successfully.
 - `npm run test:sites`: 4 Sites packaging and routing tests passed.
-- Browser interaction harness: 19 checks passed, including breakpoint synchronization, modal drawer isolation/focus containment, inspector focus restoration, and terminal reconnect ownership. A separate Node test checks process cleanup after an injected browser failure.
+- Browser interaction harness: 20 checks passed, including breakpoint synchronization, modal drawer isolation/focus containment, inspector focus restoration, terminal reconnect ownership, and a same-pane metadata change during pending creation. Node tests check escaped private-profile helper cleanup with file-backed output, bounded CDP requests, and cleanup after an injected browser failure.
 
-## Manual keyboard and accessibility-tree checks
+## Keyboard and accessibility-tree checks (not a screen-reader session)
 
 Tested against the live local runtime with the browser accessibility tree.
 
@@ -27,6 +27,10 @@ Tested against the live local runtime with the browser accessibility tree.
 - Errors, success notices, connection state, run state, loading state, and streaming activity expose alert/status live regions.
 - 640 × 800 viewport (1280px page at 200% zoom equivalent): crossing the breakpoint closes the desktop sidebar without displacing composer focus; no horizontal page overflow; project/worktree hierarchy and conversation tabs remain intact.
 - Reduced-motion preference disables nonessential animation and transition duration.
+
+## Manual assistive-technology acceptance still required
+
+The keyboard and browser accessibility-tree checks above are not manual assistive-technology testing. A human session with VoiceOver/Safari on macOS or NVDA/Chrome on Windows remains necessary to record actual spoken names, announcements, and navigation for the narrow project drawer (open, contained navigation, Escape/close), project/worktree hierarchy, conversation and inspector tabs, settings/dialog validation and status, and terminal input/output, session switching, loading and exit. Record the platform, browser, AT version, viewport/zoom, observed speech, and any defects before declaring OUT-31 accepted. This headless run did not activate a screen reader; the macOS display was asleep and VoiceOver was not running. Do not treat the AX-tree observations above as AT evidence.
 
 ## Scope note
 
