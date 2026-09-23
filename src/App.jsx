@@ -236,9 +236,12 @@ export function App() {
   }, [inspector, isNarrow, sidebarOpen]);
   useEffect(() => {
     const narrow = window.matchMedia("(max-width: 760px)");
+    let wasNarrow = narrow.matches;
     const synchronizeLayout = () => {
-      setIsNarrow(narrow.matches);
-      setSidebarOpen(!narrow.matches);
+      if (narrow.matches === wasNarrow) return;
+      wasNarrow = narrow.matches;
+      setIsNarrow(wasNarrow);
+      setSidebarOpen(!wasNarrow);
     };
     narrow.addEventListener("change", synchronizeLayout);
     window.addEventListener("resize", synchronizeLayout);

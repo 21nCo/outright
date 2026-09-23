@@ -149,6 +149,14 @@ async function responsiveFocusRegression() {
   try {
     root.render(<TooltipProvider><App /></TooltipProvider>);
     await until(() => host.querySelector('textarea[aria-label="Message the agent"]'), "responsive fixture");
+    host.querySelector('[aria-label="Close projects sidebar"]').click();
+    await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), "closed desktop sidebar");
+    window.dispatchEvent(new Event("resize"));
+    await settle();
+    assert(host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "true", "A same-breakpoint desktop resize reopened the project sidebar");
+    host.querySelector('[aria-label="Open projects sidebar"]').click();
+    await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", "reopened desktop sidebar");
+
     const composer = host.querySelector('textarea[aria-label="Message the agent"]');
     composer.focus();
     setNarrow(true);
@@ -167,6 +175,10 @@ async function responsiveFocusRegression() {
     assert(workspace.getAttribute("aria-hidden") === "true", "Project drawer did not hide the workspace from assistive technology");
     assert(scrim?.tagName === "DIV" && scrim.tabIndex === -1, "Project drawer backdrop entered the tab order");
     const closeButton = document.activeElement;
+    window.dispatchEvent(new Event("resize"));
+    await settle();
+    assert(sidebar.getAttribute("aria-hidden") === "false", "A same-breakpoint narrow resize closed the project drawer");
+    assert(workspace.hasAttribute("inert") && sidebar.contains(document.activeElement), "A same-breakpoint narrow resize lost drawer focus containment");
     composer.focus();
     assert(document.activeElement === closeButton, "Inert workspace accepted focus while the project drawer was open");
     const focusable = visibleFocusable(sidebar);
