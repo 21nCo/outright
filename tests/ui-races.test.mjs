@@ -70,32 +70,87 @@ function waitForExit(child, timeout) {
   });
 }
 
-function windowsDescendants(pid) {
+function windowsProcesses(pids) {
+  if (pids?.length === 0) return [];
+  const filter = pids ? ` -Filter "${pids.map((pid) => `ProcessId = ${Number(pid)}`).join(" OR ")}"` : "";
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-    "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress"],
-  { encoding: "utf8", windowsHide: true, timeout: 5_000 });
-  if (result.status !== 0) throw new Error(`Cannot inspect Windows process tree: ${result.stderr || result.error}`);
-  const processes = [JSON.parse(result.stdout)].flat();
-  const descendants = [];
-  const frontier = [pid];
+    `Get-CimInstance Win32_Process${filter} | Select-Object ProcessId,ParentProcessId,@{Name='CreatedMs';Expression={([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds()}} | ConvertTo-Json -Compress`],
+  { encoding: "utf8", windowsHide: true, timeout: 8_000 });
+  if (result.status !== 0) throw new Error(`Cannot inspect Windows process identities: ${result.stderr || result.error}`);
+  const processes = result.stdout.trim() ? [JSON.parse(result.stdout)].flat().filter(Boolean) : [];
+  if (processes.some((item) => !Number.isSafeInteger(item.ProcessId) || !Number.isSafeInteger(item.ParentProcessId)
+    || !Number.isSafeInteger(item.CreatedMs))) throw new Error("Cannot verify Windows process identity timestamps");
+  return processes;
+}
+
+function snapshotWindowsTree(child) {
+  if (process.platform !== "win32" || hasExited(child)) return;
+  const processes = windowsProcesses();
+  const root = processes.find((item) => item.ProcessId === child.pid);
+  if (!root) throw new Error(`Cannot identify owned Windows process ${child.pid}`);
+  if (child.ownedWindows?.has(child.pid) && child.ownedWindows.get(child.pid) !== root.CreatedMs) {
+    throw new Error(`Windows process ${child.pid} changed identity`);
+  }
+  child.ownedWindows ??= new Map();
+  child.ownedWindows.set(child.pid, root.CreatedMs);
+  const frontier = [child.pid];
   while (frontier.length) {
     const parent = frontier.shift();
-    for (const process of processes.filter((item) => item.ParentProcessId === parent)) {
-      descendants.push(process.ProcessId);
-      frontier.push(process.ProcessId);
+    for (const item of processes.filter((candidate) => candidate.ParentProcessId === parent)) {
+      if (child.ownedWindows.has(item.ProcessId)) continue;
+      child.ownedWindows.set(item.ProcessId, item.CreatedMs);
+      frontier.push(item.ProcessId);
     }
   }
-  return descendants;
+}
+
+function liveWindowsOwned(child) {
+  const owned = child.ownedWindows;
+  if (!owned?.size) return [];
+  return matchingOwnedProcesses(child, windowsProcesses([...owned.keys()]));
+}
+
+function matchingOwnedProcesses(child, processes) {
+  return processes.filter((item) => child.ownedWindows?.get(item.ProcessId) === item.CreatedMs
+    && (item.ProcessId !== child.pid || !hasExited(child)));
+}
+
+function killWindowsOwned(item) {
+  if (!Number.isSafeInteger(item.CreatedMs)) throw new Error(`Windows process ${item.ProcessId} has no verified creation time`);
+  // A .NET Process handle is held across the identity check and Kill(), so a
+  // recycled numeric PID cannot become the termination target between them.
+  const command = `$p=[System.Diagnostics.Process]::GetProcessById(${Number(item.ProcessId)}); try { $handle=$p.Handle; if (([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds() -eq ${item.CreatedMs}) { $p.Kill() } } finally { $p.Dispose() }`;
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command],
+    { encoding: "utf8", windowsHide: true, timeout: 8_000 });
+  // A process exiting during acquisition is not an error if the later liveness
+  // check verifies it gone; all other errors remain visible to cleanup.
+  if (result.status !== 0 && windowsProcesses([item.ProcessId]).some((current) => current.CreatedMs === item.CreatedMs)) {
+    throw new Error(`Could not terminate owned Windows process ${item.ProcessId}: ${result.stderr || result.error}`);
+  }
+}
+
+function posixGroupHasExecutable(output, groupId) {
+  const members = output.split("\n").map((line) => {
+    const fields = line.trim().match(/^(\d+)\s+(\S+)/);
+    return fields && Number(fields[1]) === groupId ? fields[2] : null;
+  }).filter(Boolean);
+  return members.length === 0 || members.some((status) => !status.startsWith("Z"));
+}
+
+function livePosixGroup(child) {
+  const result = spawnSync("ps", ["-e", "-o", "pgid=,stat="], { encoding: "utf8", timeout: 5_000 });
+  if (result.status !== 0) throw new Error(`Cannot inspect POSIX group ${child.pid}: ${result.stderr || result.error}`);
+  return posixGroupHasExecutable(result.stdout, child.pid);
 }
 
 function terminateTree(child, signal) {
   if (!child?.pid) return;
   if (process.platform === "win32") {
-    // Windows does not deliver catchable SIGTERM to Node children. Snapshot
-    // descendants even when the leader has already exited, then force the tree.
-    const descendants = windowsDescendants(child.pid);
-    for (const pid of [child.pid, ...descendants].reverse()) {
-      spawnSync("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore", windowsHide: true, timeout: 5_000 });
+    // Never enumerate from or signal an exited leader's recycled numeric PID.
+    snapshotWindowsTree(child);
+    for (const item of liveWindowsOwned(child)) {
+      if (item.ProcessId === child.pid && hasExited(child)) continue;
+      killWindowsOwned(item);
     }
     return;
   }
@@ -112,25 +167,31 @@ function terminateTree(child, signal) {
 }
 
 function treeGone(child) {
-  if (process.platform === "win32") return hasExited(child) && windowsDescendants(child.pid).length === 0 && pipesClosed(child);
-  try { process.kill(-child.pid, 0); return false; }
-  catch (error) { if (error.code === "ESRCH" || error.code === "EPERM") return hasExited(child) && pipesClosed(child); throw error; }
+  if (process.platform === "win32") return hasExited(child) && liveWindowsOwned(child).length === 0 && pipesClosed(child);
+  try { process.kill(-child.pid, 0); }
+  catch (error) {
+    if (error.code === "ESRCH") return hasExited(child) && pipesClosed(child);
+    if (error.code !== "EPERM") throw error;
+    return false; // Permission denial cannot prove that the group is gone.
+  }
+  return hasExited(child) && pipesClosed(child) && !livePosixGroup(child);
 }
 
 async function waitForTree(child, timeout) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     if (treeGone(child)) return true;
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, 200));
   }
   return treeGone(child);
 }
 
 async function stop(child) {
   if (!child?.pid) return "absent";
+  snapshotWindowsTree(child);
   if (hasExited(child) && pipesClosed(child) && treeGone(child)) return "graceful";
   terminateTree(child, "SIGTERM");
-  if (await waitForTree(child, 2_000)) return process.platform === "win32" ? "taskkill" : "graceful";
+  if (await waitForTree(child, 2_000)) return process.platform === "win32" ? "forced" : "graceful";
   terminateTree(child, "SIGKILL");
   if (!await waitForTree(child, 5_000)) throw new Error(`Process tree ${child.pid} did not exit after forced termination`);
   return "forced";
@@ -221,29 +282,58 @@ test("process cleanup terminates the tree and waits for pipe close", { timeout: 
       child.stdout.once("data", resolve);
     });
     const outcome = await stop(child);
-    assert.equal(outcome, process.platform === "win32" ? "taskkill" : "forced");
+    assert.equal(outcome, "forced");
     assert.equal(hasExited(child) && child.stdout.closed && child.stderr.closed, true);
   } finally { await stop(child); }
 });
 
 test("exited group leader cannot leave a pipe-holding descendant", { timeout: 30_000 }, async () => {
   const child = spawn(process.execPath, [exitedLeader], {
-    cwd: root, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+    cwd: root, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
   });
   let descendantId;
+  let fixtureOutput = "";
   try {
     await new Promise((resolve, reject) => {
       child.once("error", reject);
       child.stdout.on("data", (chunk) => {
-        const match = chunk.toString().match(/descendant:(\d+)/);
+        fixtureOutput += chunk;
+        if (fixtureOutput.includes("spawn-error:")) { reject(new Error(fixtureOutput)); return; }
+        const match = fixtureOutput.match(/descendant:(\d+)/);
         if (match) { descendantId = Number(match[1]); resolve(); }
       });
     });
+    if (process.platform === "win32") {
+      const deadline = Date.now() + 4_000;
+      do {
+        snapshotWindowsTree(child);
+        if (child.ownedWindows.has(descendantId)) break;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      } while (Date.now() < deadline);
+      assert(child.ownedWindows.has(descendantId), "Windows fixture descendant identity was not captured before leader exit");
+    }
+    child.stdin.end("exit\n");
     assert(await waitForExit(child, 3_000), "Leader did not exit independently");
-    assert.equal(child.stdout.closed, false, "Fixture descendant did not retain the pipe");
+    if (process.platform !== "win32") assert.equal(child.stdout.closed, false, "Fixture descendant did not retain the pipe");
     process.kill(descendantId, 0);
     await stop(child);
     assert.equal(child.stdout.closed && child.stderr.closed, true);
+    if (process.platform === "win32") assert.equal(liveWindowsOwned(child).length, 0, "Owned descendant survived cleanup");
+  } finally { await stop(child); }
+});
+
+test("fixture reports descendant spawn failure without waiting for self-expiry", { timeout: 10_000 }, async () => {
+  const child = spawn(process.execPath, [exitedLeader], {
+    cwd: root, env: { ...process.env, OUTRIGHT_TEST_MISSING_CHILD: "1" },
+    detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  try {
+    assert(await waitForExit(child, 5_000), "Spawn failure was not reported before fixture expiry");
+    if (!child.stdout.closed) await new Promise((resolve) => child.stdout.once("close", resolve));
+    assert.match(output, /spawn-error:/);
+    assert.notEqual(child.exitCode, 0);
   } finally { await stop(child); }
 });
 
@@ -256,6 +346,19 @@ test("cleanup runs all owners after an earlier failure", async () => {
     ["profile", async () => { attempted.push("profile"); }],
   ]), /UI harness cleanup failed/);
   assert.deepEqual(attempted, ["DevTools", "browser", "Vite", "profile"]);
+});
+
+test("recycled Windows PIDs and POSIX zombie-only groups are not live owned targets", () => {
+  const exited = { pid: 4100, exitCode: 0, signalCode: null, ownedWindows: new Map([[4100, 100], [4101, 200]]) };
+  assert.deepEqual(matchingOwnedProcesses(exited, [
+    { ProcessId: 4100, CreatedMs: 300 },
+    { ProcessId: 4101, CreatedMs: 200 },
+    { ProcessId: 4102, CreatedMs: 400 },
+  ]).map((item) => item.ProcessId), [4101]);
+  assert.deepEqual(matchingOwnedProcesses(exited, [{ ProcessId: 4101, CreatedMs: 500 }]), []);
+  assert.equal(posixGroupHasExecutable("4100 Z\n4100 Z+\n42 S", 4100), false);
+  assert.equal(posixGroupHasExecutable("4100 Z\n4100 S+", 4100), true);
+  assert.equal(posixGroupHasExecutable("42 S", 4100), true, "An unobservable group cannot be declared gone");
 });
 
 test("browser interaction regressions pass in headless Chrome", { timeout: 90_000 }, async () => {
@@ -279,6 +382,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 90_00
 
   try {
     await waitForServer(url, vite, () => output);
+    snapshotWindowsTree(vite);
     browser = spawn(chromeExecutable(), [
       "--headless=new",
       "--disable-background-networking",
@@ -300,6 +404,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 90_00
     browser.stdout.on("data", (chunk) => { browserOutput += chunk; });
     browser.stderr.on("data", (chunk) => { browserOutput += chunk; });
     await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, () => browserOutput);
+    snapshotWindowsTree(browser);
     const targetResponse = await fetch(`http://127.0.0.1:${debugPort}/json/new?${encodeURIComponent("about:blank")}`, { method: "PUT" });
     if (!targetResponse.ok) throw new Error(await targetResponse.text());
     const target = await targetResponse.json();
@@ -342,7 +447,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 90_00
         }
         if (event.params.name !== "__requestFixtureViewport") return;
         const width = Number(event.params.payload);
-        if (![1280, 1200, 640, 620, 390].includes(width)) throw new Error(`Unexpected fixture viewport: ${width}`);
+        if (![1280, 1200, 760, 640, 620, 390].includes(width)) throw new Error(`Unexpected fixture viewport: ${width}`);
         await devtools.send("Emulation.setDeviceMetricsOverride", { width, height: 844, deviceScaleFactor: 1, mobile: false });
         await devtools.send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-viewport-ready", { detail: ${width} }))` });
       })().catch((error) => { viewportError = error; });
@@ -363,12 +468,13 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 90_00
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     assert.match(state?.title ?? "", /^PASS/, state?.text || browserOutput);
-    assert.match(state.text, /10 interaction regressions passed/);
+    assert.match(state.text, /11 interaction regressions passed/);
   } catch (error) {
     failure = error;
   } finally {
     try {
       await cleanupResources([
+        ["Chrome identity snapshot", () => snapshotWindowsTree(browser)],
         ["DevTools", () => closeDevTools(devtools)],
         ["Chrome tree", () => stop(browser)],
         ["Vite tree", () => stop(vite)],

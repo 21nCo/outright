@@ -142,7 +142,14 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     const token = ++reconcileTokenRef.current;
     setLoading(true);
     try { await activateTerminal(terminal, token); }
-    catch (error) { if (token === reconcileTokenRef.current) onError(error); }
+    catch (error) {
+      if (token === reconcileTokenRef.current) {
+        if (document.activeElement?.dataset.tabId === terminal.id) {
+          document.getElementById(domId("terminal-tab", activeIdRef.current))?.focus({ preventScroll: true });
+        }
+        onError(error);
+      }
+    }
     finally { if (token === reconcileTokenRef.current) setLoading(false); }
   }
 

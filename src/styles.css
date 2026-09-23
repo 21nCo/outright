@@ -499,6 +499,9 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
 @media (max-width: 760px) {
   .app-shell { position: relative; display: block; min-width: 0; }
   .sidebar { position: fixed; z-index: 50; inset: 0 auto 0 0; width: min(88vw, 336px); max-width: calc(100vw - 44px); box-shadow: 18px 0 50px rgba(0,0,0,.22); }
+  .recovery-notice { flex-wrap: wrap; }
+  .recovery-actions { width: 100%; flex: 0 0 100%; align-items: stretch; }
+  .recovery-actions [data-slot="button"] { min-width: 0; white-space: normal; }
   .sidebar-is-closed .sidebar { transform: translateX(-100%); }
   .mobile-scrim { position: fixed; z-index: 49; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; display: block; background: rgba(0,0,0,.32); cursor: default; }
   .workspace { width: 100%; }
@@ -552,9 +555,7 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .commit-bar button { width: 100%; }
   .terminal-tab { min-width: 130px; }
   .terminal-loading { font-size: 0; }
-  .recovery-notice { flex-wrap: wrap; }
-  .recovery-actions { width: 100%; flex: 0 0 100%; align-items: stretch; }
-  .recovery-actions [data-slot="button"] { width: 100%; min-width: 0; white-space: normal; }
+  .recovery-actions [data-slot="button"] { width: 100%; }
 }
 
 @media (prefers-reduced-motion: reduce) {

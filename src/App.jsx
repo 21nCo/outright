@@ -79,6 +79,7 @@ export function App() {
   const pendingPrependScrollRef = useRef(null);
   const sidebarRef = useRef(null);
   const sidebarFocusIntentRef = useRef(null);
+  const sidebarFocusOwnerRef = useRef(null);
   const inspectorRef = useRef(null);
   const inspectorInvokerRef = useRef(null);
   const inspectorReturnFocusRef = useRef(null);
@@ -278,8 +279,8 @@ export function App() {
       }
       if (event.key === "Escape" && !document.querySelector('[role="dialog"]:not(#project-sidebar)')) {
         if (isNarrow && sidebarOpen) closeSidebar();
-        else if (inspector && inspectorRef.current?.contains(event.target)
-          && !event.target.closest(".terminal-host")) closeInspector();
+        else if (inspector && !event.target.closest?.(".terminal-host")
+          && (inspectorRef.current?.contains(event.target) || event.target.closest?.(".composer") || event.target === inspectorInvokerRef.current)) closeInspector();
       }
     };
     window.addEventListener("keydown", keyboard); return () => window.removeEventListener("keydown", keyboard);
@@ -287,21 +288,34 @@ export function App() {
   useEffect(() => {
     const narrow = window.matchMedia("(max-width: 760px)");
     let wasNarrow = narrow.matches;
+    const trackFocus = (event) => {
+      if (event.target.matches?.('[aria-label="Open projects sidebar"]')) sidebarFocusOwnerRef.current = "opener";
+      else if (sidebarRef.current?.contains(event.target)) sidebarFocusOwnerRef.current = "sidebar";
+      else {
+        sidebarFocusOwnerRef.current = null;
+        sidebarFocusIntentRef.current = null;
+      }
+    };
     const synchronizeLayout = () => {
       if (narrow.matches === wasNarrow) return;
       wasNarrow = narrow.matches;
       const activeElement = document.activeElement;
-      sidebarFocusIntentRef.current = wasNarrow
-        ? (sidebarRef.current?.contains(activeElement) ? "opener" : null)
-        : (activeElement?.matches?.('[aria-label="Open projects sidebar"]') ? "sidebar" : null);
+      const owner = activeElement === document.body ? sidebarFocusOwnerRef.current
+        : sidebarRef.current?.contains(activeElement) ? "sidebar"
+          : activeElement?.matches?.('[aria-label="Open projects sidebar"]') ? "opener" : null;
+      sidebarFocusOwnerRef.current = owner;
+      sidebarFocusIntentRef.current = wasNarrow && owner === "sidebar" ? "opener"
+        : !wasNarrow && owner === "opener" ? "sidebar" : null;
       setIsNarrow(wasNarrow);
       setSidebarOpen(!wasNarrow);
     };
     narrow.addEventListener("change", synchronizeLayout);
     window.addEventListener("resize", synchronizeLayout);
+    document.addEventListener("focusin", trackFocus);
     return () => {
       narrow.removeEventListener("change", synchronizeLayout);
       window.removeEventListener("resize", synchronizeLayout);
+      document.removeEventListener("focusin", trackFocus);
     };
   }, []);
   useLayoutEffect(() => {
@@ -322,17 +336,32 @@ export function App() {
   }, [isNarrow, sidebarOpen]);
   useLayoutEffect(() => {
     const intent = sidebarFocusIntentRef.current;
-    if (intent === "opener") {
-      if (sidebarOpen) return;
-      sidebarFocusIntentRef.current = null;
-      document.querySelector('[aria-label="Open projects sidebar"]')?.focus({ preventScroll: true });
-      return;
-    }
-    if (intent === "sidebar") {
-      if (!sidebarOpen) return;
-      sidebarFocusIntentRef.current = null;
-      sidebarRef.current?.querySelector('button:not(:disabled)')?.focus({ preventScroll: true });
-    }
+    if (!intent || (intent === "opener" && sidebarOpen) || (intent === "sidebar" && !sidebarOpen)) return;
+    let frame;
+    const deadline = performance.now() + 500;
+    const transfer = () => {
+      if (sidebarFocusIntentRef.current !== intent) return;
+      const target = intent === "opener" ? document.querySelector('[aria-label="Open projects sidebar"]')
+        : sidebarRef.current?.querySelector('button:not(:disabled)');
+      const active = document.activeElement;
+      const fromPriorControl = intent === "opener" ? sidebarRef.current?.contains(active)
+        : active?.matches?.('[aria-label="Open projects sidebar"]');
+      if (active !== document.body && active !== target && !fromPriorControl) {
+        sidebarFocusIntentRef.current = null; // Do not override a newer user focus choice.
+        return;
+      }
+      if (target?.isConnected && target.getClientRects().length && getComputedStyle(target).visibility === "visible") {
+        target.focus({ preventScroll: true });
+        if (document.activeElement === target && target.getBoundingClientRect().width > 0) {
+          sidebarFocusOwnerRef.current = intent;
+          sidebarFocusIntentRef.current = null;
+          return;
+        }
+      }
+      if (performance.now() < deadline) frame = requestAnimationFrame(transfer);
+    };
+    transfer();
+    return () => cancelAnimationFrame(frame);
   }, [isNarrow, sidebarOpen]);
   useLayoutEffect(() => {
     if (!inspector) return;

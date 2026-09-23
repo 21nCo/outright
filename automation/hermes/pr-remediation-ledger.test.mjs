@@ -54,6 +54,19 @@ test("a complete architecture assessment opens the reset implementation gate", (
   });
 });
 
+test("a recurrence reopens a resolved family and invalidates its prior assessment", () => {
+  const state = createLedger({ prNumber: 2, prUrl: "url", head: "abc", skill });
+  recordFailure(state, { familyId: "focus", title: "Focus", round: 1, head: "a", evidence: "lost focus" });
+  state.families.focus.state = "resolved";
+  state.families.focus.resolution = { head: "b", evidence: "old repair" };
+  state.families.focus.assessment = { invariant: "old contract" };
+  recordFailure(state, { familyId: "focus", title: "Focus", round: 2, head: "b", evidence: "lost again" });
+  assert.equal(state.families.focus.state, "architecture_reset_required");
+  assert.equal(state.families.focus.resolution, undefined);
+  assert.equal(state.families.focus.assessment, undefined);
+  assert.deepEqual(evaluateLedger(state).resetRequired, ["focus"]);
+});
+
 test("CLI initialization creates the required reusable ledger artifact", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-ledger-"));
   try {
