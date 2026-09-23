@@ -278,7 +278,8 @@ export function App() {
       }
       if (event.key === "Escape" && !document.querySelector('[role="dialog"]:not(#project-sidebar)')) {
         if (isNarrow && sidebarOpen) closeSidebar();
-        else if (inspector) closeInspector();
+        else if (inspector && inspectorRef.current?.contains(event.target)
+          && !event.target.closest(".terminal-host")) closeInspector();
       }
     };
     window.addEventListener("keydown", keyboard); return () => window.removeEventListener("keydown", keyboard);

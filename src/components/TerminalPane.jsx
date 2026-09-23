@@ -150,6 +150,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     const currentTab = event.target.closest('[role="tab"]');
     if (!currentTab || !event.currentTarget.contains(currentTab)) return;
+    if (loading) { event.preventDefault(); return; }
     const currentIndex = terminals.findIndex((terminal) => terminal.id === currentTab.dataset.tabId);
     if (currentIndex < 0) return;
     const nextIndex = nextTabIndex(currentIndex, terminals.length, event.key);

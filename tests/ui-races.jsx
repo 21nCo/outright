@@ -14,7 +14,6 @@ const results = document.getElementById("results");
 const root = createRoot(host);
 const originalFetch = window.fetch;
 const OriginalSocket = window.WebSocket;
-const originalMatchMedia = window.matchMedia.bind(window);
 const keys = ["outright.selected-project", "outright.selected-worktree", "outright.selected-conversation"];
 const saved = keys.map((key) => localStorage.getItem(key));
 const projects = ["A", "B"].map((id) => ({ id, name: `Review ${id}`, path: `/fixture/${id}`, worktrees: [{ id, name: id, path: `/fixture/${id}`, branch: "main", changedCount: 0 }] }));
@@ -163,6 +162,12 @@ async function terminalKeyboardRegression() {
   const second = [...host.querySelectorAll('[role="tab"]')].find((tab) => tab.textContent === "Terminal A2");
   assert(document.activeElement === second, "Switching terminal tabs dropped focus");
   assert(second.getAttribute("aria-disabled") === "true" && !second.disabled, "Loading terminal tab became unfocusable");
+  for (const key of ["ArrowLeft", "Home", "End"]) {
+    second.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+    await settle();
+    assert(document.activeElement === second, `${key} moved focus to an unselected tab while loading`);
+    assert(secondBufferRequests === 1, `${key} started a second request while loading`);
+  }
   pendingBuffer.resolve(response({ buffer: "Terminal A2 output\r\n" }));
   await until(() => second.getAttribute("aria-selected") === "true", "keyboard terminal A2 activation");
   assert(document.activeElement === second, "Activated terminal did not retain focus");
@@ -226,6 +231,8 @@ async function commandPaletteRegression() {
   await until(() => failureRequests === 1, "failed command search");
   await until(() => document.querySelector(".command-error"), "command search failure message");
   assert(document.querySelector(".command-error").textContent.includes("Search failed"), "Command search failure was reported as an empty result");
+  assert(!document.querySelector('.command-error[role="alert"]'), "Retryable search failure interrupted speech with an assertive alert");
+  assert(document.querySelector('.command-results [role="status"]')?.textContent.includes("Retry search available"), "Search failure and retry availability were not announced politely");
   assert(!document.querySelector(".no-results"), "Command search failure also rendered the no-results state");
   document.querySelector(".command-error button").click();
   await until(() => failureRequests === 2, "retried command search");
@@ -260,25 +267,15 @@ async function responsiveFocusRegression() {
   root.render(null);
   await settle();
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
-  const listeners = new Set();
-  let narrow = false;
-  const responsiveQuery = {
-    media: "(max-width: 760px)",
-    get matches() { return narrow; },
-    onchange: null,
-    addEventListener(type, listener) { if (type === "change") listeners.add(listener); },
-    removeEventListener(type, listener) { if (type === "change") listeners.delete(listener); },
-    addListener(listener) { listeners.add(listener); },
-    removeListener(listener) { listeners.delete(listener); },
-    dispatchEvent(event) { listeners.forEach((listener) => listener(event)); return true; },
+  // Change the actual CSS viewport: mocking matchMedia alone can report desktop
+  // while the real 390px layout hides the control under test.
+  const setWidth = async (width) => {
+    await window.__fixtureSetViewport(width);
+    await until(() => window.innerWidth === width && window.matchMedia("(max-width: 760px)").matches === (width <= 760), `real ${width}px layout`);
+    await settle();
   };
-  const setNarrow = (matches) => {
-    narrow = matches;
-    const event = { matches, media: responsiveQuery.media };
-    responsiveQuery.onchange?.(event);
-    responsiveQuery.dispatchEvent(event);
-  };
-  window.matchMedia = (query) => query === responsiveQuery.media ? responsiveQuery : originalMatchMedia(query);
+  if (!window.__fixtureSetViewport) return false; // Manual preview still runs width-independent cases.
+  await setWidth(1280);
   route = async (url) => {
     if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
     if (url.pathname === "/api/conversations") return response({ conversations: [chats[url.searchParams.get("projectId")]] });
@@ -294,26 +291,26 @@ async function responsiveFocusRegression() {
     await until(() => host.querySelector('textarea[aria-label="Message the agent"]'), "responsive fixture");
     host.querySelector('[aria-label="Close projects sidebar"]').click();
     await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), "closed desktop sidebar");
-    window.dispatchEvent(new Event("resize"));
-    await settle();
+    await setWidth(1200);
     assert(host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "true", "A same-breakpoint desktop resize reopened the project sidebar");
     host.querySelector('[aria-label="Open projects sidebar"]').click();
     await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", "reopened desktop sidebar");
+    await setWidth(1280);
 
     for (let round = 0; round < 3; round += 1) {
       const desktopSidebarControl = host.querySelector('[aria-label="Close projects sidebar"]');
       desktopSidebarControl.focus();
-      setNarrow(true);
+      await setWidth(640);
       await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), `sidebar closed from focused desktop control ${round + 1}`);
-      await until(() => document.activeElement === host.querySelector('[aria-label="Open projects sidebar"]'), `focus restored after hiding desktop sidebar ${round + 1}`);
-      setNarrow(false);
+      await until(() => visibleFocus(host.querySelector('[aria-label="Open projects sidebar"]')), `visible focus restored after hiding desktop sidebar ${round + 1}`);
+      await setWidth(1280);
       await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", `sidebar reopened after wide transition ${round + 1}`);
-      await until(() => host.querySelector("#project-sidebar").contains(document.activeElement), `sidebar focus after wide transition ${round + 1}`);
+      await until(() => host.querySelector("#project-sidebar").contains(document.activeElement) && visibleFocus(document.activeElement), `visible sidebar focus after wide transition ${round + 1}`);
     }
 
     const composer = host.querySelector('textarea[aria-label="Message the agent"]');
     composer.focus();
-    setNarrow(true);
+    await setWidth(640);
     await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), "sidebar closed after narrow transition");
     assert(document.activeElement === composer, "Entering the narrow layout moved focus away from the composer");
     assert(host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "true", "Entering the narrow layout left the project drawer exposed");
@@ -329,8 +326,7 @@ async function responsiveFocusRegression() {
     assert(workspace.getAttribute("aria-hidden") === "true", "Project drawer did not hide the workspace from assistive technology");
     assert(scrim?.tagName === "DIV" && scrim.tabIndex === -1, "Project drawer backdrop entered the tab order");
     const closeButton = document.activeElement;
-    window.dispatchEvent(new Event("resize"));
-    await settle();
+    await setWidth(620);
     assert(sidebar.getAttribute("aria-hidden") === "false", "A same-breakpoint narrow resize closed the project drawer");
     assert(workspace.hasAttribute("inert") && sidebar.contains(document.activeElement), "A same-breakpoint narrow resize lost drawer focus containment");
     composer.focus();
@@ -353,9 +349,9 @@ async function responsiveFocusRegression() {
     await until(() => host.querySelector('textarea[placeholder*="in B"]'), "project selected while drawer closed");
     const composerB = host.querySelector('textarea[aria-label="Message the agent"]');
     composerB.focus();
-    setNarrow(false);
+    await setWidth(1280);
     await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", "wide sidebar after closed selection");
-    setNarrow(true);
+    await setWidth(390);
     await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "true", "narrow sidebar after closed selection");
     assert(document.activeElement === composerB, "Selecting a project while the drawer was closed left stale focus restoration state");
 
@@ -363,7 +359,21 @@ async function responsiveFocusRegression() {
     terminalTrigger.click();
     await until(() => host.querySelector("#workspace-inspector"), "narrow inspector");
     await until(() => document.activeElement?.id === "inspector-tab-terminal", "inspector tab focus");
-    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    const terminalInput = host.querySelector(".terminal-host .xterm-helper-textarea");
+    assert(terminalInput, "Terminal input did not mount");
+    await until(() => host.querySelector('.terminal-tabs [role="tab"][aria-selected="true"]'), "active terminal for Escape input");
+    const keyEvents = [];
+    const observeKey = (event) => keyEvents.push({ key: event.key, target: event.target, trusted: event.isTrusted });
+    document.addEventListener("keydown", observeKey, true);
+    terminalInput.focus();
+    await window.__fixtureSendKey("Escape");
+    await settle();
+    document.removeEventListener("keydown", observeKey, true);
+    assert(host.querySelector("#workspace-inspector"), "Escape from terminal input dismissed the inspector");
+    assert(keyEvents.some((event) => event.key === "Escape" && event.target === terminalInput && event.trusted), "Trusted Escape did not reach the terminal input");
+    const terminalTab = host.querySelector("#inspector-tab-terminal");
+    terminalTab.focus();
+    terminalTab.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
     await until(() => !host.querySelector("#workspace-inspector"), "inspector escape close");
     assert(document.activeElement === terminalTrigger, "Escape did not restore focus to the inspector invoker");
 
@@ -375,8 +385,15 @@ async function responsiveFocusRegression() {
   } finally {
     root.render(null);
     await settle();
-    window.matchMedia = originalMatchMedia;
   }
+  return true;
+}
+
+function visibleFocus(element) {
+  if (!element || document.activeElement !== element || !element.isConnected || element.closest("[inert]")) return false;
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0 && getComputedStyle(element).visibility === "visible"
+    && rect.left < window.innerWidth && rect.right > 0;
 }
 
 async function recoveryActionsRegression() {
@@ -393,7 +410,7 @@ async function recoveryActionsRegression() {
   };
   root.render(<TooltipProvider><App /></TooltipProvider>);
   await until(() => host.querySelectorAll(".recovery-actions button").length === 3, "owner recovery actions");
-  assert(window.matchMedia("(max-width: 520px)").matches, "Recovery layout test did not run at phone width");
+  if (!window.matchMedia("(max-width: 520px)").matches) return false; // Harness executes geometry at 390px.
   const noticeRect = host.querySelector(".recovery-notice").getBoundingClientRect();
   const buttons = [...host.querySelectorAll(".recovery-actions button")];
   for (const button of buttons) {
@@ -401,6 +418,7 @@ async function recoveryActionsRegression() {
     assert(rect.left >= noticeRect.left - 1 && rect.right <= noticeRect.right + 1, `${button.textContent.trim()} overflowed the recovery notice`);
     assert(rect.right <= window.innerWidth + 1, `${button.textContent.trim()} was outside the phone viewport`);
   }
+  return true;
 }
 
 try {
@@ -420,10 +438,11 @@ try {
   results.textContent += "PASS: command search keeps asynchronous results current and selectable\n";
   await changesLoadingRegression();
   results.textContent += "PASS: changes pane waits for status before announcing a clean tree\n";
-  await responsiveFocusRegression();
-  results.textContent += "PASS: narrow drawer and inspector contain and restore focus\n";
-  await recoveryActionsRegression();
-  results.textContent += "PASS: phone-width recovery decisions remain inside the viewport\n10 interaction regressions passed";
+  const responsiveRan = await responsiveFocusRegression();
+  results.textContent += responsiveRan ? "PASS: narrow drawer and inspector contain and restore focus\n" : "SKIP: responsive transition requires the CDP viewport bridge\n";
+  const phoneRan = await recoveryActionsRegression();
+  results.textContent += phoneRan ? "PASS: phone-width recovery decisions remain inside the viewport\n" : "SKIP: phone geometry requires a narrow viewport\n";
+  results.textContent += `${8 + Number(responsiveRan) + Number(phoneRan)} interaction regressions passed`;
   document.title = "PASS — Outright interaction regressions";
 } catch (error) {
   results.textContent += `\nFAIL: ${error.stack}`;
@@ -432,6 +451,5 @@ try {
   root.unmount();
   window.fetch = originalFetch;
   window.WebSocket = OriginalSocket;
-  window.matchMedia = originalMatchMedia;
   keys.forEach((key, index) => saved[index] === null ? localStorage.removeItem(key) : localStorage.setItem(key, saved[index]));
 }

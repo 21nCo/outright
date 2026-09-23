@@ -11,6 +11,7 @@ import WebSocket from "ws";
 const root = fileURLToPath(new URL("../", import.meta.url));
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
 const stubbornChild = path.join(root, "tests", "fixtures", "stubborn-child.mjs");
+const exitedLeader = path.join(root, "tests", "fixtures", "exited-leader.mjs");
 
 function chromeExecutable() {
   const candidates = [
@@ -56,6 +57,10 @@ function hasExited(child) {
   return !child || child.exitCode !== null || child.signalCode !== null;
 }
 
+function pipesClosed(child) {
+  return child.stdout?.closed !== false && child.stderr?.closed !== false;
+}
+
 function waitForExit(child, timeout) {
   if (hasExited(child)) return Promise.resolve(true);
   return new Promise((resolve) => {
@@ -65,23 +70,79 @@ function waitForExit(child, timeout) {
   });
 }
 
+function windowsDescendants(pid) {
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+    "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress"],
+  { encoding: "utf8", windowsHide: true, timeout: 5_000 });
+  if (result.status !== 0) throw new Error(`Cannot inspect Windows process tree: ${result.stderr || result.error}`);
+  const processes = [JSON.parse(result.stdout)].flat();
+  const descendants = [];
+  const frontier = [pid];
+  while (frontier.length) {
+    const parent = frontier.shift();
+    for (const process of processes.filter((item) => item.ParentProcessId === parent)) {
+      descendants.push(process.ProcessId);
+      frontier.push(process.ProcessId);
+    }
+  }
+  return descendants;
+}
+
 function terminateTree(child, signal) {
-  if (hasExited(child)) return;
+  if (!child?.pid) return;
   if (process.platform === "win32") {
-    if (signal === "SIGKILL") spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
-    else child.kill();
+    // Windows does not deliver catchable SIGTERM to Node children. Snapshot
+    // descendants even when the leader has already exited, then force the tree.
+    const descendants = windowsDescendants(child.pid);
+    for (const pid of [child.pid, ...descendants].reverse()) {
+      spawnSync("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore", windowsHide: true, timeout: 5_000 });
+    }
     return;
   }
+  // A detached group can outlive its leader and retain its inherited pipes.
   try { process.kill(-child.pid, signal); }
-  catch (error) { if (error.code !== "ESRCH") throw error; }
+  catch (error) {
+    if (error.code === "ESRCH") return;
+    if (error.code !== "EPERM") throw error;
+    // macOS Chrome may put protected helpers in its process group. The group
+    // signal is rejected even though its own launcher is still ours to reap.
+    if (!hasExited(child)) child.kill(signal);
+    else if (!pipesClosed(child)) throw error;
+  }
+}
+
+function treeGone(child) {
+  if (process.platform === "win32") return hasExited(child) && windowsDescendants(child.pid).length === 0 && pipesClosed(child);
+  try { process.kill(-child.pid, 0); return false; }
+  catch (error) { if (error.code === "ESRCH" || error.code === "EPERM") return hasExited(child) && pipesClosed(child); throw error; }
+}
+
+async function waitForTree(child, timeout) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (treeGone(child)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return treeGone(child);
 }
 
 async function stop(child) {
-  if (hasExited(child)) return;
+  if (!child?.pid) return "absent";
+  if (hasExited(child) && pipesClosed(child) && treeGone(child)) return "graceful";
   terminateTree(child, "SIGTERM");
-  if (await waitForExit(child, 2_000)) return;
+  if (await waitForTree(child, 2_000)) return process.platform === "win32" ? "taskkill" : "graceful";
   terminateTree(child, "SIGKILL");
-  if (!await waitForExit(child, 5_000)) throw new Error(`Process ${child.pid} did not exit after forced termination`);
+  if (!await waitForTree(child, 5_000)) throw new Error(`Process tree ${child.pid} did not exit after forced termination`);
+  return "forced";
+}
+
+async function cleanupResources(steps) {
+  const errors = [];
+  for (const [label, cleanup] of steps) {
+    try { await cleanup(); }
+    catch (error) { errors.push(new Error(`${label}: ${error.message}`, { cause: error })); }
+  }
+  if (errors.length) throw new AggregateError(errors, `UI harness cleanup failed: ${errors.map((error) => error.message).join("; ")}`);
 }
 
 async function waitForJson(url, child, logs) {
@@ -102,9 +163,11 @@ function connectDevTools(url) {
     const socket = new WebSocket(url);
     const pending = new Map();
     let sequence = 0;
+    let eventHandler = () => {};
     socket.once("error", reject);
     socket.once("open", () => resolve({
       socket,
+      onEvent(handler) { eventHandler = handler; },
       send(method, params = {}) {
         return new Promise((done, fail) => {
           const id = ++sequence;
@@ -115,7 +178,8 @@ function connectDevTools(url) {
     }));
     socket.on("message", (message) => {
       const payload = JSON.parse(message);
-      if (!payload.id || !pending.has(payload.id)) return;
+      if (!payload.id) { eventHandler(payload); return; }
+      if (!pending.has(payload.id)) return;
       const { done, fail } = pending.get(payload.id);
       pending.delete(payload.id);
       if (payload.error) fail(new Error(payload.error.message));
@@ -144,19 +208,54 @@ async function closeDevTools(devtools) {
   if (devtools.socket.readyState < WebSocket.CLOSING) devtools.socket.close();
 }
 
-test("forced process cleanup waits for the child exit", { timeout: 15_000 }, async () => {
+test("process cleanup terminates the tree and waits for pipe close", { timeout: 20_000 }, async () => {
   const child = spawn(process.execPath, [stubbornChild], {
     cwd: root,
     detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
-  await new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.stdout.once("data", resolve);
+  try {
+    await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.stdout.once("data", resolve);
+    });
+    const outcome = await stop(child);
+    assert.equal(outcome, process.platform === "win32" ? "taskkill" : "forced");
+    assert.equal(hasExited(child) && child.stdout.closed && child.stderr.closed, true);
+  } finally { await stop(child); }
+});
+
+test("exited group leader cannot leave a pipe-holding descendant", { timeout: 30_000 }, async () => {
+  const child = spawn(process.execPath, [exitedLeader], {
+    cwd: root, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
   });
-  await stop(child);
-  assert.equal(hasExited(child), true);
+  let descendantId;
+  try {
+    await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.stdout.on("data", (chunk) => {
+        const match = chunk.toString().match(/descendant:(\d+)/);
+        if (match) { descendantId = Number(match[1]); resolve(); }
+      });
+    });
+    assert(await waitForExit(child, 3_000), "Leader did not exit independently");
+    assert.equal(child.stdout.closed, false, "Fixture descendant did not retain the pipe");
+    process.kill(descendantId, 0);
+    await stop(child);
+    assert.equal(child.stdout.closed && child.stderr.closed, true);
+  } finally { await stop(child); }
+});
+
+test("cleanup runs all owners after an earlier failure", async () => {
+  const attempted = [];
+  await assert.rejects(cleanupResources([
+    ["DevTools", async () => { attempted.push("DevTools"); throw new Error("socket failure"); }],
+    ["browser", async () => { attempted.push("browser"); }],
+    ["Vite", async () => { attempted.push("Vite"); }],
+    ["profile", async () => { attempted.push("profile"); }],
+  ]), /UI harness cleanup failed/);
+  assert.deepEqual(attempted, ["DevTools", "browser", "Vite", "profile"]);
 });
 
 test("browser interaction regressions pass in headless Chrome", { timeout: 90_000 }, async () => {
@@ -176,6 +275,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 90_00
   const url = `http://127.0.0.1:${port}/tests/ui-races.html`;
   let browser;
   let devtools;
+  let failure;
 
   try {
     await waitForServer(url, vite, () => output);
@@ -206,11 +306,53 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 90_00
     devtools = await connectDevTools(target.webSocketDebuggerUrl);
     await devtools.send("Runtime.enable");
     await devtools.send("Page.enable");
-    await devtools.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: false });
+    await devtools.send("Runtime.addBinding", { name: "__requestFixtureViewport" });
+    await devtools.send("Runtime.addBinding", { name: "__requestFixtureKey" });
+    await devtools.send("Page.addScriptToEvaluateOnNewDocument", { source: `
+      window.__fixtureSetViewport = (width) => new Promise((resolve) => {
+        const ready = (event) => {
+          if (event.detail !== width) return;
+          window.removeEventListener("fixture-viewport-ready", ready);
+          resolve();
+        };
+        window.addEventListener("fixture-viewport-ready", ready);
+        window.__requestFixtureViewport(String(width));
+      });
+      window.__fixtureSendKey = (key) => new Promise((resolve) => {
+        const ready = (event) => {
+          if (event.detail !== key) return;
+          window.removeEventListener("fixture-key-ready", ready);
+          resolve();
+        };
+        window.addEventListener("fixture-key-ready", ready);
+        window.__requestFixtureKey(key);
+      });
+    ` });
+    let viewportError;
+    devtools.onEvent((event) => {
+      if (event.method !== "Runtime.bindingCalled") return;
+      (async () => {
+        if (event.params.name === "__requestFixtureKey") {
+          if (event.params.payload !== "Escape") throw new Error("Unexpected fixture key");
+          const key = { key: "Escape", code: "Escape", windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 };
+          await devtools.send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...key });
+          await devtools.send("Input.dispatchKeyEvent", { type: "keyUp", ...key });
+          await devtools.send("Runtime.evaluate", { expression: 'window.dispatchEvent(new CustomEvent("fixture-key-ready", { detail: "Escape" }))' });
+          return;
+        }
+        if (event.params.name !== "__requestFixtureViewport") return;
+        const width = Number(event.params.payload);
+        if (![1280, 1200, 640, 620, 390].includes(width)) throw new Error(`Unexpected fixture viewport: ${width}`);
+        await devtools.send("Emulation.setDeviceMetricsOverride", { width, height: 844, deviceScaleFactor: 1, mobile: false });
+        await devtools.send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-viewport-ready", { detail: ${width} }))` });
+      })().catch((error) => { viewportError = error; });
+    });
+    await devtools.send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 844, deviceScaleFactor: 1, mobile: false });
     await devtools.send("Page.navigate", { url });
     const deadline = Date.now() + 30_000;
     let state;
     while (Date.now() < deadline) {
+      if (viewportError) throw viewportError;
       const evaluated = await devtools.send("Runtime.evaluate", {
         expression: "({ title: document.title, text: document.getElementById('results')?.textContent ?? '' })",
         returnByValue: true,
@@ -222,10 +364,20 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 90_00
     }
     assert.match(state?.title ?? "", /^PASS/, state?.text || browserOutput);
     assert.match(state.text, /10 interaction regressions passed/);
+  } catch (error) {
+    failure = error;
   } finally {
-    await closeDevTools(devtools);
-    await stop(browser);
-    await stop(vite);
-    rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    try {
+      await cleanupResources([
+        ["DevTools", () => closeDevTools(devtools)],
+        ["Chrome tree", () => stop(browser)],
+        ["Vite tree", () => stop(vite)],
+        ["Chrome profile", () => rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })],
+      ]);
+    } catch (error) {
+      if (failure) throw new AggregateError([failure, error], `UI fixture failed: ${failure.message}; ${error.message}`);
+      throw error;
+    }
   }
+  if (failure) throw failure;
 });
