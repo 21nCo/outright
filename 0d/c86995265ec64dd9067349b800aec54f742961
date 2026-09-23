@@ -1,0 +1,72 @@
+.github/workflows/ci.yml
+  h_a39f9495f9ec1d 15-19
+.gitignore
+  h_a39f9495f9ec1d 3
+README.md
+  h_a39f9495f9ec1d 21-22,34
+package.json
+  h_a39f9495f9ec1d 7-11,16
+scripts/build-agent-supervisor.mjs
+  h_a39f9495f9ec1d 1-73
+scripts/run-tests.mjs
+  h_a39f9495f9ec1d 1-29
+server/agent-manager.mjs
+  h_a39f9495f9ec1d 2-5,12-25,27-285,298,300,308,311,313-319,321,323,326-328,333-342,348-362,370-374,380-381,383-420,433,437-447,451,454,456-457,460-461,467-472,477-479,484-495,515-518,522-526,528-531,533-544,546-551,554-558,571-579,584-589,592,598-600,604-605,610-615,617,623-631,635-705,728-734,736-741,745-814,817,820-847,893-894,897-905,909-951,954-960,962-966,1052-1096
+server/agent-manager.test.mjs
+  h_a39f9495f9ec1d 3,5-7,9-11,14-24,26,30-39,45-54,57,61,63,69-73,76-92,94-101,141-166,199-219,237-500,540,545-569,609-611,614-615,636-653,669-1639
+server/agent-supervisor-darwin.c
+  h_a39f9495f9ec1d 1-446
+server/agent-supervisor-windows.c
+  h_a39f9495f9ec1d 1-100
+server/agent-supervisor.c
+  h_a39f9495f9ec1d 1-490
+server/database.mjs
+  h_a39f9495f9ec1d 2,32,34,37-47,49-73,77,92,138-143,159-162,198-200,203-214,217-221,225-226,228,232-239,241-242,244-281,283-395,400,407-414,423-433,490-493,506-517,529-600
+server/database.test.mjs
+  h_a39f9495f9ec1d 3-8,37-127,133-620
+server/git-service.mjs
+  h_a39f9495f9ec1d 92-94
+server/git-service.test.mjs
+  h_a39f9495f9ec1d 27-28,40-46,56,84-89
+server/outright-runtime.mjs
+  h_a39f9495f9ec1d 3-4,9,15-26,168-187,207-210,221-225,238,248-403,562-733
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 3-12,18-1107
+server/ui-recovery.test.mjs
+  h_a39f9495f9ec1d 1-123
+src/App.jsx
+  h_a39f9495f9ec1d 28,32,82,86-88,146-151,153-156,158,163-165,167-179,185-188,191,195-204,214,216-218,227,245-249,256,293-295,327-331,378,380-411,418,473-476,479-480,483,492-495,497,518,540-541,596-597,602-603,627,629-653,657
+src/components/ChangesPane.jsx
+  h_a39f9495f9ec1d 71
+src/components/CommandPalette.jsx
+  h_a39f9495f9ec1d 9,12,15,17-20,22,24-25,30-31,34-37,46,52-54,58-60
+src/components/ContextPane.jsx
+  h_a39f9495f9ec1d 11
+src/components/SettingsDialog.jsx
+  h_a39f9495f9ec1d 26
+src/components/TerminalPane.jsx
+  h_a39f9495f9ec1d 141-143,151-154,160,166
+src/recovery-policy.js
+  h_a39f9495f9ec1d 1-123
+src/styles.css
+  h_a39f9495f9ec1d 341,343-349,458-461,472-474,520
+tests/ui-accessibility.test.mjs
+  h_a39f9495f9ec1d 22-23,27-29,33-39,42,44-47,49-50
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 6-7,35-39,72,122-200,245-253,287-301,331-336,338
+tests/ui-races.test.mjs
+  h_a39f9495f9ec1d 1-165
+tests/vite.ui-races.config.mjs
+  h_a39f9495f9ec1d 1-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0dc86995265ec64dd9067349b800aec54f742961",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
