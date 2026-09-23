@@ -1,0 +1,22 @@
+README.md
+  h_a39f9495f9ec1d 26-28,74
+accessibility-qa.md
+  h_a39f9495f9ec1d 3,7-11,14
+src/components/TerminalPane.jsx
+  h_a39f9495f9ec1d 27-28,158,174,213,219-220,234-239,243-244,250-257
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 392-457,849-850,865
+tests/ui-races.test.mjs
+  h_a39f9495f9ec1d 3,194-199,207,209,518-521,534-536,539-540,542-545,556,558,622-623
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "259744f27af5557bd06533e7f20a11c8873d6e0c",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
