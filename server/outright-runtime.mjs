@@ -1,19 +1,29 @@
 import { WebSocketServer } from "ws";
 import chokidar from "chokidar";
+import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { realpath } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { createOutrightDatabase } from "./database.mjs";
-import { createAgentManager } from "./agent-manager.mjs";
+import { AGENT_SUPERVISOR, createAgentManager, defaultGroupMembers, hardenWindowsLaunchDirectory, terminateTree } from "./agent-manager.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts() }) {
-  const database = createOutrightDatabase();
-  const recoveredRuns = database.recoverInterruptedRuns();
-  if (recoveredRuns) database.audit("runtime.runs.recovered", { target: "runtime", count: recoveredRuns });
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000 }) {
+  // The database-backed lease is acquired before reconciliation so another
+  // live runtime can never have its queued/running rows treated as crash state.
+  const database = createOutrightDatabase({ runtimeLease: true });
+  // Completion markers are trusted recovery evidence. Secure their directory
+  // before reconciliation reads any record, rather than waiting for the agent
+  // manager to initialize after recovery has already classified pending rows.
+  if (process.platform === "win32") hardenWindowsLaunchDirectory(database.launchDirectory);
+  const reconciliation = database.reconcileInterruptedRuns({
+    probeAlive: (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync),
+  });
+  if (reconciliation.count) database.audit("runtime.runs.reconciled", { target: "runtime", ...reconciliation });
   const eventHub = createRuntimeEventHub();
   const runtimeInstanceId = randomUUID();
   const wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024 });
@@ -155,7 +165,26 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const conversation = database.getConversation(conversationMatch[1]);
         if (!conversation) throw apiError(404, "Conversation not found");
         const messagePage = database.listMessagePage(conversation.id, { limit: 200 });
-        return json(response, 200, { ...conversation, messages: messagePage.messages, messagePage: messagePage.page, runs: database.listRuns(conversation.id) });
+        const worktreeInterruptedRun = database.findUnresolvedInterruptedRunForWorktree(conversation.worktreePath) ?? null;
+        const recoveryConversation = worktreeInterruptedRun ? database.getConversation(worktreeInterruptedRun.conversationId) : null;
+        return json(response, 200, {
+          ...conversation,
+          messages: messagePage.messages,
+          messagePage: messagePage.page,
+          runs: database.listRuns(conversation.id),
+          oldestInterruptedRun: database.findUnresolvedInterruptedRun(conversation.id) ?? null,
+          worktreeInterruptedRun,
+          recoveryConversation: recoveryConversation ? {
+            id: recoveryConversation.id,
+            title: recoveryConversation.title,
+            projectId: recoveryConversation.projectId,
+            worktreeId: recoveryConversation.worktreeId,
+            worktreePath: recoveryConversation.worktreePath,
+            archived: Boolean(recoveryConversation.archived),
+            provider: recoveryConversation.provider,
+            providerSessionId: recoveryConversation.providerSessionId,
+          } : null,
+        });
       }
       if (conversationMatch && request.method === "PATCH") {
         const conversation = database.updateConversation(conversationMatch[1], await readJson(request));
@@ -175,6 +204,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (conversationMoveMatch && request.method === "POST") {
         if (!database.getConversation(conversationMoveMatch[1])) throw apiError(404, "Conversation not found");
         const body = await readJson(request);
+        const unresolved = database.listUnresolvedInterruptedRuns(conversationMoveMatch[1]);
+        if (unresolved.some((run) => !run.worktreePath || run.worktreePath !== body.worktreePath)) {
+          throw apiError(409, "Resolve the interrupted run before moving this conversation away from its recovery worktree", { code: "RUN_RECOVERY_REQUIRED" });
+        }
         const { worktreePath: destinationPath } = await resolveWorktreeTarget(body);
         const conversation = database.moveConversation(conversationMoveMatch[1], { projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath });
         database.audit("conversation.moved", { target: conversation.id, projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath });
@@ -185,6 +218,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (runCreateMatch && request.method === "POST") {
         const conversation = database.getConversation(runCreateMatch[1]);
         if (!conversation) throw apiError(404, "Conversation not found");
+        // Recovery ownership is scoped to the worktree, not the chat. Another
+        // conversation targeting the same checkout must not start while an
+        // interrupted process tree may still mutate it.
+        const interrupted = database.findUnresolvedInterruptedRunForWorktree(conversation.worktreePath);
+        if (interrupted) throw apiError(409, "Resolve the interrupted run before starting more agent work", { code: "RUN_RECOVERY_REQUIRED", runId: interrupted.id });
         const body = await readJson(request);
         const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
         if (!prompt) throw apiError(400, "Prompt is required");
@@ -197,7 +235,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (!providerInfo?.available) throw apiError(409, `${provider} CLI is not available`);
         const userMessage = database.addMessage({ conversationId: conversation.id, role: "user", kind: "text", body: prompt });
         publish({ type: "message.created", conversationId: conversation.id, payload: userMessage });
-        const run = database.createRun({ conversationId: conversation.id, provider, model: body.model ?? conversation.model ?? settings.model, reasoningEffort: body.reasoningEffort || settings.reasoningEffort, approvalPolicy: body.approvalPolicy || settings.approvalPolicy, prompt });
+        const run = database.createRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, provider, model: body.model ?? conversation.model ?? settings.model, reasoningEffort: body.reasoningEffort || settings.reasoningEffort, approvalPolicy: body.approvalPolicy || settings.approvalPolicy, prompt });
         return json(response, 202, await agents.schedule({ conversation: database.getConversation(conversation.id), run }));
       }
       const runMatch = url.pathname.match(/^\/api\/runs\/([^/]+)$/);
@@ -207,6 +245,162 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       }
       const stopRunMatch = url.pathname.match(/^\/api\/runs\/([^/]+)\/stop$/);
       if (stopRunMatch && request.method === "POST") { const stopped = await agents.stop(stopRunMatch[1]); return json(response, stopped ? 202 : 404, { stopped }); }
+      const resumeRunMatch = url.pathname.match(/^\/api\/runs\/([^/]+)\/resume$/);
+      if (resumeRunMatch && request.method === "POST") {
+        let interrupted = database.getRun(resumeRunMatch[1]);
+        if (!interrupted) throw apiError(404, "Run not found");
+        if (interrupted.status !== "interrupted" || interrupted.recoveryDecision) throw apiError(409, "Run is not waiting for a recovery decision");
+        const body = await readJson(request);
+        const policy = body.policy;
+        if (!["discard", "discard-unverifiable", "resume-session", "retry"].includes(policy)) throw apiError(400, "Recovery policy must be discard, discard-unverifiable, resume-session, or retry");
+        const conversation = database.getConversation(interrupted.conversationId);
+        if (!conversation) throw apiError(404, "Conversation not found");
+
+        // Databases created before durable process ownership can contain a
+        // running row with neither pid nor immutable launch worktree. There is
+        // no process tree the runtime can verify or signal, so ordinary
+        // recovery stays fail-closed. The operator can explicitly acknowledge
+        // that legacy uncertainty and discard only that row; no replacement
+        // work is scheduled, and any remaining legacy rows keep the global
+        // recovery gate closed.
+        if (policy === "discard-unverifiable") {
+          const legacyUnverifiable = interrupted.recoveryClass === "unknown"
+            && !(Number.isSafeInteger(interrupted.pid) && interrupted.pid > 0)
+            && !interrupted.worktreePath;
+          if (!legacyUnverifiable) throw apiError(409, "Only a legacy run without process or worktree identity can use manual cleanup", { code: "RECOVERY_MANUAL_CLEANUP_UNAVAILABLE", runId: interrupted.id });
+          if (body.confirmation !== interrupted.id) throw apiError(400, "Exact run id confirmation is required for unverifiable legacy cleanup", { code: "RECOVERY_CONFIRMATION_REQUIRED", runId: interrupted.id });
+          const resolved = database.resolveInterruptedRun(interrupted.id, policy);
+          if (!resolved) throw apiError(409, "Run is not waiting for a recovery decision");
+          database.audit("agent.run.recovery.discard-unverifiable", { target: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
+          publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: resolved });
+          return json(response, 200, resolved);
+        }
+
+        // Every unresolved interrupted run of the worktree is verified before
+        // any decision is recorded — not only runs from the selected chat. A
+        // sibling conversation can carry a started run while this chat holds a
+        // never-started run; recovering either one must not schedule work while
+        // the sibling process tree can still mutate the same checkout.
+        //
+        // Each previously started run is re-probed regardless of its
+        // restart-time classification: a detached leader can exit while
+        // provider descendants still hold the process group. Only a
+        // verified-exited (or never started) run may be resolved. A verifiably
+        // live process blocks every policy; an unverifiable tree (e.g. on
+        // Windows, where the spawned tree is not owned and a gone leader
+        // proves nothing) blocks every policy too — including discard, because
+        // a recorded discard would clear the submission gate and let a new run
+        // start while the original descendants may still mutate the same
+        // worktree.
+        for (const pending of database.listUnresolvedInterruptedRunsForWorktree(interrupted.worktreePath)) {
+          // Both classes are durable proofs made during restart reconciliation.
+          // Re-probing an exited row later would let an unrelated process that
+          // reused the PID turn a settled fact back into an unknown/alive gate.
+          if (["never-started", "exited"].includes(pending.recoveryClass)) continue;
+          if (!(Number.isSafeInteger(pending.pid) && pending.pid > 0)) {
+            throw apiError(409, "An interrupted provider process cannot be verified, so no recovery decision can be recorded yet", { code: "RECOVERY_PROCESS_UNKNOWN", runId: pending.id });
+          }
+          const handshake = database.getLaunchHandshake(pending.id);
+          let verdict = recoveryVerdict(await recoveryProcessAlive(pending.pid, handshake));
+          if (verdict === "alive") {
+            const processIdentity = await recoveryProcessIdentity(pending.pid, handshake?.ownershipToken, handshake?.platformOwnershipId);
+            if (!recoveryIdentityMatches(pending, handshake, processIdentity)) {
+              throw apiError(409, "The interrupted provider process identity cannot be verified, so it will not be signaled", { code: "RECOVERY_PROCESS_UNKNOWN", pid: pending.pid, runId: pending.id });
+            }
+            let terminationProven = false;
+            try { terminationProven = await terminateRecoveryProcess(pending.pid, "SIGTERM", handshake) === true; }
+            catch { /* Verification below remains fail-closed. */ }
+            if (terminationProven) verdict = "exited";
+            const started = Date.now();
+            const deadline = Date.now() + recoveryTerminationTimeoutMs;
+            let escalated = false;
+            while (verdict === "alive" && Date.now() < deadline) {
+              if (!escalated && Date.now() - started >= recoveryTerminationGraceMs) {
+                const currentIdentity = await recoveryProcessIdentity(pending.pid, handshake?.ownershipToken, handshake?.platformOwnershipId);
+                if (!recoveryIdentityMatches(pending, handshake, currentIdentity)) {
+                  throw apiError(409, "The interrupted provider process identity changed before escalation, so it will not be signaled", { code: "RECOVERY_PROCESS_UNKNOWN", pid: pending.pid, runId: pending.id });
+                }
+                if (handshake?.providerPid && handshake?.providerProcessIdentity) {
+                  const providerIdentity = await recoveryProcessIdentity(handshake.providerPid);
+                  if (providerIdentity !== handshake.providerProcessIdentity) {
+                    throw apiError(409, "The interrupted provider child identity changed before escalation, so it will not be signaled", { code: "RECOVERY_PROCESS_UNKNOWN", pid: handshake.providerPid, runId: pending.id });
+                  }
+                }
+                try { terminationProven = await terminateRecoveryProcess(pending.pid, "SIGKILL", handshake) === true; }
+                catch { /* Verification below remains fail-closed. */ }
+                if (terminationProven) verdict = "exited";
+                escalated = true;
+              }
+              if (verdict !== "alive") break;
+              await new Promise((resolve) => setTimeout(resolve, 50));
+              verdict = recoveryVerdict(await recoveryProcessAlive(pending.pid, handshake));
+            }
+            if (verdict === "alive") {
+              throw apiError(409, "The interrupted provider process did not stop, so no recovery decision was recorded", { code: "RECOVERY_PROCESS_ACTIVE", pid: pending.pid, runId: pending.id });
+            }
+          }
+          if (verdict !== "exited") {
+            throw apiError(409, "An interrupted provider process cannot be verified, so no recovery decision can be recorded yet", { code: "RECOVERY_PROCESS_UNKNOWN", pid: pending.pid, runId: pending.id });
+          }
+          // Persist every proof established by this pass, including sibling
+          // conversations. On Windows the Job Object handle disappears after
+          // termination, so a later request cannot reconstruct that proof
+          // from the leader pid alone. Keep the pid: validation failures must
+          // leave the run retryable without discarding its process identity.
+          const verified = database.updateRun(pending.id, { recoveryClass: "exited" });
+          publish({ type: "run.recovery-updated", conversationId: verified.conversationId, runId: verified.id, payload: verified });
+          if (pending.id === interrupted.id) interrupted = verified;
+        }
+
+        if (policy === "discard") {
+          const resolved = database.resolveInterruptedRun(interrupted.id, policy);
+          if (!resolved) throw apiError(409, "Run is not waiting for a recovery decision");
+          database.audit("agent.run.recovery.discard", { target: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
+          publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: resolved });
+          return json(response, 200, resolved);
+        }
+
+        // Replacement work must respect worktree order across conversations:
+        // resuming or retrying a run may not schedule its replacement while an
+        // older unresolved run still awaits a decision, or the newer run's
+        // side effects could later be overwritten by the older recovery.
+        // Discard remains allowed above because it schedules no work.
+        const unresolved = database.listUnresolvedInterruptedRunsForWorktree(interrupted.worktreePath);
+        const selected = unresolved.findIndex((candidate) => candidate.id === interrupted.id);
+        if (selected > 0) {
+          throw apiError(409, "Resolve the older interrupted run before resuming or retrying this one", { code: "RECOVERY_ORDER_REQUIRED", runId: unresolved[0].id });
+        }
+
+        if (!interrupted.worktreePath) {
+          throw apiError(409, "This legacy run has no trustworthy launch worktree; discard it after process verification instead", { code: "RECOVERY_TARGET_UNKNOWN", runId: interrupted.id });
+        }
+        if (conversation.worktreePath !== interrupted.worktreePath) {
+          throw apiError(409, "The conversation target changed after this run started; move it back before resuming or retrying", { code: "RECOVERY_TARGET_CHANGED", runId: interrupted.id, worktreePath: interrupted.worktreePath });
+        }
+
+        // Resumed and retried runs revalidate worktree identity and trust at
+        // submission, and again inside the agent drain before spawning.
+        const target = await resolveWorktreeTarget({ projectId: conversation.projectId, worktreeId: conversation.worktreeId, worktreePath: conversation.worktreePath });
+        if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
+        const providerInfo = agents.providers().find((item) => item.id === interrupted.provider);
+        if (!providerInfo?.available) throw apiError(409, `${interrupted.provider} CLI is not available`);
+        // Recovery is bound to the immutable run session first. A mutable
+        // conversation session is only a compatible fallback when the
+        // conversation still targets the same provider.
+        const sessionId = interrupted.providerSessionId
+          || (conversation.provider === interrupted.provider ? conversation.providerSessionId : null);
+        if (policy === "resume-session" && !sessionId) throw apiError(409, "No provider session is available to resume", { code: "NO_PROVIDER_SESSION" });
+        const recovery = database.beginInterruptedRunRecovery(interrupted.id, policy, { providerSessionId: sessionId });
+        if (!recovery) throw apiError(409, "Run is not waiting for a recovery decision");
+        database.audit(`agent.run.recovery.${policy}`, { target: recovery.run.id, recoveredFrom: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
+        publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: recovery.interrupted });
+        return json(response, 202, await agents.schedule({
+          conversation: recovery.conversation,
+          run: recovery.run,
+          forceFreshSession: policy === "retry",
+          providerSessionId: policy === "retry" ? null : sessionId,
+        }));
+      }
 
       if (url.pathname === "/api/trust" && request.method === "POST") {
         const body = await readJson(request);
@@ -363,6 +557,178 @@ function isLoopback(address) {
   if (normalized === "::1" || normalized === "::") return true;
   const ipv4 = normalized.replace(/^::ffff:/, "");
   return ipv4.startsWith("127.");
+}
+
+// Recovery verdicts are tri-state: "alive" (still running), "exited"
+// (verified terminated), "unknown" (cannot verify). Legacy boolean probes map
+// conservatively; anything unrecognized is unknown.
+function recoveryVerdict(value) {
+  if (value === true) return "alive";
+  if (value === false) return "exited";
+  return ["alive", "exited", "unknown"].includes(value) ? value : "unknown";
+}
+
+const DARWIN_OWNERSHIP_PREFIX = "com.21n.outright.";
+
+function darwinLaunchdTarget(handshake) {
+  const ownershipToken = handshake?.ownershipToken;
+  const platformOwnershipId = handshake?.platformOwnershipId;
+  if (typeof ownershipToken !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(ownershipToken)) return null;
+  if (platformOwnershipId !== `${DARWIN_OWNERSHIP_PREFIX}${ownershipToken}`) return null;
+  const uid = process.getuid?.();
+  return Number.isInteger(uid) ? `gui/${uid}/${platformOwnershipId}` : null;
+}
+
+export function defaultRecoveryProcessAlive(pid, platform = process.platform, groupMembers = defaultGroupMembers, kill = process.kill, handshake = null, run = spawnSync) {
+  let darwinOwnershipUnknown = false;
+  if (platform === "darwin") {
+    const target = darwinLaunchdTarget(handshake);
+    if (target) {
+      const result = run(AGENT_SUPERVISOR, ["--probe", handshake.platformOwnershipId], { encoding: "utf8" });
+      const verdict = result.stdout?.trim();
+      if (["alive", "exited"].includes(verdict)) return verdict;
+      if (verdict === "absent") {
+        // A unique launchd label can be absent briefly after the authorized
+        // wrapper has spawned its supervisor but before launchctl submit has
+        // completed. The matching wrapper proves that launch is still in
+        // progress, but there is not yet a kernel boundary that recovery can
+        // terminate, so keep the run unresolved until the job appears or the
+        // wrapper exits. A live mismatched/reused pid also fails closed.
+        const wrapperIdentity = defaultRecoveryProcessIdentity(
+          pid, platform, readFileSync, run, handshake.ownershipToken, handshake.platformOwnershipId,
+        );
+        if (wrapperIdentity === handshake.processIdentity) return "unknown";
+        // The gated native supervisor is durably identified before it can
+        // submit the launchd job. While that exact process is alive it may
+        // still submit, so fail closed. Once its boot-scoped identity no
+        // longer matches, an absent unique job proves that no launch owner
+        // remains, even if the wrapper pid has since been reused.
+        const supervisorPid = Number(handshake.providerPid);
+        const supervisorIdentity = typeof handshake.providerProcessIdentity === "string"
+          ? handshake.providerProcessIdentity
+          : null;
+        if (!Number.isSafeInteger(supervisorPid) || supervisorPid <= 0 || !supervisorIdentity) return "unknown";
+        const liveSupervisorIdentity = defaultRecoveryProviderProcessIdentity(supervisorPid, platform, run);
+        if (liveSupervisorIdentity == null) {
+          try { kill(supervisorPid, 0); return "unknown"; }
+          catch (error) {
+            if (error.code !== "ESRCH") return "unknown";
+          }
+        }
+        if (liveSupervisorIdentity === supervisorIdentity) return "unknown";
+        // launchctl submit is forked by the supervisor and inherits the
+        // wrapper-owned process group. If the supervisor dies while submit is
+        // in flight, that child can still create the job, so the whole group
+        // must be empty before an absent label is accepted as exited.
+        try { kill(-pid, 0); return "unknown"; }
+        catch (error) {
+          if (error.code !== "ESRCH") return "unknown";
+        }
+        // The first absent-label sample predates the group probe. Submit may
+        // have succeeded immediately before its child exited, so re-read the
+        // unique label after the group is empty to form a coherent proof.
+        const settled = run(AGENT_SUPERVISOR, ["--probe", handshake.platformOwnershipId], { encoding: "utf8" }).stdout?.trim();
+        return settled === "absent" ? "exited" : recoveryVerdict(settled);
+      }
+      darwinOwnershipUnknown = true;
+      // The handshake is written before the platform supervisor submits its
+      // launchd job. During that short interval, a live wrapper is still a
+      // valid owner; if it is gone too, fail closed as unknown.
+    }
+  }
+  if (platform === "win32") {
+    // The spawned tree is not owned on Windows, so a gone leader says nothing
+    // about its descendants: only a live leader is verifiable.
+    try { kill(pid, 0); return "alive"; }
+    catch { return "unknown"; }
+  }
+  try {
+    kill(-pid, 0);
+    const members = groupMembers(pid);
+    if (members == null) return "alive";
+    return members.some((member) => member.state !== "Z") ? "alive" : "exited";
+  } catch (error) {
+    return error.code === "ESRCH" && !darwinOwnershipUnknown ? "exited" : "unknown";
+  }
+}
+
+export function defaultRecoveryProviderProcessIdentity(pid, platform = process.platform, run = spawnSync) {
+  if (platform !== "darwin") return null;
+  try {
+    const boot = run("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8" });
+    const started = run("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
+    return boot.status === 0 && started.status === 0 && started.stdout.trim()
+      ? `darwin-process:${boot.stdout.trim()}:${started.stdout.trim()}`
+      : null;
+  } catch { return null; }
+}
+
+export function defaultRecoveryProcessIdentity(pid, platform = process.platform, readFile = readFileSync, run = spawnSync, ownershipToken = null, platformOwnershipId = null) {
+  try {
+    if (platform === "linux") {
+      const bootId = readFile("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      const stat = readFile(`/proc/${pid}/stat`, "utf8");
+      const close = stat.lastIndexOf(")");
+      if (close < 0) return null;
+      const startTicks = stat.slice(close + 2).split(" ")[19];
+      return bootId && startTicks ? `linux:${bootId}:${startTicks}` : null;
+    }
+    if (platform === "darwin") {
+      if (typeof ownershipToken !== "string" || !/^[0-9a-f-]{36}$/i.test(ownershipToken)) return null;
+      const bootResult = run("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8" });
+      const launchdTarget = darwinLaunchdTarget({ ownershipToken, platformOwnershipId });
+      if (launchdTarget) {
+        const launchdResult = run("/bin/launchctl", ["print", launchdTarget], { encoding: "utf8" });
+        const boot = bootResult.status === 0 ? bootResult.stdout.trim() : "";
+        if (boot && launchdResult.status === 0) return `darwin:${boot}:${ownershipToken}`;
+      }
+      const processResult = run("/bin/ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
+      const boot = bootResult.status === 0 ? bootResult.stdout.trim() : "";
+      const command = processResult.status === 0 ? processResult.stdout.trim() : "";
+      return boot && command === `outright-agent-${ownershipToken}` ? `darwin:${boot}:${ownershipToken}` : null;
+    }
+    if (platform === "win32") {
+      const script = `$boot=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks;$start=(Get-Process -Id ${pid}).StartTime.ToUniversalTime().Ticks;Write-Output ($boot.ToString() + ':' + $start.ToString())`;
+      const result = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true });
+      const started = result.status === 0 ? result.stdout.trim() : "";
+      return started ? `win32:${started}` : null;
+    }
+  } catch { /* A missing or unreadable process is not identifiable. */ }
+  return null;
+}
+
+function recoveryIdentityMatches(run, handshake, processIdentity) {
+  return handshake?.authorized === true
+    && handshake.pid === run.pid
+    && typeof handshake.processIdentity === "string"
+    && handshake.processIdentity.length > 0
+    && handshake.processIdentity === processIdentity;
+}
+
+export function defaultTerminateRecoveryProcess(pid, signal = "SIGTERM", handshake = null, platform = process.platform, run = spawnSync, kill = process.kill) {
+  if (platform === "win32") {
+    const result = run("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+    if (result.status !== 0) throw new Error("Unable to terminate the recovered Windows process tree");
+    return true;
+  }
+  if (platform === "linux" && signal === "SIGKILL") {
+    const providerPid = Number(handshake?.providerPid);
+    if (Number.isSafeInteger(providerPid) && providerPid > 0 && typeof handshake?.providerProcessIdentity === "string") {
+      kill(providerPid, "SIGKILL");
+      return false;
+    }
+    throw new Error("A verified provider identity is required for Linux recovery escalation");
+  }
+  if (platform === "darwin") {
+    const target = darwinLaunchdTarget(handshake);
+    if (target) {
+      const result = run(AGENT_SUPERVISOR, ["--terminate", handshake.platformOwnershipId], { stdio: "ignore" });
+      if (result.status !== 0) throw new Error("Unable to terminate the recovered macOS process coalition");
+      return true;
+    }
+  }
+  terminateTree({ pid }, signal, platform, run, kill);
+  return false;
 }
 
 async function canonicalOf(target) {

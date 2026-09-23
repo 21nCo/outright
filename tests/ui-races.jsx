@@ -3,6 +3,8 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "../src/App.jsx";
+import { ChangesPane } from "../src/components/ChangesPane.jsx";
+import { CommandPalette } from "../src/components/CommandPalette.jsx";
 import { TerminalPane } from "../src/components/TerminalPane.jsx";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
 import "../src/styles.css";
@@ -30,6 +32,11 @@ async function until(check, label) {
 }
 function assert(value, message) { if (!value) throw new Error(message); }
 function deferred() { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; }
+function setControlValue(control, value) {
+  const prototype = control instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  Object.getOwnPropertyDescriptor(prototype, "value").set.call(control, value);
+  control.dispatchEvent(new Event("input", { bubbles: true }));
+}
 function visibleFocusable(container) { return [...container.querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')].filter((element) => element.getClientRects().length && element.getAttribute("aria-hidden") !== "true"); }
 let route;
 window.fetch = async (input, options = {}) => {
@@ -62,8 +69,7 @@ async function chatRace(rejectForTrust, switchTarget = true) {
   root.render(<TooltipProvider><App /></TooltipProvider>);
   await until(() => host.querySelector('textarea[placeholder*="in A"]'), "conversation A");
   const input = host.querySelector('textarea[aria-label="Message the agent"]');
-  Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(input, "Delayed response regression");
-  input.dispatchEvent(new Event("input", { bubbles: true }));
+  setControlValue(input, "Delayed response regression");
   await until(() => !host.querySelector('[aria-label="Send message"]').disabled, "enabled composer");
   host.querySelector('[aria-label="Send message"]').click();
   await until(() => submitted, "run submitted in A");
@@ -113,6 +119,85 @@ async function terminalRace() {
   assert(errors.length === 0, "Terminal reconciliation reported errors");
 }
 
+async function terminalKeyboardRegression() {
+  root.render(null);
+  await settle();
+  const pendingBuffer = deferred();
+  let secondBufferRequests = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("A2")] });
+    if (url.pathname === "/api/terminals/term-A2") { secondBufferRequests += 1; return pendingBuffer.promise; }
+    return response({ buffer: `Output ${url.pathname}\r\n` });
+  };
+  root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => { throw error; }} sendRuntime={() => {}} />);
+  await until(() => host.querySelector('[role="tab"][aria-selected="true"]')?.textContent === "Terminal A", "keyboard terminal A");
+  const first = [...host.querySelectorAll('[role="tab"]')].find((tab) => tab.textContent === "Terminal A");
+  first.focus();
+  first.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+  await until(() => secondBufferRequests === 1, "keyboard terminal A2 request");
+  const second = [...host.querySelectorAll('[role="tab"]')].find((tab) => tab.textContent === "Terminal A2");
+  assert(document.activeElement === second, "Switching terminal tabs dropped focus");
+  assert(second.getAttribute("aria-disabled") === "true" && !second.disabled, "Loading terminal tab became unfocusable");
+  pendingBuffer.resolve(response({ buffer: "Terminal A2 output\r\n" }));
+  await until(() => second.getAttribute("aria-selected") === "true", "keyboard terminal A2 activation");
+  assert(document.activeElement === second, "Activated terminal did not retain focus");
+  second.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true }));
+  await settle();
+  assert(secondBufferRequests === 1, "Navigating to the active terminal re-fetched its buffer");
+  assert(document.activeElement === second, "Navigating to the active terminal moved focus");
+  const close = second.parentElement.querySelector('[aria-label^="Close terminal"]');
+  close.focus();
+  close.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
+  await settle();
+  assert(document.activeElement === close, "Terminal tablist handled an arrow key from the close control");
+}
+
+async function commandPaletteRegression() {
+  root.render(null);
+  await settle();
+  const oldResults = deferred();
+  const currentResults = deferred();
+  const requested = new Set();
+  let selected = null;
+  route = async (url) => {
+    if (url.pathname !== "/api/search") return response({});
+    const search = url.searchParams.get("q");
+    requested.add(search);
+    return search === "older" ? oldResults.promise : currentResults.promise;
+  };
+  root.render(<CommandPalette open onOpenChange={() => {}} projects={[]} onSelectProject={() => {}} onSelectConversation={(conversation) => { selected = conversation; }} />);
+  await until(() => document.querySelector('[role="combobox"]'), "command palette input");
+  const input = document.querySelector('[role="combobox"]');
+  setControlValue(input, "   ");
+  await settle();
+  assert(Boolean(document.querySelector(".command-hint")), "Whitespace-only command query hid the search hint");
+  setControlValue(input, "older");
+  await until(() => requested.has("older"), "older command search");
+  setControlValue(input, "current");
+  await until(() => requested.has("current"), "current command search");
+  oldResults.resolve(response({ conversations: [{ id: "old", title: "Old result", provider: "codex", worktreePath: "/old" }], messages: [] }));
+  await settle();
+  assert(!document.body.textContent.includes("Old result"), "A stale command search response remained selectable");
+  currentResults.resolve(response({ conversations: [{ id: "current", title: "Current result", provider: "codex", worktreePath: "/current" }], messages: [] }));
+  await until(() => document.querySelector('[role="option"]')?.textContent.includes("Current result"), "current command result");
+  await until(() => input.getAttribute("aria-activedescendant") === "command-result-0", "active remote command result");
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  assert(selected?.id === "current", "Enter did not select the asynchronously loaded command result");
+  assert([...document.querySelector('[role="listbox"]').children].every((element) => element.getAttribute("role") === "option"), "Command listbox contains non-option children");
+}
+
+async function changesLoadingRegression() {
+  root.render(null);
+  await settle();
+  const pendingStatus = deferred();
+  route = async (url) => url.pathname === "/api/git/status" ? pendingStatus.promise : response({ diff: "" });
+  root.render(<ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} />);
+  await settle();
+  assert(!host.querySelector(".clean-state"), "Changes pane announced a clean tree before status loaded");
+  pendingStatus.resolve(response({ branch: "main", files: [], stagedCount: 0 }));
+  await until(() => host.querySelector(".clean-state"), "loaded clean tree status");
+}
+
 async function responsiveFocusRegression() {
   root.render(null);
   await settle();
@@ -157,6 +242,15 @@ async function responsiveFocusRegression() {
     host.querySelector('[aria-label="Open projects sidebar"]').click();
     await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", "reopened desktop sidebar");
 
+    const desktopSidebarControl = host.querySelector('[aria-label="Close projects sidebar"]');
+    desktopSidebarControl.focus();
+    setNarrow(true);
+    await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), "sidebar closed from focused desktop control");
+    await until(() => document.activeElement === host.querySelector('[aria-label="Open projects sidebar"]'), "focus restored after hiding desktop sidebar");
+    setNarrow(false);
+    await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", "sidebar reopened after wide transition");
+    await until(() => host.querySelector("#project-sidebar").contains(document.activeElement), "sidebar focus after wide transition");
+
     const composer = host.querySelector('textarea[aria-label="Message the agent"]');
     composer.focus();
     setNarrow(true);
@@ -190,6 +284,21 @@ async function responsiveFocusRegression() {
     await until(() => !host.querySelector("#main-workspace")?.hasAttribute("inert"), "project drawer close");
     await until(() => document.activeElement === host.querySelector('[aria-label="Open projects sidebar"]'), "project drawer opener focus restoration");
 
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true, cancelable: true }));
+    await until(() => document.querySelector('[role="combobox"]'), "narrow command palette");
+    const paletteInput = document.querySelector('[role="combobox"]');
+    setControlValue(paletteInput, "Review B");
+    await until(() => [...document.querySelectorAll('[role="option"]')].some((option) => option.textContent.includes("Review B")), "narrow project search result");
+    [...document.querySelectorAll('[role="option"]')].find((option) => option.textContent.includes("Review B")).click();
+    await until(() => host.querySelector('textarea[placeholder*="in B"]'), "project selected while drawer closed");
+    const composerB = host.querySelector('textarea[aria-label="Message the agent"]');
+    composerB.focus();
+    setNarrow(false);
+    await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", "wide sidebar after closed selection");
+    setNarrow(true);
+    await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "true", "narrow sidebar after closed selection");
+    assert(document.activeElement === composerB, "Selecting a project while the drawer was closed left stale focus restoration state");
+
     const terminalTrigger = host.querySelector('[aria-label="Terminal"]');
     terminalTrigger.click();
     await until(() => host.querySelector("#workspace-inspector"), "narrow inspector");
@@ -219,8 +328,14 @@ try {
   results.textContent += "PASS: delayed trust response cannot target another conversation\n";
   await terminalRace();
   results.textContent += "PASS: worktree switch removes old terminal tabs and rejects stale buffer responses\n";
+  await terminalKeyboardRegression();
+  results.textContent += "PASS: terminal keyboard switching retains focus and ignores non-tab controls\n";
+  await commandPaletteRegression();
+  results.textContent += "PASS: command search keeps asynchronous results current and selectable\n";
+  await changesLoadingRegression();
+  results.textContent += "PASS: changes pane waits for status before announcing a clean tree\n";
   await responsiveFocusRegression();
-  results.textContent += "PASS: narrow drawer and inspector contain and restore focus\n5 interaction regressions passed";
+  results.textContent += "PASS: narrow drawer and inspector contain and restore focus\n8 interaction regressions passed";
   document.title = "PASS — Outright interaction regressions";
 } catch (error) {
   results.textContent += `\nFAIL: ${error.stack}`;

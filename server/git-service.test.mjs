@@ -24,7 +24,8 @@ test("reviews, stages, commits, creates, and safely removes discovered worktrees
     await git(repository, ["add", "README.md"]);
     await git(repository, ["commit", "-m", "initial"]);
 
-    const service = createGitService({ database: { audit: (action, details) => audit.push({ action, details }), getSettings: () => ({ editor: "zed" }) }, getProjects: () => projects, getConfig: async () => ({ scanRoots: [canonicalScanRoot] }) });
+    let interruptedRun = null;
+    const service = createGitService({ database: { audit: (action, details) => audit.push({ action, details }), getSettings: () => ({ editor: "zed" }), findUnresolvedInterruptedRunForWorktree: () => interruptedRun }, getProjects: () => projects, getConfig: async () => ({ scanRoots: [canonicalScanRoot] }) });
     await writeFile(path.join(repository, "README.md"), "first\nsecond\n");
     assert.equal((await service.status(repository)).unstagedCount, 1);
     assert.match((await service.diff(repository, "README.md")).diff, /\+second/);
@@ -36,6 +37,13 @@ test("reviews, stages, commits, creates, and safely removes discovered worktrees
     const created = await service.createWorktree({ projectId: "project", branch: "feature/runtime", name: "project-runtime" });
     projects = [{ ...projects[0], worktrees: [...projects[0].worktrees, { id: "runtime", path: created.path, isLinked: true, changedCount: 0 }] }];
     assert.equal(await exists(created.path), true);
+    interruptedRun = { id: "interrupted-run" };
+    await assert.rejects(
+      service.removeWorktree({ projectId: "project", worktreePath: created.path, confirmation: created.path }),
+      /Resolve the interrupted run/,
+    );
+    assert.equal(await exists(created.path), true, "pending recovery prevents destructive worktree removal");
+    interruptedRun = null;
     assert.equal((await service.removeWorktree({ projectId: "project", worktreePath: created.path, confirmation: created.path })).removed, true);
     assert.equal(await exists(created.path), false);
     assert.ok(audit.some((entry) => entry.action === "git.commit"));
@@ -45,7 +53,7 @@ test("reviews, stages, commits, creates, and safely removes discovered worktrees
   }
 });
 
-test("parses filenames with spaces, quotes, and renames from NUL porcelain output", async () => {
+test("parses portable filenames and supported quote characters from NUL porcelain output", async () => {
   const scanRoot = await mkdtemp(path.join(os.tmpdir(), "outright-git-spaces-"));
   const rawRepository = path.join(scanRoot, "project");
   try {
@@ -73,9 +81,12 @@ test("parses filenames with spaces, quotes, and renames from NUL porcelain outpu
     assert.equal(renamed.path, "renamed file.txt");
     assert.equal(renamed.originalPath, "hello world.txt");
 
-    await writeFile(path.join(repository, `quoted "name".txt`), "q\n");
-    status = await service.status(repository);
-    assert.ok(status.files.some((file) => file.path === `quoted "name".txt`));
+    // Windows filesystems reject double quotes before Git can observe them.
+    if (process.platform !== "win32") {
+      await writeFile(path.join(repository, `quoted "name".txt`), "q\n");
+      status = await service.status(repository);
+      assert.ok(status.files.some((file) => file.path === `quoted "name".txt`));
+    }
   } finally {
     await rm(scanRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }

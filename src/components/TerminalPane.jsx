@@ -138,8 +138,9 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   }
 
   async function selectTerminal(terminal) {
-    if (loading || terminal.cwd !== worktree.path) return;
-    const token = beginSelection();
+    if (loading || terminal.cwd !== worktree.path || terminal.id === activeIdRef.current) return;
+    const token = ++reconcileTokenRef.current;
+    setLoading(true);
     try { await activateTerminal(terminal, token); }
     catch (error) { if (token === reconcileTokenRef.current) onError(error); }
     finally { if (token === reconcileTokenRef.current) setLoading(false); }
@@ -147,19 +148,22 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
 
   function navigateTerminalTabs(event) {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-    const currentIndex = Math.max(0, terminals.findIndex((terminal) => terminal.id === activeId));
+    const currentTab = event.target.closest('[role="tab"]');
+    if (!currentTab || !event.currentTarget.contains(currentTab)) return;
+    const currentIndex = terminals.findIndex((terminal) => terminal.id === currentTab.dataset.tabId);
+    if (currentIndex < 0) return;
     const nextIndex = nextTabIndex(currentIndex, terminals.length, event.key);
     if (nextIndex < 0) return;
     event.preventDefault();
     const next = terminals[nextIndex];
     event.currentTarget.querySelector(`[data-tab-id="${CSS.escape(next.id)}"]`)?.focus();
-    selectTerminal(next);
+    if (next.id !== activeIdRef.current) selectTerminal(next);
   }
 
   return <section className="terminal-pane" aria-label="Worktree terminals">
     <p className="sr-only" id="terminal-help">Terminal input and output. Use the left and right arrow keys on a terminal tab to switch sessions.</p>
     <header className="terminal-tabs" role="tablist" aria-label="Open terminals" aria-orientation="horizontal" aria-busy={loading} onKeyDown={navigateTerminalTabs}>
-      {terminals.map((terminal) => <div className={`terminal-tab ${terminal.id === activeId ? "is-active" : ""}`} key={terminal.id}><button className="terminal-tab-select" id={domId("terminal-tab", terminal.id)} data-tab-id={terminal.id} role="tab" aria-selected={terminal.id === activeId} aria-controls="terminal-panel" tabIndex={terminal.id === activeId ? 0 : -1} disabled={loading} onClick={() => selectTerminal(terminal)}><TerminalWindow /><span>{terminal.name}</span></button><button className="terminal-tab-close" aria-label={`Close terminal ${terminal.name}`} disabled={loading} onClick={() => closeTerminal(terminal.id)}><X /></button></div>)}
+      {terminals.map((terminal) => <div className={`terminal-tab ${terminal.id === activeId ? "is-active" : ""}`} key={terminal.id}><button className="terminal-tab-select" id={domId("terminal-tab", terminal.id)} data-tab-id={terminal.id} role="tab" aria-selected={terminal.id === activeId} aria-controls="terminal-panel" tabIndex={terminal.id === activeId ? 0 : -1} aria-disabled={loading || undefined} onClick={() => selectTerminal(terminal)}><TerminalWindow /><span>{terminal.name}</span></button><button className="terminal-tab-close" aria-label={`Close terminal ${terminal.name}`} disabled={loading} onClick={() => closeTerminal(terminal.id)}><X /></button></div>)}
       <Button variant="ghost" size="icon-xs" disabled={loading} onClick={createTerminal} aria-label="New terminal"><Plus /></Button>
       {loading && <span className="terminal-loading" role="status"><ArrowsClockwise className="spin" />Loading terminal</span>}
     </header>

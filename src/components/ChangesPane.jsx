@@ -68,7 +68,7 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
     <header className="pane-toolbar"><div><strong>{status?.branch || worktree.branch}</strong><span>{status?.files.length ?? 0} changed files</span></div><Button variant="ghost" size="icon-sm" onClick={refresh} aria-label="Refresh changes"><ArrowsClockwise className={loading ? "spin" : ""} /></Button></header>
     <div className="changes-layout">
       <div className="changed-files" aria-busy={loading}>
-        {!status?.files.length && <div className="clean-state" role="status"><Check />Working tree is clean</div>}
+        {status && !status.files.length && <div className="clean-state" role="status"><Check />Working tree is clean</div>}
         {status?.files.map((file) => <div key={file.path} className={`change-file ${file.path === selectedFile ? "is-active" : ""}`}><button className="change-file-select" aria-pressed={file.path === selectedFile} onClick={() => chooseFile(file)}><span className={`file-status ${hasStaged(file) ? "staged" : ""}`}>{file.status}</span><span>{file.path}</span></button><span className="file-actions">{hasStaged(file) ? <Button variant="ghost" size="icon-xs" onClick={() => mutate("/api/git/unstage", [file.path])} aria-label={`Unstage ${file.path}`}><Minus /></Button> : <Button variant="ghost" size="icon-xs" onClick={() => mutate("/api/git/stage", [file.path])} aria-label={`Stage ${file.path}`}><Plus /></Button>}<Button variant="ghost" size="icon-xs" onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, file: file.path, editor: settings.editor } }).catch(onError)} aria-label={`Open ${file.path}`}><ArrowSquareOut /></Button></span></div>)}
       </div>
       <div className="diff-column">

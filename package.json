@@ -4,11 +4,16 @@
   "type": "module",
   "scripts": {
     "postinstall": "node scripts/fix-node-pty-permissions.mjs",
+    "build:supervisor": "node scripts/build-agent-supervisor.mjs",
+    "predev": "npm run build:supervisor",
+    "prebuild": "npm run build:supervisor",
+    "prestart": "npm run build:supervisor",
+    "pretest": "npm run build:supervisor",
     "dev": "vite",
     "build": "vite build && node scripts/prepare-sites-build.mjs",
     "start": "node server/standalone.mjs",
     "preview": "vite preview",
-    "test": "node --test server/*.test.mjs automation/hermes/*.test.mjs tests/ui-accessibility.test.mjs",
+    "test": "node scripts/run-tests.mjs",
     "test:sites": "node --test tests/sites-worker.test.mjs"
   },
   "dependencies": {

@@ -338,9 +338,15 @@ button, input, textarea, select { font: inherit; }
 .inspector > header nav button.is-active::after { content: ""; position: absolute; inset: auto 8px 0; height: 2px; background: var(--foreground); }
 .inspector-body { min-height: 0; overflow: hidden; }
 .workspace-tools { white-space: nowrap; }
-.run-state { height: 25px; padding: 0 8px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line-soft); border-radius: 999px; color: var(--muted-foreground); font-size: 9px; }
+.run-state { height: 25px; padding: 0 8px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line-soft); border-radius: 999px; color: var(--foreground); font-size: 9px; }
 .run-state small { color: inherit; }
-.run-state.running, .run-state.queued { color: var(--amber); }
+.run-state.running, .run-state.queued, .run-state.launching, .run-state.interrupted { color: var(--amber); }
+.recovery-notice { margin: 0 0 10px; padding: 11px 12px; display: flex; align-items: flex-start; gap: 10px; border: 1px solid color-mix(in oklab, var(--amber) 45%, var(--border)); border-radius: 9px; background: var(--subtle-canvas); }
+.recovery-notice > svg { flex: none; width: 18px; height: 18px; margin-top: 1px; color: var(--amber); }
+.recovery-copy { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.recovery-copy strong { font-size: 12px; }
+.recovery-copy p { margin: 0; color: var(--muted-foreground); font-size: 11px; line-height: 1.55; }
+.recovery-actions { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .run-state.failed, .run-state.stopped { color: var(--destructive); }
 .run-state.completed { color: var(--green); }
 .status-dot.error { background: var(--destructive); }
@@ -449,10 +455,10 @@ select { height: 34px; padding: 0 28px 0 10px; border: 1px solid var(--input); b
 .command-search > svg { color: var(--muted-foreground); }
 .command-search input { border: 0; box-shadow: none; font-size: 13px; }
 .command-results { max-height: 440px; padding: 6px; overflow-y: auto; }
-.command-results > button { width: 100%; min-height: 48px; padding: 6px 9px; border: 0; border-radius: 7px; display: grid; grid-template-columns: 20px minmax(0,1fr); align-items: center; gap: 9px; color: var(--muted-foreground); background: transparent; cursor: pointer; text-align: left; }
-.command-results > button:hover, .command-results > button.is-active { color: var(--foreground); background: var(--active); }
-.command-results > button svg { width: 17px; height: 17px; }
-.command-results > button span { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.command-options > button { width: 100%; min-height: 48px; padding: 6px 9px; border: 0; border-radius: 7px; display: grid; grid-template-columns: 20px minmax(0,1fr); align-items: center; gap: 9px; color: var(--muted-foreground); background: transparent; cursor: pointer; text-align: left; }
+.command-options > button:hover, .command-options > button.is-active { color: var(--foreground); background: var(--active); }
+.command-options > button svg { width: 17px; height: 17px; }
+.command-options > button span { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .command-results strong, .command-results small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .command-results strong { color: var(--foreground); font-size: 11px; }
 .command-results small { font-size: 9px; }
@@ -463,9 +469,9 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
 .settings-dialog { max-width: 680px; max-height: min(820px, calc(100vh - 40px)); overflow-y: auto; }
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 18px; }
 .setting-row { display: flex; flex-direction: column; gap: 6px; }
-.setting-row > span { display: flex; align-items: center; gap: 5px; color: var(--muted-foreground); font-size: 10px; font-weight: 600; }
-.setting-row > span svg { width: 13px; height: 13px; }
-.setting-row > select, .setting-row > input { width: 100%; }
+.setting-row > span:first-child { display: flex; align-items: center; gap: 5px; color: var(--muted-foreground); font-size: 10px; font-weight: 600; }
+.setting-row > span:first-child svg { width: 13px; height: 13px; }
+.setting-row > select, .setting-row > input:not([type="checkbox"]) { width: 100%; }
 .switch-row { height: 34px; display: flex; align-items: center; gap: 7px; color: var(--foreground); font-size: 11px; }
 .template-settings { padding-top: 15px; border-top: 1px solid var(--line-soft); }
 .template-settings > header strong { display: block; font-size: 11px; }
@@ -511,7 +517,7 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .inspector > header nav button { min-width: 86px; min-height: 42px; justify-content: center; }
   .settings-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); }
   [data-slot="dialog-content"] { max-height: calc(100dvh - 16px); padding: 18px; overflow-y: auto; }
-  .command-dialog { inset: 8px; width: auto; max-width: none; max-height: calc(100dvh - 16px); display: block; translate: 0 0; }
+  .command-dialog { inset: 8px; width: auto; max-width: none; max-height: calc(100dvh - 16px); padding: 0; display: block; overflow: hidden; translate: 0 0; }
   .command-results { max-height: calc(100dvh - 88px); }
   .settings-grid { grid-template-columns: minmax(0,1fr); }
   .new-template { grid-template-columns: minmax(0,1fr); }

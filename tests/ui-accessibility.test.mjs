@@ -19,27 +19,34 @@ test("DOM ids remain valid for provider and runtime identifiers", () => {
   assert.equal(domId("chat-tab", "abc/123:next"), "chat-tab-abc-123-next");
 });
 
-test("core surfaces retain accessible semantics and narrow-screen fallbacks", async () => {
-  const [app, terminal, palette, styles] = await Promise.all([
+test("core surfaces retain their semantic wiring and narrow-screen fallbacks", async () => {
+  const [app, terminal, palette, settings, context, changes, styles] = await Promise.all([
     readFile(new URL("src/App.jsx", root), "utf8"),
     readFile(new URL("src/components/TerminalPane.jsx", root), "utf8"),
     readFile(new URL("src/components/CommandPalette.jsx", root), "utf8"),
+    readFile(new URL("src/components/SettingsDialog.jsx", root), "utf8"),
+    readFile(new URL("src/components/ContextPane.jsx", root), "utf8"),
+    readFile(new URL("src/components/ChangesPane.jsx", root), "utf8"),
     readFile(new URL("src/styles.css", root), "utf8"),
   ]);
 
-  for (const expected of [
-    'role="tablist"',
-    'role="tabpanel"',
-    'role="status"',
-    'role="alert"',
-    'aria-live="polite"',
-    'className="mobile-scrim"',
-  ]) assert.match(app, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-
+  assert.match(app, /id="project-sidebar" role=\{isNarrow && sidebarOpen \? "dialog"/);
+  assert.match(app, /aria-modal=\{isNarrow && sidebarOpen \? true/);
+  assert.match(app, /id="main-workspace"[^\n]+inert=\{isNarrow && sidebarOpen \? true/);
+  assert.match(app, /className="mobile-scrim"[^\n]+aria-hidden="true"/);
+  assert.match(app, /worktree\.isLinked && <>/);
+  assert.match(app, /function StreamingMessage[^\n]+aria-busy="true"/);
+  assert.doesNotMatch(app.match(/function StreamingMessage[^\n]+/)?.[0] ?? "", /role="status"|aria-live/);
   assert.match(terminal, /screenReaderMode: true/);
   assert.match(terminal, /aria-describedby="terminal-help"/);
+  assert.match(terminal, /aria-disabled=\{loading \|\| undefined\}/);
   assert.match(palette, /role="combobox"/);
-  assert.match(palette, /role="listbox"/);
+  assert.match(palette, /className="command-options" id="command-results" role="listbox"/);
+  assert.match(settings, /type="checkbox" aria-label="Notify when runs finish"/);
+  assert.match(context, /tabIndex=\{0\} aria-label=\{`Preview of \$\{file\.name\}`\}/);
+  assert.match(changes, /status && !status\.files\.length/);
   assert.match(styles, /@media \(max-width: 760px\)/);
+  assert.match(styles, /\.command-dialog \{[^}]+padding: 0;[^}]+overflow: hidden;/);
+  assert.match(styles, /\.setting-row > input:not\(\[type="checkbox"\]\)/);
   assert.match(styles, /@media \(prefers-reduced-motion: reduce\)/);
 });
