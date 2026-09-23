@@ -45,6 +45,7 @@ export function App() {
   const [runtimeEvent, setRuntimeEvent] = useState(null);
   const [connection, setConnection] = useState("connecting");
   const [isScanning, setIsScanning] = useState(true);
+  const [isNarrow, setIsNarrow] = useState(() => typeof window !== "undefined" && window.matchMedia("(max-width: 760px)").matches);
   const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === "undefined" || !window.matchMedia("(max-width: 760px)").matches);
   const [inspector, setInspector] = useState(null);
   const [theme, setTheme] = useState(() => localStorage.getItem("outright.theme") || "system");
@@ -75,8 +76,11 @@ export function App() {
   const stickToBottomRef = useRef(true);
   const pendingPrependScrollRef = useRef(null);
   const sidebarRef = useRef(null);
+  const sidebarReturnFocusRef = useRef(false);
   const chatTabsRef = useRef(null);
   const inspectorRef = useRef(null);
+  const inspectorInvokerRef = useRef(null);
+  const inspectorReturnFocusRef = useRef(null);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
 
   const loadBootstrap = useCallback(async (manual = false) => {
@@ -218,25 +222,61 @@ export function App() {
     const keyboard = (event) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); setCommandOpen(true); }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "n") { event.preventDefault(); setNewChatOpen(true); }
-      if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "t") { event.preventDefault(); setInspector("terminal"); }
-      if (event.key === "Escape" && !document.querySelector('[role="dialog"]')) {
-        if (window.matchMedia("(max-width: 760px)").matches && sidebarOpen) closeSidebar();
-        else if (inspector) setInspector(null);
+      if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "t") {
+        event.preventDefault();
+        inspectorInvokerRef.current = document.querySelector('[aria-label="Terminal"]');
+        setInspector("terminal");
+      }
+      if (event.key === "Escape" && !document.querySelector('[role="dialog"]:not(#project-sidebar)')) {
+        if (isNarrow && sidebarOpen) closeSidebar();
+        else if (inspector) closeInspector();
       }
     };
     window.addEventListener("keydown", keyboard); return () => window.removeEventListener("keydown", keyboard);
-  }, [inspector, sidebarOpen]);
+  }, [inspector, isNarrow, sidebarOpen]);
   useEffect(() => {
     const narrow = window.matchMedia("(max-width: 760px)");
-    if (narrow.matches) setSidebarOpen(false);
+    const synchronizeLayout = () => {
+      setIsNarrow(narrow.matches);
+      setSidebarOpen(!narrow.matches);
+    };
+    narrow.addEventListener("change", synchronizeLayout);
+    window.addEventListener("resize", synchronizeLayout);
+    return () => {
+      narrow.removeEventListener("change", synchronizeLayout);
+      window.removeEventListener("resize", synchronizeLayout);
+    };
   }, []);
-  useEffect(() => {
-    if (!sidebarOpen || !window.matchMedia("(max-width: 760px)").matches) return;
-    window.requestAnimationFrame(() => sidebarRef.current?.querySelector('[aria-label="Close projects sidebar"]')?.focus());
+  useLayoutEffect(() => {
+    if (!isNarrow || !sidebarOpen) return;
+    const sidebar = sidebarRef.current;
+    sidebar?.focus();
+    const containFocus = (event) => {
+      if (event.key !== "Tab") return;
+      const focusable = focusableElements(sidebar);
+      if (!focusable.length) { event.preventDefault(); sidebar?.focus(); return; }
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (event.shiftKey && (document.activeElement === sidebar || document.activeElement === first)) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    sidebar?.addEventListener("keydown", containFocus);
+    return () => sidebar?.removeEventListener("keydown", containFocus);
+  }, [isNarrow, sidebarOpen]);
+  useLayoutEffect(() => {
+    if (sidebarOpen || !sidebarReturnFocusRef.current) return;
+    sidebarReturnFocusRef.current = false;
+    document.querySelector('[aria-label="Open projects sidebar"]')?.focus({ preventScroll: true });
   }, [sidebarOpen]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!inspector) return;
-    window.requestAnimationFrame(() => inspectorRef.current?.querySelector('[role="tab"][aria-selected="true"]')?.focus());
+    inspectorRef.current?.querySelector('[role="tab"][aria-selected="true"]')?.focus({ preventScroll: true });
+  }, [inspector]);
+  useLayoutEffect(() => {
+    if (inspector || !inspectorReturnFocusRef.current) return;
+    const invoker = inspectorReturnFocusRef.current;
+    inspectorReturnFocusRef.current = null;
+    if (invoker.isConnected) invoker.focus({ preventScroll: true });
   }, [inspector]);
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 2800); return () => clearTimeout(timer); }, [toast]);
   useEffect(() => { if (!error) return; const timer = setTimeout(() => setError(""), 6000); return () => clearTimeout(timer); }, [error]);
@@ -286,8 +326,20 @@ export function App() {
   }
 
   function closeSidebar() {
+    sidebarReturnFocusRef.current = true;
     setSidebarOpen(false);
-    window.requestAnimationFrame(() => document.querySelector('[aria-label="Open projects sidebar"]')?.focus());
+  }
+
+  function toggleInspector(nextInspector, invoker) {
+    if (inspector === nextInspector) { closeInspector(); return; }
+    inspectorInvokerRef.current = invoker;
+    setInspector(nextInspector);
+  }
+
+  function closeInspector() {
+    inspectorReturnFocusRef.current = inspectorInvokerRef.current;
+    inspectorInvokerRef.current = null;
+    setInspector(null);
   }
 
   function navigateProjectButtons(event) {
@@ -431,17 +483,17 @@ export function App() {
   if (!bootstrap || !project || !worktree) return <LoadingScreen isScanning={isScanning} />;
 
   return <div className={`app-shell ${sidebarOpen ? "sidebar-is-open" : "sidebar-is-closed"}`}>
-    <aside className="sidebar" id="project-sidebar" aria-label="Projects and worktrees" aria-hidden={!sidebarOpen} ref={sidebarRef}>
+    <aside className="sidebar" id="project-sidebar" role={isNarrow && sidebarOpen ? "dialog" : undefined} aria-modal={isNarrow && sidebarOpen ? true : undefined} aria-label="Projects and worktrees" aria-hidden={!sidebarOpen} tabIndex={isNarrow ? -1 : undefined} ref={sidebarRef}>
       <header className="sidebar-brand"><div className="brand-lockup"><span className="brand-glyph"><Sparkle weight="fill" /></span><strong>Outright</strong></div><Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon-sm" onClick={closeSidebar} aria-label="Close projects sidebar" />}><SidebarSimple /></TooltipTrigger><TooltipContent>Close sidebar</TooltipContent></Tooltip></header>
       <div className="sidebar-actions"><Button className="new-chat-action" onClick={() => setNewChatOpen(true)}><Plus weight="bold" /> New chat <kbd>⌘N</kbd></Button><Button variant="ghost" className="sidebar-action" onClick={() => setCommandOpen(true)}><MagnifyingGlass /> Search <kbd>⌘K</kbd></Button><Button variant="ghost" className="sidebar-action" onClick={() => loadBootstrap(true)}><ArrowsClockwise className={isScanning ? "spin" : ""} /> Scan projects</Button></div>
       <Separator /><div className="project-section-heading"><span>Projects</span><Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon-xs" onClick={() => setNewGroupOpen(true)} aria-label="New project group" />}><FolderPlus /></TooltipTrigger><TooltipContent>New project group</TooltipContent></Tooltip></div>
       <ScrollArea className="project-scroll" viewportProps={{ tabIndex: 0, "aria-label": "Project groups, projects, and worktrees", onKeyDown: navigateProjectButtons }}><div className="group-list">{groupedProjects.map((group) => { const isOpen = expandedGroups[group.id] ?? true; return <section className="project-group" key={group.id}><button className="group-heading" aria-expanded={isOpen} onClick={() => setExpandedGroups((current) => ({ ...current, [group.id]: !isOpen }))}>{isOpen ? <CaretDown /> : <CaretRight />}<Folders weight="duotone" /><span>{group.name}</span><small>{group.projects.length}</small></button>{isOpen && group.projects.map((item) => <ProjectTree key={item.id} project={item} activeProjectId={project.id} activeWorktreeId={worktree.id} expanded={expandedProjects[item.id] ?? item.id === project.id} groups={groups.groups} onToggle={() => setExpandedProjects((current) => ({ ...current, [item.id]: !(current[item.id] ?? item.id === project.id) }))} onSelectProject={() => chooseProject(item)} onSelectWorktree={(nextWorktree) => chooseProject(item, nextWorktree)} onMove={(groupId) => moveProject(item.id, groupId)} onCreateWorktree={() => setWorktreeDialog(item)} />)}</section>; })}</div></ScrollArea>
       <footer className="sidebar-footer"><span className={`status-dot ${connection === "connected" ? "live" : "demo"}`} aria-hidden="true" /><span role="status" aria-live="polite">{connection === "connected" ? "Runtime connected" : connection}</span>{bootstrap.truncated ? <small className="scan-limit" title={`Showing ${bootstrap.projects.length} of ${bootstrap.repositoryCount} discovered repositories. Increase maxProjects in outright.config.json to show more.`}><WarningCircle />{bootstrap.projects.length}/{bootstrap.repositoryCount}</small> : <small>{bootstrap.scanDurationMs ? `${Math.round(bootstrap.scanDurationMs)}ms` : ""}</small>}<Button variant="ghost" size="icon-xs" onClick={() => setSettingsOpen(true)} aria-label="Settings"><GearSix /></Button></footer>
     </aside>
-    {sidebarOpen && <button className="mobile-scrim" onClick={closeSidebar} aria-label="Close projects sidebar" />}
+    {isNarrow && sidebarOpen && <div className="mobile-scrim" onClick={closeSidebar} aria-hidden="true" />}
 
-    <main id="main-workspace" className={`workspace ${inspector ? "has-inspector" : ""}`}>
-      <header className="workspace-bar">{!sidebarOpen && <Button variant="ghost" size="icon-sm" onClick={() => setSidebarOpen(true)} aria-label="Open projects sidebar" aria-controls="project-sidebar" aria-expanded={sidebarOpen}><SidebarSimple /></Button>}<div className="workspace-context"><span>{project.name}</span><CaretRight /><GitBranch /><strong>{worktree.name}</strong></div><div className="workspace-tools"><RunState run={activeRun ?? latestRun} /><WorktreeState worktree={worktree} /><Tooltip><TooltipTrigger render={<Button variant={inspector === "changes" ? "secondary" : "ghost"} size="icon-sm" onClick={() => setInspector(inspector === "changes" ? null : "changes")} aria-label="Changes" aria-controls="workspace-inspector" aria-expanded={inspector === "changes"} />}><GitDiff /></TooltipTrigger><TooltipContent>Changes</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "terminal" ? "secondary" : "ghost"} size="icon-sm" onClick={() => setInspector(inspector === "terminal" ? null : "terminal")} aria-label="Terminal" aria-controls="workspace-inspector" aria-expanded={inspector === "terminal"} />}><TerminalWindow /></TooltipTrigger><TooltipContent>Terminal ⌘⇧T</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "context" ? "secondary" : "ghost"} size="icon-sm" onClick={() => setInspector(inspector === "context" ? null : "context")} aria-label="Project context" aria-controls="workspace-inspector" aria-expanded={inspector === "context"} />}><Info /></TooltipTrigger><TooltipContent>Project context</TooltipContent></Tooltip><ThemeMenu theme={theme} onThemeChange={setTheme} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Worktree options" />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, editor: settings.editor } }).catch((nextError) => setError(nextError.message))}><FolderOpen />Open in {settings.editor}</DropdownMenuItem>{worktree.isLinked && <DropdownMenuItem variant="destructive" onClick={() => setRemoveWorktreeOpen(true)}><Trash />Remove worktree</DropdownMenuItem>}</DropdownMenuContent></DropdownMenu></div></header>
+    <main id="main-workspace" className={`workspace ${inspector ? "has-inspector" : ""}`} inert={isNarrow && sidebarOpen ? true : undefined} aria-hidden={isNarrow && sidebarOpen ? true : undefined}>
+      <header className="workspace-bar">{!sidebarOpen && <Button variant="ghost" size="icon-sm" onClick={() => setSidebarOpen(true)} aria-label="Open projects sidebar" aria-controls="project-sidebar" aria-expanded={sidebarOpen}><SidebarSimple /></Button>}<div className="workspace-context"><span>{project.name}</span><CaretRight /><GitBranch /><strong>{worktree.name}</strong></div><div className="workspace-tools"><RunState run={activeRun ?? latestRun} /><WorktreeState worktree={worktree} /><Tooltip><TooltipTrigger render={<Button variant={inspector === "changes" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("changes", event.currentTarget)} aria-label="Changes" aria-controls="workspace-inspector" aria-expanded={inspector === "changes"} />}><GitDiff /></TooltipTrigger><TooltipContent>Changes</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "terminal" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("terminal", event.currentTarget)} aria-label="Terminal" aria-controls="workspace-inspector" aria-expanded={inspector === "terminal"} />}><TerminalWindow /></TooltipTrigger><TooltipContent>Terminal ⌘⇧T</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "context" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("context", event.currentTarget)} aria-label="Project context" aria-controls="workspace-inspector" aria-expanded={inspector === "context"} />}><Info /></TooltipTrigger><TooltipContent>Project context</TooltipContent></Tooltip><ThemeMenu theme={theme} onThemeChange={setTheme} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Worktree options" />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, editor: settings.editor } }).then(() => setToast(`Opened in ${settings.editor}`)).catch((nextError) => setError(nextError.message))}><PencilSimple />Open in {settings.editor}</DropdownMenuItem><DropdownMenuItem onClick={() => setWorktreeDialog(project)}><GitBranch />New worktree</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onClick={() => setRemoveWorktreeOpen(true)}><Trash />Remove worktree</DropdownMenuItem></DropdownMenuContent></DropdownMenu></div></header>
       <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll" role="tablist" aria-label="Open agent chats" aria-orientation="horizontal" ref={chatTabsRef} onKeyDown={(event) => navigateTabs(event, '[role="tab"]', selectedConversationId, setSelectedConversationId)}>{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={() => { dragConversationRef.current = item.id; }} onDragOver={(event) => event.preventDefault()} onDrop={() => reorderConversation(item.id)}><button className="tab-select" id={domId("chat-tab", item.id)} data-tab-id={item.id} role="tab" aria-selected={item.id === selectedConversationId} aria-controls="conversation-panel" tabIndex={item.id === selectedConversationId ? 0 : -1} onClick={() => setSelectedConversationId(item.id)} onDoubleClick={() => { setSelectedConversationId(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); api(`/api/conversations/${item.id}`, { method: "PATCH", body: { archived: true } }).then(() => loadConversations()).catch((nextError) => setError(nextError.message)); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
       <div className="work-area">
         <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
@@ -449,7 +501,7 @@ export function App() {
           <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages" }}><div className="message-column">{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? conversation.messages.map((message) => <Message key={message.id} message={message} />) : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}{conversation?.messagePage?.hasLater && <button className="history-return" onClick={loadConversation}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button>}</div></ScrollArea>
           <form className="composer" onSubmit={sendPrompt}><textarea aria-label="Message the agent" placeholder={conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={setDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running" role="status" aria-live="polite"><span className="status-dot demo" aria-hidden="true" />Agent is {activeRun.status}</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim()} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
         </section>
-        {inspector && <aside className="inspector" id="workspace-inspector" aria-label="Workspace inspector" tabIndex={-1} ref={inspectorRef}><header><nav role="tablist" aria-label="Inspector panels" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', inspector, setInspector)}><button id="inspector-tab-changes" data-tab-id="changes" role="tab" className={inspector === "changes" ? "is-active" : ""} aria-selected={inspector === "changes"} aria-controls="inspector-content" tabIndex={inspector === "changes" ? 0 : -1} onClick={() => setInspector("changes")}><GitDiff />Changes</button><button id="inspector-tab-terminal" data-tab-id="terminal" role="tab" className={inspector === "terminal" ? "is-active" : ""} aria-selected={inspector === "terminal"} aria-controls="inspector-content" tabIndex={inspector === "terminal" ? 0 : -1} onClick={() => setInspector("terminal")}><TerminalWindow />Terminal</button><button id="inspector-tab-context" data-tab-id="context" role="tab" className={inspector === "context" ? "is-active" : ""} aria-selected={inspector === "context"} aria-controls="inspector-content" tabIndex={inspector === "context" ? 0 : -1} onClick={() => setInspector("context")}><TreeStructure />Context</button></nav><Button variant="ghost" size="icon-xs" onClick={() => setInspector(null)} aria-label="Close inspector"><X /></Button></header><div className="inspector-body" id="inspector-content" role="tabpanel" aria-labelledby={`inspector-tab-${inspector}`}>{inspector === "changes" && <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />}{inspector === "terminal" && <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} sendRuntime={sendRuntime} onError={handleError} />}{inspector === "context" && <ContextPane worktree={worktree} settings={settings} onError={handleError} />}</div></aside>}
+        {inspector && <aside className="inspector" id="workspace-inspector" aria-label="Workspace inspector" tabIndex={-1} ref={inspectorRef}><header><nav role="tablist" aria-label="Inspector panels" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', inspector, setInspector)}><button id="inspector-tab-changes" data-tab-id="changes" role="tab" className={inspector === "changes" ? "is-active" : ""} aria-selected={inspector === "changes"} aria-controls="inspector-content" tabIndex={inspector === "changes" ? 0 : -1} onClick={() => setInspector("changes")}><GitDiff />Changes</button><button id="inspector-tab-terminal" data-tab-id="terminal" role="tab" className={inspector === "terminal" ? "is-active" : ""} aria-selected={inspector === "terminal"} aria-controls="inspector-content" tabIndex={inspector === "terminal" ? 0 : -1} onClick={() => setInspector("terminal")}><TerminalWindow />Terminal</button><button id="inspector-tab-context" data-tab-id="context" role="tab" className={inspector === "context" ? "is-active" : ""} aria-selected={inspector === "context"} aria-controls="inspector-content" tabIndex={inspector === "context" ? 0 : -1} onClick={() => setInspector("context")}><TreeStructure />Context</button></nav><Button variant="ghost" size="icon-xs" onClick={closeInspector} aria-label="Close inspector"><X /></Button></header><div className="inspector-body" id="inspector-content" role="tabpanel" aria-labelledby={`inspector-tab-${inspector}`}>{inspector === "changes" && <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />}{inspector === "terminal" && <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} sendRuntime={sendRuntime} onError={handleError} />}{inspector === "context" && <ContextPane worktree={worktree} settings={settings} onError={handleError} />}</div></aside>}
       </div>
     </main>
 
@@ -486,6 +538,7 @@ function buildGroupedProjects(projects, state) { const result = state.groups.map
 function preferredWorktree(project) { return project.worktrees.find((item) => item.name === "dev" || item.path.endsWith("-dev")) ?? project.worktrees.find((item) => item.branch === "next") ?? project.worktrees[0]; }
 function compactPath(value = "") { return value.replace(/^\/Users\/[^/]+/, "~"); }
 function defaultSettings() { return { provider: "codex", model: "", reasoningEffort: "medium", approvalPolicy: "workspace-write", editor: "zed", notifications: true, maxConcurrentRuns: 3 }; }
+function focusableElements(container) { return container ? [...container.querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')].filter((element) => element.getClientRects().length && element.getAttribute("aria-hidden") !== "true") : []; }
 function upsert(items, item) { return [...items.filter((entry) => entry.id !== item.id), item].sort((a, b) => a.createdAt.localeCompare(b.createdAt)); }
 function boundStreamingText(value) { return value.length > MAX_STREAMING_CHARACTERS ? `${value.slice(0, MAX_STREAMING_CHARACTERS)}${LIVE_TRUNCATION_MARKER}` : value; }
 function formatTime(value) { return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(value)); }

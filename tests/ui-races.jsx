@@ -12,6 +12,7 @@ const results = document.getElementById("results");
 const root = createRoot(host);
 const originalFetch = window.fetch;
 const OriginalSocket = window.WebSocket;
+const originalMatchMedia = window.matchMedia.bind(window);
 const keys = ["outright.selected-project", "outright.selected-worktree", "outright.selected-conversation"];
 const saved = keys.map((key) => localStorage.getItem(key));
 const projects = ["A", "B"].map((id) => ({ id, name: `Review ${id}`, path: `/fixture/${id}`, worktrees: [{ id, name: id, path: `/fixture/${id}`, branch: "main", changedCount: 0 }] }));
@@ -29,6 +30,7 @@ async function until(check, label) {
 }
 function assert(value, message) { if (!value) throw new Error(message); }
 function deferred() { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; }
+function visibleFocusable(container) { return [...container.querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')].filter((element) => element.getClientRects().length && element.getAttribute("aria-hidden") !== "true"); }
 let route;
 window.fetch = async (input, options = {}) => {
   const url = new URL(input, location.origin);
@@ -111,6 +113,91 @@ async function terminalRace() {
   assert(errors.length === 0, "Terminal reconciliation reported errors");
 }
 
+async function responsiveFocusRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const listeners = new Set();
+  let narrow = false;
+  const responsiveQuery = {
+    media: "(max-width: 760px)",
+    get matches() { return narrow; },
+    onchange: null,
+    addEventListener(type, listener) { if (type === "change") listeners.add(listener); },
+    removeEventListener(type, listener) { if (type === "change") listeners.delete(listener); },
+    addListener(listener) { listeners.add(listener); },
+    removeListener(listener) { listeners.delete(listener); },
+    dispatchEvent(event) { listeners.forEach((listener) => listener(event)); return true; },
+  };
+  const setNarrow = (matches) => {
+    narrow = matches;
+    const event = { matches, media: responsiveQuery.media };
+    responsiveQuery.onchange?.(event);
+    responsiveQuery.dispatchEvent(event);
+  };
+  window.matchMedia = (query) => query === responsiveQuery.media ? responsiveQuery : originalMatchMedia(query);
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats[url.searchParams.get("projectId")]] });
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A")] });
+    if (url.pathname.startsWith("/api/terminals/")) return response({ buffer: "Responsive focus fixture\r\n" });
+    const match = url.pathname.match(/^\/api\/conversations\/chat-([AB])$/);
+    if (match) return response(chats[match[1]]);
+    return response({});
+  };
+
+  try {
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('textarea[aria-label="Message the agent"]'), "responsive fixture");
+    const composer = host.querySelector('textarea[aria-label="Message the agent"]');
+    composer.focus();
+    setNarrow(true);
+    await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), "sidebar closed after narrow transition");
+    assert(document.activeElement === composer, "Entering the narrow layout moved focus away from the composer");
+    assert(host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "true", "Entering the narrow layout left the project drawer exposed");
+
+    const opener = host.querySelector('[aria-label="Open projects sidebar"]');
+    opener.click();
+    await until(() => host.querySelector("#main-workspace")?.hasAttribute("inert"), "modal project drawer");
+    const sidebar = host.querySelector("#project-sidebar");
+    const workspace = host.querySelector("#main-workspace");
+    const scrim = host.querySelector(".mobile-scrim");
+    await until(() => sidebar.contains(document.activeElement), "project drawer focus");
+    assert(sidebar.getAttribute("role") === "dialog" && sidebar.getAttribute("aria-modal") === "true", "Project drawer is not exposed as a modal dialog");
+    assert(workspace.getAttribute("aria-hidden") === "true", "Project drawer did not hide the workspace from assistive technology");
+    assert(scrim?.tagName === "DIV" && scrim.tabIndex === -1, "Project drawer backdrop entered the tab order");
+    const closeButton = document.activeElement;
+    composer.focus();
+    assert(document.activeElement === closeButton, "Inert workspace accepted focus while the project drawer was open");
+    const focusable = visibleFocusable(sidebar);
+    focusable[0].focus();
+    focusable[0].dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true }));
+    assert(document.activeElement === focusable.at(-1), "Shift+Tab escaped the project drawer");
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    await until(() => !host.querySelector("#main-workspace")?.hasAttribute("inert"), "project drawer close");
+    await until(() => document.activeElement === host.querySelector('[aria-label="Open projects sidebar"]'), "project drawer opener focus restoration");
+
+    const terminalTrigger = host.querySelector('[aria-label="Terminal"]');
+    terminalTrigger.click();
+    await until(() => host.querySelector("#workspace-inspector"), "narrow inspector");
+    await until(() => document.activeElement?.id === "inspector-tab-terminal", "inspector tab focus");
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    await until(() => !host.querySelector("#workspace-inspector"), "inspector escape close");
+    assert(document.activeElement === terminalTrigger, "Escape did not restore focus to the inspector invoker");
+
+    terminalTrigger.click();
+    await until(() => host.querySelector('[aria-label="Close inspector"]'), "inspector close control");
+    host.querySelector('[aria-label="Close inspector"]').click();
+    await until(() => !host.querySelector("#workspace-inspector"), "inspector button close");
+    assert(document.activeElement === terminalTrigger, "Inspector close control did not restore invoker focus");
+  } finally {
+    root.render(null);
+    await settle();
+    window.matchMedia = originalMatchMedia;
+  }
+}
+
 try {
   await chatRace(false, false);
   results.textContent = "PASS: sending in the current conversation shows its run\n";
@@ -119,7 +206,9 @@ try {
   await chatRace(true);
   results.textContent += "PASS: delayed trust response cannot target another conversation\n";
   await terminalRace();
-  results.textContent += "PASS: worktree switch removes old terminal tabs and rejects stale buffer responses\n4 interaction regressions passed";
+  results.textContent += "PASS: worktree switch removes old terminal tabs and rejects stale buffer responses\n";
+  await responsiveFocusRegression();
+  results.textContent += "PASS: narrow drawer and inspector contain and restore focus\n5 interaction regressions passed";
   document.title = "PASS — Outright interaction regressions";
 } catch (error) {
   results.textContent += `\nFAIL: ${error.stack}`;
@@ -128,5 +217,6 @@ try {
   root.unmount();
   window.fetch = originalFetch;
   window.WebSocket = OriginalSocket;
+  window.matchMedia = originalMatchMedia;
   keys.forEach((key, index) => saved[index] === null ? localStorage.removeItem(key) : localStorage.setItem(key, saved[index]));
 }
