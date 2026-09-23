@@ -22,6 +22,7 @@ const terminal = (id) => ({ id: `term-${id}`, name: `Terminal ${id}`, cwd: `/fix
 const response = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 const frame = () => new Promise((resolve) => document.hidden ? setTimeout(resolve, 16) : requestAnimationFrame(resolve));
 async function settle() { await frame(); await frame(); }
+function terminalReady(name) { return host.querySelector('.terminal-tabs[aria-busy="false"] [role="tab"][aria-selected="true"]')?.textContent === name; }
 async function until(check, label) {
   const deadline = performance.now() + 5000;
   while (!check()) {
@@ -102,7 +103,7 @@ async function terminalRace() {
   };
   const show = (project) => root.render(<TerminalPane worktree={project.worktrees[0]} runtimeEvent={null} onError={onError} sendRuntime={sendRuntime} />);
   show(projects[0]);
-  await until(() => host.querySelector('[role="tab"][aria-selected="true"]')?.textContent === "Terminal A", "terminal A");
+  await until(() => terminalReady("Terminal A"), "terminal A ready");
   [...host.querySelectorAll('[role="tab"]')].find((tab) => tab.textContent === "Terminal A2").click();
   await until(() => bufferRequested, "pending second terminal buffer");
   holdLists = true;
@@ -111,7 +112,7 @@ async function terminalRace() {
   assert(!host.querySelector('[role="tab"]'), "Old worktree tabs remained selectable");
   assert(host.querySelector('[aria-label="New terminal"]').disabled, "Terminal controls enabled before reconciliation");
   delayedList.resolve(response({ terminals: [terminal("A"), terminal("B")] }));
-  await until(() => host.querySelector('[role="tab"][aria-selected="true"]')?.textContent === "Terminal B", "terminal B");
+  await until(() => terminalReady("Terminal B"), "terminal B ready");
   delayedBuffer.resolve(response({ buffer: "Stale A output\r\n" }));
   await settle();
   assert(host.querySelector('[role="tab"][aria-selected="true"]')?.textContent === "Terminal B", "Late A selection replaced B");
@@ -154,7 +155,7 @@ async function terminalKeyboardRegression() {
     return response({ buffer: `Output ${url.pathname}\r\n` });
   };
   root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => { throw error; }} sendRuntime={() => {}} />);
-  await until(() => host.querySelector('[role="tab"][aria-selected="true"]')?.textContent === "Terminal A", "keyboard terminal A");
+  await until(() => terminalReady("Terminal A"), "keyboard terminal A ready");
   const first = [...host.querySelectorAll('[role="tab"]')].find((tab) => tab.textContent === "Terminal A");
   first.focus();
   first.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
@@ -169,7 +170,7 @@ async function terminalKeyboardRegression() {
     assert(secondBufferRequests === 1, `${key} started a second request while loading`);
   }
   pendingBuffer.resolve(response({ buffer: "Terminal A2 output\r\n" }));
-  await until(() => second.getAttribute("aria-selected") === "true", "keyboard terminal A2 activation");
+  await until(() => terminalReady("Terminal A2"), "keyboard terminal A2 activation");
   assert(document.activeElement === second, "Activated terminal did not retain focus");
   second.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true }));
   await settle();
@@ -180,6 +181,59 @@ async function terminalKeyboardRegression() {
   close.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
   await settle();
   assert(document.activeElement === close, "Terminal tablist handled an arrow key from the close control");
+}
+
+async function terminalActivationOwnershipRegression() {
+  root.render(null);
+  await settle();
+  host.style.width = "320px";
+  const pending = deferred();
+  let holdSecond = true;
+  const sent = [];
+  const sendRuntime = (message) => sent.push(message);
+  const onError = (error) => { throw error; };
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") return response(terminal("A3"));
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("A2")] });
+    if (options.method === "DELETE") return response({});
+    if (url.pathname === "/api/terminals/term-A2" && holdSecond) return pending.promise;
+    if (url.pathname === "/api/terminals/term-A2") return response({ buffer: "A2 refreshed\r\n", outputCursor: 2 });
+    if (url.pathname === "/api/terminals/term-A3") return response({ buffer: "A3 ready\r\n", outputCursor: 0 });
+    return response({ buffer: "Old A output\r\n", outputCursor: 0 });
+  };
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} onError={onError} sendRuntime={sendRuntime} />);
+  show();
+  await until(() => terminalReady("Terminal A"), "ownership fixture initial terminal ready");
+  const initialSize = sent.findLast((message) => message.type === "terminal.resize");
+  assert(initialSize?.terminalId === "term-A", "Initial activation did not synchronize the selected PTY size");
+  host.querySelector('[data-tab-id="term-A2"]').click();
+  await until(() => host.querySelector('.terminal-tabs[aria-busy="true"]'), "pending terminal activation");
+  assert(host.querySelector('[role="tab"][aria-selected="true"]')?.dataset.tabId === "term-A", "Pending candidate was selected before its buffer was installed");
+  await until(() => host.querySelector(".xterm-rows")?.textContent.includes("Old A output"), "committed terminal output");
+  host.style.width = "540px";
+  await settle();
+  show({ type: "terminal.output", terminalId: "term-A2", payload: { data: "Included snapshot\r\n", cursor: 1 } });
+  await settle();
+  show({ type: "terminal.output", terminalId: "term-A2", payload: { data: "After snapshot\r\n", cursor: 2 } });
+  await settle();
+  pending.resolve(response({ buffer: "Included snapshot\r\n", outputCursor: 1 }));
+  await until(() => terminalReady("Terminal A2"), "activation with buffered output");
+  holdSecond = false;
+  await until(() => host.querySelector(".xterm-rows")?.textContent.includes("After snapshot"), "live output after snapshot");
+  const screen = host.querySelector(".xterm-rows").textContent;
+  assert(screen.split("Included snapshot").length === 2 && !screen.includes("Old A output"), "Activation duplicated snapshot output or retained the wrong buffer");
+  const sizes = sent.filter((message) => message.type === "terminal.resize" && message.terminalId === "term-A2");
+  assert(sizes.length && sizes.at(-1).cols > initialSize.cols && sizes.at(-1).rows > 0, "Activation lost the current fitted PTY size");
+  host.querySelector('[aria-label="New terminal"]').click();
+  await until(() => terminalReady("Terminal A3"), "created terminal ready");
+  assert(sent.some((message) => message.type === "terminal.resize" && message.terminalId === "term-A3"), "Created terminal did not receive its fitted PTY size");
+  host.querySelector('[aria-label="Close terminal Terminal A3"]').click();
+  await until(() => terminalReady("Terminal A2"), "terminal after close ready");
+  const beforeReconnect = sent.length;
+  show({ type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [terminal("A"), terminal("A2")] } });
+  await until(() => terminalReady("Terminal A2") && sent.length > beforeReconnect, "reconnected terminal ready");
+  assert(sent.slice(beforeReconnect).some((message) => message.type === "terminal.resize" && message.terminalId === "term-A2"), "Reconnection did not synchronize PTY size");
+  host.style.width = "";
 }
 
 async function terminalRejectedSwitchRegression() {
@@ -193,7 +247,7 @@ async function terminalRejectedSwitchRegression() {
     return response({ buffer: "Terminal A output\r\n" });
   };
   root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => errors.push(error)} sendRuntime={() => {}} />);
-  await until(() => host.querySelector('[role="tab"][aria-selected="true"]')?.textContent === "Terminal A", "rejection fixture terminal A");
+  await until(() => terminalReady("Terminal A"), "rejection fixture terminal A ready");
   const first = [...host.querySelectorAll('[role="tab"]')].find((tab) => tab.textContent === "Terminal A");
   first.focus();
   first.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
@@ -236,7 +290,7 @@ async function terminalMutationFailureRegression() {
   };
   const show = (runtimeEvent = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={runtimeEvent} onError={onError} sendRuntime={() => {}} />);
   show();
-  await until(() => host.querySelector('[role="tab"][aria-selected="true"]')?.textContent === "Terminal A", "mutation fixture terminal A");
+  await until(() => terminalReady("Terminal A"), "mutation fixture terminal A ready");
   const selected = () => host.querySelector('[role="tab"][aria-selected="true"][tabindex="0"]');
   failure = "create";
   host.querySelector('[aria-label="New terminal"]').click();
@@ -550,6 +604,8 @@ try {
   results.textContent += "PASS: worktree switch removes old terminal tabs and rejects stale buffer responses\n";
   await terminalKeyboardRegression();
   results.textContent += "PASS: terminal keyboard switching retains focus and ignores non-tab controls\n";
+  await terminalActivationOwnershipRegression();
+  results.textContent += "PASS: terminal activation commits output and current PTY size together\n";
   await terminalRejectedSwitchRegression();
   results.textContent += "PASS: rejected terminal switch restores the selected tab focus\n";
   await commandPaletteRegression();
@@ -564,7 +620,7 @@ try {
   results.textContent += "PASS: create, close and reconnect failures preserve terminal tab ownership\n";
   const phoneRan = await recoveryActionsRegression();
   results.textContent += phoneRan ? "PASS: phone-width recovery decisions remain inside the viewport\n" : "SKIP: phone geometry requires a narrow viewport\n";
-  results.textContent += `${11 + Number(responsiveRan) + Number(phoneRan)} interaction regressions passed`;
+  results.textContent += `${12 + Number(responsiveRan) + Number(phoneRan)} interaction regressions passed`;
   document.title = "PASS — Outright interaction regressions";
 } catch (error) {
   results.textContent += `\nFAIL: ${error.stack}`;

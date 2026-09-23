@@ -107,7 +107,11 @@ function recordWindowsTree(child, processes) {
   const visited = new Set(frontier);
   while (frontier.length) {
     const parent = frontier.shift();
+    const parentCreated = child.ownedWindows.get(parent);
     for (const item of processes.filter((candidate) => candidate.ParentProcessId === parent)) {
+      // Windows retains stale PPIDs when a PID is recycled. Creation order
+      // must establish parentage before this process becomes a kill target.
+      if (item.CreatedMs < parentCreated) continue;
       if (child.ownedWindows.has(item.ProcessId) && child.ownedWindows.get(item.ProcessId) !== item.CreatedMs) continue;
       child.ownedWindows.set(item.ProcessId, item.CreatedMs);
       if (!visited.has(item.ProcessId)) {
@@ -220,17 +224,17 @@ async function cleanupResources(steps) {
   if (errors.length) throw new AggregateError(errors, `UI harness cleanup failed: ${errors.map((error) => error.message).join("; ")}`);
 }
 
-async function waitForJson(url, child, logs) {
-  const deadline = Date.now() + 20_000;
+async function waitForJson(url, child, logs, diagnostic) {
+  const deadline = Date.now() + 45_000;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) throw new Error(`Chrome exited before DevTools was ready:\n${logs()}`);
+    if (hasExited(child)) throw new Error(`Chrome exited before DevTools was ready: ${diagnostic()}; output: ${logs()}`);
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
       if (response.ok) return response.json();
     } catch { /* Chrome is still starting. */ }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error(`Timed out waiting for ${url}:\n${logs()}`);
+  throw new Error(`Timed out waiting for ${url}: ${diagnostic()}; output: ${logs()}`);
 }
 
 function connectDevTools(url) {
@@ -397,9 +401,19 @@ test("two Windows snapshots discover late grandchildren only below identity-matc
     { ProcessId: 4104, ParentProcessId: 4101, CreatedMs: 500 },
   ]);
   assert.equal(leader.ownedWindows.has(4104), false);
+  const recycled = { pid: 4200, exitCode: null, signalCode: null };
+  recordWindowsTree(recycled, [
+    { ProcessId: 4200, ParentProcessId: 1, CreatedMs: 1000 },
+    { ProcessId: 4201, ParentProcessId: 4200, CreatedMs: 50 },
+    { ProcessId: 4202, ParentProcessId: 4200, CreatedMs: 1100 },
+    { ProcessId: 4203, ParentProcessId: 4202, CreatedMs: 1050 },
+  ]);
+  assert.equal(recycled.ownedWindows.has(4201), false, "Stale PPID adopted an older unrelated process");
+  assert.equal(recycled.ownedWindows.has(4202), true);
+  assert.equal(recycled.ownedWindows.has(4203), false, "Stale grandchild adopted below a verified parent");
 });
 
-test("browser interaction regressions pass in headless Chrome", { timeout: 90_000 }, async () => {
+test("browser interaction regressions pass in headless Chrome", { timeout: 120_000 }, async () => {
   const port = await unusedPort();
   const debugPort = await unusedPort();
   const profile = mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
@@ -421,7 +435,9 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 90_00
   try {
     await waitForServer(url, vite, () => output);
     snapshotWindowsTree(vite);
-    browser = spawn(chromeExecutable(), [
+    const executable = chromeExecutable();
+    const launchedAt = new Date().toISOString();
+    browser = spawn(executable, [
       "--headless=new",
       "--disable-background-networking",
       "--disable-component-update",
@@ -439,9 +455,21 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 90_00
       windowsHide: true,
     });
     let browserOutput = "";
+    let browserError;
+    browser.once("error", (error) => { browserError = error; });
     browser.stdout.on("data", (chunk) => { browserOutput += chunk; });
     browser.stderr.on("data", (chunk) => { browserOutput += chunk; });
-    await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, () => browserOutput);
+    const diagnostic = () => JSON.stringify({ executable, pid: browser.pid, launchedAt, checkedAt: new Date().toISOString(), exitCode: browser.exitCode, signalCode: browser.signalCode, spawnError: browserError?.message });
+    if (process.platform === "win32") {
+      const captureDeadline = Date.now() + 10_000;
+      while (!browserError && !hasExited(browser) && Date.now() < captureDeadline) {
+        const rootProcess = windowsProcesses([browser.pid])[0];
+        if (rootProcess) { recordWindowsTree(browser, [rootProcess]); break; }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      if (!browser.ownedWindows?.has(browser.pid)) throw new Error(`Cannot capture Chrome launch identity: ${diagnostic()}; output: ${browserOutput}`);
+    }
+    await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, () => browserOutput, diagnostic);
     snapshotWindowsTree(browser);
     const targetResponse = await fetch(`http://127.0.0.1:${debugPort}/json/new?${encodeURIComponent("about:blank")}`, { method: "PUT" });
     if (!targetResponse.ok) throw new Error(await targetResponse.text());
@@ -506,7 +534,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 90_00
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     assert.match(state?.title ?? "", /^PASS/, state?.text || browserOutput);
-    assert.match(state.text, /13 interaction regressions passed/);
+    assert.match(state.text, /14 interaction regressions passed/);
   } catch (error) {
     failure = error;
   } finally {

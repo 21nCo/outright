@@ -55,6 +55,24 @@ test("enforces terminal limits, input bounds, and suppresses close-after-exit ev
   manager.shutdown();
 });
 
+test("terminal buffer snapshot carries the output cursor for lossless activation", () => {
+  const events = [];
+  let onData;
+  const manager = createTerminalManager({
+    publish: (event) => events.push(event), database: { audit() {} },
+    spawnTerminal: () => ({ pid: 1, onData(callback) { onData = callback; }, onExit() {}, kill() {} }),
+  });
+  const { id } = manager.create({ cwd: process.cwd() });
+  onData("before\n");
+  const snapshot = manager.get(id);
+  onData("after\n");
+  assert.equal(snapshot.buffer, "before\n");
+  assert.equal(snapshot.outputCursor, 1);
+  assert.deepEqual(events.map(({ payload }) => payload.cursor), [1, 2]);
+  assert.equal(manager.get(id).outputCursor, 2);
+  manager.shutdown();
+});
+
 async function waitFor(predicate, timeout = 3000, diagnostic = () => "") {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
