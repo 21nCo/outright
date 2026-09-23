@@ -205,12 +205,14 @@ async function terminalActivationOwnershipRegression() {
   show();
   await until(() => terminalReady("Terminal A"), "ownership fixture initial terminal ready");
   const initialSize = sent.findLast((message) => message.type === "terminal.resize");
+  const initialHostWidth = host.querySelector(".terminal-host").getBoundingClientRect().width;
   assert(initialSize?.terminalId === "term-A", "Initial activation did not synchronize the selected PTY size");
   host.querySelector('[data-tab-id="term-A2"]').click();
   await until(() => host.querySelector('.terminal-tabs[aria-busy="true"]'), "pending terminal activation");
   assert(host.querySelector('[role="tab"][aria-selected="true"]')?.dataset.tabId === "term-A", "Pending candidate was selected before its buffer was installed");
   await until(() => host.querySelector(".xterm-rows")?.textContent.includes("Old A output"), "committed terminal output");
   host.style.width = "540px";
+  await until(() => host.querySelector(".terminal-host")?.getBoundingClientRect().width > initialHostWidth + 100, "terminal host expanded during activation");
   await settle();
   show({ type: "terminal.output", terminalId: "term-A2", payload: { data: "Included snapshot\r\n", cursor: 1 } });
   await settle();
@@ -223,7 +225,10 @@ async function terminalActivationOwnershipRegression() {
   const screen = host.querySelector(".xterm-rows").textContent;
   assert(screen.split("Included snapshot").length === 2 && !screen.includes("Old A output"), "Activation duplicated snapshot output or retained the wrong buffer");
   const sizes = sent.filter((message) => message.type === "terminal.resize" && message.terminalId === "term-A2");
-  assert(sizes.length && sizes.at(-1).cols > initialSize.cols && sizes.at(-1).rows > 0, "Activation lost the current fitted PTY size");
+  const currentHostWidth = host.querySelector(".terminal-host").getBoundingClientRect().width;
+  const currentGridWidth = host.querySelector(".xterm-screen").getBoundingClientRect().width;
+  assert(sizes.length && sizes.at(-1).cols > initialSize.cols && sizes.at(-1).rows > 0,
+    `Activation lost fitted PTY size: initial=${JSON.stringify(initialSize)}, next=${JSON.stringify(sizes)}, host=${initialHostWidth}->${currentHostWidth}, grid=${currentGridWidth}`);
   host.querySelector('[aria-label="New terminal"]').click();
   await until(() => terminalReady("Terminal A3"), "created terminal ready");
   assert(sent.some((message) => message.type === "terminal.resize" && message.terminalId === "term-A3"), "Created terminal did not receive its fitted PTY size");
@@ -256,6 +261,53 @@ async function terminalRejectedSwitchRegression() {
   await until(() => errors.length === 1 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "rejected terminal response");
   assert(host.querySelector('[role="tab"][aria-selected="true"]') === first && first.tabIndex === 0, "Failed terminal switch changed selection");
   assert(document.activeElement === first, "Failed terminal switch left focus on an unselected tab");
+}
+
+async function terminalExitDuringActivationRegression() {
+  root.render(null);
+  await settle();
+  const pending = deferred();
+  const sent = [];
+  let requested = false;
+  const onError = (error) => { throw error; };
+  const sendRuntime = (message) => sent.push(message);
+  route = async (url) => {
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("A2")] });
+    if (url.pathname === "/api/terminals/term-A2") { requested = true; return pending.promise; }
+    return response({ buffer: "A running\r\n", outputCursor: 0 });
+  };
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} onError={onError} sendRuntime={sendRuntime} />);
+  show();
+  await until(() => terminalReady("Terminal A"), "initial terminal before exit race");
+  host.querySelector('[data-tab-id="term-A2"]').click();
+  await until(() => requested && host.querySelector('.terminal-tabs[aria-busy="true"]'), "held activation before exit");
+  show({ type: "terminal.exit", terminalId: "term-A2", payload: { exitCode: 7 } });
+  await settle();
+  pending.resolve(response({ buffer: "A2 snapshot\r\n", outputCursor: 0, status: "exited", exitCode: 7 }));
+  await until(() => terminalReady("Terminal A2"), "exited session snapshot");
+  await until(() => host.querySelector('.xterm-rows')?.textContent.includes("process exited 7"), "exited terminal announcement");
+  assert(!sent.some((message) => message.type === "terminal.resize" && message.terminalId === "term-A2"), "Exited terminal was sized as if it accepted input");
+  assert(host.querySelector('.terminal-pane [role="status"]')?.textContent.includes("process exited 7"), "Exited session was not announced accessibly");
+  host.querySelector('[data-tab-id="term-A"]').click();
+  await until(() => terminalReady("Terminal A"), "running session after exited tab");
+  assert(!host.querySelector('.terminal-pane [role="status"]')?.textContent, "Running terminal retained an exit notice");
+  show({ type: "terminal.exit", terminalId: "term-A", payload: { exitCode: 8 } });
+  await until(() => host.querySelector('.xterm-rows')?.textContent.includes("process exited 8"), "active terminal exit");
+  assert(host.querySelector('.terminal-pane [role="status"]')?.textContent.includes("process exited 8"), "Active exit was not announced accessibly");
+  assert(host.querySelector('[data-tab-id="term-A"]').getAttribute("aria-label").includes("process exited 8"), "Exited tab still presented as running");
+  root.render(null);
+  await settle();
+  route = async (url) => url.pathname === "/api/terminals"
+    ? response({ terminals: [terminal("A"), terminal("A2")] })
+    : response(url.pathname.endsWith("term-A2")
+      ? { buffer: "Already exited\r\n", status: "exited", exitCode: 9 }
+      : { buffer: "Still running\r\n", status: "running" });
+  show();
+  await until(() => terminalReady("Terminal A"), "initial tab before exited snapshot");
+  host.querySelector('[data-tab-id="term-A2"]').click();
+  await until(() => terminalReady("Terminal A2"), "exited snapshot without event");
+  assert(host.querySelector('.terminal-pane [role="status"]')?.textContent.includes("process exited 9"), "Snapshot-only exit was not announced");
+  assert(!sent.some((message) => message.type === "terminal.resize" && message.terminalId === "term-A2"), "Snapshot-only exit made input ready");
 }
 
 async function terminalInitialFailureRegression() {
@@ -608,6 +660,8 @@ try {
   results.textContent += "PASS: terminal activation commits output and current PTY size together\n";
   await terminalRejectedSwitchRegression();
   results.textContent += "PASS: rejected terminal switch restores the selected tab focus\n";
+  await terminalExitDuringActivationRegression();
+  results.textContent += "PASS: terminal exit during activation is announced and cannot accept input\n";
   await commandPaletteRegression();
   results.textContent += "PASS: command search keeps asynchronous results current and selectable\n";
   await changesLoadingRegression();
@@ -620,7 +674,7 @@ try {
   results.textContent += "PASS: create, close and reconnect failures preserve terminal tab ownership\n";
   const phoneRan = await recoveryActionsRegression();
   results.textContent += phoneRan ? "PASS: phone-width recovery decisions remain inside the viewport\n" : "SKIP: phone geometry requires a narrow viewport\n";
-  results.textContent += `${12 + Number(responsiveRan) + Number(phoneRan)} interaction regressions passed`;
+  results.textContent += `${13 + Number(responsiveRan) + Number(phoneRan)} interaction regressions passed`;
   document.title = "PASS — Outright interaction regressions";
 } catch (error) {
   results.textContent += `\nFAIL: ${error.stack}`;

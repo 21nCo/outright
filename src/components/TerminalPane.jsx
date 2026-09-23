@@ -21,10 +21,12 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   const loadingRef = useRef(true);
   const reconcileTokenRef = useRef(0);
   const pendingOutputRef = useRef(null);
+  const exitedIdsRef = useRef(new Set());
   const terminalsRef = useRef([]);
   const [terminals, setTerminals] = useState([]);
   const [activeId, setActiveId] = useState("");
   const [loading, setLoading] = useState(true);
+  const [exitNotice, setExitNotice] = useState("");
 
   useEffect(() => {
     const xterm = new Terminal({
@@ -87,10 +89,14 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   }
 
   async function activateTerminal(terminal, token) {
-    const pending = { id: terminal.id, chunks: [], length: 0, overflow: false };
+    const pending = { id: terminal.id, chunks: [], length: 0, overflow: false, exit: null };
     pendingOutputRef.current = pending;
     try {
       const detail = await api(`/api/terminals/${terminal.id}`);
+      if (token !== reconcileTokenRef.current) return;
+      // Leave output and exit events staged through the layout handoff. A
+      // resize can settle while the snapshot request is in flight.
+      await new Promise((resolve) => requestAnimationFrame(resolve));
       if (token !== reconcileTokenRef.current) return;
       if (pending.overflow) throw new Error("Terminal output exceeded the activation buffer; retry the tab");
       const xterm = xtermRef.current;
@@ -101,11 +107,20 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
         if (!Number.isSafeInteger(detail.outputCursor) || !Number.isSafeInteger(cursor) || cursor > detail.outputCursor) xterm?.write(data);
         if (Number.isSafeInteger(cursor)) displayedCursor = Math.max(displayedCursor, cursor);
       }
+      const exited = pending.exit || (detail.status === "exited" ? { exitCode: detail.exitCode } : null);
+      if (exited) {
+        exitedIdsRef.current.add(terminal.id);
+        xterm?.writeln(`\r\n\x1b[90m[process exited ${exited.exitCode ?? "unknown"}]\x1b[0m`);
+        stageTerminals(terminalsRef.current.map((item) => item.id === terminal.id ? { ...item, status: "exited", exitCode: exited.exitCode } : item));
+      } else exitedIdsRef.current.delete(terminal.id);
+      setExitNotice(exited ? `${terminal.name} process exited ${exited.exitCode ?? "unknown"}` : "");
       activeIdRef.current = terminal.id;
       displayedCursorRef.current = displayedCursor;
-      try { fitRef.current?.fit(); } catch { /* The host may be transitioning. */ }
-      if (xterm) sendRuntime({ type: "terminal.resize", terminalId: terminal.id, cols: xterm.cols, rows: xterm.rows });
-      inputReadyRef.current = true;
+      if (!exited) {
+        try { fitRef.current?.fit(); } catch { /* The host may be transitioning. */ }
+        if (xterm) sendRuntime({ type: "terminal.resize", terminalId: terminal.id, cols: xterm.cols, rows: xterm.rows });
+        inputReadyRef.current = true;
+      }
       setActiveId(terminal.id);
     } finally {
       if (pendingOutputRef.current === pending) pendingOutputRef.current = null;
@@ -147,7 +162,22 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
         }
       }
     }
-    if (runtimeEvent?.type === "terminal.exit" && runtimeEvent.terminalId === activeIdRef.current) xtermRef.current?.writeln(`\r\n\x1b[90m[process exited ${runtimeEvent.payload.exitCode}]\x1b[0m`);
+    if (runtimeEvent?.type === "terminal.exit") {
+      const pending = pendingOutputRef.current;
+      if (pending?.id === runtimeEvent.terminalId) pending.exit = runtimeEvent.payload;
+      if (runtimeEvent.terminalId === activeIdRef.current && !exitedIdsRef.current.has(runtimeEvent.terminalId)) {
+        exitedIdsRef.current.add(runtimeEvent.terminalId);
+        inputReadyRef.current = false;
+        const currentName = terminalsRef.current.find((item) => item.id === runtimeEvent.terminalId)?.name ?? "Terminal";
+        setExitNotice(`${currentName} process exited ${runtimeEvent.payload.exitCode ?? "unknown"}`);
+        setTerminals((current) => {
+          const next = current.map((item) => item.id === runtimeEvent.terminalId ? { ...item, status: "exited", exitCode: runtimeEvent.payload.exitCode } : item);
+          terminalsRef.current = next;
+          return next;
+        });
+        xtermRef.current?.writeln(`\r\n\x1b[90m[process exited ${runtimeEvent.payload.exitCode ?? "unknown"}]\x1b[0m`);
+      }
+    }
     if (runtimeEvent?.type === "runtime.connected" && (runtimeEvent.payload?.replay?.requestedAfter > 0 || runtimeEvent.payload?.restarted) && activeIdRef.current) {
       const previousId = activeIdRef.current;
       const token = beginSelection();
@@ -243,11 +273,12 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   return <section className="terminal-pane" aria-label="Worktree terminals">
     <p className="sr-only" id="terminal-help">Terminal input and output. Use the left and right arrow keys on a terminal tab to switch sessions.</p>
     <header className="terminal-tabs" role="tablist" aria-label="Open terminals" aria-orientation="horizontal" aria-busy={loading} onKeyDown={navigateTerminalTabs}>
-      {terminals.map((terminal) => <div className={`terminal-tab ${terminal.id === activeId ? "is-active" : ""}`} key={terminal.id}><button className="terminal-tab-select" id={domId("terminal-tab", terminal.id)} data-tab-id={terminal.id} role="tab" aria-selected={terminal.id === activeId} aria-controls="terminal-panel" tabIndex={terminal.id === activeId || (!activeId && terminals[0]?.id === terminal.id) ? 0 : -1} aria-disabled={loading || undefined} onClick={() => selectTerminal(terminal)}><TerminalWindow /><span>{terminal.name}</span></button><button className="terminal-tab-close" aria-label={`Close terminal ${terminal.name}`} disabled={loading} onClick={() => closeTerminal(terminal.id)}><X /></button></div>)}
+      {terminals.map((terminal) => <div className={`terminal-tab ${terminal.id === activeId ? "is-active" : ""}`} key={terminal.id}><button className="terminal-tab-select" id={domId("terminal-tab", terminal.id)} data-tab-id={terminal.id} role="tab" aria-selected={terminal.id === activeId} aria-controls="terminal-panel" tabIndex={terminal.id === activeId || (!activeId && terminals[0]?.id === terminal.id) ? 0 : -1} aria-disabled={loading || undefined} aria-label={`${terminal.name}${terminal.status === "exited" ? `, process exited ${terminal.exitCode ?? "unknown"}` : ""}`} onClick={() => selectTerminal(terminal)}><TerminalWindow /><span>{terminal.name}</span></button><button className="terminal-tab-close" aria-label={`Close terminal ${terminal.name}`} disabled={loading} onClick={() => closeTerminal(terminal.id)}><X /></button></div>)}
       <Button variant="ghost" size="icon-xs" disabled={loading} onClick={createTerminal} aria-label="New terminal"><Plus /></Button>
       {loading && <span className="terminal-loading" role="status"><ArrowsClockwise className="spin" />Loading terminal</span>}
     </header>
     <div className="terminal-host" id="terminal-panel" ref={hostRef} role="tabpanel" aria-label="Active terminal output" aria-labelledby={activeId ? domId("terminal-tab", activeId) : undefined} aria-describedby="terminal-help" />
+    <span className="sr-only" role="status">{exitNotice}</span>
   </section>;
 }
 

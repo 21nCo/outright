@@ -91,19 +91,18 @@ function snapshotWindowsTree(child) {
 
 function recordWindowsTree(child, processes) {
   child.ownedWindows ??= new Map();
+  const live = new Map(processes.map((item) => [item.ProcessId, item]));
   if (!hasExited(child)) {
-    const root = processes.find((item) => item.ProcessId === child.pid);
-    if (!root) throw new Error(`Cannot identify owned Windows process ${child.pid}`);
-    if (child.ownedWindows.has(child.pid) && child.ownedWindows.get(child.pid) !== root.CreatedMs) {
-      throw new Error(`Windows process ${child.pid} changed identity`);
-    }
-    child.ownedWindows.set(child.pid, root.CreatedMs);
+    const root = live.get(child.pid);
+    if (!root && !child.ownedWindows.has(child.pid)) throw new Error(`Cannot identify owned Windows process ${child.pid}`);
+    // A recorded launcher can disappear/recycle before Node observes exit.
+    // Keep its old identity for child cleanup, but never adopt its replacement.
+    if (root && !child.ownedWindows.has(child.pid)) child.ownedWindows.set(child.pid, root.CreatedMs);
   }
   // An exited leader's numeric PID may be recycled. Only traverse descendants
   // whose recorded creation identity still matches the current snapshot.
-  const live = new Map(processes.map((item) => [item.ProcessId, item]));
   const frontier = [...child.ownedWindows].filter(([pid, created]) =>
-    (pid !== child.pid || !hasExited(child)) && live.get(pid)?.CreatedMs === created).map(([pid]) => pid);
+    live.get(pid)?.CreatedMs === created).map(([pid]) => pid);
   const visited = new Set(frontier);
   while (frontier.length) {
     const parent = frontier.shift();
@@ -413,6 +412,25 @@ test("two Windows snapshots discover late grandchildren only below identity-matc
   assert.equal(recycled.ownedWindows.has(4203), false, "Stale grandchild adopted below a verified parent");
 });
 
+test("a vanished Windows launcher preserves verified descendants without adopting a reused PID", () => {
+  const launcher = { pid: 4100, exitCode: null, signalCode: null };
+  recordWindowsTree(launcher, [
+    { ProcessId: 4100, ParentProcessId: 1, CreatedMs: 100 },
+    { ProcessId: 4101, ParentProcessId: 4100, CreatedMs: 200 },
+  ]);
+  recordWindowsTree(launcher, [
+    { ProcessId: 4101, ParentProcessId: 4100, CreatedMs: 200 },
+    { ProcessId: 4102, ParentProcessId: 4101, CreatedMs: 300 },
+  ]);
+  assert.equal(launcher.ownedWindows.get(4102), 300);
+  recordWindowsTree(launcher, [
+    { ProcessId: 4100, ParentProcessId: 1, CreatedMs: 999 },
+    { ProcessId: 4101, ParentProcessId: 4100, CreatedMs: 200 },
+    { ProcessId: 4103, ParentProcessId: 4100, CreatedMs: 1000 },
+  ]);
+  assert.equal(launcher.ownedWindows.has(4103), false);
+});
+
 test("browser interaction regressions pass in headless Chrome", { timeout: 120_000 }, async () => {
   const port = await unusedPort();
   const debugPort = await unusedPort();
@@ -534,7 +552,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     assert.match(state?.title ?? "", /^PASS/, state?.text || browserOutput);
-    assert.match(state.text, /14 interaction regressions passed/);
+    assert.match(state.text, /15 interaction regressions passed/);
   } catch (error) {
     failure = error;
   } finally {
