@@ -1,0 +1,37 @@
+.claude/settings.json
+  s_95e2a0aaebea0d::t_b68694cbd7ab8c 1-90
+.codex/hooks.json
+  s_95e2a0aaebea0d::t_5d26c9cf047aa6 1-88
+.cursor/hooks.json
+  s_95e2a0aaebea0d::t_e1ff5ba7ecce9d 1-40
+.entire/.gitignore
+  s_95e2a0aaebea0d::t_10bd315c8a22d4 1-5
+.entire/settings.json
+  s_95e2a0aaebea0d::t_6536d40f0c2bd7 1-9
+.factory/settings.json
+  s_95e2a0aaebea0d::t_212670e786e4fd 1-85
+.gemini/settings.json
+  s_95e2a0aaebea0d::t_d4d8646d8bca45 1-141
+.github/hooks/entire.json
+  s_95e2a0aaebea0d::t_09a7028d429009 1-61
+.opencode/plugins/entire.ts
+  s_95e2a0aaebea0d::t_21d7eff5fe69d8 1-269
+.pi/extensions/entire/index.ts
+  s_95e2a0aaebea0d::t_775a232ddc714e 1-147
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3d458af0de37b200880a41c0d4518dac5a6a13fd",
+  "prompts": {},
+  "sessions": {
+    "s_95e2a0aaebea0d": {
+      "agent_id": {
+        "tool": "amp",
+        "id": "TU-034TpXTxITmGES4dDWsxoi",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
