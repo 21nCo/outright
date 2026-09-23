@@ -18,10 +18,13 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   const activeIdRef = useRef("");
   const displayedCursorRef = useRef(0);
   const inputReadyRef = useRef(false);
+  const awaitingVisibleFitRef = useRef(false);
   const loadingRef = useRef(true);
   const reconcileTokenRef = useRef(0);
   const pendingOutputRef = useRef(null);
   const exitedIdsRef = useRef(new Set());
+  const mutationRef = useRef(false);
+  const queuedReconnectRef = useRef(null);
   const terminalsRef = useRef([]);
   const [terminals, setTerminals] = useState([]);
   const [activeId, setActiveId] = useState("");
@@ -44,23 +47,32 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     xterm.open(hostRef.current);
     xtermRef.current = xterm;
     fitRef.current = fit;
-    const resize = new ResizeObserver(() => {
+    const resizeTerminal = () => {
       try {
+        if (document.hidden) return;
         fit.fit();
-        if (inputReadyRef.current && activeIdRef.current) sendRuntime({ type: "terminal.resize", terminalId: activeIdRef.current, cols: xterm.cols, rows: xterm.rows });
+        if (!loadingRef.current && activeIdRef.current && !exitedIdsRef.current.has(activeIdRef.current)
+          && (inputReadyRef.current || awaitingVisibleFitRef.current)) {
+          sendRuntime({ type: "terminal.resize", terminalId: activeIdRef.current, cols: xterm.cols, rows: xterm.rows });
+          inputReadyRef.current = true;
+          awaitingVisibleFitRef.current = false;
+        }
       } catch { /* The terminal may be transitioning out of the DOM. */ }
-    });
+    };
+    const resize = new ResizeObserver(resizeTerminal);
     resize.observe(hostRef.current);
+    document.addEventListener("visibilitychange", resizeTerminal);
     const disposable = xterm.onData((data) => {
       if (inputReadyRef.current && !loadingRef.current && activeIdRef.current) sendRuntime({ type: "terminal.input", terminalId: activeIdRef.current, data });
     });
-    return () => { disposable.dispose(); resize.disconnect(); xterm.dispose(); xtermRef.current = null; };
+    return () => { disposable.dispose(); document.removeEventListener("visibilitychange", resizeTerminal); resize.disconnect(); xterm.dispose(); xtermRef.current = null; };
   }, [sendRuntime]);
 
   function beginSelection() {
     const token = ++reconcileTokenRef.current;
     loadingRef.current = true;
     inputReadyRef.current = false;
+    awaitingVisibleFitRef.current = false;
     setLoading(true);
     return token;
   }
@@ -71,21 +83,27 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       activeIdRef.current = "";
       displayedCursorRef.current = 0;
       inputReadyRef.current = false;
+      awaitingVisibleFitRef.current = false;
       xtermRef.current?.reset();
       setActiveId("");
     }
     setTerminals(next);
   }
 
-  function recoverSelection(restoreInput = false) {
+  function recoverSelection(restoreInput = false, restoreFit = false) {
     const selected = terminalsRef.current.find((item) => item.id === activeIdRef.current) ?? terminalsRef.current[0];
     if (selected?.id !== activeIdRef.current) {
       activeIdRef.current = selected?.id ?? "";
       displayedCursorRef.current = 0;
       inputReadyRef.current = false;
+      awaitingVisibleFitRef.current = false;
       xtermRef.current?.reset();
       setActiveId(activeIdRef.current);
-    } else if (restoreInput && selected) inputReadyRef.current = true;
+    } else if (selected) {
+      const running = !exitedIdsRef.current.has(selected.id) && selected.status !== "exited";
+      inputReadyRef.current = restoreInput && running;
+      awaitingVisibleFitRef.current = restoreFit && running;
+    }
   }
 
   async function activateTerminal(terminal, token) {
@@ -96,7 +114,11 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       if (token !== reconcileTokenRef.current) return;
       // Leave output and exit events staged through the layout handoff. A
       // resize can settle while the snapshot request is in flight.
-      await new Promise((resolve) => requestAnimationFrame(resolve));
+      await new Promise((resolve) => {
+        let frame;
+        const timer = setTimeout(() => { cancelAnimationFrame(frame); resolve(); }, 100);
+        if (!document.hidden) frame = requestAnimationFrame(() => { clearTimeout(timer); resolve(); });
+      });
       if (token !== reconcileTokenRef.current) return;
       if (pending.overflow) throw new Error("Terminal output exceeded the activation buffer; retry the tab");
       const xterm = xtermRef.current;
@@ -112,15 +134,18 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
         exitedIdsRef.current.add(terminal.id);
         xterm?.writeln(`\r\n\x1b[90m[process exited ${exited.exitCode ?? "unknown"}]\x1b[0m`);
         stageTerminals(terminalsRef.current.map((item) => item.id === terminal.id ? { ...item, status: "exited", exitCode: exited.exitCode } : item));
-      } else exitedIdsRef.current.delete(terminal.id);
+      } else {
+        exitedIdsRef.current.delete(terminal.id);
+        stageTerminals(terminalsRef.current.map((item) => item.id === terminal.id ? { ...item, status: "running", exitCode: undefined } : item));
+      }
       setExitNotice(exited ? `${terminal.name} process exited ${exited.exitCode ?? "unknown"}` : "");
       activeIdRef.current = terminal.id;
       displayedCursorRef.current = displayedCursor;
-      if (!exited) {
+      if (!exited && !document.hidden) {
         try { fitRef.current?.fit(); } catch { /* The host may be transitioning. */ }
         if (xterm) sendRuntime({ type: "terminal.resize", terminalId: terminal.id, cols: xterm.cols, rows: xterm.rows });
         inputReadyRef.current = true;
-      }
+      } else if (!exited) awaitingVisibleFitRef.current = true;
       setActiveId(terminal.id);
     } finally {
       if (pendingOutputRef.current === pending) pendingOutputRef.current = null;
@@ -165,53 +190,74 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     if (runtimeEvent?.type === "terminal.exit") {
       const pending = pendingOutputRef.current;
       if (pending?.id === runtimeEvent.terminalId) pending.exit = runtimeEvent.payload;
-      if (runtimeEvent.terminalId === activeIdRef.current && !exitedIdsRef.current.has(runtimeEvent.terminalId)) {
+      if (terminalsRef.current.some((item) => item.id === runtimeEvent.terminalId)) {
+        const firstExit = !exitedIdsRef.current.has(runtimeEvent.terminalId);
         exitedIdsRef.current.add(runtimeEvent.terminalId);
-        inputReadyRef.current = false;
-        const currentName = terminalsRef.current.find((item) => item.id === runtimeEvent.terminalId)?.name ?? "Terminal";
-        setExitNotice(`${currentName} process exited ${runtimeEvent.payload.exitCode ?? "unknown"}`);
-        setTerminals((current) => {
-          const next = current.map((item) => item.id === runtimeEvent.terminalId ? { ...item, status: "exited", exitCode: runtimeEvent.payload.exitCode } : item);
-          terminalsRef.current = next;
-          return next;
-        });
-        xtermRef.current?.writeln(`\r\n\x1b[90m[process exited ${runtimeEvent.payload.exitCode ?? "unknown"}]\x1b[0m`);
+        stageTerminals(terminalsRef.current.map((item) => item.id === runtimeEvent.terminalId
+          ? { ...item, status: "exited", exitCode: runtimeEvent.payload.exitCode } : item));
+        if (runtimeEvent.terminalId === activeIdRef.current) {
+          inputReadyRef.current = false;
+          awaitingVisibleFitRef.current = false;
+          if (firstExit) {
+            const currentName = terminalsRef.current.find((item) => item.id === runtimeEvent.terminalId)?.name ?? "Terminal";
+            setExitNotice(`${currentName} process exited ${runtimeEvent.payload.exitCode ?? "unknown"}`);
+            xtermRef.current?.writeln(`\r\n\x1b[90m[process exited ${runtimeEvent.payload.exitCode ?? "unknown"}]\x1b[0m`);
+          }
+        }
       }
     }
     if (runtimeEvent?.type === "runtime.connected" && (runtimeEvent.payload?.replay?.requestedAfter > 0 || runtimeEvent.payload?.restarted) && activeIdRef.current) {
-      const previousId = activeIdRef.current;
-      const token = beginSelection();
-      const reconcile = async () => {
-        setLoading(true);
-        const matching = (runtimeEvent.payload.terminals ?? []).filter((terminal) => terminal.cwd === worktree.path);
-        let terminal = matching.find((item) => item.id === previousId && item.status === "running") ?? matching.find((item) => item.status === "running");
-        if (!terminal) terminal = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: worktree.name, cols: 100, rows: 30 } });
-        if (token !== reconcileTokenRef.current) return;
-        stageTerminals([...matching.filter((item) => item.id !== terminal.id), terminal]);
-        await activateTerminal(terminal, token);
-      };
-      reconcile().catch((error) => { if (token === reconcileTokenRef.current) { recoverSelection(); onError(error); } }).finally(() => {
-        if (token === reconcileTokenRef.current) { loadingRef.current = false; setLoading(false); }
-      });
+      if (mutationRef.current) queuedReconnectRef.current = runtimeEvent.payload;
+      else reconcileConnection(runtimeEvent.payload);
     }
   }, [runtimeEvent, onError, worktree.name, worktree.path]);
 
+  function reconcileConnection(payload, refresh = false) {
+    const previousId = activeIdRef.current;
+    const token = beginSelection();
+    const reconcile = async () => {
+      const all = refresh ? (await api("/api/terminals")).terminals : (payload.terminals ?? []);
+      if (token !== reconcileTokenRef.current) return;
+      const matching = all.filter((terminal) => terminal.cwd === worktree.path);
+      let terminal = matching.find((item) => item.id === previousId && item.status === "running") ?? matching.find((item) => item.status === "running");
+      if (!terminal) terminal = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: worktree.name, cols: 100, rows: 30 } });
+      if (token !== reconcileTokenRef.current) return;
+      stageTerminals([...matching.filter((item) => item.id !== terminal.id), terminal]);
+      await activateTerminal(terminal, token);
+    };
+    reconcile().catch((error) => { if (token === reconcileTokenRef.current) { recoverSelection(); onError(error); } }).finally(() => {
+      if (token === reconcileTokenRef.current) { loadingRef.current = false; setLoading(false); }
+    });
+  }
+
+  function finishMutation(token) {
+    mutationRef.current = false;
+    if (token === reconcileTokenRef.current) { loadingRef.current = false; setLoading(false); }
+    const queued = queuedReconnectRef.current;
+    queuedReconnectRef.current = null;
+    if (queued) reconcileConnection(queued, true);
+  }
+
   async function createTerminal() {
     if (loading) return;
+    mutationRef.current = true;
     const wasReady = inputReadyRef.current;
+    const wasAwaitingFit = awaitingVisibleFitRef.current;
     const token = beginSelection();
     try {
       const terminal = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: `${worktree.name} ${terminals.length + 1}` } });
       if (token !== reconcileTokenRef.current) return;
       stageTerminals([...terminals, terminal]);
       await activateTerminal(terminal, token);
-    } catch (error) { if (token === reconcileTokenRef.current) { recoverSelection(wasReady); onError(error); } }
-    finally { if (token === reconcileTokenRef.current) { loadingRef.current = false; setLoading(false); } }
+    } catch (error) { if (token === reconcileTokenRef.current) { recoverSelection(wasReady, wasAwaitingFit); onError(error); } }
+    finally { finishMutation(token); }
   }
 
   async function closeTerminal(id) {
     if (loading) return;
+    mutationRef.current = true;
     const wasReady = inputReadyRef.current;
+    const wasAwaitingFit = awaitingVisibleFitRef.current;
     const previousId = activeIdRef.current;
     const focusedClose = document.activeElement?.closest(".terminal-tab")?.querySelector('[role="tab"]')?.dataset.tabId === id;
     const token = beginSelection();
@@ -234,18 +280,20 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
         });
       }
       await activateTerminal(next, token);
-    } catch (error) { if (token === reconcileTokenRef.current) { recoverSelection(wasReady); onError(error); } }
-    finally { if (token === reconcileTokenRef.current) { loadingRef.current = false; setLoading(false); } }
+    } catch (error) { if (token === reconcileTokenRef.current) { recoverSelection(wasReady, wasAwaitingFit); onError(error); } }
+    finally { finishMutation(token); }
   }
 
   async function selectTerminal(terminal) {
-    if (loading || terminal.cwd !== worktree.path || (terminal.id === activeIdRef.current && inputReadyRef.current)) return;
+    if (loading || terminal.cwd !== worktree.path
+      || (terminal.id === activeIdRef.current && (inputReadyRef.current || awaitingVisibleFitRef.current))) return;
     const wasReady = inputReadyRef.current;
+    const wasAwaitingFit = awaitingVisibleFitRef.current;
     const token = beginSelection();
     try { await activateTerminal(terminal, token); }
     catch (error) {
       if (token === reconcileTokenRef.current) {
-        recoverSelection(wasReady);
+        recoverSelection(wasReady, wasAwaitingFit);
         if (document.activeElement?.dataset.tabId === terminal.id) {
           document.getElementById(domId("terminal-tab", activeIdRef.current))?.focus({ preventScroll: true });
         }
@@ -267,7 +315,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     event.preventDefault();
     const next = terminals[nextIndex];
     event.currentTarget.querySelector(`[data-tab-id="${CSS.escape(next.id)}"]`)?.focus();
-    if (next.id !== activeIdRef.current || !inputReadyRef.current) selectTerminal(next);
+    if (next.id !== activeIdRef.current || (!inputReadyRef.current && !awaitingVisibleFitRef.current)) selectTerminal(next);
   }
 
   return <section className="terminal-pane" aria-label="Worktree terminals">

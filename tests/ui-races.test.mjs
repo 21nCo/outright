@@ -160,6 +160,23 @@ function livePosixGroup(child) {
   return posixGroupHasExecutable(result.stdout, child.pid);
 }
 
+function posixGroupDiagnostic(child) {
+  const result = spawnSync("ps", ["-e", "-o", "pid=,ppid=,pgid=,stat=,comm="], { encoding: "utf8", timeout: 5_000 });
+  if (result.status !== 0) return `ps failed: ${result.stderr || result.error}`;
+  return result.stdout.split("\n").filter((line) => Number(line.trim().split(/\s+/)[2]) === child.pid).join(" | ");
+}
+
+function terminateOwnedChromeHelpers(child, signal) {
+  if (!child.profile) return false;
+  // The profile is a freshly created, private path passed only to this Chrome
+  // launch. pkill matches commands when signalling, rather than checking a
+  // numeric PID and later risking termination of a recycled, unrelated PID.
+  const pattern = child.profile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const result = spawnSync("pkill", [signal === "SIGKILL" ? "-KILL" : "-TERM", "-f", pattern], { encoding: "utf8", timeout: 5_000 });
+  if (result.status !== 0 && result.status !== 1) throw new Error(`Cannot terminate profile-owned Chrome helpers: ${result.stderr || result.error}`);
+  return true;
+}
+
 function terminateTree(child, signal) {
   if (!child?.pid) return;
   if (process.platform === "win32") {
@@ -177,9 +194,11 @@ function terminateTree(child, signal) {
     if (error.code === "ESRCH") return;
     if (error.code !== "EPERM") throw error;
     // macOS Chrome may put protected helpers in its process group. The group
-    // signal is rejected even though its own launcher is still ours to reap.
+    // signal is rejected even though other helpers in this private profile
+    // can be terminated individually without targeting a recycled PID.
+    const profileOwned = terminateOwnedChromeHelpers(child, signal);
     if (!hasExited(child)) child.kill(signal);
-    else if (!pipesClosed(child)) throw error;
+    else if (!pipesClosed(child) && !profileOwned) throw error;
   }
 }
 
@@ -210,7 +229,7 @@ async function stop(child) {
   terminateTree(child, "SIGTERM");
   if (await waitForTree(child, 2_000)) return process.platform === "win32" ? "forced" : "graceful";
   terminateTree(child, "SIGKILL");
-  if (!await waitForTree(child, 5_000)) throw new Error(`Process tree ${child.pid} did not exit after forced termination`);
+  if (!await waitForTree(child, 5_000)) throw new Error(`Process tree ${child.pid} did not exit after forced termination; exit=${child.exitCode}/${child.signalCode}, pipes=${pipesClosed(child)}, group=${process.platform === "win32" ? "Windows owned-process snapshot" : posixGroupDiagnostic(child)}`);
   return "forced";
 }
 
@@ -302,6 +321,22 @@ test("process cleanup terminates the tree and waits for pipe close", { timeout: 
     assert.equal(outcome, "forced");
     assert.equal(hasExited(child) && child.stdout.closed && child.stderr.closed, true);
   } finally { await stop(child); }
+});
+
+test("private-profile fallback signals only its owned process", { skip: process.platform === "win32", timeout: 15_000 }, async () => {
+  const profile = mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
+  const child = spawn(process.execPath, [stubbornChild, `--user-data-dir=${profile}`], {
+    cwd: root, detached: true, stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.profile = profile;
+  try {
+    await new Promise((resolve, reject) => { child.once("error", reject); child.stdout.once("data", resolve); });
+    assert.equal(terminateOwnedChromeHelpers(child, "SIGKILL"), true);
+    assert(await waitForTree(child, 5_000), "Profile-owned process survived atomic command-line matching");
+  } finally {
+    await stop(child);
+    rmSync(profile, { recursive: true, force: true });
+  }
 });
 
 test("exited group leader cannot leave a pipe-holding descendant", { timeout: 30_000 }, async () => {
@@ -431,6 +466,24 @@ test("a vanished Windows launcher preserves verified descendants without adoptin
   assert.equal(launcher.ownedWindows.has(4103), false);
 });
 
+test("fixture assertion failures still clean Chrome, Vite and profile independently", { timeout: 120_000 }, async () => {
+  if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE) return;
+  const env = { ...process.env, OUTRIGHT_TEST_UI_ASSERTION_FAILURE: "1" };
+  delete env.NODE_TEST_CONTEXT;
+  const child = spawn(process.execPath, ["--test", "--test-name-pattern=browser interaction regressions", fileURLToPath(import.meta.url)], {
+    cwd: root, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stderr.on("data", (chunk) => { output += chunk; });
+  try {
+    assert(await waitForExit(child, 90_000), "Injected browser assertion did not terminate promptly");
+    assert.notEqual(child.exitCode, 0, output);
+    assert.match(output, /Injected UI assertion failure after fixture pass/);
+    assert.doesNotMatch(output, /UI harness cleanup failed|did not exit after forced termination|ENOTEMPTY/);
+  } finally { if (!hasExited(child)) child.kill("SIGKILL"); }
+});
+
 test("browser interaction regressions pass in headless Chrome", { timeout: 120_000 }, async () => {
   const port = await unusedPort();
   const debugPort = await unusedPort();
@@ -472,6 +525,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
       detached: process.platform !== "win32",
       windowsHide: true,
     });
+    browser.profile = profile;
     let browserOutput = "";
     let browserError;
     browser.once("error", (error) => { browserError = error; });
@@ -552,7 +606,8 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     assert.match(state?.title ?? "", /^PASS/, state?.text || browserOutput);
-    assert.match(state.text, /15 interaction regressions passed/);
+    assert.match(state.text, /18 interaction regressions passed/);
+    if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
   } catch (error) {
     failure = error;
   } finally {

@@ -310,19 +310,128 @@ async function terminalExitDuringActivationRegression() {
   assert(!sent.some((message) => message.type === "terminal.resize" && message.terminalId === "term-A2"), "Snapshot-only exit made input ready");
 }
 
+async function terminalExitRejectionRegression() {
+  root.render(null);
+  await settle();
+  const pending = deferred();
+  const errors = [];
+  const sent = [];
+  let hold = true;
+  const onError = (error) => errors.push(error);
+  const sendRuntime = (message) => sent.push(message);
+  route = async (url) => {
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("A2")] });
+    if (url.pathname === "/api/terminals/term-A2" && hold) return pending.promise;
+    return response({ buffer: "Running output\r\n", status: "running" });
+  };
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} onError={onError} sendRuntime={sendRuntime} />);
+  show();
+  await until(() => terminalReady("Terminal A"), "running A before rejected exit");
+  host.querySelector('[data-tab-id="term-A2"]').click();
+  await until(() => host.querySelector('.terminal-tabs[aria-busy="true"]'), "pending candidate before rejection");
+  show({ type: "terminal.exit", terminalId: "term-A2", payload: { exitCode: 7 } });
+  await settle();
+  assert(host.querySelector('[data-tab-id="term-A2"]').getAttribute("aria-label").includes("process exited 7"), "Candidate exit disappeared before activation failed");
+  show({ type: "terminal.exit", terminalId: "term-A", payload: { exitCode: 8 } });
+  await settle();
+  pending.reject(new Error("Buffer unavailable"));
+  await until(() => errors.length === 1 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "rejected candidate after both exits");
+  assert(host.querySelector('[data-tab-id="term-A"]').getAttribute("aria-label").includes("process exited 8"), "Active exit disappeared on recovery");
+  assert(host.querySelector('[role="tab"][aria-selected="true"]')?.dataset.tabId === "term-A", "Rejection lost selected tab");
+  const before = sent.length;
+  host.querySelector('.terminal-host').style.width = "540px";
+  await settle();
+  assert(!sent.slice(before).some((message) => message.type === "terminal.input" || message.type === "terminal.resize"), "Rejected activation restored input/resize to an exited session");
+  hold = false;
+  host.querySelector('[data-tab-id="term-A2"]').click();
+  await until(() => terminalReady("Terminal A2"), "exited candidate reacquired as running");
+  assert(!host.querySelector('[data-tab-id="term-A2"]').getAttribute("aria-label").includes("exited"), "Fresh running snapshot retained stale exit state");
+  assert(!host.querySelector('.terminal-pane [role="status"]')?.textContent, "Fresh running snapshot retained an exit notice");
+  assert(sent.slice(before).some((message) => message.type === "terminal.resize" && message.terminalId === "term-A2"), "Running reacquisition did not synchronize the selected PTY");
+}
+
+async function terminalReconnectMutationRegression() {
+  root.render(null);
+  await settle();
+  const creating = deferred();
+  const deleting = deferred();
+  let all = [terminal("A")];
+  const errors = [];
+  const onError = (error) => errors.push(error);
+  const sendRuntime = () => {};
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") return creating.promise;
+    if (url.pathname === "/api/terminals") return response({ terminals: all });
+    if (options.method === "DELETE") return deleting.promise;
+    return response({ buffer: "Running\r\n", status: "running" });
+  };
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} onError={onError} sendRuntime={sendRuntime} />);
+  show();
+  await until(() => terminalReady("Terminal A"), "initial tab before reconnect mutation");
+  host.querySelector('[aria-label="New terminal"]').click();
+  await until(() => host.querySelector('.terminal-tabs[aria-busy="true"]'), "pending create before reconnect");
+  show({ type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [terminal("A")] } });
+  await settle();
+  all = [terminal("A"), terminal("A2")];
+  creating.resolve(response(terminal("A2")));
+  await until(() => terminalReady("Terminal A2"), "created terminal after stale reconnect");
+  await until(() => host.querySelector('.terminal-tabs[aria-busy="false"]'), "authoritative create reconciliation");
+  assert(host.querySelectorAll('[role="tab"]').length === 2, "Reconnect discarded newly created terminal");
+  host.querySelector('[aria-label="Close terminal Terminal A2"]').click();
+  await until(() => host.querySelector('.terminal-tabs[aria-busy="true"]'), "pending delete before reconnect");
+  show({ type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [terminal("A"), terminal("A2")] } });
+  await settle();
+  all = [terminal("A")];
+  deleting.resolve(response({}));
+  await until(() => terminalReady("Terminal A"), "remaining tab after stale reconnect");
+  await until(() => host.querySelector('.terminal-tabs[aria-busy="false"]'), "authoritative delete reconciliation");
+  assert(host.querySelectorAll('[role="tab"]').length === 1 && !host.querySelector('[data-tab-id="term-A2"]'), "Reconnect resurrected deleted terminal");
+  assert(errors.length === 0, "Reconnect mutation reported an error");
+}
+
+async function terminalBackgroundActivationRegression() {
+  root.render(null);
+  await settle();
+  const prior = Object.getOwnPropertyDescriptor(document, "hidden");
+  const sent = [];
+  const onError = (error) => { throw error; };
+  const sendRuntime = (message) => sent.push(message);
+  route = async (url) => url.pathname === "/api/terminals"
+    ? response({ terminals: [terminal("A"), terminal("A2")] })
+    : response({ buffer: "Background output\r\n", status: "running" });
+  try {
+    root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={onError} sendRuntime={sendRuntime} />);
+    await until(() => terminalReady("Terminal A"), "visible terminal before background activation");
+    Object.defineProperty(document, "hidden", { configurable: true, value: true });
+    host.querySelector('[data-tab-id="term-A2"]').click();
+    await until(() => terminalReady("Terminal A2"), "background activation without animation frame");
+    assert(!sent.some((message) => message.type === "terminal.resize" && message.terminalId === "term-A2"), "Hidden terminal published a stale fitted size");
+  } finally {
+    if (prior) Object.defineProperty(document, "hidden", prior);
+    else delete document.hidden;
+    document.dispatchEvent(new Event("visibilitychange"));
+  }
+  await until(() => sent.some((message) => message.type === "terminal.resize" && message.terminalId === "term-A2"), "visible terminal fitted before input");
+}
+
 async function terminalInitialFailureRegression() {
   root.render(null);
   await settle();
   const errors = [];
+  const sent = [];
   route = async (url) => {
     if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("A2")] });
     if (url.pathname === "/api/terminals/term-A") return response({ error: "Buffer failed" }, 500);
     return response({ buffer: "" });
   };
-  root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => errors.push(error)} sendRuntime={() => {}} />);
+  root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => errors.push(error)} sendRuntime={(message) => sent.push(message)} />);
   await until(() => errors.length === 1 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "initial terminal buffer rejection");
   assert(host.querySelectorAll('[role="tab"]').length === 2, "Fixture lost existing terminal tabs");
   assert(host.querySelectorAll('[role="tab"][tabindex="0"]').length === 1, "Buffer failure left no keyboard-reachable terminal tab");
+  const before = sent.length;
+  host.querySelector('.terminal-host').style.width = "540px";
+  await settle();
+  assert(!sent.slice(before).some((message) => message.type === "terminal.resize" || message.type === "terminal.input"), "Failed initial activation became input-ready on resize");
 }
 
 async function terminalMutationFailureRegression() {
@@ -528,7 +637,12 @@ async function responsiveFocusRegression() {
     const sidebar = host.querySelector("#project-sidebar");
     const workspace = host.querySelector("#main-workspace");
     const scrim = host.querySelector(".mobile-scrim");
-    await until(() => sidebar.contains(document.activeElement), "project drawer focus");
+    try {
+      await until(() => sidebar.contains(document.activeElement) && document.activeElement.matches('button:not(:disabled)'), "actionable project drawer focus");
+    } catch (error) {
+      const first = sidebar.querySelector('button:not(:disabled)');
+      throw new Error(`${error.message}; active=${document.activeElement?.outerHTML?.slice(0, 300)}; sidebar=${sidebar.getAttribute("aria-hidden")}/${sidebar.getAttribute("role")}; first=${first?.outerHTML?.slice(0, 200)}; firstRect=${JSON.stringify(first?.getBoundingClientRect().toJSON())}; firstVisibility=${first && getComputedStyle(first).visibility}; inert=${workspace.hasAttribute("inert")}`);
+    }
     assert(document.activeElement.matches('button:not(:disabled)'), "Drawer entry focused an aside sentinel instead of an actionable button");
     assert(sidebar.getAttribute("role") === "dialog" && sidebar.getAttribute("aria-modal") === "true", "Project drawer is not exposed as a modal dialog");
     assert(workspace.getAttribute("aria-hidden") === "true", "Project drawer did not hide the workspace from assistive technology");
@@ -662,6 +776,12 @@ try {
   results.textContent += "PASS: rejected terminal switch restores the selected tab focus\n";
   await terminalExitDuringActivationRegression();
   results.textContent += "PASS: terminal exit during activation is announced and cannot accept input\n";
+  await terminalExitRejectionRegression();
+  results.textContent += "PASS: candidate and active exits survive failed activation and fresh running reacquisition\n";
+  await terminalReconnectMutationRegression();
+  results.textContent += "PASS: reconnect refreshes authoritative terminals after pending create and delete\n";
+  await terminalBackgroundActivationRegression();
+  results.textContent += "PASS: background activation settles and fits when visible\n";
   await commandPaletteRegression();
   results.textContent += "PASS: command search keeps asynchronous results current and selectable\n";
   await changesLoadingRegression();
@@ -674,7 +794,7 @@ try {
   results.textContent += "PASS: create, close and reconnect failures preserve terminal tab ownership\n";
   const phoneRan = await recoveryActionsRegression();
   results.textContent += phoneRan ? "PASS: phone-width recovery decisions remain inside the viewport\n" : "SKIP: phone geometry requires a narrow viewport\n";
-  results.textContent += `${13 + Number(responsiveRan) + Number(phoneRan)} interaction regressions passed`;
+  results.textContent += `${16 + Number(responsiveRan) + Number(phoneRan)} interaction regressions passed`;
   document.title = "PASS — Outright interaction regressions";
 } catch (error) {
   results.textContent += `\nFAIL: ${error.stack}`;

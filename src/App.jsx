@@ -80,6 +80,7 @@ export function App() {
   const sidebarRef = useRef(null);
   const sidebarFocusIntentRef = useRef(null);
   const sidebarFocusOwnerRef = useRef(null);
+  const sidebarFocusSourceRef = useRef(null);
   const inspectorRef = useRef(null);
   const inspectorInvokerRef = useRef(null);
   const inspectorReturnFocusRef = useRef(null);
@@ -289,11 +290,16 @@ export function App() {
     const narrow = window.matchMedia("(max-width: 760px)");
     let wasNarrow = narrow.matches;
     const trackFocus = (event) => {
+      if (sidebarFocusIntentRef.current && event.target !== sidebarFocusSourceRef.current
+        && event.target !== sidebarRef.current && !sidebarRef.current?.contains(event.target)
+        && !event.target.matches?.('[aria-label="Open projects sidebar"]')) {
+        sidebarFocusIntentRef.current = null;
+        sidebarFocusSourceRef.current = null;
+      }
       if (event.target.matches?.('[aria-label="Open projects sidebar"]')) sidebarFocusOwnerRef.current = "opener";
       else if (sidebarRef.current?.contains(event.target)) sidebarFocusOwnerRef.current = "sidebar";
       else {
         sidebarFocusOwnerRef.current = null;
-        sidebarFocusIntentRef.current = null;
       }
     };
     const synchronizeLayout = () => {
@@ -306,6 +312,7 @@ export function App() {
       sidebarFocusOwnerRef.current = owner;
       sidebarFocusIntentRef.current = wasNarrow && owner === "sidebar" ? "opener"
         : !wasNarrow && owner === "opener" ? "sidebar" : null;
+      sidebarFocusSourceRef.current = sidebarFocusIntentRef.current ? activeElement : null;
       setIsNarrow(wasNarrow);
       setSidebarOpen(!wasNarrow);
     };
@@ -348,10 +355,12 @@ export function App() {
       const target = intent === "opener" ? document.querySelector('[aria-label="Open projects sidebar"]')
         : sidebarRef.current?.querySelector('button:not(:disabled)');
       const active = document.activeElement;
-      const fromPriorControl = intent === "opener" ? sidebarRef.current?.contains(active)
-        : active?.matches?.('[aria-label="Open projects sidebar"]') || active === sidebarRef.current;
+      const fromPriorControl = active === sidebarFocusSourceRef.current || (intent === "opener"
+        ? sidebarRef.current?.contains(active)
+        : active?.matches?.('[aria-label="Open projects sidebar"]') || active === sidebarRef.current);
       if (active !== document.body && active !== target && !fromPriorControl) {
         sidebarFocusIntentRef.current = null; // Do not override a newer user focus choice.
+        sidebarFocusSourceRef.current = null;
         return;
       }
       if (target?.isConnected && target.getClientRects().length && getComputedStyle(target).visibility === "visible") {
@@ -359,6 +368,7 @@ export function App() {
         if (document.activeElement === target && target.getBoundingClientRect().width > 0) {
           sidebarFocusOwnerRef.current = intent;
           sidebarFocusIntentRef.current = null;
+          sidebarFocusSourceRef.current = null;
           return;
         }
       }
@@ -459,12 +469,14 @@ export function App() {
   function closeSidebar() {
     if (!sidebarOpen) return;
     sidebarFocusIntentRef.current = "opener";
+    sidebarFocusSourceRef.current = document.activeElement;
     setSidebarOpen(false);
   }
 
   function openSidebar() {
     if (sidebarOpen) return;
     sidebarFocusIntentRef.current = "sidebar";
+    sidebarFocusSourceRef.current = document.activeElement;
     setSidebarOpen(true);
   }
 
