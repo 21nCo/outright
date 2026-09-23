@@ -124,7 +124,7 @@ process.on("SIGTERM", () => { if (!authorized) abandon(); });
 process.on("SIGINT", () => { if (!authorized) abandon(); });
 const finish = (code, signal) => {
   if (completionTimer) clearTimeout(completionTimer);
-  if (process.platform === "win32") {
+  if (process.platform === "win32" && !signal && code === 0) {
     // The Job Object is empty when its supervisor exits. Preserve that proof
     // until the runtime commits the terminal row, so a crash between those
     // events cannot strand a running row after every owned process is gone.

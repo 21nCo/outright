@@ -257,6 +257,10 @@ static int control_existing_job(const char *mode, const char *label) {
   if (strcmp(mode, "--probe") == 0) {
     free(target);
     if (count < 0) { dprintf(STDOUT_FILENO, "unknown\n"); return 4; }
+    // A newly submitted job can have an allocated coalition before its first
+    // process starts. An empty coalition is an exit proof only after launchd
+    // has recorded at least one run.
+    if (count == 0 && state.runs < 1) { dprintf(STDOUT_FILENO, "unknown\n"); return 4; }
     if (count == 0) cleanup_output_pipes(label);
     dprintf(STDOUT_FILENO, "%s\n", count > 0 ? "alive" : "exited");
     return count > 0 ? 0 : 3;

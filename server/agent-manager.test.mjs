@@ -1137,12 +1137,7 @@ test("the launch wrapper records durable identity before authorization and clean
     while (!existsSync(handshakePath3) && Date.now() < deadline3) await new Promise((resolve) => setTimeout(resolve, 10));
     child3.stdin.write("go\nstop\n");
     await withDeadline(new Promise((resolve) => child3.once("exit", resolve)), "coalesced authorization and stop", () => { try { child3.kill("SIGKILL"); } catch {} });
-    if (process.platform === "win32") {
-      const stoppedRecord = JSON.parse(readFileSync(handshakePath3, "utf8"));
-      assert.equal(stoppedRecord.completed, true, "a stopped Windows Job Object preserves its completion proof");
-    } else {
-      assert.equal(existsSync(handshakePath3), false, "the coalesced stop command tears down the authorized provider");
-    }
+    assert.equal(existsSync(handshakePath3), false, "a forced stop never claims the Windows Job Object completed normally");
     if (process.platform === "darwin") {
       const absent = spawnSync(platformSupervisor, ["--probe", `com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}`], { encoding: "utf8" });
       assert.equal(absent.status, 3);

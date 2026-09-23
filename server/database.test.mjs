@@ -163,6 +163,29 @@ test("uses a durable wrapper completion marker after the owned tree exits", () =
   }
 });
 
+test("rejects unauthorized or mismatched completion markers", () => {
+  for (const [name, marker] of [
+    ["unauthorized", { pid: 4242, authorized: false, completed: true }],
+    ["mismatched", { pid: 4343, authorized: true, completed: true }],
+  ]) {
+    const root = mkdtempSync(path.join(os.tmpdir(), `outright-${name}-completion-`));
+    const database = createOutrightDatabase({ filename: path.join(root, "outright.db") });
+    try {
+      const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+      const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "running" });
+      database.updateRun(run.id, { status: "running", pid: 4242 });
+      writeFileSync(path.join(database.launchDirectory, `${run.id}.json`), JSON.stringify(marker));
+      let probes = 0;
+      database.reconcileInterruptedRuns({ probeAlive: () => { probes++; return "unknown"; } });
+      assert.equal(database.getRun(run.id).recoveryClass, "unknown", `${name} marker must fail closed`);
+      assert.equal(probes, 1, `${name} marker falls through to the platform probe`);
+    } finally {
+      database.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("classifies a provider process still alive after the restart", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

@@ -6,7 +6,7 @@ import path from "node:path";
 import { realpath } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { createOutrightDatabase } from "./database.mjs";
-import { AGENT_SUPERVISOR, createAgentManager, defaultGroupMembers, terminateTree } from "./agent-manager.mjs";
+import { AGENT_SUPERVISOR, createAgentManager, defaultGroupMembers, hardenWindowsLaunchDirectory, terminateTree } from "./agent-manager.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
@@ -16,6 +16,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
   const database = createOutrightDatabase({ runtimeLease: true });
+  // Completion markers are trusted recovery evidence. Secure their directory
+  // before reconciliation reads any record, rather than waiting for the agent
+  // manager to initialize after recovery has already classified pending rows.
+  if (process.platform === "win32") hardenWindowsLaunchDirectory(database.launchDirectory);
   const reconciliation = database.reconcileInterruptedRuns({
     probeAlive: (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync),
   });
