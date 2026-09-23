@@ -896,6 +896,14 @@ test("recovery identities are boot-scoped and Windows taskkill supplies a whole-
       "a failed supervisor identity probe is uncertainty, not proof of exit",
     );
     assert.equal(
+      defaultRecoveryProcessAlive(123, "darwin", () => null, (pid) => {
+        if (pid === -123) return;
+        throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      }, missingJobHandshake, deadWrapperRun),
+      "unknown",
+      "an in-flight launchctl child keeps the wrapper-owned process group unresolved",
+    );
+    assert.equal(
       defaultRecoveryProcessAlive(123, "darwin", () => null, () => {}, missingJobHandshake, (executable) => executable === AGENT_SUPERVISOR
         ? { status: 3, stdout: "exited\n" }
         : { status: 1, stdout: "" }),

@@ -607,9 +607,17 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
         const liveSupervisorIdentity = defaultRecoveryProviderProcessIdentity(supervisorPid, platform, run);
         if (liveSupervisorIdentity == null) {
           try { kill(supervisorPid, 0); return "unknown"; }
-          catch (error) { return error.code === "ESRCH" ? "exited" : "unknown"; }
+          catch (error) {
+            if (error.code !== "ESRCH") return "unknown";
+          }
         }
-        return liveSupervisorIdentity === supervisorIdentity ? "unknown" : "exited";
+        if (liveSupervisorIdentity === supervisorIdentity) return "unknown";
+        // launchctl submit is forked by the supervisor and inherits the
+        // wrapper-owned process group. If the supervisor dies while submit is
+        // in flight, that child can still create the job, so the whole group
+        // must be empty before an absent label is accepted as exited.
+        try { kill(-pid, 0); return "unknown"; }
+        catch (error) { return error.code === "ESRCH" ? "exited" : "unknown"; }
       }
       darwinOwnershipUnknown = true;
       // The handshake is written before the platform supervisor submits its
