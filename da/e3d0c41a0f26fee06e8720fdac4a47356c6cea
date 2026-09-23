@@ -1,0 +1,26 @@
+automation/hermes/pr-remediation-ledger.mjs
+  h_a39f9495f9ec1d 61-63
+automation/hermes/pr-remediation-ledger.test.mjs
+  h_a39f9495f9ec1d 70-83
+src/App.jsx
+  h_a39f9495f9ec1d 324-328,352
+src/components/TerminalPane.jsx
+  h_a39f9495f9ec1d 19-20,45,49-51,55,57-58,63-70,77,82,92,95,105,112,115-117,127,130,136,143,149-155,158,162,164,175,190
+tests/fixtures/exited-leader.mjs
+  h_a39f9495f9ec1d 6-7,16-20,22
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 207-267,426,561-564,567
+tests/ui-races.test.mjs
+  h_a39f9495f9ec1d 87-92,94-107,111,113-116,316,332-334,380-401,509
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "dae3d0c41a0f26fee06e8720fdac4a47356c6cea",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
