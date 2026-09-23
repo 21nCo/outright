@@ -89,6 +89,9 @@ export function createGitService({ database, getProjects, getConfig }) {
     if (!worktree.isLinked) throw httpError(400, "The primary worktree cannot be removed");
     if (confirmation !== worktreePath) throw httpError(400, "Exact worktree path confirmation is required");
     if (worktree.changedCount) throw httpError(409, "Worktree has uncommitted changes");
+    if (database.findUnresolvedInterruptedRunForWorktree?.(worktreePath)) {
+      throw httpError(409, "Resolve the interrupted run before removing this worktree");
+    }
     await git(project.path, ["worktree", "remove", worktreePath]);
     database.audit("git.worktree.removed", { target: worktreePath, projectId });
     return { removed: true };

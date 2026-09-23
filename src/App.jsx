@@ -24,9 +24,11 @@ import { ContextPane } from "@/components/ContextPane";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { TerminalPane } from "@/components/TerminalPane";
 import { api, connectRuntime, query } from "@/lib/runtime-api";
+import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "@/recovery-policy";
 
 const MAX_RENDERED_MESSAGES = 1000;
 const MAX_STREAMING_CHARACTERS = 1024 * 1024;
+const MAX_PENDING_RUNTIME_EVENT_BYTES = 2 * 1024 * 1024;
 const LIVE_TRUNCATION_MARKER = "\n\n[Live output truncated]";
 
 export function App() {
@@ -73,6 +75,9 @@ export function App() {
   const messageViewportRef = useRef(null);
   const stickToBottomRef = useRef(true);
   const pendingPrependScrollRef = useRef(null);
+  const submissionPendingRef = useRef(false);
+  const checkpointCursorsRef = useRef(new Map());
+  const pendingConversationLoadRef = useRef(null);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
 
   const loadBootstrap = useCallback(async (manual = false) => {
@@ -130,27 +135,65 @@ export function App() {
   useEffect(() => { if (selectedWorktreeId) localStorage.setItem("outright.selected-worktree", selectedWorktreeId); }, [selectedWorktreeId]);
   useEffect(() => { if (selectedConversationId) localStorage.setItem("outright.selected-conversation", selectedConversationId); }, [selectedConversationId]);
   const loadConversation = useCallback(async () => {
-    if (!selectedConversationId || !conversations.some((item) => item.id === selectedConversationId)) { setConversation(null); return; }
+    if (!selectedConversationId || !conversations.some((item) => item.id === selectedConversationId)) {
+      pendingConversationLoadRef.current?.controller?.abort();
+      pendingConversationLoadRef.current = null;
+      setConversation(null);
+      return;
+    }
     const requestedId = selectedConversationId;
+    pendingConversationLoadRef.current?.controller?.abort();
+    const controller = new AbortController();
+    const pendingLoad = { conversationId: requestedId, events: [], eventBytes: 0, overflowed: false, controller };
+    pendingConversationLoadRef.current = pendingLoad;
     try {
-      const nextConversation = await api(`/api/conversations/${requestedId}`);
+      const nextConversation = await api(`/api/conversations/${requestedId}`, { signal: controller.signal });
       // Stale responses from an earlier selection are discarded before they
       // can associate the composer or execution state with the wrong worktree.
       if (selectedConversationRef.current !== requestedId) return;
       if (nextConversation.projectId !== selectedProjectRef.current || nextConversation.worktreeId !== selectedWorktreeRef.current) return;
+      if (pendingConversationLoadRef.current !== pendingLoad) return;
+      pendingConversationLoadRef.current = null;
+      const replayed = replayConversationEvents(nextConversation.messages, pendingLoad.events, MAX_RENDERED_MESSAGES);
       stickToBottomRef.current = true;
-      setConversation(nextConversation); setStreamingText(""); setRunEvents([]);
+      checkpointCursorsRef.current = replayed.cursors;
+      setConversation({
+        ...nextConversation,
+        messages: replayed.messages,
+        messagePage: {
+          ...nextConversation.messagePage,
+          hasMore: Boolean(nextConversation.messagePage?.hasMore || replayed.dropped),
+          olderCount: (nextConversation.messagePage?.olderCount ?? 0) + replayed.dropped,
+          beforeId: replayed.messages[0]?.id ?? null,
+        },
+      });
+      setStreamingText(boundStreamingText(replayed.streamingText));
+      setRunEvents(replayed.runEvents);
       window.requestAnimationFrame(() => {
         const viewport = messageViewportRef.current;
         if (viewport) viewport.scrollTop = viewport.scrollHeight;
       });
     }
-    catch (nextError) { setError(nextError.message); }
+    catch (nextError) {
+      if (pendingConversationLoadRef.current === pendingLoad) pendingConversationLoadRef.current = null;
+      if (nextError.name !== "AbortError") setError(nextError.message);
+    }
   }, [selectedConversationId, conversations]);
   useEffect(() => { loadConversation(); }, [loadConversation]);
+  const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
   const handleRuntimeEvent = useCallback((event) => {
     setRuntimeEvent(event);
+    const pendingLoad = pendingConversationLoadRef.current;
+    if (["message.created", "run.event"].includes(event.type)
+      && bufferConversationRuntimeEvent(pendingLoad, event, MAX_PENDING_RUNTIME_EVENT_BYTES) === "overflow") {
+      // Discard the stale response and immediately request a newer bounded
+      // snapshot. Clearing first ensures subsequent events cannot grow the
+      // overflowing buffer while the microtask schedules its replacement.
+      pendingLoad.controller.abort();
+      if (pendingConversationLoadRef.current === pendingLoad) pendingConversationLoadRef.current = null;
+      queueMicrotask(loadConversation);
+    }
     if (event.type === "projects.changed") {
       const payload = event.payload.projects ? event.payload : { projects: event.payload };
       setBootstrap((current) => current ? { ...current, ...payload } : current);
@@ -160,7 +203,11 @@ export function App() {
       loadConversation();
     }
     if (event.type === "conversation.created" || event.type === "conversation.updated") loadConversations(event.conversationId);
+    if (shouldReloadConversationForResolvedRun(event, selectedConversationRef.current, selectedRecoveryRunId)) loadConversation();
     if (event.type === "message.created" && event.conversationId === selectedConversationRef.current) {
+      if (isStaleCheckpointMessage(checkpointCursorsRef.current, event.payload)) return;
+      recordCheckpointCursor(checkpointCursorsRef.current, event.payload);
+      setStreamingText((current) => streamingTextAfterRuntimeEvent(current, event));
       setConversation((current) => {
         if (!current) return current;
         const alreadyPresent = current.messages.some((message) => message.id === event.payload.id);
@@ -169,7 +216,7 @@ export function App() {
           ...current,
           messagePage: { ...current.messagePage, total, newerCount: (current.messagePage.newerCount ?? 0) + (alreadyPresent ? 0 : 1) },
         };
-        const merged = upsert(current.messages, event.payload);
+        const merged = upsertRuntimeMessage(current.messages, event.payload);
         const dropped = Math.max(0, merged.length - MAX_RENDERED_MESSAGES);
         const messages = merged.slice(-MAX_RENDERED_MESSAGES);
         return {
@@ -187,15 +234,18 @@ export function App() {
     }
     if (event.type === "run.event" && event.conversationId === selectedConversationRef.current) {
       const runEvent = event.payload;
-      if (runEvent.type === "assistant.delta") setStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(current + (runEvent.payload.text ?? "")));
-      if (runEvent.type === "assistant.message") setStreamingText(boundStreamingText(runEvent.payload.text ?? ""));
+      if (runEvent.type === "assistant.delta") {
+        const checkpointEventSeq = checkpointCursorsRef.current.get(event.runId) ?? 0;
+        setStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event, checkpointEventSeq)));
+      }
+      if (runEvent.type === "assistant.message") setStreamingText((current) => streamingTextAfterRuntimeEvent(current, event));
       if (runEvent.type.startsWith("tool.")) setRunEvents((current) => [...current, runEvent].slice(-20));
       if (["run.completed", "run.failed", "run.stopped"].includes(runEvent.type)) {
         window.setTimeout(loadConversation, 80);
         if (document.hidden && settings.notifications && Notification.permission === "granted") new Notification(`Outright run ${runEvent.type.split(".")[1]}`, { body: conversation?.title ?? "Agent run" });
       }
     }
-  }, [loadConversation, loadConversations, settings.notifications, conversation?.title]);
+  }, [loadConversation, loadConversations, settings.notifications, conversation?.title, selectedRecoveryRunId]);
   runtimeHandlerRef.current = handleRuntimeEvent;
 
   useEffect(() => {
@@ -254,8 +304,40 @@ export function App() {
     });
   }, [conversation?.messages.at(-1)?.id, streamingText]);
 
-  const activeRun = conversation?.runs?.find((run) => ["queued", "running"].includes(run.status));
+  const activeRun = conversation?.runs?.find((run) => ["queued", "launching", "running"].includes(run.status));
   const latestRun = conversation?.runs?.[0];
+  // Worktree-wide recovery metadata gates sibling chats before submission;
+  // the conversation-local values remain fallbacks for older runtimes.
+  const interruptedRun = recoveryGate(conversation);
+  const recoveryConversation = conversation?.recoveryConversation ?? null;
+
+  async function resolveRecovery(run, policy) {
+    try {
+      if (policy === "discard-unverifiable" && !window.confirm("Only continue after you have verified outside Outright that the legacy provider is no longer running. Discard this unverifiable recovery record?")) return;
+      await api(`/api/runs/${run.id}/resume`, { method: "POST", body: { policy, ...(policy === "discard-unverifiable" ? { confirmation: run.id } : {}) } });
+      await loadConversation();
+    } catch (nextError) {
+      setError(nextError.payload?.code === "NO_PROVIDER_SESSION" ? "No provider session is available to resume" : nextError.message);
+    }
+  }
+
+  async function openRecoveryConversation() {
+    if (!recoveryConversation?.id) return;
+    try {
+      if (recoveryConversation.archived) {
+        await api(`/api/conversations/${recoveryConversation.id}`, { method: "PATCH", body: { archived: false } });
+      }
+      if (recoveryConversation.projectId === selectedProjectRef.current && recoveryConversation.worktreeId === selectedWorktreeRef.current) {
+        await loadConversations(recoveryConversation.id);
+        return;
+      }
+      const ownerProject = bootstrap?.projects.find((item) => item.id === recoveryConversation.projectId);
+      const ownerWorktree = ownerProject?.worktrees.find((item) => item.id === recoveryConversation.worktreeId);
+      if (!ownerProject || !ownerWorktree) throw new Error("The recovery chat worktree is no longer available");
+      pendingConversationRef.current = recoveryConversation.id;
+      await chooseProject(ownerProject, ownerWorktree);
+    } catch (nextError) { setError(nextError.message); }
+  }
 
   async function chooseProject(nextProject, explicitWorktree) {
     const nextWorktree = explicitWorktree ?? preferredWorktree(nextProject);
@@ -276,15 +358,17 @@ export function App() {
   }
   async function sendPrompt(event, promptOverride, targetOverride) {
     event?.preventDefault();
-    const prompt = (promptOverride ?? draft).trim();
-    if (!prompt || activeRun) return;
+    const submittedDraft = promptOverride ?? draft;
+    const prompt = submittedDraft.trim();
+    if (!prompt || activeRun || interruptedRun || submissionPendingRef.current) return;
+    submissionPendingRef.current = true;
     let target = targetOverride ?? conversation;
-    if (!target) target = await createConversation(prompt.split(/\n/)[0].slice(0, 52));
-    if (!target || !isSelectedTarget(target)) return;
-    setDraft(""); setStreamingText(""); setRunEvents([]);
     try {
+      if (!target) target = await createConversation(prompt.split(/\n/)[0].slice(0, 52));
+      if (!target || !isSelectedTarget(target)) return;
       const run = await api(`/api/conversations/${target.id}/runs`, { method: "POST", body: { prompt, provider: target.provider || settings.provider, model: target.model || settings.model, reasoningEffort: settings.reasoningEffort, approvalPolicy: settings.approvalPolicy } });
       if (!isSelectedTarget(target)) return;
+      setDraft((current) => draftAfterSubmission(current, submittedDraft)); setStreamingText(""); setRunEvents([]);
       setConversation((current) => {
         if (current && current.id !== target.id) return current;
         const next = current ?? { ...target, messages: [], runs: [] };
@@ -293,8 +377,12 @@ export function App() {
     } catch (nextError) {
       if (!isSelectedTarget(target)) return;
       if (nextError.payload?.code === "PROJECT_TRUST_REQUIRED") { setPendingPrompt({ prompt, target }); setTrustRequest(nextError.payload.project); }
-      else setError(nextError.message);
+      else {
+        if (nextError.payload?.code === "RUN_RECOVERY_REQUIRED") await loadConversation();
+        setError(nextError.message);
+      }
     }
+    finally { submissionPendingRef.current = false; }
   }
   async function trustAndRun() {
     const pending = pendingPrompt;
@@ -315,6 +403,7 @@ export function App() {
     setLoadingEarlier(true);
     try {
       const result = await api(query(`/api/conversations/${conversation.id}/messages`, { before: conversation.messages[0].id, limit: 200 }));
+      checkpointCursorsRef.current = checkpointCursors(result.messages, checkpointCursorsRef.current);
       setConversation((current) => {
         if (current?.id !== conversation.id) return current;
         const merged = [...result.messages, ...current.messages];
@@ -336,8 +425,8 @@ export function App() {
   async function createGroup(event) { event.preventDefault(); try { await api("/api/groups", { method: "POST", body: { name: newGroupName } }); setNewGroupName(""); setNewGroupOpen(false); await refreshGroups(); setToast("Project group created"); } catch (nextError) { setError(nextError.message); } }
   async function refreshGroups() { const projectGroups = await api("/api/groups"); setBootstrap((current) => ({ ...current, projectGroups })); }
   async function moveProject(projectId, groupId) { try { const projectGroups = await api("/api/project-memberships", { method: "PUT", body: { projectId, groupId } }); setBootstrap((current) => ({ ...current, projectGroups })); setToast("Project group updated"); } catch (nextError) { setError(nextError.message); } }
-  async function updateConversation(patch) { try { const updated = await api(`/api/conversations/${conversation.id}`, { method: "PATCH", body: patch }); setConversation((current) => ({ ...current, ...updated })); await loadConversations(updated.id); return updated; } catch (nextError) { setError(nextError.message); } }
-  async function archiveConversation() { await updateConversation({ archived: true }); setSelectedConversationId(""); setManageChatOpen(false); }
+  async function updateConversation(patch) { try { const updated = await api(`/api/conversations/${conversation.id}`, { method: "PATCH", body: patch }); setConversation((current) => ({ ...current, ...updated })); await loadConversations(updated.id); return updated; } catch (nextError) { setError(nextError.message); return null; } }
+  async function archiveConversation() { const updated = await updateConversation({ archived: true }); if (!updated) return; setSelectedConversationId(""); setManageChatOpen(false); }
   async function saveChatSettings(event) {
     event.preventDefault();
     const { destination, ...patch } = chatDraft;
@@ -397,7 +486,8 @@ export function App() {
         <section className="conversation-pane">
           <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} onManage={openManageChat} />
           <ScrollArea className="message-scroll" viewportRef={messageViewportRef}><div className="message-column">{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? conversation.messages.map((message) => <Message key={message.id} message={message} />) : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}{conversation?.messagePage?.hasLater && <button className="history-return" onClick={loadConversation}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button>}</div></ScrollArea>
-          <form className="composer" onSubmit={sendPrompt}><textarea aria-label="Message the agent" placeholder={conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={setDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running"><span className="status-dot demo" />Agent is {activeRun.status}</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop agent"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim()} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
+          {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}
+          <form className="composer" onSubmit={sendPrompt}><textarea aria-label="Message the agent" disabled={Boolean(interruptedRun)} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={setDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running"><span className="status-dot demo" />Agent is {activeRun.status}</span> : interruptedRun ? <span className="send-hint running"><WarningCircle />Recovery decision required</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop agent"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun)} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
         </section>
         {inspector && <aside className="inspector"><header><nav aria-label="Inspector panels"><button className={inspector === "changes" ? "is-active" : ""} aria-pressed={inspector === "changes"} onClick={() => setInspector("changes")}><GitDiff />Changes</button><button className={inspector === "terminal" ? "is-active" : ""} aria-pressed={inspector === "terminal"} onClick={() => setInspector("terminal")}><TerminalWindow />Terminal</button><button className={inspector === "context" ? "is-active" : ""} aria-pressed={inspector === "context"} onClick={() => setInspector("context")}><TreeStructure />Context</button></nav><Button variant="ghost" size="icon-xs" onClick={() => setInspector(null)} aria-label="Close inspector"><X /></Button></header><div className="inspector-body">{inspector === "changes" && <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />}{inspector === "terminal" && <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} sendRuntime={sendRuntime} onError={handleError} />}{inspector === "context" && <ContextPane worktree={worktree} settings={settings} onError={handleError} />}</div></aside>}
       </div>
@@ -423,10 +513,35 @@ function ConversationHeader({ conversation, worktree, latestRun, onManage }) { r
 function Message({ message }) { const user = message.role === "user"; if (message.kind === "tool") return <article className="message is-agent is-tool" data-message-id={message.id}><div className="avatar"><CheckCircle weight="fill" /></div><div className="message-body"><p className="message-text">{message.body}</p></div></article>; return <article className={`message ${user ? "is-user" : "is-agent"}`} data-message-id={message.id}><div className="avatar">{user ? "Y" : <Sparkle weight="fill" />}</div><div className="message-body"><div className="message-meta"><strong>{user ? "You" : "Outright"}</strong><time>{formatTime(message.createdAt)}</time></div><p className="message-text">{message.body}</p>{message.payload?.runId && <small className="message-run">{message.payload.provider} · {message.payload.runId.slice(0, 8)}</small>}</div></article>; }
 function StreamingMessage({ text, events }) { return <article className="message is-agent is-streaming"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" /></div><p className="message-text">{text}</p><ToolActivity events={events} /></div></article>; }
 function RunningMessage({ run, events }) { return <article className="message is-agent is-streaming"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" /></div><p className="thinking-copy">{run.status === "queued" ? "Waiting for an execution slot…" : "Working in this worktree…"}</p><ToolActivity events={events} /></div></article>; }
+// Interrupted runs surface here until the operator picks a continuation
+// policy; the preserved partial output stays visible above the notice.
+function RecoveryNotice({ run, conversation, recoveryConversation, onOpenRecovery, onResolve }) {
+  const classCopy = {
+    "never-started": "it was still queued, so no provider process started and no side effects happened",
+    exited: "its provider process exited during the restart; partial side effects may exist in the worktree",
+    alive: "its provider process was still running after the restart and is no longer supervised; partial side effects may exist",
+    unknown: "the provider process state could not be determined; partial side effects may exist",
+  }[run.recoveryClass ?? "unknown"];
+  // `||`, not `??`: an empty-string conversation session must not hide a
+  // session still recorded on the interrupted run.
+  const ownsRecovery = recoveryBelongsToConversation(run, conversation);
+  const owner = ownsRecovery ? conversation : recoveryConversation;
+  const sessionId = run.providerSessionId || (owner?.provider === run.provider ? owner?.providerSessionId : null);
+  const action = recoveryNoticeAction(run, conversation);
+  const title = action === "discard-unverifiable"
+    ? "Unverifiable legacy recovery requires cleanup"
+    : ownsRecovery ? "Run interrupted by a runtime restart" : `Recovery required in ${owner?.title ?? "another chat"}`;
+  const copy = action === "discard-unverifiable"
+    ? "Outright cannot verify this legacy provider or its original worktree. After checking outside Outright that it is no longer running, discard only this recovery record to release its gate."
+    : ownsRecovery
+      ? `Reconciliation found ${classCopy}. Review the preserved partial output above, then choose how to continue before anything is retried.`
+      : "Another chat in this worktree owns an interrupted run. Open it to inspect the preserved output and choose an explicit continuation policy.";
+  return <div className="recovery-notice" role="alert"><WarningCircle weight="fill" /><div className="recovery-copy"><strong>{title}</strong><p>{copy}</p></div><div className="recovery-actions">{action === "discard-unverifiable" ? <Button size="sm" variant="destructive" onClick={() => onResolve(run, "discard-unverifiable")}>Discard legacy record</Button> : action === "owner" ? <><Button size="sm" disabled={!sessionId} onClick={() => onResolve(run, "resume-session")}><ArrowsClockwise />Resume session</Button><Button size="sm" variant="outline" onClick={() => onResolve(run, "retry")}>Retry from scratch</Button><Button size="sm" variant="ghost" onClick={() => onResolve(run, "discard")}>Discard</Button></> : <Button size="sm" onClick={onOpenRecovery}><ChatCircle />Open recovery chat</Button>}</div></div>;
+}
 function ToolActivity({ events }) { if (!events.length) return null; return <div className="tool-activity">{events.slice(-4).map((event) => <div key={event.id}><CheckCircle /><span>{toolLabel(event)}</span></div>)}</div>; }
 function EmptyChat({ worktree, onCreate }) { return <div className="empty-chat"><ChatCircle size={29} /><h2>Start in {worktree.name}</h2><p>Create a durable conversation, then run Codex or Claude directly in this worktree.</p><Button onClick={onCreate}><Plus />New chat</Button></div>; }
 function WorktreeState({ worktree }) { if (worktree.isPrunable) return <span className="worktree-state warning"><WarningCircle />stale</span>; if (worktree.changedCount) return <span className="worktree-state warning"><GitDiff />{worktree.changedCount} changed</span>; return <span className="worktree-state clean"><Check />clean</span>; }
-function RunState({ run }) { if (!run) return null; const running = ["queued", "running"].includes(run.status); return <span className={`run-state ${run.status}`}><span className={`status-dot ${running ? "demo" : run.status === "completed" ? "live" : "error"}`} />{run.status}{run.costUsd != null && <small>${Number(run.costUsd).toFixed(3)}</small>}</span>; }
+function RunState({ run }) { if (!run) return null; const running = ["queued", "launching", "running"].includes(run.status); const pendingDecision = run.status === "interrupted" && !run.recoveryDecision; return <span className={`run-state ${run.status}`} title={pendingDecision ? "Restart interrupted this run; choose a continuation below" : undefined}><span className={`status-dot ${running || pendingDecision ? "demo" : run.status === "completed" ? "live" : "error"}`} />{run.status}{run.costUsd != null && <small>${Number(run.costUsd).toFixed(3)}</small>}</span>; }
 function GitHealth({ worktree }) { if (worktree.isPrunable) return <span className="git-health warning"><WarningCircle /></span>; if (worktree.changedCount) return <span className="git-health warning"><span className="status-dot demo" />{worktree.changedCount}</span>; return <span className="git-health clean"><Check /></span>; }
 function TemplateMenu({ templates, onSelect }) { if (!templates.length) return null; return <DropdownMenu><DropdownMenuTrigger render={<Button type="button" variant="ghost" size="icon-sm" aria-label="Prompt templates" />}><ClockCounterClockwise /></DropdownMenuTrigger><DropdownMenuContent align="start"><DropdownMenuGroup><DropdownMenuLabel>Prompt templates</DropdownMenuLabel>{templates.map((template) => <DropdownMenuItem key={template.id} onClick={() => onSelect(template.prompt)}>{template.title}</DropdownMenuItem>)}</DropdownMenuGroup></DropdownMenuContent></DropdownMenu>; }
 function ThemeMenu({ theme, onThemeChange }) { const Icon = theme === "light" ? Sun : theme === "dark" ? Moon : Desktop; return <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Change theme" />}><Icon /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup><DropdownMenuLabel>Appearance</DropdownMenuLabel></DropdownMenuGroup><DropdownMenuRadioGroup value={theme} onValueChange={onThemeChange}><DropdownMenuRadioItem value="system"><Desktop />System</DropdownMenuRadioItem><DropdownMenuRadioItem value="light"><Sun />Light</DropdownMenuRadioItem><DropdownMenuRadioItem value="dark"><Moon />Dark</DropdownMenuRadioItem></DropdownMenuRadioGroup></DropdownMenuContent></DropdownMenu>; }
@@ -436,7 +551,6 @@ function buildGroupedProjects(projects, state) { const result = state.groups.map
 function preferredWorktree(project) { return project.worktrees.find((item) => item.name === "dev" || item.path.endsWith("-dev")) ?? project.worktrees.find((item) => item.branch === "next") ?? project.worktrees[0]; }
 function compactPath(value = "") { return value.replace(/^\/Users\/[^/]+/, "~"); }
 function defaultSettings() { return { provider: "codex", model: "", reasoningEffort: "medium", approvalPolicy: "workspace-write", editor: "zed", notifications: true, maxConcurrentRuns: 3 }; }
-function upsert(items, item) { return [...items.filter((entry) => entry.id !== item.id), item].sort((a, b) => a.createdAt.localeCompare(b.createdAt)); }
 function boundStreamingText(value) { return value.length > MAX_STREAMING_CHARACTERS ? `${value.slice(0, MAX_STREAMING_CHARACTERS)}${LIVE_TRUNCATION_MARKER}` : value; }
 function formatTime(value) { return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(value)); }
 function runSummary(run) { const tokens = Number(run.inputTokens ?? 0) + Number(run.outputTokens ?? 0); return `${run.status}${tokens ? ` · ${tokens.toLocaleString()} tokens` : ""}${run.costUsd != null ? ` · $${Number(run.costUsd).toFixed(3)}` : ""}`; }

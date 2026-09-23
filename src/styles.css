@@ -335,9 +335,15 @@ button, input, textarea { font: inherit; }
 .inspector > header nav button.is-active::after { content: ""; position: absolute; inset: auto 8px 0; height: 2px; background: var(--foreground); }
 .inspector-body { min-height: 0; overflow: hidden; }
 .workspace-tools { white-space: nowrap; }
-.run-state { height: 25px; padding: 0 8px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line-soft); border-radius: 999px; color: var(--muted-foreground); font-size: 9px; }
+.run-state { height: 25px; padding: 0 8px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line-soft); border-radius: 999px; color: var(--foreground); font-size: 9px; }
 .run-state small { color: inherit; }
-.run-state.running, .run-state.queued { color: var(--amber); }
+.run-state.running, .run-state.queued, .run-state.launching, .run-state.interrupted { color: var(--amber); }
+.recovery-notice { margin: 0 0 10px; padding: 11px 12px; display: flex; align-items: flex-start; gap: 10px; border: 1px solid color-mix(in oklab, var(--amber) 45%, var(--border)); border-radius: 9px; background: var(--subtle-canvas); }
+.recovery-notice > svg { flex: none; width: 18px; height: 18px; margin-top: 1px; color: var(--amber); }
+.recovery-copy { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.recovery-copy strong { font-size: 12px; }
+.recovery-copy p { margin: 0; color: var(--muted-foreground); font-size: 11px; line-height: 1.55; }
+.recovery-actions { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .run-state.failed, .run-state.stopped { color: var(--destructive); }
 .run-state.completed { color: var(--green); }
 .status-dot.error { background: var(--destructive); }
