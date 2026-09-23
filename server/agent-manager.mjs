@@ -124,7 +124,17 @@ process.on("SIGTERM", () => { if (!authorized) abandon(); });
 process.on("SIGINT", () => { if (!authorized) abandon(); });
 const finish = (code, signal) => {
   if (completionTimer) clearTimeout(completionTimer);
-  try { fs.unlinkSync(handshakePath); } catch {}
+  if (process.platform === "win32") {
+    // The Job Object is empty when its supervisor exits. Preserve that proof
+    // until the runtime commits the terminal row, so a crash between those
+    // events cannot strand a running row after every owned process is gone.
+    try {
+      const record = JSON.parse(fs.readFileSync(handshakePath, "utf8"));
+      writeHandshake({ ...record, completed: true, completedAt: new Date().toISOString() });
+    } catch {}
+  } else {
+    try { fs.unlinkSync(handshakePath); } catch {}
+  }
   if (signal) {
     // Re-raise the provider's termination signal so the runtime reports the
     // accurate "stopped by signal" cause instead of a generic 137 — except
@@ -467,9 +477,6 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     if (!active.has(state.run.id) || state.finishing) return;
     state.finishing = true;
     clearCheckpointTimer(state);
-    // The wrapper removes its own handshake record, but a hard kill (stop
-    // timeout) can bypass it; never leave a stale record behind.
-    try { if (state.launchHandshakePath) unlinkSync(state.launchHandshakePath); } catch { /* Already gone. */ }
     const successful = exitCode === 0 && !error && !state.stopped;
     const status = state.stopped ? "stopped" : successful ? "completed" : "failed";
     const message = error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : "");
@@ -479,6 +486,10 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     // A crash can therefore leave the run recoverable, but never terminal with
     // its final assistant segment missing.
     const finished = database.finishRun(state.run.id, { status, finishedAt, exitCode, error: message || null, pid: null }, transcriptMessage);
+    // A Windows wrapper leaves a completed Job Object proof until this
+    // terminal transaction succeeds. Other platforms may leave a record only
+    // after a hard kill; both are safe to remove after the durable commit.
+    try { if (state.launchHandshakePath) unlinkSync(state.launchHandshakePath); } catch { /* Already gone. */ }
     if (finished.message) publish({ type: "message.created", conversationId: state.conversation.id, payload: finished.message });
     active.delete(state.run.id);
     clearAssistant(state);

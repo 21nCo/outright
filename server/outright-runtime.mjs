@@ -617,7 +617,14 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
         // in flight, that child can still create the job, so the whole group
         // must be empty before an absent label is accepted as exited.
         try { kill(-pid, 0); return "unknown"; }
-        catch (error) { return error.code === "ESRCH" ? "exited" : "unknown"; }
+        catch (error) {
+          if (error.code !== "ESRCH") return "unknown";
+        }
+        // The first absent-label sample predates the group probe. Submit may
+        // have succeeded immediately before its child exited, so re-read the
+        // unique label after the group is empty to form a coherent proof.
+        const settled = run(AGENT_SUPERVISOR, ["--probe", handshake.platformOwnershipId], { encoding: "utf8" }).stdout?.trim();
+        return settled === "absent" ? "exited" : recoveryVerdict(settled);
       }
       darwinOwnershipUnknown = true;
       // The handshake is written before the platform supervisor submits its

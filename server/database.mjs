@@ -314,7 +314,14 @@ export function createOutrightDatabase(options = {}) {
               adopted.push(run.id);
             }
           }
-          else if (run.pid != null) classification = normalizeProbeResult(probeAlive(run.pid, readLaunchHandshake(launchDirectory, run.id), run));
+          else if (run.pid != null) {
+            const handshake = readLaunchHandshake(launchDirectory, run.id);
+            classification = handshake?.completed === true
+              && handshake.authorized === true
+              && handshake.pid === run.pid
+              ? "exited"
+              : normalizeProbeResult(probeAlive(run.pid, handshake, run));
+          }
           const result = db.prepare("UPDATE runs SET status = 'interrupted', pid = ?, finished_at = ?, recovery_class = ? WHERE id = ? AND status IN ('queued', 'running', 'launching')")
             .run(pid, finishedAt, classification, run.id);
           if (!result.changes) continue;

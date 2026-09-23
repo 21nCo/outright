@@ -1037,7 +1037,12 @@ test("the launch wrapper records durable identity before authorization and clean
     const code = await withDeadline(child2Exited, "authorized wrapper exit", () => { try { child2.kill("SIGKILL"); } catch {} });
     assert.equal(code, 0);
     assert.equal(existsSync(marker2), true, "the authorized wrapper starts the provider");
-    assert.equal(existsSync(handshakePath2), false, "the handshake record is cleaned up after completion");
+    if (process.platform === "win32") {
+      const completedRecord = JSON.parse(readFileSync(handshakePath2, "utf8"));
+      assert.equal(completedRecord.completed, true, "Windows preserves the empty Job Object proof for restart recovery");
+    } else {
+      assert.equal(existsSync(handshakePath2), false, "the handshake record is cleaned up after completion");
+    }
     if (process.platform === "darwin") {
       assert.equal(existsSync(`/tmp/outright-agent-com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}-stdout.fifo`), false);
       assert.equal(existsSync(`/tmp/outright-agent-com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}-stderr.fifo`), false);

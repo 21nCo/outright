@@ -142,6 +142,27 @@ test("reconciles queued and running work as interrupted after a runtime restart"
   }
 });
 
+test("uses a durable wrapper completion marker after the owned tree exits", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-completed-launch-"));
+  const database = createOutrightDatabase({ filename: path.join(root, "outright.db") });
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "running" });
+    database.updateRun(run.id, { status: "running", pid: 4242 });
+    const handshakePath = path.join(database.launchDirectory, `${run.id}.json`);
+    writeFileSync(handshakePath, JSON.stringify({ pid: 4242, authorized: true, completed: true, completedAt: "2026-09-23T00:00:00.000Z" }));
+    let probes = 0;
+    const result = database.reconcileInterruptedRuns({ probeAlive: () => { probes++; return "unknown"; } });
+    assert.equal(result.counts.exited, 1);
+    assert.equal(database.getRun(run.id).recoveryClass, "exited");
+    assert.equal(probes, 0, "the kernel-owner completion proof does not fall back to an unverifiable PID sample");
+    assert.equal(existsSync(handshakePath), false, "the consumed completion marker is swept after reconciliation");
+  } finally {
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("classifies a provider process still alive after the restart", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

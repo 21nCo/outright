@@ -903,6 +903,16 @@ test("recovery identities are boot-scoped and Windows taskkill supplies a whole-
       "unknown",
       "an in-flight launchctl child keeps the wrapper-owned process group unresolved",
     );
+    let launchdProbe = 0;
+    assert.equal(
+      defaultRecoveryProcessAlive(123, "darwin", () => null, () => {
+        throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      }, missingJobHandshake, (executable) => executable === AGENT_SUPERVISOR
+        ? { status: 0, stdout: ++launchdProbe === 1 ? "absent\n" : "alive\n" }
+        : { status: 3, stdout: "" }),
+      "alive",
+      "recovery rechecks launchd after submit exits instead of accepting a stale absent sample",
+    );
     assert.equal(
       defaultRecoveryProcessAlive(123, "darwin", () => null, () => {}, missingJobHandshake, (executable) => executable === AGENT_SUPERVISOR
         ? { status: 3, stdout: "exited\n" }
