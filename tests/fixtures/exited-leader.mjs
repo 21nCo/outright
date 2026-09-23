@@ -3,7 +3,8 @@ import { fileURLToPath } from "node:url";
 
 const executable = process.env.OUTRIGHT_TEST_MISSING_CHILD ? "outright-nonexistent-child-executable" : process.execPath;
 const descendant = spawn(executable, [fileURLToPath(new URL("./stubborn-child.mjs", import.meta.url))], {
-  stdio: ["ignore", "inherit", "inherit"],
+  detached: process.platform === "win32",
+  stdio: process.platform === "win32" ? ["ignore", "pipe", "pipe"] : ["ignore", "inherit", "inherit"],
   windowsHide: true,
 });
 descendant.once("error", (error) => {
@@ -12,8 +13,11 @@ descendant.once("error", (error) => {
 });
 descendant.once("spawn", () => {
   descendant.unref();
-  process.stdout.write(`descendant:${descendant.pid}\n`);
-  // Keep the leader alive until the harness records its child's identity.
+  if (process.platform === "win32") {
+    descendant.stdout.once("data", () => process.stdout.write(`descendant:${descendant.pid}:ready\n`));
+    descendant.stderr.on("data", (chunk) => process.stderr.write(chunk));
+  } else process.stdout.write(`descendant:${descendant.pid}:ready\n`);
+  // Keep the leader alive until the harness records a ready child's identity.
   process.stdin.once("data", () => process.exit(0));
-  setTimeout(() => process.exit(1), 5_000).unref();
+  setTimeout(() => { process.stdout.write("leader-expiry\n"); process.exit(1); }, 20_000).unref();
 });

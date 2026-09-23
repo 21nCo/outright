@@ -204,6 +204,67 @@ async function terminalRejectedSwitchRegression() {
   assert(document.activeElement === first, "Failed terminal switch left focus on an unselected tab");
 }
 
+async function terminalInitialFailureRegression() {
+  root.render(null);
+  await settle();
+  const errors = [];
+  route = async (url) => {
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("A2")] });
+    if (url.pathname === "/api/terminals/term-A") return response({ error: "Buffer failed" }, 500);
+    return response({ buffer: "" });
+  };
+  root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => errors.push(error)} sendRuntime={() => {}} />);
+  await until(() => errors.length === 1 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "initial terminal buffer rejection");
+  assert(host.querySelectorAll('[role="tab"]').length === 2, "Fixture lost existing terminal tabs");
+  assert(host.querySelectorAll('[role="tab"][tabindex="0"]').length === 1, "Buffer failure left no keyboard-reachable terminal tab");
+}
+
+async function terminalMutationFailureRegression() {
+  root.render(null);
+  await settle();
+  const errors = [];
+  const onError = (error) => errors.push(error);
+  let failure = "";
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST" && failure === "create") return response({ error: "Create failed" }, 500);
+    if (url.pathname === "/api/terminals" && options.method === "POST") return response(terminal("A3"));
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("A2")] });
+    if (url.pathname === "/api/terminals/term-A" && options.method === "DELETE" && failure === "delete") return response({ error: "Delete failed" }, 500);
+    if (url.pathname === "/api/terminals/term-A2" && failure === "replacement-buffer") return response({ error: "Buffer failed" }, 500);
+    if (url.pathname === "/api/terminals/term-A" && failure === "reconnect-buffer") return response({ error: "Reconnect failed" }, 500);
+    return response({ buffer: "" });
+  };
+  const show = (runtimeEvent = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={runtimeEvent} onError={onError} sendRuntime={() => {}} />);
+  show();
+  await until(() => host.querySelector('[role="tab"][aria-selected="true"]')?.textContent === "Terminal A", "mutation fixture terminal A");
+  const selected = () => host.querySelector('[role="tab"][aria-selected="true"][tabindex="0"]');
+  failure = "create";
+  host.querySelector('[aria-label="New terminal"]').click();
+  await until(() => errors.length === 1 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "failed terminal creation");
+  assert(selected()?.textContent === "Terminal A", "Failed creation lost the selected tab");
+  failure = "delete";
+  host.querySelector('[aria-label="Close terminal Terminal A"]').click();
+  await until(() => errors.length === 2 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "failed terminal deletion");
+  assert(selected()?.textContent === "Terminal A", "Failed deletion lost the selected tab");
+  failure = "replacement-buffer";
+  host.querySelector('[aria-label="Close terminal Terminal A"]').focus();
+  host.querySelector('[aria-label="Close terminal Terminal A"]').click();
+  await until(() => errors.length === 3 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "failed replacement buffer");
+  assert(selected()?.textContent === "Terminal A2", "Failed replacement buffer lost the remaining tab");
+  await until(() => document.activeElement === selected(), "focus after deleting selected terminal");
+
+  // A fresh pane keeps the previous tab reachable if a reconnect buffer fails.
+  root.render(null);
+  await settle();
+  failure = "";
+  show();
+  await until(() => selected()?.textContent === "Terminal A", "reconnection fixture terminal A");
+  failure = "reconnect-buffer";
+  show({ type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [terminal("A"), terminal("A2")] } });
+  await until(() => errors.length === 4 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "failed terminal reconnection");
+  assert(selected()?.textContent === "Terminal A", "Failed reconnection left no selected tab");
+}
+
 async function commandPaletteRegression() {
   root.render(null);
   await settle();
@@ -362,6 +423,7 @@ async function responsiveFocusRegression() {
     const workspace = host.querySelector("#main-workspace");
     const scrim = host.querySelector(".mobile-scrim");
     await until(() => sidebar.contains(document.activeElement), "project drawer focus");
+    assert(document.activeElement.matches('button:not(:disabled)'), "Drawer entry focused an aside sentinel instead of an actionable button");
     assert(sidebar.getAttribute("role") === "dialog" && sidebar.getAttribute("aria-modal") === "true", "Project drawer is not exposed as a modal dialog");
     assert(workspace.getAttribute("aria-hidden") === "true", "Project drawer did not hide the workspace from assistive technology");
     assert(scrim?.tagName === "DIV" && scrim.tabIndex === -1, "Project drawer backdrop entered the tab order");
@@ -496,9 +558,13 @@ try {
   results.textContent += "PASS: changes pane waits for status before announcing a clean tree\n";
   const responsiveRan = await responsiveFocusRegression();
   results.textContent += responsiveRan ? "PASS: narrow drawer and inspector contain and restore focus\n" : "SKIP: responsive transition requires the CDP viewport bridge\n";
+  await terminalInitialFailureRegression();
+  results.textContent += "PASS: failed initial terminal activation retains a keyboard-reachable tab\n";
+  await terminalMutationFailureRegression();
+  results.textContent += "PASS: create, close and reconnect failures preserve terminal tab ownership\n";
   const phoneRan = await recoveryActionsRegression();
   results.textContent += phoneRan ? "PASS: phone-width recovery decisions remain inside the viewport\n" : "SKIP: phone geometry requires a narrow viewport\n";
-  results.textContent += `${9 + Number(responsiveRan) + Number(phoneRan)} interaction regressions passed`;
+  results.textContent += `${11 + Number(responsiveRan) + Number(phoneRan)} interaction regressions passed`;
   document.title = "PASS — Outright interaction regressions";
 } catch (error) {
   results.textContent += `\nFAIL: ${error.stack}`;

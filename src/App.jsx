@@ -321,7 +321,11 @@ export function App() {
   useLayoutEffect(() => {
     if (!isNarrow || !sidebarOpen) return;
     const sidebar = sidebarRef.current;
-    if (!sidebar?.contains(document.activeElement)) sidebar?.focus();
+    if (!sidebar?.contains(document.activeElement)) {
+      const first = sidebar?.querySelector('button:not(:disabled)');
+      if (first?.getClientRects().length) first.focus({ preventScroll: true });
+      else sidebar?.focus();
+    }
     const containFocus = (event) => {
       if (event.key !== "Tab") return;
       const focusable = focusableElements(sidebar);
@@ -345,7 +349,7 @@ export function App() {
         : sidebarRef.current?.querySelector('button:not(:disabled)');
       const active = document.activeElement;
       const fromPriorControl = intent === "opener" ? sidebarRef.current?.contains(active)
-        : active?.matches?.('[aria-label="Open projects sidebar"]');
+        : active?.matches?.('[aria-label="Open projects sidebar"]') || active === sidebarRef.current;
       if (active !== document.body && active !== target && !fromPriorControl) {
         sidebarFocusIntentRef.current = null; // Do not override a newer user focus choice.
         return;

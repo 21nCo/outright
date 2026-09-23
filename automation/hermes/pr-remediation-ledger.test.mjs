@@ -67,6 +67,20 @@ test("a recurrence reopens a resolved family and invalidates its prior assessmen
   assert.deepEqual(evaluateLedger(state).resetRequired, ["focus"]);
 });
 
+test("same-round failure reopens a one-round resolved family without stale proof", () => {
+  const state = createLedger({ prNumber: 2, prUrl: "url", head: "abc", skill });
+  const failure = { familyId: "focus", title: "Focus", round: 1, head: "a", evidence: "lost focus" };
+  recordFailure(state, failure);
+  state.families.focus.state = "resolved";
+  state.families.focus.resolution = { head: "b", evidence: "old repair" };
+  state.families.focus.assessment = { invariant: "old contract" };
+  recordFailure(state, { ...failure, head: "b", evidence: "lost again" });
+  assert.equal(state.families.focus.state, "open");
+  assert.equal(state.families.focus.resolution, undefined);
+  assert.equal(state.families.focus.assessment, undefined);
+  assert.deepEqual(state.families.focus.failedRounds, [1]);
+});
+
 test("CLI initialization creates the required reusable ledger artifact", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-ledger-"));
   try {

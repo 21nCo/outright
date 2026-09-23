@@ -84,22 +84,36 @@ function windowsProcesses(pids) {
 }
 
 function snapshotWindowsTree(child) {
-  if (process.platform !== "win32" || hasExited(child)) return;
-  const processes = windowsProcesses();
-  const root = processes.find((item) => item.ProcessId === child.pid);
-  if (!root) throw new Error(`Cannot identify owned Windows process ${child.pid}`);
-  if (child.ownedWindows?.has(child.pid) && child.ownedWindows.get(child.pid) !== root.CreatedMs) {
-    throw new Error(`Windows process ${child.pid} changed identity`);
-  }
+  if (process.platform !== "win32" || !child?.pid) return;
+  if (hasExited(child) && !child.ownedWindows?.size) return;
+  recordWindowsTree(child, windowsProcesses());
+}
+
+function recordWindowsTree(child, processes) {
   child.ownedWindows ??= new Map();
-  child.ownedWindows.set(child.pid, root.CreatedMs);
-  const frontier = [child.pid];
+  if (!hasExited(child)) {
+    const root = processes.find((item) => item.ProcessId === child.pid);
+    if (!root) throw new Error(`Cannot identify owned Windows process ${child.pid}`);
+    if (child.ownedWindows.has(child.pid) && child.ownedWindows.get(child.pid) !== root.CreatedMs) {
+      throw new Error(`Windows process ${child.pid} changed identity`);
+    }
+    child.ownedWindows.set(child.pid, root.CreatedMs);
+  }
+  // An exited leader's numeric PID may be recycled. Only traverse descendants
+  // whose recorded creation identity still matches the current snapshot.
+  const live = new Map(processes.map((item) => [item.ProcessId, item]));
+  const frontier = [...child.ownedWindows].filter(([pid, created]) =>
+    (pid !== child.pid || !hasExited(child)) && live.get(pid)?.CreatedMs === created).map(([pid]) => pid);
+  const visited = new Set(frontier);
   while (frontier.length) {
     const parent = frontier.shift();
     for (const item of processes.filter((candidate) => candidate.ParentProcessId === parent)) {
-      if (child.ownedWindows.has(item.ProcessId)) continue;
+      if (child.ownedWindows.has(item.ProcessId) && child.ownedWindows.get(item.ProcessId) !== item.CreatedMs) continue;
       child.ownedWindows.set(item.ProcessId, item.CreatedMs);
-      frontier.push(item.ProcessId);
+      if (!visited.has(item.ProcessId)) {
+        visited.add(item.ProcessId);
+        frontier.push(item.ProcessId);
+      }
     }
   }
 }
@@ -299,7 +313,7 @@ test("exited group leader cannot leave a pipe-holding descendant", { timeout: 30
       child.stdout.on("data", (chunk) => {
         fixtureOutput += chunk;
         if (fixtureOutput.includes("spawn-error:")) { reject(new Error(fixtureOutput)); return; }
-        const match = fixtureOutput.match(/descendant:(\d+)/);
+        const match = fixtureOutput.match(/descendant:(\d+):ready/);
         if (match) { descendantId = Number(match[1]); resolve(); }
       });
     });
@@ -315,7 +329,9 @@ test("exited group leader cannot leave a pipe-holding descendant", { timeout: 30
     child.stdin.end("exit\n");
     assert(await waitForExit(child, 3_000), "Leader did not exit independently");
     if (process.platform !== "win32") assert.equal(child.stdout.closed, false, "Fixture descendant did not retain the pipe");
-    process.kill(descendantId, 0);
+    if (process.platform === "win32") {
+      assert(liveWindowsOwned(child).some((item) => item.ProcessId === descendantId), "Verified Windows descendant exited before stop");
+    } else process.kill(descendantId, 0);
     await stop(child);
     assert.equal(child.stdout.closed && child.stderr.closed, true);
     if (process.platform === "win32") assert.equal(liveWindowsOwned(child).length, 0, "Owned descendant survived cleanup");
@@ -359,6 +375,28 @@ test("recycled Windows PIDs and POSIX zombie-only groups are not live owned targ
   assert.equal(posixGroupHasExecutable("4100 Z\n4100 Z+\n42 S", 4100), false);
   assert.equal(posixGroupHasExecutable("4100 Z\n4100 S+", 4100), true);
   assert.equal(posixGroupHasExecutable("42 S", 4100), true, "An unobservable group cannot be declared gone");
+});
+
+test("two Windows snapshots discover late grandchildren only below identity-matching children", () => {
+  const leader = { pid: 4100, exitCode: null, signalCode: null };
+  recordWindowsTree(leader, [
+    { ProcessId: 4100, ParentProcessId: 1, CreatedMs: 100 },
+    { ProcessId: 4101, ParentProcessId: 4100, CreatedMs: 200 },
+  ]);
+  leader.exitCode = 0;
+  recordWindowsTree(leader, [
+    { ProcessId: 4100, ParentProcessId: 1, CreatedMs: 999 },
+    { ProcessId: 4101, ParentProcessId: 4100, CreatedMs: 200 },
+    { ProcessId: 4102, ParentProcessId: 4101, CreatedMs: 300 },
+    { ProcessId: 4103, ParentProcessId: 4100, CreatedMs: 400 },
+  ]);
+  assert.equal(leader.ownedWindows.get(4102), 300);
+  assert.equal(leader.ownedWindows.has(4103), false);
+  recordWindowsTree(leader, [
+    { ProcessId: 4101, ParentProcessId: 4100, CreatedMs: 888 },
+    { ProcessId: 4104, ParentProcessId: 4101, CreatedMs: 500 },
+  ]);
+  assert.equal(leader.ownedWindows.has(4104), false);
 });
 
 test("browser interaction regressions pass in headless Chrome", { timeout: 90_000 }, async () => {
@@ -468,7 +506,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 90_00
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     assert.match(state?.title ?? "", /^PASS/, state?.text || browserOutput);
-    assert.match(state.text, /11 interaction regressions passed/);
+    assert.match(state.text, /13 interaction regressions passed/);
   } catch (error) {
     failure = error;
   } finally {
