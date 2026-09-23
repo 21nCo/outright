@@ -1,13 +1,17 @@
 # OUT-31 Accessibility and Narrow-Screen QA
 
-Date: 2026-09-23
+Updated: 2026-09-24
 
 ## Automated coverage
 
-- `npm test`: 47 tests passed, including keyboard tab navigation, safe DOM IDs, semantic roles, terminal screen-reader mode, live regions, and responsive fallback guards.
+The required `npm test` browser regression suite needs Google Chrome or Chromium;
+set `CHROME_PATH` to the executable on machines without a standard installation.
+Missing Chrome fails the suite rather than silently dropping the interaction checks.
+
+- `npm test`: 157 passed, 1 platform skip on macOS, including keyboard tab navigation, safe DOM IDs, semantic roles, terminal screen-reader mode, live regions, responsive fallbacks, and headless browser interactions.
 - `npm run build`: production client/server/Sites artifacts built successfully.
 - `npm run test:sites`: 4 Sites packaging and routing tests passed.
-- Browser interaction harness: 5 checks passed, including breakpoint synchronization, modal drawer isolation/focus containment, and inspector focus restoration.
+- Browser interaction harness: 19 checks passed, including breakpoint synchronization, modal drawer isolation/focus containment, inspector focus restoration, and terminal reconnect ownership. A separate Node test checks process cleanup after an injected browser failure.
 
 ## Manual keyboard and accessibility-tree checks
 

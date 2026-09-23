@@ -24,6 +24,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   const pendingOutputRef = useRef(null);
   const exitedIdsRef = useRef(new Set());
   const mutationRef = useRef(false);
+  const reconcilingRef = useRef(false);
+  const mountedRef = useRef(false);
   const queuedReconnectRef = useRef(null);
   const terminalsRef = useRef([]);
   const [terminals, setTerminals] = useState([]);
@@ -153,6 +155,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   }
 
   useEffect(() => {
+    mountedRef.current = true;
     const token = beginSelection();
     let cancelled = false;
     (async () => {
@@ -168,7 +171,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       } catch (error) { if (!cancelled && token === reconcileTokenRef.current) { recoverSelection(); onError(error); } }
       finally { if (!cancelled && token === reconcileTokenRef.current) { loadingRef.current = false; setLoading(false); } }
     })();
-    return () => { cancelled = true; ++reconcileTokenRef.current; pendingOutputRef.current = null; activeIdRef.current = ""; displayedCursorRef.current = 0; };
+    return () => { cancelled = true; mountedRef.current = false; ++reconcileTokenRef.current; queuedReconnectRef.current = null; pendingOutputRef.current = null; activeIdRef.current = ""; displayedCursorRef.current = 0; };
   }, [worktree.id, worktree.name, worktree.path, onError]);
 
   useEffect(() => {
@@ -207,12 +210,14 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       }
     }
     if (runtimeEvent?.type === "runtime.connected" && (runtimeEvent.payload?.replay?.requestedAfter > 0 || runtimeEvent.payload?.restarted) && activeIdRef.current) {
-      if (mutationRef.current) queuedReconnectRef.current = runtimeEvent.payload;
+      if (mutationRef.current || reconcilingRef.current) queuedReconnectRef.current = runtimeEvent.payload;
       else reconcileConnection(runtimeEvent.payload);
     }
   }, [runtimeEvent, onError, worktree.name, worktree.path]);
 
   function reconcileConnection(payload, refresh = false) {
+    if (!mountedRef.current) return;
+    reconcilingRef.current = true;
     const previousId = activeIdRef.current;
     const token = beginSelection();
     const reconcile = async () => {
@@ -226,16 +231,28 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       await activateTerminal(terminal, token);
     };
     reconcile().catch((error) => { if (token === reconcileTokenRef.current) { recoverSelection(); onError(error); } }).finally(() => {
-      if (token === reconcileTokenRef.current) { loadingRef.current = false; setLoading(false); }
+      reconcilingRef.current = false;
+      if (mountedRef.current && token === reconcileTokenRef.current) {
+        loadingRef.current = false;
+        setLoading(false);
+        drainReconnect();
+      }
     });
+  }
+
+  function drainReconnect() {
+    if (!mountedRef.current || mutationRef.current || reconcilingRef.current) return;
+    const queued = queuedReconnectRef.current;
+    queuedReconnectRef.current = null;
+    if (queued) reconcileConnection(queued, true);
   }
 
   function finishMutation(token) {
     mutationRef.current = false;
-    if (token === reconcileTokenRef.current) { loadingRef.current = false; setLoading(false); }
-    const queued = queuedReconnectRef.current;
-    queuedReconnectRef.current = null;
-    if (queued) reconcileConnection(queued, true);
+    if (!mountedRef.current || token !== reconcileTokenRef.current) return;
+    loadingRef.current = false;
+    setLoading(false);
+    drainReconnect();
   }
 
   async function createTerminal() {

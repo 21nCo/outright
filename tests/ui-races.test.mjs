@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -191,7 +191,12 @@ function terminateTree(child, signal) {
   // A detached group can outlive its leader and retain its inherited pipes.
   try { process.kill(-child.pid, signal); }
   catch (error) {
-    if (error.code === "ESRCH") return;
+    if (error.code === "ESRCH") {
+      // Chrome helpers may leave the launcher's group while inheriting its
+      // pipes. The private profile remains a stronger ownership identifier.
+      if (!pipesClosed(child)) terminateOwnedChromeHelpers(child, signal);
+      return;
+    }
     if (error.code !== "EPERM") throw error;
     // macOS Chrome may put protected helpers in its process group. The group
     // signal is rejected even though other helpers in this private profile
@@ -199,7 +204,9 @@ function terminateTree(child, signal) {
     const profileOwned = terminateOwnedChromeHelpers(child, signal);
     if (!hasExited(child)) child.kill(signal);
     else if (!pipesClosed(child) && !profileOwned) throw error;
+    return;
   }
+  if (child.profile && !pipesClosed(child)) terminateOwnedChromeHelpers(child, signal);
 }
 
 function treeGone(child) {
@@ -508,7 +515,10 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
     snapshotWindowsTree(vite);
     const executable = chromeExecutable();
     const launchedAt = new Date().toISOString();
-    browser = spawn(executable, [
+    const browserLog = path.join(profile, "chrome.log");
+    const logFd = openSync(browserLog, "w");
+    try {
+      browser = spawn(executable, [
       "--headless=new",
       "--disable-background-networking",
       "--disable-component-update",
@@ -521,16 +531,20 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
       "about:blank",
     ], {
       cwd: root,
-      stdio: ["ignore", "pipe", "pipe"],
+      // A browser helper may outlive its launcher and inherit these handles.
+      // Capture diagnostics to a private file, not pipes keeping Node alive.
+      stdio: ["ignore", logFd, logFd],
       detached: process.platform !== "win32",
       windowsHide: true,
-    });
+      });
+    } finally { closeSync(logFd); }
     browser.profile = profile;
-    let browserOutput = "";
+    const logs = () => {
+      try { return readFileSync(browserLog, "utf8").slice(-10_000); }
+      catch { return ""; }
+    };
     let browserError;
     browser.once("error", (error) => { browserError = error; });
-    browser.stdout.on("data", (chunk) => { browserOutput += chunk; });
-    browser.stderr.on("data", (chunk) => { browserOutput += chunk; });
     const diagnostic = () => JSON.stringify({ executable, pid: browser.pid, launchedAt, checkedAt: new Date().toISOString(), exitCode: browser.exitCode, signalCode: browser.signalCode, spawnError: browserError?.message });
     if (process.platform === "win32") {
       const captureDeadline = Date.now() + 10_000;
@@ -539,9 +553,9 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
         if (rootProcess) { recordWindowsTree(browser, [rootProcess]); break; }
         await new Promise((resolve) => setTimeout(resolve, 200));
       }
-      if (!browser.ownedWindows?.has(browser.pid)) throw new Error(`Cannot capture Chrome launch identity: ${diagnostic()}; output: ${browserOutput}`);
+      if (!browser.ownedWindows?.has(browser.pid)) throw new Error(`Cannot capture Chrome launch identity: ${diagnostic()}; output: ${logs()}`);
     }
-    await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, () => browserOutput, diagnostic);
+    await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, logs, diagnostic);
     snapshotWindowsTree(browser);
     const targetResponse = await fetch(`http://127.0.0.1:${debugPort}/json/new?${encodeURIComponent("about:blank")}`, { method: "PUT" });
     if (!targetResponse.ok) throw new Error(await targetResponse.text());
@@ -605,8 +619,8 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
       if (state.title.startsWith("FAIL")) throw new Error(state.text);
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    assert.match(state?.title ?? "", /^PASS/, state?.text || browserOutput);
-    assert.match(state.text, /18 interaction regressions passed/);
+    assert.match(state?.title ?? "", /^PASS/, state?.text || logs());
+    assert.match(state.text, /19 interaction regressions passed/);
     if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
   } catch (error) {
     failure = error;

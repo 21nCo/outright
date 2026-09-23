@@ -389,6 +389,72 @@ async function terminalReconnectMutationRegression() {
   assert(errors.length === 0, "Reconnect mutation reported an error");
 }
 
+async function terminalReconnectOwnershipRegression() {
+  root.render(null);
+  await settle();
+  const firstCreation = deferred();
+  let posts = 0;
+  let lists = 0;
+  let all = [terminal("A")];
+  const errors = [];
+  const onError = (error) => errors.push(error);
+  const sendRuntime = () => {};
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") {
+      posts += 1;
+      return posts === 1 ? firstCreation.promise : response(terminal("A3"));
+    }
+    if (url.pathname === "/api/terminals") { lists += 1; return response({ terminals: all }); }
+    return response({ buffer: "Running\r\n", status: "running" });
+  };
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} onError={onError} sendRuntime={sendRuntime} />);
+  show();
+  await until(() => terminalReady("Terminal A"), "terminal before overlapping reconnects");
+  const reconnect = () => ({ type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [{ ...terminal("A"), status: "exited" }] } });
+  show(reconnect());
+  await until(() => posts === 1, "first reconnect creation");
+  show(reconnect());
+  await settle();
+  assert(posts === 1, `Overlapping reconnects created ${posts} PTYs instead of coalescing`);
+  all = [terminal("A"), terminal("A2")];
+  firstCreation.resolve(response(terminal("A2")));
+  await until(() => terminalReady("Terminal A2"), "single reconciled terminal");
+  assert(posts === 1 && errors.length === 0, "Reconnect left an untracked terminal");
+
+  const pending = deferred();
+  const deleting = deferred();
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") { posts += 1; return pending.promise; }
+    if (url.pathname === "/api/terminals") { lists += 1; return response({ terminals: [terminal("A")] }); }
+    if (options.method === "DELETE") return deleting.promise;
+    return response({ buffer: "Running\r\n", status: "running" });
+  };
+  show();
+  await settle();
+  host.querySelector('[aria-label="New terminal"]').click();
+  await until(() => host.querySelector('.terminal-tabs[aria-busy="true"]'), "create before unmount");
+  show({ type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [terminal("A")] } });
+  await settle();
+  root.render(null);
+  await settle();
+  const before = [lists, posts];
+  pending.resolve(response(terminal("A3")));
+  await settle();
+  assert(lists === before[0] && posts === before[1], "Unmounted create issued a queued reconnect request");
+  show();
+  await until(() => terminalReady("Terminal A"), "terminal before unmounted delete");
+  host.querySelector('[aria-label="Close terminal Terminal A"]').click();
+  await until(() => host.querySelector('.terminal-tabs[aria-busy="true"]'), "delete before unmount");
+  show({ type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [terminal("A")] } });
+  await settle();
+  root.render(null);
+  await settle();
+  const beforeDelete = [lists, posts];
+  deleting.resolve(response({}));
+  await settle();
+  assert(lists === beforeDelete[0] && posts === beforeDelete[1], "Unmounted delete created a replacement or issued queued reconnect");
+}
+
 async function terminalBackgroundActivationRegression() {
   root.render(null);
   await settle();
@@ -780,6 +846,8 @@ try {
   results.textContent += "PASS: candidate and active exits survive failed activation and fresh running reacquisition\n";
   await terminalReconnectMutationRegression();
   results.textContent += "PASS: reconnect refreshes authoritative terminals after pending create and delete\n";
+  await terminalReconnectOwnershipRegression();
+  results.textContent += "PASS: overlapping reconnects coalesce and unmount discards queued work\n";
   await terminalBackgroundActivationRegression();
   results.textContent += "PASS: background activation settles and fits when visible\n";
   await commandPaletteRegression();
@@ -794,7 +862,7 @@ try {
   results.textContent += "PASS: create, close and reconnect failures preserve terminal tab ownership\n";
   const phoneRan = await recoveryActionsRegression();
   results.textContent += phoneRan ? "PASS: phone-width recovery decisions remain inside the viewport\n" : "SKIP: phone geometry requires a narrow viewport\n";
-  results.textContent += `${16 + Number(responsiveRan) + Number(phoneRan)} interaction regressions passed`;
+  results.textContent += `${17 + Number(responsiveRan) + Number(phoneRan)} interaction regressions passed`;
   document.title = "PASS — Outright interaction regressions";
 } catch (error) {
   results.textContent += `\nFAIL: ${error.stack}`;
