@@ -18,7 +18,7 @@ const projects = ["A", "B"].map((id) => ({ id, name: `Review ${id}`, path: `/fix
 const chats = Object.fromEntries(projects.map(({ id }) => [id, { id: `chat-${id}`, title: `Conversation ${id}`, projectId: id, worktreeId: id, worktreePath: `/fixture/${id}`, provider: "codex", messages: [], runs: [] }]));
 const terminal = (id) => ({ id: `term-${id}`, name: `Terminal ${id}`, cwd: `/fixture/${id[0]}`, status: "running" });
 const response = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
-const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+const frame = () => new Promise((resolve) => document.hidden ? setTimeout(resolve, 16) : requestAnimationFrame(resolve));
 async function settle() { await frame(); await frame(); }
 async function until(check, label) {
   const deadline = performance.now() + 5000;
@@ -72,8 +72,9 @@ async function chatRace(rejectForTrust, switchTarget = true) {
   pendingRun.resolve(rejectForTrust
     ? response({ error: "Project trust is required", code: "PROJECT_TRUST_REQUIRED", project: projects[0] }, 403)
     : response({ id: "run-A", conversationId: "chat-A", status: "running" }));
-  await settle();
-  assert(Boolean(host.querySelector('[aria-label="Stop agent"]')) === !switchTarget, switchTarget ? "A's run was attached to B" : "Current conversation did not receive its run");
+  if (switchTarget) await settle();
+  else await until(() => Boolean(host.querySelector('[aria-label="Stop active agent run"]')), "current conversation run");
+  assert(Boolean(host.querySelector('[aria-label="Stop active agent run"]')) === !switchTarget, switchTarget ? "A's run was attached to B" : "Current conversation did not receive its run");
   assert(!document.querySelector('[role="dialog"]'), "A's trust response opened in B");
 }
 

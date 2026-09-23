@@ -4,6 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { ArrowsClockwise, Plus, TerminalWindow, X } from "@phosphor-icons/react";
 import "@xterm/xterm/css/xterm.css";
 import { Button } from "@/components/ui/button";
+import { domId, nextTabIndex } from "@/lib/accessibility";
 import { api } from "@/lib/runtime-api";
 
 export function TerminalPane(props) {
@@ -27,6 +28,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       fontFamily: '"DM Sans Variable", monospace',
       fontSize: 12,
       lineHeight: 1.25,
+      screenReaderMode: true,
       scrollback: 5000,
       theme: terminalTheme(),
     });
@@ -143,13 +145,25 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     finally { if (token === reconcileTokenRef.current) setLoading(false); }
   }
 
+  function navigateTerminalTabs(event) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const currentIndex = Math.max(0, terminals.findIndex((terminal) => terminal.id === activeId));
+    const nextIndex = nextTabIndex(currentIndex, terminals.length, event.key);
+    if (nextIndex < 0) return;
+    event.preventDefault();
+    const next = terminals[nextIndex];
+    event.currentTarget.querySelector(`[data-tab-id="${CSS.escape(next.id)}"]`)?.focus();
+    selectTerminal(next);
+  }
+
   return <section className="terminal-pane" aria-label="Worktree terminals">
-    <header className="terminal-tabs" role="tablist" aria-label="Open terminals">
-      {terminals.map((terminal) => <div className={`terminal-tab ${terminal.id === activeId ? "is-active" : ""}`} key={terminal.id}><button className="terminal-tab-select" role="tab" aria-selected={terminal.id === activeId} disabled={loading} onClick={() => selectTerminal(terminal)}><TerminalWindow /><span>{terminal.name}</span></button><button className="terminal-tab-close" aria-label={`Close terminal ${terminal.name}`} disabled={loading} onClick={() => closeTerminal(terminal.id)}><X /></button></div>)}
+    <p className="sr-only" id="terminal-help">Terminal input and output. Use the left and right arrow keys on a terminal tab to switch sessions.</p>
+    <header className="terminal-tabs" role="tablist" aria-label="Open terminals" aria-orientation="horizontal" aria-busy={loading} onKeyDown={navigateTerminalTabs}>
+      {terminals.map((terminal) => <div className={`terminal-tab ${terminal.id === activeId ? "is-active" : ""}`} key={terminal.id}><button className="terminal-tab-select" id={domId("terminal-tab", terminal.id)} data-tab-id={terminal.id} role="tab" aria-selected={terminal.id === activeId} aria-controls="terminal-panel" tabIndex={terminal.id === activeId ? 0 : -1} disabled={loading} onClick={() => selectTerminal(terminal)}><TerminalWindow /><span>{terminal.name}</span></button><button className="terminal-tab-close" aria-label={`Close terminal ${terminal.name}`} disabled={loading} onClick={() => closeTerminal(terminal.id)}><X /></button></div>)}
       <Button variant="ghost" size="icon-xs" disabled={loading} onClick={createTerminal} aria-label="New terminal"><Plus /></Button>
-      {loading && <ArrowsClockwise className="spin" />}
+      {loading && <span className="terminal-loading" role="status"><ArrowsClockwise className="spin" />Loading terminal</span>}
     </header>
-    <div className="terminal-host" ref={hostRef} role="tabpanel" aria-label="Active terminal output" />
+    <div className="terminal-host" id="terminal-panel" ref={hostRef} role="tabpanel" aria-label="Active terminal output" aria-labelledby={activeId ? domId("terminal-tab", activeId) : undefined} aria-describedby="terminal-help" />
   </section>;
 }
 
