@@ -1,25 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChatCircle, FolderOpen, GitBranch, MagnifyingGlass } from "@phosphor-icons/react";
+import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { api, query as buildQuery } from "@/lib/runtime-api";
 
 export function CommandPalette({ open, onOpenChange, projects, onSelectProject, onSelectConversation }) {
   const [query, setQuery] = useState("");
-  const [remote, setRemote] = useState({ query: "", conversations: [], messages: [], loading: false });
+  const [remote, setRemote] = useState({ query: "", conversations: [], messages: [], loading: false, error: null });
+  const [searchAttempt, setSearchAttempt] = useState(0);
   const [activeIndex, setActiveIndex] = useState(-1);
   const resultsRef = useRef(null);
   const normalizedQuery = query.trim();
   useEffect(() => {
     if (!open) setQuery("");
-    if (!open || normalizedQuery.length < 2) { setRemote({ query: normalizedQuery, conversations: [], messages: [], loading: false }); return; }
+    if (!open || normalizedQuery.length < 2) { setRemote({ query: normalizedQuery, conversations: [], messages: [], loading: false, error: null }); return; }
     const controller = new AbortController();
-    setRemote({ query: normalizedQuery, conversations: [], messages: [], loading: true });
+    setRemote({ query: normalizedQuery, conversations: [], messages: [], loading: true, error: null });
     const timer = window.setTimeout(() => api(buildQuery("/api/search", { q: normalizedQuery }), { signal: controller.signal })
-      .then((result) => { if (!controller.signal.aborted) setRemote({ query: normalizedQuery, ...result, loading: false }); })
-      .catch(() => { if (!controller.signal.aborted) setRemote({ query: normalizedQuery, conversations: [], messages: [], loading: false }); }), 180);
+      .then((result) => { if (!controller.signal.aborted) setRemote({ query: normalizedQuery, ...result, loading: false, error: null }); })
+      .catch(() => { if (!controller.signal.aborted) setRemote({ query: normalizedQuery, conversations: [], messages: [], loading: false, error: "Conversation search failed." }); }), 180);
     return () => { controller.abort(); window.clearTimeout(timer); };
-  }, [open, normalizedQuery]);
+  }, [open, normalizedQuery, searchAttempt]);
   const local = useMemo(() => {
     const needle = normalizedQuery.toLowerCase();
     if (!needle) return [];
@@ -29,6 +31,7 @@ export function CommandPalette({ open, onOpenChange, projects, onSelectProject, 
     ]).slice(0, 12);
   }, [projects, normalizedQuery]);
   const remoteConversations = remote.query === normalizedQuery ? remote.conversations : [];
+  const remoteError = remote.query === normalizedQuery ? remote.error : null;
   const results = useMemo(() => [
     ...local,
     ...remoteConversations.map((conversation) => ({ type: "conversation", conversation })),
@@ -56,7 +59,8 @@ export function CommandPalette({ open, onOpenChange, projects, onSelectProject, 
       ? <button id={`command-result-${index}`} data-result-index={index} role="option" aria-selected={activeIndex === index} className={activeIndex === index ? "is-active" : ""} tabIndex={-1} key={item.conversation.id} onMouseMove={() => setActiveIndex(index)} onClick={() => select(item)}><ChatCircle /><span><strong>{item.conversation.title}</strong><small>{item.conversation.provider} · {item.conversation.worktreePath}</small></span></button>
       : <button id={`command-result-${index}`} data-result-index={index} role="option" aria-selected={activeIndex === index} className={activeIndex === index ? "is-active" : ""} tabIndex={-1} key={`${item.type}:${item.project.id}:${item.worktree?.id ?? ""}`} onMouseMove={() => setActiveIndex(index)} onClick={() => select(item)}>{item.type === "project" ? <FolderOpen /> : <GitBranch />}<span><strong>{item.type === "project" ? item.project.name : item.worktree.name}</strong><small>{item.project.name}{item.worktree ? ` · ${item.worktree.branch}` : ""}</small></span></button>)}
     </div>
-    {normalizedQuery.length >= 2 && !remote.loading && !results.length && <p className="no-results">No matching projects or conversations.</p>}
-    <span className="sr-only" role="status" aria-live="polite">{!normalizedQuery ? "Type to search" : remote.loading ? "Searching" : `${results.length} results`}</span>
+    {normalizedQuery.length >= 2 && !remote.loading && remoteError && <div className="command-error" role="alert"><span>{results.length ? "Conversation search failed. Showing local matches only." : "Search failed. Try again."}</span><Button size="sm" variant="outline" onClick={() => setSearchAttempt((current) => current + 1)}>Retry search</Button></div>}
+    {normalizedQuery.length >= 2 && !remote.loading && !remoteError && !results.length && <p className="no-results">No matching projects or conversations.</p>}
+    <span className="sr-only" role="status" aria-live="polite">{!normalizedQuery ? "Type to search" : remote.loading ? "Searching" : remoteError ? (results.length ? `${results.length} local results` : "Search failed") : `${results.length} results`}</span>
   </div></DialogContent></Dialog>;
 }

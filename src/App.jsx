@@ -78,8 +78,7 @@ export function App() {
   const stickToBottomRef = useRef(true);
   const pendingPrependScrollRef = useRef(null);
   const sidebarRef = useRef(null);
-  const sidebarReturnFocusRef = useRef(false);
-  const sidebarFocusOnOpenRef = useRef(false);
+  const sidebarFocusIntentRef = useRef(null);
   const inspectorRef = useRef(null);
   const inspectorInvokerRef = useRef(null);
   const inspectorReturnFocusRef = useRef(null);
@@ -291,8 +290,9 @@ export function App() {
       if (narrow.matches === wasNarrow) return;
       wasNarrow = narrow.matches;
       const activeElement = document.activeElement;
-      if (wasNarrow) sidebarReturnFocusRef.current = Boolean(sidebarRef.current?.contains(activeElement));
-      else sidebarFocusOnOpenRef.current = activeElement?.matches?.('[aria-label="Open projects sidebar"]') ?? false;
+      sidebarFocusIntentRef.current = wasNarrow
+        ? (sidebarRef.current?.contains(activeElement) ? "opener" : null)
+        : (activeElement?.matches?.('[aria-label="Open projects sidebar"]') ? "sidebar" : null);
       setIsNarrow(wasNarrow);
       setSidebarOpen(!wasNarrow);
     };
@@ -306,7 +306,7 @@ export function App() {
   useLayoutEffect(() => {
     if (!isNarrow || !sidebarOpen) return;
     const sidebar = sidebarRef.current;
-    sidebar?.focus();
+    if (!sidebar?.contains(document.activeElement)) sidebar?.focus();
     const containFocus = (event) => {
       if (event.key !== "Tab") return;
       const focusable = focusableElements(sidebar);
@@ -320,15 +320,19 @@ export function App() {
     return () => sidebar?.removeEventListener("keydown", containFocus);
   }, [isNarrow, sidebarOpen]);
   useLayoutEffect(() => {
-    if (sidebarOpen || !sidebarReturnFocusRef.current) return;
-    sidebarReturnFocusRef.current = false;
-    document.querySelector('[aria-label="Open projects sidebar"]')?.focus({ preventScroll: true });
-  }, [sidebarOpen]);
-  useLayoutEffect(() => {
-    if (!sidebarOpen || !sidebarFocusOnOpenRef.current) return;
-    sidebarFocusOnOpenRef.current = false;
-    sidebarRef.current?.querySelector('button:not(:disabled)')?.focus({ preventScroll: true });
-  }, [sidebarOpen]);
+    const intent = sidebarFocusIntentRef.current;
+    if (intent === "opener") {
+      if (sidebarOpen) return;
+      sidebarFocusIntentRef.current = null;
+      document.querySelector('[aria-label="Open projects sidebar"]')?.focus({ preventScroll: true });
+      return;
+    }
+    if (intent === "sidebar") {
+      if (!sidebarOpen) return;
+      sidebarFocusIntentRef.current = null;
+      sidebarRef.current?.querySelector('button:not(:disabled)')?.focus({ preventScroll: true });
+    }
+  }, [isNarrow, sidebarOpen]);
   useLayoutEffect(() => {
     if (!inspector) return;
     inspectorRef.current?.querySelector('[role="tab"][aria-selected="true"]')?.focus({ preventScroll: true });
@@ -419,8 +423,15 @@ export function App() {
   }
 
   function closeSidebar() {
-    sidebarReturnFocusRef.current = true;
+    if (!sidebarOpen) return;
+    sidebarFocusIntentRef.current = "opener";
     setSidebarOpen(false);
+  }
+
+  function openSidebar() {
+    if (sidebarOpen) return;
+    sidebarFocusIntentRef.current = "sidebar";
+    setSidebarOpen(true);
   }
 
   function toggleInspector(nextInspector, invoker) {
@@ -445,10 +456,12 @@ export function App() {
     buttons[nextTabIndex(currentIndex, buttons.length, event.key)]?.focus();
   }
 
-  function navigateTabs(event, selector, currentId, choose) {
+  function navigateTabs(event, selector, choose) {
     if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+    const current = event.target.closest?.(selector);
+    if (!current || !event.currentTarget.contains(current)) return;
     const tabs = [...event.currentTarget.querySelectorAll(selector)];
-    const currentIndex = Math.max(0, tabs.findIndex((tab) => tab.dataset.tabId === currentId));
+    const currentIndex = tabs.indexOf(current);
     const nextIndex = nextTabIndex(currentIndex, tabs.length, event.key);
     if (nextIndex < 0) return;
     event.preventDefault();
@@ -593,8 +606,8 @@ export function App() {
     {isNarrow && sidebarOpen && <div className="mobile-scrim" onClick={closeSidebar} aria-hidden="true" />}
 
     <main id="main-workspace" className={`workspace ${inspector ? "has-inspector" : ""}`} inert={isNarrow && sidebarOpen ? true : undefined} aria-hidden={isNarrow && sidebarOpen ? true : undefined}>
-      <header className="workspace-bar">{!sidebarOpen && <Button variant="ghost" size="icon-sm" onClick={() => setSidebarOpen(true)} aria-label="Open projects sidebar" aria-controls="project-sidebar" aria-expanded={sidebarOpen}><SidebarSimple /></Button>}<div className="workspace-context"><span>{project.name}</span><CaretRight /><GitBranch /><strong>{worktree.name}</strong></div><div className="workspace-tools"><RunState run={activeRun ?? latestRun} /><WorktreeState worktree={worktree} /><Tooltip><TooltipTrigger render={<Button variant={inspector === "changes" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("changes", event.currentTarget)} aria-label="Changes" aria-controls="workspace-inspector" aria-expanded={inspector === "changes"} />}><GitDiff /></TooltipTrigger><TooltipContent>Changes</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "terminal" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("terminal", event.currentTarget)} aria-label="Terminal" aria-controls="workspace-inspector" aria-expanded={inspector === "terminal"} />}><TerminalWindow /></TooltipTrigger><TooltipContent>Terminal ⌘⇧T</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "context" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("context", event.currentTarget)} aria-label="Project context" aria-controls="workspace-inspector" aria-expanded={inspector === "context"} />}><Info /></TooltipTrigger><TooltipContent>Project context</TooltipContent></Tooltip><ThemeMenu theme={theme} onThemeChange={setTheme} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Worktree options" />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, editor: settings.editor } }).then(() => setToast(`Opened in ${settings.editor}`)).catch((nextError) => setError(nextError.message))}><PencilSimple />Open in {settings.editor}</DropdownMenuItem><DropdownMenuItem onClick={() => setWorktreeDialog(project)}><GitBranch />New worktree</DropdownMenuItem>{worktree.isLinked && <><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onClick={() => setRemoveWorktreeOpen(true)}><Trash />Remove worktree</DropdownMenuItem></>}</DropdownMenuContent></DropdownMenu></div></header>
-      <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll" role="tablist" aria-label="Open agent chats" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', selectedConversationId, setSelectedConversationId)}>{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={() => { dragConversationRef.current = item.id; }} onDragOver={(event) => event.preventDefault()} onDrop={() => reorderConversation(item.id)}><button className="tab-select" id={domId("chat-tab", item.id)} data-tab-id={item.id} role="tab" aria-selected={item.id === selectedConversationId} aria-controls="conversation-panel" tabIndex={item.id === selectedConversationId ? 0 : -1} onClick={() => setSelectedConversationId(item.id)} onDoubleClick={() => { setSelectedConversationId(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); api(`/api/conversations/${item.id}`, { method: "PATCH", body: { archived: true } }).then(() => loadConversations()).catch((nextError) => setError(nextError.message)); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
+      <header className="workspace-bar">{!sidebarOpen && <Button variant="ghost" size="icon-sm" onClick={openSidebar} aria-label="Open projects sidebar" aria-controls="project-sidebar" aria-expanded={sidebarOpen}><SidebarSimple /></Button>}<div className="workspace-context"><span>{project.name}</span><CaretRight /><GitBranch /><strong>{worktree.name}</strong></div><div className="workspace-tools"><RunState run={activeRun ?? latestRun} /><WorktreeState worktree={worktree} /><Tooltip><TooltipTrigger render={<Button variant={inspector === "changes" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("changes", event.currentTarget)} aria-label="Changes" aria-controls="workspace-inspector" aria-expanded={inspector === "changes"} />}><GitDiff /></TooltipTrigger><TooltipContent>Changes</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "terminal" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("terminal", event.currentTarget)} aria-label="Terminal" aria-controls="workspace-inspector" aria-expanded={inspector === "terminal"} />}><TerminalWindow /></TooltipTrigger><TooltipContent>Terminal ⌘⇧T</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "context" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("context", event.currentTarget)} aria-label="Project context" aria-controls="workspace-inspector" aria-expanded={inspector === "context"} />}><Info /></TooltipTrigger><TooltipContent>Project context</TooltipContent></Tooltip><ThemeMenu theme={theme} onThemeChange={setTheme} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Worktree options" />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, editor: settings.editor } }).then(() => setToast(`Opened in ${settings.editor}`)).catch((nextError) => setError(nextError.message))}><PencilSimple />Open in {settings.editor}</DropdownMenuItem><DropdownMenuItem onClick={() => setWorktreeDialog(project)}><GitBranch />New worktree</DropdownMenuItem>{worktree.isLinked && <><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onClick={() => setRemoveWorktreeOpen(true)}><Trash />Remove worktree</DropdownMenuItem></>}</DropdownMenuContent></DropdownMenu></div></header>
+      <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll" role="tablist" aria-label="Open agent chats" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', setSelectedConversationId)}>{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={() => { dragConversationRef.current = item.id; }} onDragOver={(event) => event.preventDefault()} onDrop={() => reorderConversation(item.id)}><button className="tab-select" id={domId("chat-tab", item.id)} data-tab-id={item.id} role="tab" aria-selected={item.id === selectedConversationId} aria-controls="conversation-panel" tabIndex={item.id === selectedConversationId ? 0 : -1} onClick={() => setSelectedConversationId(item.id)} onDoubleClick={() => { setSelectedConversationId(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); api(`/api/conversations/${item.id}`, { method: "PATCH", body: { archived: true } }).then(() => loadConversations()).catch((nextError) => setError(nextError.message)); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
       <div className="work-area">
         <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
           <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} onManage={openManageChat} />
@@ -602,7 +615,7 @@ export function App() {
           {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}
           <form className="composer" onSubmit={sendPrompt}><textarea aria-label="Message the agent" disabled={Boolean(interruptedRun)} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={setDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running" role="status" aria-live="polite"><span className="status-dot demo" aria-hidden="true" />Agent is {activeRun.status}</span> : interruptedRun ? <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Recovery decision required</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun)} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
         </section>
-        {inspector && <aside className="inspector" id="workspace-inspector" aria-label="Workspace inspector" tabIndex={-1} ref={inspectorRef}><header><nav role="tablist" aria-label="Inspector panels" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', inspector, setInspector)}><button id="inspector-tab-changes" data-tab-id="changes" role="tab" className={inspector === "changes" ? "is-active" : ""} aria-selected={inspector === "changes"} aria-controls="inspector-content" tabIndex={inspector === "changes" ? 0 : -1} onClick={() => setInspector("changes")}><GitDiff />Changes</button><button id="inspector-tab-terminal" data-tab-id="terminal" role="tab" className={inspector === "terminal" ? "is-active" : ""} aria-selected={inspector === "terminal"} aria-controls="inspector-content" tabIndex={inspector === "terminal" ? 0 : -1} onClick={() => setInspector("terminal")}><TerminalWindow />Terminal</button><button id="inspector-tab-context" data-tab-id="context" role="tab" className={inspector === "context" ? "is-active" : ""} aria-selected={inspector === "context"} aria-controls="inspector-content" tabIndex={inspector === "context" ? 0 : -1} onClick={() => setInspector("context")}><TreeStructure />Context</button></nav><Button variant="ghost" size="icon-xs" onClick={closeInspector} aria-label="Close inspector"><X /></Button></header><div className="inspector-body" id="inspector-content" role="tabpanel" aria-labelledby={`inspector-tab-${inspector}`}>{inspector === "changes" && <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />}{inspector === "terminal" && <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} sendRuntime={sendRuntime} onError={handleError} />}{inspector === "context" && <ContextPane worktree={worktree} settings={settings} onError={handleError} />}</div></aside>}
+        {inspector && <aside className="inspector" id="workspace-inspector" aria-label="Workspace inspector" tabIndex={-1} ref={inspectorRef}><header><nav role="tablist" aria-label="Inspector panels" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', setInspector)}><button id="inspector-tab-changes" data-tab-id="changes" role="tab" className={inspector === "changes" ? "is-active" : ""} aria-selected={inspector === "changes"} aria-controls="inspector-content" tabIndex={inspector === "changes" ? 0 : -1} onClick={() => setInspector("changes")}><GitDiff />Changes</button><button id="inspector-tab-terminal" data-tab-id="terminal" role="tab" className={inspector === "terminal" ? "is-active" : ""} aria-selected={inspector === "terminal"} aria-controls="inspector-content" tabIndex={inspector === "terminal" ? 0 : -1} onClick={() => setInspector("terminal")}><TerminalWindow />Terminal</button><button id="inspector-tab-context" data-tab-id="context" role="tab" className={inspector === "context" ? "is-active" : ""} aria-selected={inspector === "context"} aria-controls="inspector-content" tabIndex={inspector === "context" ? 0 : -1} onClick={() => setInspector("context")}><TreeStructure />Context</button></nav><Button variant="ghost" size="icon-xs" onClick={closeInspector} aria-label="Close inspector"><X /></Button></header><div className="inspector-body" id="inspector-content" role="tabpanel" aria-labelledby={`inspector-tab-${inspector}`}>{inspector === "changes" && <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />}{inspector === "terminal" && <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} sendRuntime={sendRuntime} onError={handleError} />}{inspector === "context" && <ContextPane worktree={worktree} settings={settings} onError={handleError} />}</div></aside>}
       </div>
     </main>
 

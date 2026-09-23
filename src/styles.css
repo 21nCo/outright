@@ -466,6 +466,7 @@ select { height: 34px; padding: 0 28px 0 10px; border: 1px solid var(--input); b
 .command-hint span { display: flex; align-items: center; gap: 4px; font-size: 10px; }
 kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--line-soft); border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; background: var(--subtle-canvas); font-size: 9px; }
 .no-results { padding: 35px; color: var(--muted-foreground); text-align: center; font-size: 11px; }
+.command-error { padding: 24px; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--destructive); text-align: center; font-size: 11px; }
 .settings-dialog { max-width: 680px; max-height: min(820px, calc(100vh - 40px)); overflow-y: auto; }
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 18px; }
 .setting-row { display: flex; flex-direction: column; gap: 6px; }
@@ -551,6 +552,9 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .commit-bar button { width: 100%; }
   .terminal-tab { min-width: 130px; }
   .terminal-loading { font-size: 0; }
+  .recovery-notice { flex-wrap: wrap; }
+  .recovery-actions { width: 100%; flex: 0 0 100%; align-items: stretch; }
+  .recovery-actions [data-slot="button"] { width: 100%; min-width: 0; white-space: normal; }
 }
 
 @media (prefers-reduced-motion: reduce) {

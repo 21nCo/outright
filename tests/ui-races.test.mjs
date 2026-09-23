@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
+const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
+const stubbornChild = path.join(root, "tests", "fixtures", "stubborn-child.mjs");
 
 function chromeExecutable() {
   const candidates = [
@@ -50,14 +52,36 @@ async function waitForServer(url, child, logs) {
   throw new Error(`Timed out waiting for ${url}:\n${logs()}`);
 }
 
+function hasExited(child) {
+  return !child || child.exitCode !== null || child.signalCode !== null;
+}
+
+function waitForExit(child, timeout) {
+  if (hasExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const exited = () => { clearTimeout(timer); resolve(true); };
+    const timer = setTimeout(() => { child.off("exit", exited); resolve(false); }, timeout);
+    child.once("exit", exited);
+  });
+}
+
+function terminateTree(child, signal) {
+  if (hasExited(child)) return;
+  if (process.platform === "win32") {
+    if (signal === "SIGKILL") spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+    else child.kill();
+    return;
+  }
+  try { process.kill(-child.pid, signal); }
+  catch (error) { if (error.code !== "ESRCH") throw error; }
+}
+
 async function stop(child) {
-  if (!child || child.exitCode !== null) return;
-  child.kill();
-  await Promise.race([
-    new Promise((resolve) => child.once("exit", resolve)),
-    new Promise((resolve) => setTimeout(resolve, 2_000)),
-  ]);
-  if (child.exitCode === null) child.kill("SIGKILL");
+  if (hasExited(child)) return;
+  terminateTree(child, "SIGTERM");
+  if (await waitForExit(child, 2_000)) return;
+  terminateTree(child, "SIGKILL");
+  if (!await waitForExit(child, 5_000)) throw new Error(`Process ${child.pid} did not exit after forced termination`);
 }
 
 async function waitForJson(url, child, logs) {
@@ -97,17 +121,54 @@ function connectDevTools(url) {
       if (payload.error) fail(new Error(payload.error.message));
       else done(payload.result);
     });
+    socket.on("close", () => {
+      for (const { fail } of pending.values()) fail(new Error("DevTools connection closed"));
+      pending.clear();
+    });
   });
 }
+
+async function closeDevTools(devtools) {
+  if (!devtools) return;
+  try {
+    await Promise.race([
+      devtools.send("Browser.close"),
+      new Promise((resolve) => setTimeout(resolve, 1_000)),
+    ]);
+  } catch { /* Forced process cleanup below remains authoritative. */ }
+  if (devtools.socket.readyState >= WebSocket.CLOSING) return;
+  await Promise.race([
+    new Promise((resolve) => devtools.socket.once("close", resolve)),
+    new Promise((resolve) => setTimeout(resolve, 1_000)),
+  ]);
+  if (devtools.socket.readyState < WebSocket.CLOSING) devtools.socket.close();
+}
+
+test("forced process cleanup waits for the child exit", { timeout: 15_000 }, async () => {
+  const child = spawn(process.execPath, [stubbornChild], {
+    cwd: root,
+    detached: process.platform !== "win32",
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.stdout.once("data", resolve);
+  });
+  await stop(child);
+  assert.equal(hasExited(child), true);
+});
 
 test("browser interaction regressions pass in headless Chrome", { timeout: 90_000 }, async () => {
   const port = await unusedPort();
   const debugPort = await unusedPort();
   const profile = mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
-  const vite = spawn(process.platform === "win32" ? "npm.cmd" : "npm", ["exec", "--", "vite", "--config", "tests/vite.ui-races.config.mjs", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
+  const vite = spawn(process.execPath, [viteCli, "--config", "tests/vite.ui-races.config.mjs", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
     cwd: root,
     env: { ...process.env, NO_COLOR: "1" },
     stdio: ["ignore", "pipe", "pipe"],
+    detached: process.platform !== "win32",
+    windowsHide: true,
   });
   let output = "";
   vite.stdout.on("data", (chunk) => { output += chunk; });
@@ -132,16 +193,21 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 90_00
     ], {
       cwd: root,
       stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+      windowsHide: true,
     });
     let browserOutput = "";
     browser.stdout.on("data", (chunk) => { browserOutput += chunk; });
     browser.stderr.on("data", (chunk) => { browserOutput += chunk; });
     await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, () => browserOutput);
-    const targetResponse = await fetch(`http://127.0.0.1:${debugPort}/json/new?${encodeURIComponent(url)}`, { method: "PUT" });
+    const targetResponse = await fetch(`http://127.0.0.1:${debugPort}/json/new?${encodeURIComponent("about:blank")}`, { method: "PUT" });
     if (!targetResponse.ok) throw new Error(await targetResponse.text());
     const target = await targetResponse.json();
     devtools = await connectDevTools(target.webSocketDebuggerUrl);
     await devtools.send("Runtime.enable");
+    await devtools.send("Page.enable");
+    await devtools.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: false });
+    await devtools.send("Page.navigate", { url });
     const deadline = Date.now() + 30_000;
     let state;
     while (Date.now() < deadline) {
@@ -155,11 +221,11 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 90_00
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     assert.match(state?.title ?? "", /^PASS/, state?.text || browserOutput);
-    assert.match(state.text, /8 interaction regressions passed/);
+    assert.match(state.text, /10 interaction regressions passed/);
   } finally {
-    devtools?.socket.close();
+    await closeDevTools(devtools);
     await stop(browser);
     await stop(vite);
-    rmSync(profile, { recursive: true, force: true });
+    rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });

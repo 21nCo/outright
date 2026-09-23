@@ -31,7 +31,7 @@ async function until(check, label) {
   }
 }
 function assert(value, message) { if (!value) throw new Error(message); }
-function deferred() { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; }
+function deferred() { let resolve; let reject; const promise = new Promise((done, fail) => { resolve = done; reject = fail; }); return { promise, resolve, reject }; }
 function setControlValue(control, value) {
   const prototype = control instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
   Object.getOwnPropertyDescriptor(prototype, "value").set.call(control, value);
@@ -119,6 +119,31 @@ async function terminalRace() {
   assert(errors.length === 0, "Terminal reconciliation reported errors");
 }
 
+async function chatTabControlRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const secondChat = { ...chats.A, id: "chat-A2", title: "Conversation A2" };
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A, secondChat] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/conversations/chat-A2") return response(secondChat);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelectorAll('[role="tab"][id^="chat-tab-"]').length === 2, "two chat tabs");
+  const selected = host.querySelector('[role="tab"][aria-selected="true"]');
+  const archive = host.querySelector('[aria-label="Archive Conversation A"]');
+  archive.focus();
+  for (const key of ["ArrowRight", "Home", "End"]) {
+    archive.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+    await settle();
+    assert(document.activeElement === archive, `Chat tablist handled ${key} from the Archive control`);
+    assert(selected.getAttribute("aria-selected") === "true", `Chat selection changed after ${key} on the Archive control`);
+  }
+}
+
 async function terminalKeyboardRegression() {
   root.render(null);
   await settle();
@@ -157,13 +182,25 @@ async function commandPaletteRegression() {
   await settle();
   const oldResults = deferred();
   const currentResults = deferred();
+  const retryResults = deferred();
+  const staleFailure = deferred();
+  const latestResults = deferred();
   const requested = new Set();
+  let failureRequests = 0;
   let selected = null;
   route = async (url) => {
     if (url.pathname !== "/api/search") return response({});
     const search = url.searchParams.get("q");
     requested.add(search);
-    return search === "older" ? oldResults.promise : currentResults.promise;
+    if (search === "older") return oldResults.promise;
+    if (search === "current") return currentResults.promise;
+    if (search === "failure") {
+      failureRequests += 1;
+      if (failureRequests === 1) throw new Error("Search service unavailable");
+      return retryResults.promise;
+    }
+    if (search === "stale-failure") return staleFailure.promise;
+    return latestResults.promise;
   };
   root.render(<CommandPalette open onOpenChange={() => {}} projects={[]} onSelectProject={() => {}} onSelectConversation={(conversation) => { selected = conversation; }} />);
   await until(() => document.querySelector('[role="combobox"]'), "command palette input");
@@ -184,6 +221,27 @@ async function commandPaletteRegression() {
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
   assert(selected?.id === "current", "Enter did not select the asynchronously loaded command result");
   assert([...document.querySelector('[role="listbox"]').children].every((element) => element.getAttribute("role") === "option"), "Command listbox contains non-option children");
+
+  setControlValue(input, "failure");
+  await until(() => failureRequests === 1, "failed command search");
+  await until(() => document.querySelector(".command-error"), "command search failure message");
+  assert(document.querySelector(".command-error").textContent.includes("Search failed"), "Command search failure was reported as an empty result");
+  assert(!document.querySelector(".no-results"), "Command search failure also rendered the no-results state");
+  document.querySelector(".command-error button").click();
+  await until(() => failureRequests === 2, "retried command search");
+  retryResults.resolve(response({ conversations: [{ id: "retry", title: "Retry result", provider: "codex", worktreePath: "/retry" }], messages: [] }));
+  await until(() => document.querySelector('[role="option"]')?.textContent.includes("Retry result"), "retried command result");
+  assert(!document.querySelector(".command-error"), "Successful retry left the search failure visible");
+
+  setControlValue(input, "stale-failure");
+  await until(() => requested.has("stale-failure"), "stale failed search");
+  setControlValue(input, "latest");
+  await until(() => requested.has("latest"), "latest search after failure");
+  staleFailure.reject(new Error("Stale search failed"));
+  await settle();
+  assert(!document.querySelector(".command-error"), "A stale failed search replaced the current query state");
+  latestResults.resolve(response({ conversations: [{ id: "latest", title: "Latest result", provider: "codex", worktreePath: "/latest" }], messages: [] }));
+  await until(() => document.querySelector('[role="option"]')?.textContent.includes("Latest result"), "latest result after stale failure");
 }
 
 async function changesLoadingRegression() {
@@ -242,14 +300,16 @@ async function responsiveFocusRegression() {
     host.querySelector('[aria-label="Open projects sidebar"]').click();
     await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", "reopened desktop sidebar");
 
-    const desktopSidebarControl = host.querySelector('[aria-label="Close projects sidebar"]');
-    desktopSidebarControl.focus();
-    setNarrow(true);
-    await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), "sidebar closed from focused desktop control");
-    await until(() => document.activeElement === host.querySelector('[aria-label="Open projects sidebar"]'), "focus restored after hiding desktop sidebar");
-    setNarrow(false);
-    await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", "sidebar reopened after wide transition");
-    await until(() => host.querySelector("#project-sidebar").contains(document.activeElement), "sidebar focus after wide transition");
+    for (let round = 0; round < 3; round += 1) {
+      const desktopSidebarControl = host.querySelector('[aria-label="Close projects sidebar"]');
+      desktopSidebarControl.focus();
+      setNarrow(true);
+      await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), `sidebar closed from focused desktop control ${round + 1}`);
+      await until(() => document.activeElement === host.querySelector('[aria-label="Open projects sidebar"]'), `focus restored after hiding desktop sidebar ${round + 1}`);
+      setNarrow(false);
+      await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", `sidebar reopened after wide transition ${round + 1}`);
+      await until(() => host.querySelector("#project-sidebar").contains(document.activeElement), `sidebar focus after wide transition ${round + 1}`);
+    }
 
     const composer = host.querySelector('textarea[aria-label="Message the agent"]');
     composer.focus();
@@ -319,6 +379,30 @@ async function responsiveFocusRegression() {
   }
 }
 
+async function recoveryActionsRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const interrupted = { id: "run-interrupted", conversationId: "chat-A", status: "interrupted", recoveryClass: "exited", provider: "codex", providerSessionId: "session-A" };
+  const recoveryChat = { ...chats.A, providerSessionId: "session-A", runs: [interrupted] };
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [recoveryChat] });
+    if (url.pathname === "/api/conversations/chat-A") return response(recoveryChat);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelectorAll(".recovery-actions button").length === 3, "owner recovery actions");
+  assert(window.matchMedia("(max-width: 520px)").matches, "Recovery layout test did not run at phone width");
+  const noticeRect = host.querySelector(".recovery-notice").getBoundingClientRect();
+  const buttons = [...host.querySelectorAll(".recovery-actions button")];
+  for (const button of buttons) {
+    const rect = button.getBoundingClientRect();
+    assert(rect.left >= noticeRect.left - 1 && rect.right <= noticeRect.right + 1, `${button.textContent.trim()} overflowed the recovery notice`);
+    assert(rect.right <= window.innerWidth + 1, `${button.textContent.trim()} was outside the phone viewport`);
+  }
+}
+
 try {
   await chatRace(false, false);
   results.textContent = "PASS: sending in the current conversation shows its run\n";
@@ -326,6 +410,8 @@ try {
   results.textContent += "PASS: delayed send cannot attach A's run to B\n";
   await chatRace(true);
   results.textContent += "PASS: delayed trust response cannot target another conversation\n";
+  await chatTabControlRegression();
+  results.textContent += "PASS: chat tab navigation ignores nested archive controls\n";
   await terminalRace();
   results.textContent += "PASS: worktree switch removes old terminal tabs and rejects stale buffer responses\n";
   await terminalKeyboardRegression();
@@ -335,7 +421,9 @@ try {
   await changesLoadingRegression();
   results.textContent += "PASS: changes pane waits for status before announcing a clean tree\n";
   await responsiveFocusRegression();
-  results.textContent += "PASS: narrow drawer and inspector contain and restore focus\n8 interaction regressions passed";
+  results.textContent += "PASS: narrow drawer and inspector contain and restore focus\n";
+  await recoveryActionsRegression();
+  results.textContent += "PASS: phone-width recovery decisions remain inside the viewport\n10 interaction regressions passed";
   document.title = "PASS — Outright interaction regressions";
 } catch (error) {
   results.textContent += `\nFAIL: ${error.stack}`;
