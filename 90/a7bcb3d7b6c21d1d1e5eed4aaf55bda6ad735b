@@ -1,0 +1,31 @@
+server/git-service.test.mjs
+  s_6126673cc0a89e::t_684572956acbf7 27-28,40-46
+server/database.test.mjs
+  s_6126673cc0a89e::t_684572956acbf7 166-188
+server/agent-manager.test.mjs
+  s_6126673cc0a89e::t_684572956acbf7 1140
+server/git-service.mjs
+  s_6126673cc0a89e::t_684572956acbf7 92-94
+server/outright-runtime.mjs
+  s_6126673cc0a89e::t_684572956acbf7 9,19-22
+server/agent-manager.mjs
+  s_6126673cc0a89e::t_684572956acbf7 127
+server/agent-supervisor-darwin.c
+  s_6126673cc0a89e::t_684572956acbf7 260-263
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "90a7bcb3d7b6c21d1d1e5eed4aaf55bda6ad735b",
+  "prompts": {},
+  "sessions": {
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
