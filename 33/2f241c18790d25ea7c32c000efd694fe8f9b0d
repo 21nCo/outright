@@ -1,0 +1,37 @@
+automation/hermes/pr-remediation-ledger.mjs
+  s_28d4128c7417df::t_4488144e3a192b 61,64-66
+automation/hermes/pr-remediation-ledger.test.mjs
+  s_28d4128c7417df::t_48a1dc7f667c11 57-69
+src/App.jsx
+  s_28d4128c7417df::t_db6d6174f65262 82,282-283,291-298,303-308,314,318,339-364
+src/components/TerminalPane.jsx
+  s_dbeaf6beea25e6::t_4c94c4b15aa8e4 145-152
+src/styles.css
+  s_dbeaf6beea25e6::t_75bfa4abe542e6 502-504,558
+tests/fixtures/exited-leader.mjs
+  s_dbeaf6beea25e6::t_c4182019fad334 4-5,9-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "332f241c18790d25ea7c32c000efd694fe8f9b0d",
+  "prompts": {},
+  "sessions": {
+    "s_28d4128c7417df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1c1c580e-3b46-4699-b932-7f146605890c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_dbeaf6beea25e6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c886-73ef-72c2-b7ee-54bc7cc84533",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
