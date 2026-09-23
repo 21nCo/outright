@@ -1,0 +1,19 @@
+tests/ui-races.jsx
+  s_621f2416635dac::t_e275766dd5a1b1 313-416,421,427,431-434,640-645,779-784,797
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a96c0ced5c61f9f7aa0c92bdf39197313fa504fc",
+  "prompts": {},
+  "sessions": {
+    "s_621f2416635dac": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0cf88-d299-7c41-8dce-27bbb0f005de",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
