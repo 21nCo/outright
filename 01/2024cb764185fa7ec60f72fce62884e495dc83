@@ -1,0 +1,36 @@
+accessibility-qa.md
+  h_a39f9495f9ec1d 1-29
+package.json
+  h_a39f9495f9ec1d 11
+src/App.jsx
+  h_a39f9495f9ec1d 26,48,77-79,222-225,228-231,233-240,285-313,434-435,438-439,441,443-445,447,449-450,452,462-465,474-475,479,484
+src/components/ChangesPane.jsx
+  h_a39f9495f9ec1d 70-72,75-76,79
+src/components/CommandPalette.jsx
+  h_a39f9495f9ec1d 1,10-11,21,27-31,33-47,49-51,53
+src/components/ContextPane.jsx
+  h_a39f9495f9ec1d 9,11
+src/components/SettingsDialog.jsx
+  h_a39f9495f9ec1d 26,28
+src/components/TerminalPane.jsx
+  h_a39f9495f9ec1d 7,31,148-158,160-162,164,166
+src/lib/accessibility.js
+  h_a39f9495f9ec1d 1-12
+src/styles.css
+  h_a39f9495f9ec1d 147-148,152-153,194,244,298,350,385-388,392,414-415,453,491-552
+tests/ui-accessibility.test.mjs
+  h_a39f9495f9ec1d 1-45
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 21,75-77
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "012024cb764185fa7ec60f72fce62884e495dc83",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
