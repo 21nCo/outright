@@ -164,6 +164,44 @@ test("archived conversations reject new runs before any message or agent schedul
   assert.deepEqual(runtime.database.listRuns(conversation.id), []);
 }));
 
+test("archiving during asynchronous worktree validation rejects a run without durable side effects", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Interleaved archive", provider: "codex" });
+  const original = runtime.git.requireWorktree;
+  let release;
+  let entered;
+  const waiting = new Promise((resolve) => { entered = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  runtime.git.requireWorktree = async (...args) => { entered(); await gate; return original(...args); };
+  const result = responseCapture();
+  const pending = runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "must not persist" }), result);
+  try {
+    await waiting;
+    runtime.database.updateConversation(conversation.id, { archived: true });
+  } finally { release(); }
+  await pending;
+  assert.equal(result.statusCode, 409);
+  assert.equal(result.body.code, "CONVERSATION_ARCHIVED");
+  assert.deepEqual(runtime.database.listMessages(conversation.id), []);
+  assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+}));
+
+test("archived interrupted chat cannot consume retry or resume decision", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Archived recovery", provider: "codex" });
+  // Legacy rows can predate the archive guard; simulate one without bypassing
+  // the public recovery endpoint under test.
+  runtime.database.updateConversation(conversation.id, { archived: true });
+  const run = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "codex", approvalPolicy: "read-only", prompt: "unfinished" });
+  runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+  for (const policy of ["retry", "resume-session"]) {
+    const result = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy }), result);
+    assert.equal(result.statusCode, 409);
+    assert.equal(result.body.code, "CONVERSATION_ARCHIVED");
+    assert.equal(runtime.database.getRun(run.id).recoveryDecision, null);
+    assert.equal(runtime.database.listRuns(conversation.id).length, 1);
+  }
+}));
+
 test("legacy runs without a trustworthy target reject replacement work but allow discard", async () => {
   const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-legacy-runtime-"));
   const previousDataDir = process.env.OUTRIGHT_DATA_DIR;

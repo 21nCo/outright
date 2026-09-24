@@ -126,6 +126,9 @@ export function App() {
     if (!project || !worktree) return;
     const forProjectId = project.id;
     const forWorktreeId = worktree.id;
+    // A stale callback must not advance the shared generation or clear the
+    // current worktree's list-error state before its own owner is checked.
+    if (selectedProjectRef.current !== forProjectId || selectedWorktreeRef.current !== forWorktreeId) return;
     const request = ++conversationListRequestRef.current;
     setConversationListFailed(false);
     try {

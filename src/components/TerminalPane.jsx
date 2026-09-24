@@ -295,7 +295,9 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     try {
       await api(`/api/terminals/${id}`, { method: "DELETE" });
       if (token !== reconcileTokenRef.current) return;
-      const remaining = terminals.filter((item) => item.id !== id);
+      // An exit can update another tab while DELETE is pending; the render-time
+      // list is not authoritative after the asynchronous wait.
+      const remaining = terminalsRef.current.filter((item) => item.id !== id);
       let next = remaining.find((item) => item.id === previousId) ?? remaining[0];
       stageTerminals(remaining);
       if (!next) {

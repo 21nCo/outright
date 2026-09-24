@@ -354,6 +354,76 @@ async function terminalExitWhileCreatingRegression() {
   assert(host.querySelector('#terminal-tab-term-A')?.getAttribute('aria-label')?.includes('process exited 7'), "Exited terminal became running on reselect");
 }
 
+async function terminalExitWhileClosingRegression() {
+  root.render(null);
+  await settle();
+  const deletion = deferred();
+  const remainingDetail = deferred();
+  const sent = [];
+  let exited = false;
+  let detailRequested = false;
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("A2")] });
+    if (options.method === "DELETE") return deletion.promise;
+    if (url.pathname === "/api/terminals/term-A2") { detailRequested = true; return remainingDetail.promise; }
+    if (url.pathname.startsWith("/api/terminals/")) return response({ buffer: "", outputCursor: 0, status: "running" });
+    return response({});
+  };
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} onError={(error) => { throw error; }} sendRuntime={(message) => sent.push(message)} />);
+  show();
+  await until(() => terminalReady("Terminal A"), "terminal before pending close");
+  host.querySelector('[aria-label="Close terminal Terminal A"]').click();
+  await until(() => host.querySelector('.terminal-tabs[aria-busy="true"]'), "held terminal DELETE");
+  exited = true;
+  show({ type: "terminal.exit", terminalId: "term-A2", payload: { exitCode: 9 } });
+  await until(() => host.querySelector('#terminal-tab-term-A2')?.getAttribute('aria-label')?.includes('process exited 9'), "other terminal exit while DELETE held");
+  deletion.resolve(response({}));
+  await until(() => detailRequested, "remaining terminal detail held");
+  assert(host.querySelector('#terminal-tab-term-A2')?.getAttribute('aria-label')?.includes('process exited 9'), "Closing a different tab revived the exit before activation");
+  remainingDetail.resolve(response({ buffer: "", outputCursor: 0, status: exited ? "exited" : "running", exitCode: 9 }));
+  await until(() => terminalReady("Terminal A2"), "remaining terminal selected after close");
+  assert(host.querySelector('#terminal-tab-term-A2')?.getAttribute('aria-label')?.includes('process exited 9'), "Closing a different tab revived the exited terminal");
+  assert(host.querySelector('.terminal-pane [role="status"]')?.textContent.includes('process exited 9'), "Remaining terminal exit not announced");
+  assert(!sent.some((item) => item.type === "terminal.resize" && item.terminalId === "term-A2"), "Exited remaining terminal was resized");
+}
+
+async function staleArchiveWorktreeRegression(rejectFirstList = false) {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const patch = deferred();
+  const bList = deferred();
+  let bRequested = false;
+  let bRetry = false;
+  let aPatched = false;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations" && url.searchParams.get("projectId") === "B") { bRequested = true; return bRetry ? response({ conversations: [chats.B] }) : bList.promise; }
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A" && options.method === "PATCH") { aPatched = true; return patch.promise; }
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/conversations/chat-B") return response(chats.B);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('#chat-tab-chat-A[aria-selected="true"]'), "selected A before archive");
+  host.querySelector('[aria-label="Archive Conversation A"]').click();
+  await until(() => aPatched, "held A archive PATCH");
+  [...host.querySelectorAll("button")].find((button) => button.textContent.includes("Review B")).click();
+  await until(() => bRequested, "B list in flight");
+  patch.resolve(response({ ...chats.A, archived: true }));
+  await settle();
+  bList.resolve(rejectFirstList ? response({ error: "B list unavailable" }, 503) : response({ conversations: [chats.B] }));
+  if (rejectFirstList) {
+    await until(() => host.querySelector('.history-loader')?.textContent === 'Retry chat list', "B list error remains retryable");
+    bRetry = true;
+    host.querySelector('.history-loader').click();
+  }
+  await until(() => host.querySelector('#chat-tab-chat-B[aria-selected="true"]'), "B list accepted after A archive");
+  assert(host.querySelector('#chat-tab-chat-B')?.tabIndex === 0, "B tab not keyboard reachable after stale archive");
+  assert(host.querySelector('#conversation-panel')?.getAttribute('aria-labelledby') === 'chat-tab-chat-B', "B panel owner lost");
+}
+
 async function terminalKeyboardRegression() {
   root.render(null);
   await settle();
@@ -1208,6 +1278,9 @@ try {
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
     ["archived chat ownership", archivedChatOwnershipRegression, "an archived chat cannot keep a pane or accept runs during held or failed refresh"],
     ["terminal exit during create", terminalExitWhileCreatingRegression, "an exit received while create is held remains exited in the tablist"],
+    ["terminal exit during close", terminalExitWhileClosingRegression, "a held delete retains another terminal's exit"],
+    ["late archive after owner switch", () => staleArchiveWorktreeRegression(false), "late A archive does not discard B's list response"],
+    ["late archive and B retry", () => staleArchiveWorktreeRegression(true), "late A archive preserves B's retry after a failed list"],
     ["worktree chat list failure", chatFailedWorktreeListRegression, "a rejected list cannot expose old-owner chat tabs and a retry restores the new owner"],
     ["worktree terminal switch", terminalRace, "worktree switch removes old terminal tabs and rejects stale buffer responses"],
     ["terminal keyboard", terminalKeyboardRegression, "terminal keyboard switching retains focus and ignores non-tab controls"],

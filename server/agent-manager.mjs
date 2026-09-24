@@ -158,7 +158,18 @@ const teardown = () => {
   if (teardownStarted || !provider) return;
   teardownStarted = true;
   if (providerGone) finishWhenOwnedGroupIsEmpty();
-  else try { provider.kill("SIGTERM"); } catch { /* Already gone. */ }
+  else {
+    try { provider.kill("SIGTERM"); } catch { /* Already gone. */ }
+    // The production supervisor owns its descendants and its own escalation:
+    // never kill it before it has reaped them. For a direct child (including
+    // the wrapper's coalesced go/stop fixture), retain this parent as the
+    // reaper and bound a child that ignores SIGTERM.
+    if (executable !== ${JSON.stringify(AGENT_SUPERVISOR)}) {
+      completionTimer = setTimeout(() => {
+        if (!providerGone) try { provider.kill("SIGKILL"); } catch { /* Already gone. */ }
+      }, 750);
+    }
+  }
 };
 process.stdin.setEncoding("utf8");
 let commandBuffer = "";
