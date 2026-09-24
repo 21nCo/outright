@@ -106,8 +106,12 @@ function withWorktreeRuntime(fn, options = {}) {
     const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-"));
     const previousPath = process.env.PATH;
     const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+    const previousGitTrace = process.env.GIT_TRACE2_EVENT;
     let runtime;
     try {
+      // Disposable repositories must not be attached to a host Git Trace2
+      // consumer that may create .git/ai entries while teardown removes them.
+      process.env.GIT_TRACE2_EVENT = "0";
       for (const args of [["init", repo], ["-C", repo, "config", "user.email", "test@example.com"], ["-C", repo, "config", "user.name", "Test"], ["-C", repo, "commit", "--allow-empty", "-m", "init"]]) {
         const result = spawnSync("git", args, { encoding: "utf8" });
         if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
@@ -130,8 +134,10 @@ function withWorktreeRuntime(fn, options = {}) {
       process.env.PATH = previousPath;
       if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
       await runtime?.shutdown();
+      if (previousGitTrace === undefined) delete process.env.GIT_TRACE2_EVENT; else process.env.GIT_TRACE2_EVENT = previousGitTrace;
       rmSync(dataDirectory, { recursive: true, force: true });
-      rmSync(root, { recursive: true, force: true });
+      // Retain bounded cleanup retries for filesystem races outside Git.
+      rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     }
   };
 }
@@ -169,7 +175,9 @@ async function waitForValidation(entered, pending) {
   try {
     await Promise.race([
       entered,
-      pending.then(() => { throw new Error("Run request completed before worktree validation"); }, (error) => { throw new Error("Run request failed before worktree validation", { cause: error }); }),
+      // API errors resolve as HTTP error responses; only unexpected runtime
+      // faults reject the promise, which still needs to fail this rendezvous.
+      pending.then(() => { throw new Error("Run request settled before worktree validation"); }, (error) => { throw new Error("Run request rejected unexpectedly before worktree validation", { cause: error }); }),
       new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Worktree validation was not reached within 5 seconds")), 5000); }),
     ]);
   } finally { clearTimeout(timer); }
@@ -196,7 +204,7 @@ test("archiving during asynchronous worktree validation rejects a run without du
   assert.deepEqual(runtime.database.listRuns(conversation.id), []);
 }));
 
-test("validation rendezvous fails promptly when the run request rejects before the gate", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("validation rendezvous fails promptly when an HTTP error settles before the gate", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
   const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Early rejection", provider: "codex" });
   const original = runtime.git.requireWorktree;
   let release;
@@ -207,7 +215,7 @@ test("validation rendezvous fails promptly when the run request rejects before t
   const result = responseCapture();
   const pending = runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "" }), result);
   try {
-    await assert.rejects(waitForValidation(waiting, pending), /Run request completed before worktree validation/);
+    await assert.rejects(waitForValidation(waiting, pending), /Run request settled before worktree validation/);
   } finally { release(); }
   await pending;
   assert.equal(result.statusCode, 400);
@@ -231,6 +239,49 @@ test("archived interrupted chat cannot consume retry or resume decision", { skip
     assert.equal(runtime.database.listRuns(conversation.id).length, 1);
   }
 }));
+
+test("archived replacement recovery cannot probe or signal a live sibling", (() => {
+  let probes = 0;
+  const signals = [];
+  return withRuntime(async (runtime) => {
+    const target = "/tmp/archived-shared-tree";
+    const sibling = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: target, title: "Live sibling", provider: "codex" });
+    const archived = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: target, title: "Archived owner", provider: "codex" });
+    // Legacy interrupted rows may predate the archive guard.
+    runtime.database.updateConversation(archived.id, { archived: true });
+    const liveRun = runtime.database.createRun({ conversationId: sibling.id, worktreePath: target, provider: "codex", approvalPolicy: "read-only", prompt: "still running" });
+    runtime.database.updateRun(liveRun.id, { status: "running", pid: 4242 });
+    writeFileSync(path.join(runtime.database.launchDirectory, `${liveRun.id}.json`), JSON.stringify({ pid: 4242, authorized: true, processIdentity: "test:owned" }));
+    const pending = runtime.database.createRun({ conversationId: archived.id, worktreePath: target, provider: "codex", approvalPolicy: "read-only", prompt: "never started" });
+    runtime.database.reconcileInterruptedRuns({ probeAlive: () => true });
+    const before = runtime.database.getRun(liveRun.id);
+
+    for (const policy of ["retry", "resume-session"]) {
+      const result = responseCapture();
+      await runtime.handleRequest(requestStream("POST", `/api/runs/${pending.id}/resume`, { policy }), result);
+      assert.equal(result.statusCode, 409);
+      assert.equal(result.body.code, "CONVERSATION_ARCHIVED");
+      assert.deepEqual(runtime.database.getRun(liveRun.id), before, "sibling recovery state stays untouched");
+      assert.equal(runtime.database.getRun(pending.id).recoveryDecision, null);
+      assert.equal(runtime.database.listRuns(archived.id).length, 1);
+      assert.deepEqual(runtime.database.listMessages(archived.id), []);
+    }
+    assert.equal(probes, 0, "rejected replacement must not inspect live siblings");
+    assert.deepEqual(signals, [], "rejected replacement must not signal providers");
+
+    const discard = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${pending.id}/resume`, { policy: "discard" }), discard);
+    assert.equal(discard.statusCode, 200, "archived discard still cleans the worktree-wide live process");
+    assert.equal(runtime.database.getRun(pending.id).recoveryDecision, "discard");
+    assert.equal(runtime.database.getRun(liveRun.id).recoveryClass, "exited");
+    assert.deepEqual(signals, ["SIGTERM"]);
+  }, {
+    recoveryProcessAlive: () => { probes += 1; return "alive"; },
+    recoveryProcessIdentity: () => "test:owned",
+    terminateRecoveryProcess: async (_pid, signal) => { signals.push(signal); return true; },
+    recoveryTerminationTimeoutMs: 0,
+  });
+})());
 
 test("legacy runs without a trustworthy target reject replacement work but allow discard", async () => {
   const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-legacy-runtime-"));

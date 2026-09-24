@@ -957,8 +957,6 @@ test("windows launch ACLs remove inherited broad access before handshakes are wr
   );
 });
 
-// The real launch wrapper must durably record its own pid and only start the
-// provider after the runtime's authorization byte.
 test("wrapper rejects an unsupervised provider that could escape through a detached descendant", { timeout: 10000 }, async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-wrapper-boundary-"));
   const handshakePath = path.join(root, "launch.json");
@@ -989,6 +987,8 @@ test("wrapper rejects an unsupervised provider that could escape through a detac
   }
 });
 
+// The real launch wrapper must durably record its own pid and only start the
+// provider after the runtime's authorization byte.
 test("the launch wrapper records durable identity before authorization and cleans up on exit", { timeout: 20000 }, async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-launch-"));
   const launchDirectory = path.join(root, "launches");

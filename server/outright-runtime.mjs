@@ -266,6 +266,12 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (!["discard", "discard-unverifiable", "resume-session", "retry"].includes(policy)) throw apiError(400, "Recovery policy must be discard, discard-unverifiable, resume-session, or retry");
         const conversation = database.getConversation(interrupted.conversationId);
         if (!conversation) throw apiError(404, "Conversation not found");
+        // Replacement requests must not tear down any process on an archived
+        // chat's worktree, including a live sibling, merely to return 409.
+        // Discard policies still verify and clean the interrupted process.
+        if (conversation.archived && ["retry", "resume-session"].includes(policy)) {
+          throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
+        }
 
         // Databases created before durable process ownership can contain a
         // running row with neither pid nor immutable launch worktree. There is
