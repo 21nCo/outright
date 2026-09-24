@@ -11,6 +11,7 @@ import WebSocket, { WebSocketServer } from "ws";
 const root = fileURLToPath(new URL("../", import.meta.url));
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
 const stubbornChild = path.join(root, "tests", "fixtures", "stubborn-child.mjs");
+const cooperativeChild = path.join(root, "tests", "fixtures", "cooperative-child.mjs");
 const exitedLeader = path.join(root, "tests", "fixtures", "exited-leader.mjs");
 
 function chromeExecutable() {
@@ -373,10 +374,13 @@ test("browser fixture polling reports its last step and preserves the phase dead
   assert.equal(recovered.title, "PASS");
   assert.equal(transientPolls, 4);
   let missing = false;
+  let missingPolls = 0;
   await assert.rejects(waitForFixture(async () => {
+    missingPolls += 1;
     if (!missing) { missing = true; return { result: { value: { title: "Running", progress } } }; }
     return { exceptionDetails: { text: "Execution context was destroyed" } };
-  }, Date.now() + 30), /7\/21 complete, current step=terminal activation/);
+  }, Date.now() + 250), /7\/21 complete, current step=terminal activation/);
+  assert(missingPolls >= 2, "Negative transient diagnostic never exercised its exceptional second evaluation");
 });
 
 test("a silent DevTools request fails within its bound", { timeout: 5_000 }, async () => {
@@ -609,17 +613,17 @@ test("nested runner deadline exceeds its child's full browser budget", () => {
 });
 
 test("parent permits a slow child beyond the old shorter watchdog", { timeout: 5_000 }, async () => {
-  const child = spawn(process.execPath, [stubbornChild], {
+  const child = spawn(process.execPath, [cooperativeChild], {
     cwd: root, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
   });
-  let release;
   try {
     await new Promise((resolve, reject) => { child.once("error", reject); child.stdout.once("data", resolve); });
-    release = setTimeout(() => child.kill("SIGKILL"), 160);
     assert.equal(await waitForExit(child, 90), false, "Controlled child exited before the old watchdog");
     assert(await waitForExit(child, nestedRunnerBudget(100, 100)), "Parent did not allow child to finish its declared scaled budget");
+    assert.equal(child.exitCode, 0, "Child did not finish naturally within its declared budget");
+    assert.equal(child.signalCode, null, "Test's own forced kill must not satisfy the child budget");
   } finally {
-    clearTimeout(release);
+    if (!hasExited(child)) child.kill("SIGKILL");
     await stop(child);
   }
 });

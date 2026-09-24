@@ -408,6 +408,9 @@ async function terminalExitRejectionRegression() {
   assert(host.querySelector('[role="tab"][aria-selected="true"]')?.dataset.tabId === "term-A", "Rejection lost selected tab");
   const before = sent.length;
   host.querySelector('.terminal-host').style.width = "540px";
+  const input = host.querySelector('.terminal-host .xterm-helper-textarea');
+  input.focus();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "x", code: "KeyX", keyCode: 88, which: 88, bubbles: true, cancelable: true }));
   await settle();
   assert(!sent.slice(before).some((message) => message.type === "terminal.input" || message.type === "terminal.resize"), "Rejected activation restored input/resize to an exited session");
   hold = false;
@@ -661,20 +664,33 @@ async function terminalMutationFailureRegression() {
   await settle();
   const errors = [];
   const onError = (error) => errors.push(error);
+  const sent = [];
+  const sendRuntime = (message) => sent.push(message);
   let failure = "";
+  let pendingReconnect;
+  let heldBufferRequested = false;
   route = async (url, options) => {
     if (url.pathname === "/api/terminals" && options.method === "POST" && failure === "create") return response({ error: "Create failed" }, 500);
     if (url.pathname === "/api/terminals" && options.method === "POST") return response(terminal("A3"));
+    if (url.pathname === "/api/terminals" && failure === "reconnect-list") return response({ error: "List failed" }, 500);
     if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("A2")] });
     if (url.pathname === "/api/terminals/term-A" && options.method === "DELETE" && failure === "delete") return response({ error: "Delete failed" }, 500);
     if (url.pathname === "/api/terminals/term-A2" && failure === "replacement-buffer") return response({ error: "Buffer failed" }, 500);
     if (url.pathname === "/api/terminals/term-A" && failure === "reconnect-buffer") return response({ error: "Reconnect failed" }, 500);
-    return response({ buffer: "" });
+    if (url.pathname === "/api/terminals/term-A" && failure === "hold-reconnect-buffer") { heldBufferRequested = true; return pendingReconnect.promise; }
+    return response({ buffer: "Retained output\r\n", status: "running" });
   };
-  const show = (runtimeEvent = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={runtimeEvent} onError={onError} sendRuntime={() => {}} />);
+  const show = (runtimeEvent = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={runtimeEvent} onError={onError} sendRuntime={sendRuntime} />);
   show();
   await until(() => terminalReady("Terminal A"), "mutation fixture terminal A ready");
   const selected = () => host.querySelector('[role="tab"][aria-selected="true"][tabindex="0"]');
+  const typeIntoTerminal = () => {
+    const input = host.querySelector('.terminal-host .xterm-helper-textarea');
+    input.focus();
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "x", code: "KeyX", keyCode: 88, which: 88, bubbles: true, cancelable: true }));
+  };
+  typeIntoTerminal();
+  await until(() => sent.some((message) => message.type === "terminal.input" && message.terminalId === "term-A" && message.data === "x"), "baseline running terminal input");
   failure = "create";
   host.querySelector('[aria-label="New terminal"]').click();
   await until(() => errors.length === 1 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "failed terminal creation");
@@ -700,6 +716,32 @@ async function terminalMutationFailureRegression() {
   show({ type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [terminal("A"), terminal("A2")] } });
   await until(() => errors.length === 4 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "failed terminal reconnection");
   assert(selected()?.textContent === "Terminal A", "Failed reconnection left no selected tab");
+  const beforeInput = sent.filter((message) => message.type === "terminal.input" && message.terminalId === "term-A").length;
+  typeIntoTerminal();
+  await until(() => sent.filter((message) => message.type === "terminal.input" && message.terminalId === "term-A").length > beforeInput, "running terminal input after failed reconnect buffer");
+  const beforeResize = sent.filter((message) => message.type === "terminal.resize" && message.terminalId === "term-A").length;
+  host.querySelector('.terminal-host').style.width = "540px";
+  await until(() => sent.filter((message) => message.type === "terminal.resize" && message.terminalId === "term-A").length > beforeResize, "running terminal resize after failed reconnect buffer");
+  assert(host.querySelector('.xterm-rows')?.textContent.includes("Retained output"), "Rejected buffer discarded the prior terminal output");
+
+  pendingReconnect = deferred();
+  heldBufferRequested = false;
+  failure = "hold-reconnect-buffer";
+  show({ type: "runtime.connected", payload: { replay: { requestedAfter: 2 }, terminals: [terminal("A"), terminal("A2")] } });
+  await until(() => heldBufferRequested, "first reconnect buffer held before queued list refresh");
+  show({ type: "runtime.connected", payload: { replay: { requestedAfter: 3 }, terminals: [terminal("A"), terminal("A2")] } });
+  await settle();
+  failure = "reconnect-list";
+  pendingReconnect.resolve(response({ buffer: "Retained output\r\n", status: "running" }));
+  await until(() => errors.length === 5 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "failed authoritative reconnect list");
+  assert(selected()?.textContent === "Terminal A", "Failed list request lost the selected tab");
+  const beforeListInput = sent.filter((message) => message.type === "terminal.input" && message.terminalId === "term-A").length;
+  typeIntoTerminal();
+  await until(() => sent.filter((message) => message.type === "terminal.input" && message.terminalId === "term-A").length > beforeListInput, "running terminal input after rejected list");
+  const beforeListResize = sent.filter((message) => message.type === "terminal.resize" && message.terminalId === "term-A").length;
+  host.querySelector('.terminal-host').style.width = "460px";
+  await until(() => sent.filter((message) => message.type === "terminal.resize" && message.terminalId === "term-A").length > beforeListResize, "running terminal resize after rejected list");
+  assert(host.querySelector('.xterm-rows')?.textContent.includes("Retained output"), "Rejected list discarded the prior terminal output");
 }
 
 async function commandPaletteRegression() {

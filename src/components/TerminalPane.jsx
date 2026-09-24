@@ -226,6 +226,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     if (!mountedRef.current) return;
     reconcilingRef.current = true;
     const previousId = activeIdRef.current;
+    const wasReady = inputReadyRef.current;
+    const wasAwaitingFit = awaitingVisibleFitRef.current;
     const token = beginSelection();
     const reconcile = async () => {
       const all = refresh ? (await api("/api/terminals")).terminals : (payload.terminals ?? []);
@@ -237,7 +239,12 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       stageTerminals([...matching.filter((item) => item.id !== terminal.id), terminal]);
       await activateTerminal(terminal, token);
     };
-    reconcile().catch((error) => { if (token === reconcileTokenRef.current) { recoverSelection(); onErrorRef.current(error); } }).finally(() => {
+    reconcile().catch((error) => {
+      if (token !== reconcileTokenRef.current) return;
+      const retained = activeIdRef.current === previousId;
+      recoverSelection(retained && wasReady, retained && wasAwaitingFit);
+      onErrorRef.current(error);
+    }).finally(() => {
       reconcilingRef.current = false;
       if (mountedRef.current && token === reconcileTokenRef.current) {
         loadingRef.current = false;
