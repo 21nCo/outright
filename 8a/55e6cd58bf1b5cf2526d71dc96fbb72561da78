@@ -1,0 +1,29 @@
+server/outright-runtime.test.mjs
+  s_36647e141eaee6::t_e81ecf7ecdfccd 167-204
+tests/ui-races.jsx
+  s_2944c5ead9b0d2::t_65087eb0bb0212 357-426,1281-1283
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8a55e6cd58bf1b5cf2526d71dc96fbb72561da78",
+  "prompts": {},
+  "sessions": {
+    "s_2944c5ead9b0d2": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "c8a5b118-e911-4e86-86eb-cab72774d02a",
+        "model": "composer-2.5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_36647e141eaee6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0cf1a-f300-7be0-a59e-0cdd239e38f0",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
