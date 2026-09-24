@@ -503,7 +503,7 @@ export function App() {
   }
 
   function navigateTabs(event, selector, choose) {
-    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     const current = event.target.closest?.(selector);
     if (!current || !event.currentTarget.contains(current)) return;
     const tabs = [...event.currentTarget.querySelectorAll(selector)];

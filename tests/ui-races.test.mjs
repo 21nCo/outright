@@ -40,12 +40,11 @@ async function unusedPort() {
   });
 }
 
-async function waitForServer(url, child, logs) {
-  const deadline = Date.now() + 20_000;
+async function waitForServer(url, child, logs, deadline = Date.now() + 20_000) {
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`Vite exited before the UI harness loaded:\n${logs()}`);
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
+      const response = await fetch(url, { signal: AbortSignal.timeout(Math.max(1, Math.min(2_000, deadline - Date.now()))) });
       if (response.ok) return;
     } catch { /* Vite is still starting. */ }
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -258,12 +257,11 @@ async function cleanupResources(steps) {
   if (errors.length) throw new AggregateError(errors, `UI harness cleanup failed: ${errors.map((error) => error.message).join("; ")}`);
 }
 
-async function waitForJson(url, child, logs, diagnostic) {
-  const deadline = Date.now() + 45_000;
+async function waitForJson(url, child, logs, diagnostic, deadline = Date.now() + 45_000) {
   while (Date.now() < deadline) {
     if (hasExited(child)) throw new Error(`Chrome exited before DevTools was ready: ${diagnostic()}; output: ${logs()}`);
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
+      const response = await fetch(url, { signal: AbortSignal.timeout(Math.max(1, Math.min(2_000, deadline - Date.now()))) });
       if (response.ok) return response.json();
     } catch { /* Chrome is still starting. */ }
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -271,9 +269,11 @@ async function waitForJson(url, child, logs, diagnostic) {
   throw new Error(`Timed out waiting for ${url}: ${diagnostic()}; output: ${logs()}`);
 }
 
-function connectDevTools(url) {
+function connectDevTools(url, handshakeTimeout = 10_000) {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url);
+    // A responsive DevTools HTTP endpoint does not guarantee its WebSocket
+    // upgrade completes. Bound the handshake independently of test timeout.
+    const socket = new WebSocket(url, { handshakeTimeout });
     const pending = new Map();
     let sequence = 0;
     let eventHandler = () => {};
@@ -335,6 +335,24 @@ test("a silent DevTools request fails within its bound", { timeout: 5_000 }, asy
     await assert.rejects(devtools.send("Page.enable", {}, 25), /Timed out waiting for DevTools Page.enable/);
   } finally {
     devtools?.socket.terminate();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a stalled DevTools handshake releases its socket", { timeout: 5_000 }, async () => {
+  const sockets = new Set();
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("data", () => {}); // Receive the upgrade request but never answer.
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await assert.rejects(connectDevTools(`ws://127.0.0.1:${server.address().port}`, 50), /timed out/i);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(sockets.size, 0, "Timed-out handshake retained an open server-side socket");
+  } finally {
+    for (const socket of sockets) socket.destroy();
     await new Promise((resolve) => server.close(resolve));
   }
 });
@@ -544,6 +562,14 @@ test("fixture assertion failures still clean Chrome, Vite and profile independen
 });
 
 test("browser interaction regressions pass in headless Chrome", { timeout: 120_000 }, async () => {
+  // Reserve the last part of the test's own bound for independent cleanup.
+  const deadline = Date.now() + 95_000;
+  let phase = "allocate fixture";
+  const remaining = () => {
+    const duration = deadline - Date.now();
+    if (duration <= 0) throw new Error(`UI fixture exceeded its pre-cleanup deadline during ${phase}`);
+    return duration;
+  };
   const port = await unusedPort();
   const debugPort = await unusedPort();
   const profile = mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
@@ -563,7 +589,8 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
   let failure;
 
   try {
-    await waitForServer(url, vite, () => output);
+    phase = "wait for Vite";
+    await waitForServer(url, vite, () => output, Math.min(Date.now() + 20_000, deadline));
     snapshotWindowsTree(vite);
     const executable = chromeExecutable();
     const launchedAt = new Date().toISOString();
@@ -607,17 +634,22 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
       }
       if (!browser.ownedWindows?.has(browser.pid)) throw new Error(`Cannot capture Chrome launch identity: ${diagnostic()}; output: ${logs()}`);
     }
-    await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, logs, diagnostic);
+    phase = "wait for Chrome DevTools HTTP";
+    await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, logs, diagnostic, Math.min(Date.now() + 45_000, deadline));
     snapshotWindowsTree(browser);
-    const targetResponse = await fetch(`http://127.0.0.1:${debugPort}/json/new?${encodeURIComponent("about:blank")}`, { method: "PUT", signal: AbortSignal.timeout(10_000) });
+    phase = "create DevTools target";
+    const targetResponse = await fetch(`http://127.0.0.1:${debugPort}/json/new?${encodeURIComponent("about:blank")}`, { method: "PUT", signal: AbortSignal.timeout(Math.min(10_000, remaining())) });
     if (!targetResponse.ok) throw new Error(await targetResponse.text());
     const target = await targetResponse.json();
-    devtools = await connectDevTools(target.webSocketDebuggerUrl);
-    await devtools.send("Runtime.enable");
-    await devtools.send("Page.enable");
-    await devtools.send("Runtime.addBinding", { name: "__requestFixtureViewport" });
-    await devtools.send("Runtime.addBinding", { name: "__requestFixtureKey" });
-    await devtools.send("Page.addScriptToEvaluateOnNewDocument", { source: `
+    phase = "connect DevTools WebSocket";
+    devtools = await connectDevTools(target.webSocketDebuggerUrl, Math.min(10_000, remaining()));
+    const send = (method, params) => devtools.send(method, params, Math.min(10_000, remaining()));
+    phase = "install fixture bindings";
+    await send("Runtime.enable");
+    await send("Page.enable");
+    await send("Runtime.addBinding", { name: "__requestFixtureViewport" });
+    await send("Runtime.addBinding", { name: "__requestFixtureKey" });
+    await send("Page.addScriptToEvaluateOnNewDocument", { source: `
       window.__fixtureSetViewport = (width) => new Promise((resolve) => {
         const ready = (event) => {
           if (event.detail !== width) return;
@@ -644,25 +676,26 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
         if (event.params.name === "__requestFixtureKey") {
           if (event.params.payload !== "Escape") throw new Error("Unexpected fixture key");
           const key = { key: "Escape", code: "Escape", windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 };
-          await devtools.send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...key });
-          await devtools.send("Input.dispatchKeyEvent", { type: "keyUp", ...key });
-          await devtools.send("Runtime.evaluate", { expression: 'window.dispatchEvent(new CustomEvent("fixture-key-ready", { detail: "Escape" }))' });
+          await send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...key });
+          await send("Input.dispatchKeyEvent", { type: "keyUp", ...key });
+          await send("Runtime.evaluate", { expression: 'window.dispatchEvent(new CustomEvent("fixture-key-ready", { detail: "Escape" }))' });
           return;
         }
         if (event.params.name !== "__requestFixtureViewport") return;
         const width = Number(event.params.payload);
         if (![1280, 1200, 760, 640, 620, 390].includes(width)) throw new Error(`Unexpected fixture viewport: ${width}`);
-        await devtools.send("Emulation.setDeviceMetricsOverride", { width, height: 844, deviceScaleFactor: 1, mobile: false });
-        await devtools.send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-viewport-ready", { detail: ${width} }))` });
+        await send("Emulation.setDeviceMetricsOverride", { width, height: 844, deviceScaleFactor: 1, mobile: false });
+        await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-viewport-ready", { detail: ${width} }))` });
       })().catch((error) => { viewportError = error; });
     });
-    await devtools.send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 844, deviceScaleFactor: 1, mobile: false });
-    await devtools.send("Page.navigate", { url });
-    const deadline = Date.now() + 30_000;
+    await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 844, deviceScaleFactor: 1, mobile: false });
+    await send("Page.navigate", { url });
+    phase = "run browser interaction fixtures";
+    const fixtureDeadline = Math.min(Date.now() + 30_000, deadline);
     let state;
-    while (Date.now() < deadline) {
+    while (Date.now() < fixtureDeadline) {
       if (viewportError) throw viewportError;
-      const evaluated = await devtools.send("Runtime.evaluate", {
+      const evaluated = await send("Runtime.evaluate", {
         expression: "({ title: document.title, text: document.getElementById('results')?.textContent ?? '' })",
         returnByValue: true,
       });
@@ -675,7 +708,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
     assert.match(state.text, /20 interaction regressions passed/);
     if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
   } catch (error) {
-    failure = error;
+    failure = new Error(`UI fixture ${phase}: ${error.message}`, { cause: error });
   } finally {
     try {
       await cleanupResources([

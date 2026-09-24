@@ -8,10 +8,10 @@ The required `npm test` browser regression suite needs Google Chrome or Chromium
 set `CHROME_PATH` to the executable on machines without a standard installation.
 Missing Chrome fails the suite rather than silently dropping the interaction checks.
 
-- `npm test`: 159 passed, 1 platform skip on macOS, including keyboard tab navigation, safe DOM IDs, semantic roles, terminal screen-reader mode, live regions, responsive fallbacks, and headless browser interactions.
+- `SHELL=/bin/bash npm test`: 160 passed, 1 platform skip on macOS, including keyboard tab navigation, safe DOM IDs, semantic roles, terminal screen-reader mode, live regions, responsive fallbacks, and headless browser interactions. The local zsh startup update prompt corrupted the unrelated PTY sentinel in a plain `npm test` run; the configured bash shell passed the same full suite.
 - `npm run build`: production client/server/Sites artifacts built successfully.
 - `npm run test:sites`: 4 Sites packaging and routing tests passed.
-- Browser interaction harness: 20 checks passed, including breakpoint synchronization, modal drawer isolation/focus containment, inspector focus restoration, terminal reconnect ownership, and a same-pane metadata change during pending creation. Node tests check escaped private-profile helper cleanup with file-backed output, bounded CDP requests, and cleanup after an injected browser failure.
+- Browser interaction harness: 20 checks passed, including breakpoint synchronization, modal drawer isolation/focus containment, inspector focus restoration, horizontal chat/inspector tab keys, terminal reconnect ownership, and a same-pane metadata change during pending creation and deletion. Node tests check escaped private-profile helper cleanup with file-backed output, bounded CDP requests and handshake, and cleanup after an injected browser failure. The previously reported intermittent macOS full-suite browser timeout did not reproduce in this round; the new phase/deadline diagnostics and exact-head cross-OS run still need independent review.
 
 ## Keyboard and accessibility-tree checks (not a screen-reader session)
 

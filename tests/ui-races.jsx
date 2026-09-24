@@ -129,6 +129,9 @@ async function chatTabControlRegression() {
     if (url.pathname === "/api/conversations") return response({ conversations: [chats.A, secondChat] });
     if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
     if (url.pathname === "/api/conversations/chat-A2") return response(secondChat);
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [], stagedCount: 0 });
+    if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A")] });
     return response({});
   };
   root.render(<TooltipProvider><App /></TooltipProvider>);
@@ -142,6 +145,35 @@ async function chatTabControlRegression() {
     assert(document.activeElement === archive, `Chat tablist handled ${key} from the Archive control`);
     assert(selected.getAttribute("aria-selected") === "true", `Chat selection changed after ${key} on the Archive control`);
   }
+  const assertVerticalKeysIgnored = async (tab, selectedTab, label) => {
+    tab.focus();
+    for (const key of ["ArrowUp", "ArrowDown"]) {
+      const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+      tab.dispatchEvent(event);
+      await settle();
+      assert(!event.defaultPrevented, `${label} captured ${key} in a horizontal tablist`);
+      assert(document.activeElement === tab && selectedTab.getAttribute("aria-selected") === "true", `${label} changed focus or selection on ${key}: active=${document.activeElement?.outerHTML.slice(0, 180)}, selected=${selectedTab.getAttribute("aria-selected")}`);
+    }
+  };
+  await assertVerticalKeysIgnored(selected, selected, "Chat");
+  selected.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+  await until(() => host.querySelector('[role="tab"][id="chat-tab-chat-A2"][aria-selected="true"]'), "right arrow selects second chat");
+  const nextChat = host.querySelector('[id="chat-tab-chat-A2"]');
+  nextChat.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true }));
+  await until(() => selected.getAttribute("aria-selected") === "true", "Home returns to first chat");
+  const changes = host.querySelector('[aria-label="Changes"]');
+  assert(!host.querySelector("#workspace-inspector"), "Inspector was already open before Changes click");
+  changes.click();
+  await settle();
+  assert(host.querySelector('#workspace-inspector'), `Inspector did not open: changes=${changes.outerHTML.slice(0, 400)}, connected=${changes.isConnected}, active=${document.activeElement?.outerHTML.slice(0, 250)}`);
+  assert(host.querySelector('#inspector-tab-changes[aria-selected="true"]'),
+    `Changes did not select the inspector tab: ${host.querySelector('#workspace-inspector')?.outerHTML.slice(0, 600)}`);
+  const inspectorTab = host.querySelector("#inspector-tab-changes");
+  await assertVerticalKeysIgnored(inspectorTab, inspectorTab, "Inspector");
+  inspectorTab.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true, cancelable: true }));
+  await until(() => host.querySelector('#inspector-tab-context[aria-selected="true"]'), "End selects final inspector tab");
+  host.querySelector("#inspector-tab-context").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
+  await until(() => host.querySelector('#inspector-tab-terminal[aria-selected="true"]'), "left arrow selects terminal inspector tab");
 }
 
 async function terminalKeyboardRegression() {
@@ -411,7 +443,8 @@ async function terminalSamePaneRestartRegression() {
   await until(() => posts === 1, "pending create before same-pane restart");
   show("A renamed");
   await settle();
-  if (lists > 1) await until(() => terminalReady("Terminal A"), "stale list fetched before create settled");
+  assert(lists === 1 && host.querySelector('.terminal-tabs[aria-busy="true"]') && !host.querySelector('[data-tab-id="term-A2"]'),
+    "Metadata-only rerender restarted the terminal list or released the pending creation");
   show("A renamed", { type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [terminal("A")] } });
   await settle();
   all = [terminal("A"), terminal("A2")];
@@ -422,6 +455,8 @@ async function terminalSamePaneRestartRegression() {
   await until(() => host.querySelector('.terminal-tabs[aria-busy="true"]'), "pending delete before same-pane restart");
   show("A renamed again");
   await settle();
+  assert(host.querySelector('.terminal-tabs[aria-busy="true"]') && host.querySelector('[data-tab-id="term-A2"]'),
+    "Metadata-only rerender released the pending deletion");
   const beforeDeleteReconcile = lists;
   show("A renamed again", { type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [terminal("A"), terminal("A2")] } });
   await settle();
