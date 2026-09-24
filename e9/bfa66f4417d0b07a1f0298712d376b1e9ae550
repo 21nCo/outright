@@ -1,0 +1,29 @@
+tests/ui-races.jsx
+  s_dbeaf6beea25e6::t_b64b80a9faebb5 132-134,148-176,446-447,458-459
+tests/ui-races.test.mjs
+  s_621f2416635dac::t_737c07e32c7fb2 43,47,260,264,272,274-276,342-359,565-572,592-593,637-638,640-641,644-652,679-681,687-688,691-694,696,698,711
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e9bfa66f4417d0b07a1f0298712d376b1e9ae550",
+  "prompts": {},
+  "sessions": {
+    "s_621f2416635dac": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0cf88-d299-7c41-8dce-27bbb0f005de",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_dbeaf6beea25e6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c886-73ef-72c2-b7ee-54bc7cc84533",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
