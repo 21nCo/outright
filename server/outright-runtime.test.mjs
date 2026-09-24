@@ -153,6 +153,17 @@ test("reconciles runs at startup and resolves discard decisions through the API"
   assert.equal(repeat.statusCode, 409, "decisions are final");
 }));
 
+test("archived conversations reject new runs before any message or agent scheduling", withRuntime(async (runtime) => {
+  const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Archived", provider: "codex" });
+  runtime.database.updateConversation(conversation.id, { archived: true });
+  const rejected = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "must not run" }), rejected);
+  assert.equal(rejected.statusCode, 409);
+  assert.equal(rejected.body.code, "CONVERSATION_ARCHIVED");
+  assert.deepEqual(runtime.database.listMessages(conversation.id), []);
+  assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+}));
+
 test("legacy runs without a trustworthy target reject replacement work but allow discard", async () => {
   const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-legacy-runtime-"));
   const previousDataDir = process.env.OUTRIGHT_DATA_DIR;

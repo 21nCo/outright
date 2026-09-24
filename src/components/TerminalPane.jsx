@@ -278,7 +278,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     try {
       const terminal = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: `${worktreeNameRef.current} ${terminals.length + 1}` } });
       if (token !== reconcileTokenRef.current) return;
-      stageTerminals([...terminals, terminal]);
+      stageTerminals([...terminalsRef.current.filter((item) => item.id !== terminal.id), terminal]);
       await activateTerminal(terminal, token);
     } catch (error) { if (token === reconcileTokenRef.current) { recoverSelection(wasReady, wasAwaitingFit); onErrorRef.current(error); } }
     finally { finishMutation(token); }

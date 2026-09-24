@@ -229,6 +229,131 @@ async function chatSettingsArchiveRegression() {
   assert(!host.querySelector('#conversation-panel')?.hasAttribute('aria-labelledby'), "Empty conversation panel still references an archived tab");
 }
 
+async function archivedChatOwnershipRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const sibling = { ...chats.A, id: "chat-A2", title: "Conversation A2" };
+  const oldChat = { ...chats.A, messages: [{ id: "old-archived-message", role: "user", kind: "text", body: "Archived content must disappear", createdAt: "2026-09-24T00:00:00Z" }] };
+  const heldList = deferred();
+  const heldDetail = deferred();
+  let archived = false;
+  let retryList = false;
+  let retryDetail = false;
+  let postCount = 0;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return archived ? retryList ? response({ conversations: [sibling] }) : heldList.promise : response({ conversations: [chats.A, sibling] });
+    if (url.pathname === "/api/conversations/chat-A" && options.method === "PATCH") { archived = true; return response({ ...chats.A, archived: true }); }
+    if (url.pathname === "/api/conversations/chat-A") return response(oldChat);
+    if (url.pathname === "/api/conversations/chat-A2") return retryDetail ? response(sibling) : heldDetail.promise;
+    if (url.pathname.endsWith("/runs")) { postCount += 1; return response({ id: "run-A", status: "running" }, 202); }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('#chat-tab-chat-A[aria-selected="true"]') && host.querySelector('.message-text')?.textContent === "Archived content must disappear", "loaded chat before archive");
+  host.querySelector('.conversation-meta button').click();
+  await until(() => document.querySelector('[role="dialog"]')?.textContent.includes("Conversation settings"), "settings before held archive");
+  [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent.includes("Archive conversation")).click();
+  await until(() => archived, "archive PATCH completed while list is held");
+  await settle();
+  assert(host.querySelector('.conversation-header h1')?.textContent !== chats.A.title, "Archived chat remained the visible, executable pane during held refresh");
+  assert(!host.querySelector('.message-text')?.textContent.includes('Archived content'), "Archived chat message remained under sibling tab");
+  assert(host.querySelector('[aria-label="Send message"]')?.disabled, "Send remained available while sibling detail was pending");
+  const composer = host.querySelector('textarea[aria-label="Message the agent"]');
+  setControlValue(composer, "Should never run on archived chat");
+  await settle();
+  host.querySelector('[aria-label="Send message"]')?.click();
+  await settle();
+  assert(postCount === 0, "Archived chat accepted a run while refresh was held");
+  heldList.resolve(response({ error: "List unavailable" }, 500));
+  await until(() => host.querySelector('[role="alert"]')?.textContent.includes("List unavailable"), "failed archive refresh");
+  assert(!host.querySelector('#chat-tab-chat-A'), "Archived chat remained a tab after failed refresh");
+  const listRetry = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Retry chat list');
+  assert(listRetry, "Failed list has no keyboard-reachable retry action");
+  listRetry.focus();
+  assert(document.activeElement === listRetry, "Failed list retry cannot receive keyboard focus");
+  retryList = true;
+  listRetry.click();
+  await until(() => ![...host.querySelectorAll('button')].some((button) => button.textContent === 'Retry chat list'), "list recovery");
+  heldDetail.resolve(response({ error: "Detail unavailable" }, 500));
+  await until(() => [...host.querySelectorAll('button')].some((button) => button.textContent === 'Retry loading chat'), "failed sibling detail");
+  assert(host.querySelector('.conversation-header h1')?.textContent !== chats.A.title, "Failed sibling detail restored archived content");
+  retryDetail = true;
+  [...host.querySelectorAll('button')].find((button) => button.textContent === 'Retry loading chat').click();
+  await until(() => host.querySelector('.conversation-header h1')?.textContent === sibling.title, "sibling loads after detail retry");
+  assert(postCount === 0, "Archived chat was submitted during list or detail recovery");
+}
+
+async function chatFailedWorktreeListRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  let failB = true;
+  const oldChat = { ...chats.A, messages: [{ id: "old-worktree-message", role: "user", kind: "text", body: "Previous worktree message", createdAt: "2026-09-24T00:00:00Z" }] };
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") {
+      if (url.searchParams.get("projectId") === "B" && failB) return response({ error: "List unavailable" }, 500);
+      return response({ conversations: [chats[url.searchParams.get("projectId")]] });
+    }
+    if (url.pathname === "/api/conversations/chat-A") return response(oldChat);
+    if (url.pathname === "/api/conversations/chat-B") return response(chats.B);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('#chat-tab-chat-A[aria-selected="true"]') && host.querySelector('.message-text')?.textContent === "Previous worktree message", "first worktree chat");
+  [...host.querySelectorAll("button")].find((button) => button.textContent.includes("Review B")).click();
+  await until(() => host.querySelector('[role="alert"]')?.textContent.includes("List unavailable"), "rejected next worktree list");
+  assert(!host.querySelector('#chat-tab-chat-A'), "Failed B list left A's stale, untabbable chat in the B tablist");
+  assert(!host.querySelector('.message-text')?.textContent.includes('Previous worktree'), "Failed B list exposed A's message content");
+  failB = false;
+  [...host.querySelectorAll('button')].find((button) => button.textContent === 'Retry chat list').click();
+  await until(() => host.querySelector('#chat-tab-chat-B[aria-selected="true"]'), "recovered next worktree list");
+  assert(host.querySelector('#chat-tab-chat-B')?.tabIndex === 0, "Recovered chat tab cannot be reached with Tab");
+  assert(host.querySelector('#conversation-panel')?.getAttribute('aria-labelledby') === 'chat-tab-chat-B', "Recovered panel has the wrong owner");
+  const tab = host.querySelector('#chat-tab-chat-B');
+  tab.focus();
+  tab.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+  await settle();
+  assert(document.activeElement === tab && tab.getAttribute('aria-selected') === 'true', "Recovered chat lost keyboard roving focus");
+}
+
+async function terminalExitWhileCreatingRegression() {
+  root.render(null);
+  await settle();
+  const pendingCreate = deferred();
+  let posts = 0;
+  let exited = false;
+  const runtimeMessages = [];
+  const onError = (error) => { throw error; };
+  const sendRuntime = (message) => runtimeMessages.push(message);
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") { posts += 1; return pendingCreate.promise; }
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A")] });
+    if (url.pathname === "/api/terminals/term-A") return response({ buffer: "", outputCursor: 0, status: exited ? "exited" : "running", exitCode: exited ? 7 : undefined });
+    if (url.pathname.startsWith("/api/terminals/")) return response({ buffer: "", outputCursor: 0, status: "running" });
+    return response({});
+  };
+  const show = (runtimeEvent) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={runtimeEvent} onError={onError} sendRuntime={sendRuntime} />);
+  show(null);
+  await until(() => terminalReady("Terminal A"), "initial terminal before concurrent create and exit");
+  host.querySelector('[aria-label="New terminal"]').click();
+  await until(() => posts === 1, "held create POST");
+  exited = true;
+  show({ type: "terminal.exit", terminalId: "term-A", payload: { exitCode: 7 } });
+  await until(() => host.querySelector('#terminal-tab-term-A')?.getAttribute('aria-label')?.includes('process exited 7'), "old terminal exit while create pending");
+  pendingCreate.resolve(response(terminal("A2")));
+  await until(() => terminalReady("Terminal A2"), "new terminal after held create");
+  assert(host.querySelector('#terminal-tab-term-A')?.getAttribute('aria-label')?.includes('process exited 7'), "Late create revived an exited terminal in the tablist");
+  const priorResizeCount = runtimeMessages.filter((message) => message.type === "terminal.resize" && message.terminalId === "term-A").length;
+  host.querySelector('#terminal-tab-term-A').click();
+  await until(() => terminalReady("Terminal A"), "return to exited terminal after create");
+  assert([...host.querySelectorAll('.terminal-pane [role="status"]')].some((notice) => notice.textContent.includes('process exited 7')), "Exiting terminal lost its notice after the new tab activated");
+  assert(runtimeMessages.filter((message) => message.type === "terminal.resize" && message.terminalId === "term-A").length === priorResizeCount, "Exited terminal sent another resize");
+  assert(host.querySelector('#terminal-tab-term-A')?.getAttribute('aria-label')?.includes('process exited 7'), "Exited terminal became running on reselect");
+}
+
 async function terminalKeyboardRegression() {
   root.render(null);
   await settle();
@@ -1081,6 +1206,9 @@ try {
     ["delayed trust response", () => chatRace(true), "delayed trust response cannot target another conversation"],
     ["chat tab controls", chatTabControlRegression, "chat tab navigation ignores nested archive controls"],
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
+    ["archived chat ownership", archivedChatOwnershipRegression, "an archived chat cannot keep a pane or accept runs during held or failed refresh"],
+    ["terminal exit during create", terminalExitWhileCreatingRegression, "an exit received while create is held remains exited in the tablist"],
+    ["worktree chat list failure", chatFailedWorktreeListRegression, "a rejected list cannot expose old-owner chat tabs and a retry restores the new owner"],
     ["worktree terminal switch", terminalRace, "worktree switch removes old terminal tabs and rejects stale buffer responses"],
     ["terminal keyboard", terminalKeyboardRegression, "terminal keyboard switching retains focus and ignores non-tab controls"],
     ["terminal selection during reconnect", terminalSelectionReconnectRegression, "selected terminal and output survive a reconnect while its buffer is pending"],

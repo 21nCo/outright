@@ -42,6 +42,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   const agents = createAgentManager({ database, publish, validateConversation: async (conversation) => {
     const target = await resolveWorktreeTarget(conversation);
     return () => {
+      if (database.getConversation(conversation.id)?.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
       if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required");
     };
   } });
@@ -218,6 +219,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (runCreateMatch && request.method === "POST") {
         const conversation = database.getConversation(runCreateMatch[1]);
         if (!conversation) throw apiError(404, "Conversation not found");
+        if (conversation.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
         // Recovery ownership is scoped to the worktree, not the chat. Another
         // conversation targeting the same checkout must not start while an
         // interrupted process tree may still mutate it.
