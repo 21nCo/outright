@@ -1,0 +1,37 @@
+server/outright-runtime.mjs
+  s_dbeaf6beea25e6::t_80983e61a403c0 45,222
+server/outright-runtime.test.mjs
+  s_30dfa2b8858bc8::t_36bce94368511b 156-166
+src/App.jsx
+  s_30dfa2b8858bc8::t_652cd8a791eb2b 42-43,92-93,129-130,135-137,139,142,144-149,152-161,165-170,175,187,192,195-199,222-225,227,464,501-506,570,576,580,642-670,727,731,733
+src/components/TerminalPane.jsx
+  s_dbeaf6beea25e6::t_1c1cf480a29096 281
+tests/ui-races.jsx
+  s_30dfa2b8858bc8::t_edb8e080506085 232-356,1209-1211
+tests/ui-races.test.mjs
+  s_30dfa2b8858bc8::t_61a0432b85263b 800
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "eff228ceb584daf51e60c9d5fbe7667c443eef31",
+  "prompts": {},
+  "sessions": {
+    "s_30dfa2b8858bc8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c258-bb70-7753-bbe1-1fd667ccb651",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_dbeaf6beea25e6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c886-73ef-72c2-b7ee-54bc7cc84533",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
