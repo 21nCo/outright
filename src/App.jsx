@@ -91,7 +91,13 @@ export function App() {
   const pendingConversationLoadRef = useRef(null);
   const conversationListRequestRef = useRef(0);
   const conversationOwnerRef = useRef("");
+  const conversationsRef = useRef([]);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+
+  function stageConversations(next) {
+    conversationsRef.current = next;
+    setConversations(next);
+  }
 
   const loadBootstrap = useCallback(async (manual = false) => {
     setIsScanning(true);
@@ -137,7 +143,7 @@ export function App() {
       // conversations of the worktree the user has since switched to.
       if (request !== conversationListRequestRef.current || selectedProjectRef.current !== forProjectId || selectedWorktreeRef.current !== forWorktreeId) return;
       const available = result.conversations.filter((item) => !item.archived);
-      setConversations(available);
+      stageConversations(available);
       const wanted = preferredId || pendingConversationRef.current || selectedConversationRef.current;
       const selected = available.find((item) => item.id === wanted) ?? available[0];
       pendingConversationRef.current = "";
@@ -157,7 +163,7 @@ export function App() {
     pendingConversationLoadRef.current?.controller?.abort();
     pendingConversationLoadRef.current = null;
     selectedConversationRef.current = "";
-    setConversations([]); setConversation(null); setSelectedConversationId("");
+    stageConversations([]); setConversation(null); setSelectedConversationId("");
     setConversationListFailed(false); setConversationLoadFailed(false);
     setStreamingText(""); setRunEvents([]); checkpointCursorsRef.current.clear();
   }
@@ -645,8 +651,8 @@ export function App() {
   function removeArchivedChat(updated) {
     if (updated.projectId !== selectedProjectRef.current || updated.worktreeId !== selectedWorktreeRef.current) return;
     ++conversationListRequestRef.current;
-    const remaining = conversations.filter((item) => item.id !== updated.id);
-    setConversations(remaining);
+    const remaining = conversationsRef.current.filter((item) => item.id !== updated.id);
+    stageConversations(remaining);
     if (selectedConversationRef.current !== updated.id) return;
     pendingConversationLoadRef.current?.controller?.abort();
     pendingConversationLoadRef.current = null;
@@ -695,7 +701,7 @@ export function App() {
     const next = [...conversations];
     const [source] = next.splice(next.findIndex((item) => item.id === sourceId), 1);
     next.splice(next.findIndex((item) => item.id === targetId), 0, source);
-    setConversations(next);
+    stageConversations(next);
     await Promise.all(next.map((item, index) => api(`/api/conversations/${item.id}`, { method: "PATCH", body: { tabPosition: index } })));
   }
 

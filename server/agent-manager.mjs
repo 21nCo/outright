@@ -180,6 +180,14 @@ process.stdin.on("data", (chunk) => {
   for (const rawCommand of commands) {
     const command = rawCommand.trim();
     if (!authorized && command === "go") {
+      // A direct child has no kernel-owned descendant boundary. Only the
+      // supervisor may make a production ownership/cleanup claim; the opt-in
+      // direct path exists solely for trusted, leaf-only wrapper fixtures.
+      if (executable !== ${JSON.stringify(AGENT_SUPERVISOR)} && process.env.OUTRIGHT_TEST_DIRECT_WRAPPER !== "1") {
+        console.error("Direct provider launch requires platform supervision");
+        try { fs.unlinkSync(handshakePath); } catch {}
+        process.exit(127);
+      }
       authorized = true;
       const { spawn } = require("node:child_process");
       const darwinLaunch = process.platform === "darwin";

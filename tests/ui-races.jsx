@@ -39,6 +39,7 @@ function setControlValue(control, value) {
 }
 function visibleFocusable(container) { return [...container.querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')].filter((element) => element.getClientRects().length && element.getAttribute("aria-hidden") !== "true"); }
 let route;
+const fixtureSockets = [];
 window.fetch = async (input, options = {}) => {
   const url = new URL(input, location.origin);
   if (!url.pathname.startsWith("/api/")) throw new Error(`Unexpected test request: ${url}`);
@@ -47,7 +48,7 @@ window.fetch = async (input, options = {}) => {
 window.WebSocket = class extends EventTarget {
   static OPEN = 1;
   readyState = 1;
-  constructor() { super(); queueMicrotask(() => this.dispatchEvent(new Event("open"))); }
+  constructor() { super(); fixtureSockets.push(this); queueMicrotask(() => this.dispatchEvent(new Event("open"))); }
   send() {}
   close() { this.readyState = 3; }
 };
@@ -283,6 +284,44 @@ async function archivedChatOwnershipRegression() {
   [...host.querySelectorAll('button')].find((button) => button.textContent === 'Retry loading chat').click();
   await until(() => host.querySelector('.conversation-header h1')?.textContent === sibling.title, "sibling loads after detail retry");
   assert(postCount === 0, "Archived chat was submitted during list or detail recovery");
+}
+
+async function sameOwnerArchiveRefreshRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const sibling = { ...chats.A, id: "chat-A2", title: "Conversation A2" };
+  const fresh = { ...chats.A, id: "chat-A3", title: "Conversation A3" };
+  const patch = deferred();
+  let list = [chats.A, sibling];
+  let refreshFails = false;
+  let patchStarted = false;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return refreshFails ? response({ error: "Refresh failed" }, 503) : response({ conversations: list });
+    if (url.pathname === "/api/conversations/chat-A" && options.method === "PATCH") { patchStarted = true; return patch.promise; }
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/conversations/chat-A3") return response(fresh);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('#chat-tab-chat-A[aria-selected="true"]') && host.querySelector('#chat-tab-chat-A2'), "initial same-owner tabs");
+  host.querySelector('[aria-label="Archive Conversation A"]').click();
+  await until(() => patchStarted, "held same-owner archive");
+  // A current-owner runtime refresh replaces B with C while the old archive
+  // handler still captures [A, B]. The next GET fails, so its local update
+  // must not resurrect B or drop C.
+  list = [chats.A, fresh];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "conversation.created", conversationId: fresh.id }) }));
+  await until(() => host.querySelector('#chat-tab-chat-A3[aria-selected="true"]') && !host.querySelector('#chat-tab-chat-A2'), "new authoritative same-owner list");
+  refreshFails = true;
+  patch.resolve(response({ ...chats.A, archived: true }));
+  await until(() => host.querySelector('.history-loader')?.textContent === "Retry chat list", "failed archive follow-up refresh");
+  assert(!host.querySelector('#chat-tab-chat-A'), "Archived tab remained after failed refresh");
+  assert(!host.querySelector('#chat-tab-chat-A2'), "Archived PATCH resurrected removed sibling B");
+  const selected = host.querySelector('#chat-tab-chat-A3');
+  assert(selected?.getAttribute("aria-selected") === "true" && selected.tabIndex === 0, "Archived PATCH dropped current sibling C or its roving selection");
+  assert(host.querySelector('#conversation-panel')?.getAttribute('aria-labelledby') === selected.id, "Panel lost the current sibling owner");
 }
 
 async function chatFailedWorktreeListRegression() {
@@ -1277,6 +1316,7 @@ try {
     ["chat tab controls", chatTabControlRegression, "chat tab navigation ignores nested archive controls"],
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
     ["archived chat ownership", archivedChatOwnershipRegression, "an archived chat cannot keep a pane or accept runs during held or failed refresh"],
+    ["same-owner archive refresh", sameOwnerArchiveRefreshRegression, "a held archive cannot overwrite a newer same-worktree list after refresh failure"],
     ["terminal exit during create", terminalExitWhileCreatingRegression, "an exit received while create is held remains exited in the tablist"],
     ["terminal exit during close", terminalExitWhileClosingRegression, "a held delete retains another terminal's exit"],
     ["late archive after owner switch", () => staleArchiveWorktreeRegression(false), "late A archive does not discard B's list response"],

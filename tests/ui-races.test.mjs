@@ -797,7 +797,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       if (viewportError) throw viewportError;
       return send(method, params);
     }, deadline);
-    assert.match(state.text, /29 interaction regressions passed/);
+    assert.match(state.text, /30 interaction regressions passed/);
     if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
   } catch (error) {
     failure = new Error(`UI fixture ${phase}: ${error.message}`, { cause: error });

@@ -14,6 +14,9 @@ const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
 const fakeLaunchDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-agent-test-"));
 const WRAPPER_OWNERSHIP_TOKEN = "00000000-0000-4000-8000-000000000001";
 const platformSupervisor = AGENT_SUPERVISOR;
+// Direct wrapper probes are trusted leaf-only fixtures, never production
+// launches. Production requires the platform supervisor's owned boundary.
+process.env.OUTRIGHT_TEST_DIRECT_WRAPPER = "1";
 const wrapperArgs = (handshakePath, ...providerArgs) => [
   "-e", LAUNCH_WRAPPER_SOURCE, handshakePath, WRAPPER_OWNERSHIP_TOKEN,
   process.platform === "darwin" ? `com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}` : "-",
@@ -956,6 +959,36 @@ test("windows launch ACLs remove inherited broad access before handshakes are wr
 
 // The real launch wrapper must durably record its own pid and only start the
 // provider after the runtime's authorization byte.
+test("wrapper rejects an unsupervised provider that could escape through a detached descendant", { timeout: 10000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-wrapper-boundary-"));
+  const handshakePath = path.join(root, "launch.json");
+  const marker = path.join(root, "detached-descendant-pid");
+  const provider = `const { spawn } = require("node:child_process"); const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" }); require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(child.pid)); child.unref();`;
+  const child = spawn(process.execPath, ["-e", LAUNCH_WRAPPER_SOURCE, handshakePath, WRAPPER_OWNERSHIP_TOKEN, "-", process.execPath, "-e", provider], {
+    stdio: ["pipe", "ignore", "ignore", "pipe"],
+    env: { ...process.env, OUTRIGHT_TEST_DIRECT_WRAPPER: "" },
+  });
+  let timer;
+  try {
+    child.stdin.end("go\n");
+    const [code] = await Promise.race([
+      once(child, "close"),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Unsupervised wrapper did not reject promptly")), 5000); }),
+    ]);
+    assert.equal(code, 127, "unsupervised launch cannot appear to complete successfully");
+    assert.equal(existsSync(marker), false, "the unsupervised provider did not create an escaped descendant");
+    assert.equal(existsSync(handshakePath), false, "the rejected launch left no ownership claim");
+  } finally {
+    clearTimeout(timer);
+    try { child.kill("SIGKILL"); } catch {}
+    if (existsSync(marker)) {
+      const descendantPid = Number(readFileSync(marker, "utf8"));
+      if (Number.isSafeInteger(descendantPid) && descendantPid > 0) try { process.kill(descendantPid, "SIGKILL"); } catch {}
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("the launch wrapper records durable identity before authorization and cleans up on exit", { timeout: 20000 }, async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-launch-"));
   const launchDirectory = path.join(root, "launches");

@@ -164,7 +164,18 @@ test("archived conversations reject new runs before any message or agent schedul
   assert.deepEqual(runtime.database.listRuns(conversation.id), []);
 }));
 
-test("archiving during asynchronous worktree validation rejects a run without durable side effects", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+async function waitForValidation(entered, pending) {
+  let timer;
+  try {
+    await Promise.race([
+      entered,
+      pending.then(() => { throw new Error("Run request completed before worktree validation"); }, (error) => { throw new Error("Run request failed before worktree validation", { cause: error }); }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Worktree validation was not reached within 5 seconds")), 5000); }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
+
+test("archiving during asynchronous worktree validation rejects a run without durable side effects", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
   const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Interleaved archive", provider: "codex" });
   const original = runtime.git.requireWorktree;
   let release;
@@ -175,12 +186,31 @@ test("archiving during asynchronous worktree validation rejects a run without du
   const result = responseCapture();
   const pending = runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "must not persist" }), result);
   try {
-    await waiting;
+    await waitForValidation(waiting, pending);
     runtime.database.updateConversation(conversation.id, { archived: true });
   } finally { release(); }
   await pending;
   assert.equal(result.statusCode, 409);
   assert.equal(result.body.code, "CONVERSATION_ARCHIVED");
+  assert.deepEqual(runtime.database.listMessages(conversation.id), []);
+  assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+}));
+
+test("validation rendezvous fails promptly when the run request rejects before the gate", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Early rejection", provider: "codex" });
+  const original = runtime.git.requireWorktree;
+  let release;
+  let entered;
+  const waiting = new Promise((resolve) => { entered = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  runtime.git.requireWorktree = async (...args) => { entered(); await gate; return original(...args); };
+  const result = responseCapture();
+  const pending = runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "" }), result);
+  try {
+    await assert.rejects(waitForValidation(waiting, pending), /Run request completed before worktree validation/);
+  } finally { release(); }
+  await pending;
+  assert.equal(result.statusCode, 400);
   assert.deepEqual(runtime.database.listMessages(conversation.id), []);
   assert.deepEqual(runtime.database.listRuns(conversation.id), []);
 }));
