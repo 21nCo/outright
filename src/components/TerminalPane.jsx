@@ -5,6 +5,7 @@ import { ArrowsClockwise, Plus, TerminalWindow, X } from "@phosphor-icons/react"
 import "@xterm/xterm/css/xterm.css";
 import { Button } from "@/components/ui/button";
 import { domId, nextTabIndex } from "@/lib/accessibility";
+import { pruneExitedIds } from "@/lib/terminal-exit-state";
 import { api } from "@/lib/runtime-api";
 
 export function TerminalPane(props) {
@@ -85,6 +86,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
 
   function stageTerminals(next) {
     terminalsRef.current = next;
+    pruneExitedIds(exitedIdsRef.current, next, pendingOutputRef.current);
     if (activeIdRef.current && !next.some((item) => item.id === activeIdRef.current)) {
       activeIdRef.current = "";
       displayedCursorRef.current = 0;

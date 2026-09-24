@@ -382,6 +382,42 @@ async function terminalExitRejectionRegression() {
   assert(sent.slice(before).some((message) => message.type === "terminal.resize" && message.terminalId === "term-A2"), "Running reacquisition did not synchronize the selected PTY");
 }
 
+async function terminalRepeatedExitCloseRegression() {
+  root.render(null);
+  await settle();
+  let all = [terminal("A")];
+  let created = 0;
+  const errors = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") {
+      const next = terminal(`A${++created}`);
+      all = [...all, next];
+      return response(next);
+    }
+    if (url.pathname === "/api/terminals") return response({ terminals: all });
+    if (options.method === "DELETE") {
+      all = all.filter((item) => !url.pathname.endsWith(item.id));
+      return response({});
+    }
+    return response({ buffer: "Running\r\n", status: "running" });
+  };
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} onError={(error) => errors.push(error)} sendRuntime={() => {}} />);
+  show();
+  await until(() => terminalReady("Terminal A"), "initial terminal before repeated exits");
+  for (let index = 1; index <= 4; index += 1) {
+    const name = `Terminal A${index}`;
+    const id = `term-A${index}`;
+    host.querySelector('[aria-label="New terminal"]').click();
+    await until(() => terminalReady(name), `created terminal ${index}`);
+    show({ type: "terminal.exit", terminalId: id, payload: { exitCode: index } });
+    await until(() => host.querySelector(`[data-tab-id="${id}"]`)?.getAttribute("aria-label").includes(`process exited ${index}`), `exited terminal ${index}`);
+    host.querySelector(`[aria-label="Close terminal ${name}"]`).click();
+    await until(() => terminalReady("Terminal A") && !host.querySelector(`[data-tab-id="${id}"]`), `closed exited terminal ${index}`);
+    assert(host.querySelectorAll('[role="tab"]').length === 1, `Exited terminal ${index} remained in the tablist`);
+  }
+  assert(errors.length === 0 && created === 4, "Repeated exit and close lost terminal ownership");
+}
+
 async function terminalReconnectMutationRegression() {
   root.render(null);
   await settle();
@@ -901,47 +937,41 @@ async function recoveryActionsRegression() {
 }
 
 try {
-  await chatRace(false, false);
-  results.textContent = "PASS: sending in the current conversation shows its run\n";
-  await chatRace(false);
-  results.textContent += "PASS: delayed send cannot attach A's run to B\n";
-  await chatRace(true);
-  results.textContent += "PASS: delayed trust response cannot target another conversation\n";
-  await chatTabControlRegression();
-  results.textContent += "PASS: chat tab navigation ignores nested archive controls\n";
-  await terminalRace();
-  results.textContent += "PASS: worktree switch removes old terminal tabs and rejects stale buffer responses\n";
-  await terminalKeyboardRegression();
-  results.textContent += "PASS: terminal keyboard switching retains focus and ignores non-tab controls\n";
-  await terminalActivationOwnershipRegression();
-  results.textContent += "PASS: terminal activation commits output and current PTY size together\n";
-  await terminalRejectedSwitchRegression();
-  results.textContent += "PASS: rejected terminal switch restores the selected tab focus\n";
-  await terminalExitDuringActivationRegression();
-  results.textContent += "PASS: terminal exit during activation is announced and cannot accept input\n";
-  await terminalExitRejectionRegression();
-  results.textContent += "PASS: candidate and active exits survive failed activation and fresh running reacquisition\n";
-  await terminalReconnectMutationRegression();
-  results.textContent += "PASS: reconnect refreshes authoritative terminals after pending create and delete\n";
-  await terminalSamePaneRestartRegression();
-  results.textContent += "PASS: same-pane restart drains reconnect after pending mutation\n";
-  await terminalReconnectOwnershipRegression();
-  results.textContent += "PASS: overlapping reconnects coalesce and unmount discards queued work\n";
-  await terminalBackgroundActivationRegression();
-  results.textContent += "PASS: background activation settles and fits when visible\n";
-  await commandPaletteRegression();
-  results.textContent += "PASS: command search keeps asynchronous results current and selectable\n";
-  await changesLoadingRegression();
-  results.textContent += "PASS: changes pane waits for status before announcing a clean tree\n";
-  const responsiveRan = await responsiveFocusRegression();
-  results.textContent += responsiveRan ? "PASS: narrow drawer and inspector contain and restore focus\n" : "SKIP: responsive transition requires the CDP viewport bridge\n";
-  await terminalInitialFailureRegression();
-  results.textContent += "PASS: failed initial terminal activation retains a keyboard-reachable tab\n";
-  await terminalMutationFailureRegression();
-  results.textContent += "PASS: create, close and reconnect failures preserve terminal tab ownership\n";
-  const phoneRan = await recoveryActionsRegression();
-  results.textContent += phoneRan ? "PASS: phone-width recovery decisions remain inside the viewport\n" : "SKIP: phone geometry requires a narrow viewport\n";
-  results.textContent += `${18 + Number(responsiveRan) + Number(phoneRan)} interaction regressions passed`;
+  const steps = [
+    ["current conversation send", () => chatRace(false, false), "sending in the current conversation shows its run"],
+    ["delayed send", () => chatRace(false), "delayed send cannot attach A's run to B"],
+    ["delayed trust response", () => chatRace(true), "delayed trust response cannot target another conversation"],
+    ["chat tab controls", chatTabControlRegression, "chat tab navigation ignores nested archive controls"],
+    ["worktree terminal switch", terminalRace, "worktree switch removes old terminal tabs and rejects stale buffer responses"],
+    ["terminal keyboard", terminalKeyboardRegression, "terminal keyboard switching retains focus and ignores non-tab controls"],
+    ["terminal activation ownership", terminalActivationOwnershipRegression, "terminal activation commits output and current PTY size together"],
+    ["rejected terminal switch", terminalRejectedSwitchRegression, "rejected terminal switch restores the selected tab focus"],
+    ["terminal exit during activation", terminalExitDuringActivationRegression, "terminal exit during activation is announced and cannot accept input"],
+    ["terminal exit rejection", terminalExitRejectionRegression, "candidate and active exits survive failed activation and fresh running reacquisition"],
+    ["repeated terminal exit and close", terminalRepeatedExitCloseRegression, "repeated terminal exits and closes retain only live tabs"],
+    ["terminal reconnect during mutation", terminalReconnectMutationRegression, "reconnect refreshes authoritative terminals after pending create and delete"],
+    ["same-pane terminal metadata", terminalSamePaneRestartRegression, "same-pane restart drains reconnect after pending mutation"],
+    ["terminal reconnect ownership", terminalReconnectOwnershipRegression, "overlapping reconnects coalesce and unmount discards queued work"],
+    ["background terminal activation", terminalBackgroundActivationRegression, "background activation settles and fits when visible"],
+    ["command search", commandPaletteRegression, "command search keeps asynchronous results current and selectable"],
+    ["changes loading", changesLoadingRegression, "changes pane waits for status before announcing a clean tree"],
+    ["responsive focus", responsiveFocusRegression, "narrow drawer and inspector contain and restore focus", "responsive transition requires the CDP viewport bridge"],
+    ["initial terminal failure", terminalInitialFailureRegression, "failed initial terminal activation retains a keyboard-reachable tab"],
+    ["terminal mutation failure", terminalMutationFailureRegression, "create, close and reconnect failures preserve terminal tab ownership"],
+    ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],
+  ];
+  const startedAt = performance.now();
+  window.__fixtureStartedAt = startedAt;
+  let passed = 0;
+  for (const [index, [step, run, success, skipped]] of steps.entries()) {
+    const stepStartedAt = performance.now();
+    window.__fixtureProgress = { step, completed: index, total: steps.length, stepStartedAt };
+    const ran = await run();
+    results.textContent += `${ran === false && skipped ? `SKIP: ${skipped}` : `PASS: ${success}`}\n`;
+    if (ran !== false) passed += 1;
+  }
+  window.__fixtureProgress = { step: "complete", completed: steps.length, total: steps.length, stepStartedAt: performance.now() };
+  results.textContent += `${passed} interaction regressions passed`;
   document.title = "PASS — Outright interaction regressions";
 } catch (error) {
   results.textContent += `\nFAIL: ${error.stack}`;

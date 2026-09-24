@@ -326,6 +326,41 @@ async function closeDevTools(devtools) {
   if (devtools.socket.readyState !== WebSocket.CLOSED) devtools.socket.terminate();
 }
 
+async function waitForFixture(send, deadline) {
+  let state;
+  while (Date.now() < deadline) {
+    const evaluated = await send("Runtime.evaluate", {
+      expression: "({ title: document.title, text: document.getElementById('results')?.textContent ?? '', progress: window.__fixtureProgress && { ...window.__fixtureProgress, elapsedMs: Math.round(performance.now() - window.__fixtureStartedAt), stepElapsedMs: Math.round(performance.now() - window.__fixtureProgress.stepStartedAt) } })",
+      returnByValue: true,
+    });
+    state = evaluated.result.value;
+    if (state.title.startsWith("PASS")) return state;
+    if (state.title.startsWith("FAIL")) throw new Error(`${state.text}\n${fixtureProgress(state)}`);
+    await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(0, deadline - Date.now()))));
+  }
+  throw new Error(`Interaction phase exceeded its pre-cleanup deadline: ${fixtureProgress(state)}; page=${state?.title ?? "unavailable"}; output=${state?.text?.slice(-1000) ?? "unavailable"}`);
+}
+
+function fixtureProgress(state) {
+  const progress = state?.progress;
+  return progress
+    ? `${progress.completed}/${progress.total} complete, current step=${progress.step}, elapsed=${progress.elapsedMs}ms, step=${progress.stepElapsedMs}ms`
+    : "fixture has not reported a step";
+}
+
+test("browser fixture polling reports its last step and preserves the phase deadline", { timeout: 5_000 }, async () => {
+  const progress = { step: "terminal activation", completed: 7, total: 21, elapsedMs: 1234, stepElapsedMs: 250 };
+  const send = async () => ({ result: { value: { title: "Running", text: "Running interaction regressions", progress } } });
+  await assert.rejects(waitForFixture(send, Date.now() + 30), /7\/21 complete, current step=terminal activation, elapsed=1234ms/);
+  let polls = 0;
+  const completed = await waitForFixture(async () => {
+    polls += 1;
+    return { result: { value: { title: polls === 2 ? "PASS" : "Running", text: "21 interaction regressions passed", progress } } };
+  }, Date.now() + 500);
+  assert.equal(completed.title, "PASS");
+  assert.equal(polls, 2);
+});
+
 test("a silent DevTools request fails within its bound", { timeout: 5_000 }, async () => {
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   await new Promise((resolve) => server.once("listening", resolve));
@@ -543,22 +578,38 @@ test("a vanished Windows launcher preserves verified descendants without adoptin
   assert.equal(launcher.ownedWindows.has(4103), false);
 });
 
-test("fixture assertion failures still clean Chrome, Vite and profile independently", { timeout: 120_000 }, async () => {
-  if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE) return;
-  const env = { ...process.env, OUTRIGHT_TEST_UI_ASSERTION_FAILURE: "1" };
+test("fixture assertion failures still clean Chrome, Vite and profile independently", { timeout: 120_000 }, async (context) => {
+  if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE) { context.skip("Nested injected-failure run"); return; }
+  const profile = mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
+  const env = { ...process.env, OUTRIGHT_TEST_UI_ASSERTION_FAILURE: "1", OUTRIGHT_TEST_UI_PROFILE: profile };
   delete env.NODE_TEST_CONTEXT;
   const child = spawn(process.execPath, ["--test", "--test-name-pattern=browser interaction regressions", fileURLToPath(import.meta.url)], {
-    cwd: root, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+    cwd: root, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true,
   });
+  child.profile = profile;
   let output = "";
   child.stdout.on("data", (chunk) => { output += chunk; });
   child.stderr.on("data", (chunk) => { output += chunk; });
+  let failure;
   try {
+    snapshotWindowsTree(child);
     assert(await waitForExit(child, 90_000), "Injected browser assertion did not terminate promptly");
     assert.notEqual(child.exitCode, 0, output);
     assert.match(output, /Injected UI assertion failure after fixture pass/);
     assert.doesNotMatch(output, /UI harness cleanup failed|did not exit after forced termination|ENOTEMPTY/);
-  } finally { if (!hasExited(child)) child.kill("SIGKILL"); }
+  } catch (error) { failure = error; }
+  finally {
+    try {
+      await cleanupResources([
+        ["nested runner", () => stop(child)],
+        ["nested Chrome profile", () => rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })],
+      ]);
+    } catch (error) {
+      if (failure) throw new AggregateError([failure, error], `Injected fixture failed: ${failure.message}; ${error.message}`);
+      throw error;
+    }
+  }
+  if (failure) throw failure;
 });
 
 test("browser interaction regressions pass in headless Chrome", { timeout: 120_000 }, async () => {
@@ -572,7 +623,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
   };
   const port = await unusedPort();
   const debugPort = await unusedPort();
-  const profile = mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
+  const profile = process.env.OUTRIGHT_TEST_UI_PROFILE ?? mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
   const vite = spawn(process.execPath, [viteCli, "--config", "tests/vite.ui-races.config.mjs", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
     cwd: root,
     env: { ...process.env, NO_COLOR: "1" },
@@ -691,21 +742,11 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
     await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 844, deviceScaleFactor: 1, mobile: false });
     await send("Page.navigate", { url });
     phase = "run browser interaction fixtures";
-    const fixtureDeadline = Math.min(Date.now() + 30_000, deadline);
-    let state;
-    while (Date.now() < fixtureDeadline) {
+    const state = await waitForFixture(async (method, params) => {
       if (viewportError) throw viewportError;
-      const evaluated = await send("Runtime.evaluate", {
-        expression: "({ title: document.title, text: document.getElementById('results')?.textContent ?? '' })",
-        returnByValue: true,
-      });
-      state = evaluated.result.value;
-      if (state.title.startsWith("PASS")) break;
-      if (state.title.startsWith("FAIL")) throw new Error(state.text);
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    assert.match(state?.title ?? "", /^PASS/, state?.text || logs());
-    assert.match(state.text, /20 interaction regressions passed/);
+      return send(method, params);
+    }, deadline);
+    assert.match(state.text, /21 interaction regressions passed/);
     if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
   } catch (error) {
     failure = new Error(`UI fixture ${phase}: ${error.message}`, { cause: error });

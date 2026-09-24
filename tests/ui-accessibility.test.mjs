@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { domId, nextTabIndex } from "../src/lib/accessibility.js";
+import { pruneExitedIds } from "../src/lib/terminal-exit-state.js";
 
 const root = new URL("../", import.meta.url);
 
@@ -17,6 +18,23 @@ test("tab navigation wraps and supports Home and End", () => {
 
 test("DOM ids remain valid for provider and runtime identifiers", () => {
   assert.equal(domId("chat-tab", "abc/123:next"), "chat-tab-abc-123-next");
+});
+
+test("exited terminal identities remain bounded by the staged list and pending activation", () => {
+  const exited = new Set();
+  for (let index = 0; index < 50; index += 1) {
+    const id = `exited-${index}`;
+    exited.add(id);
+    pruneExitedIds(exited, [{ id: "active" }, { id }], null);
+    assert.deepEqual([...exited], [id], "Staging discarded a current exit");
+    pruneExitedIds(exited, [{ id: "active" }], null);
+    assert.equal(exited.size, 0, "A closed terminal kept its exit identity");
+  }
+  exited.add("pending-exit");
+  pruneExitedIds(exited, [{ id: "active" }], { id: "pending-exit", exit: { exitCode: 7 } });
+  assert(exited.has("pending-exit"), "An exit during activation was lost");
+  pruneExitedIds(exited, [{ id: "active" }], null);
+  assert.equal(exited.size, 0);
 });
 
 test("core surfaces retain their semantic wiring and narrow-screen fallbacks", async () => {
