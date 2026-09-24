@@ -1,0 +1,20 @@
+src/components/TerminalPane.jsx
+  h_a39f9495f9ec1d 229-230,242-247
+tests/fixtures/cooperative-child.mjs
+  h_a39f9495f9ec1d 1-3
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 411-413,667-668,670-671,675,680-681,683,687-693,719-744
+tests/ui-races.test.mjs
+  h_a39f9495f9ec1d 14,377,379,382-383,616,623-624,626
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b31418d4036d6079b29c34028bde0398571f7c16",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
