@@ -215,6 +215,42 @@ async function terminalKeyboardRegression() {
   assert(document.activeElement === close, "Terminal tablist handled an arrow key from the close control");
 }
 
+async function terminalSelectionReconnectRegression() {
+  root.render(null);
+  await settle();
+  const heldBuffer = deferred();
+  let holdBuffer = true;
+  let requests = 0;
+  let lists = 0;
+  const errors = [];
+  const onError = (error) => errors.push(error);
+  const sendRuntime = () => {};
+  route = async (url) => {
+    if (url.pathname === "/api/terminals") { lists += 1; return response({ terminals: [terminal("A"), terminal("A2")] }); }
+    if (url.pathname === "/api/terminals/term-A2") {
+      requests += 1;
+      return holdBuffer ? heldBuffer.promise : response({ buffer: "A2 selected output\r\n", status: "running" });
+    }
+    return response({ buffer: "A original output\r\n", status: "running" });
+  };
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} onError={onError} sendRuntime={sendRuntime} />);
+  show();
+  await until(() => terminalReady("Terminal A"), "initial selection before reconnect");
+  const next = host.querySelector('[data-tab-id="term-A2"]');
+  next.focus();
+  next.click();
+  await until(() => requests === 1 && host.querySelector('.terminal-tabs[aria-busy="true"]'), "held selected tab buffer");
+  show({ type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [terminal("A"), terminal("A2")] } });
+  await settle();
+  holdBuffer = false;
+  heldBuffer.resolve(response({ buffer: "A2 selected output\r\n", status: "running" }));
+  await until(() => terminalReady("Terminal A2"), "selected tab survives reconnect");
+  await until(() => lists === 2 && requests === 2 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "authoritative reconnect after selected tab");
+  await until(() => host.querySelector('.xterm-rows')?.textContent.includes("A2 selected output"), "reconnected selected output");
+  assert(document.activeElement === next, "Reconnect moved focus away from selected terminal tab");
+  assert(errors.length === 0, "Reconnect during selection reported errors");
+}
+
 async function terminalActivationOwnershipRegression() {
   root.render(null);
   await settle();
@@ -401,7 +437,9 @@ async function terminalRepeatedExitCloseRegression() {
     }
     return response({ buffer: "Running\r\n", status: "running" });
   };
-  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} onError={(error) => errors.push(error)} sendRuntime={() => {}} />);
+  const onError = (error) => errors.push(error);
+  const sendRuntime = () => {};
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} onError={onError} sendRuntime={sendRuntime} />);
   show();
   await until(() => terminalReady("Terminal A"), "initial terminal before repeated exits");
   for (let index = 1; index <= 4; index += 1) {
@@ -411,6 +449,11 @@ async function terminalRepeatedExitCloseRegression() {
     await until(() => terminalReady(name), `created terminal ${index}`);
     show({ type: "terminal.exit", terminalId: id, payload: { exitCode: index } });
     await until(() => host.querySelector(`[data-tab-id="${id}"]`)?.getAttribute("aria-label").includes(`process exited ${index}`), `exited terminal ${index}`);
+    await until(() => host.querySelector('.xterm-rows')?.textContent.includes(`process exited ${index}`), `exit banner ${index}`);
+    assert(host.querySelector('.xterm-rows')?.textContent.includes("Running"), `Exit ${index} lost previous terminal output`);
+    show({ type: "terminal.output", terminalId: id, payload: { cursor: index, data: `After exit ${index}\r\n` } });
+    await settle();
+    assert(host.querySelector('.xterm-rows')?.textContent.includes(`process exited ${index}`), `Rerender lost exit banner ${index}`);
     host.querySelector(`[aria-label="Close terminal ${name}"]`).click();
     await until(() => terminalReady("Terminal A") && !host.querySelector(`[data-tab-id="${id}"]`), `closed exited terminal ${index}`);
     assert(host.querySelectorAll('[role="tab"]').length === 1, `Exited terminal ${index} remained in the tablist`);
@@ -944,6 +987,7 @@ try {
     ["chat tab controls", chatTabControlRegression, "chat tab navigation ignores nested archive controls"],
     ["worktree terminal switch", terminalRace, "worktree switch removes old terminal tabs and rejects stale buffer responses"],
     ["terminal keyboard", terminalKeyboardRegression, "terminal keyboard switching retains focus and ignores non-tab controls"],
+    ["terminal selection during reconnect", terminalSelectionReconnectRegression, "selected terminal and output survive a reconnect while its buffer is pending"],
     ["terminal activation ownership", terminalActivationOwnershipRegression, "terminal activation commits output and current PTY size together"],
     ["rejected terminal switch", terminalRejectedSwitchRegression, "rejected terminal switch restores the selected tab focus"],
     ["terminal exit during activation", terminalExitDuringActivationRegression, "terminal exit during activation is announced and cannot accept input"],

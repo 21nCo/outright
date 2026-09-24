@@ -333,9 +333,12 @@ async function waitForFixture(send, deadline) {
       expression: "({ title: document.title, text: document.getElementById('results')?.textContent ?? '', progress: window.__fixtureProgress && { ...window.__fixtureProgress, elapsedMs: Math.round(performance.now() - window.__fixtureStartedAt), stepElapsedMs: Math.round(performance.now() - window.__fixtureProgress.stepStartedAt) } })",
       returnByValue: true,
     });
-    state = evaluated.result.value;
-    if (state.title.startsWith("PASS")) return state;
-    if (state.title.startsWith("FAIL")) throw new Error(`${state.text}\n${fixtureProgress(state)}`);
+    const next = evaluated?.exceptionDetails ? null : evaluated?.result?.value;
+    if (next && typeof next.title === "string") {
+      state = next;
+      if (state.title.startsWith("PASS")) return state;
+      if (state.title.startsWith("FAIL")) throw new Error(`${state.text}\n${fixtureProgress(state)}`);
+    }
     await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(0, deadline - Date.now()))));
   }
   throw new Error(`Interaction phase exceeded its pre-cleanup deadline: ${fixtureProgress(state)}; page=${state?.title ?? "unavailable"}; output=${state?.text?.slice(-1000) ?? "unavailable"}`);
@@ -359,6 +362,21 @@ test("browser fixture polling reports its last step and preserves the phase dead
   }, Date.now() + 500);
   assert.equal(completed.title, "PASS");
   assert.equal(polls, 2);
+  let transientPolls = 0;
+  const recovered = await waitForFixture(async () => {
+    transientPolls += 1;
+    if (transientPolls === 1) return { result: { value: { title: "Running", text: "Still running", progress } } };
+    if (transientPolls === 2) return { exceptionDetails: { text: "Execution context was destroyed" } };
+    if (transientPolls === 3) return { result: {} };
+    return { result: { value: { title: "PASS", text: "Done" } } };
+  }, Date.now() + 1_000);
+  assert.equal(recovered.title, "PASS");
+  assert.equal(transientPolls, 4);
+  let missing = false;
+  await assert.rejects(waitForFixture(async () => {
+    if (!missing) { missing = true; return { result: { value: { title: "Running", progress } } }; }
+    return { exceptionDetails: { text: "Execution context was destroyed" } };
+  }, Date.now() + 30), /7\/21 complete, current step=terminal activation/);
 });
 
 test("a silent DevTools request fails within its bound", { timeout: 5_000 }, async () => {
@@ -578,7 +596,35 @@ test("a vanished Windows launcher preserves verified descendants without adoptin
   assert.equal(launcher.ownedWindows.has(4103), false);
 });
 
-test("fixture assertion failures still clean Chrome, Vite and profile independently", { timeout: 120_000 }, async (context) => {
+// The child has 120 seconds including its 95-second interaction phase and
+// cleanup. The parent must outlive that contract before invoking fallback
+// cleanup, and retain a separate reserve for its own tree/profile cleanup.
+const browserFixtureTimeout = 120_000;
+const nestedStartupAllowance = 15_000;
+const nestedRunnerBudget = (childBudget, startupAllowance) => childBudget + startupAllowance;
+const nestedExitTimeout = nestedRunnerBudget(browserFixtureTimeout, nestedStartupAllowance);
+test("nested runner deadline exceeds its child's full browser budget", () => {
+  assert(nestedExitTimeout > browserFixtureTimeout);
+  assert(nestedExitTimeout > 95_000 + 25_000);
+});
+
+test("parent permits a slow child beyond the old shorter watchdog", { timeout: 5_000 }, async () => {
+  const child = spawn(process.execPath, [stubbornChild], {
+    cwd: root, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+  });
+  let release;
+  try {
+    await new Promise((resolve, reject) => { child.once("error", reject); child.stdout.once("data", resolve); });
+    release = setTimeout(() => child.kill("SIGKILL"), 160);
+    assert.equal(await waitForExit(child, 90), false, "Controlled child exited before the old watchdog");
+    assert(await waitForExit(child, nestedRunnerBudget(100, 100)), "Parent did not allow child to finish its declared scaled budget");
+  } finally {
+    clearTimeout(release);
+    await stop(child);
+  }
+});
+
+test("fixture assertion failures still clean Chrome, Vite and profile independently", { timeout: nestedExitTimeout + 25_000 }, async (context) => {
   if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE) { context.skip("Nested injected-failure run"); return; }
   const profile = mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
   const env = { ...process.env, OUTRIGHT_TEST_UI_ASSERTION_FAILURE: "1", OUTRIGHT_TEST_UI_PROFILE: profile };
@@ -593,7 +639,7 @@ test("fixture assertion failures still clean Chrome, Vite and profile independen
   let failure;
   try {
     snapshotWindowsTree(child);
-    assert(await waitForExit(child, 90_000), "Injected browser assertion did not terminate promptly");
+    assert(await waitForExit(child, nestedExitTimeout), "Injected browser assertion did not terminate within the child and cleanup budgets");
     assert.notEqual(child.exitCode, 0, output);
     assert.match(output, /Injected UI assertion failure after fixture pass/);
     assert.doesNotMatch(output, /UI harness cleanup failed|did not exit after forced termination|ENOTEMPTY/);
@@ -612,7 +658,7 @@ test("fixture assertion failures still clean Chrome, Vite and profile independen
   if (failure) throw failure;
 });
 
-test("browser interaction regressions pass in headless Chrome", { timeout: 120_000 }, async () => {
+test("browser interaction regressions pass in headless Chrome", { timeout: browserFixtureTimeout }, async () => {
   // Reserve the last part of the test's own bound for independent cleanup.
   const deadline = Date.now() + 95_000;
   let phase = "allocate fixture";
@@ -746,7 +792,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: 120_0
       if (viewportError) throw viewportError;
       return send(method, params);
     }, deadline);
-    assert.match(state.text, /21 interaction regressions passed/);
+    assert.match(state.text, /22 interaction regressions passed/);
     if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
   } catch (error) {
     failure = new Error(`UI fixture ${phase}: ${error.message}`, { cause: error });

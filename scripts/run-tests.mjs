@@ -11,6 +11,7 @@ const tests = directories.flatMap((directory) => readdirSync(path.join(root, dir
   .map((name) => path.join(root, directory, name)));
 tests.push(
   path.join(root, "tests", "ui-accessibility.test.mjs"),
+  path.join(root, "tests", "terminal-exit-state.test.mjs"),
   path.join(root, "tests", "ui-races.test.mjs"),
 );
 
