@@ -176,6 +176,59 @@ async function chatTabControlRegression() {
   await until(() => host.querySelector('#inspector-tab-terminal[aria-selected="true"]'), "left arrow selects terminal inspector tab");
 }
 
+async function chatSettingsArchiveRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const sibling = { ...chats.A, id: "chat-A2", title: "Conversation A2" };
+  let archived = false;
+  let archivedSibling = false;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: archivedSibling ? [] : archived ? [sibling] : [chats.A, sibling] });
+    if (url.pathname === "/api/conversations/chat-A" && options.method === "PATCH") {
+      assert(JSON.parse(options.body).archived === true, "Settings did not archive the selected conversation");
+      archived = true;
+      return response({ ...chats.A, archived: true });
+    }
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/conversations/chat-A2" && options.method === "PATCH") {
+      assert(JSON.parse(options.body).archived === true, "Inline archive did not archive the sibling");
+      archivedSibling = true;
+      return response({ ...sibling, archived: true });
+    }
+    if (url.pathname === "/api/conversations/chat-A2") return response(sibling);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('#chat-tab-chat-A[aria-selected="true"]') && host.querySelector('#chat-tab-chat-A2'), "two chat tabs with A selected");
+  await until(() => host.querySelector('.conversation-header h1')?.textContent === chats.A.title, "selected conversation content before settings");
+  host.querySelector('.conversation-meta button').click();
+  await until(() => document.querySelector('[role="dialog"]')?.textContent.includes("Conversation settings"), "conversation settings dialog");
+  const archive = [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent.includes("Archive conversation"));
+  assert(archive, "Settings archive action is missing");
+  archive.click();
+  await until(() => archived && !document.querySelector('[role="dialog"]') && host.querySelectorAll('.chat-tabs [role="tab"]').length === 1, "archive and sibling selection");
+  const selected = host.querySelector('#chat-tab-chat-A2');
+  assert(selected?.getAttribute("aria-selected") === "true" && selected.tabIndex === 0, "Remaining chat is not selected and tabbable after settings archive");
+  assert(!host.querySelector('#chat-tab-chat-A'), "Archived chat remains in the tablist");
+  assert(host.querySelector('#conversation-panel')?.getAttribute('aria-labelledby') === selected.id, "Conversation panel does not label itself from the remaining tab");
+  await until(() => host.querySelector('.conversation-header h1')?.textContent === sibling.title, "sibling conversation content");
+  const preceding = visibleFocusable(host.querySelector('.workspace-bar')).at(-1);
+  assert(preceding, "No keyboard entry point preceding the chat tabs");
+  preceding.focus();
+  if (window.__fixtureSendKey) {
+    await window.__fixtureSendKey("Tab");
+    assert(document.activeElement === selected, `Tab did not reach the remaining chat: ${document.activeElement?.outerHTML.slice(0, 180)}`);
+  }
+  selected.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+  await settle();
+  assert(document.activeElement === selected && selected.getAttribute("aria-selected") === "true", "Arrow navigation lost the sole remaining chat");
+  host.querySelector('[aria-label="Archive Conversation A2"]').click();
+  await until(() => archivedSibling && !host.querySelector('.chat-tabs [role="tab"]') && host.querySelector('.conversation-header h1')?.textContent === "No conversation selected", "inline archive of last chat");
+  assert(!host.querySelector('#conversation-panel')?.hasAttribute('aria-labelledby'), "Empty conversation panel still references an archived tab");
+}
+
 async function terminalKeyboardRegression() {
   root.render(null);
   await settle();
@@ -1027,6 +1080,7 @@ try {
     ["delayed send", () => chatRace(false), "delayed send cannot attach A's run to B"],
     ["delayed trust response", () => chatRace(true), "delayed trust response cannot target another conversation"],
     ["chat tab controls", chatTabControlRegression, "chat tab navigation ignores nested archive controls"],
+    ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
     ["worktree terminal switch", terminalRace, "worktree switch removes old terminal tabs and rejects stale buffer responses"],
     ["terminal keyboard", terminalKeyboardRegression, "terminal keyboard switching retains focus and ignores non-tab controls"],
     ["terminal selection during reconnect", terminalSelectionReconnectRegression, "selected terminal and output survive a reconnect while its buffer is pending"],

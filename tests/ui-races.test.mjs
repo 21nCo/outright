@@ -775,11 +775,12 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       if (event.method !== "Runtime.bindingCalled") return;
       (async () => {
         if (event.params.name === "__requestFixtureKey") {
-          if (event.params.payload !== "Escape") throw new Error("Unexpected fixture key");
-          const key = { key: "Escape", code: "Escape", windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 };
+          if (!["Escape", "Tab"].includes(event.params.payload)) throw new Error("Unexpected fixture key");
+          const code = event.params.payload === "Tab" ? 9 : 27;
+          const key = { key: event.params.payload, code: event.params.payload, windowsVirtualKeyCode: code, nativeVirtualKeyCode: code };
           await send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...key });
           await send("Input.dispatchKeyEvent", { type: "keyUp", ...key });
-          await send("Runtime.evaluate", { expression: 'window.dispatchEvent(new CustomEvent("fixture-key-ready", { detail: "Escape" }))' });
+          await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-key-ready", { detail: ${JSON.stringify(event.params.payload)} }))` });
           return;
         }
         if (event.params.name !== "__requestFixtureViewport") return;
@@ -796,7 +797,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       if (viewportError) throw viewportError;
       return send(method, params);
     }, deadline);
-    assert.match(state.text, /22 interaction regressions passed/);
+    assert.match(state.text, /23 interaction regressions passed/);
     if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
   } catch (error) {
     failure = new Error(`UI fixture ${phase}: ${error.message}`, { cause: error });

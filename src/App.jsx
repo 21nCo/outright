@@ -597,7 +597,7 @@ export function App() {
   async function refreshGroups() { const projectGroups = await api("/api/groups"); setBootstrap((current) => ({ ...current, projectGroups })); }
   async function moveProject(projectId, groupId) { try { const projectGroups = await api("/api/project-memberships", { method: "PUT", body: { projectId, groupId } }); setBootstrap((current) => ({ ...current, projectGroups })); setToast("Project group updated"); } catch (nextError) { setError(nextError.message); } }
   async function updateConversation(patch) { try { const updated = await api(`/api/conversations/${conversation.id}`, { method: "PATCH", body: patch }); setConversation((current) => ({ ...current, ...updated })); await loadConversations(updated.id); return updated; } catch (nextError) { setError(nextError.message); return null; } }
-  async function archiveConversation() { const updated = await updateConversation({ archived: true }); if (!updated) return; setSelectedConversationId(""); setManageChatOpen(false); }
+  async function archiveConversation() { const updated = await updateConversation({ archived: true }); if (!updated) return; setManageChatOpen(false); }
   async function saveChatSettings(event) {
     event.preventDefault();
     const { destination, ...patch } = chatDraft;
