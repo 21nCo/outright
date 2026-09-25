@@ -550,6 +550,126 @@ async function trustPendingListRefreshRegression() {
   assert(runs[1].provider === "claude" && runs[1].prompt === "Preserve pending prompt", "Trust continuation used stale metadata or lost prompt");
 }
 
+async function newChatSupersededListRegression(failSuccessor = false) {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "" : "A"));
+  const created = { ...chats.A, id: "chat-new", title: "First prompt", provider: "codex" };
+  const fresh = { ...created, provider: "claude" };
+  const heldPostCreateList = deferred();
+  let lists = 0;
+  let runs = 0;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations" && options.method === "POST") return response(created, 201);
+    if (url.pathname === "/api/conversations") {
+      lists++;
+      if (lists === 1) return response({ conversations: [] });
+      if (lists === 2) return heldPostCreateList.promise;
+      if (lists === 3 && failSuccessor) return response({ error: "List unavailable" }, 503);
+      return response({ conversations: [created] });
+    }
+    if (url.pathname === "/api/conversations/chat-new") return response(fresh);
+    if (url.pathname === "/api/conversations/chat-new/runs") { runs++; return response({ id: `run-${runs}`, status: "queued" }, 202); }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('textarea[aria-label="Message the agent"]:not(:disabled)'), "new chat composer ready");
+  setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "First prompt must survive");
+  await until(() => host.querySelector('[aria-label="Send message"]:not(:disabled)'), "first prompt enabled");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => lists === 2, "held post-create list");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "conversation.created", conversationId: created.id }) }));
+  await until(() => lists === 3, "superseding chat list");
+  if (failSuccessor) {
+    await until(() => host.querySelector('.history-loader')?.textContent === "Retry chat list", "successor list failure");
+  } else {
+    await until(() => host.querySelector('#chat-tab-chat-new[aria-selected="true"]') && !host.querySelector('[aria-label="Send message"]')?.disabled, "successor selected created chat");
+  }
+  heldPostCreateList.resolve(response({ conversations: [created] }));
+  await settle();
+  assert(runs === 0, "Superseded list submitted a run before the current list/detail owner was ready");
+  assert(host.querySelector('textarea[aria-label="Message the agent"]')?.value === "First prompt must survive", "Superseded list discarded the first draft");
+  assert(host.textContent.includes("Chat created, but your message was not sent"), "Created chat silently dropped the first prompt without a visible retry instruction");
+  assert(getComputedStyle(host.querySelector('.first-prompt-notice')).display !== 'none', "Unsent first-prompt notice is visually hidden");
+  if (failSuccessor) {
+    assert(host.querySelector('[aria-label="Send message"]')?.disabled, "Failed successor list left Send enabled");
+    [...host.querySelectorAll('button')].find((button) => button.textContent === "Retry chat list").click();
+    await until(() => host.querySelector('#chat-tab-chat-new[aria-selected="true"]') && !host.querySelector('[aria-label="Send message"]')?.disabled, "failed successor list recovery");
+  }
+  assert(host.querySelector('textarea[placeholder*="Ask claude"]'), "Retry did not use fresh detail metadata");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => runs === 1, "explicit retry of first prompt");
+  await until(() => !host.querySelector('.first-prompt-notice'), "successful retry clears the unsent notice");
+}
+
+async function newChatOrdinaryRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "" : "A"));
+  const created = { ...chats.A, id: "chat-new", provider: "codex" };
+  const runs = [];
+  let lists = 0;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations" && options.method === "POST") return response(created, 201);
+    if (url.pathname === "/api/conversations") return response({ conversations: url.searchParams.get("projectId") === "A" ? (++lists === 1 ? [] : [created]) : [chats.B] });
+    if (url.pathname === "/api/conversations/chat-new") return response({ ...created, provider: "claude" });
+    if (url.pathname === "/api/conversations/chat-new/runs") { runs.push(JSON.parse(options.body)); return response({ id: "run-new", status: "queued" }, 202); }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('textarea[aria-label="Message the agent"]:not(:disabled)'), "ordinary empty chat");
+  setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "First ordinary prompt");
+  await until(() => host.querySelector('[aria-label="Send message"]:not(:disabled)'), "ordinary prompt enabled");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => runs.length === 1, "ordinary first run");
+  assert(runs[0].provider === "claude" && runs[0].prompt === "First ordinary prompt", "Ordinary first send lost current detail metadata");
+  assert(!host.textContent.includes("Chat created, but your message was not sent"), "Ordinary first send showed a false retry warning");
+}
+
+async function newChatOwnerSwitchRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "" : "A"));
+  const created = { ...chats.A, id: "chat-new" };
+  const heldList = deferred();
+  let aLists = 0;
+  let runs = 0;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations" && options.method === "POST") return response(created, 201);
+    if (url.pathname === "/api/conversations") {
+      if (url.searchParams.get("projectId") === "B") return response({ conversations: [chats.B] });
+      aLists++;
+      return aLists === 1 ? response({ conversations: [] }) : aLists === 2 ? heldList.promise : response({ conversations: [created] });
+    }
+    if (url.pathname === "/api/conversations/chat-B") return response(chats.B);
+    if (url.pathname === "/api/conversations/chat-new") return response({ ...created, provider: "claude" });
+    if (url.pathname.endsWith("/runs")) { runs++; return response({ id: "run", status: "queued" }, 202); }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('textarea[aria-label="Message the agent"]:not(:disabled)'), "empty owner A");
+  setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "Owner A draft");
+  await until(() => host.querySelector('[aria-label="Send message"]:not(:disabled)'), "owner A prompt enabled");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => aLists === 2, "held owner A post-create list");
+  [...host.querySelectorAll("button")].find((button) => button.textContent.includes("Review B")).click();
+  await until(() => host.querySelector('#chat-tab-chat-B[aria-selected="true"]'), "owner B selected");
+  heldList.resolve(response({ conversations: [created] }));
+  await settle();
+  assert(runs === 0 && !host.querySelector('#chat-tab-chat-new'), "Old-owner handoff submitted or selected the created chat in B");
+  assert(host.querySelector('[aria-label="Send message"]')?.disabled && host.querySelector('.first-prompt-notice')?.textContent.includes("Return to its worktree"), "Owner B could submit A's unsent draft without a visible owner warning");
+  [...host.querySelectorAll("button")].find((button) => button.textContent.includes("Review A")).click();
+  await until(() => host.querySelector('#chat-tab-chat-new[aria-selected="true"]'), "returned to created chat in A");
+  assert(host.textContent.includes("Chat created, but your message was not sent"), "Owner switch lost the unsent first-prompt notice");
+  assert(host.querySelector('textarea[aria-label="Message the agent"]')?.value === "Owner A draft", "Owner switch discarded the unsent draft");
+  await until(() => host.querySelector('[aria-label="Send message"]:not(:disabled)'), "owner A retry ready");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => runs === 1, "owner A explicit retry");
+}
+
 async function terminalExitWhileCreatingRegression() {
   root.render(null);
   await settle();
@@ -1513,6 +1633,10 @@ try {
     ["chat list submission fence", chatListSubmissionFenceRegression, "a pending list refresh cannot submit with stale chat metadata"],
     ["initial chat list failure submission", initialChatListFailureSubmissionRegression, "initial list failure disables submission until retry"],
     ["trust pending list refresh", trustPendingListRefreshRegression, "trust continuation survives a held list refresh and uses fresh detail"],
+    ["new chat failed successor list", () => newChatSupersededListRegression(true), "a failed successor list preserves the first prompt across retry"],
+    ["new chat superseded list", () => newChatSupersededListRegression(false), "a superseded successful list leaves the first prompt visibly retryable"],
+    ["new chat ordinary first send", newChatOrdinaryRegression, "a normal first prompt submits once with fresh detail metadata"],
+    ["new chat owner switch", newChatOwnerSwitchRegression, "a worktree switch during creation never submits to the new owner and preserves retry on return"],
     ["terminal exit during create", terminalExitWhileCreatingRegression, "an exit received while create is held remains exited in the tablist"],
     ["terminal exit during close", terminalExitWhileClosingRegression, "a held delete retains another terminal's exit"],
     ["late archive after owner switch", () => staleArchiveWorktreeRegression(false), "late A archive does not discard B's list response"],
