@@ -41,6 +41,7 @@ export function App() {
   const [conversation, setConversation] = useState(null);
   const [conversationListFailed, setConversationListFailed] = useState(false);
   const [conversationLoadFailed, setConversationLoadFailed] = useState(false);
+  const [conversationDetailReady, setConversationDetailReady] = useState(false);
   const [expandedGroups, setExpandedGroups] = useState({});
   const [expandedProjects, setExpandedProjects] = useState({});
   const [draft, setDraft] = useState("");
@@ -89,6 +90,7 @@ export function App() {
   const submissionPendingRef = useRef(false);
   const checkpointCursorsRef = useRef(new Map());
   const pendingConversationLoadRef = useRef(null);
+  const readyConversationRef = useRef(null);
   const conversationListRequestRef = useRef(0);
   const conversationOwnerRef = useRef("");
   const conversationsRef = useRef([]);
@@ -162,6 +164,8 @@ export function App() {
     ++conversationListRequestRef.current;
     pendingConversationLoadRef.current?.controller?.abort();
     pendingConversationLoadRef.current = null;
+    readyConversationRef.current = null;
+    setConversationDetailReady(false);
     selectedConversationRef.current = "";
     stageConversations([]); setConversation(null); setSelectedConversationId("");
     setConversationListFailed(false); setConversationLoadFailed(false);
@@ -181,6 +185,8 @@ export function App() {
   useEffect(() => { if (selectedWorktreeId) localStorage.setItem("outright.selected-worktree", selectedWorktreeId); }, [selectedWorktreeId]);
   useEffect(() => { if (selectedConversationId) localStorage.setItem("outright.selected-conversation", selectedConversationId); }, [selectedConversationId]);
   const loadConversation = useCallback(async () => {
+    readyConversationRef.current = null;
+    setConversationDetailReady(false);
     setConversationLoadFailed(false);
     if (!selectedConversationId || !conversations.some((item) => item.id === selectedConversationId)) {
       pendingConversationLoadRef.current?.controller?.abort();
@@ -208,6 +214,8 @@ export function App() {
       }
       pendingConversationLoadRef.current = null;
       const replayed = replayConversationEvents(nextConversation.messages, pendingLoad.events, MAX_RENDERED_MESSAGES);
+      readyConversationRef.current = nextConversation;
+      setConversationDetailReady(true);
       stickToBottomRef.current = true;
       checkpointCursorsRef.current = replayed.cursors;
       setConversation({
@@ -470,7 +478,8 @@ export function App() {
   }, [conversation?.messages.at(-1)?.id, streamingText]);
 
   const activeRun = conversation?.runs?.find((run) => ["queued", "launching", "running"].includes(run.status));
-  const waitingForConversation = Boolean(selectedConversationId && !conversation);
+  const waitingForConversation = Boolean(selectedConversationId && (!conversation || !conversationDetailReady));
+  const submissionUnavailable = Boolean(selectedConversationId && (!conversationDetailReady || conversationLoadFailed || conversationListFailed));
   const latestRun = conversation?.runs?.[0];
   // Worktree-wide recovery metadata gates sibling chats before submission;
   // the conversation-local values remain fallbacks for older runtimes.
@@ -583,12 +592,15 @@ export function App() {
     const submittedDraft = promptOverride ?? draft;
     const prompt = submittedDraft.trim();
     if (!prompt || activeRun || interruptedRun || conversationListFailed || submissionPendingRef.current) return;
+    if (selectedConversationRef.current && (!readyConversationRef.current || pendingConversationLoadRef.current || conversationLoadFailed || !isSelectedTarget(readyConversationRef.current))) return;
     submissionPendingRef.current = true;
-    let target = targetOverride ?? conversation;
+    let target = selectedConversationRef.current ? readyConversationRef.current : targetOverride ?? conversation;
     try {
       if (!target && selectedConversationRef.current) return; // The selected chat is still loading.
-      if (!target) target = await createConversation(prompt.split(/\n/)[0].slice(0, 52));
+      const createdHere = !target;
+      if (createdHere) target = await createConversation(prompt.split(/\n/)[0].slice(0, 52));
       if (!target || !isSelectedTarget(target)) return;
+      if (!createdHere && (pendingConversationLoadRef.current || readyConversationRef.current !== target || conversationLoadFailed)) return;
       const run = await api(`/api/conversations/${target.id}/runs`, { method: "POST", body: { prompt, provider: target.provider || settings.provider, model: target.model || settings.model, reasoningEffort: settings.reasoningEffort, approvalPolicy: settings.approvalPolicy } });
       if (!isSelectedTarget(target)) return;
       setDraft((current) => draftAfterSubmission(current, submittedDraft)); setStreamingText(""); setRunEvents([]);
@@ -609,7 +621,10 @@ export function App() {
   }
   async function trustAndRun() {
     const pending = pendingPrompt;
-    if (!pending || !isSelectedTarget(pending.target)) { setTrustRequest(null); setPendingPrompt(null); return; }
+    if (!pending || !isSelectedTarget(pending.target) || !readyConversationRef.current || !isSelectedTarget(readyConversationRef.current)
+      || pendingConversationLoadRef.current || conversationLoadFailed || conversationListFailed) {
+      setTrustRequest(null); setPendingPrompt(null); return;
+    }
     try {
       await api("/api/trust", { method: "POST", body: { projectId: trustRequest.id, projectPath: trustRequest.path, confirmation: trustRequest.path } });
       setBootstrap((current) => ({ ...current, trustedProjects: [...current.trustedProjects, { projectId: trustRequest.id, projectPath: trustRequest.path }] }));
@@ -654,6 +669,8 @@ export function App() {
     const remaining = conversationsRef.current.filter((item) => item.id !== updated.id);
     stageConversations(remaining);
     if (selectedConversationRef.current !== updated.id) return;
+    readyConversationRef.current = null;
+    setConversationDetailReady(false);
     pendingConversationLoadRef.current?.controller?.abort();
     pendingConversationLoadRef.current = null;
     const nextId = remaining[0]?.id ?? "";
@@ -672,7 +689,12 @@ export function App() {
     try {
       const updated = await api(`/api/conversations/${conversation.id}`, { method: "PATCH", body: patch });
       if (updated.archived) removeArchivedChat(updated);
-      else setConversation((current) => current?.id === updated.id ? { ...current, ...updated } : current);
+      else {
+        if (readyConversationRef.current?.id === updated.id && isSelectedTarget(updated) && !pendingConversationLoadRef.current) {
+          readyConversationRef.current = { ...readyConversationRef.current, ...updated };
+        }
+        setConversation((current) => current?.id === updated.id ? { ...current, ...updated } : current);
+      }
       await loadConversations(updated.archived ? undefined : updated.id);
       return updated;
     } catch (nextError) { setError(nextError.message); return null; }
@@ -739,7 +761,7 @@ export function App() {
           <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} onManage={openManageChat} />
           <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages" }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? conversation.messages.map((message) => <Message key={message.id} message={message} />) : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}{conversation?.messagePage?.hasLater && <button className="history-return" onClick={loadConversation}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button>}</div></ScrollArea>
           {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}
-          <form className="composer" onSubmit={sendPrompt}><textarea aria-label="Message the agent" disabled={Boolean(interruptedRun)} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversationLoadFailed ? "Chat unavailable; retry loading…" : waitingForConversation ? "Loading selected chat…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={setDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running" role="status" aria-live="polite"><span className="status-dot demo" aria-hidden="true" />Agent is {activeRun.status}</span> : interruptedRun ? <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Recovery decision required</span> : waitingForConversation ? <span className="send-hint" role="status" aria-live="polite">{conversationLoadFailed ? "Chat unavailable; retry loading" : "Loading selected chat"}</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun) || waitingForConversation || conversationListFailed} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
+          <form className="composer" onSubmit={sendPrompt}><textarea aria-label="Message the agent" disabled={Boolean(interruptedRun) || submissionUnavailable} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversationLoadFailed ? "Chat unavailable; retry loading…" : waitingForConversation ? "Loading selected chat…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={setDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running" role="status" aria-live="polite"><span className="status-dot demo" aria-hidden="true" />Agent is {activeRun.status}</span> : interruptedRun ? <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Recovery decision required</span> : waitingForConversation ? <span className="send-hint" role="status" aria-live="polite">{conversationLoadFailed ? "Chat unavailable; retry loading" : "Loading selected chat"}</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun) || submissionUnavailable} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
         </section>
         {inspector && <aside className="inspector" id="workspace-inspector" aria-label="Workspace inspector" tabIndex={-1} ref={inspectorRef}><header><nav role="tablist" aria-label="Inspector panels" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', setInspector)}><button id="inspector-tab-changes" data-tab-id="changes" role="tab" className={inspector === "changes" ? "is-active" : ""} aria-selected={inspector === "changes"} aria-controls="inspector-content" tabIndex={inspector === "changes" ? 0 : -1} onClick={() => setInspector("changes")}><GitDiff />Changes</button><button id="inspector-tab-terminal" data-tab-id="terminal" role="tab" className={inspector === "terminal" ? "is-active" : ""} aria-selected={inspector === "terminal"} aria-controls="inspector-content" tabIndex={inspector === "terminal" ? 0 : -1} onClick={() => setInspector("terminal")}><TerminalWindow />Terminal</button><button id="inspector-tab-context" data-tab-id="context" role="tab" className={inspector === "context" ? "is-active" : ""} aria-selected={inspector === "context"} aria-controls="inspector-content" tabIndex={inspector === "context" ? 0 : -1} onClick={() => setInspector("context")}><TreeStructure />Context</button></nav><Button variant="ghost" size="icon-xs" onClick={closeInspector} aria-label="Close inspector"><X /></Button></header><div className="inspector-body" id="inspector-content" role="tabpanel" aria-labelledby={`inspector-tab-${inspector}`}>{inspector === "changes" && <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />}{inspector === "terminal" && <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} sendRuntime={sendRuntime} onError={handleError} />}{inspector === "context" && <ContextPane worktree={worktree} settings={settings} onError={handleError} />}</div></aside>}
       </div>
@@ -750,7 +772,7 @@ export function App() {
 
     <SimpleDialog open={newChatOpen} onOpenChange={setNewChatOpen} title="New agent chat" description={`${project.name} / ${worktree.name}`} onSubmit={(event) => { event.preventDefault(); createConversation(); }} submit="Create chat"><label htmlFor="chat-title">What should the agent work on?</label><Input id="chat-title" autoFocus value={newChatTitle} onChange={(event) => setNewChatTitle(event.target.value)} placeholder="Review the worktree scanner" /></SimpleDialog>
     <SimpleDialog open={newGroupOpen} onOpenChange={setNewGroupOpen} title="Create project group" description="Organize related projects together in the sidebar." onSubmit={createGroup} submit="Create group" disabled={!newGroupName.trim()}><label htmlFor="group-name">Group name</label><Input id="group-name" autoFocus value={newGroupName} onChange={(event) => setNewGroupName(event.target.value)} placeholder="Client work" /></SimpleDialog>
-    <Dialog open={Boolean(trustRequest)} onOpenChange={(open) => !open && setTrustRequest(null)}><DialogContent><DialogHeader><DialogTitle>Trust this project?</DialogTitle><DialogDescription>Agents can read and, under the selected policy, modify files or run commands inside this project.</DialogDescription></DialogHeader>{trustRequest && <div className="trust-card"><ShieldCheck /><div><strong>{trustRequest.name}</strong><code>{trustRequest.path}</code></div></div>}<p className="trust-note">Outright will pass <strong>{settings.approvalPolicy}</strong> to the provider. Full-access mode can make changes beyond the worktree and should only be used in an external sandbox.</p><DialogFooter><Button variant="outline" onClick={() => setTrustRequest(null)}>Cancel</Button><Button onClick={trustAndRun}>Trust and run</Button></DialogFooter></DialogContent></Dialog>
+    <Dialog open={Boolean(trustRequest)} onOpenChange={(open) => !open && setTrustRequest(null)}><DialogContent><DialogHeader><DialogTitle>Trust this project?</DialogTitle><DialogDescription>Agents can read and, under the selected policy, modify files or run commands inside this project.</DialogDescription></DialogHeader>{trustRequest && <div className="trust-card"><ShieldCheck /><div><strong>{trustRequest.name}</strong><code>{trustRequest.path}</code></div></div>}<p className="trust-note">Outright will pass <strong>{settings.approvalPolicy}</strong> to the provider. Full-access mode can make changes beyond the worktree and should only be used in an external sandbox.</p><DialogFooter><Button variant="outline" onClick={() => setTrustRequest(null)}>Cancel</Button><Button disabled={submissionUnavailable} onClick={trustAndRun}>Trust and run</Button></DialogFooter></DialogContent></Dialog>
     <Dialog open={manageChatOpen} onOpenChange={setManageChatOpen}><DialogContent><form className="dialog-form" onSubmit={saveChatSettings}><DialogHeader><DialogTitle>Conversation settings</DialogTitle><DialogDescription>Rename, move, pin, or attach an existing provider session.</DialogDescription></DialogHeader><label htmlFor="chat-settings-title">Title</label><Input id="chat-settings-title" value={chatDraft.title} onChange={(event) => setChatDraft({ ...chatDraft, title: event.target.value })} /><label htmlFor="chat-settings-destination">Move to worktree</label><select id="chat-settings-destination" value={chatDraft.destination} onChange={(event) => setChatDraft({ ...chatDraft, destination: event.target.value })}>{bootstrap.projects.map((item) => <optgroup key={item.id} label={item.name}>{item.worktrees.filter((entry) => !entry.isPrunable && !entry.isBare).map((entry) => <option key={entry.id} value={`${item.id}::${entry.id}`}>{entry.name} · {entry.branch}</option>)}</optgroup>)}</select><label htmlFor="chat-settings-provider">Provider</label><select id="chat-settings-provider" value={chatDraft.provider} onChange={(event) => setChatDraft({ ...chatDraft, provider: event.target.value })}>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.label}</option>)}</select><label htmlFor="chat-settings-model">Model</label><Input id="chat-settings-model" value={chatDraft.model} onChange={(event) => setChatDraft({ ...chatDraft, model: event.target.value })} placeholder="Provider default" /><label htmlFor="chat-settings-session">Provider session ID</label><Input id="chat-settings-session" value={chatDraft.providerSessionId} onChange={(event) => setChatDraft({ ...chatDraft, providerSessionId: event.target.value })} placeholder="Attach or resume an existing session" /><div className="manage-actions"><Button type="button" variant="outline" onClick={() => updateConversation({ pinned: !conversation.pinned })}><PushPin />{conversation?.pinned ? "Unpin" : "Pin"}</Button><Button type="button" variant="destructive" onClick={archiveConversation}><Archive />Archive conversation</Button></div><DialogFooter><Button variant="outline" type="button" onClick={() => setManageChatOpen(false)}>Cancel</Button><Button type="submit">Save</Button></DialogFooter></form></DialogContent></Dialog>
     <SimpleDialog open={Boolean(worktreeDialog)} onOpenChange={(open) => !open && setWorktreeDialog(null)} title="Create worktree" description={worktreeDialog?.name ?? ""} onSubmit={createWorktree} submit="Create worktree" disabled={!worktreeDraft.branch.trim()}><label htmlFor="worktree-branch">Branch name</label><Input id="worktree-branch" value={worktreeDraft.branch} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, branch: event.target.value })} placeholder="feature/my-change" /><label htmlFor="worktree-directory">Directory name <small>optional</small></label><Input id="worktree-directory" value={worktreeDraft.name} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, name: event.target.value })} placeholder="project-my-change" /><label htmlFor="worktree-base">Base revision</label><Input id="worktree-base" value={worktreeDraft.baseBranch} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, baseBranch: event.target.value })} /></SimpleDialog>
     <Dialog open={removeWorktreeOpen} onOpenChange={setRemoveWorktreeOpen}><DialogContent><DialogHeader><DialogTitle>Remove worktree?</DialogTitle><DialogDescription>This is allowed only when the linked worktree has no uncommitted changes. Type its exact path to confirm.</DialogDescription></DialogHeader><code className="confirm-path">{worktree.path}</code><label htmlFor="remove-worktree-confirmation">Confirmation path</label><Input id="remove-worktree-confirmation" value={removeConfirmation} onChange={(event) => setRemoveConfirmation(event.target.value)} placeholder="Exact worktree path" /><DialogFooter><Button variant="outline" onClick={() => setRemoveWorktreeOpen(false)}>Cancel</Button><Button variant="destructive" disabled={removeConfirmation !== worktree.path} onClick={removeWorktree}>Remove worktree</Button></DialogFooter></DialogContent></Dialog>

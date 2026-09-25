@@ -324,6 +324,85 @@ async function sameOwnerArchiveRefreshRegression() {
   assert(host.querySelector('#conversation-panel')?.getAttribute('aria-labelledby') === selected.id, "Panel lost the current sibling owner");
 }
 
+async function chatDetailRefreshOwnershipRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const oldDetail = { ...chats.A, provider: "codex" };
+  const freshDetail = { ...chats.A, provider: "claude" };
+  const heldRefresh = deferred();
+  const heldRetry = deferred();
+  const heldTrustRefresh = deferred();
+  let detailRequests = 0;
+  const runs = [];
+  let trustRequests = 0;
+  let requireTrust = true;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") {
+      detailRequests += 1;
+      if (detailRequests === 1) return response(oldDetail);
+      if (detailRequests === 2) return heldRefresh.promise;
+      if (detailRequests === 3) return heldRetry.promise;
+      if (detailRequests === 4) return heldTrustRefresh.promise;
+      return response(freshDetail);
+    }
+    if (url.pathname === "/api/conversations/chat-A/runs") {
+      runs.push(JSON.parse(options.body));
+      return requireTrust ? response({ error: "Trust required", code: "PROJECT_TRUST_REQUIRED", project: projects[0] }, 403) : response({ id: `run-${runs.length}`, status: "queued" }, 202);
+    }
+    if (url.pathname === "/api/trust") { trustRequests += 1; return response({}); }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('textarea[placeholder*="Ask codex"]'), "loaded old detail");
+  const composer = host.querySelector('textarea[aria-label="Message the agent"]');
+  setControlValue(composer, "Must use current detail");
+  const refresh = () => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { restarted: true } }) }));
+  refresh();
+  await until(() => detailRequests === 2, "held same-chat detail refresh");
+  assert(host.querySelector('#chat-tab-chat-A[aria-selected="true"]'), "Refresh lost the selected chat tab");
+  heldRefresh.resolve(response({ error: "Detail offline" }, 503));
+  await until(() => [...host.querySelectorAll('button')].some((button) => button.textContent === "Retry loading chat"), "failed same-chat refresh");
+  assert(host.querySelector('#conversation-panel')?.getAttribute('aria-labelledby') === "chat-tab-chat-A", "Failure lost selected panel ownership");
+  assert(host.querySelector('[aria-label="Send message"]')?.disabled, "Failed detail refresh left send available");
+  composer.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  host.querySelector('[aria-label="Send message"]')?.click();
+  host.querySelector('.composer').requestSubmit(); // A direct form submit must obey the same guard.
+  await settle();
+  assert(runs.length === 0, "Failed same-chat detail submitted a stale run via Enter or button");
+  [...host.querySelectorAll('button')].find((button) => button.textContent === "Retry loading chat").click();
+  await until(() => detailRequests === 3, "held detail retry");
+  assert(host.querySelector('[aria-label="Send message"]')?.disabled, "Pending detail retry re-enabled send");
+  host.querySelector('.composer').requestSubmit();
+  await settle();
+  assert(runs.length === 0, "Pending detail retry submitted a stale run");
+  heldRetry.resolve(response(freshDetail));
+  await until(() => host.querySelector('textarea[placeholder*="Ask claude"]'), "fresh detail after retry");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => document.querySelector('[role="dialog"]')?.textContent.includes("Trust this project?"), "pending trust continuation");
+  assert(runs.length === 1 && runs[0].provider === "claude", "First submission did not use fresh detail");
+  refresh();
+  await until(() => detailRequests === 4, "held trust continuation refresh");
+  await until(() => [...document.querySelectorAll('[role="dialog"] button')].some((button) => button.textContent === "Trust and run" && button.disabled), "trust continuation disabled during refresh");
+  heldTrustRefresh.resolve(response({ error: "Detail offline again" }, 503));
+  await until(() => [...host.querySelectorAll('button')].some((button) => button.textContent === "Retry loading chat"), "failed trust continuation refresh");
+  const trustButton = [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Trust and run");
+  assert(trustButton.disabled, "Trust continuation remained enabled after failed detail refresh");
+  trustButton.click();
+  await settle();
+  assert(runs.length === 1, "Trust continuation submitted another run from stale detail");
+  assert(trustRequests === 0, "Trust continuation changed trust while detail was unavailable");
+  document.querySelector('[role="dialog"] button')?.click();
+  requireTrust = false;
+  [...host.querySelectorAll('button')].find((button) => button.textContent === "Retry loading chat").click();
+  await until(() => host.querySelector('textarea[placeholder*="Ask claude"]') && !host.querySelector('[aria-label="Send message"]')?.disabled, "successful detail retry after trust failure");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => runs.length === 2, "submission after fresh detail");
+  assert(runs[1].provider === "claude", "Final submission used stale provider");
+}
+
 async function chatFailedWorktreeListRegression() {
   root.render(null);
   await settle();
@@ -1317,6 +1396,7 @@ try {
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
     ["archived chat ownership", archivedChatOwnershipRegression, "an archived chat cannot keep a pane or accept runs during held or failed refresh"],
     ["same-owner archive refresh", sameOwnerArchiveRefreshRegression, "a held archive cannot overwrite a newer same-worktree list after refresh failure"],
+    ["chat detail refresh ownership", chatDetailRefreshOwnershipRegression, "failed and pending same-chat detail blocks submission and trust until fresh detail loads"],
     ["terminal exit during create", terminalExitWhileCreatingRegression, "an exit received while create is held remains exited in the tablist"],
     ["terminal exit during close", terminalExitWhileClosingRegression, "a held delete retains another terminal's exit"],
     ["late archive after owner switch", () => staleArchiveWorktreeRegression(false), "late A archive does not discard B's list response"],
