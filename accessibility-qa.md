@@ -28,9 +28,11 @@ Tested against the live local runtime with the browser accessibility tree.
 - 640 × 800 viewport (1280px page at 200% zoom equivalent): crossing the breakpoint closes the desktop sidebar without displacing composer focus; no horizontal page overflow; project/worktree hierarchy and conversation tabs remain intact.
 - Reduced-motion preference disables nonessential animation and transition duration.
 
-## Manual assistive-technology acceptance still required
+## Manual assistive-technology session deferred to OUT-45
 
-The keyboard and browser accessibility-tree checks above are not manual assistive-technology testing. A human session with VoiceOver/Safari on macOS or NVDA/Chrome on Windows remains necessary to record actual spoken names, announcements, and navigation for the narrow project drawer (open, contained navigation, Escape/close), project/worktree hierarchy, conversation and inspector tabs, settings/dialog validation and status, and terminal input/output, session switching, loading and exit. Record the platform, browser, AT version, viewport/zoom, observed speech, and any defects before declaring OUT-31 accepted. This headless run did not activate a screen reader; the macOS display was asleep and VoiceOver was not running. Do not treat the AX-tree observations above as AT evidence.
+The keyboard and browser accessibility-tree checks above are not manual assistive-technology testing. On 2026-09-25 the owner deferred the spoken-flow session until after the current implementation backlog, tracked by [OUT-45](https://linear.app/21n/issue/OUT-45/run-post-backlog-screen-reader-acceptance-across-outright-workflows). A missing VoiceOver/Safari or NVDA/Chrome session alone is therefore not an OUT-31 PR or merge-readiness blocker. OUT-31 still requires its keyboard, semantics, responsive, automated, and independent code-review gates; this deferral does not claim full-product screen-reader acceptance.
+
+OUT-45 will record actual spoken names, announcements, and navigation for the integrated drawer, project/worktree hierarchy, conversation and inspector tabs, command palette, settings/dialog validation and status, terminal input/output/loading/exit, and the workflows implemented by then. It will capture platform, browser, AT version, viewport/zoom, observed speech, and defects. The current headless run did not activate a screen reader; do not treat its AX-tree observations as AT evidence. The command-palette result-announcement cadence flagged in PR review is part of OUT-45's spoken-flow check.
 
 ## Scope note
 

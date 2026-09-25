@@ -10,4 +10,6 @@ Durable product direction: use the expanded option-1-style sidebar with project 
 
 Production direction: incrementally bring Outright to daily-driver ADE parity with Orca, Superset, and Synara. Treat security boundaries, durable recovery, bounded resource use, responsive and accessible interaction, and long-session performance as launch gates rather than follow-up polish.
 
+OUT-31 acceptance clarification (2026-09-25): its manual VoiceOver/Safari or NVDA/Chrome spoken-flow session is deferred to OUT-45 after the current implementation backlog. Keep OUT-31's keyboard, semantic, responsive, automated, and independent-review requirements. Do not claim actual screen-reader acceptance from browser accessibility-tree checks; OUT-45 remains a full-product acceptance step before launch.
+
 Build app UI in `src/`. Keep `.openai/hosting.json`, `worker/index.js`, `scripts/prepare-sites-build.mjs`, and `tests/sites-worker.test.mjs` intact so the same local prototype can be handed to Sites. Before a Sites handoff, run `npm run build` and `npm run test:sites`; the build must leave `dist/client/index.html`, `dist/server/index.js`, and `dist/.openai/hosting.json`.
