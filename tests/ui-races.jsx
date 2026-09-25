@@ -555,10 +555,10 @@ async function newChatSupersededListRegression(failSuccessor = false) {
   await settle();
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "" : "A"));
   const created = { ...chats.A, id: "chat-new", title: "First prompt", provider: "codex" };
-  const fresh = { ...created, provider: "claude" };
+  const fresh = { ...created, provider: "claude", model: "fresh-model" };
   const heldPostCreateList = deferred();
   let lists = 0;
-  let runs = 0;
+  const runs = [];
   route = async (url, options) => {
     if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
     if (url.pathname === "/api/conversations" && options.method === "POST") return response(created, 201);
@@ -570,7 +570,7 @@ async function newChatSupersededListRegression(failSuccessor = false) {
       return response({ conversations: [created] });
     }
     if (url.pathname === "/api/conversations/chat-new") return response(fresh);
-    if (url.pathname === "/api/conversations/chat-new/runs") { runs++; return response({ id: `run-${runs}`, status: "queued" }, 202); }
+    if (url.pathname === "/api/conversations/chat-new/runs") { runs.push(JSON.parse(options.body)); return response({ id: `run-${runs.length}`, status: "queued" }, 202); }
     return response({});
   };
   root.render(<TooltipProvider><App /></TooltipProvider>);
@@ -588,7 +588,7 @@ async function newChatSupersededListRegression(failSuccessor = false) {
   }
   heldPostCreateList.resolve(response({ conversations: [created] }));
   await settle();
-  assert(runs === 0, "Superseded list submitted a run before the current list/detail owner was ready");
+  assert(runs.length === 0, "Superseded list submitted a run before the current list/detail owner was ready");
   assert(host.querySelector('textarea[aria-label="Message the agent"]')?.value === "First prompt must survive", "Superseded list discarded the first draft");
   assert(host.textContent.includes("Chat created, but your message was not sent"), "Created chat silently dropped the first prompt without a visible retry instruction");
   assert(getComputedStyle(host.querySelector('.first-prompt-notice')).display !== 'none', "Unsent first-prompt notice is visually hidden");
@@ -599,7 +599,8 @@ async function newChatSupersededListRegression(failSuccessor = false) {
   }
   assert(host.querySelector('textarea[placeholder*="Ask claude"]'), "Retry did not use fresh detail metadata");
   host.querySelector('[aria-label="Send message"]').click();
-  await until(() => runs === 1, "explicit retry of first prompt");
+  await until(() => runs.length === 1, "explicit retry of first prompt");
+  assert(runs[0].prompt === "First prompt must survive" && runs[0].provider === "claude" && runs[0].model === "fresh-model", "Explicit first-prompt retry lost prompt or fresh provider/model");
   await until(() => !host.querySelector('.first-prompt-notice'), "successful retry clears the unsent notice");
 }
 
@@ -1620,6 +1621,142 @@ async function recoveryActionsRegression() {
   return true;
 }
 
+async function acceptedFirstPromptOwnerSwitchRegression(sameWorktree = false) {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "" : "A"));
+  const created = { ...chats.A, id: "chat-new", title: "First prompt", provider: "codex" };
+  const sibling = { ...chats.A, id: "chat-C", title: "Conversation C" };
+  const heldRun = deferred();
+  let aLists = 0;
+  const runs = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }, { id: "claude", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations" && options.method === "POST") return response(created, 201);
+    if (url.pathname === "/api/conversations") {
+      if (url.searchParams.get("projectId") === "B") return response({ conversations: [chats.B] });
+      aLists++;
+      if (aLists === 1) return response({ conversations: [] });
+      if (aLists === 2) return response({ error: "List unavailable" }, 503);
+      return response({ conversations: sameWorktree ? [created, sibling] : [created] });
+    }
+    if (url.pathname === "/api/conversations/chat-new") return response({ ...created, provider: "claude", model: "fresh-model" });
+    if (url.pathname === "/api/conversations/chat-C") return response(sibling);
+    if (url.pathname === "/api/conversations/chat-B") return response(chats.B);
+    if (url.pathname === "/api/conversations/chat-new/runs") { runs.push(JSON.parse(options.body)); return heldRun.promise; }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('textarea[aria-label="Message the agent"]:not(:disabled)'), "empty first-prompt composer");
+  setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "Prompt accepted once");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => host.querySelector('.history-loader')?.textContent === "Retry chat list" && host.querySelector('.first-prompt-notice'), "failed creation list keeps first prompt");
+  host.querySelector('.history-loader').click();
+  await until(() => host.querySelector('#chat-tab-chat-new[aria-selected="true"]') && !host.querySelector('[aria-label="Send message"]')?.disabled, "first prompt retry ready");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => runs.length === 1, "held retry POST");
+  assert(runs[0].prompt === "Prompt accepted once" && runs[0].provider === "claude" && runs[0].model === "fresh-model", "Retry did not use fresh detail payload");
+  if (sameWorktree) host.querySelector('#chat-tab-chat-C').click();
+  else [...host.querySelectorAll("button")].find((button) => button.textContent.includes("Review B")).click();
+  await until(() => host.querySelector(sameWorktree ? '#chat-tab-chat-C[aria-selected="true"]' : '#chat-tab-chat-B[aria-selected="true"]'), "other selection while POST held");
+  const newerDraft = sameWorktree ? "Prompt accepted once" : "Newer owner B draft";
+  if (sameWorktree) setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "");
+  setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), newerDraft);
+  heldRun.resolve(response({ id: "run-new", conversationId: "chat-new", status: "queued" }, 202));
+  await settle();
+  assert(runs.length === 1, "Accepted retry duplicated while settling");
+  assert(!host.querySelector(".first-prompt-notice"), "Accepted retry left a false unsent first-prompt marker after owner switch");
+  assert(host.querySelector('textarea[aria-label="Message the agent"]')?.value === newerDraft, "Accepted retry erased a newer draft");
+  if (sameWorktree) host.querySelector('#chat-tab-chat-new').click();
+  else [...host.querySelectorAll("button")].find((button) => button.textContent.includes("Review A")).click();
+  await until(() => host.querySelector('#chat-tab-chat-new[aria-selected="true"]'), "return to accepted first-prompt chat");
+  assert(!host.querySelector('.first-prompt-notice') && runs.length === 1, "Returning to accepted chat offered duplicate first-prompt retry");
+}
+
+async function dialogCreateSuccessorRegression(failSuccessor = false, failPrivate = false) {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "" : "A"));
+  const created = { ...chats.A, id: "chat-dialog", title: "Dialog chat" };
+  const heldList = deferred();
+  let lists = 0;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations" && options.method === "POST") return response(created, 201);
+    if (url.pathname === "/api/conversations") {
+      lists++;
+      if (lists === 1) return response({ conversations: [] });
+      if (lists === 2) return failPrivate ? response({ error: "List unavailable" }, 503) : heldList.promise;
+      if (lists === 3 && failSuccessor) return response({ error: "List unavailable" }, 503);
+      return response({ conversations: [created] });
+    }
+    if (url.pathname === "/api/conversations/chat-dialog") return response(created);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('textarea[aria-label="Message the agent"]:not(:disabled)'), "dialog fixture ready");
+  host.querySelector('[aria-label="New chat tab"]').click();
+  await until(() => document.querySelector('[role="dialog"] input#chat-title'), "new chat dialog");
+  setControlValue(document.querySelector('input#chat-title'), "Dialog chat");
+  [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Create chat").click();
+  if (failPrivate) {
+    await until(() => host.querySelector('.history-loader')?.textContent === "Retry chat list", "failed private dialog list");
+    assert(!host.textContent.includes("Chat created, but its details could not be loaded"), "Dialog duplicated a failed-list error as a detail failure");
+    host.querySelector('.history-loader').click();
+    await until(() => host.querySelector('#chat-tab-chat-dialog[aria-selected="true"]') && host.querySelector('textarea[aria-label="Message the agent"]:not(:disabled)'), "private dialog list retry");
+    return;
+  }
+  await until(() => lists === 2, "held dialog post-create list");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "conversation.created", conversationId: created.id }) }));
+  await until(() => lists === 3, "socket successor list");
+  if (failSuccessor) await until(() => host.querySelector('.history-loader')?.textContent === "Retry chat list", "failed dialog successor");
+  else await until(() => host.querySelector('#chat-tab-chat-dialog[aria-selected="true"]') && host.querySelector('textarea[aria-label="Message the agent"]:not(:disabled)'), "successful dialog successor");
+  heldList.resolve(response({ conversations: [created] }));
+  await settle();
+  assert(!host.textContent.includes("Chat created, but its details could not be loaded"), "Dialog creation reported false detail failure after successor load");
+  if (failSuccessor) {
+    host.querySelector('.history-loader').click();
+    await until(() => host.querySelector('#chat-tab-chat-dialog[aria-selected="true"]') && host.querySelector('textarea[aria-label="Message the agent"]:not(:disabled)'), "dialog successor retry");
+  }
+}
+
+async function inlineArchiveFocusRegression(last = false, newerFocus = false, nonselected = false) {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const sibling = { ...chats.A, id: "chat-C", title: "Conversation C" };
+  const patch = deferred();
+  let patched = false;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === `/api/conversations/${nonselected ? "chat-C" : "chat-A"}` && options.method === "PATCH") { patched = true; return patch.promise; }
+    if (url.pathname === "/api/conversations") return response({ conversations: patched ? (last ? [] : nonselected ? [chats.A] : [sibling]) : last ? [chats.A] : [chats.A, sibling] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/conversations/chat-C") return response(sibling);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('#chat-tab-chat-A[aria-selected="true"]') && host.querySelector('[aria-label="Archive Conversation A"]'), "archive fixture ready");
+  const archived = nonselected ? sibling : chats.A;
+  const archive = host.querySelector(`[aria-label="Archive ${archived.title}"]`);
+  archive.focus();
+  archive.click();
+  await until(() => patched, "held archive PATCH");
+  const newer = host.querySelector('[aria-label="Settings"]');
+  if (newerFocus) newer.focus();
+  patch.resolve(response({ ...archived, archived: true }));
+  await until(() => !host.querySelector(`#chat-tab-${archived.id}`), "archived tab removed");
+  await settle();
+  const expected = newerFocus ? newer : last ? host.querySelector('[aria-label="New chat tab"]') : host.querySelector(nonselected ? '#chat-tab-chat-A' : '#chat-tab-chat-C');
+  assert(document.activeElement === expected, `Inline archive focus was not restored to ${newerFocus ? "newer choice" : last ? "new chat" : "selected sibling"}; active=${document.activeElement?.outerHTML?.slice(0, 240)}, expected=${expected?.outerHTML?.slice(0, 240)}`);
+  if (!newerFocus && !last) {
+    assert(expected?.tabIndex === 0 && expected.getAttribute('aria-selected') === 'true'
+      && host.querySelector('#conversation-panel')?.getAttribute('aria-labelledby') === expected.id,
+    "Archived sibling focus, roving tab and panel owner diverged");
+  }
+}
+
+
 try {
   const steps = [
     ["current conversation send", () => chatRace(false, false), "sending in the current conversation shows its run"],
@@ -1637,6 +1774,15 @@ try {
     ["new chat superseded list", () => newChatSupersededListRegression(false), "a superseded successful list leaves the first prompt visibly retryable"],
     ["new chat ordinary first send", newChatOrdinaryRegression, "a normal first prompt submits once with fresh detail metadata"],
     ["new chat owner switch", newChatOwnerSwitchRegression, "a worktree switch during creation never submits to the new owner and preserves retry on return"],
+    ["accepted retry owner switch", acceptedFirstPromptOwnerSwitchRegression, "an accepted retry settles its first prompt after an owner switch"],
+    ["accepted retry chat switch", () => acceptedFirstPromptOwnerSwitchRegression(true), "an accepted retry settles its first prompt after a chat switch"],
+    ["dialog successor success", () => dialogCreateSuccessorRegression(false), "dialog creation follows a successful socket successor"],
+    ["dialog successor failure", () => dialogCreateSuccessorRegression(true), "dialog creation uses list retry after a failed socket successor"],
+    ["dialog private list failure", () => dialogCreateSuccessorRegression(false, true), "dialog creation reports a current list failure once and retains retry"],
+    ["inline archive sibling focus", () => inlineArchiveFocusRegression(false, false), "inline archive focuses the selected sibling tab"],
+    ["inline archive nonselected focus", () => inlineArchiveFocusRegression(false, false, true), "inline archive of an inactive tab focuses the still-selected tab"],
+    ["inline archive last-tab focus", () => inlineArchiveFocusRegression(true, false), "inline archive focuses New chat after the final tab"],
+    ["inline archive newer focus", () => inlineArchiveFocusRegression(false, true), "inline archive preserves a newer focus choice"],
     ["terminal exit during create", terminalExitWhileCreatingRegression, "an exit received while create is held remains exited in the tablist"],
     ["terminal exit during close", terminalExitWhileClosingRegression, "a held delete retains another terminal's exit"],
     ["late archive after owner switch", () => staleArchiveWorktreeRegression(false), "late A archive does not discard B's list response"],
