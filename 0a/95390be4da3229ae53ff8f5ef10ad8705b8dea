@@ -1,0 +1,23 @@
+src/App.jsx
+  s_a2bd3276976ac7::t_509435186d1fc3 49,504-507,604,606,608-612,615-630,639,646,651,817
+tests/ui-races.jsx
+  s_a2bd3276976ac7::t_3006b6a853023f 553-672,1636-1639
+tests/ui-races.test.mjs
+  s_a2bd3276976ac7::t_f4863e7782b25e 800
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0a95390be4da3229ae53ff8f5ef10ad8705b8dea",
+  "prompts": {},
+  "sessions": {
+    "s_a2bd3276976ac7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d8b0-85e2-7702-9013-989547be5d4f",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
