@@ -1659,7 +1659,7 @@ async function acceptedFirstPromptOwnerSwitchRegression(sameWorktree = false) {
   if (sameWorktree) host.querySelector('#chat-tab-chat-C').click();
   else [...host.querySelectorAll("button")].find((button) => button.textContent.includes("Review B")).click();
   await until(() => host.querySelector(sameWorktree ? '#chat-tab-chat-C[aria-selected="true"]' : '#chat-tab-chat-B[aria-selected="true"]'), "other selection while POST held");
-  const newerDraft = sameWorktree ? "Prompt accepted once" : "Newer owner B draft";
+  const newerDraft = sameWorktree ? "Newer sibling C draft" : "Newer owner B draft";
   if (sameWorktree) setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "");
   setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), newerDraft);
   heldRun.resolve(response({ id: "run-new", conversationId: "chat-new", status: "queued" }, 202));
