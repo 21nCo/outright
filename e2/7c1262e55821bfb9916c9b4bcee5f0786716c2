@@ -1,0 +1,18 @@
+src/App.jsx
+  h_a39f9495f9ec1d 49,102,110-114,183,472-489,633,641,643,645-647,650,656,661-664,674,687-688,690,757,761-764,775,778,852,858
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 558,561,573,591,602-603,1624-1759,1777-1785
+tests/ui-races.test.mjs
+  h_a39f9495f9ec1d 800
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e27c1262e55821bfb9916c9b4bcee5f0786716c2",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
