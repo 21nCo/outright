@@ -40,6 +40,7 @@ export function App() {
   const [conversations, setConversations] = useState([]);
   const [conversation, setConversation] = useState(null);
   const [conversationListFailed, setConversationListFailed] = useState(false);
+  const [conversationListPending, setConversationListPending] = useState(true);
   const [conversationLoadFailed, setConversationLoadFailed] = useState(false);
   const [conversationDetailReady, setConversationDetailReady] = useState(false);
   const [expandedGroups, setExpandedGroups] = useState({});
@@ -92,6 +93,8 @@ export function App() {
   const pendingConversationLoadRef = useRef(null);
   const readyConversationRef = useRef(null);
   const conversationListRequestRef = useRef(0);
+  const conversationListPendingRef = useRef(true);
+  const trustGrantedRef = useRef(false);
   const conversationOwnerRef = useRef("");
   const conversationsRef = useRef([]);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
@@ -138,6 +141,14 @@ export function App() {
     // current worktree's list-error state before its own owner is checked.
     if (selectedProjectRef.current !== forProjectId || selectedWorktreeRef.current !== forWorktreeId) return;
     const request = ++conversationListRequestRef.current;
+    // A list refresh may change the selected chat or its execution metadata.
+    // Fence submission synchronously, before React renders the pending state.
+    conversationListPendingRef.current = true;
+    setConversationListPending(true);
+    pendingConversationLoadRef.current?.controller?.abort();
+    pendingConversationLoadRef.current = null;
+    readyConversationRef.current = null;
+    setConversationDetailReady(false);
     setConversationListFailed(false);
     try {
       const result = await api(query("/api/conversations", { projectId: forProjectId, worktreeId: forWorktreeId }));
@@ -148,12 +159,17 @@ export function App() {
       stageConversations(available);
       const wanted = preferredId || pendingConversationRef.current || selectedConversationRef.current;
       const selected = available.find((item) => item.id === wanted) ?? available[0];
+      conversationListPendingRef.current = false;
+      setConversationListPending(false);
       pendingConversationRef.current = "";
       selectedConversationRef.current = selected?.id ?? "";
       setConversation((current) => current?.id === selected?.id ? current : null);
       setSelectedConversationId(selected?.id ?? "");
+      return selected ?? null;
     } catch (nextError) {
       if (request === conversationListRequestRef.current && selectedProjectRef.current === forProjectId && selectedWorktreeRef.current === forWorktreeId) {
+        conversationListPendingRef.current = false;
+        setConversationListPending(false);
         setConversationListFailed(true);
         setError(nextError.message);
       }
@@ -165,6 +181,8 @@ export function App() {
     pendingConversationLoadRef.current?.controller?.abort();
     pendingConversationLoadRef.current = null;
     readyConversationRef.current = null;
+    conversationListPendingRef.current = true;
+    setConversationListPending(true);
     setConversationDetailReady(false);
     selectedConversationRef.current = "";
     stageConversations([]); setConversation(null); setSelectedConversationId("");
@@ -188,6 +206,7 @@ export function App() {
     readyConversationRef.current = null;
     setConversationDetailReady(false);
     setConversationLoadFailed(false);
+    if (conversationListPendingRef.current || conversationListFailed) return;
     if (!selectedConversationId || !conversations.some((item) => item.id === selectedConversationId)) {
       pendingConversationLoadRef.current?.controller?.abort();
       pendingConversationLoadRef.current = null;
@@ -206,7 +225,7 @@ export function App() {
       // can associate the composer or execution state with the wrong worktree.
       if (selectedConversationRef.current !== requestedId || !conversations.some((item) => item.id === requestedId)) return;
       if (nextConversation.projectId !== selectedProjectRef.current || nextConversation.worktreeId !== selectedWorktreeRef.current) return;
-      if (pendingConversationLoadRef.current !== pendingLoad) return;
+      if (pendingConversationLoadRef.current !== pendingLoad || conversationListPendingRef.current || conversationListFailed) return;
       if (nextConversation.archived) {
         removeArchivedChat(nextConversation);
         loadConversations();
@@ -241,7 +260,7 @@ export function App() {
         if (nextError.name !== "AbortError") { setConversationLoadFailed(true); setError(nextError.message); }
       }
     }
-  }, [selectedConversationId, conversations, loadConversations]);
+  }, [selectedConversationId, conversations, loadConversations, conversationListFailed]);
   useEffect(() => { loadConversation(); }, [loadConversation]);
   const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
@@ -479,7 +498,8 @@ export function App() {
 
   const activeRun = conversation?.runs?.find((run) => ["queued", "launching", "running"].includes(run.status));
   const waitingForConversation = Boolean(selectedConversationId && (!conversation || !conversationDetailReady));
-  const submissionUnavailable = Boolean(selectedConversationId && (!conversationDetailReady || conversationLoadFailed || conversationListFailed));
+  const submissionUnavailable = conversationListPending || conversationListFailed
+    || Boolean(selectedConversationId && (!conversationDetailReady || conversationLoadFailed));
   const latestRun = conversation?.runs?.[0];
   // Worktree-wide recovery metadata gates sibling chats before submission;
   // the conversation-local values remain fallbacks for older runtimes.
@@ -581,7 +601,9 @@ export function App() {
     try {
       const created = await api("/api/conversations", { method: "POST", body: { projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: title.trim() || "New agent chat", provider: settings.provider, model: settings.model } });
       if (selectedProjectRef.current !== created.projectId || selectedWorktreeRef.current !== created.worktreeId) return null;
-      pendingConversationRef.current = created.id; setNewChatTitle(""); setNewChatOpen(false); await loadConversations(created.id); return created;
+      pendingConversationRef.current = created.id; setNewChatTitle(""); setNewChatOpen(false);
+      const selected = await loadConversations(created.id);
+      return selected?.id === created.id ? { ...created, ...selected } : null;
     } catch (nextError) { setError(nextError.message); return null; }
   }
   function isSelectedTarget(target) {
@@ -591,44 +613,51 @@ export function App() {
     event?.preventDefault();
     const submittedDraft = promptOverride ?? draft;
     const prompt = submittedDraft.trim();
-    if (!prompt || activeRun || interruptedRun || conversationListFailed || submissionPendingRef.current) return;
-    if (selectedConversationRef.current && (!readyConversationRef.current || pendingConversationLoadRef.current || conversationLoadFailed || !isSelectedTarget(readyConversationRef.current))) return;
+    if (!prompt || activeRun || interruptedRun || conversationListPendingRef.current || conversationListFailed || submissionPendingRef.current) return false;
+    if (selectedConversationRef.current && (!readyConversationRef.current || pendingConversationLoadRef.current || conversationLoadFailed || !isSelectedTarget(readyConversationRef.current))) return false;
     submissionPendingRef.current = true;
     let target = selectedConversationRef.current ? readyConversationRef.current : targetOverride ?? conversation;
     try {
-      if (!target && selectedConversationRef.current) return; // The selected chat is still loading.
+      if (!target && selectedConversationRef.current) return false; // The selected chat is still loading.
       const createdHere = !target;
       if (createdHere) target = await createConversation(prompt.split(/\n/)[0].slice(0, 52));
-      if (!target || !isSelectedTarget(target)) return;
-      if (!createdHere && (pendingConversationLoadRef.current || readyConversationRef.current !== target || conversationLoadFailed)) return;
+      if (!target || !isSelectedTarget(target) || conversationListPendingRef.current || conversationListFailed) return false;
+      if (!createdHere && (pendingConversationLoadRef.current || readyConversationRef.current !== target || conversationLoadFailed)) return false;
       const run = await api(`/api/conversations/${target.id}/runs`, { method: "POST", body: { prompt, provider: target.provider || settings.provider, model: target.model || settings.model, reasoningEffort: settings.reasoningEffort, approvalPolicy: settings.approvalPolicy } });
-      if (!isSelectedTarget(target)) return;
+      if (!isSelectedTarget(target)) return true;
       setDraft((current) => draftAfterSubmission(current, submittedDraft)); setStreamingText(""); setRunEvents([]);
       setConversation((current) => {
         if (current && current.id !== target.id) return current;
         const next = current ?? { ...target, messages: [], runs: [] };
         return { ...next, runs: [run, ...(next.runs ?? []).filter((item) => item.id !== run.id)] };
       });
+      return true;
     } catch (nextError) {
-      if (!isSelectedTarget(target)) return;
-      if (nextError.payload?.code === "PROJECT_TRUST_REQUIRED") { setPendingPrompt({ prompt, target }); setTrustRequest(nextError.payload.project); }
+      if (!isSelectedTarget(target)) return false;
+      if (nextError.payload?.code === "PROJECT_TRUST_REQUIRED") { trustGrantedRef.current = false; setPendingPrompt({ prompt, target }); setTrustRequest(nextError.payload.project); }
       else {
         if (nextError.payload?.code === "RUN_RECOVERY_REQUIRED") await loadConversation();
         setError(nextError.message);
       }
+      return false;
     }
     finally { submissionPendingRef.current = false; }
   }
   async function trustAndRun() {
     const pending = pendingPrompt;
-    if (!pending || !isSelectedTarget(pending.target) || !readyConversationRef.current || !isSelectedTarget(readyConversationRef.current)
-      || pendingConversationLoadRef.current || conversationLoadFailed || conversationListFailed) {
-      setTrustRequest(null); setPendingPrompt(null); return;
-    }
+    if (!pending || !isSelectedTarget(pending.target)) { setTrustRequest(null); setPendingPrompt(null); trustGrantedRef.current = false; return; }
+    if (conversationListPendingRef.current || conversationListFailed || !readyConversationRef.current
+      || !isSelectedTarget(readyConversationRef.current) || pendingConversationLoadRef.current || conversationLoadFailed) return;
     try {
-      await api("/api/trust", { method: "POST", body: { projectId: trustRequest.id, projectPath: trustRequest.path, confirmation: trustRequest.path } });
-      setBootstrap((current) => ({ ...current, trustedProjects: [...current.trustedProjects, { projectId: trustRequest.id, projectPath: trustRequest.path }] }));
-      setTrustRequest(null); setPendingPrompt(null); await sendPrompt(null, pending.prompt, pending.target);
+      if (!trustGrantedRef.current) {
+        await api("/api/trust", { method: "POST", body: { projectId: trustRequest.id, projectPath: trustRequest.path, confirmation: trustRequest.path } });
+        trustGrantedRef.current = true;
+        setBootstrap((current) => ({ ...current, trustedProjects: [...current.trustedProjects, { projectId: trustRequest.id, projectPath: trustRequest.path }] }));
+      }
+      if (!isSelectedTarget(pending.target)) { setTrustRequest(null); setPendingPrompt(null); trustGrantedRef.current = false; return; }
+      if (conversationListPendingRef.current || conversationListFailed || !readyConversationRef.current
+        || !isSelectedTarget(readyConversationRef.current) || pendingConversationLoadRef.current || conversationLoadFailed) return;
+      if (await sendPrompt(null, pending.prompt)) { setTrustRequest(null); setPendingPrompt(null); trustGrantedRef.current = false; }
     } catch (nextError) { setError(nextError.message); }
   }
   async function stopRun() { try { await api(`/api/runs/${activeRun.id}/stop`, { method: "POST" }); } catch (nextError) { setError(nextError.message); } }

@@ -437,6 +437,119 @@ async function chatFailedWorktreeListRegression() {
   assert(document.activeElement === tab && tab.getAttribute('aria-selected') === 'true', "Recovered chat lost keyboard roving focus");
 }
 
+async function chatListSubmissionFenceRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const pendingList = deferred();
+  let listRequests = 0;
+  let detailRequests = 0;
+  const runs = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") {
+      listRequests++;
+      return listRequests === 2 ? pendingList.promise : response({ conversations: [chats.A] });
+    }
+    if (url.pathname === "/api/conversations/chat-A") {
+      detailRequests++;
+      return response({ ...chats.A, provider: detailRequests === 1 ? "codex" : "claude" });
+    }
+    if (url.pathname === "/api/conversations/chat-A/runs") { runs.push(JSON.parse(options.body)); return response({ id: "run", status: "queued" }, 202); }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('textarea[placeholder*="Ask codex"]'), "old chat detail");
+  setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "Use current metadata");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "conversation.updated", conversationId: "chat-A" }) }));
+  await until(() => listRequests === 2, "held list refresh");
+  host.querySelector('.composer').requestSubmit();
+  assert(runs.length === 0, "Synchronous list fence allowed a stale run before rerender");
+  await settle();
+  assert(host.querySelector('[aria-label="Send message"]')?.disabled, "Held list refresh left stale chat executable");
+  host.querySelector('.composer').requestSubmit();
+  await settle();
+  assert(runs.length === 0, "Held list refresh posted a stale run");
+  pendingList.resolve(response({ conversations: [chats.A] }));
+  await until(() => host.querySelector('textarea[placeholder*="Ask claude"]'), "fresh detail after list refresh");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => runs.length === 1, "send after list refresh");
+  assert(runs[0].provider === "claude", "Send used stale metadata after list refresh");
+}
+
+async function initialChatListFailureSubmissionRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "" : "A"));
+  let fail = true;
+  let runs = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return fail ? response({ error: "List offline" }, 503) : response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname.endsWith("/runs")) { runs++; return response({ id: "run", status: "queued" }, 202); }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => [...host.querySelectorAll('button')].some((button) => button.textContent === "Retry chat list"), "initial list failure");
+  setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "Do not silently discard");
+  assert(host.querySelector('[aria-label="Send message"]')?.disabled, "Initial list failure left composer enabled");
+  host.querySelector('.composer').requestSubmit();
+  await settle();
+  assert(runs === 0, "Initial list failure posted a run");
+  fail = false;
+  [...host.querySelectorAll('button')].find((button) => button.textContent === "Retry chat list").click();
+  await until(() => host.querySelector('#chat-tab-chat-A[aria-selected="true"]') && !host.querySelector('[aria-label="Send message"]')?.disabled, "list recovery");
+}
+
+async function trustPendingListRefreshRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const pendingTrust = deferred();
+  const pendingList = deferred();
+  let listRequests = 0;
+  let detailRequests = 0;
+  let trustRequests = 0;
+  const runs = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") {
+      listRequests++;
+      return listRequests === 2 ? pendingList.promise : response({ conversations: [chats.A] });
+    }
+    if (url.pathname === "/api/conversations/chat-A") {
+      detailRequests++;
+      return response({ ...chats.A, provider: detailRequests === 1 ? "codex" : "claude" });
+    }
+    if (url.pathname === "/api/conversations/chat-A/runs") {
+      runs.push(JSON.parse(options.body));
+      return runs.length === 1 ? response({ error: "Trust required", code: "PROJECT_TRUST_REQUIRED", project: projects[0] }, 403) : response({ id: "run", status: "queued" }, 202);
+    }
+    if (url.pathname === "/api/trust") { trustRequests++; return trustRequests === 1 ? pendingTrust.promise : response({}); }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('textarea[placeholder*="Ask codex"]'), "old detail before trust");
+  setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "Preserve pending prompt");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => document.querySelector('[role="dialog"]')?.textContent.includes("Trust this project?"), "trust request");
+  [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Trust and run").click();
+  await until(() => trustRequests === 1, "held trust POST");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "conversation.updated", conversationId: "chat-A" }) }));
+  await until(() => listRequests === 2, "held list during trust POST");
+  pendingTrust.resolve(response({}));
+  await settle();
+  assert(runs.length === 1, "Trust continuation submitted while chat list was pending");
+  assert(document.querySelector('[role="dialog"]')?.textContent.includes("Trust this project?"), "Trust refresh race discarded pending prompt");
+  pendingList.resolve(response({ conversations: [chats.A] }));
+  await until(() => host.querySelector('textarea[placeholder*="Ask claude"]'), "fresh detail after trust race");
+  [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Trust and run").click();
+  await until(() => runs.length === 2, "resumed pending trust prompt");
+  assert(trustRequests === 1, "Trust continuation repeated an already granted trust request");
+  assert(runs[1].provider === "claude" && runs[1].prompt === "Preserve pending prompt", "Trust continuation used stale metadata or lost prompt");
+}
+
 async function terminalExitWhileCreatingRegression() {
   root.render(null);
   await settle();
@@ -1397,6 +1510,9 @@ try {
     ["archived chat ownership", archivedChatOwnershipRegression, "an archived chat cannot keep a pane or accept runs during held or failed refresh"],
     ["same-owner archive refresh", sameOwnerArchiveRefreshRegression, "a held archive cannot overwrite a newer same-worktree list after refresh failure"],
     ["chat detail refresh ownership", chatDetailRefreshOwnershipRegression, "failed and pending same-chat detail blocks submission and trust until fresh detail loads"],
+    ["chat list submission fence", chatListSubmissionFenceRegression, "a pending list refresh cannot submit with stale chat metadata"],
+    ["initial chat list failure submission", initialChatListFailureSubmissionRegression, "initial list failure disables submission until retry"],
+    ["trust pending list refresh", trustPendingListRefreshRegression, "trust continuation survives a held list refresh and uses fresh detail"],
     ["terminal exit during create", terminalExitWhileCreatingRegression, "an exit received while create is held remains exited in the tablist"],
     ["terminal exit during close", terminalExitWhileClosingRegression, "a held delete retains another terminal's exit"],
     ["late archive after owner switch", () => staleArchiveWorktreeRegression(false), "late A archive does not discard B's list response"],
