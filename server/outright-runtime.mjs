@@ -39,7 +39,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     return eventHub.publish(event);
   }
 
-  const agents = createAgentManager({ database, publish, validateConversation: async (conversation) => {
+  const agents = createAgentManager({ database, publish, onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }), validateConversation: async (conversation) => {
     const target = await resolveWorktreeTarget(conversation);
     return () => {
       if (database.getConversation(conversation.id)?.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
@@ -233,8 +233,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         const settings = database.getSettings();
         const provider = body.provider || conversation.provider || settings.provider;
-        const providerInfo = agents.providers().find((item) => item.id === provider);
-        if (!providerInfo?.available) throw apiError(409, `${provider} CLI is not available`);
+        if (!await agents.providerAvailable(provider)) throw apiError(409, `${provider} CLI is not available`);
         // Archive, move, or recovery can commit during either validation await.
         // Fence both message and run creation to the current durable target.
         const currentConversation = database.getConversation(conversation.id);
@@ -405,8 +404,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         // submission, and again inside the agent drain before spawning.
         const target = await resolveWorktreeTarget({ projectId: conversation.projectId, worktreeId: conversation.worktreeId, worktreePath: conversation.worktreePath });
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
-        const providerInfo = agents.providers().find((item) => item.id === interrupted.provider);
-        if (!providerInfo?.available) throw apiError(409, `${interrupted.provider} CLI is not available`);
+        if (!await agents.providerAvailable(interrupted.provider)) throw apiError(409, `${interrupted.provider} CLI is not available`);
         // Recovery is bound to the immutable run session first. A mutable
         // conversation session is only a compatible fallback when the
         // conversation still targets the same provider.

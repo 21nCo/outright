@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowSquareOut, ArrowsClockwise, Check, GitCommit, Minus, Plus } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { api, query } from "@/lib/runtime-api";
+import { WindowedDiff } from "@/components/WindowedDiff";
 
 export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast }) {
   const [status, setStatus] = useState(null);
@@ -11,17 +12,32 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
   const [diff, setDiff] = useState("");
   const [commitMessage, setCommitMessage] = useState("");
   const [loading, setLoading] = useState(true);
+  const diffRequestRef = useRef(0);
+  const statusRequestRef = useRef(0);
+
+  useEffect(() => {
+    ++statusRequestRef.current;
+    ++diffRequestRef.current;
+    setStatus(null);
+    setDiff("");
+    return () => { ++statusRequestRef.current; ++diffRequestRef.current; };
+  }, [worktree.path]);
 
   const loadDiff = useCallback(async (filePath, mode) => {
+    const request = ++diffRequestRef.current;
     if (!filePath) { setDiff(""); return; }
-    try { setDiff((await api(query("/api/git/diff", { path: worktree.path, file: filePath, staged: mode === "staged" }))).diff); }
-    catch (error) { onError(error); }
+    try {
+      const next = await api(query("/api/git/diff", { path: worktree.path, file: filePath, staged: mode === "staged" }));
+      if (request === diffRequestRef.current) setDiff(next.diff);
+    } catch (error) { if (request === diffRequestRef.current) onError(error); }
   }, [worktree.path, onError]);
 
   const refresh = useCallback(async () => {
+    const request = ++statusRequestRef.current;
     setLoading(true);
     try {
       const next = await api(query("/api/git/status", { path: worktree.path }));
+      if (request !== statusRequestRef.current) return;
       setStatus(next);
       const current = next.files.find((file) => file.path === selectedFile);
       const nextFile = current?.path ?? next.files[0]?.path ?? "";
@@ -32,8 +48,8 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
         setViewMode(mode);
         await loadDiff(nextFile, mode);
       } else setDiff("");
-    } catch (error) { onError(error); }
-    finally { setLoading(false); }
+    } catch (error) { if (request === statusRequestRef.current) onError(error); }
+    finally { if (request === statusRequestRef.current) setLoading(false); }
   }, [worktree.path, selectedFile, viewMode, loadDiff, onError]);
 
   useEffect(() => { refresh(); }, [worktree.id]);
@@ -73,7 +89,7 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
       </div>
       <div className="diff-column">
         {selected && <div className="diff-mode" role="group" aria-label="Diff view"><Button variant={viewMode === "unstaged" ? "secondary" : "ghost"} size="xs" aria-pressed={viewMode === "unstaged"} onClick={() => chooseMode("unstaged")}>Unstaged</Button><Button variant={viewMode === "staged" ? "secondary" : "ghost"} size="xs" aria-pressed={viewMode === "staged"} disabled={!stagedEligible} onClick={() => chooseMode("staged")}>Staged{selected.originalPath ? ` (renamed from ${selected.originalPath})` : ""}</Button></div>}
-        <pre className="diff-view" tabIndex={0} aria-label={selected ? `Diff for ${selected.path}, ${viewMode}` : "No diff selected"}>{diff ? diff.split("\n").map((line, index) => <span className={line.startsWith("+") && !line.startsWith("+++") ? "added" : line.startsWith("-") && !line.startsWith("---") ? "removed" : line.startsWith("@@") ? "hunk" : ""} key={`${index}:${line}`}><i aria-hidden="true">{index + 1}</i>{line}{"\n"}</span>) : <span className="diff-empty">Select a changed file to inspect its diff.</span>}</pre>
+        <WindowedDiff key={`${worktree.id}:${selectedFile}:${viewMode}`} diff={diff} label={selected ? `Diff for ${selected.path}, ${viewMode}` : "No diff selected"} />
       </div>
     </div>
     <footer className="commit-bar"><Input aria-label="Commit message" value={commitMessage} onChange={(event) => setCommitMessage(event.target.value)} placeholder="Commit message" onKeyDown={(event) => { if (event.key === "Enter") commit(); }} /><Button onClick={commit} disabled={!commitMessage.trim() || !status?.stagedCount}><GitCommit /> Commit {status?.stagedCount ? `${status.stagedCount} staged` : ""}</Button></footer>

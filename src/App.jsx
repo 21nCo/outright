@@ -19,6 +19,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ChangesPane } from "@/components/ChangesPane";
+import { ESTIMATED_MESSAGE_HEIGHT, WindowedMessages } from "@/components/WindowedMessages";
 import { CommandPalette } from "@/components/CommandPalette";
 import { ContextPane } from "@/components/ContextPane";
 import { SettingsDialog } from "@/components/SettingsDialog";
@@ -49,6 +50,8 @@ export function App() {
   const draftRevisionRef = useRef(0);
   const [unsentCreatedChat, setUnsentCreatedChat] = useState(null);
   const [streamingText, setStreamingText] = useState("");
+  const streamingTextRef = useRef("");
+  const streamingFlushRef = useRef(null);
   const [runEvents, setRunEvents] = useState([]);
   const [runtimeEvent, setRuntimeEvent] = useState(null);
   const [connection, setConnection] = useState("connecting");
@@ -101,6 +104,21 @@ export function App() {
   const conversationsRef = useRef([]);
   const archiveFocusRef = useRef(null);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+
+  const applyStreamingText = useCallback((change, immediate = false) => {
+    streamingTextRef.current = change(streamingTextRef.current);
+    if (immediate) {
+      clearTimeout(streamingFlushRef.current);
+      streamingFlushRef.current = null;
+      setStreamingText(streamingTextRef.current);
+    } else if (!streamingFlushRef.current) {
+      streamingFlushRef.current = window.setTimeout(() => {
+        streamingFlushRef.current = null;
+        setStreamingText(streamingTextRef.current);
+      }, 32);
+    }
+  }, []);
+  useEffect(() => () => clearTimeout(streamingFlushRef.current), []);
 
   function stageConversations(next) {
     conversationsRef.current = next;
@@ -196,7 +214,7 @@ export function App() {
     selectedConversationRef.current = "";
     stageConversations([]); setConversation(null); setSelectedConversationId("");
     setConversationListFailed(false); setConversationLoadFailed(false);
-    setStreamingText(""); setRunEvents([]); checkpointCursorsRef.current.clear();
+    applyStreamingText(() => "", true); setRunEvents([]); checkpointCursorsRef.current.clear();
   }
   useEffect(() => { loadConversations(); }, [project?.id, worktree?.id, loadConversations]);
   useLayoutEffect(() => { selectedConversationRef.current = selectedConversationId; }, [selectedConversationId]);
@@ -256,7 +274,7 @@ export function App() {
           beforeId: replayed.messages[0]?.id ?? null,
         },
       });
-      setStreamingText(boundStreamingText(replayed.streamingText));
+      applyStreamingText(() => boundStreamingText(replayed.streamingText), true);
       setRunEvents(replayed.runEvents);
       window.requestAnimationFrame(() => {
         const viewport = messageViewportRef.current;
@@ -274,7 +292,8 @@ export function App() {
   const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
   const handleRuntimeEvent = useCallback((event) => {
-    setRuntimeEvent(event);
+    if (["projects.changed", "terminal.output", "terminal.exit", "runtime.connected"].includes(event.type)
+      || (event.type === "run.event" && ["run.completed", "run.failed", "run.stopped"].includes(event.payload?.type))) setRuntimeEvent(event);
     const pendingLoad = pendingConversationLoadRef.current;
     if (["message.created", "run.event"].includes(event.type)
       && bufferConversationRuntimeEvent(pendingLoad, event, MAX_PENDING_RUNTIME_EVENT_BYTES) === "overflow") {
@@ -289,6 +308,7 @@ export function App() {
       const payload = event.payload.projects ? event.payload : { projects: event.payload };
       setBootstrap((current) => current ? { ...current, ...payload } : current);
     }
+    if (event.type === "providers.changed") setBootstrap((current) => current ? { ...current, providers: event.payload.providers } : current);
     if (event.type === "runtime.connected" && (event.payload?.replay?.missed || event.payload?.restarted)) {
       loadBootstrap();
       loadConversation();
@@ -298,7 +318,7 @@ export function App() {
     if (event.type === "message.created" && event.conversationId === selectedConversationRef.current) {
       if (isStaleCheckpointMessage(checkpointCursorsRef.current, event.payload)) return;
       recordCheckpointCursor(checkpointCursorsRef.current, event.payload);
-      setStreamingText((current) => streamingTextAfterRuntimeEvent(current, event));
+      applyStreamingText((current) => streamingTextAfterRuntimeEvent(current, event), true);
       setConversation((current) => {
         if (!current) return current;
         const alreadyPresent = current.messages.some((message) => message.id === event.payload.id);
@@ -327,16 +347,16 @@ export function App() {
       const runEvent = event.payload;
       if (runEvent.type === "assistant.delta") {
         const checkpointEventSeq = checkpointCursorsRef.current.get(event.runId) ?? 0;
-        setStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event, checkpointEventSeq)));
+        applyStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event, checkpointEventSeq)));
       }
-      if (runEvent.type === "assistant.message") setStreamingText((current) => streamingTextAfterRuntimeEvent(current, event));
+      if (runEvent.type === "assistant.message") applyStreamingText((current) => streamingTextAfterRuntimeEvent(current, event), true);
       if (runEvent.type.startsWith("tool.")) setRunEvents((current) => [...current, runEvent].slice(-20));
       if (["run.completed", "run.failed", "run.stopped"].includes(runEvent.type)) {
         window.setTimeout(loadConversation, 80);
         if (document.hidden && settings.notifications && Notification.permission === "granted") new Notification(`Outright run ${runEvent.type.split(".")[1]}`, { body: conversation?.title ?? "Agent run" });
       }
     }
-  }, [loadConversation, loadConversations, settings.notifications, conversation?.title, selectedRecoveryRunId]);
+  }, [loadConversation, loadConversations, settings.notifications, conversation?.title, selectedRecoveryRunId, applyStreamingText]);
   runtimeHandlerRef.current = handleRuntimeEvent;
 
   useEffect(() => {
@@ -492,9 +512,22 @@ export function App() {
   useEffect(() => {
     const viewport = messageViewportRef.current;
     if (!viewport) return;
-    const updateStickiness = () => { stickToBottomRef.current = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96; };
+    let lastScrollTop = viewport.scrollTop;
+    const updateStickiness = () => {
+      const top = viewport.scrollTop;
+      if (!pendingPrependScrollRef.current) {
+        if (viewport.scrollHeight - viewport.clientHeight - top < 96) stickToBottomRef.current = true;
+        else if (top < lastScrollTop - 1) stickToBottomRef.current = false;
+      }
+      lastScrollTop = top;
+    };
     viewport.addEventListener("scroll", updateStickiness, { passive: true });
-    return () => viewport.removeEventListener("scroll", updateStickiness);
+    const resize = new ResizeObserver(() => {
+      if (stickToBottomRef.current && !pendingPrependScrollRef.current) viewport.scrollTop = viewport.scrollHeight;
+    });
+    const column = viewport.querySelector(".message-column");
+    if (column) resize.observe(column);
+    return () => { viewport.removeEventListener("scroll", updateStickiness); resize.disconnect(); };
   }, [conversation?.id]);
   useLayoutEffect(() => {
     const pending = pendingPrependScrollRef.current;
@@ -502,21 +535,38 @@ export function App() {
     if (!pending || !viewport) return;
     const restoreAnchor = () => {
       const anchor = [...viewport.querySelectorAll("[data-message-id]")].find((element) => element.dataset.messageId === pending.messageId);
-      if (anchor) viewport.scrollTop += anchor.getBoundingClientRect().top - pending.top;
+      if (anchor && pending.top !== undefined) viewport.scrollTop += anchor.getBoundingClientRect().top - pending.top;
+      else if (!pending.restoredFallback) {
+        viewport.scrollTop += (pending.prependedCount ?? 0) * ESTIMATED_MESSAGE_HEIGHT;
+        pending.restoredFallback = true;
+      }
     };
     restoreAnchor();
-    const firstFrame = window.requestAnimationFrame(() => {
+    let framesRemaining = 8;
+    let frame;
+    const cancelForUserScroll = () => {
+      if (pendingPrependScrollRef.current === pending) pendingPrependScrollRef.current = null;
+      window.cancelAnimationFrame(frame);
+    };
+    viewport.addEventListener("wheel", cancelForUserScroll, { passive: true });
+    viewport.addEventListener("touchstart", cancelForUserScroll, { passive: true });
+    viewport.addEventListener("keydown", cancelForUserScroll);
+    const keepAnchor = () => {
+      if (pendingPrependScrollRef.current !== pending) return;
       restoreAnchor();
-      const secondFrame = window.requestAnimationFrame(() => {
-        restoreAnchor();
-        pendingPrependScrollRef.current = null;
-      });
-      pending.cancelSecondFrame = () => window.cancelAnimationFrame(secondFrame);
-    });
-    return () => { window.cancelAnimationFrame(firstFrame); pending.cancelSecondFrame?.(); };
+      if (--framesRemaining > 0) frame = window.requestAnimationFrame(keepAnchor);
+      else if (pendingPrependScrollRef.current === pending) pendingPrependScrollRef.current = null;
+    };
+    frame = window.requestAnimationFrame(keepAnchor);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      viewport.removeEventListener("wheel", cancelForUserScroll);
+      viewport.removeEventListener("touchstart", cancelForUserScroll);
+      viewport.removeEventListener("keydown", cancelForUserScroll);
+    };
   }, [conversation?.messages[0]?.id]);
   useEffect(() => {
-    if (!stickToBottomRef.current) return;
+    if (!stickToBottomRef.current || pendingPrependScrollRef.current) return;
     window.requestAnimationFrame(() => {
       const viewport = messageViewportRef.current;
       if (viewport) viewport.scrollTop = viewport.scrollHeight;
@@ -687,7 +737,7 @@ export function App() {
       setUnsentCreatedChat((current) => current?.id === target.id && current.projectId === target.projectId && current.worktreeId === target.worktreeId ? null : current);
       setDraft((current) => draftRevisionRef.current === submittedDraftRevision ? draftAfterSubmission(current, submittedDraft) : current);
       if (!isSelectedTarget(target)) return true;
-      setStreamingText(""); setRunEvents([]);
+      applyStreamingText(() => "", true); setRunEvents([]);
       setConversation((current) => {
         if (current && current.id !== target.id) return current;
         const next = current ?? { ...target, messages: [], runs: [] };
@@ -727,11 +777,12 @@ export function App() {
     if (!conversation?.messagePage?.hasMore || loadingEarlier || !conversation.messages[0]) return;
     const viewport = messageViewportRef.current;
     const anchor = viewport?.querySelector(`[data-message-id="${CSS.escape(conversation.messages[0].id)}"]`);
-    pendingPrependScrollRef.current = anchor ? { messageId: conversation.messages[0].id, top: anchor.getBoundingClientRect().top } : null;
+    pendingPrependScrollRef.current = { messageId: conversation.messages[0].id, top: anchor?.getBoundingClientRect().top };
     stickToBottomRef.current = false;
     setLoadingEarlier(true);
     try {
       const result = await api(query(`/api/conversations/${conversation.id}/messages`, { before: conversation.messages[0].id, limit: 200 }));
+      if (pendingPrependScrollRef.current?.messageId === conversation.messages[0].id) pendingPrependScrollRef.current.prependedCount = result.messages.length;
       checkpointCursorsRef.current = checkpointCursors(result.messages, checkpointCursorsRef.current);
       setConversation((current) => {
         if (current?.id !== conversation.id) return current;
@@ -770,7 +821,7 @@ export function App() {
     pendingConversationLoadRef.current = null;
     selectedConversationRef.current = nextId;
     setSelectedConversationId(nextId);
-    setConversation(null); setConversationLoadFailed(false); setStreamingText(""); setRunEvents([]); checkpointCursorsRef.current.clear();
+    setConversation(null); setConversationLoadFailed(false); applyStreamingText(() => "", true); setRunEvents([]); checkpointCursorsRef.current.clear();
   }
   async function archiveChat(item, focusSource) {
     try {
@@ -853,7 +904,7 @@ export function App() {
       <div className="work-area">
         <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
           <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} onManage={openManageChat} />
-          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages" }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? conversation.messages.map((message) => <Message key={message.id} message={message} />) : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}{conversation?.messagePage?.hasLater && <button className="history-return" onClick={loadConversation}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button>}</div></ScrollArea>
+          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages" }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? <WindowedMessages messages={conversation.messages} viewportRef={messageViewportRef} renderMessage={(message) => <Message message={message} />} /> : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}{conversation?.messagePage?.hasLater && <button className="history-return" onClick={loadConversation}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button>}</div></ScrollArea>
           {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}
           <form className="composer" onSubmit={sendPrompt}>{unsentCreatedChat && <div className="first-prompt-notice" role="status" aria-live="polite">Chat created, but your message was not sent. {unsentForOwner ? firstPromptAwaitingSelection ? "Open the created chat before sending again." : "Send again when the chat is ready." : "Return to its worktree before sending again."}{unsentForOwner && firstPromptAwaitingSelection && conversations.some((item) => item.id === unsentForOwner.id) && <Button type="button" variant="outline" size="sm" onClick={() => setSelectedConversationId(unsentForOwner.id)}>Open created chat</Button>}{!unsentForOwner && unsentProject && unsentWorktree && <Button type="button" variant="outline" size="sm" onClick={() => { pendingConversationRef.current = unsentCreatedChat.id; chooseProject(unsentProject, unsentWorktree); }}>Return to created chat</Button>}<Button type="button" variant="ghost" size="sm" onClick={() => { setUnsentCreatedChat(null); editDraft(""); }}>Discard unsent message</Button></div>}<textarea aria-label="Message the agent" disabled={Boolean(interruptedRun) || submissionUnavailable} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversationLoadFailed ? "Chat unavailable; retry loading…" : waitingForConversation ? "Loading selected chat…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={editDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running" role="status" aria-live="polite"><span className="status-dot demo" aria-hidden="true" />Agent is {activeRun.status}</span> : interruptedRun ? <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Recovery decision required</span> : waitingForConversation ? <span className="send-hint" role="status" aria-live="polite">{conversationLoadFailed ? "Chat unavailable; retry loading" : "Loading selected chat"}</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun) || submissionUnavailable || firstPromptAwaitingSelection} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
         </section>

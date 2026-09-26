@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createProviderDiscovery } from "./provider-discovery.mjs";
 
 const MAX_PROVIDER_LINE_BYTES = 1024 * 1024;
 const MAX_ASSISTANT_BYTES = 1024 * 1024;
@@ -298,7 +299,7 @@ export function defaultLaunchCommand(command, run, launchDirectory) {
   };
 }
 
-export function createAgentManager({ database, publish, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
+export function createAgentManager({ database, publish, onProvidersChanged = () => {}, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
   const resolvedLaunchDirectory = launchDirectory
     ?? database.launchDirectory;
   assertPrivateLaunchDirectory(resolvedLaunchDirectory);
@@ -306,12 +307,10 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
   const queue = [];
   let shuttingDown = false;
   let shutdownPromise;
+  const providerDiscovery = createProviderDiscovery({ onChange: onProvidersChanged });
 
   function providers() {
-    return [
-      detectProvider("codex", "Codex", ["--version"], ["gpt-5.4", "gpt-5.3-codex"]),
-      detectProvider("claude", "Claude Code", ["--version"], ["sonnet", "opus", "haiku"]),
-    ];
+    return providerDiscovery.list();
   }
 
   async function schedule({ conversation, run, forceFreshSession = false, providerSessionId }) {
@@ -731,12 +730,14 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
 
   return {
     providers,
+    providerAvailable: providerDiscovery.available,
     schedule,
     stop,
     activeRuns: () => [...active.keys()],
     shutdown() {
       if (shutdownPromise) return shutdownPromise;
       shuttingDown = true;
+      providerDiscovery.close();
       const ids = [...queue.map((entry) => entry.run.id), ...active.keys()];
       shutdownPromise = Promise.all(ids.map(stop));
       return shutdownPromise;
@@ -1111,11 +1112,6 @@ export function hardenWindowsLaunchDirectory(directory, run = spawnSync, environ
   if (result.error || result.status !== 0) {
     throw new Error("Unable to secure the Windows launch directory ACL", { cause: result.error });
   }
-}
-
-function detectProvider(id, label, versionArgs, models) {
-  const result = spawnSync(id, versionArgs, { encoding: "utf8", timeout: 2500 });
-  return { id, label, available: result.status === 0, version: (result.stdout || result.stderr || "").trim(), models };
 }
 
 function sanitizedEnvironment(environment) {

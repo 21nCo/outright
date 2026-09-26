@@ -38,7 +38,10 @@ export function recordCheckpointCursor(cursors, message) {
   const runId = message?.payload?.runId;
   const seq = message?.payload?.checkpointEventSeq;
   if (typeof runId === "string" && Number.isSafeInteger(seq)) {
-    cursors.set(runId, Math.max(cursors.get(runId) ?? 0, seq));
+    const latest = Math.max(cursors.get(runId) ?? 0, seq);
+    cursors.delete(runId);
+    cursors.set(runId, latest);
+    while (cursors.size > 2048) cursors.delete(cursors.keys().next().value);
   }
   return cursors;
 }
@@ -78,8 +81,8 @@ export function bufferConversationRuntimeEvent(pendingLoad, event, maxBytes) {
 }
 
 export function replayConversationEvents(snapshotMessages = [], events = [], maxMessages = Number.POSITIVE_INFINITY) {
-  let messages = [...snapshotMessages];
-  const cursors = checkpointCursors(messages);
+  const messagesById = new Map(snapshotMessages.map((message) => [message.id, message]));
+  const cursors = checkpointCursors(snapshotMessages);
   let streamingText = "";
   let runEvents = [];
   for (const event of events) {
@@ -87,7 +90,8 @@ export function replayConversationEvents(snapshotMessages = [], events = [], max
       if (isStaleCheckpointMessage(cursors, event.payload)) continue;
       recordCheckpointCursor(cursors, event.payload);
       streamingText = streamingTextAfterRuntimeEvent(streamingText, event);
-      messages = upsertRuntimeMessage(messages, event.payload);
+      messagesById.delete(event.payload.id);
+      messagesById.set(event.payload.id, event.payload);
       continue;
     }
     if (event?.type !== "run.event") continue;
@@ -98,6 +102,7 @@ export function replayConversationEvents(snapshotMessages = [], events = [], max
     }
     if (event.payload?.type?.startsWith("tool.")) runEvents = [...runEvents, event.payload].slice(-20);
   }
+  let messages = [...messagesById.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   const dropped = Math.max(0, messages.length - maxMessages);
   if (dropped) messages = messages.slice(-maxMessages);
   return { messages, cursors, streamingText, runEvents, dropped };

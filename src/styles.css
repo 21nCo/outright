@@ -398,8 +398,8 @@ select { height: 34px; padding: 0 28px 0 10px; border: 1px solid var(--input); b
 .file-actions { display: flex; opacity: 0; }
 .change-file:hover .file-actions, .change-file:focus-within .file-actions, .change-file.is-active .file-actions { opacity: 1; }
 .clean-state { height: 100%; display: flex; align-items: center; justify-content: center; gap: 7px; color: var(--green); font-size: 10px; }
-.diff-view { min-height: 0; margin: 0; padding: 9px 0 30px; overflow: auto; color: var(--muted-foreground); background: var(--canvas); font: 9px/1.55 "DM Sans Variable", monospace; }
-.diff-view > span { display: block; min-height: 14px; padding-right: 8px; white-space: pre; }
+.diff-view { min-height: 0; margin: 0; padding: 9px 0 30px; overflow: auto; color: var(--muted-foreground); background: var(--canvas); font: 9px/14px "DM Sans Variable", monospace; }
+.diff-view span { display: block; height: 14px; padding-right: 8px; white-space: pre; }
 .diff-view i { width: 32px; margin-right: 9px; display: inline-block; color: color-mix(in oklab, var(--muted-foreground) 55%, transparent); text-align: right; font-style: normal; user-select: none; }
 .diff-view .added { color: var(--green); background: color-mix(in oklab, var(--green) 10%, transparent); }
 .diff-view .removed { color: var(--destructive); background: color-mix(in oklab, var(--destructive) 9%, transparent); }

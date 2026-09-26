@@ -4,6 +4,8 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "../src/App.jsx";
 import { ChangesPane } from "../src/components/ChangesPane.jsx";
+import { WindowedMessages } from "../src/components/WindowedMessages.jsx";
+import { WindowedDiff } from "../src/components/WindowedDiff.jsx";
 import { CommandPalette } from "../src/components/CommandPalette.jsx";
 import { TerminalPane } from "../src/components/TerminalPane.jsx";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
@@ -1425,6 +1427,187 @@ async function changesLoadingRegression() {
   await until(() => host.querySelector(".clean-state"), "loaded clean tree status");
 }
 
+async function staleDiffSelectionRegression() {
+  root.render(null);
+  await settle();
+  const older = deferred();
+  const staleStatus = deferred();
+  let holdStatus = false;
+  route = async (url) => {
+    if (url.pathname === "/api/git/status") {
+      if (url.searchParams.get("path") === projects[1].worktrees[0].path) return response({ branch: "B branch", files: [], stagedCount: 0 });
+      if (holdStatus) return staleStatus.promise;
+      return response({ branch: "A branch", files: [{ path: "a.txt", status: " M", index: " ", worktree: "M" }, { path: "b.txt", status: " M", index: " ", worktree: "M" }], stagedCount: 0 });
+    }
+    if (url.pathname === "/api/git/diff") return url.searchParams.get("file") === "a.txt" ? older.promise : response({ diff: "+current B\n" });
+    return response({});
+  };
+  root.render(<ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} />);
+  await until(() => host.querySelectorAll(".change-file-select").length === 2, "two changed files");
+  [...host.querySelectorAll(".change-file-select")].find((button) => button.textContent.includes("b.txt")).click();
+  await until(() => host.querySelector(".diff-view")?.textContent.includes("current B"), "newer selected diff");
+  older.resolve(response({ diff: "+stale A\n" }));
+  await settle();
+  assert(host.querySelector(".diff-view")?.textContent.includes("current B") && !host.querySelector(".diff-view")?.textContent.includes("stale A"), "A late diff response replaced the selected file");
+  holdStatus = true;
+  host.querySelector('[aria-label="Refresh changes"]').click();
+  await settle();
+  root.render(<ChangesPane worktree={projects[1].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} />);
+  await until(() => host.querySelector('.pane-toolbar strong')?.textContent === "B branch", "new worktree status");
+  staleStatus.resolve(response({ branch: "A branch", files: [], stagedCount: 0 }));
+  await settle();
+  assert(host.querySelector('.pane-toolbar strong')?.textContent === "B branch", "A stale worktree status replaced B's status");
+}
+
+async function longTranscriptWindowRegression() {
+  root.render(null);
+  await settle();
+  const messages = Array.from({ length: 1_000 }, (_, index) => ({ id: `message-${index}`, body: `Message ${index}` }));
+  const viewport = React.createRef();
+  const started = performance.now();
+  root.render(<div ref={viewport} style={{ height: 420, overflowY: "auto" }} tabIndex={0} aria-label="Long conversation fixture"><WindowedMessages messages={messages} viewportRef={viewport} renderMessage={(message) => <article data-message-id={message.id} style={{ minHeight: 80, marginBottom: 30 }}>{message.body}</article>} /></div>);
+  await until(() => host.querySelectorAll('[role="listitem"]').length > 0 && host.querySelectorAll('[role="listitem"]').length < 40, "bounded initial transcript DOM");
+  const initialCount = host.querySelectorAll('[role="listitem"]').length;
+  viewport.current.scrollTop = viewport.current.scrollHeight;
+  viewport.current.dispatchEvent(new Event("scroll"));
+  try { await until(() => host.querySelector('[data-message-id="message-999"]'), "last message after long scroll"); }
+  catch (error) { throw new Error(`${error.message}; scroll=${viewport.current.scrollTop}/${viewport.current.scrollHeight}, rows=${[...host.querySelectorAll('[data-message-id]')].map((row) => row.dataset.messageId).join(",")}`); }
+  assert(host.querySelectorAll('[role="listitem"]').length < 40, "Long scroll mounted the whole transcript");
+  viewport.current.scrollTop = 0;
+  viewport.current.dispatchEvent(new Event("scroll"));
+  await until(() => host.querySelector('[data-message-id="message-0"]'), "first message after return scroll");
+  assert(document.activeElement !== viewport.current || viewport.current.tabIndex === 0, "Transcript lost keyboard scroll access");
+  const elapsedMs = Math.round(performance.now() - started);
+  assert(elapsedMs < 1_000, `Long transcript navigation exceeded its 1s fixture budget: ${elapsedMs}ms`);
+  window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), transcript: { elapsedMs, mountedAtStart: initialCount, heapBytes: performance.memory?.usedJSHeapSize ?? null } };
+}
+
+async function largeDiffWindowRegression() {
+  root.render(null);
+  await settle();
+  const diff = Array.from({ length: 50_000 }, (_, index) => `+line ${index}\n`).join("");
+  const started = performance.now();
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={diff} label="Large diff fixture" /></div>);
+  await until(() => host.querySelector(".diff-view")?.querySelectorAll("span").length > 0, "large diff initial rows");
+  const viewport = host.querySelector(".diff-view");
+  assert(viewport.querySelectorAll("span").length < 200, "Large diff mounted every line");
+  viewport.scrollTop = viewport.scrollHeight;
+  viewport.dispatchEvent(new Event("scroll"));
+  await until(() => viewport.textContent.includes("+line 49999"), "last diff line after scroll");
+  assert(viewport.querySelectorAll("span").length < 200, "Large diff scroll mounted every line");
+  const elapsedMs = Math.round(performance.now() - started);
+  assert(elapsedMs < 1_000, `Large diff navigation exceeded its 1s fixture budget: ${elapsedMs}ms`);
+  window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), diff: { elapsedMs, mountedAtEnd: viewport.querySelectorAll("span").length, heapBytes: performance.memory?.usedJSHeapSize ?? null } };
+}
+
+async function manyWorktreeSessionRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-W0" : index === 1 ? "W0" : "A"));
+  const worktrees = Array.from({ length: 200 }, (_, index) => ({ id: `W${index}`, name: `Tree ${index}`, path: `/fixture/A/W${index}`, branch: `branch-${index}`, changedCount: 0 }));
+  const project = { ...projects[0], worktrees };
+  const conversationFor = (id) => ({ id: `chat-${id}`, title: `Chat ${id}`, projectId: "A", worktreeId: id, worktreePath: `/fixture/A/${id}`, provider: "codex", messages: [{ id: `message-${id}`, role: "assistant", kind: "text", body: `Output for ${id}`, createdAt: "2026-09-26T00:00:00Z" }], runs: [] });
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [project], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [conversationFor(url.searchParams.get("worktreeId"))] });
+    const id = url.pathname.match(/^\/api\/conversations\/chat-(W\d+)$/)?.[1];
+    if (id) return response(conversationFor(id));
+    return response({});
+  };
+  const started = performance.now();
+  const heapBefore = performance.memory?.usedJSHeapSize ?? null;
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('#chat-tab-chat-W0[aria-selected="true"]'), "initial many-worktree chat");
+  for (let index = 0; index < 8; index += 1) {
+    const id = index % 2 ? "W0" : "W199";
+    const target = [...host.querySelectorAll(".worktree-row")].find((row) => row.textContent.includes(`Tree ${Number(id.slice(1))}`));
+    assert(target, `Missing ${id} in worktree navigation`);
+    target.click();
+    await until(() => host.querySelector(`#chat-tab-chat-${id}[aria-selected="true"]`) && host.querySelector(`[data-message-id="message-${id}"]`), `selected ${id} chat`);
+    assert(host.querySelectorAll(".message-scroll").length === 1 && host.querySelectorAll("[data-message-id]").length === 1, "Worktree navigation accumulated hidden conversations");
+  }
+  const input = host.querySelector('textarea[aria-label="Message the agent"]');
+  const inputStarted = performance.now();
+  setControlValue(input, "Responsive after switching worktrees");
+  await frame();
+  const inputFrameMs = Math.round(performance.now() - inputStarted);
+  assert(host.querySelectorAll(".worktree-row").length === 200, "Fixture did not exercise all worktree rows");
+  const elapsedMs = Math.round(performance.now() - started);
+  assert(elapsedMs < 3_000 && inputFrameMs < 250, `Many-worktree interaction exceeded its fixture budget: navigation ${elapsedMs}ms, input ${inputFrameMs}ms`);
+  window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), worktrees: { count: 200, switches: 8, elapsedMs, inputFrameMs, heapBefore, heapAfter: performance.memory?.usedJSHeapSize ?? null } };
+}
+
+async function pagedTranscriptAnchorRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (index) => ({ id: `message-${index}`, role: "assistant", kind: "text", body: `Historical message ${index}`, createdAt: new Date(index * 1_000).toISOString() });
+  const initial = Array.from({ length: 1_000 }, (_, index) => message(index + 1_000));
+  const older = Array.from({ length: 200 }, (_, index) => message(index + 800));
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A/messages") return response({ messages: older, messagePage: { hasMore: true, olderCount: 800, beforeId: "message-800", total: 2_000 } });
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: initial, messagePage: { hasMore: true, olderCount: 1_000, beforeId: "message-1000", total: 2_000 } });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.history-loader')?.textContent.includes("1000"), "paged transcript loaded");
+  await settle();
+  const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+  try { await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96, "latest messages on open"); }
+  catch (error) { throw new Error(`${error.message}: scroll=${viewport.scrollTop}, height=${viewport.scrollHeight}, client=${viewport.clientHeight}`); }
+  viewport.scrollTop = 0;
+  viewport.dispatchEvent(new Event("scroll"));
+  await until(() => host.querySelector('[data-message-id="message-1000"]'), "first anchor visible");
+  await settle();
+  const before = host.querySelector('[data-message-id="message-1000"]').getBoundingClientRect().top;
+  host.querySelector('.history-loader').click();
+  try { await until(() => host.querySelector('.history-loader')?.textContent.includes("800") && host.querySelector('[data-message-id="message-1000"]'), "paged anchor restored"); }
+  catch (error) { throw new Error(`${error.message}; loader=${host.querySelector('.history-loader')?.textContent}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}, rows=${[...host.querySelectorAll('[data-message-id]')].map((item) => item.dataset.messageId).join(",")}`); }
+  await settle();
+  const anchor = host.querySelector('[data-message-id="message-1000"]');
+  assert(anchor && Math.abs(anchor.getBoundingClientRect().top - before) < 10, `Loading earlier messages moved the reading anchor by ${anchor ? Math.round(anchor.getBoundingClientRect().top - before) : "missing"}px`);
+  assert(host.querySelectorAll('[role="listitem"]').length < 40, "Paged transcript mounted too many messages");
+}
+
+async function sustainedOutputRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('#chat-tab-chat-A[aria-selected="true"]'), "stream fixture chat");
+  const socket = fixtureSockets.at(-1);
+  const sendDelta = (seq) => socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", runId: "run-stream", conversationId: "chat-A", payload: { type: "assistant.delta", seq, payload: { text: "x".repeat(256) } } }) }));
+  sendDelta(1);
+  await until(() => host.querySelector('.is-streaming .message-text'), "streamed output visible");
+  const text = host.querySelector('.is-streaming .message-text');
+  let paints = 0;
+  const observer = new MutationObserver(() => { paints += 1; });
+  observer.observe(text, { subtree: true, characterData: true, childList: true });
+  const started = performance.now();
+  for (let seq = 2; seq <= 201; seq += 1) {
+    sendDelta(seq);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  await until(() => text.textContent.length === 201 * 256, "sustained output complete");
+  observer.disconnect();
+  const input = host.querySelector('textarea[aria-label="Message the agent"]');
+  const inputStarted = performance.now();
+  setControlValue(input, "Type during output");
+  await frame();
+  const inputFrameMs = Math.round(performance.now() - inputStarted);
+  assert(paints < 50, `Sustained output repainted ${paints} times for 200 small deltas`);
+  assert(inputFrameMs < 250, `Typing after sustained output missed its 250ms fixture budget: ${inputFrameMs}ms`);
+  window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), output: { deltas: 200, elapsedMs: Math.round(performance.now() - started), paints, inputFrameMs } };
+}
+
 async function responsiveFocusRegression() {
   root.render(null);
   await settle();
@@ -1802,6 +1985,12 @@ try {
     ["background terminal activation", terminalBackgroundActivationRegression, "background activation settles and fits when visible"],
     ["command search", commandPaletteRegression, "command search keeps asynchronous results current and selectable"],
     ["changes loading", changesLoadingRegression, "changes pane waits for status before announcing a clean tree"],
+    ["stale diff selection", staleDiffSelectionRegression, "a slow prior diff cannot replace the selected file"],
+    ["long transcript window", longTranscriptWindowRegression, "a thousand messages keep a bounded DOM and remain scrollable"],
+    ["large diff window", largeDiffWindowRegression, "fifty thousand diff lines keep a bounded DOM and preserve the last line"],
+    ["paged transcript anchor", pagedTranscriptAnchorRegression, "loading earlier history preserves its visible reading anchor"],
+    ["sustained output", sustainedOutputRegression, "small deltas coalesce without losing output or input responsiveness"],
+    ["many worktree sessions", manyWorktreeSessionRegression, "repeated switches across two hundred worktrees keep one conversation mounted"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and inspector contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["initial terminal failure", terminalInitialFailureRegression, "failed initial terminal activation retains a keyboard-reachable tab"],
     ["terminal mutation failure", terminalMutationFailureRegression, "create, close and reconnect failures preserve terminal tab ownership"],
@@ -1818,6 +2007,7 @@ try {
     if (ran !== false) passed += 1;
   }
   window.__fixtureProgress = { step: "complete", completed: steps.length, total: steps.length, stepStartedAt: performance.now() };
+  results.textContent += `Performance fixture: ${JSON.stringify(window.__performanceEvidence)}\n`;
   results.textContent += `${passed} interaction regressions passed`;
   document.title = "PASS — Outright interaction regressions";
 } catch (error) {
