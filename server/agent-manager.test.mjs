@@ -929,21 +929,14 @@ test("shutdown racing the running-state commit never authorizes the provider", a
   assert.deepEqual(manager.activeRuns(), []);
 });
 
-test("shutdown retains ownership when a closed supervisor leaves a stale handshake", async (t) => {
+test("shutdown retains ownership when a closed supervisor leaves a stale handshake", async () => {
   const database = fakeDatabase();
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-stale-handshake-"));
   const handshakePath = path.join(root, "run-1.json");
   const child = fakeChild();
-  // Shutdown signals the recorded process group on POSIX. Use a detached
-  // child owned by this test; a made-up PID could collide with a CI runner's
-  // unrelated process group and terminate the test job.
-  const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
-  const groupId = (pid) => Number(spawnSync("ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim());
-  const ownedGroup = process.platform === "win32" || (groupId(holder.pid) === holder.pid && groupId(process.pid) !== holder.pid);
-  const identity = `shutdown fixture: worker=${process.pid}, holder=${holder.pid}, holderGroup=${process.platform === "win32" ? "windows" : groupId(holder.pid)}, workerGroup=${process.platform === "win32" ? "windows" : groupId(process.pid)}`;
-  process.stderr.write(`${identity}\n`); // Keep evidence if the test worker is terminated before TAP flushes.
-  t.diagnostic(identity);
-  child.pid = holder.pid;
+  // This fixture verifies durable handshake ownership. Keep the fake child
+  // pid-less so it cannot signal any external process group. The real wrapper
+  // and descendant tests below verify OS-visible tree termination separately.
   const originalWrite = child.stdin.write.bind(child.stdin);
   child.stdin.write = (chunk) => {
     const written = originalWrite(chunk);
@@ -951,7 +944,6 @@ test("shutdown retains ownership when a closed supervisor leaves a stale handsha
     return written;
   };
   try {
-    assert.equal(ownedGroup, true, "fixture must prove a separate owned process group before signaling it");
     const manager = createAgentManager({
       database,
       publish: () => {},
@@ -962,16 +954,15 @@ test("shutdown retains ownership when a closed supervisor leaves a stale handsha
     });
     const run = database.createRun(codexRun("run-1"));
     await manager.schedule({ conversation: database.getConversation("conv-1"), run });
-    writeFileSync(handshakePath, JSON.stringify({ pid: child.pid, authorized: true, processIdentity: "test:owned" }));
+    writeFileSync(handshakePath, JSON.stringify({ authorized: true, processIdentity: "test:owned" }));
 
     await assert.rejects(manager.shutdown(), /Agent process tree did not terminate/);
 
-    assert.equal(existsSync(handshakePath), true, "an empty process group cannot erase ancestry-based supervisor ownership");
+    assert.deepEqual(child.signals, ["SIGTERM"], "shutdown still requests termination of its owned child");
+    assert.equal(existsSync(handshakePath), true, "a closed child cannot erase the supervisor's durable ownership record");
     assert.equal(database.getRun(run.id).status, "running");
     assert.deepEqual(manager.activeRuns(), [run.id], "the run slot remains owned until the supervisor proves its complete tree is gone");
   } finally {
-    if (!ownedGroup || process.platform === "win32") holder.kill("SIGKILL");
-    else try { process.kill(-holder.pid, "SIGKILL"); } catch { /* Already gone. */ }
     rmSync(root, { recursive: true, force: true });
   }
 });

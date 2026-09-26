@@ -1754,11 +1754,21 @@ async function productionDiffViewportRegression() {
   setControlValue(find, "unstaged 25000");
   await settle();
   find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-  // Reproduce a native End/scroll event arriving after Find requested a seek
-  // but before React has mounted the target window on a slower host.
+  // Let the first alignment commit, then deliver a queued native End/scroll.
+  // A one-shot layout correction must not give the older key event ownership.
+  await settle();
+  await settle();
   viewport.scrollTop = viewport.scrollHeight;
   viewport.dispatchEvent(new Event("scroll"));
-  try { await until(() => viewport.textContent.includes("unstaged 25000"), "offscreen diff match"); }
+  await settle();
+  const matchIsVisible = () => {
+    const mark = viewport.querySelector('[data-find-match="true"]');
+    if (!mark?.textContent.includes("unstaged 25000")) return false;
+    const row = mark.getBoundingClientRect();
+    const bounds = viewport.getBoundingClientRect();
+    return row.bottom > bounds.top && row.top < bounds.bottom;
+  };
+  try { await until(matchIsVisible, "offscreen diff match"); }
   catch (error) { throw new Error(`${error.message}; status=${host.querySelector('.window-find [aria-hidden="true"]')?.textContent}; scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}; rows=${[...viewport.querySelectorAll('[data-find-match], span')].slice(0, 3).map((row) => row.textContent.slice(0, 30)).join('|')}; marked=${viewport.querySelector('[data-find-match="true"]')?.textContent.slice(0, 80)}`); }
   assert(viewport.querySelector('[data-find-match="true"]')?.textContent.includes("unstaged 25000"), "Found diff line was not marked");
   assert(viewport.querySelectorAll("span").length < 200, "Finding a diff match mounted all lines");
@@ -2508,11 +2518,12 @@ async function replayKeepsLatestPageBoundaryRegression() {
     searchOrder: index, createdAt: new Date(index * 1000).toISOString(), payload: { runId: `run-${index}`, checkpointEventSeq: seq } });
   const latest = Array.from({ length: 200 }, (_, index) => message(index + 800));
   const heldDetail = deferred();
+  let detailStarted = false;
   let before = null;
   route = async (url) => {
     if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
     if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
-    if (url.pathname === "/api/conversations/chat-A") return heldDetail.promise;
+    if (url.pathname === "/api/conversations/chat-A") { detailStarted = true; return heldDetail.promise; }
     if (url.pathname === "/api/conversations/chat-A/messages") {
       before = url.searchParams.get("before");
       return response({ messages: Array.from({ length: 200 }, (_, index) => message(index + 600)), messagePage: { hasMore: true, olderCount: 600, total: 1000, beforeId: "replay-600" } });
@@ -2520,7 +2531,7 @@ async function replayKeepsLatestPageBoundaryRegression() {
     return response({});
   };
   root.render(<TooltipProvider><App /></TooltipProvider>);
-  await until(() => fixtureSockets.at(-1) && host.querySelector('.message-scroll'), "pending latest detail fixture");
+  await until(() => detailStarted && fixtureSockets.at(-1) && host.querySelector('.message-scroll'), "held latest detail request started");
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(10, 2) }) }));
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1000, 1) }) }));
   heldDetail.resolve(response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: 800, total: 1000, beforeId: "replay-800" } }));
@@ -2539,20 +2550,32 @@ async function deferredReloadSelectionOwnershipRegression() {
   const sibling = { ...chats.B, projectId: "A", worktreeId: "A", worktreePath: projects[0].worktrees[0].path };
   let aReads = 0;
   let bReads = 0;
-  route = async (url) => {
+  let heldASignal;
+  const heldA = deferred();
+  route = async (url, options) => {
     if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
     if (url.pathname === "/api/conversations") return response({ conversations: [chats.A, sibling] });
-    if (url.pathname === "/api/conversations/chat-A") { aReads += 1; return response({ ...chats.A, messages: [], messagePage: { total: 0 } }); }
+    if (url.pathname === "/api/conversations/chat-A") {
+      aReads += 1;
+      if (aReads === 2) heldASignal = options.signal;
+      return aReads === 2 ? heldA.promise : response({ ...chats.A, messages: [], messagePage: { total: 0 } });
+    }
     if (url.pathname === "/api/conversations/chat-B") { bReads += 1; return response({ ...sibling, messages: [], messagePage: { total: 0 } }); }
     return response({});
   };
   root.render(<TooltipProvider><App /></TooltipProvider>);
   await until(() => aReads === 1 && host.querySelector('#chat-tab-chat-A[aria-selected="true"]'), "A detail ready before deferred switch");
-  startTransition(() => host.querySelector('#chat-tab-chat-B').click());
-  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.resolved", conversationId: "chat-B", runId: "run-B" }) }));
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.resolved", conversationId: "chat-A", runId: "run-A" }) }));
+  await until(() => aReads === 2, "A refresh held before deferred reload");
+  // Overflow queues A's replacement detail read in a microtask. Switch
+  // selection synchronously before that callback can claim the shared slot.
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "noise", payload: { type: "noop", padding: "x".repeat(1_100_000) } }) }));
+  assert(heldASignal?.aborted, "Overflow did not queue a deferred replacement for A");
+  host.querySelector('#chat-tab-chat-B').click();
   await until(() => bReads >= 1 && host.querySelector('#chat-tab-chat-B[aria-selected="true"]'), "B detail after queued reload");
+  heldA.resolve(response({ ...chats.A, messages: [], messagePage: { total: 0 } }));
   await until(() => host.querySelector('.conversation-header h1')?.textContent === sibling.title, "B selected detail committed");
-  assert(aReads === 1, `A stale deferred callback made ${aReads} detail reads after selecting B`);
+  assert(aReads === 2, `A stale deferred callback made ${aReads} detail reads after selecting B`);
 }
 
 async function latestBeforeFindOwnershipRegression() {
