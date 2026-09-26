@@ -684,7 +684,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
   let output = "";
   vite.stdout.on("data", (chunk) => { output += chunk; });
   vite.stderr.on("data", (chunk) => { output += chunk; });
-  const url = `http://127.0.0.1:${port}/tests/ui-races.html`;
+  const url = `http://127.0.0.1:${port}/tests/ui-races.html${process.env.OUTRIGHT_UI_STEP ? `?only=${encodeURIComponent(process.env.OUTRIGHT_UI_STEP)}` : ""}`;
   let browser;
   let devtools;
   let failure;
@@ -814,10 +814,10 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       if (viewportError) throw viewportError;
       return send(method, params);
     }, deadline);
-    assert.match(state.text, /63 interaction regressions passed/);
+    assert.match(state.text, process.env.OUTRIGHT_UI_STEP ? /1 interaction regressions passed/ : /67 interaction regressions passed/);
     const performanceFixture = state.text.match(/Performance fixture: (\{[^\n]+\})/);
-    assert.ok(performanceFixture, "large fixture measurements were not recorded");
-    console.log(`UI performance: ${performanceFixture[1]}`);
+    if (!process.env.OUTRIGHT_UI_STEP) assert.ok(performanceFixture, "large fixture measurements were not recorded");
+    if (performanceFixture) console.log(`UI performance: ${performanceFixture[1]}`);
     if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
   } catch (error) {
     failure = new Error(`UI fixture ${phase}: ${error.message}`, { cause: error });

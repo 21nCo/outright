@@ -14,6 +14,9 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
   const [loading, setLoading] = useState(true);
   const diffRequestRef = useRef(0);
   const statusRequestRef = useRef(0);
+  const selectionRef = useRef({ file: "", mode: "unstaged" });
+  const refreshRef = useRef(null);
+  const lastRuntimeEventRef = useRef(null);
   const ownerRef = useRef({ path: worktree.path, generation: 0 });
   if (ownerRef.current.path !== worktree.path) ownerRef.current = { path: worktree.path, generation: ownerRef.current.generation + 1 };
 
@@ -22,6 +25,9 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
     ++diffRequestRef.current;
     setStatus(null);
     setDiff("");
+    selectionRef.current = { file: "", mode: "unstaged" };
+    setSelectedFile("");
+    setViewMode("unstaged");
     setCommitMessage("");
     return () => { ++statusRequestRef.current; ++diffRequestRef.current; };
   }, [worktree.path]);
@@ -33,8 +39,8 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
     if (!filePath) { setDiff(""); return; }
     try {
       const next = await api(query("/api/git/diff", { path: worktree.path, file: filePath, staged: mode === "staged" }));
-      if (ownerRef.current === owner && request === diffRequestRef.current) setDiff(next.diff);
-    } catch (error) { if (ownerRef.current === owner && request === diffRequestRef.current) onError(error); }
+      if (ownerRef.current === owner && request === diffRequestRef.current && selectionRef.current.file === filePath && selectionRef.current.mode === mode) setDiff(next.diff);
+    } catch (error) { if (ownerRef.current === owner && request === diffRequestRef.current && selectionRef.current.file === filePath && selectionRef.current.mode === mode) onError(error); }
   }, [worktree.path, onError]);
 
   const refresh = useCallback(async () => {
@@ -46,33 +52,39 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
       const next = await api(query("/api/git/status", { path: worktree.path }));
       if (ownerRef.current !== owner || request !== statusRequestRef.current) return;
       setStatus(next);
-      const current = next.files.find((file) => file.path === selectedFile);
+      const selection = selectionRef.current;
+      const current = next.files.find((file) => file.path === selection.file);
       const nextFile = current?.path ?? next.files[0]?.path ?? "";
+      const entry = current ?? next.files[0];
+      const mode = hasStaged(entry) ? selection.mode : "unstaged";
+      selectionRef.current = { file: nextFile, mode };
       setSelectedFile(nextFile);
+      setViewMode(mode);
       if (nextFile) {
-        const entry = current ?? next.files[0];
-        const mode = hasStaged(entry) ? viewMode : "unstaged";
-        setViewMode(mode);
         await loadDiff(nextFile, mode);
-      } else setDiff("");
+      } else { ++diffRequestRef.current; setDiff(""); }
     } catch (error) { if (ownerRef.current === owner && request === statusRequestRef.current) onError(error); }
     finally { if (ownerRef.current === owner && request === statusRequestRef.current) setLoading(false); }
-  }, [worktree.path, selectedFile, viewMode, loadDiff, onError]);
+  }, [worktree.path, loadDiff, onError]);
 
-  useEffect(() => { refresh(); }, [worktree.path]);
+  refreshRef.current = refresh;
+  useEffect(() => { refreshRef.current(); }, [worktree.path]);
   useEffect(() => {
+    if (!runtimeEvent || lastRuntimeEventRef.current === runtimeEvent) return;
+    lastRuntimeEventRef.current = runtimeEvent;
     // Completion events arrive nested as run.event payloads, not top-level types.
     const eventType = runtimeEvent?.type === "run.event" ? runtimeEvent.payload?.type : runtimeEvent?.type;
-    if (["projects.changed", "run.completed", "run.failed", "run.stopped"].includes(eventType)) refresh();
-  }, [runtimeEvent, refresh]);
+    if (["projects.changed", "run.completed", "run.failed", "run.stopped"].includes(eventType)) refreshRef.current();
+  }, [runtimeEvent]);
 
   async function chooseFile(file) {
     const mode = hasStaged(file) ? "staged" : "unstaged";
+    selectionRef.current = { file: file.path, mode };
     setSelectedFile(file.path);
     setViewMode(mode);
     await loadDiff(file.path, mode);
   }
-  async function chooseMode(mode) { setViewMode(mode); await loadDiff(selectedFile, mode); }
+  async function chooseMode(mode) { const file = selectionRef.current.file; selectionRef.current = { file, mode }; setViewMode(mode); await loadDiff(file, mode); }
   async function mutate(endpoint, files) {
     const owner = ownerRef.current;
     const path = worktree.path;

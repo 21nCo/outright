@@ -1459,6 +1459,49 @@ async function staleDiffSelectionRegression() {
   assert(host.querySelector('.pane-toolbar strong')?.textContent === "B branch", "A stale worktree status replaced B's status");
 }
 
+async function changesSelectionRefreshRegression() {
+  root.render(null); await settle();
+  const pendingStatus = deferred();
+  const requests = [];
+  let holdStatus = false;
+  const pendingMutation = deferred();
+  const files = ["a.txt", "b.txt"].map((file) => ({ path: file, status: "MM", index: "M", worktree: "M" }));
+  route = async (url) => {
+    requests.push(`${url.pathname}:${url.searchParams.get("file") ?? ""}:${url.searchParams.get("staged") ?? ""}`);
+    if (url.pathname === "/api/git/status") return holdStatus ? pendingStatus.promise : response({ branch: "main", files, stagedCount: 2 });
+    if (url.pathname === "/api/git/diff") return response({ diff: `${url.searchParams.get("file")}:${url.searchParams.get("staged")}` });
+    if (url.pathname === "/api/git/unstage") return pendingMutation.promise;
+    return response({});
+  };
+  const tree = projects[0].worktrees[0];
+  const pane = (event) => <div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>;
+  root.render(pane(null));
+  await until(() => host.querySelectorAll('.change-file-select').length === 2, "change selection ready");
+  holdStatus = true;
+  host.querySelector('[aria-label="Refresh changes"]').click();
+  await settle();
+  [...host.querySelectorAll('.change-file-select')].find((button) => button.textContent.includes("b.txt")).click();
+  host.querySelector('.diff-mode button').click();
+  await until(() => host.querySelector('.diff-view')?.textContent.includes("b.txt:false"), "new file and mode diff");
+  pendingStatus.resolve(response({ branch: "main", files, stagedCount: 2 }));
+  holdStatus = false;
+  await settle();
+  assert(host.querySelector('.change-file.is-active')?.textContent.includes("b.txt") && host.querySelector('.diff-mode button[aria-pressed="true"]')?.textContent === "Unstaged", "Pending status restored an obsolete file or mode");
+  assert(host.querySelector('.diff-view')?.textContent.includes("b.txt:false"), "Pending status restored an obsolete diff");
+  const event = { type: "run.event", payload: { type: "run.completed" } };
+  root.render(pane(event)); await settle();
+  const statusCount = requests.filter((item) => item.startsWith("/api/git/status")).length;
+  root.render(pane(event)); await settle();
+  assert(requests.filter((item) => item.startsWith("/api/git/status")).length === statusCount, "Retained completion event retriggered status on selection rerender");
+  host.querySelector('[aria-label="Unstage b.txt"]').click();
+  await until(() => requests.some((item) => item.startsWith("/api/git/unstage")), "same-worktree mutation pending");
+  [...host.querySelectorAll('.change-file-select')].find((button) => button.textContent.includes("a.txt")).click();
+  host.querySelector('.diff-mode button').click();
+  pendingMutation.resolve(response({ ok: true }));
+  await settle();
+  assert(host.querySelector('.change-file.is-active')?.textContent.includes("a.txt") && host.querySelector('.diff-view')?.textContent.includes("a.txt:false"), "Mutation follow-up restored the previous file or mode");
+}
+
 async function changesMutationOwnerRegression(reject = false, mode = "stage") {
   root.render(null); await settle();
   const pending = deferred();
@@ -1601,6 +1644,32 @@ async function longTranscriptWindowRegression() {
   window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), transcript: { elapsedMs, mountedAtStart: initialCount, heapBytes: performance.memory?.usedJSHeapSize ?? null } };
 }
 
+async function variableHeightFindAnchorRegression() {
+  root.render(null); await settle();
+  const viewport = React.createRef();
+  const messages = Array.from({ length: 200 }, (_, index) => ({ id: `variable-${index}`, body: `Variable ${index}`, height: index % 3 === 0 ? 360 : 54 }));
+  const render = (rows) => <div ref={viewport} style={{ height: 420, overflowY: "auto" }} tabIndex={0}><WindowedMessages messages={rows} viewportRef={viewport} onFind={(query) => `variable-${Number(query)}`} renderMessage={(message) => <article data-message-id={message.id} style={{ height: message.height }}>{message.body}</article>} /></div>;
+  root.render(render(messages));
+  await until(() => host.querySelector('.history-find input'), "variable-height find ready");
+  const input = host.querySelector('.history-find input');
+  setControlValue(input, "100"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="variable-100"]'), "variable-height target mounted");
+  await settle(); await settle();
+  const visible = () => { const row = host.querySelector('[data-find-match="true"]'); const bounds = row?.getBoundingClientRect(); const area = viewport.current.getBoundingClientRect(); return bounds && bounds.top >= area.top && bounds.top < area.bottom; };
+  assert(visible(), "Measured tall rows displaced the found message");
+  assert(host.querySelectorAll('[role="listitem"]').length < 40, "Variable-height find mounted too many rows");
+  viewport.current.style.height = "300px";
+  await settle(); await settle();
+  assert(visible(), "Viewport resize lost the found message");
+  viewport.current.dispatchEvent(new WheelEvent("wheel", { bubbles: true }));
+  viewport.current.scrollTop = 0; viewport.current.dispatchEvent(new Event("scroll"));
+  await settle();
+  root.render(render([...messages, { id: "variable-200", body: "new", height: 360 }]));
+  await settle();
+  assert(viewport.current.scrollTop < 50, "Live append snapped back to an old find target after user scrolling");
+}
+
 async function largeDiffWindowRegression() {
   root.render(null);
   await settle();
@@ -1739,9 +1808,20 @@ async function pagedTranscriptFindRegression() {
   const input = host.querySelector('.history-find input');
   setControlValue(input, "Needle"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-10"]'), "old persisted match");
+  try { await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-10"]'), "old persisted match"); }
+  catch (error) { throw new Error(`${error.message}; status=${host.querySelector('.history-find [role="status"]')?.textContent}, scroll=${host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]')?.scrollTop}, rows=${[...host.querySelectorAll('[data-message-id]')].map((item) => item.dataset.messageId).slice(0, 4).join(',')}`); }
+  await settle();
+  const foundRow = host.querySelector('[data-find-match="true"]');
+  const foundViewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+  assert(foundRow && foundRow.getBoundingClientRect().top < foundViewport.getBoundingClientRect().bottom && foundRow.getBoundingClientRect().bottom > foundViewport.getBoundingClientRect().top, `Initial found row was mounted but not visible: scroll=${foundViewport.scrollTop}, row=${foundRow?.getBoundingClientRect().top}`);
   assert(host.querySelectorAll('[role="listitem"]').length < 40, "Old search match mounted all history");
   assert(host.querySelector('.history-return'), "An older search page lost return-to-latest navigation");
+  for (const type of ["run.completed", "run.failed", "run.stopped"]) {
+    fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: `run-${type}`, payload: { type } }) }));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await settle();
+    assert(host.querySelector('.history-return') && host.querySelector('[data-find-match="true"] [data-message-id="message-10"]'), `${type} replaced the chosen history page or find highlight: return=${Boolean(host.querySelector('.history-return'))}, match=${host.querySelector('[data-find-match="true"] [data-message-id]')?.dataset.messageId}, status=${host.querySelector('.history-find [role="status"]')?.textContent}, scroll=${host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]')?.scrollTop}, rows=${[...host.querySelectorAll('[data-message-id]')].map((item) => item.dataset.messageId).slice(0, 3).join(',')}`);
+  }
   host.querySelector('[aria-label="Next conversation match"]').click();
   await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-900"]'), "newer persisted match");
   const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
@@ -1749,6 +1829,7 @@ async function pagedTranscriptFindRegression() {
   const bounds = input.getBoundingClientRect();
   const visible = viewport.getBoundingClientRect();
   assert(document.activeElement === input && bounds.top >= visible.top && bounds.bottom <= visible.bottom, "Focused find control scrolled out of the transcript viewport");
+  viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true }));
   viewport.scrollTop = Math.max(0, viewport.scrollTop - 350);
   viewport.dispatchEvent(new Event("scroll"));
   await settle();
@@ -1775,9 +1856,11 @@ async function pagedTranscriptFindRegression() {
   await until(() => lateRequested, "late find started");
   host.querySelector('.history-return').click();
   await until(() => host.querySelector('.history-loader')?.textContent.includes("800"), "return to latest completed");
+  assert(!host.querySelector('[data-find-match="true"]'), "Return to latest kept a stale match highlight");
   lateSearch.resolve(response({ matchId: "message-10", messages: earliest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } }));
   await settle();
   assert(!host.querySelector('.history-return'), "A late find replaced Return to latest");
+  assert(host.querySelector('.history-find [role="status"]')?.textContent !== "No match", "A cancelled find announced a false miss");
   host.querySelector('.history-loader').click();
   await until(() => olderRequested, "older page request pending");
   setControlValue(input, "none"); await settle();
@@ -1796,6 +1879,62 @@ async function pagedTranscriptFindRegression() {
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1_001) }) }));
   await settle();
   assert(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96, "Stale prepend disabled bottom following");
+}
+
+async function backgroundLatestRefreshRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const first = { id: "fresh-1", role: "assistant", kind: "text", body: "First persisted output", createdAt: "2026-09-26T00:00:00Z" };
+  let messages = [first];
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages, messagePage: { hasMore: false, olderCount: 0, total: messages.length, beforeId: messages[0].id } });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[data-message-id="fresh-1"]'), "initial latest page");
+  messages = [...messages, { ...first, id: "fresh-2", body: "Recovered missed output" }];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await until(() => host.querySelector('[data-message-id="fresh-2"]'), "missed latest output recovered");
+  assert(!host.querySelector('.history-return'), "Latest refresh incorrectly became an older history page");
+}
+
+async function backgroundCompletionKeepsExplicitPageRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const makeMessage = (index) => ({ id: `pending-${index}`, role: "assistant", kind: "text", body: `Message ${index}`, createdAt: new Date(index * 1000).toISOString() });
+  const latest = Array.from({ length: 200 }, (_, index) => makeMessage(index + 800));
+  const older = Array.from({ length: 200 }, (_, index) => makeMessage(index));
+  const pendingLatest = deferred();
+  let holdLatest = false;
+  let detailReads = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname.endsWith("/messages/find")) return response({ matchId: "pending-10", messages: older, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1000, beforeId: "pending-0" } });
+    if (url.pathname === "/api/conversations/chat-A") {
+      detailReads += 1;
+      if (holdLatest) return pendingLatest.promise;
+      return response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: 800, total: 1000, beforeId: "pending-800" } });
+    }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.history-find input'), "explicit page fixture ready");
+  const input = host.querySelector('.history-find input');
+  setControlValue(input, "Message 10"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('.history-return'), "older page selected");
+  holdLatest = true;
+  host.querySelector('.history-return').click();
+  await until(() => detailReads === 2, "explicit latest request pending");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-1", payload: { type: "run.completed" } }) }));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert(detailReads === 2, "Background completion superseded the explicit page request");
+  holdLatest = false;
+  pendingLatest.resolve(response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: 800, total: 1000, beforeId: "pending-800" } }));
+  await until(() => !host.querySelector('.history-return') && host.querySelector('[data-message-id="pending-999"]'), "explicit latest page committed");
 }
 
 async function providerBootstrapConvergenceRegression() {
@@ -2261,17 +2400,21 @@ try {
     ["command search", commandPaletteRegression, "command search keeps asynchronous results current and selectable"],
     ["changes loading", changesLoadingRegression, "changes pane waits for status before announcing a clean tree"],
     ["stale diff selection", staleDiffSelectionRegression, "a slow prior diff cannot replace the selected file"],
+    ["changes refresh selection", changesSelectionRefreshRegression, "pending refreshes preserve current file and mode and retained events refresh once"],
     ["changes mutation owner success", () => changesMutationOwnerRegression(false), "late stage completion cannot refresh another worktree"],
     ["changes mutation owner failure", () => changesMutationOwnerRegression(true), "late stage failure cannot report in another worktree"],
     ["changes unstage owner failure", () => changesMutationOwnerRegression(true, "unstage"), "late unstage failure cannot report in another worktree"],
     ["changes commit owner success", () => changesCommitOwnerRegression(false), "late commit completion cannot update another worktree"],
     ["changes commit owner failure", () => changesCommitOwnerRegression(true), "late commit failure cannot report in another worktree"],
     ["long transcript window", longTranscriptWindowRegression, "a thousand messages keep a bounded DOM and remain scrollable"],
+    ["variable-height find anchor", variableHeightFindAnchorRegression, "measured tall messages keep a found row visible through resize and live append"],
     ["large diff window", largeDiffWindowRegression, "fifty thousand diff lines keep a bounded DOM and preserve the last line"],
     ["Unicode diff find", unicodeDiffFindRegression, "length-changing case folding keeps the correct diff line"],
     ["production diff viewport", productionDiffViewportRegression, "staged and unstaged large diffs stay bounded in the inspector"],
     ["paged transcript anchor", pagedTranscriptAnchorRegression, "loading earlier history preserves its visible reading anchor"],
     ["paged transcript find", pagedTranscriptFindRegression, "find navigates older persisted messages with bounded mounted rows"],
+    ["background latest refresh", backgroundLatestRefreshRegression, "a missed event refreshes the latest page without keeping a stale snapshot"],
+    ["background completion page ownership", backgroundCompletionKeepsExplicitPageRegression, "run completion cannot supersede an explicit Return to latest request"],
     ["provider bootstrap convergence", providerBootstrapConvergenceRegression, "a checking bootstrap converges after an earlier provider event"],
     ["provider checking rate", providerCheckingRateRegression, "repeated checking snapshots keep a bounded poll cadence"],
     ["sustained output", sustainedOutputRegression, "small deltas coalesce without losing output or input responsiveness"],
@@ -2281,17 +2424,20 @@ try {
     ["terminal mutation failure", terminalMutationFailureRegression, "create, close and reconnect failures preserve terminal tab ownership"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],
   ];
+  const selectedStep = new URLSearchParams(location.search).get("only");
+  const selectedSteps = selectedStep ? steps.filter(([name]) => name === selectedStep) : steps;
+  if (!selectedSteps.length) throw new Error(`Unknown interaction fixture: ${selectedStep}`);
   const startedAt = performance.now();
   window.__fixtureStartedAt = startedAt;
   let passed = 0;
-  for (const [index, [step, run, success, skipped]] of steps.entries()) {
+  for (const [index, [step, run, success, skipped]] of selectedSteps.entries()) {
     const stepStartedAt = performance.now();
-    window.__fixtureProgress = { step, completed: index, total: steps.length, stepStartedAt };
+    window.__fixtureProgress = { step, completed: index, total: selectedSteps.length, stepStartedAt };
     const ran = await run();
     results.textContent += `${ran === false && skipped ? `SKIP: ${skipped}` : `PASS: ${success}`}\n`;
     if (ran !== false) passed += 1;
   }
-  window.__fixtureProgress = { step: "complete", completed: steps.length, total: steps.length, stepStartedAt: performance.now() };
+  window.__fixtureProgress = { step: "complete", completed: selectedSteps.length, total: selectedSteps.length, stepStartedAt: performance.now() };
   results.textContent += `Performance fixture: ${JSON.stringify(window.__performanceEvidence)}\n`;
   results.textContent += `${passed} interaction regressions passed`;
   document.title = "PASS — Outright interaction regressions";

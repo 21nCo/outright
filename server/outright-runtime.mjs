@@ -208,7 +208,14 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (!needle || needle.length > 200) throw apiError(400, "Search text must be 1 to 200 characters");
         const direction = url.searchParams.get("direction") ?? "next";
         if (!["next", "previous"].includes(direction)) throw apiError(400, "Search direction is invalid");
-        return json(response, 200, database.findMessagePage(conversationFindMatch[1], needle, url.searchParams.get("after"), direction === "previous" ? -1 : 1));
+        const findController = new AbortController();
+        const abortFind = () => findController.abort();
+        response.once?.("close", abortFind);
+        try {
+          const result = await database.findMessagePage(conversationFindMatch[1], needle, url.searchParams.get("after"), direction === "previous" ? -1 : 1, findController.signal);
+          if (response.destroyed) return true;
+          return json(response, 200, result);
+        } finally { response.off?.("close", abortFind); }
       }
       const conversationMoveMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/move$/);
       if (conversationMoveMatch && request.method === "POST") {
@@ -475,6 +482,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/audit" && request.method === "GET") return json(response, 200, { entries: database.listAudit(Number(url.searchParams.get("limit") ?? 100)) });
       throw apiError(404, "API route not found");
     } catch (error) {
+      if (response.destroyed) return true;
       return json(response, error.statusCode ?? 500, { error: error.message || "Internal server error", ...(error.details ?? {}) });
     }
   }

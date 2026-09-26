@@ -4,9 +4,11 @@ import { windowRange } from "@/lib/windowing";
 export const ESTIMATED_MESSAGE_HEIGHT = 110;
 const FULL_RENDER_LIMIT = 80;
 
-export function WindowedMessages({ messages, viewportRef, renderMessage, onFind, onCancelFind }) {
+export function WindowedMessages({ messages, viewportRef, renderMessage, onFind, onCancelFind, resetFindGeneration = 0 }) {
   const listRef = useRef(null);
   const heightsRef = useRef(new Map());
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
   const rangeRef = useRef({ start: 0, end: Math.min(messages.length, FULL_RENDER_LIMIT), top: 0, bottom: 0 });
   const [range, setRange] = useState(rangeRef.current);
   const [needle, setNeedle] = useState("");
@@ -28,6 +30,7 @@ export function WindowedMessages({ messages, viewportRef, renderMessage, onFind,
       try {
         const id = await onFind(query, direction, foundId);
         if (generation !== searchGenerationRef.current) return;
+        if (id === undefined) return; // A newer page action cancelled this request.
         setSearchError(false);
         setFoundId(id);
         pendingFoundRef.current = id;
@@ -67,15 +70,55 @@ export function WindowedMessages({ messages, viewportRef, renderMessage, onFind,
     if (!viewport || !list) return;
     const known = heightsRef.current;
     const localOffset = list.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
-    const next = messages.length <= FULL_RENDER_LIMIT
+    let next = messages.length <= FULL_RENDER_LIMIT
       ? { start: 0, end: messages.length, top: 0, bottom: 0 }
       : windowRange(messages.length, (index) => known.get(messages[index].id) ?? ESTIMATED_MESSAGE_HEIGHT, Math.max(0, -localOffset), viewport.clientHeight);
+    let pinned = pendingFoundRef.current;
+    if (!pinned && foundId) {
+      const marked = list.querySelector('[data-find-match="true"]');
+      const bounds = marked?.getBoundingClientRect();
+      const visible = viewport.getBoundingClientRect();
+      if (bounds && bounds.bottom > visible.top && bounds.top < visible.bottom) pinned = foundId;
+    }
+    const target = pinned ? messages.findIndex((message) => message.id === pinned) : -1;
+    if (target >= 0 && (target < next.start || target >= next.end)) {
+      const start = Math.max(0, target - 5);
+      const end = Math.min(messages.length, target + 6);
+      let top = 0;
+      let bottom = 0;
+      for (let index = 0; index < start; index += 1) top += known.get(messages[index].id) ?? ESTIMATED_MESSAGE_HEIGHT;
+      for (let index = end; index < messages.length; index += 1) bottom += known.get(messages[index].id) ?? ESTIMATED_MESSAGE_HEIGHT;
+      next = { start, end, top, bottom };
+    }
     const prior = rangeRef.current;
     if (prior.start !== next.start || prior.end !== next.end || prior.top !== next.top || prior.bottom !== next.bottom) {
       rangeRef.current = next;
       setRange(next);
     }
-  }, [messages, viewportRef]);
+  }, [messages, viewportRef, foundId]);
+
+  useLayoutEffect(() => {
+    ++searchGenerationRef.current;
+    pendingFoundRef.current = null;
+    setFoundId(null);
+    setFoundIndex(-1);
+    setSearched(false);
+    setSearching(false);
+  }, [resetFindGeneration]);
+
+  useEffect(() => {
+    if (!foundId) return;
+    const index = messages.findIndex((message) => message.id === foundId);
+    if (index >= 0) { setFoundIndex(index); return; }
+    const frame = window.requestAnimationFrame(() => {
+      if (messagesRef.current.some((message) => message.id === foundId)) return;
+      if (pendingFoundRef.current === foundId) pendingFoundRef.current = null;
+      setFoundId(null);
+      setFoundIndex(-1);
+      setSearched(false);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [messages, foundId]);
 
   useLayoutEffect(() => {
     if (!foundId) return;
@@ -86,12 +129,22 @@ export function WindowedMessages({ messages, viewportRef, renderMessage, onFind,
     const viewport = viewportRef.current;
     const list = listRef.current;
     if (!viewport || !list) return;
-    let offset = viewport.scrollTop + list.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
-    for (let row = 0; row < index; row += 1) offset += heightsRef.current.get(messages[row].id) ?? ESTIMATED_MESSAGE_HEIGHT;
-    viewport.scrollTop = Math.max(0, offset - viewport.clientHeight / 3);
-    pendingFoundRef.current = null;
+    let frame;
+    let settled = 0;
+    const align = () => {
+      if (pendingFoundRef.current !== foundId) return;
+      const row = [...list.querySelectorAll("[data-window-id]")].find((element) => element.dataset.windowId === foundId);
+      if (!row) { update(); frame = window.requestAnimationFrame(align); return; }
+      const delta = row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - viewport.clientHeight / 3;
+      if (Math.abs(delta) > 2) { viewport.scrollTop += delta; settled = 0; update(); }
+      else settled += 1;
+      if (settled < 2) frame = window.requestAnimationFrame(align);
+      else pendingFoundRef.current = null;
+    };
     update();
-  }, [foundId, findRequest, messages, viewportRef, update]);
+    frame = window.requestAnimationFrame(align);
+    return () => window.cancelAnimationFrame(frame);
+  }, [foundId, findRequest, messages, range.start, range.end, viewportRef, update]);
 
   useEffect(() => {
     const ids = new Set(messages.map((message) => message.id));
@@ -101,11 +154,33 @@ export function WindowedMessages({ messages, viewportRef, renderMessage, onFind,
     let frame = 0;
     const schedule = () => { if (!frame) frame = window.setTimeout(() => { frame = 0; update(); }, 16); };
     viewport.addEventListener("scroll", schedule, { passive: true });
-    const resize = new ResizeObserver(schedule);
+    const resize = new ResizeObserver(() => {
+      const match = list.querySelector('[data-find-match="true"]');
+      if (match && foundId && !pendingFoundRef.current) {
+        const bounds = match.getBoundingClientRect();
+        const visible = viewport.getBoundingClientRect();
+        if (bounds.bottom > visible.top && bounds.top < visible.bottom) {
+          pendingFoundRef.current = foundId;
+          setFindRequest((current) => current + 1);
+        }
+      }
+      schedule();
+    });
     resize.observe(viewport);
     update();
     return () => { viewport.removeEventListener("scroll", schedule); resize.disconnect(); clearTimeout(frame); };
-  }, [messages, update, viewportRef]);
+  }, [messages, update, viewportRef, foundId]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const cancel = () => { pendingFoundRef.current = null; };
+    viewport.addEventListener("pointerdown", cancel, { passive: true });
+    viewport.addEventListener("wheel", cancel, { passive: true });
+    viewport.addEventListener("touchstart", cancel, { passive: true });
+    viewport.addEventListener("keydown", cancel);
+    return () => { viewport.removeEventListener("pointerdown", cancel); viewport.removeEventListener("wheel", cancel); viewport.removeEventListener("touchstart", cancel); viewport.removeEventListener("keydown", cancel); };
+  }, [viewportRef]);
 
   useLayoutEffect(() => {
     if (messages.length <= FULL_RENDER_LIMIT) return;

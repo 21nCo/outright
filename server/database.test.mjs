@@ -34,7 +34,7 @@ test("persists settings, groups, conversations, messages, runs, and search", () 
   }
 });
 
-test("conversation find reaches old and new pages, wraps, and treats query text literally", () => {
+test("conversation find reaches old and new pages, wraps, and treats query text literally", async () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
     const chat = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Long", provider: "codex" });
@@ -42,30 +42,80 @@ test("conversation find reaches old and new pages, wraps, and treats query text 
     const ids = [];
     for (let index = 0; index < 240; index += 1) ids.push(database.addMessage({ conversationId: chat.id, role: "user", body: index === 2 || index === 238 ? "literal % marker" : `filler ${index}` }).id);
     database.addMessage({ conversationId: other.id, role: "user", body: "literal % marker" });
-    const first = database.findMessagePage(chat.id, "literal %", null);
+    const first = await database.findMessagePage(chat.id, "literal %", null);
     assert.equal(first.matchId, ids[2]);
     assert.ok(first.messages.some((message) => message.id === ids[2]));
     assert.ok(first.messages.length <= 200);
-    const last = database.findMessagePage(chat.id, "literal %", first.matchId);
+    const last = await database.findMessagePage(chat.id, "literal %", first.matchId);
     assert.equal(last.matchId, ids[238]);
-    assert.equal(database.findMessagePage(chat.id, "literal %", last.matchId).matchId, ids[2], "next wraps across the full conversation");
-    assert.equal(database.findMessagePage(chat.id, "literal %", ids[2], -1).matchId, ids[238], "previous wraps backwards");
-    assert.equal(database.findMessagePage(chat.id, "no such text", null).matchId, null);
-    assert.throws(() => database.findMessagePage(chat.id, "marker", "not-a-message"), /cursor/);
+    assert.equal((await database.findMessagePage(chat.id, "literal %", last.matchId)).matchId, ids[2], "next wraps across the full conversation");
+    assert.equal((await database.findMessagePage(chat.id, "literal %", ids[2], -1)).matchId, ids[238], "previous wraps backwards");
+    assert.equal((await database.findMessagePage(chat.id, "no such text", null)).matchId, null);
+    await assert.rejects(database.findMessagePage(chat.id, "marker", "not-a-message"), /cursor/);
   } finally { database.close(); }
 });
 
-test("conversation find folds Unicode consistently across old and new pages", () => {
+test("conversation find folds Unicode consistently across old and new pages", async () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
     const chat = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Unicode", provider: "codex" });
     const old = database.addMessage({ conversationId: chat.id, role: "user", body: "CAFÉ ÉTÉ" });
     for (let index = 0; index < 205; index += 1) database.addMessage({ conversationId: chat.id, role: "user", body: `filler ${index}` });
     const recent = database.addMessage({ conversationId: chat.id, role: "user", body: "Café été" });
-    assert.equal(database.findMessagePage(chat.id, "café", null).matchId, old.id);
-    assert.equal(database.findMessagePage(chat.id, "CAFÉ", old.id).matchId, recent.id);
-    assert.equal(database.findMessagePage(chat.id, "ÉTÉ", recent.id, -1).matchId, old.id);
+    assert.equal((await database.findMessagePage(chat.id, "café", null)).matchId, old.id);
+    assert.equal((await database.findMessagePage(chat.id, "CAFÉ", old.id)).matchId, recent.id);
+    assert.equal((await database.findMessagePage(chat.id, "ÉTÉ", recent.id, -1)).matchId, old.id);
   } finally { database.close(); }
+});
+
+test("large no-match find yields to other requests and stays in its conversation", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Large", provider: "codex" });
+    const siblings = Array.from({ length: 24 }, (_, index) => database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: `Sibling ${index}`, provider: "codex" }));
+    for (let index = 0; index < 512; index += 1) {
+      database.addMessage({ conversationId: chat.id, role: "assistant", body: "A".repeat(64 * 1024) });
+      if (index % 16 === 0) database.addMessage({ conversationId: siblings[index % siblings.length].id, role: "assistant", body: "unique sibling token" });
+    }
+    let ticks = 0;
+    let maximumGapMs = 0;
+    let lastTick = performance.now();
+    const timer = setInterval(() => {
+      const now = performance.now();
+      maximumGapMs = Math.max(maximumGapMs, now - lastTick);
+      lastTick = now;
+      ticks += 1;
+    }, 1);
+    try {
+      assert.equal((await database.findMessagePage(chat.id, "unique sibling token", null)).matchId, null);
+    } finally { clearInterval(timer); }
+    assert.ok(ticks >= 1, `Search blocked the event loop: ${ticks} timer ticks`);
+    assert.ok(maximumGapMs < 100, `Search blocked event delivery for ${maximumGapMs.toFixed(1)}ms`);
+    assert.ok((await database.findMessagePage(siblings[0].id, "unique sibling token", null)).matchId, "Find lost another conversation's match");
+  } finally { database.close(); }
+});
+
+test("conversation find bounds concurrent scans and releases aborted work", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Scans", provider: "codex" });
+    for (let index = 0; index < 100; index += 1) database.addMessage({ conversationId: chat.id, role: "assistant", body: "unmatched body" });
+    const controllers = Array.from({ length: 8 }, () => new AbortController());
+    const scans = controllers.map((controller) => database.findMessagePage(chat.id, "absent", null, 1, controller.signal));
+    await assert.rejects(database.findMessagePage(chat.id, "absent", null), /Too many conversation searches/);
+    for (const controller of controllers) controller.abort();
+    await Promise.all(scans);
+    assert.equal((await database.findMessagePage(chat.id, "absent", null)).matchId, null, "Aborted scans retained a search slot");
+  } finally { database.close(); }
+});
+
+test("database shutdown cancels a yielding conversation search", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Shutdown", provider: "codex" });
+  for (let index = 0; index < 100; index += 1) database.addMessage({ conversationId: chat.id, role: "assistant", body: "unmatched body" });
+  const pending = database.findMessagePage(chat.id, "absent", null);
+  database.close();
+  assert.equal((await pending).matchId, null);
 });
 
 test("runs retain immutable worktree ownership and unresolved recovery blocks move or archive", () => {
