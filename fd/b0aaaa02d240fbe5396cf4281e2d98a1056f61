@@ -1,0 +1,37 @@
+docs/out-32-performance.md
+  s_16208d9e94c152::t_e2952678d0f870 18-25
+server/provider-discovery.mjs
+  s_16208d9e94c152::t_2548fd6e146aeb 10,51-53,75
+server/provider-discovery.test.mjs
+  s_16208d9e94c152::t_3d11593a29f76a 119-156
+src/App.jsx
+  s_ee6f287c08acb3::t_e4d155b5b5bb42 145-173,248-250,254,259,1174,1190,1197
+tests/ui-races.jsx
+  s_ee6f287c08acb3::t_8143e508b583ce 182-233,2778
+tests/ui-races.test.mjs
+  s_ee6f287c08acb3::t_36170fce6bb5e4 825
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fdb0aaaa02d240fbe5396cf4281e2d98a1056f61",
+  "prompts": {},
+  "sessions": {
+    "s_16208d9e94c152": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0dbe7-1ef9-7b80-8341-fe952b6e9b65",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_ee6f287c08acb3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0dbe8-d479-71a1-9012-f08e8b29a7ff",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
