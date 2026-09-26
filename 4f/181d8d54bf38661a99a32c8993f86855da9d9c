@@ -1,0 +1,47 @@
+server/database.mjs
+  s_6126673cc0a89e::t_fa33c7976a5944 75-77,204
+server/database.test.mjs
+  s_16208d9e94c152::t_39b4844eaef63c 58-70
+server/outright-runtime.test.mjs
+  s_16208d9e94c152::t_afbe1be69f2cc9 253-271
+server/provider-discovery.mjs
+  s_16208d9e94c152::t_2bedd53dcb1671 51-52,54-55
+server/provider-discovery.test.mjs
+  s_16208d9e94c152::t_f393ff8319f9fe 69-86
+src/App.jsx
+  s_16208d9e94c152::t_5e04caa01c5034 89-90,148,150,165,228-232,259-262,350-352,565-570,817,820-822,828,844-850,857-859,973
+src/components/WindowedDiff.jsx
+  s_16208d9e94c152::t_04a618a1c74986 21,25,31-32
+src/components/WindowedMessages.jsx
+  s_16208d9e94c152::t_6901ea99a53b6b 15,20,23,33-34,45,85,92,94,127
+src/styles.css
+  s_16208d9e94c152::t_6345ec0024f846 399
+tests/ui-races.jsx
+  s_16208d9e94c152::t_4bebc8943fa4a3 1462,1469,1471,1477-1478,1622-1633,1652-1653,1660,1669-1672,1716-1717,1719-1721,1727-1729,1733,1747-1763,1771-1798,1825-1842,2266,2271,2276,2278
+tests/ui-races.test.mjs
+  s_16208d9e94c152::t_818d13bf4fe3e3 817
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4f181d8d54bf38661a99a32c8993f86855da9d9c",
+  "prompts": {},
+  "sessions": {
+    "s_16208d9e94c152": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0dbe7-1ef9-7b80-8341-fe952b6e9b65",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
