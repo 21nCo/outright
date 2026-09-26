@@ -15,7 +15,9 @@ tests.push(
   path.join(root, "tests", "ui-races.test.mjs"),
 );
 
-const result = spawnSync(process.execPath, ["--test", "--test-timeout=300000", ...tests], {
+// Browser performance fixtures need an uncontended renderer to measure the
+// app rather than simultaneous Chrome instances started by other test files.
+const result = spawnSync(process.execPath, ["--test", "--test-concurrency=1", "--test-timeout=300000", ...tests], {
   stdio: "inherit",
   timeout: 600_000,
   killSignal: "SIGKILL",

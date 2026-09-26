@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ArrowSquareOut, ArrowsClockwise, Check, GitCommit, Minus, Plus } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { api, query } from "@/lib/runtime-api";
+import { WindowedDiff } from "@/components/WindowedDiff";
 
 export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast }) {
   const [status, setStatus] = useState(null);
@@ -11,54 +12,102 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
   const [diff, setDiff] = useState("");
   const [commitMessage, setCommitMessage] = useState("");
   const [loading, setLoading] = useState(true);
+  const diffRequestRef = useRef(0);
+  const statusRequestRef = useRef(0);
+  const selectionRef = useRef({ file: "", mode: "unstaged" });
+  const refreshRef = useRef(null);
+  const lastRuntimeEventRef = useRef(null);
+  const ownerRef = useRef({ path: worktree.path, generation: 0 });
+  useLayoutEffect(() => {
+    if (ownerRef.current.path !== worktree.path) ownerRef.current = { path: worktree.path, generation: ownerRef.current.generation + 1 };
+  }, [worktree.path]);
+
+  useEffect(() => {
+    ++statusRequestRef.current;
+    ++diffRequestRef.current;
+    setStatus(null);
+    setDiff("");
+    selectionRef.current = { file: "", mode: "unstaged" };
+    setSelectedFile("");
+    setViewMode("unstaged");
+    setCommitMessage("");
+    return () => { ++statusRequestRef.current; ++diffRequestRef.current; };
+  }, [worktree.path]);
 
   const loadDiff = useCallback(async (filePath, mode) => {
+    const owner = ownerRef.current;
+    if (owner.path !== worktree.path) return;
+    const request = ++diffRequestRef.current;
+    // A same-selection refresh retains the reader's line and find state.
+    // A different file or mode owns different text, even on failure.
+    if (selectionRef.current.file !== filePath || selectionRef.current.mode !== mode) return;
     if (!filePath) { setDiff(""); return; }
-    try { setDiff((await api(query("/api/git/diff", { path: worktree.path, file: filePath, staged: mode === "staged" }))).diff); }
-    catch (error) { onError(error); }
+    try {
+      const next = await api(query("/api/git/diff", { path: worktree.path, file: filePath, staged: mode === "staged" }));
+      if (ownerRef.current === owner && request === diffRequestRef.current && selectionRef.current.file === filePath && selectionRef.current.mode === mode) setDiff(next.diff);
+    } catch (error) { if (ownerRef.current === owner && request === diffRequestRef.current && selectionRef.current.file === filePath && selectionRef.current.mode === mode) onError(error); }
   }, [worktree.path, onError]);
 
   const refresh = useCallback(async () => {
+    const owner = ownerRef.current;
+    if (owner.path !== worktree.path) return;
+    const request = ++statusRequestRef.current;
     setLoading(true);
     try {
       const next = await api(query("/api/git/status", { path: worktree.path }));
+      if (ownerRef.current !== owner || request !== statusRequestRef.current) return;
       setStatus(next);
-      const current = next.files.find((file) => file.path === selectedFile);
+      const selection = selectionRef.current;
+      const current = next.files.find((file) => file.path === selection.file);
       const nextFile = current?.path ?? next.files[0]?.path ?? "";
+      const entry = current ?? next.files[0];
+      const mode = hasStaged(entry) ? selection.mode : "unstaged";
+      if (nextFile !== selection.file || mode !== selection.mode) setDiff("");
+      selectionRef.current = { file: nextFile, mode };
       setSelectedFile(nextFile);
+      setViewMode(mode);
       if (nextFile) {
-        const entry = current ?? next.files[0];
-        const mode = hasStaged(entry) ? viewMode : "unstaged";
-        setViewMode(mode);
         await loadDiff(nextFile, mode);
-      } else setDiff("");
-    } catch (error) { onError(error); }
-    finally { setLoading(false); }
-  }, [worktree.path, selectedFile, viewMode, loadDiff, onError]);
+      } else { ++diffRequestRef.current; setDiff(""); }
+    } catch (error) { if (ownerRef.current === owner && request === statusRequestRef.current) onError(error); }
+    finally { if (ownerRef.current === owner && request === statusRequestRef.current) setLoading(false); }
+  }, [worktree.path, loadDiff, onError]);
 
-  useEffect(() => { refresh(); }, [worktree.id]);
+  useLayoutEffect(() => { refreshRef.current = refresh; }, [refresh]);
+  useEffect(() => { refreshRef.current(); }, [worktree.path]);
   useEffect(() => {
+    if (!runtimeEvent || lastRuntimeEventRef.current === runtimeEvent) return;
+    lastRuntimeEventRef.current = runtimeEvent;
     // Completion events arrive nested as run.event payloads, not top-level types.
     const eventType = runtimeEvent?.type === "run.event" ? runtimeEvent.payload?.type : runtimeEvent?.type;
-    if (["projects.changed", "run.completed", "run.failed", "run.stopped"].includes(eventType)) refresh();
-  }, [runtimeEvent, refresh]);
+    if (["projects.changed", "run.completed", "run.failed", "run.stopped"].includes(eventType)) refreshRef.current();
+  }, [runtimeEvent]);
 
   async function chooseFile(file) {
     const mode = hasStaged(file) ? "staged" : "unstaged";
+    selectionRef.current = { file: file.path, mode };
+    if (file.path !== selectedFile || mode !== viewMode) setDiff("");
     setSelectedFile(file.path);
     setViewMode(mode);
     await loadDiff(file.path, mode);
   }
-  async function chooseMode(mode) { setViewMode(mode); await loadDiff(selectedFile, mode); }
+  async function chooseMode(mode) { const file = selectionRef.current.file; selectionRef.current = { file, mode }; if (mode !== viewMode) setDiff(""); setViewMode(mode); await loadDiff(file, mode); }
   async function mutate(endpoint, files) {
-    try { setStatus(await api(endpoint, { method: "POST", body: { path: worktree.path, files } })); await refresh(); }
-    catch (error) { onError(error); }
+    const owner = ownerRef.current;
+    const path = worktree.path;
+    try {
+      await api(endpoint, { method: "POST", body: { path, files } });
+      if (ownerRef.current === owner) await refresh();
+    } catch (error) { if (ownerRef.current === owner) onError(error); }
   }
   async function commit() {
+    const owner = ownerRef.current;
+    const path = worktree.path;
     try {
-      await api("/api/git/commit", { method: "POST", body: { path: worktree.path, message: commitMessage } });
+      await api("/api/git/commit", { method: "POST", body: { path, message: commitMessage } });
+      if (ownerRef.current !== owner) return;
       setCommitMessage(""); onToast("Commit created"); await refresh();
-    } catch (error) { onError(error); }
+    } catch (error) { if (ownerRef.current === owner) onError(error); }
   }
 
   const selected = status?.files.find((file) => file.path === selectedFile) ?? null;
@@ -73,7 +122,7 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
       </div>
       <div className="diff-column">
         {selected && <div className="diff-mode" role="group" aria-label="Diff view"><Button variant={viewMode === "unstaged" ? "secondary" : "ghost"} size="xs" aria-pressed={viewMode === "unstaged"} onClick={() => chooseMode("unstaged")}>Unstaged</Button><Button variant={viewMode === "staged" ? "secondary" : "ghost"} size="xs" aria-pressed={viewMode === "staged"} disabled={!stagedEligible} onClick={() => chooseMode("staged")}>Staged{selected.originalPath ? ` (renamed from ${selected.originalPath})` : ""}</Button></div>}
-        <pre className="diff-view" tabIndex={0} aria-label={selected ? `Diff for ${selected.path}, ${viewMode}` : "No diff selected"}>{diff ? diff.split("\n").map((line, index) => <span className={line.startsWith("+") && !line.startsWith("+++") ? "added" : line.startsWith("-") && !line.startsWith("---") ? "removed" : line.startsWith("@@") ? "hunk" : ""} key={`${index}:${line}`}><i aria-hidden="true">{index + 1}</i>{line}{"\n"}</span>) : <span className="diff-empty">Select a changed file to inspect its diff.</span>}</pre>
+        <WindowedDiff key={`${worktree.id}:${selectedFile}:${viewMode}`} diff={diff} label={selected ? `Diff for ${selected.path}, ${viewMode}` : "No diff selected"} />
       </div>
     </div>
     <footer className="commit-bar"><Input aria-label="Commit message" value={commitMessage} onChange={(event) => setCommitMessage(event.target.value)} placeholder="Commit message" onKeyDown={(event) => { if (event.key === "Enter") commit(); }} /><Button onClick={commit} disabled={!commitMessage.trim() || !status?.stagedCount}><GitCommit /> Commit {status?.stagedCount ? `${status.stagedCount} staged` : ""}</Button></footer>

@@ -34,6 +34,185 @@ test("persists settings, groups, conversations, messages, runs, and search", () 
   }
 });
 
+test("conversation find reaches old and new pages, wraps, and treats query text literally", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Long", provider: "codex" });
+    const other = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Other", provider: "codex" });
+    const ids = [];
+    for (let index = 0; index < 240; index += 1) ids.push(database.addMessage({ conversationId: chat.id, role: "user", body: index === 0 ? "literal wildcard marker" : index === 2 || index === 238 ? "literal % marker" : `filler ${index}` }).id);
+    database.addMessage({ conversationId: other.id, role: "user", body: "literal % marker" });
+    const first = await database.findMessagePage(chat.id, "literal %", null);
+    assert.equal(first.matchId, ids[2]);
+    assert.ok(first.messages.some((message) => message.id === ids[2]));
+    assert.ok(first.messages.length <= 200);
+    const last = await database.findMessagePage(chat.id, "literal %", first.matchId);
+    assert.equal(last.matchId, ids[238]);
+    assert.equal((await database.findMessagePage(chat.id, "literal %", last.matchId)).matchId, ids[2], "next wraps across the full conversation");
+    assert.equal((await database.findMessagePage(chat.id, "literal %", ids[2], -1)).matchId, ids[238], "previous wraps backwards");
+    assert.equal((await database.findMessagePage(chat.id, "no such text", null)).matchId, null);
+    await assert.rejects(database.findMessagePage(chat.id, "marker", "not-a-message"), /cursor/);
+  } finally { database.close(); }
+});
+
+test("forward message pages continue from a found page with exact persisted counts", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Long", provider: "codex" });
+    const sibling = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Sibling", provider: "codex" });
+    const ids = Array.from({ length: 405 }, (_, index) => database.addMessage({ conversationId: chat.id, role: "user", body: `row ${index}` }).id);
+    database.addMessage({ conversationId: sibling.id, role: "user", body: "sibling" });
+    const first = database.listMessagePage(chat.id, { afterId: ids[4], limit: 200 });
+    assert.deepEqual(first.messages.map((message) => message.id), ids.slice(5, 205));
+    assert.deepEqual([first.page.olderCount, first.page.newerCount, first.page.total], [5, 200, 405]);
+    const second = database.listMessagePage(chat.id, { afterId: first.messages.at(-1).id, limit: 200 });
+    assert.deepEqual(second.messages.map((message) => message.id), ids.slice(205));
+    assert.deepEqual([second.page.olderCount, second.page.newerCount], [205, 0]);
+    const exhausted = database.listMessagePage(chat.id, { afterId: ids.at(-1), limit: 200 });
+    assert.deepEqual(exhausted.messages, []);
+    assert.deepEqual([exhausted.page.olderCount, exhausted.page.newerCount, exhausted.page.hasLater], [405, 0, false]);
+    assert.equal(database.messageCount(chat.id), 405);
+    assert.throws(() => database.listMessagePage(chat.id, { afterId: "foreign" }), /cursor/);
+    assert.throws(() => database.listMessagePage(chat.id, { afterId: ids[0], beforeId: ids[2] }), /one message cursor/);
+  } finally { database.close(); }
+});
+
+test("conversation find folds Unicode consistently across old and new pages", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Unicode", provider: "codex" });
+    const old = database.addMessage({ conversationId: chat.id, role: "user", body: "CAFÉ ÉTÉ" });
+    for (let index = 0; index < 205; index += 1) database.addMessage({ conversationId: chat.id, role: "user", body: `filler ${index}` });
+    const recent = database.addMessage({ conversationId: chat.id, role: "user", body: "Café été" });
+    assert.equal((await database.findMessagePage(chat.id, "café", null)).matchId, old.id);
+    assert.equal((await database.findMessagePage(chat.id, "CAFÉ", old.id)).matchId, recent.id);
+    assert.equal((await database.findMessagePage(chat.id, "ÉTÉ", recent.id, -1)).matchId, old.id);
+  } finally { database.close(); }
+});
+
+test("large no-match find yields to other requests and stays in its conversation", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Large", provider: "codex" });
+    const siblings = Array.from({ length: 24 }, (_, index) => database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: `Sibling ${index}`, provider: "codex" }));
+    for (let index = 0; index < 512; index += 1) {
+      database.addMessage({ conversationId: chat.id, role: "assistant", body: "A".repeat(64 * 1024) });
+      if (index % 16 === 0) database.addMessage({ conversationId: siblings[index % siblings.length].id, role: "assistant", body: "unique sibling token" });
+    }
+    let ticks = 0;
+    let maximumGapMs = 0;
+    let lastTick = performance.now();
+    const timer = setInterval(() => {
+      const now = performance.now();
+      maximumGapMs = Math.max(maximumGapMs, now - lastTick);
+      lastTick = now;
+      ticks += 1;
+    }, 1);
+    try {
+      let result = await database.findMessagePage(chat.id, "unique sibling token", null);
+      assert.equal(result.partial, true, "one request must stop after its text budget");
+      assert.ok(result.nextAfterId, "a partial result must provide a durable resume cursor");
+      while (result.partial) result = await database.findMessagePage(chat.id, "unique sibling token", result.nextAfterId, 1, undefined, { originId: result.originId, wrapped: result.wrapped });
+      assert.equal(result.matchId, null);
+    } finally { clearInterval(timer); }
+    assert.ok(ticks >= 1, `Search blocked the event loop: ${ticks} timer ticks`);
+    assert.ok(maximumGapMs < 100, `Search blocked event delivery for ${maximumGapMs.toFixed(1)}ms`);
+    assert.ok((await database.findMessagePage(siblings[0].id, "unique sibling token", null)).matchId, "Find lost another conversation's match");
+  } finally { database.close(); }
+});
+
+test("bounded find resumes across an end wrap without skipping an older match", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Resume", provider: "codex" });
+    const ids = [];
+    for (let index = 0; index < 3_000; index += 1) ids.push(database.addMessage({ conversationId: chat.id, role: "user", body: index === 2_500 ? "far needle" : "filler" }).id);
+    let result = await database.findMessagePage(chat.id, "needle", ids[2_600]);
+    assert.equal(result.partial, true, "the first request scanned beyond its row budget");
+    let requests = 1;
+    while (result.partial) {
+      result = await database.findMessagePage(chat.id, "needle", result.nextAfterId, 1, undefined, { originId: result.originId, wrapped: result.wrapped });
+      requests += 1;
+      assert.ok(requests <= 8, "continuation did not advance through the bounded scan");
+    }
+    assert.equal(result.matchId, ids[2_500]);
+  } finally { database.close(); }
+});
+
+test("sparse conversation search stays responsive with a large sibling history", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-sparse-find-"));
+  const filename = path.join(directory, "history.db");
+  const database = createOutrightDatabase({ filename });
+  try {
+    const target = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Target", provider: "codex" });
+    const sibling = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Sibling", provider: "codex" });
+    const first = database.addMessage({ conversationId: target.id, role: "assistant", body: "needle first" });
+    const bulk = new Database(filename);
+    try {
+      const insert = bulk.prepare("INSERT INTO messages (id, conversation_id, role, body, created_at) VALUES (?, ?, 'assistant', 'unrelated body', '2026-09-26')");
+      bulk.transaction(() => { for (let index = 0; index < 500_000; index += 1) insert.run(`sibling-${index}`, sibling.id); })();
+    } finally { bulk.close(); }
+    const last = database.addMessage({ conversationId: target.id, role: "assistant", body: "needle last" });
+    const durations = [];
+    for (let index = 0; index < 3; index += 1) {
+      const started = performance.now();
+      assert.equal((await database.findMessagePage(target.id, "absent", null)).matchId, null);
+      durations.push(performance.now() - started);
+    }
+    assert.ok(durations.sort((a, b) => a - b)[1] < 250, `Sparse search blocked the runtime: ${durations.map((value) => value.toFixed(1)).join(", ")}ms`);
+    const pageStarted = performance.now();
+    assert.equal(database.listMessagePage(target.id, { beforeId: last.id, limit: 1 }).messages[0].id, first.id);
+    assert.ok(performance.now() - pageStarted < 250, "Sparse history pagination scanned sibling messages");
+    assert.equal((await database.findMessagePage(target.id, "needle", first.id)).matchId, last.id);
+    assert.equal((await database.findMessagePage(target.id, "needle", last.id)).matchId, first.id, "wrapped search crossed sibling history");
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("existing message rows gain indexed search order and new writes preserve it", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-search-migrate-"));
+  const filename = path.join(directory, "legacy.db");
+  const raw = new Database(filename);
+  try {
+    raw.exec(`CREATE TABLE conversations (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, worktree_path TEXT NOT NULL,
+      title TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', provider_session_id TEXT, tab_position INTEGER NOT NULL DEFAULT 0,
+      archived INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      role TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'text', body TEXT NOT NULL DEFAULT '', payload TEXT, created_at TEXT NOT NULL);
+      INSERT INTO conversations (id, project_id, worktree_id, worktree_path, title, provider, created_at, updated_at)
+        VALUES ('old-chat', 'p', 'w', '/tmp/w', 'Old', 'codex', '2026-09-26', '2026-09-26');
+      INSERT INTO messages (id, conversation_id, role, body, created_at) VALUES ('old-one', 'old-chat', 'user', 'needle', '2026-09-26');`);
+  } finally { raw.close(); }
+  const database = createOutrightDatabase({ filename });
+  try {
+    const newer = database.addMessage({ conversationId: "old-chat", role: "user", body: "needle again" });
+    assert.equal((await database.findMessagePage("old-chat", "needle", null)).matchId, "old-one");
+    assert.equal((await database.findMessagePage("old-chat", "needle", "old-one")).matchId, newer.id);
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("conversation find bounds concurrent scans and releases aborted work", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Scans", provider: "codex" });
+    for (let index = 0; index < 100; index += 1) database.addMessage({ conversationId: chat.id, role: "assistant", body: "unmatched body" });
+    const controllers = Array.from({ length: 8 }, () => new AbortController());
+    const scans = controllers.map((controller) => database.findMessagePage(chat.id, "absent", null, 1, controller.signal));
+    await assert.rejects(database.findMessagePage(chat.id, "absent", null), /Too many conversation searches/);
+    for (const controller of controllers) controller.abort();
+    await Promise.all(scans);
+    assert.equal((await database.findMessagePage(chat.id, "absent", null)).matchId, null, "Aborted scans retained a search slot");
+  } finally { database.close(); }
+});
+
+test("database shutdown cancels a yielding conversation search", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Shutdown", provider: "codex" });
+  for (let index = 0; index < 100; index += 1) database.addMessage({ conversationId: chat.id, role: "assistant", body: "unmatched body" });
+  const pending = database.findMessagePage(chat.id, "absent", null);
+  database.close();
+  assert.equal((await pending).matchId, null);
+});
+
 test("runs retain immutable worktree ownership and unresolved recovery blocks move or archive", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
@@ -659,7 +838,7 @@ test("pages messages newest-first at the boundary while returning each page chro
 
     const latest = database.listMessagePage(conversation.id, { limit: 2 });
     assert.deepEqual(latest.messages.map((message) => message.id), ["message-4", "message-5"]);
-    assert.deepEqual(latest.page, { hasMore: true, olderCount: 3, total: 5, beforeId: "message-4", limit: 2 });
+    assert.deepEqual(latest.page, { hasMore: true, olderCount: 3, hasLater: false, newerCount: 0, total: 5, beforeId: "message-4", limit: 2 });
 
     const middle = database.listMessagePage(conversation.id, { beforeId: latest.page.beforeId, limit: 2 });
     assert.deepEqual(middle.messages.map((message) => message.id), ["message-2", "message-3"]);

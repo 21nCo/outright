@@ -39,7 +39,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     return eventHub.publish(event);
   }
 
-  const agents = createAgentManager({ database, publish, validateConversation: async (conversation) => {
+  const agents = createAgentManager({ database, publish, onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }), validateConversation: async (conversation) => {
     const target = await resolveWorktreeTarget(conversation);
     return () => {
       if (database.getConversation(conversation.id)?.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
@@ -193,13 +193,41 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         return json(response, conversation ? 200 : 404, conversation);
       }
       const conversationMessagesMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages$/);
+      const conversationCountMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages\/count$/);
+      if (conversationCountMatch && request.method === "GET") {
+        if (!database.getConversation(conversationCountMatch[1])) throw apiError(404, "Conversation not found");
+        return json(response, 200, { total: database.messageCount(conversationCountMatch[1]) });
+      }
       if (conversationMessagesMatch && request.method === "GET") {
         if (!database.getConversation(conversationMessagesMatch[1])) throw apiError(404, "Conversation not found");
         const messagePage = database.listMessagePage(conversationMessagesMatch[1], {
           beforeId: url.searchParams.get("before") || undefined,
+          afterId: url.searchParams.get("after") || undefined,
           limit: Number(url.searchParams.get("limit") || 200),
         });
         return json(response, 200, { messages: messagePage.messages, messagePage: messagePage.page });
+      }
+      const conversationFindMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages\/find$/);
+      if (conversationFindMatch && request.method === "GET") {
+        if (!database.getConversation(conversationFindMatch[1])) throw apiError(404, "Conversation not found");
+        const needle = requiredQuery(url, "q").trim();
+        if (!needle || needle.length > 200) throw apiError(400, "Search text must be 1 to 200 characters");
+        const direction = url.searchParams.get("direction") ?? "next";
+        if (!["next", "previous"].includes(direction)) throw apiError(400, "Search direction is invalid");
+        const findController = new AbortController();
+        const abortFind = () => findController.abort();
+        response.once?.("close", abortFind);
+        try {
+          const originParam = url.searchParams.get("origin");
+          const wrappedParam = url.searchParams.get("wrapped");
+          if (wrappedParam && (wrappedParam !== "1" || originParam === null)) throw apiError(400, "Search continuation is invalid");
+          const result = await database.findMessagePage(
+            conversationFindMatch[1], needle, url.searchParams.get("after"), direction === "previous" ? -1 : 1, findController.signal,
+            originParam === null ? undefined : { originId: originParam === "none" ? null : originParam, wrapped: wrappedParam === "1" },
+          );
+          if (response.destroyed) return true;
+          return json(response, 200, result);
+        } finally { response.off?.("close", abortFind); }
       }
       const conversationMoveMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/move$/);
       if (conversationMoveMatch && request.method === "POST") {
@@ -233,8 +261,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         const settings = database.getSettings();
         const provider = body.provider || conversation.provider || settings.provider;
-        const providerInfo = agents.providers().find((item) => item.id === provider);
-        if (!providerInfo?.available) throw apiError(409, `${provider} CLI is not available`);
+        if (!await agents.providerAvailable(provider)) throw apiError(409, `${provider} CLI is not available`);
+        if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         // Archive, move, or recovery can commit during either validation await.
         // Fence both message and run creation to the current durable target.
         const currentConversation = database.getConversation(conversation.id);
@@ -405,8 +433,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         // submission, and again inside the agent drain before spawning.
         const target = await resolveWorktreeTarget({ projectId: conversation.projectId, worktreeId: conversation.worktreeId, worktreePath: conversation.worktreePath });
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
-        const providerInfo = agents.providers().find((item) => item.id === interrupted.provider);
-        if (!providerInfo?.available) throw apiError(409, `${interrupted.provider} CLI is not available`);
+        if (!await agents.providerAvailable(interrupted.provider)) throw apiError(409, `${interrupted.provider} CLI is not available`);
+        if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         // Recovery is bound to the immutable run session first. A mutable
         // conversation session is only a compatible fallback when the
         // conversation still targets the same provider.
@@ -466,6 +494,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/audit" && request.method === "GET") return json(response, 200, { entries: database.listAudit(Number(url.searchParams.get("limit") ?? 100)) });
       throw apiError(404, "API route not found");
     } catch (error) {
+      if (response.destroyed) return true;
       return json(response, error.statusCode ?? 500, { error: error.message || "Internal server error", ...(error.details ?? {}) });
     }
   }

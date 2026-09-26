@@ -600,16 +600,16 @@ test("a vanished Windows launcher preserves verified descendants without adoptin
   assert.equal(launcher.ownedWindows.has(4103), false);
 });
 
-// The child has 120 seconds including its 95-second interaction phase and
+// The child has 180 seconds including its 155-second interaction phase and
 // cleanup. The parent must outlive that contract before invoking fallback
 // cleanup, and retain a separate reserve for its own tree/profile cleanup.
-const browserFixtureTimeout = 120_000;
+const browserFixtureTimeout = 180_000;
 const nestedStartupAllowance = 15_000;
 const nestedRunnerBudget = (childBudget, startupAllowance) => childBudget + startupAllowance;
 const nestedExitTimeout = nestedRunnerBudget(browserFixtureTimeout, nestedStartupAllowance);
 test("nested runner deadline exceeds its child's full browser budget", () => {
   assert(nestedExitTimeout > browserFixtureTimeout);
-  assert(nestedExitTimeout > 95_000 + 25_000);
+  assert(nestedExitTimeout > 155_000 + 25_000);
 });
 
 test("parent permits a slow child beyond the old shorter watchdog", { timeout: 5_000 }, async () => {
@@ -664,7 +664,7 @@ test("fixture assertion failures still clean Chrome, Vite and profile independen
 
 test("browser interaction regressions pass in headless Chrome", { timeout: browserFixtureTimeout }, async () => {
   // Reserve the last part of the test's own bound for independent cleanup.
-  const deadline = Date.now() + 95_000;
+  const deadline = Date.now() + 155_000;
   let phase = "allocate fixture";
   const remaining = () => {
     const duration = deadline - Date.now();
@@ -684,7 +684,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
   let output = "";
   vite.stdout.on("data", (chunk) => { output += chunk; });
   vite.stderr.on("data", (chunk) => { output += chunk; });
-  const url = `http://127.0.0.1:${port}/tests/ui-races.html`;
+  const url = `http://127.0.0.1:${port}/tests/ui-races.html${process.env.OUTRIGHT_UI_STEP ? `?only=${encodeURIComponent(process.env.OUTRIGHT_UI_STEP)}` : ""}`;
   let browser;
   let devtools;
   let failure;
@@ -750,6 +750,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     await send("Page.enable");
     await send("Runtime.addBinding", { name: "__requestFixtureViewport" });
     await send("Runtime.addBinding", { name: "__requestFixtureKey" });
+    await send("Runtime.addBinding", { name: "__requestFixtureWheel" });
     await send("Page.addScriptToEvaluateOnNewDocument", { source: `
       window.__fixtureSetViewport = (width) => new Promise((resolve) => {
         const ready = (event) => {
@@ -769,14 +770,36 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
         window.addEventListener("fixture-key-ready", ready);
         window.__requestFixtureKey(key);
       });
+      window.__fixtureWheel = (x, y, deltaY) => new Promise((resolve) => {
+        const id = Math.random().toString(36).slice(2);
+        const ready = (event) => {
+          if (event.detail !== id) return;
+          window.removeEventListener("fixture-wheel-ready", ready);
+          resolve();
+        };
+        window.addEventListener("fixture-wheel-ready", ready);
+        window.__requestFixtureWheel(JSON.stringify({ id, x, y, deltaY }));
+      });
     ` });
     let viewportError;
+    const pageErrors = [];
     devtools.onEvent((event) => {
+      if (event.method === "Runtime.exceptionThrown") {
+        const details = event.params.exceptionDetails;
+        pageErrors.push(`${details.text}: ${details.exception?.description ?? details.url ?? "unknown source"}`);
+        return;
+      }
       if (event.method !== "Runtime.bindingCalled") return;
       (async () => {
+        if (event.params.name === "__requestFixtureWheel") {
+          const wheel = JSON.parse(event.params.payload);
+          await send("Input.dispatchMouseEvent", { type: "mouseWheel", x: wheel.x, y: wheel.y, deltaX: 0, deltaY: wheel.deltaY });
+          await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-wheel-ready", { detail: ${JSON.stringify(wheel.id)} }))` });
+          return;
+        }
         if (event.params.name === "__requestFixtureKey") {
-          if (!["Escape", "Tab"].includes(event.params.payload)) throw new Error("Unexpected fixture key");
-          const code = event.params.payload === "Tab" ? 9 : 27;
+          if (!["Escape", "Tab", "End"].includes(event.params.payload)) throw new Error("Unexpected fixture key");
+          const code = event.params.payload === "Tab" ? 9 : event.params.payload === "End" ? 35 : 27;
           const key = { key: event.params.payload, code: event.params.payload, windowsVirtualKeyCode: code, nativeVirtualKeyCode: code };
           await send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...key });
           await send("Input.dispatchKeyEvent", { type: "keyUp", ...key });
@@ -795,9 +818,14 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     phase = "run browser interaction fixtures";
     const state = await waitForFixture(async (method, params) => {
       if (viewportError) throw viewportError;
+      if (pageErrors.length) throw new Error(`Uncaught browser error: ${pageErrors.join("; ")}`);
       return send(method, params);
     }, deadline);
-    assert.match(state.text, /47 interaction regressions passed/);
+    assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
+    assert.match(state.text, process.env.OUTRIGHT_UI_STEP ? /1 interaction regressions passed/ : /82 interaction regressions passed/);
+    const performanceFixture = state.text.match(/Performance fixture: (\{[^\n]+\})/);
+    if (!process.env.OUTRIGHT_UI_STEP) assert.ok(performanceFixture, "large fixture measurements were not recorded");
+    if (performanceFixture) console.log(`UI performance: ${performanceFixture[1]}`);
     if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
   } catch (error) {
     failure = new Error(`UI fixture ${phase}: ${error.message}`, { cause: error });

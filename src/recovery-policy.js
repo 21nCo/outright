@@ -34,18 +34,31 @@ export function streamingTextAfterRuntimeEvent(currentText, event, checkpointEve
   return currentText;
 }
 
-export function recordCheckpointCursor(cursors, message) {
+export function recordCheckpointCursor(cursors, message, activeRunIds = new Set()) {
   const runId = message?.payload?.runId;
   const seq = message?.payload?.checkpointEventSeq;
   if (typeof runId === "string" && Number.isSafeInteger(seq)) {
-    cursors.set(runId, Math.max(cursors.get(runId) ?? 0, seq));
+    const previous = cursors.get(runId);
+    if (previous !== undefined && seq <= previous) return cursors;
+    cursors.delete(runId);
+    cursors.set(runId, seq);
+    // The server replays at most 1,000 recent events on one ordered socket.
+    // Retain every active run even when many completed runs cycle through the
+    // cache; an old completed run beyond that replay horizon cannot emit a
+    // new delayed event, while a long-lived active run still can.
+    while (cursors.size > 2048) {
+      let evictable;
+      for (const id of cursors.keys()) { if (!activeRunIds.has(id)) { evictable = id; break; } }
+      if (!evictable) break;
+      cursors.delete(evictable);
+    }
   }
   return cursors;
 }
 
-export function checkpointCursors(messages = [], initial = new Map()) {
+export function checkpointCursors(messages = [], initial = new Map(), activeRunIds = new Set()) {
   const cursors = new Map(initial);
-  for (const message of messages) recordCheckpointCursor(cursors, message);
+  for (const message of messages) recordCheckpointCursor(cursors, message, activeRunIds);
   return cursors;
 }
 
@@ -58,7 +71,17 @@ export function isStaleCheckpointMessage(cursors, message) {
 
 export function upsertRuntimeMessage(messages, message) {
   return [...messages.filter((entry) => entry.id !== message.id), message]
-    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    .sort(compareMessageOrder);
+}
+
+export function messagePrecedesPage(message, first) {
+  if (Number.isSafeInteger(message?.searchOrder) && Number.isSafeInteger(first?.searchOrder)) return message.searchOrder < first.searchOrder;
+  return Boolean(message?.createdAt && first?.createdAt && message.createdAt < first.createdAt);
+}
+
+function compareMessageOrder(left, right) {
+  if (Number.isSafeInteger(left.searchOrder) && Number.isSafeInteger(right.searchOrder)) return left.searchOrder - right.searchOrder;
+  return left.createdAt.localeCompare(right.createdAt);
 }
 
 // HTTP snapshots and websocket events travel over independent connections.
@@ -78,8 +101,8 @@ export function bufferConversationRuntimeEvent(pendingLoad, event, maxBytes) {
 }
 
 export function replayConversationEvents(snapshotMessages = [], events = [], maxMessages = Number.POSITIVE_INFINITY) {
-  let messages = [...snapshotMessages];
-  const cursors = checkpointCursors(messages);
+  const messagesById = new Map(snapshotMessages.map((message) => [message.id, message]));
+  const cursors = checkpointCursors(snapshotMessages);
   let streamingText = "";
   let runEvents = [];
   for (const event of events) {
@@ -87,7 +110,8 @@ export function replayConversationEvents(snapshotMessages = [], events = [], max
       if (isStaleCheckpointMessage(cursors, event.payload)) continue;
       recordCheckpointCursor(cursors, event.payload);
       streamingText = streamingTextAfterRuntimeEvent(streamingText, event);
-      messages = upsertRuntimeMessage(messages, event.payload);
+      messagesById.delete(event.payload.id);
+      messagesById.set(event.payload.id, event.payload);
       continue;
     }
     if (event?.type !== "run.event") continue;
@@ -98,6 +122,7 @@ export function replayConversationEvents(snapshotMessages = [], events = [], max
     }
     if (event.payload?.type?.startsWith("tool.")) runEvents = [...runEvents, event.payload].slice(-20);
   }
+  let messages = [...messagesById.values()].sort(compareMessageOrder);
   const dropped = Math.max(0, messages.length - maxMessages);
   if (dropped) messages = messages.slice(-maxMessages);
   return { messages, cursors, streamingText, runEvents, dropped };

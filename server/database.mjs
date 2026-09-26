@@ -46,6 +46,8 @@ export function createOutrightDatabase(options = {}) {
   if (filename && path.isAbsolute(filename)) mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
   if (filename !== ":memory:" || options.launchDirectory) preparePrivateLaunchDirectory(launchDirectory);
   const db = new Database(filename);
+  let activeMessageFinds = 0;
+  let closing = false;
   try {
     // A runtime keeps SQLite in exclusive locking mode for its whole lifetime.
     // The kernel releases this lease if the process crashes, so a second
@@ -75,7 +77,7 @@ export function createOutrightDatabase(options = {}) {
   return {
     filename,
     launchDirectory,
-    close: () => db.close(),
+    close: () => { closing = true; db.close(); },
     getSettings() {
       const rows = db.prepare("SELECT key, value FROM settings").all();
       return rows.reduce((settings, row) => {
@@ -166,39 +168,107 @@ export function createOutrightDatabase(options = {}) {
       return this.getConversation(id);
     },
     listMessages(conversationId) {
-      return db.prepare(`SELECT id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
-        FROM messages WHERE conversation_id = ? ORDER BY created_at, rowid`).all(conversationId).map(hydratePayload);
+      return db.prepare(`SELECT search_order AS searchOrder, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+        FROM messages WHERE conversation_id = ? ORDER BY search_order`).all(conversationId).map(hydratePayload);
+    },
+    messageCount(conversationId) {
+      return db.prepare("SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?").get(conversationId).count;
     },
     listMessagePage(conversationId, options = {}) {
       const limit = Math.max(1, Math.min(500, Number(options.limit) || 200));
+      if (options.beforeId && options.afterId) throw databaseError(400, "Choose one message cursor");
       let rows;
       if (options.beforeId) {
-        const cursor = db.prepare("SELECT rowid FROM messages WHERE conversation_id = ? AND id = ?").get(conversationId, options.beforeId);
+        const cursor = db.prepare("SELECT search_order AS rowid FROM messages WHERE conversation_id = ? AND id = ?").get(conversationId, options.beforeId);
         if (!cursor) throw databaseError(400, "Message cursor was not found");
-        rows = db.prepare(`SELECT rowid AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
-          FROM messages WHERE conversation_id = ? AND rowid < ? ORDER BY rowid DESC LIMIT ?`).all(conversationId, cursor.rowid, limit);
+        rows = db.prepare(`SELECT search_order AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order < ? ORDER BY search_order DESC LIMIT ?`).all(conversationId, cursor.rowid, limit);
+      } else if (options.afterId) {
+        const cursor = db.prepare("SELECT search_order AS rowid FROM messages WHERE conversation_id = ? AND id = ?").get(conversationId, options.afterId);
+        if (!cursor) throw databaseError(400, "Message cursor was not found");
+        rows = db.prepare(`SELECT search_order AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order > ? ORDER BY search_order ASC LIMIT ?`).all(conversationId, cursor.rowid, limit);
       } else {
-        rows = db.prepare(`SELECT rowid AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
-          FROM messages WHERE conversation_id = ? ORDER BY rowid DESC LIMIT ?`).all(conversationId, limit);
+        rows = db.prepare(`SELECT search_order AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? ORDER BY search_order DESC LIMIT ?`).all(conversationId, limit);
       }
-      rows.reverse();
-      const oldestRowId = rows[0]?.messageRowId;
-      const olderCount = oldestRowId ? db.prepare("SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ? AND rowid < ?").get(conversationId, oldestRowId).count : 0;
-      const hasMore = olderCount > 0;
+      if (!options.afterId) rows.reverse();
       const total = db.prepare("SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?").get(conversationId).count;
+      const oldestRowId = rows[0]?.messageRowId;
+      const olderCount = oldestRowId ? db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order < ?").get(conversationId, oldestRowId).count : options.afterId ? total : 0;
+      const hasMore = olderCount > 0;
+      const newerCount = Math.max(0, total - olderCount - rows.length);
       return {
-        messages: rows.map(({ messageRowId: _messageRowId, ...row }) => hydratePayload(row)),
-        page: { hasMore, olderCount, total, beforeId: rows[0]?.id ?? null, limit },
+        messages: rows.map(({ messageRowId, ...row }) => hydratePayload({ ...row, searchOrder: messageRowId })),
+        page: { hasMore, olderCount, hasLater: newerCount > 0, newerCount, total, beforeId: rows[0]?.id ?? null, limit },
       };
+    },
+    async findMessagePage(conversationId, query, afterId, direction = 1, signal, { originId = afterId, wrapped = false } = {}) {
+      if (activeMessageFinds >= 8) throw databaseError(429, "Too many conversation searches; retry");
+      activeMessageFinds += 1;
+      try {
+        const cursor = afterId ? db.prepare("SELECT search_order AS rowid FROM messages WHERE conversation_id = ? AND id = ?").get(conversationId, afterId) : null;
+        if (afterId && !cursor) throw databaseError(400, "Message cursor was not found");
+        const origin = originId ? db.prepare("SELECT search_order AS rowid FROM messages WHERE conversation_id = ? AND id = ?").get(conversationId, originId) : null;
+        if (originId && !origin) throw databaseError(400, "Message cursor was not found");
+        if (wrapped && !origin) throw databaseError(400, "Wrapped search requires an origin cursor");
+        const forward = direction !== -1;
+        const order = forward ? "ASC" : "DESC";
+        const comparison = forward ? ">" : "<";
+        // search_order tracks insertion rowid and has a conversation-scoped
+        // index. Each synchronous batch touches only this chat's next rows.
+        const batch = db.prepare(`SELECT search_order AS rowid, id, body FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order ${comparison} ? ORDER BY search_order ${order} LIMIT 8`);
+        const wrappedBatch = origin && db.prepare(`SELECT search_order AS rowid, id, body FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order ${comparison} ? AND search_order ${forward ? "<=" : ">="} ? ORDER BY search_order ${order} LIMIT 8`);
+        const foldedQuery = query.toLocaleLowerCase();
+        // One HTTP request scans a bounded amount of text. The client carries
+        // the cursor forward until the full conversation has been searched.
+        let scannedRows = 0;
+        let scannedBytes = 0;
+        const scan = async (initial, inWrappedSegment) => {
+          let boundary = initial;
+          while (true) {
+            if (signal?.aborted || closing) return null;
+            const rows = inWrappedSegment ? wrappedBatch.all(conversationId, boundary, origin.rowid) : batch.all(conversationId, boundary);
+            if (!rows.length) return null;
+            for (const row of rows) {
+              if (String(row.body ?? "").toLocaleLowerCase().includes(foldedQuery)) return { match: row };
+              boundary = row.rowid;
+              scannedRows += 1;
+              scannedBytes += String(row.body ?? "").length * 2;
+              if (scannedRows >= 512 || scannedBytes >= 8 * 1024 * 1024) return { partial: true, nextAfterId: row.id, originId: originId ?? null, wrapped: inWrappedSegment };
+            }
+            // SQLite is synchronous; yield after a small bounded batch so socket
+            // delivery and other requests can run during large no-match searches.
+            await new Promise((resolve) => setImmediate(resolve));
+          }
+        };
+        let result = await scan(cursor?.rowid ?? (forward ? 0 : Number.MAX_SAFE_INTEGER), wrapped);
+        if (!result && origin && !wrapped) result = await scan(forward ? 0 : Number.MAX_SAFE_INTEGER, true);
+        if (signal?.aborted || closing) return { matchId: null, messages: [], messagePage: null };
+        if (result?.partial) return result;
+        if (!result) return { matchId: null, messages: [], messagePage: null };
+        const match = result.match;
+        const older = db.prepare(`SELECT search_order AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order <= ? ORDER BY search_order DESC LIMIT 100`).all(conversationId, match.rowid).reverse();
+        const newer = db.prepare(`SELECT search_order AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order > ? ORDER BY search_order ASC LIMIT 100`).all(conversationId, match.rowid);
+        const rows = [...older, ...newer];
+        const olderCount = db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order < ?").get(conversationId, rows[0].messageRowId).count;
+        const newerCount = db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order > ?").get(conversationId, rows.at(-1).messageRowId).count;
+        return { matchId: match.id, messages: rows.map(({ messageRowId, ...row }) => hydratePayload({ ...row, searchOrder: messageRowId })), messagePage: {
+          hasMore: olderCount > 0, olderCount, hasLater: newerCount > 0, newerCount,
+          total: olderCount + rows.length + newerCount, beforeId: rows[0].id, limit: 200,
+        } };
+      } finally { activeMessageFinds -= 1; }
     },
     addMessage(input) {
       const message = { id: input.id ?? randomUUID(), createdAt: input.createdAt ?? now(), ...input };
-      db.prepare("INSERT INTO messages (id, conversation_id, role, kind, body, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      const inserted = db.prepare("INSERT INTO messages (id, conversation_id, role, kind, body, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
         .run(message.id, message.conversationId, message.role, message.kind ?? "text", message.body ?? "", JSON.stringify(message.payload ?? null), message.createdAt);
       // Clamp instead of overwrite: a message must never move the
       // conversation's updated_at backwards in sidebar and search ordering.
       db.prepare("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?").run(message.createdAt, message.conversationId);
-      return message;
+      return { ...message, searchOrder: Number(inserted.lastInsertRowid) };
     },
     upsertMessage(input) {
       const message = { id: input.id ?? randomUUID(), createdAt: input.createdAt ?? now(), ...input };
@@ -209,7 +279,7 @@ export function createOutrightDatabase(options = {}) {
       // stream, so the plain overwrite could regress updated_at after a newer
       // tool/user message advanced it; clamp to the newer timestamp instead.
       db.prepare("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?").run(message.createdAt, message.conversationId);
-      return hydratePayload(db.prepare(`SELECT id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+      return hydratePayload(db.prepare(`SELECT search_order AS searchOrder, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
         FROM messages WHERE id = ?`).get(message.id));
     },
     createRun(input) {
@@ -482,7 +552,8 @@ function migrate(db) {
     CREATE INDEX IF NOT EXISTS conversations_scope ON conversations(project_id, worktree_id, archived, updated_at);
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-      role TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'text', body TEXT NOT NULL DEFAULT '', payload TEXT, created_at TEXT NOT NULL
+      role TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'text', body TEXT NOT NULL DEFAULT '', payload TEXT, created_at TEXT NOT NULL,
+      search_order INTEGER
     );
     CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation_id, created_at);
     CREATE TABLE IF NOT EXISTS runs (
@@ -501,6 +572,17 @@ function migrate(db) {
     CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, target TEXT, details TEXT, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS prompt_templates (id TEXT PRIMARY KEY, title TEXT NOT NULL, prompt TEXT NOT NULL, created_at TEXT NOT NULL);
   `);
+  if (!db.pragma("table_info(messages)").some((column) => column.name === "search_order")) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.exec("ALTER TABLE messages ADD COLUMN search_order INTEGER");
+      db.exec("UPDATE messages SET search_order = rowid");
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+  }
+  db.exec(`CREATE TRIGGER IF NOT EXISTS messages_search_order_insert AFTER INSERT ON messages
+    BEGIN UPDATE messages SET search_order = NEW.rowid WHERE rowid = NEW.rowid; END`);
+  db.exec("CREATE INDEX IF NOT EXISTS messages_search_order ON messages(conversation_id, search_order)");
   try { db.exec("ALTER TABLE conversations ADD COLUMN tab_position INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'medium'"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN pid INTEGER"); } catch { /* Already migrated. */ }

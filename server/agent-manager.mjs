@@ -1,8 +1,9 @@
-import { spawn, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createProviderDiscovery } from "./provider-discovery.mjs";
 
 const MAX_PROVIDER_LINE_BYTES = 1024 * 1024;
 const MAX_ASSISTANT_BYTES = 1024 * 1024;
@@ -260,7 +261,14 @@ process.stdin.on("data", (chunk) => {
 process.stdin.on("end", () => { if (!authorized) { try { fs.unlinkSync(handshakePath); } catch {} process.exit(0); } });
 `;
 
-export function defaultLaunchCommand(command, run, launchDirectory) {
+function supervisorCommand(args, timeout) {
+  return new Promise((resolve) => {
+    execFile(AGENT_SUPERVISOR, args, { encoding: "utf8", timeout, killSignal: "SIGKILL", maxBuffer: 1024 },
+      (error, stdout) => resolve({ error, stdout }));
+  });
+}
+
+export async function defaultLaunchCommand(command, run, launchDirectory) {
   const handshakePath = path.join(launchDirectory, `${run.id}.json`);
   if (process.platform === "linux") {
     if (!existsSync(AGENT_SUPERVISOR)) {
@@ -280,9 +288,9 @@ export function defaultLaunchCommand(command, run, launchDirectory) {
   const ownershipToken = randomUUID();
   const platformOwnershipId = process.platform === "darwin" ? `com.21n.outright.${ownershipToken}` : "-";
   if (process.platform === "darwin") {
-    const capability = spawnSync(AGENT_SUPERVISOR, ["--self-test", platformOwnershipId], { encoding: "utf8", timeout: 5000, killSignal: "SIGKILL" });
-    if (capability.status !== 0 || capability.stdout?.trim() !== "supported") {
-      spawnSync(AGENT_SUPERVISOR, ["--terminate", platformOwnershipId], { stdio: "ignore", timeout: 1000, killSignal: "SIGKILL" });
+    const capability = await supervisorCommand(["--self-test", platformOwnershipId], 5000);
+    if (capability.error || capability.stdout?.trim() !== "supported") {
+      await supervisorCommand(["--terminate", platformOwnershipId], 1000);
       throw new Error("macOS agent supervision is unavailable because its kernel ownership contract could not be verified");
     }
   }
@@ -298,20 +306,19 @@ export function defaultLaunchCommand(command, run, launchDirectory) {
   };
 }
 
-export function createAgentManager({ database, publish, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
+export function createAgentManager({ database, publish, onProvidersChanged = () => {}, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
   const resolvedLaunchDirectory = launchDirectory
     ?? database.launchDirectory;
   assertPrivateLaunchDirectory(resolvedLaunchDirectory);
   const active = new Map();
   const queue = [];
+  const launches = new Set();
   let shuttingDown = false;
   let shutdownPromise;
+  const providerDiscovery = createProviderDiscovery({ onChange: onProvidersChanged });
 
   function providers() {
-    return [
-      detectProvider("codex", "Codex", ["--version"], ["gpt-5.4", "gpt-5.3-codex"]),
-      detectProvider("claude", "Claude Code", ["--version"], ["sonnet", "opus", "haiku"]),
-    ];
+    return providerDiscovery.list();
   }
 
   async function schedule({ conversation, run, forceFreshSession = false, providerSessionId }) {
@@ -324,10 +331,18 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
     return database.getRun(run.id);
   }
 
-  async function start(state) {
+  async function start(state, authorize) {
     const { conversation, run } = state;
     const command = buildProviderCommand(conversation, run);
-    const launch = launchCommand(command, run, resolvedLaunchDirectory);
+    const launch = await launchCommand(command, run, resolvedLaunchDirectory);
+    if (state.stopped || shuttingDown) return;
+    // The asynchronous capability check is a retry boundary: trust and the
+    // selected durable target may have changed while it was in flight.
+    const current = database.getConversation(run.conversationId);
+    if (!current || ["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== conversation[key])) {
+      throw new Error("Conversation target changed while preparing the run; submit again");
+    }
+    authorize?.();
     const startedAt = new Date().toISOString();
     // Crash-safe launch handshake, phase 1: this durable marker means "a spawn
     // may have been issued, but the provider was never authorized to run". A
@@ -631,11 +646,13 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
           state.conversation = entry.providerSessionId !== undefined
             ? { ...current, providerSessionId: entry.providerSessionId }
             : entry.forceFreshSession ? { ...current, providerSessionId: null } : current;
-          await start(state);
+          await start(state, authorize);
         } catch (error) {
           if (!state.stopped && !error?.preserveActiveRun) finish(state, null, error);
         }
       })();
+      launches.add(state.launch);
+      state.launch.then(() => launches.delete(state.launch), () => launches.delete(state.launch));
     }
   }
 
@@ -731,6 +748,7 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
 
   return {
     providers,
+    providerAvailable: providerDiscovery.available,
     schedule,
     stop,
     activeRuns: () => [...active.keys()],
@@ -738,7 +756,14 @@ export function createAgentManager({ database, publish, spawnProcess = spawn, va
       if (shutdownPromise) return shutdownPromise;
       shuttingDown = true;
       const ids = [...queue.map((entry) => entry.run.id), ...active.keys()];
-      shutdownPromise = Promise.all(ids.map(stop));
+      shutdownPromise = Promise.allSettled([
+        ...ids.map(stop),
+        ...launches,
+        providerDiscovery.close(),
+      ]).then((results) => {
+        const failure = results.find((result) => result.status === "rejected");
+        if (failure) throw failure.reason;
+      });
       return shutdownPromise;
     },
   };
@@ -1111,11 +1136,6 @@ export function hardenWindowsLaunchDirectory(directory, run = spawnSync, environ
   if (result.error || result.status !== 0) {
     throw new Error("Unable to secure the Windows launch directory ACL", { cause: result.error });
   }
-}
-
-function detectProvider(id, label, versionArgs, models) {
-  const result = spawnSync(id, versionArgs, { encoding: "utf8", timeout: 2500 });
-  return { id, label, available: result.status === 0, version: (result.stdout || result.stderr || "").trim(), models };
 }
 
 function sanitizedEnvironment(environment) {
