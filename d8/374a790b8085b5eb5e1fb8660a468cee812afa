@@ -1,0 +1,20 @@
+docs/out-32-performance.md
+  h_a39f9495f9ec1d 34-41
+src/App.jsx
+  h_a39f9495f9ec1d 360-363,388-389
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 2409-2458,2998
+tests/ui-races.test.mjs
+  h_a39f9495f9ec1d 825
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d8374a790b8085b5eb5e1fb8660a468cee812afa",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
