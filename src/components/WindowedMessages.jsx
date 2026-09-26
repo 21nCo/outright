@@ -52,7 +52,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
       } finally { if (generation === searchGenerationRef.current) setSearching(false); }
       return;
     }
-    let index = foundIndex;
+    let index = foundIndex < 0 ? (direction < 0 ? 0 : -1) : foundIndex;
     for (let checked = 0; checked < messages.length; checked += 1) {
       index = (index + direction + messages.length) % messages.length;
       if (!String(messages[index].body ?? "").toLocaleLowerCase().includes(query.toLocaleLowerCase())) continue;

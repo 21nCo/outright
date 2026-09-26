@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -130,6 +130,29 @@ async function waitForProcessGone(pid, timeout = 5000) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   assert.fail(`process ${pid} was not reaped within ${timeout}ms`);
+}
+
+function processGroupId(pid) {
+  const result = spawnSync("/bin/ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8", timeout: 1000 });
+  const group = Number(result.stdout.trim());
+  return result.status === 0 && Number.isSafeInteger(group) && group > 0 ? group : null;
+}
+
+if (process.env.CI && process.platform !== "win32") {
+  const signalGroup = process.kill.bind(process);
+  process.kill = (pid, signal) => {
+    if (Number.isSafeInteger(pid) && pid < 0 && signal && signal !== 0) {
+      const ownGroup = processGroupId(process.pid);
+      writeSync(2, `POSIX group signal: sender=${process.pid}/${ownGroup} target=${pid} signal=${signal}\n`);
+      if (-pid === ownGroup) throw new Error("Refusing to signal the test runner process group");
+    }
+    return signalGroup(pid, signal);
+  };
+  test.after(() => { process.kill = signalGroup; });
+  process.once("SIGTERM", () => {
+    writeSync(2, `Agent-manager test received SIGTERM: pid=${process.pid} ppid=${process.ppid} pgid=${processGroupId(process.pid)}\n`);
+    process.exit(143);
+  });
 }
 
 function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/project" }) {
@@ -685,6 +708,7 @@ for (const action of ["stop", "shutdown"]) {
   test(`${action} waits for a descendant that ignores SIGTERM`, { skip: process.platform === "win32", timeout: 10000 }, async (t) => {
     const database = fakeDatabase();
     let child;
+    let ownsDetachedGroup = false;
     const manager = createAgentManager({
       database, publish: () => {}, terminationGraceMs: 150, terminationTimeoutMs: 5000,
       // This injected process is deliberately not the Linux subreaper launch,
@@ -697,10 +721,20 @@ for (const action of ["stop", "shutdown"]) {
         return child;
       },
     });
-    t.after(() => { try { process.kill(-child.pid, "SIGKILL"); } catch {} });
+    t.after(() => {
+      try {
+        if (ownsDetachedGroup) process.kill(-child.pid, "SIGKILL");
+        else child?.kill("SIGKILL");
+      } catch { /* The owned child already exited. */ }
+    });
     const run = database.createRun(codexRun("tree"));
     await manager.schedule({ conversation: database.getConversation("conv-1"), run });
     await once(child.stdout, "data");
+    const ownGroup = processGroupId(process.pid);
+    const childGroup = processGroupId(child.pid);
+    ownsDetachedGroup = childGroup === child.pid && childGroup !== ownGroup;
+    if (process.env.CI) console.error(`POSIX shutdown ownership: action=${action} test=${process.pid}/${ownGroup} child=${child.pid}/${childGroup} detached=${ownsDetachedGroup}`);
+    assert.equal(ownsDetachedGroup, true, "the fixture must own a detached group distinct from the test runner before signaling it");
     let resolved = false;
     const stopping = (action === "stop" ? manager.stop(run.id) : manager.shutdown()).then(() => { resolved = true; });
     await once(child, "close");

@@ -265,6 +265,9 @@ button, input, textarea, select { font: inherit; }
 .history-return, .history-later { height: 32px; margin: 3px auto 0; padding: 0 12px; border: 1px solid var(--line-soft); border-radius: 999px; display: block; color: var(--foreground); background: var(--active); cursor: pointer; font-size: 10px; font-weight: 600; }
 .history-return:hover, .history-later:hover { background: var(--hover); }
 .history-forward { display: flex; justify-content: center; flex-wrap: wrap; gap: 8px; }
+.history-live-tail { width: min(760px, calc(100% - 44px)); max-height: 136px; overflow: auto; margin: 4px auto 0; padding: 10px 14px; border: 1px solid var(--line-soft); border-radius: 12px; background: var(--subtle-canvas); color: var(--foreground); }
+.history-live-tail strong { display: block; margin-bottom: 4px; font-size: 11px; }
+.history-live-tail p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.45; }
 .history-forward .history-return, .history-forward .history-later { margin: 3px 0 0; }
 .history-return:disabled, .history-later:disabled { cursor: wait; opacity: .65; }
 .message { content-visibility: auto; contain-intrinsic-size: auto 96px; display: grid; grid-template-columns: 34px minmax(0,1fr); gap: 12px; margin-bottom: 25px; }
