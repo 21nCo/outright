@@ -1,0 +1,24 @@
+.github/workflows/ci.yml
+  h_a39f9495f9ec1d 29-42
+docs/out-32-performance.md
+  h_a39f9495f9ec1d 7,45-46,51-52
+src/App.jsx
+  h_a39f9495f9ec1d 99-100,181-182,308-309,416-417,420,538-543,546-549,589-598,601-603,605-606,608,797,811-814,829-835,1022-1025,1068,1111,1257-1258,1345
+src/styles.css
+  h_a39f9495f9ec1d 330,531
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 2349-2354,2563-2627,3264,3267-3268,3280,3353
+tests/ui-races.test.mjs
+  h_a39f9495f9ec1d 825
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c7695e10a6dfa8f390ece0cad9d28a271d3ea052",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
