@@ -1,0 +1,47 @@
+server/database.mjs
+  s_16208d9e94c152::t_2d6bf7ce2dfe62 194-216
+server/database.test.mjs
+  s_ee6f287c08acb3::t_7a87a7805c8c73 37-57
+server/outright-runtime.mjs
+  s_16208d9e94c152::t_ad3adc3cf388ed 204-212,246,418
+server/outright-runtime.test.mjs
+  s_16208d9e94c152::t_c4b49ddb39e3e9 173-186,221-252
+src/App.jsx
+  s_16208d9e94c152::t_e023a501061c05 89,146-162,796,804,825-840,943
+src/components/ChangesPane.jsx
+  s_16208d9e94c152::t_ebc85be3e3f490 17-18,25,30-31,36-37,41-42,47,58-59,62,77-82,85-86,88-89,91
+src/components/WindowedDiff.jsx
+  s_16208d9e94c152::t_bf36e1f8e22b6b 15-18,20-38,40-42,58,60,62
+src/components/WindowedMessages.jsx
+  s_16208d9e94c152::t_50250cf2447062 7,12-58,76-89,121,123,125
+src/styles.css
+  s_ee6f287c08acb3::t_889f7093dcd704 385,392-400,410
+tests/ui-races.jsx
+  s_16208d9e94c152::t_539bea96a69cd9 1462-1569,1587-1597,1693-1754,1767-1768,1789-1793,1795,2176-2179,2182,2184-2185
+tests/ui-races.test.mjs
+  s_16208d9e94c152::t_5c26f02f750eb8 753,773-782,788-793,795-796,817
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3d3ab7821de5a933d5df3949da8899e918fbb3a5",
+  "prompts": {},
+  "sessions": {
+    "s_16208d9e94c152": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0dbe7-1ef9-7b80-8341-fe952b6e9b65",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_ee6f287c08acb3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0dbe8-d479-71a1-9012-f08e8b29a7ff",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
