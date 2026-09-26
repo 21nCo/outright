@@ -58,9 +58,13 @@ export function recordFailure(state, { familyId, title, round, head, evidence })
   family.failedRounds.sort((a, b) => a - b);
   family.attempts.push({ round: Number(round), head, evidence });
   family.title = title || family.title;
-  if (family.failedRounds.length >= 2 && family.state !== "resolved") {
+  // A repeated failure invalidates prior proof even within the first round.
+  delete family.assessment;
+  delete family.resolution;
+  if (family.failedRounds.length >= 2) {
     family.state = "architecture_reset_required";
-    delete family.assessment;
+  } else {
+    family.state = "open";
   }
   state.families[familyId] = family;
   state.currentHead = head || state.currentHead;

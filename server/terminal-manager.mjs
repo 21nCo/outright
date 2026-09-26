@@ -17,13 +17,14 @@ export function createTerminalManager({ publish, database, spawnTerminal = pty.s
       cwd,
       env: { ...terminalEnvironment(process.env), TERM: "xterm-256color", COLORTERM: "truecolor" },
     });
-    const terminal = { id, cwd, name: name || "Terminal", pid: processInstance.pid, process: processInstance, buffer: "", createdAt: new Date().toISOString(), status: "running" };
+    const terminal = { id, cwd, name: name || "Terminal", pid: processInstance.pid, process: processInstance, buffer: "", outputCursor: 0, createdAt: new Date().toISOString(), status: "running" };
     terminals.set(id, terminal);
     database.audit("terminal.created", { target: id, cwd, pid: terminal.pid });
     processInstance.onData((data) => {
       if (!terminals.has(id)) return;
       terminal.buffer = `${terminal.buffer}${data}`.slice(-maxBufferChars);
-      publish({ type: "terminal.output", terminalId: id, payload: { data: data.slice(-64 * 1024) } });
+      terminal.outputCursor += 1;
+      publish({ type: "terminal.output", terminalId: id, payload: { data: data.slice(-64 * 1024), cursor: terminal.outputCursor } });
     });
     processInstance.onExit(({ exitCode, signal }) => {
       if (!terminals.has(id)) return;
@@ -38,7 +39,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = pty.s
   }
 
   function list() { return [...terminals.values()].map(publicTerminal); }
-  function get(id) { const terminal = terminals.get(id); return terminal ? { ...publicTerminal(terminal), buffer: terminal.buffer } : null; }
+  function get(id) { const terminal = terminals.get(id); return terminal ? { ...publicTerminal(terminal), buffer: terminal.buffer, outputCursor: terminal.outputCursor } : null; }
   function write(id, data) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running" || typeof data !== "string" || Buffer.byteLength(data) > 64 * 1024) return false; terminal.process.write(data); return true; }
   function resize(id, cols, rows) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running") return false; terminal.process.resize(clamp(cols, 20, 400), clamp(rows, 5, 200)); return true; }
   function close(id) {

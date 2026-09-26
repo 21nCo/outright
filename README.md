@@ -23,6 +23,9 @@ Outright is a local-first workspace for running coding agents across Git project
 - At least one supported provider CLI on `PATH`: `codex` or `claude`
 - Optional editor CLI: `zed`, `code`, or `cursor`
 - Optional GitHub CLI (`gh`) for pull-request context
+- Google Chrome or Chromium for `npm test` browser interaction regressions (not
+  required to run the app); set `CHROME_PATH` to its executable if it is not
+  installed in a standard macOS, Linux, or Windows location
 
 ## Run for development
 
@@ -68,7 +71,7 @@ npm run build
 npm run test:sites
 ```
 
-The suite covers provider command construction and event normalization, SQLite recovery, PTY input/output, Git review/staging/commits, guarded worktree lifecycle, and scanner parsing.
+The suite covers provider command construction and event normalization, SQLite recovery, PTY input/output, Git review/staging/commits, guarded worktree lifecycle, scanner parsing, and browser interaction regressions. Install Chrome or Chromium before running `npm test`; the browser suite fails explicitly rather than skipping coverage if it cannot find an executable. GitHub CI runners include Chrome, and `CHROME_PATH` overrides the detected location.
 
 ## Linear delivery automation
 

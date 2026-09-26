@@ -42,6 +42,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   const agents = createAgentManager({ database, publish, validateConversation: async (conversation) => {
     const target = await resolveWorktreeTarget(conversation);
     return () => {
+      if (database.getConversation(conversation.id)?.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
       if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required");
     };
   } });
@@ -218,6 +219,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (runCreateMatch && request.method === "POST") {
         const conversation = database.getConversation(runCreateMatch[1]);
         if (!conversation) throw apiError(404, "Conversation not found");
+        if (conversation.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
         // Recovery ownership is scoped to the worktree, not the chat. Another
         // conversation targeting the same checkout must not start while an
         // interrupted process tree may still mutate it.
@@ -233,6 +235,15 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const provider = body.provider || conversation.provider || settings.provider;
         const providerInfo = agents.providers().find((item) => item.id === provider);
         if (!providerInfo?.available) throw apiError(409, `${provider} CLI is not available`);
+        // Archive, move, or recovery can commit during either validation await.
+        // Fence both message and run creation to the current durable target.
+        const currentConversation = database.getConversation(conversation.id);
+        if (!currentConversation || currentConversation.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
+        if (["projectId", "worktreeId", "worktreePath"].some((key) => currentConversation[key] !== conversation[key])) {
+          throw apiError(409, "Conversation target changed while preparing the run", { code: "CONVERSATION_TARGET_CHANGED" });
+        }
+        const currentInterrupted = database.findUnresolvedInterruptedRunForWorktree(conversation.worktreePath);
+        if (currentInterrupted) throw apiError(409, "Resolve the interrupted run before starting more agent work", { code: "RUN_RECOVERY_REQUIRED", runId: currentInterrupted.id });
         const userMessage = database.addMessage({ conversationId: conversation.id, role: "user", kind: "text", body: prompt });
         publish({ type: "message.created", conversationId: conversation.id, payload: userMessage });
         const run = database.createRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, provider, model: body.model ?? conversation.model ?? settings.model, reasoningEffort: body.reasoningEffort || settings.reasoningEffort, approvalPolicy: body.approvalPolicy || settings.approvalPolicy, prompt });
@@ -255,6 +266,12 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (!["discard", "discard-unverifiable", "resume-session", "retry"].includes(policy)) throw apiError(400, "Recovery policy must be discard, discard-unverifiable, resume-session, or retry");
         const conversation = database.getConversation(interrupted.conversationId);
         if (!conversation) throw apiError(404, "Conversation not found");
+        // Replacement requests must not tear down any process on an archived
+        // chat's worktree, including a live sibling, merely to return 409.
+        // Discard policies still verify and clean the interrupted process.
+        if (conversation.archived && ["retry", "resume-session"].includes(policy)) {
+          throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
+        }
 
         // Databases created before durable process ownership can contain a
         // running row with neither pid nor immutable launch worktree. There is
@@ -360,6 +377,12 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           return json(response, 200, resolved);
         }
 
+        // A legacy archived chat may discard above, but must never schedule a
+        // replacement or consume a retry/resume recovery decision.
+        if (database.getConversation(conversation.id)?.archived) {
+          throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
+        }
+
         // Replacement work must respect worktree order across conversations:
         // resuming or retrying a run may not schedule its replacement while an
         // older unresolved run still awaits a decision, or the newer run's
@@ -390,6 +413,13 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const sessionId = interrupted.providerSessionId
           || (conversation.provider === interrupted.provider ? conversation.providerSessionId : null);
         if (policy === "resume-session" && !sessionId) throw apiError(409, "No provider session is available to resume", { code: "NO_PROVIDER_SESSION" });
+        const currentRecoveryConversation = database.getConversation(conversation.id);
+        if (!currentRecoveryConversation || currentRecoveryConversation.archived) {
+          throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
+        }
+        if (["projectId", "worktreeId", "worktreePath"].some((key) => currentRecoveryConversation[key] !== conversation[key])) {
+          throw apiError(409, "Conversation target changed while preparing recovery", { code: "RECOVERY_TARGET_CHANGED", runId: interrupted.id });
+        }
         const recovery = database.beginInterruptedRunRecovery(interrupted.id, policy, { providerSessionId: sessionId });
         if (!recovery) throw apiError(409, "Run is not waiting for a recovery decision");
         database.audit(`agent.run.recovery.${policy}`, { target: recovery.run.id, recoveredFrom: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });

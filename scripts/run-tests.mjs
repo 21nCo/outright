@@ -9,6 +9,11 @@ const tests = directories.flatMap((directory) => readdirSync(path.join(root, dir
   .filter((name) => name.endsWith(".test.mjs"))
   .sort()
   .map((name) => path.join(root, directory, name)));
+tests.push(
+  path.join(root, "tests", "ui-accessibility.test.mjs"),
+  path.join(root, "tests", "terminal-exit-state.test.mjs"),
+  path.join(root, "tests", "ui-races.test.mjs"),
+);
 
 const result = spawnSync(process.execPath, ["--test", "--test-timeout=300000", ...tests], {
   stdio: "inherit",

@@ -7,8 +7,15 @@ test("creates a PTY, accepts input, and retains reconnectable output", async () 
   const manager = createTerminalManager({ publish: (event) => events.push(event), database: { audit() {} } });
   const terminal = manager.create({ cwd: process.cwd(), name: "Test terminal" });
   try {
-    manager.write(terminal.id, "printf 'outright-terminal-ok\\n'\r");
-    await waitFor(() => manager.get(terminal.id)?.buffer.includes("outright-terminal-ok"));
+    // Match the manager's configured shell and avoid matching echoed input.
+    const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/zsh");
+    const command = /(?:^|[\\/])(?:powershell|pwsh)(?:\.exe)?$/i.test(shell)
+      ? "Write-Output ('outright-' + 'terminal-ok')\r"
+      : /(?:^|[\\/])cmd(?:\.exe)?$/i.test(shell)
+        ? "echo outright-^terminal-ok\r"
+        : "printf 'outright-%s\\n' 'terminal-ok'\r";
+    manager.write(terminal.id, command);
+    await waitFor(() => manager.get(terminal.id)?.buffer.includes("outright-terminal-ok"), 10_000, () => manager.get(terminal.id));
     assert.equal(manager.list()[0].status, "running");
     assert.ok(events.some((event) => event.type === "terminal.output"));
   } finally {
@@ -48,11 +55,29 @@ test("enforces terminal limits, input bounds, and suppresses close-after-exit ev
   manager.shutdown();
 });
 
-async function waitFor(predicate, timeout = 3000) {
+test("terminal buffer snapshot carries the output cursor for lossless activation", () => {
+  const events = [];
+  let onData;
+  const manager = createTerminalManager({
+    publish: (event) => events.push(event), database: { audit() {} },
+    spawnTerminal: () => ({ pid: 1, onData(callback) { onData = callback; }, onExit() {}, kill() {} }),
+  });
+  const { id } = manager.create({ cwd: process.cwd() });
+  onData("before\n");
+  const snapshot = manager.get(id);
+  onData("after\n");
+  assert.equal(snapshot.buffer, "before\n");
+  assert.equal(snapshot.outputCursor, 1);
+  assert.deepEqual(events.map(({ payload }) => payload.cursor), [1, 2]);
+  assert.equal(manager.get(id).outputCursor, 2);
+  manager.shutdown();
+});
+
+async function waitFor(predicate, timeout = 3000, diagnostic = () => "") {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     if (predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  throw new Error("Timed out waiting for PTY output");
+  throw new Error(`Timed out waiting for PTY output: ${JSON.stringify(diagnostic())}`);
 }

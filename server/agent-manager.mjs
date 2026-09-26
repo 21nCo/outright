@@ -158,7 +158,18 @@ const teardown = () => {
   if (teardownStarted || !provider) return;
   teardownStarted = true;
   if (providerGone) finishWhenOwnedGroupIsEmpty();
-  else try { provider.kill("SIGTERM"); } catch { /* Already gone. */ }
+  else {
+    try { provider.kill("SIGTERM"); } catch { /* Already gone. */ }
+    // The production supervisor owns its descendants and its own escalation:
+    // never kill it before it has reaped them. For a direct child (including
+    // the wrapper's coalesced go/stop fixture), retain this parent as the
+    // reaper and bound a child that ignores SIGTERM.
+    if (executable !== ${JSON.stringify(AGENT_SUPERVISOR)}) {
+      completionTimer = setTimeout(() => {
+        if (!providerGone) try { provider.kill("SIGKILL"); } catch { /* Already gone. */ }
+      }, 750);
+    }
+  }
 };
 process.stdin.setEncoding("utf8");
 let commandBuffer = "";
@@ -169,6 +180,14 @@ process.stdin.on("data", (chunk) => {
   for (const rawCommand of commands) {
     const command = rawCommand.trim();
     if (!authorized && command === "go") {
+      // A direct child has no kernel-owned descendant boundary. Only the
+      // supervisor may make a production ownership/cleanup claim; the opt-in
+      // direct path exists solely for trusted, leaf-only wrapper fixtures.
+      if (executable !== ${JSON.stringify(AGENT_SUPERVISOR)} && process.env.OUTRIGHT_TEST_DIRECT_WRAPPER !== "1") {
+        console.error("Direct provider launch requires platform supervision");
+        try { fs.unlinkSync(handshakePath); } catch {}
+        process.exit(127);
+      }
       authorized = true;
       const { spawn } = require("node:child_process");
       const darwinLaunch = process.platform === "darwin";

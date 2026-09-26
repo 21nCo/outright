@@ -23,6 +23,7 @@ import { CommandPalette } from "@/components/CommandPalette";
 import { ContextPane } from "@/components/ContextPane";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { TerminalPane } from "@/components/TerminalPane";
+import { domId, nextTabIndex } from "@/lib/accessibility";
 import { api, connectRuntime, query } from "@/lib/runtime-api";
 import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "@/recovery-policy";
 
@@ -38,15 +39,22 @@ export function App() {
   const [selectedConversationId, setSelectedConversationId] = useState(() => localStorage.getItem("outright.selected-conversation") || "");
   const [conversations, setConversations] = useState([]);
   const [conversation, setConversation] = useState(null);
+  const [conversationListFailed, setConversationListFailed] = useState(false);
+  const [conversationListPending, setConversationListPending] = useState(true);
+  const [conversationLoadFailed, setConversationLoadFailed] = useState(false);
+  const [conversationDetailReady, setConversationDetailReady] = useState(false);
   const [expandedGroups, setExpandedGroups] = useState({});
   const [expandedProjects, setExpandedProjects] = useState({});
   const [draft, setDraft] = useState("");
+  const draftRevisionRef = useRef(0);
+  const [unsentCreatedChat, setUnsentCreatedChat] = useState(null);
   const [streamingText, setStreamingText] = useState("");
   const [runEvents, setRunEvents] = useState([]);
   const [runtimeEvent, setRuntimeEvent] = useState(null);
   const [connection, setConnection] = useState("connecting");
   const [isScanning, setIsScanning] = useState(true);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [isNarrow, setIsNarrow] = useState(() => typeof window !== "undefined" && window.matchMedia("(max-width: 760px)").matches);
+  const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === "undefined" || !window.matchMedia("(max-width: 760px)").matches);
   const [inspector, setInspector] = useState(null);
   const [theme, setTheme] = useState(() => localStorage.getItem("outright.theme") || "system");
   const [toast, setToast] = useState("");
@@ -75,10 +83,34 @@ export function App() {
   const messageViewportRef = useRef(null);
   const stickToBottomRef = useRef(true);
   const pendingPrependScrollRef = useRef(null);
+  const sidebarRef = useRef(null);
+  const sidebarFocusIntentRef = useRef(null);
+  const sidebarFocusOwnerRef = useRef(null);
+  const sidebarFocusSourceRef = useRef(null);
+  const inspectorRef = useRef(null);
+  const inspectorInvokerRef = useRef(null);
+  const inspectorReturnFocusRef = useRef(null);
   const submissionPendingRef = useRef(false);
   const checkpointCursorsRef = useRef(new Map());
   const pendingConversationLoadRef = useRef(null);
+  const readyConversationRef = useRef(null);
+  const conversationListRequestRef = useRef(0);
+  const conversationListPendingRef = useRef(true);
+  const trustGrantedRef = useRef(false);
+  const conversationOwnerRef = useRef("");
+  const conversationsRef = useRef([]);
+  const archiveFocusRef = useRef(null);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+
+  function stageConversations(next) {
+    conversationsRef.current = next;
+    setConversations(next);
+  }
+
+  function editDraft(next) {
+    draftRevisionRef.current += 1;
+    setDraft(next);
+  }
 
   const loadBootstrap = useCallback(async (manual = false) => {
     setIsScanning(true);
@@ -113,28 +145,77 @@ export function App() {
     if (!project || !worktree) return;
     const forProjectId = project.id;
     const forWorktreeId = worktree.id;
+    // A stale callback must not advance the shared generation or clear the
+    // current worktree's list-error state before its own owner is checked.
+    if (selectedProjectRef.current !== forProjectId || selectedWorktreeRef.current !== forWorktreeId) return;
+    const request = ++conversationListRequestRef.current;
+    // A list refresh may change the selected chat or its execution metadata.
+    // Fence submission synchronously, before React renders the pending state.
+    conversationListPendingRef.current = true;
+    setConversationListPending(true);
+    pendingConversationLoadRef.current?.controller?.abort();
+    pendingConversationLoadRef.current = null;
+    readyConversationRef.current = null;
+    setConversationDetailReady(false);
+    setConversationListFailed(false);
     try {
       const result = await api(query("/api/conversations", { projectId: forProjectId, worktreeId: forWorktreeId }));
       // A slower response from a previous selection must not overwrite the
       // conversations of the worktree the user has since switched to.
-      if (selectedProjectRef.current !== forProjectId || selectedWorktreeRef.current !== forWorktreeId) return;
-      setConversations(result.conversations);
+      if (request !== conversationListRequestRef.current || selectedProjectRef.current !== forProjectId || selectedWorktreeRef.current !== forWorktreeId) return;
+      const available = result.conversations.filter((item) => !item.archived);
+      stageConversations(available);
       const wanted = preferredId || pendingConversationRef.current || selectedConversationRef.current;
-      const selected = result.conversations.find((item) => item.id === wanted) ?? result.conversations[0];
+      const selected = available.find((item) => item.id === wanted) ?? available[0];
+      conversationListPendingRef.current = false;
+      setConversationListPending(false);
       pendingConversationRef.current = "";
       selectedConversationRef.current = selected?.id ?? "";
+      setConversation((current) => current?.id === selected?.id ? current : null);
       setSelectedConversationId(selected?.id ?? "");
-    } catch (nextError) { setError(nextError.message); }
+      return selected ?? null;
+    } catch (nextError) {
+      if (request === conversationListRequestRef.current && selectedProjectRef.current === forProjectId && selectedWorktreeRef.current === forWorktreeId) {
+        conversationListPendingRef.current = false;
+        setConversationListPending(false);
+        setConversationListFailed(true);
+        setError(nextError.message);
+        return { listFailed: true };
+      }
+    }
   }, [project?.id, worktree?.id]);
 
-  useEffect(() => { setSelectedConversationId(""); setConversation(null); loadConversations(); }, [project?.id, worktree?.id, loadConversations]);
+  function resetConversationContext() {
+    ++conversationListRequestRef.current;
+    pendingConversationLoadRef.current?.controller?.abort();
+    pendingConversationLoadRef.current = null;
+    readyConversationRef.current = null;
+    conversationListPendingRef.current = true;
+    setConversationListPending(true);
+    setConversationDetailReady(false);
+    selectedConversationRef.current = "";
+    stageConversations([]); setConversation(null); setSelectedConversationId("");
+    setConversationListFailed(false); setConversationLoadFailed(false);
+    setStreamingText(""); setRunEvents([]); checkpointCursorsRef.current.clear();
+  }
+  useEffect(() => { loadConversations(); }, [project?.id, worktree?.id, loadConversations]);
   useLayoutEffect(() => { selectedConversationRef.current = selectedConversationId; }, [selectedConversationId]);
   useLayoutEffect(() => { selectedProjectRef.current = selectedProjectId; }, [selectedProjectId]);
   useLayoutEffect(() => { selectedWorktreeRef.current = selectedWorktreeId; }, [selectedWorktreeId]);
+  useLayoutEffect(() => {
+    if (!project || !worktree) return;
+    const owner = `${project.id}::${worktree.id}`;
+    if (conversationOwnerRef.current && conversationOwnerRef.current !== owner) resetConversationContext();
+    conversationOwnerRef.current = owner;
+  }, [project?.id, worktree?.id]);
   useEffect(() => { if (selectedProjectId) localStorage.setItem("outright.selected-project", selectedProjectId); }, [selectedProjectId]);
   useEffect(() => { if (selectedWorktreeId) localStorage.setItem("outright.selected-worktree", selectedWorktreeId); }, [selectedWorktreeId]);
   useEffect(() => { if (selectedConversationId) localStorage.setItem("outright.selected-conversation", selectedConversationId); }, [selectedConversationId]);
   const loadConversation = useCallback(async () => {
+    readyConversationRef.current = null;
+    setConversationDetailReady(false);
+    setConversationLoadFailed(false);
+    if (conversationListPendingRef.current || conversationListFailed) return;
     if (!selectedConversationId || !conversations.some((item) => item.id === selectedConversationId)) {
       pendingConversationLoadRef.current?.controller?.abort();
       pendingConversationLoadRef.current = null;
@@ -146,15 +227,23 @@ export function App() {
     const controller = new AbortController();
     const pendingLoad = { conversationId: requestedId, events: [], eventBytes: 0, overflowed: false, controller };
     pendingConversationLoadRef.current = pendingLoad;
+    setConversation((current) => current?.id === requestedId && !current.archived ? current : null);
     try {
       const nextConversation = await api(`/api/conversations/${requestedId}`, { signal: controller.signal });
       // Stale responses from an earlier selection are discarded before they
       // can associate the composer or execution state with the wrong worktree.
-      if (selectedConversationRef.current !== requestedId) return;
+      if (selectedConversationRef.current !== requestedId || !conversations.some((item) => item.id === requestedId)) return;
       if (nextConversation.projectId !== selectedProjectRef.current || nextConversation.worktreeId !== selectedWorktreeRef.current) return;
-      if (pendingConversationLoadRef.current !== pendingLoad) return;
+      if (pendingConversationLoadRef.current !== pendingLoad || conversationListPendingRef.current || conversationListFailed) return;
+      if (nextConversation.archived) {
+        removeArchivedChat(nextConversation);
+        loadConversations();
+        return;
+      }
       pendingConversationLoadRef.current = null;
       const replayed = replayConversationEvents(nextConversation.messages, pendingLoad.events, MAX_RENDERED_MESSAGES);
+      readyConversationRef.current = nextConversation;
+      setConversationDetailReady(true);
       stickToBottomRef.current = true;
       checkpointCursorsRef.current = replayed.cursors;
       setConversation({
@@ -175,10 +264,12 @@ export function App() {
       });
     }
     catch (nextError) {
-      if (pendingConversationLoadRef.current === pendingLoad) pendingConversationLoadRef.current = null;
-      if (nextError.name !== "AbortError") setError(nextError.message);
+      if (pendingConversationLoadRef.current === pendingLoad) {
+        pendingConversationLoadRef.current = null;
+        if (nextError.name !== "AbortError") { setConversationLoadFailed(true); setError(nextError.message); }
+      }
     }
-  }, [selectedConversationId, conversations]);
+  }, [selectedConversationId, conversations, loadConversations, conversationListFailed]);
   useEffect(() => { loadConversation(); }, [loadConversation]);
   const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
@@ -264,10 +355,138 @@ export function App() {
     const keyboard = (event) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); setCommandOpen(true); }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "n") { event.preventDefault(); setNewChatOpen(true); }
-      if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "t") { event.preventDefault(); setInspector("terminal"); }
+      if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "t") {
+        event.preventDefault();
+        inspectorInvokerRef.current = document.querySelector('[aria-label="Terminal"]');
+        setInspector("terminal");
+      }
+      if (event.key === "Escape" && !document.querySelector('[role="dialog"]:not(#project-sidebar)')) {
+        if (isNarrow && sidebarOpen) closeSidebar();
+        else if (inspector && !event.target.closest?.(".terminal-host")
+          && (inspectorRef.current?.contains(event.target) || event.target.closest?.(".composer") || event.target === inspectorInvokerRef.current)) closeInspector();
+      }
     };
     window.addEventListener("keydown", keyboard); return () => window.removeEventListener("keydown", keyboard);
+  }, [inspector, isNarrow, sidebarOpen]);
+  useEffect(() => {
+    const narrow = window.matchMedia("(max-width: 760px)");
+    let wasNarrow = narrow.matches;
+    const trackFocus = (event) => {
+      if (sidebarFocusIntentRef.current && event.target !== sidebarFocusSourceRef.current
+        && event.target !== sidebarRef.current && !sidebarRef.current?.contains(event.target)
+        && !event.target.matches?.('[aria-label="Open projects sidebar"]')) {
+        sidebarFocusIntentRef.current = null;
+        sidebarFocusSourceRef.current = null;
+      }
+      if (event.target.matches?.('[aria-label="Open projects sidebar"]')) sidebarFocusOwnerRef.current = "opener";
+      else if (sidebarRef.current?.contains(event.target)) sidebarFocusOwnerRef.current = "sidebar";
+      else {
+        sidebarFocusOwnerRef.current = null;
+      }
+    };
+    const synchronizeLayout = () => {
+      if (narrow.matches === wasNarrow) return;
+      wasNarrow = narrow.matches;
+      const activeElement = document.activeElement;
+      const owner = activeElement === document.body ? sidebarFocusOwnerRef.current
+        : sidebarRef.current?.contains(activeElement) ? "sidebar"
+          : activeElement?.matches?.('[aria-label="Open projects sidebar"]') ? "opener" : null;
+      sidebarFocusOwnerRef.current = owner;
+      sidebarFocusIntentRef.current = wasNarrow && owner === "sidebar" ? "opener"
+        : !wasNarrow && owner === "opener" ? "sidebar" : null;
+      sidebarFocusSourceRef.current = sidebarFocusIntentRef.current ? activeElement : null;
+      setIsNarrow(wasNarrow);
+      setSidebarOpen(!wasNarrow);
+    };
+    narrow.addEventListener("change", synchronizeLayout);
+    window.addEventListener("resize", synchronizeLayout);
+    document.addEventListener("focusin", trackFocus);
+    return () => {
+      narrow.removeEventListener("change", synchronizeLayout);
+      window.removeEventListener("resize", synchronizeLayout);
+      document.removeEventListener("focusin", trackFocus);
+    };
   }, []);
+  useLayoutEffect(() => {
+    if (!isNarrow || !sidebarOpen) return;
+    const sidebar = sidebarRef.current;
+    if (!sidebar?.contains(document.activeElement)) {
+      const first = sidebar?.querySelector('button:not(:disabled)');
+      if (first?.getClientRects().length) first.focus({ preventScroll: true });
+      else sidebar?.focus();
+    }
+    const containFocus = (event) => {
+      if (event.key !== "Tab") return;
+      const focusable = focusableElements(sidebar);
+      if (!focusable.length) { event.preventDefault(); sidebar?.focus(); return; }
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (event.shiftKey && (document.activeElement === sidebar || document.activeElement === first)) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    sidebar?.addEventListener("keydown", containFocus);
+    return () => sidebar?.removeEventListener("keydown", containFocus);
+  }, [isNarrow, sidebarOpen]);
+  useLayoutEffect(() => {
+    const intent = sidebarFocusIntentRef.current;
+    if (!intent || (intent === "opener" && sidebarOpen) || (intent === "sidebar" && !sidebarOpen)) return;
+    let frame;
+    const deadline = performance.now() + 500;
+    const transfer = () => {
+      if (sidebarFocusIntentRef.current !== intent) return;
+      const target = intent === "opener" ? document.querySelector('[aria-label="Open projects sidebar"]')
+        : sidebarRef.current?.querySelector('button:not(:disabled)');
+      const active = document.activeElement;
+      const fromPriorControl = active === sidebarFocusSourceRef.current || (intent === "opener"
+        ? sidebarRef.current?.contains(active)
+        : active?.matches?.('[aria-label="Open projects sidebar"]') || active === sidebarRef.current);
+      if (active !== document.body && active !== target && !fromPriorControl) {
+        sidebarFocusIntentRef.current = null; // Do not override a newer user focus choice.
+        sidebarFocusSourceRef.current = null;
+        return;
+      }
+      if (target?.isConnected && target.getClientRects().length && getComputedStyle(target).visibility === "visible") {
+        target.focus({ preventScroll: true });
+        if (document.activeElement === target && target.getBoundingClientRect().width > 0) {
+          sidebarFocusOwnerRef.current = intent;
+          sidebarFocusIntentRef.current = null;
+          sidebarFocusSourceRef.current = null;
+          return;
+        }
+      }
+      if (performance.now() < deadline) frame = requestAnimationFrame(transfer);
+    };
+    transfer();
+    return () => cancelAnimationFrame(frame);
+  }, [isNarrow, sidebarOpen]);
+  useLayoutEffect(() => {
+    if (!inspector) return;
+    inspectorRef.current?.querySelector('[role="tab"][aria-selected="true"]')?.focus({ preventScroll: true });
+  }, [inspector]);
+  useLayoutEffect(() => {
+    if (inspector || !inspectorReturnFocusRef.current) return;
+    const invoker = inspectorReturnFocusRef.current;
+    inspectorReturnFocusRef.current = null;
+    if (invoker.isConnected) invoker.focus({ preventScroll: true });
+  }, [inspector]);
+  useLayoutEffect(() => {
+    const intent = archiveFocusRef.current;
+    if (!intent) return;
+    if (intent.projectId !== selectedProjectRef.current || intent.worktreeId !== selectedWorktreeRef.current) {
+      archiveFocusRef.current = null;
+      return;
+    }
+    if (intent.nextId !== selectedConversationId) {
+      if (intent.nextId !== selectedConversationRef.current) archiveFocusRef.current = null;
+      return;
+    }
+    archiveFocusRef.current = null;
+    if (document.activeElement !== intent.source && document.activeElement !== document.body) return;
+    const next = intent.nextId
+      ? document.getElementById(domId("chat-tab", intent.nextId))
+      : document.querySelector(".chat-tabs .add-tab");
+    next?.focus({ preventScroll: true });
+  }, [conversations, selectedConversationId]);
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 2800); return () => clearTimeout(timer); }, [toast]);
   useEffect(() => { if (!error) return; const timer = setTimeout(() => setError(""), 6000); return () => clearTimeout(timer); }, [error]);
   useEffect(() => {
@@ -305,6 +524,13 @@ export function App() {
   }, [conversation?.messages.at(-1)?.id, streamingText]);
 
   const activeRun = conversation?.runs?.find((run) => ["queued", "launching", "running"].includes(run.status));
+  const waitingForConversation = Boolean(selectedConversationId && (!conversation || !conversationDetailReady));
+  const submissionUnavailable = conversationListPending || conversationListFailed
+    || Boolean(selectedConversationId && (!conversationDetailReady || conversationLoadFailed));
+  const unsentForOwner = unsentCreatedChat?.projectId === project?.id && unsentCreatedChat?.worktreeId === worktree?.id ? unsentCreatedChat : null;
+  const firstPromptAwaitingSelection = Boolean(unsentCreatedChat && (!unsentForOwner || selectedConversationId !== unsentCreatedChat.id));
+  const unsentProject = bootstrap?.projects.find((item) => item.id === unsentCreatedChat?.projectId);
+  const unsentWorktree = unsentProject?.worktrees.find((item) => item.id === unsentCreatedChat?.worktreeId);
   const latestRun = conversation?.runs?.[0];
   // Worktree-wide recovery metadata gates sibling chats before submission;
   // the conversation-local values remain fallbacks for older runtimes.
@@ -341,56 +567,159 @@ export function App() {
 
   async function chooseProject(nextProject, explicitWorktree) {
     const nextWorktree = explicitWorktree ?? preferredWorktree(nextProject);
-    selectedProjectRef.current = nextProject.id; selectedWorktreeRef.current = nextWorktree.id; selectedConversationRef.current = "";
-    setSelectedProjectId(nextProject.id); setSelectedWorktreeId(nextWorktree.id); setSelectedConversationId("");
+    const changed = selectedProjectRef.current !== nextProject.id || selectedWorktreeRef.current !== nextWorktree.id;
+    if (changed) {
+      resetConversationContext();
+      selectedProjectRef.current = nextProject.id; selectedWorktreeRef.current = nextWorktree.id;
+      setSelectedProjectId(nextProject.id); setSelectedWorktreeId(nextWorktree.id);
+    } else if (pendingConversationRef.current) loadConversations(pendingConversationRef.current);
     setExpandedProjects((current) => ({ ...current, [nextProject.id]: true }));
+    if (isNarrow && sidebarOpen) closeSidebar();
   }
-  async function createConversation(title = newChatTitle) {
+
+  function closeSidebar() {
+    if (!sidebarOpen) return;
+    sidebarFocusIntentRef.current = "opener";
+    sidebarFocusSourceRef.current = document.activeElement;
+    setSidebarOpen(false);
+  }
+
+  function openSidebar() {
+    if (sidebarOpen) return;
+    sidebarFocusIntentRef.current = "sidebar";
+    sidebarFocusSourceRef.current = document.activeElement;
+    setSidebarOpen(true);
+  }
+
+  function toggleInspector(nextInspector, invoker) {
+    if (inspector === nextInspector) { closeInspector(); return; }
+    inspectorInvokerRef.current = invoker;
+    setInspector(nextInspector);
+  }
+
+  function closeInspector() {
+    inspectorReturnFocusRef.current = inspectorInvokerRef.current;
+    inspectorInvokerRef.current = null;
+    setInspector(null);
+  }
+
+  function navigateProjectButtons(event) {
+    if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+    const current = event.target.closest("button");
+    const buttons = [...event.currentTarget.querySelectorAll("button:not(:disabled)")];
+    const currentIndex = buttons.indexOf(current);
+    if (currentIndex < 0) return;
+    event.preventDefault();
+    buttons[nextTabIndex(currentIndex, buttons.length, event.key)]?.focus();
+  }
+
+  function navigateTabs(event, selector, choose) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const current = event.target.closest?.(selector);
+    if (!current || !event.currentTarget.contains(current)) return;
+    const tabs = [...event.currentTarget.querySelectorAll(selector)];
+    const currentIndex = tabs.indexOf(current);
+    const nextIndex = nextTabIndex(currentIndex, tabs.length, event.key);
+    if (nextIndex < 0) return;
+    event.preventDefault();
+    const next = tabs[nextIndex];
+    choose(next.dataset.tabId);
+    next.focus();
+    next.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+  async function createConversation(title = newChatTitle, initialPrompt = false) {
     if (!project || !worktree) return null;
+    let created;
+    let privateListRequest;
     try {
-      const created = await api("/api/conversations", { method: "POST", body: { projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: title.trim() || "New agent chat", provider: settings.provider, model: settings.model } });
-      if (selectedProjectRef.current !== created.projectId || selectedWorktreeRef.current !== created.worktreeId) return null;
-      pendingConversationRef.current = created.id; setNewChatTitle(""); setNewChatOpen(false); await loadConversations(created.id); return created;
-    } catch (nextError) { setError(nextError.message); return null; }
+      created = await api("/api/conversations", { method: "POST", body: { projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: title.trim() || "New agent chat", provider: settings.provider, model: settings.model } });
+      if (selectedProjectRef.current !== created.projectId || selectedWorktreeRef.current !== created.worktreeId) {
+        if (initialPrompt) setUnsentCreatedChat({ id: created.id, projectId: created.projectId, worktreeId: created.worktreeId });
+        return null;
+      }
+      pendingConversationRef.current = created.id; setNewChatTitle(""); setNewChatOpen(false);
+      privateListRequest = conversationListRequestRef.current + 1;
+      const selected = await loadConversations(created.id);
+      let superseded = privateListRequest !== conversationListRequestRef.current;
+      if (selected?.id === created.id) {
+        // Dialog creation leaves detail loading to the selected-chat owner.
+        // Only an immediate first prompt needs a private detail result.
+        if (!initialPrompt) return null;
+        const listRequest = conversationListRequestRef.current;
+        const detail = await api(`/api/conversations/${created.id}`);
+        superseded ||= listRequest !== conversationListRequestRef.current;
+        if (listRequest === conversationListRequestRef.current && !conversationListPendingRef.current && !conversationListFailed
+          && selectedConversationRef.current === created.id && detail.id === created.id
+          && detail.projectId === selectedProjectRef.current && detail.worktreeId === selectedWorktreeRef.current && !detail.archived) return detail;
+      }
+      if (initialPrompt) setUnsentCreatedChat({ id: created.id, projectId: created.projectId, worktreeId: created.worktreeId });
+      else if (!superseded && !selected?.listFailed) setError("Chat created, but its details could not be loaded. Retry the chat list.");
+      return null;
+    } catch (nextError) {
+      if (created && initialPrompt) {
+        setUnsentCreatedChat({ id: created.id, projectId: created.projectId, worktreeId: created.worktreeId });
+      } else if (!created || (privateListRequest === conversationListRequestRef.current
+        && created.projectId === selectedProjectRef.current && created.worktreeId === selectedWorktreeRef.current)) {
+        setError(nextError.message);
+      }
+      return null;
+    }
   }
   function isSelectedTarget(target) {
-    return target?.id === selectedConversationRef.current && target.projectId === selectedProjectRef.current && target.worktreeId === selectedWorktreeRef.current;
+    return !target?.archived && target?.id === selectedConversationRef.current && target.projectId === selectedProjectRef.current && target.worktreeId === selectedWorktreeRef.current;
   }
   async function sendPrompt(event, promptOverride, targetOverride) {
     event?.preventDefault();
     const submittedDraft = promptOverride ?? draft;
+    const submittedDraftRevision = draftRevisionRef.current;
     const prompt = submittedDraft.trim();
-    if (!prompt || activeRun || interruptedRun || submissionPendingRef.current) return;
+    if (!prompt || activeRun || interruptedRun || firstPromptAwaitingSelection || conversationListPendingRef.current || conversationListFailed || submissionPendingRef.current) return false;
+    if (selectedConversationRef.current && (!readyConversationRef.current || pendingConversationLoadRef.current || conversationLoadFailed || !isSelectedTarget(readyConversationRef.current))) return false;
     submissionPendingRef.current = true;
-    let target = targetOverride ?? conversation;
+    let target = selectedConversationRef.current ? readyConversationRef.current : targetOverride ?? conversation;
     try {
-      if (!target) target = await createConversation(prompt.split(/\n/)[0].slice(0, 52));
-      if (!target || !isSelectedTarget(target)) return;
+      if (!target && selectedConversationRef.current) return false; // The selected chat is still loading.
+      const createdHere = !target;
+      if (createdHere) target = await createConversation(prompt.split(/\n/)[0].slice(0, 52), true);
+      if (!target || !isSelectedTarget(target) || conversationListPendingRef.current || conversationListFailed) return false;
+      if (!createdHere && (pendingConversationLoadRef.current || readyConversationRef.current !== target || conversationLoadFailed)) return false;
       const run = await api(`/api/conversations/${target.id}/runs`, { method: "POST", body: { prompt, provider: target.provider || settings.provider, model: target.model || settings.model, reasoningEffort: settings.reasoningEffort, approvalPolicy: settings.approvalPolicy } });
-      if (!isSelectedTarget(target)) return;
-      setDraft((current) => draftAfterSubmission(current, submittedDraft)); setStreamingText(""); setRunEvents([]);
+      setUnsentCreatedChat((current) => current?.id === target.id && current.projectId === target.projectId && current.worktreeId === target.worktreeId ? null : current);
+      setDraft((current) => draftRevisionRef.current === submittedDraftRevision ? draftAfterSubmission(current, submittedDraft) : current);
+      if (!isSelectedTarget(target)) return true;
+      setStreamingText(""); setRunEvents([]);
       setConversation((current) => {
         if (current && current.id !== target.id) return current;
         const next = current ?? { ...target, messages: [], runs: [] };
         return { ...next, runs: [run, ...(next.runs ?? []).filter((item) => item.id !== run.id)] };
       });
+      return true;
     } catch (nextError) {
-      if (!isSelectedTarget(target)) return;
-      if (nextError.payload?.code === "PROJECT_TRUST_REQUIRED") { setPendingPrompt({ prompt, target }); setTrustRequest(nextError.payload.project); }
+      if (!isSelectedTarget(target)) return false;
+      if (nextError.payload?.code === "PROJECT_TRUST_REQUIRED") { trustGrantedRef.current = false; setPendingPrompt({ prompt, target }); setTrustRequest(nextError.payload.project); }
       else {
         if (nextError.payload?.code === "RUN_RECOVERY_REQUIRED") await loadConversation();
         setError(nextError.message);
       }
+      return false;
     }
     finally { submissionPendingRef.current = false; }
   }
   async function trustAndRun() {
     const pending = pendingPrompt;
-    if (!pending || !isSelectedTarget(pending.target)) { setTrustRequest(null); setPendingPrompt(null); return; }
+    if (!pending || !isSelectedTarget(pending.target)) { setTrustRequest(null); setPendingPrompt(null); trustGrantedRef.current = false; return; }
+    if (conversationListPendingRef.current || conversationListFailed || !readyConversationRef.current
+      || !isSelectedTarget(readyConversationRef.current) || pendingConversationLoadRef.current || conversationLoadFailed) return;
     try {
-      await api("/api/trust", { method: "POST", body: { projectId: trustRequest.id, projectPath: trustRequest.path, confirmation: trustRequest.path } });
-      setBootstrap((current) => ({ ...current, trustedProjects: [...current.trustedProjects, { projectId: trustRequest.id, projectPath: trustRequest.path }] }));
-      setTrustRequest(null); setPendingPrompt(null); await sendPrompt(null, pending.prompt, pending.target);
+      if (!trustGrantedRef.current) {
+        await api("/api/trust", { method: "POST", body: { projectId: trustRequest.id, projectPath: trustRequest.path, confirmation: trustRequest.path } });
+        trustGrantedRef.current = true;
+        setBootstrap((current) => ({ ...current, trustedProjects: [...current.trustedProjects, { projectId: trustRequest.id, projectPath: trustRequest.path }] }));
+      }
+      if (!isSelectedTarget(pending.target)) { setTrustRequest(null); setPendingPrompt(null); trustGrantedRef.current = false; return; }
+      if (conversationListPendingRef.current || conversationListFailed || !readyConversationRef.current
+        || !isSelectedTarget(readyConversationRef.current) || pendingConversationLoadRef.current || conversationLoadFailed) return;
+      if (await sendPrompt(null, pending.prompt)) { setTrustRequest(null); setPendingPrompt(null); trustGrantedRef.current = false; }
     } catch (nextError) { setError(nextError.message); }
   }
   async function stopRun() { try { await api(`/api/runs/${activeRun.id}/stop`, { method: "POST" }); } catch (nextError) { setError(nextError.message); } }
@@ -425,8 +754,46 @@ export function App() {
   async function createGroup(event) { event.preventDefault(); try { await api("/api/groups", { method: "POST", body: { name: newGroupName } }); setNewGroupName(""); setNewGroupOpen(false); await refreshGroups(); setToast("Project group created"); } catch (nextError) { setError(nextError.message); } }
   async function refreshGroups() { const projectGroups = await api("/api/groups"); setBootstrap((current) => ({ ...current, projectGroups })); }
   async function moveProject(projectId, groupId) { try { const projectGroups = await api("/api/project-memberships", { method: "PUT", body: { projectId, groupId } }); setBootstrap((current) => ({ ...current, projectGroups })); setToast("Project group updated"); } catch (nextError) { setError(nextError.message); } }
-  async function updateConversation(patch) { try { const updated = await api(`/api/conversations/${conversation.id}`, { method: "PATCH", body: patch }); setConversation((current) => ({ ...current, ...updated })); await loadConversations(updated.id); return updated; } catch (nextError) { setError(nextError.message); return null; } }
-  async function archiveConversation() { const updated = await updateConversation({ archived: true }); if (!updated) return; setSelectedConversationId(""); setManageChatOpen(false); }
+  function removeArchivedChat(updated, focusSource) {
+    if (updated.projectId !== selectedProjectRef.current || updated.worktreeId !== selectedWorktreeRef.current) return;
+    ++conversationListRequestRef.current;
+    const remaining = conversationsRef.current.filter((item) => item.id !== updated.id);
+    const nextId = selectedConversationRef.current === updated.id ? remaining[0]?.id ?? "" : selectedConversationRef.current;
+    if (focusSource && document.activeElement === focusSource) {
+      archiveFocusRef.current = { source: focusSource, nextId, projectId: updated.projectId, worktreeId: updated.worktreeId };
+    }
+    stageConversations(remaining);
+    if (selectedConversationRef.current !== updated.id) return;
+    readyConversationRef.current = null;
+    setConversationDetailReady(false);
+    pendingConversationLoadRef.current?.controller?.abort();
+    pendingConversationLoadRef.current = null;
+    selectedConversationRef.current = nextId;
+    setSelectedConversationId(nextId);
+    setConversation(null); setConversationLoadFailed(false); setStreamingText(""); setRunEvents([]); checkpointCursorsRef.current.clear();
+  }
+  async function archiveChat(item, focusSource) {
+    try {
+      const updated = await api(`/api/conversations/${item.id}`, { method: "PATCH", body: { archived: true } });
+      removeArchivedChat(updated, focusSource);
+      await loadConversations();
+    } catch (nextError) { setError(nextError.message); }
+  }
+  async function updateConversation(patch) {
+    try {
+      const updated = await api(`/api/conversations/${conversation.id}`, { method: "PATCH", body: patch });
+      if (updated.archived) removeArchivedChat(updated);
+      else {
+        if (readyConversationRef.current?.id === updated.id && isSelectedTarget(updated) && !pendingConversationLoadRef.current) {
+          readyConversationRef.current = { ...readyConversationRef.current, ...updated };
+        }
+        setConversation((current) => current?.id === updated.id ? { ...current, ...updated } : current);
+      }
+      await loadConversations(updated.archived ? undefined : updated.id);
+      return updated;
+    } catch (nextError) { setError(nextError.message); return null; }
+  }
+  async function archiveConversation() { const updated = await updateConversation({ archived: true }); if (!updated) return; setManageChatOpen(false); }
   async function saveChatSettings(event) {
     event.preventDefault();
     const { destination, ...patch } = chatDraft;
@@ -450,7 +817,7 @@ export function App() {
     const next = [...conversations];
     const [source] = next.splice(next.findIndex((item) => item.id === sourceId), 1);
     next.splice(next.findIndex((item) => item.id === targetId), 0, source);
-    setConversations(next);
+    stageConversations(next);
     await Promise.all(next.map((item, index) => api(`/api/conversations/${item.id}`, { method: "PATCH", body: { tabPosition: index } })));
   }
 
@@ -471,25 +838,26 @@ export function App() {
   if (!bootstrap || !project || !worktree) return <LoadingScreen isScanning={isScanning} />;
 
   return <div className={`app-shell ${sidebarOpen ? "sidebar-is-open" : "sidebar-is-closed"}`}>
-    <aside className="sidebar" aria-label="Projects and worktrees">
-      <header className="sidebar-brand"><div className="brand-lockup"><span className="brand-glyph"><Sparkle weight="fill" /></span><strong>Outright</strong></div><Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon-sm" onClick={() => setSidebarOpen(false)} aria-label="Collapse sidebar" />}><SidebarSimple /></TooltipTrigger><TooltipContent>Collapse sidebar</TooltipContent></Tooltip></header>
+    <aside className="sidebar" id="project-sidebar" role={isNarrow && sidebarOpen ? "dialog" : undefined} aria-modal={isNarrow && sidebarOpen ? true : undefined} aria-label="Projects and worktrees" aria-hidden={!sidebarOpen} tabIndex={isNarrow ? -1 : undefined} ref={sidebarRef}>
+      <header className="sidebar-brand"><div className="brand-lockup"><span className="brand-glyph"><Sparkle weight="fill" /></span><strong>Outright</strong></div><Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon-sm" onClick={closeSidebar} aria-label="Close projects sidebar" />}><SidebarSimple /></TooltipTrigger><TooltipContent>Close sidebar</TooltipContent></Tooltip></header>
       <div className="sidebar-actions"><Button className="new-chat-action" onClick={() => setNewChatOpen(true)}><Plus weight="bold" /> New chat <kbd>⌘N</kbd></Button><Button variant="ghost" className="sidebar-action" onClick={() => setCommandOpen(true)}><MagnifyingGlass /> Search <kbd>⌘K</kbd></Button><Button variant="ghost" className="sidebar-action" onClick={() => loadBootstrap(true)}><ArrowsClockwise className={isScanning ? "spin" : ""} /> Scan projects</Button></div>
       <Separator /><div className="project-section-heading"><span>Projects</span><Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon-xs" onClick={() => setNewGroupOpen(true)} aria-label="New project group" />}><FolderPlus /></TooltipTrigger><TooltipContent>New project group</TooltipContent></Tooltip></div>
-      <ScrollArea className="project-scroll"><div className="group-list">{groupedProjects.map((group) => { const isOpen = expandedGroups[group.id] ?? true; return <section className="project-group" key={group.id}><button className="group-heading" aria-expanded={isOpen} onClick={() => setExpandedGroups((current) => ({ ...current, [group.id]: !isOpen }))}>{isOpen ? <CaretDown /> : <CaretRight />}<Folders weight="duotone" /><span>{group.name}</span><small>{group.projects.length}</small></button>{isOpen && group.projects.map((item) => <ProjectTree key={item.id} project={item} activeProjectId={project.id} activeWorktreeId={worktree.id} expanded={expandedProjects[item.id] ?? item.id === project.id} groups={groups.groups} onToggle={() => setExpandedProjects((current) => ({ ...current, [item.id]: !(current[item.id] ?? item.id === project.id) }))} onSelectProject={() => chooseProject(item)} onSelectWorktree={(nextWorktree) => chooseProject(item, nextWorktree)} onMove={(groupId) => moveProject(item.id, groupId)} onCreateWorktree={() => setWorktreeDialog(item)} />)}</section>; })}</div></ScrollArea>
-      <footer className="sidebar-footer"><span className={`status-dot ${connection === "connected" ? "live" : "demo"}`} /><span>{connection === "connected" ? "Runtime connected" : connection}</span>{bootstrap.truncated ? <small className="scan-limit" title={`Showing ${bootstrap.projects.length} of ${bootstrap.repositoryCount} discovered repositories. Increase maxProjects in outright.config.json to show more.`}><WarningCircle />{bootstrap.projects.length}/{bootstrap.repositoryCount}</small> : <small>{bootstrap.scanDurationMs ? `${Math.round(bootstrap.scanDurationMs)}ms` : ""}</small>}<Button variant="ghost" size="icon-xs" onClick={() => setSettingsOpen(true)} aria-label="Settings"><GearSix /></Button></footer>
+      <ScrollArea className="project-scroll" viewportProps={{ tabIndex: 0, "aria-label": "Project groups, projects, and worktrees", onKeyDown: navigateProjectButtons }}><div className="group-list">{groupedProjects.map((group) => { const isOpen = expandedGroups[group.id] ?? true; return <section className="project-group" key={group.id}><button className="group-heading" aria-expanded={isOpen} onClick={() => setExpandedGroups((current) => ({ ...current, [group.id]: !isOpen }))}>{isOpen ? <CaretDown /> : <CaretRight />}<Folders weight="duotone" /><span>{group.name}</span><small>{group.projects.length}</small></button>{isOpen && group.projects.map((item) => <ProjectTree key={item.id} project={item} activeProjectId={project.id} activeWorktreeId={worktree.id} expanded={expandedProjects[item.id] ?? item.id === project.id} groups={groups.groups} onToggle={() => setExpandedProjects((current) => ({ ...current, [item.id]: !(current[item.id] ?? item.id === project.id) }))} onSelectProject={() => chooseProject(item)} onSelectWorktree={(nextWorktree) => chooseProject(item, nextWorktree)} onMove={(groupId) => moveProject(item.id, groupId)} onCreateWorktree={() => setWorktreeDialog(item)} />)}</section>; })}</div></ScrollArea>
+      <footer className="sidebar-footer"><span className={`status-dot ${connection === "connected" ? "live" : "demo"}`} aria-hidden="true" /><span role="status" aria-live="polite">{connection === "connected" ? "Runtime connected" : connection}</span>{bootstrap.truncated ? <small className="scan-limit" title={`Showing ${bootstrap.projects.length} of ${bootstrap.repositoryCount} discovered repositories. Increase maxProjects in outright.config.json to show more.`}><WarningCircle />{bootstrap.projects.length}/{bootstrap.repositoryCount}</small> : <small>{bootstrap.scanDurationMs ? `${Math.round(bootstrap.scanDurationMs)}ms` : ""}</small>}<Button variant="ghost" size="icon-xs" onClick={() => setSettingsOpen(true)} aria-label="Settings"><GearSix /></Button></footer>
     </aside>
+    {isNarrow && sidebarOpen && <div className="mobile-scrim" onClick={closeSidebar} aria-hidden="true" />}
 
-    <main className={`workspace ${inspector ? "has-inspector" : ""}`}>
-      <header className="workspace-bar">{!sidebarOpen && <Button variant="ghost" size="icon-sm" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar"><SidebarSimple /></Button>}<div className="workspace-context"><span>{project.name}</span><CaretRight /><GitBranch /><strong>{worktree.name}</strong></div><div className="workspace-tools"><RunState run={activeRun ?? latestRun} /><WorktreeState worktree={worktree} /><Tooltip><TooltipTrigger render={<Button variant={inspector === "changes" ? "secondary" : "ghost"} size="icon-sm" onClick={() => setInspector(inspector === "changes" ? null : "changes")} aria-label="Changes" />}><GitDiff /></TooltipTrigger><TooltipContent>Changes</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "terminal" ? "secondary" : "ghost"} size="icon-sm" onClick={() => setInspector(inspector === "terminal" ? null : "terminal")} aria-label="Terminal" />}><TerminalWindow /></TooltipTrigger><TooltipContent>Terminal ⌘⇧T</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "context" ? "secondary" : "ghost"} size="icon-sm" onClick={() => setInspector(inspector === "context" ? null : "context")} aria-label="Project context" />}><Info /></TooltipTrigger><TooltipContent>Project context</TooltipContent></Tooltip><ThemeMenu theme={theme} onThemeChange={setTheme} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Worktree options" />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, editor: settings.editor } }).catch((nextError) => setError(nextError.message))}><FolderOpen />Open in {settings.editor}</DropdownMenuItem>{worktree.isLinked && <DropdownMenuItem variant="destructive" onClick={() => setRemoveWorktreeOpen(true)}><Trash />Remove worktree</DropdownMenuItem>}</DropdownMenuContent></DropdownMenu></div></header>
-      <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll">{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={() => { dragConversationRef.current = item.id; }} onDragOver={(event) => event.preventDefault()} onDrop={() => reorderConversation(item.id)}><button className="tab-select" role="tab" aria-selected={item.id === selectedConversationId} onClick={() => setSelectedConversationId(item.id)} onDoubleClick={() => { setSelectedConversationId(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); api(`/api/conversations/${item.id}`, { method: "PATCH", body: { archived: true } }).then(() => loadConversations()).catch((nextError) => setError(nextError.message)); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
+    <main id="main-workspace" className={`workspace ${inspector ? "has-inspector" : ""}`} inert={isNarrow && sidebarOpen ? true : undefined} aria-hidden={isNarrow && sidebarOpen ? true : undefined}>
+      <header className="workspace-bar">{!sidebarOpen && <Button variant="ghost" size="icon-sm" onClick={openSidebar} aria-label="Open projects sidebar" aria-controls="project-sidebar" aria-expanded={sidebarOpen}><SidebarSimple /></Button>}<div className="workspace-context"><span>{project.name}</span><CaretRight /><GitBranch /><strong>{worktree.name}</strong></div><div className="workspace-tools"><RunState run={activeRun ?? latestRun} /><WorktreeState worktree={worktree} /><Tooltip><TooltipTrigger render={<Button variant={inspector === "changes" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("changes", event.currentTarget)} aria-label="Changes" aria-controls="workspace-inspector" aria-expanded={inspector === "changes"} />}><GitDiff /></TooltipTrigger><TooltipContent>Changes</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "terminal" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("terminal", event.currentTarget)} aria-label="Terminal" aria-controls="workspace-inspector" aria-expanded={inspector === "terminal"} />}><TerminalWindow /></TooltipTrigger><TooltipContent>Terminal ⌘⇧T</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "context" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("context", event.currentTarget)} aria-label="Project context" aria-controls="workspace-inspector" aria-expanded={inspector === "context"} />}><Info /></TooltipTrigger><TooltipContent>Project context</TooltipContent></Tooltip><ThemeMenu theme={theme} onThemeChange={setTheme} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Worktree options" />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, editor: settings.editor } }).then(() => setToast(`Opened in ${settings.editor}`)).catch((nextError) => setError(nextError.message))}><PencilSimple />Open in {settings.editor}</DropdownMenuItem><DropdownMenuItem onClick={() => setWorktreeDialog(project)}><GitBranch />New worktree</DropdownMenuItem>{worktree.isLinked && <><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onClick={() => setRemoveWorktreeOpen(true)}><Trash />Remove worktree</DropdownMenuItem></>}</DropdownMenuContent></DropdownMenu></div></header>
+      <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll" role="tablist" aria-label="Open agent chats" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', setSelectedConversationId)}>{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={() => { dragConversationRef.current = item.id; }} onDragOver={(event) => event.preventDefault()} onDrop={() => reorderConversation(item.id)}><button className="tab-select" id={domId("chat-tab", item.id)} data-tab-id={item.id} role="tab" aria-selected={item.id === selectedConversationId} aria-controls="conversation-panel" tabIndex={item.id === selectedConversationId ? 0 : -1} onClick={() => setSelectedConversationId(item.id)} onDoubleClick={() => { setSelectedConversationId(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); archiveChat(item, event.currentTarget); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
       <div className="work-area">
-        <section className="conversation-pane">
+        <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
           <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} onManage={openManageChat} />
-          <ScrollArea className="message-scroll" viewportRef={messageViewportRef}><div className="message-column">{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? conversation.messages.map((message) => <Message key={message.id} message={message} />) : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}{conversation?.messagePage?.hasLater && <button className="history-return" onClick={loadConversation}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button>}</div></ScrollArea>
+          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages" }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? conversation.messages.map((message) => <Message key={message.id} message={message} />) : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}{conversation?.messagePage?.hasLater && <button className="history-return" onClick={loadConversation}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button>}</div></ScrollArea>
           {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}
-          <form className="composer" onSubmit={sendPrompt}><textarea aria-label="Message the agent" disabled={Boolean(interruptedRun)} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={setDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running"><span className="status-dot demo" />Agent is {activeRun.status}</span> : interruptedRun ? <span className="send-hint running"><WarningCircle />Recovery decision required</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop agent"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun)} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
+          <form className="composer" onSubmit={sendPrompt}>{unsentCreatedChat && <div className="first-prompt-notice" role="status" aria-live="polite">Chat created, but your message was not sent. {unsentForOwner ? firstPromptAwaitingSelection ? "Open the created chat before sending again." : "Send again when the chat is ready." : "Return to its worktree before sending again."}{unsentForOwner && firstPromptAwaitingSelection && conversations.some((item) => item.id === unsentForOwner.id) && <Button type="button" variant="outline" size="sm" onClick={() => setSelectedConversationId(unsentForOwner.id)}>Open created chat</Button>}{!unsentForOwner && unsentProject && unsentWorktree && <Button type="button" variant="outline" size="sm" onClick={() => { pendingConversationRef.current = unsentCreatedChat.id; chooseProject(unsentProject, unsentWorktree); }}>Return to created chat</Button>}<Button type="button" variant="ghost" size="sm" onClick={() => { setUnsentCreatedChat(null); editDraft(""); }}>Discard unsent message</Button></div>}<textarea aria-label="Message the agent" disabled={Boolean(interruptedRun) || submissionUnavailable} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversationLoadFailed ? "Chat unavailable; retry loading…" : waitingForConversation ? "Loading selected chat…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={editDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running" role="status" aria-live="polite"><span className="status-dot demo" aria-hidden="true" />Agent is {activeRun.status}</span> : interruptedRun ? <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Recovery decision required</span> : waitingForConversation ? <span className="send-hint" role="status" aria-live="polite">{conversationLoadFailed ? "Chat unavailable; retry loading" : "Loading selected chat"}</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun) || submissionUnavailable || firstPromptAwaitingSelection} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
         </section>
-        {inspector && <aside className="inspector"><header><nav aria-label="Inspector panels"><button className={inspector === "changes" ? "is-active" : ""} aria-pressed={inspector === "changes"} onClick={() => setInspector("changes")}><GitDiff />Changes</button><button className={inspector === "terminal" ? "is-active" : ""} aria-pressed={inspector === "terminal"} onClick={() => setInspector("terminal")}><TerminalWindow />Terminal</button><button className={inspector === "context" ? "is-active" : ""} aria-pressed={inspector === "context"} onClick={() => setInspector("context")}><TreeStructure />Context</button></nav><Button variant="ghost" size="icon-xs" onClick={() => setInspector(null)} aria-label="Close inspector"><X /></Button></header><div className="inspector-body">{inspector === "changes" && <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />}{inspector === "terminal" && <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} sendRuntime={sendRuntime} onError={handleError} />}{inspector === "context" && <ContextPane worktree={worktree} settings={settings} onError={handleError} />}</div></aside>}
+        {inspector && <aside className="inspector" id="workspace-inspector" aria-label="Workspace inspector" tabIndex={-1} ref={inspectorRef}><header><nav role="tablist" aria-label="Inspector panels" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', setInspector)}><button id="inspector-tab-changes" data-tab-id="changes" role="tab" className={inspector === "changes" ? "is-active" : ""} aria-selected={inspector === "changes"} aria-controls="inspector-content" tabIndex={inspector === "changes" ? 0 : -1} onClick={() => setInspector("changes")}><GitDiff />Changes</button><button id="inspector-tab-terminal" data-tab-id="terminal" role="tab" className={inspector === "terminal" ? "is-active" : ""} aria-selected={inspector === "terminal"} aria-controls="inspector-content" tabIndex={inspector === "terminal" ? 0 : -1} onClick={() => setInspector("terminal")}><TerminalWindow />Terminal</button><button id="inspector-tab-context" data-tab-id="context" role="tab" className={inspector === "context" ? "is-active" : ""} aria-selected={inspector === "context"} aria-controls="inspector-content" tabIndex={inspector === "context" ? 0 : -1} onClick={() => setInspector("context")}><TreeStructure />Context</button></nav><Button variant="ghost" size="icon-xs" onClick={closeInspector} aria-label="Close inspector"><X /></Button></header><div className="inspector-body" id="inspector-content" role="tabpanel" aria-labelledby={`inspector-tab-${inspector}`}>{inspector === "changes" && <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />}{inspector === "terminal" && <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} sendRuntime={sendRuntime} onError={handleError} />}{inspector === "context" && <ContextPane worktree={worktree} settings={settings} onError={handleError} />}</div></aside>}
       </div>
     </main>
 
@@ -498,11 +866,11 @@ export function App() {
 
     <SimpleDialog open={newChatOpen} onOpenChange={setNewChatOpen} title="New agent chat" description={`${project.name} / ${worktree.name}`} onSubmit={(event) => { event.preventDefault(); createConversation(); }} submit="Create chat"><label htmlFor="chat-title">What should the agent work on?</label><Input id="chat-title" autoFocus value={newChatTitle} onChange={(event) => setNewChatTitle(event.target.value)} placeholder="Review the worktree scanner" /></SimpleDialog>
     <SimpleDialog open={newGroupOpen} onOpenChange={setNewGroupOpen} title="Create project group" description="Organize related projects together in the sidebar." onSubmit={createGroup} submit="Create group" disabled={!newGroupName.trim()}><label htmlFor="group-name">Group name</label><Input id="group-name" autoFocus value={newGroupName} onChange={(event) => setNewGroupName(event.target.value)} placeholder="Client work" /></SimpleDialog>
-    <Dialog open={Boolean(trustRequest)} onOpenChange={(open) => !open && setTrustRequest(null)}><DialogContent><DialogHeader><DialogTitle>Trust this project?</DialogTitle><DialogDescription>Agents can read and, under the selected policy, modify files or run commands inside this project.</DialogDescription></DialogHeader>{trustRequest && <div className="trust-card"><ShieldCheck /><div><strong>{trustRequest.name}</strong><code>{trustRequest.path}</code></div></div>}<p className="trust-note">Outright will pass <strong>{settings.approvalPolicy}</strong> to the provider. Full-access mode can make changes beyond the worktree and should only be used in an external sandbox.</p><DialogFooter><Button variant="outline" onClick={() => setTrustRequest(null)}>Cancel</Button><Button onClick={trustAndRun}>Trust and run</Button></DialogFooter></DialogContent></Dialog>
-    <Dialog open={manageChatOpen} onOpenChange={setManageChatOpen}><DialogContent><form className="dialog-form" onSubmit={saveChatSettings}><DialogHeader><DialogTitle>Conversation settings</DialogTitle><DialogDescription>Rename, move, pin, or attach an existing provider session.</DialogDescription></DialogHeader><label>Title</label><Input value={chatDraft.title} onChange={(event) => setChatDraft({ ...chatDraft, title: event.target.value })} /><label>Move to worktree</label><select value={chatDraft.destination} onChange={(event) => setChatDraft({ ...chatDraft, destination: event.target.value })}>{bootstrap.projects.map((item) => <optgroup key={item.id} label={item.name}>{item.worktrees.filter((entry) => !entry.isPrunable && !entry.isBare).map((entry) => <option key={entry.id} value={`${item.id}::${entry.id}`}>{entry.name} · {entry.branch}</option>)}</optgroup>)}</select><label>Provider</label><select value={chatDraft.provider} onChange={(event) => setChatDraft({ ...chatDraft, provider: event.target.value })}>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.label}</option>)}</select><label>Model</label><Input value={chatDraft.model} onChange={(event) => setChatDraft({ ...chatDraft, model: event.target.value })} placeholder="Provider default" /><label>Provider session ID</label><Input value={chatDraft.providerSessionId} onChange={(event) => setChatDraft({ ...chatDraft, providerSessionId: event.target.value })} placeholder="Attach or resume an existing session" /><div className="manage-actions"><Button type="button" variant="outline" onClick={() => updateConversation({ pinned: !conversation.pinned })}><PushPin />{conversation?.pinned ? "Unpin" : "Pin"}</Button><Button type="button" variant="destructive" onClick={archiveConversation}><Archive />Archive</Button></div><DialogFooter><Button variant="outline" type="button" onClick={() => setManageChatOpen(false)}>Cancel</Button><Button type="submit">Save</Button></DialogFooter></form></DialogContent></Dialog>
-    <SimpleDialog open={Boolean(worktreeDialog)} onOpenChange={(open) => !open && setWorktreeDialog(null)} title="Create worktree" description={worktreeDialog?.name ?? ""} onSubmit={createWorktree} submit="Create worktree" disabled={!worktreeDraft.branch.trim()}><label>Branch name</label><Input value={worktreeDraft.branch} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, branch: event.target.value })} placeholder="feature/my-change" /><label>Directory name <small>optional</small></label><Input value={worktreeDraft.name} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, name: event.target.value })} placeholder="project-my-change" /><label>Base revision</label><Input value={worktreeDraft.baseBranch} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, baseBranch: event.target.value })} /></SimpleDialog>
-    <Dialog open={removeWorktreeOpen} onOpenChange={setRemoveWorktreeOpen}><DialogContent><DialogHeader><DialogTitle>Remove worktree?</DialogTitle><DialogDescription>This is allowed only when the linked worktree has no uncommitted changes. Type its exact path to confirm.</DialogDescription></DialogHeader><code className="confirm-path">{worktree.path}</code><Input value={removeConfirmation} onChange={(event) => setRemoveConfirmation(event.target.value)} placeholder="Exact worktree path" /><DialogFooter><Button variant="outline" onClick={() => setRemoveWorktreeOpen(false)}>Cancel</Button><Button variant="destructive" disabled={removeConfirmation !== worktree.path} onClick={removeWorktree}>Remove worktree</Button></DialogFooter></DialogContent></Dialog>
-    {toast && <div className="toast"><CheckCircle weight="fill" />{toast}</div>}{error && <div className="error-toast"><WarningCircle weight="fill" /><span>{error}</span><button onClick={() => setError("")}><X /></button></div>}
+    <Dialog open={Boolean(trustRequest)} onOpenChange={(open) => !open && setTrustRequest(null)}><DialogContent><DialogHeader><DialogTitle>Trust this project?</DialogTitle><DialogDescription>Agents can read and, under the selected policy, modify files or run commands inside this project.</DialogDescription></DialogHeader>{trustRequest && <div className="trust-card"><ShieldCheck /><div><strong>{trustRequest.name}</strong><code>{trustRequest.path}</code></div></div>}<p className="trust-note">Outright will pass <strong>{settings.approvalPolicy}</strong> to the provider. Full-access mode can make changes beyond the worktree and should only be used in an external sandbox.</p><DialogFooter><Button variant="outline" onClick={() => setTrustRequest(null)}>Cancel</Button><Button disabled={submissionUnavailable} onClick={trustAndRun}>Trust and run</Button></DialogFooter></DialogContent></Dialog>
+    <Dialog open={manageChatOpen} onOpenChange={setManageChatOpen}><DialogContent><form className="dialog-form" onSubmit={saveChatSettings}><DialogHeader><DialogTitle>Conversation settings</DialogTitle><DialogDescription>Rename, move, pin, or attach an existing provider session.</DialogDescription></DialogHeader><label htmlFor="chat-settings-title">Title</label><Input id="chat-settings-title" value={chatDraft.title} onChange={(event) => setChatDraft({ ...chatDraft, title: event.target.value })} /><label htmlFor="chat-settings-destination">Move to worktree</label><select id="chat-settings-destination" value={chatDraft.destination} onChange={(event) => setChatDraft({ ...chatDraft, destination: event.target.value })}>{bootstrap.projects.map((item) => <optgroup key={item.id} label={item.name}>{item.worktrees.filter((entry) => !entry.isPrunable && !entry.isBare).map((entry) => <option key={entry.id} value={`${item.id}::${entry.id}`}>{entry.name} · {entry.branch}</option>)}</optgroup>)}</select><label htmlFor="chat-settings-provider">Provider</label><select id="chat-settings-provider" value={chatDraft.provider} onChange={(event) => setChatDraft({ ...chatDraft, provider: event.target.value })}>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.label}</option>)}</select><label htmlFor="chat-settings-model">Model</label><Input id="chat-settings-model" value={chatDraft.model} onChange={(event) => setChatDraft({ ...chatDraft, model: event.target.value })} placeholder="Provider default" /><label htmlFor="chat-settings-session">Provider session ID</label><Input id="chat-settings-session" value={chatDraft.providerSessionId} onChange={(event) => setChatDraft({ ...chatDraft, providerSessionId: event.target.value })} placeholder="Attach or resume an existing session" /><div className="manage-actions"><Button type="button" variant="outline" onClick={() => updateConversation({ pinned: !conversation.pinned })}><PushPin />{conversation?.pinned ? "Unpin" : "Pin"}</Button><Button type="button" variant="destructive" onClick={archiveConversation}><Archive />Archive conversation</Button></div><DialogFooter><Button variant="outline" type="button" onClick={() => setManageChatOpen(false)}>Cancel</Button><Button type="submit">Save</Button></DialogFooter></form></DialogContent></Dialog>
+    <SimpleDialog open={Boolean(worktreeDialog)} onOpenChange={(open) => !open && setWorktreeDialog(null)} title="Create worktree" description={worktreeDialog?.name ?? ""} onSubmit={createWorktree} submit="Create worktree" disabled={!worktreeDraft.branch.trim()}><label htmlFor="worktree-branch">Branch name</label><Input id="worktree-branch" value={worktreeDraft.branch} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, branch: event.target.value })} placeholder="feature/my-change" /><label htmlFor="worktree-directory">Directory name <small>optional</small></label><Input id="worktree-directory" value={worktreeDraft.name} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, name: event.target.value })} placeholder="project-my-change" /><label htmlFor="worktree-base">Base revision</label><Input id="worktree-base" value={worktreeDraft.baseBranch} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, baseBranch: event.target.value })} /></SimpleDialog>
+    <Dialog open={removeWorktreeOpen} onOpenChange={setRemoveWorktreeOpen}><DialogContent><DialogHeader><DialogTitle>Remove worktree?</DialogTitle><DialogDescription>This is allowed only when the linked worktree has no uncommitted changes. Type its exact path to confirm.</DialogDescription></DialogHeader><code className="confirm-path">{worktree.path}</code><label htmlFor="remove-worktree-confirmation">Confirmation path</label><Input id="remove-worktree-confirmation" value={removeConfirmation} onChange={(event) => setRemoveConfirmation(event.target.value)} placeholder="Exact worktree path" /><DialogFooter><Button variant="outline" onClick={() => setRemoveWorktreeOpen(false)}>Cancel</Button><Button variant="destructive" disabled={removeConfirmation !== worktree.path} onClick={removeWorktree}>Remove worktree</Button></DialogFooter></DialogContent></Dialog>
+    {toast && <div className="toast" role="status" aria-live="polite"><CheckCircle weight="fill" />{toast}</div>}{error && <div className="error-toast" role="alert" aria-live="assertive"><WarningCircle weight="fill" /><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error"><X /></button></div>}
   </div>;
 }
 
@@ -511,8 +879,8 @@ function ProjectTree({ project, activeProjectId, activeWorktreeId, expanded, gro
 }
 function ConversationHeader({ conversation, worktree, latestRun, onManage }) { return <section className="conversation-header"><div className="conversation-symbol"><ChatCircle weight="duotone" /></div><div><h1>{conversation?.title ?? "No conversation selected"}</h1><p><GitBranch />{worktree.branch}<span>·</span>{compactPath(worktree.path)}</p></div><div className="conversation-meta">{conversation && <button onClick={onManage}><span>{conversation.provider}</span><PencilSimple /></button>}{latestRun && <small>{runSummary(latestRun)}</small>}</div></section>; }
 function Message({ message }) { const user = message.role === "user"; if (message.kind === "tool") return <article className="message is-agent is-tool" data-message-id={message.id}><div className="avatar"><CheckCircle weight="fill" /></div><div className="message-body"><p className="message-text">{message.body}</p></div></article>; return <article className={`message ${user ? "is-user" : "is-agent"}`} data-message-id={message.id}><div className="avatar">{user ? "Y" : <Sparkle weight="fill" />}</div><div className="message-body"><div className="message-meta"><strong>{user ? "You" : "Outright"}</strong><time>{formatTime(message.createdAt)}</time></div><p className="message-text">{message.body}</p>{message.payload?.runId && <small className="message-run">{message.payload.provider} · {message.payload.runId.slice(0, 8)}</small>}</div></article>; }
-function StreamingMessage({ text, events }) { return <article className="message is-agent is-streaming"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" /></div><p className="message-text">{text}</p><ToolActivity events={events} /></div></article>; }
-function RunningMessage({ run, events }) { return <article className="message is-agent is-streaming"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" /></div><p className="thinking-copy">{run.status === "queued" ? "Waiting for an execution slot…" : "Working in this worktree…"}</p><ToolActivity events={events} /></div></article>; }
+function StreamingMessage({ text, events }) { return <article className="message is-agent is-streaming" aria-busy="true"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="message-text">{text}</p><ToolActivity events={events} /></div></article>; }
+function RunningMessage({ run, events }) { return <article className="message is-agent is-streaming" role="status" aria-live="polite"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="thinking-copy">{run.status === "queued" ? "Waiting for an execution slot…" : "Working in this worktree…"}</p><ToolActivity events={events} /></div></article>; }
 // Interrupted runs surface here until the operator picks a continuation
 // policy; the preserved partial output stays visible above the notice.
 function RecoveryNotice({ run, conversation, recoveryConversation, onOpenRecovery, onResolve }) {
@@ -541,16 +909,17 @@ function RecoveryNotice({ run, conversation, recoveryConversation, onOpenRecover
 function ToolActivity({ events }) { if (!events.length) return null; return <div className="tool-activity">{events.slice(-4).map((event) => <div key={event.id}><CheckCircle /><span>{toolLabel(event)}</span></div>)}</div>; }
 function EmptyChat({ worktree, onCreate }) { return <div className="empty-chat"><ChatCircle size={29} /><h2>Start in {worktree.name}</h2><p>Create a durable conversation, then run Codex or Claude directly in this worktree.</p><Button onClick={onCreate}><Plus />New chat</Button></div>; }
 function WorktreeState({ worktree }) { if (worktree.isPrunable) return <span className="worktree-state warning"><WarningCircle />stale</span>; if (worktree.changedCount) return <span className="worktree-state warning"><GitDiff />{worktree.changedCount} changed</span>; return <span className="worktree-state clean"><Check />clean</span>; }
-function RunState({ run }) { if (!run) return null; const running = ["queued", "launching", "running"].includes(run.status); const pendingDecision = run.status === "interrupted" && !run.recoveryDecision; return <span className={`run-state ${run.status}`} title={pendingDecision ? "Restart interrupted this run; choose a continuation below" : undefined}><span className={`status-dot ${running || pendingDecision ? "demo" : run.status === "completed" ? "live" : "error"}`} />{run.status}{run.costUsd != null && <small>${Number(run.costUsd).toFixed(3)}</small>}</span>; }
+function RunState({ run }) { if (!run) return null; const running = ["queued", "launching", "running"].includes(run.status); const pendingDecision = run.status === "interrupted" && !run.recoveryDecision; return <span className={`run-state ${run.status}`} role="status" aria-live="polite" title={pendingDecision ? "Restart interrupted this run; choose a continuation below" : undefined}><span className={`status-dot ${running || pendingDecision ? "demo" : run.status === "completed" ? "live" : "error"}`} aria-hidden="true" />{run.status}{run.costUsd != null && <small>${Number(run.costUsd).toFixed(3)}</small>}</span>; }
 function GitHealth({ worktree }) { if (worktree.isPrunable) return <span className="git-health warning"><WarningCircle /></span>; if (worktree.changedCount) return <span className="git-health warning"><span className="status-dot demo" />{worktree.changedCount}</span>; return <span className="git-health clean"><Check /></span>; }
 function TemplateMenu({ templates, onSelect }) { if (!templates.length) return null; return <DropdownMenu><DropdownMenuTrigger render={<Button type="button" variant="ghost" size="icon-sm" aria-label="Prompt templates" />}><ClockCounterClockwise /></DropdownMenuTrigger><DropdownMenuContent align="start"><DropdownMenuGroup><DropdownMenuLabel>Prompt templates</DropdownMenuLabel>{templates.map((template) => <DropdownMenuItem key={template.id} onClick={() => onSelect(template.prompt)}>{template.title}</DropdownMenuItem>)}</DropdownMenuGroup></DropdownMenuContent></DropdownMenu>; }
 function ThemeMenu({ theme, onThemeChange }) { const Icon = theme === "light" ? Sun : theme === "dark" ? Moon : Desktop; return <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Change theme" />}><Icon /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup><DropdownMenuLabel>Appearance</DropdownMenuLabel></DropdownMenuGroup><DropdownMenuRadioGroup value={theme} onValueChange={onThemeChange}><DropdownMenuRadioItem value="system"><Desktop />System</DropdownMenuRadioItem><DropdownMenuRadioItem value="light"><Sun />Light</DropdownMenuRadioItem><DropdownMenuRadioItem value="dark"><Moon />Dark</DropdownMenuRadioItem></DropdownMenuRadioGroup></DropdownMenuContent></DropdownMenu>; }
 function SimpleDialog({ open, onOpenChange, title, description, onSubmit, submit, disabled, children }) { return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><form className="dialog-form" onSubmit={onSubmit}><DialogHeader><DialogTitle>{title}</DialogTitle><DialogDescription>{description}</DialogDescription></DialogHeader>{children}<DialogFooter><Button type="button" variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button><Button type="submit" disabled={disabled}>{submit}</Button></DialogFooter></form></DialogContent></Dialog>; }
-function LoadingScreen({ isScanning }) { return <div className="loading-screen"><span className="brand-glyph"><Sparkle weight="fill" /></span><h1>Outright</h1><p>{isScanning ? "Starting the local runtime…" : "No projects found"}</p></div>; }
+function LoadingScreen({ isScanning }) { return <div className="loading-screen" role="status" aria-live="polite"><span className="brand-glyph"><Sparkle weight="fill" /></span><h1>Outright</h1><p>{isScanning ? "Starting the local runtime…" : "No projects found"}</p></div>; }
 function buildGroupedProjects(projects, state) { const result = state.groups.map((group) => ({ ...group, projects: projects.filter((project) => state.memberships[project.id] === group.id) })); const ungrouped = projects.filter((project) => !state.groups.some((group) => group.id === state.memberships[project.id])); return ungrouped.length ? [...result, { id: "ungrouped", name: "Ungrouped", projects: ungrouped }] : result; }
 function preferredWorktree(project) { return project.worktrees.find((item) => item.name === "dev" || item.path.endsWith("-dev")) ?? project.worktrees.find((item) => item.branch === "next") ?? project.worktrees[0]; }
 function compactPath(value = "") { return value.replace(/^\/Users\/[^/]+/, "~"); }
 function defaultSettings() { return { provider: "codex", model: "", reasoningEffort: "medium", approvalPolicy: "workspace-write", editor: "zed", notifications: true, maxConcurrentRuns: 3 }; }
+function focusableElements(container) { return container ? [...container.querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')].filter((element) => element.getClientRects().length && element.getAttribute("aria-hidden") !== "true") : []; }
 function boundStreamingText(value) { return value.length > MAX_STREAMING_CHARACTERS ? `${value.slice(0, MAX_STREAMING_CHARACTERS)}${LIVE_TRUNCATION_MARKER}` : value; }
 function formatTime(value) { return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(value)); }
 function runSummary(run) { const tokens = Number(run.inputTokens ?? 0) + Number(run.outputTokens ?? 0); return `${run.status}${tokens ? ` · ${tokens.toLocaleString()} tokens` : ""}${run.costUsd != null ? ` · $${Number(run.costUsd).toFixed(3)}` : ""}`; }
