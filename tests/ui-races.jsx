@@ -2406,6 +2406,56 @@ async function findWhileMetadataRefreshRegression() {
   }
 }
 
+async function metadataBeforeFindResultRegression() {
+  for (const kind of ["completion", "reconnect", "list", "no-match", "error"]) {
+    root.render(null); await settle();
+    keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+    const message = (index) => ({ id: `pending-${index}`, role: "assistant", kind: "text", body: `Match ${index}`, createdAt: new Date(index * 1000).toISOString() });
+    const older = Array.from({ length: 20 }, (_, index) => message(index));
+    const latest = Array.from({ length: 20 }, (_, index) => message(index + 80));
+    const running = { ...chats.A, runs: [{ id: "run-pending", status: "running", conversationId: "chat-A" }] };
+    const completed = { ...running, runs: [{ id: "run-pending", status: "completed", conversationId: "chat-A" }] };
+    const pendingFind = deferred();
+    let findRequested = false;
+    let detailReads = 0;
+    route = async (url) => {
+      if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+      if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+      if (url.pathname.endsWith("/messages/find")) { findRequested = true; return pendingFind.promise; }
+      if (url.pathname === "/api/conversations/chat-A/messages/count") return response({ total: 100 });
+      if (url.pathname === "/api/conversations/chat-A") {
+        detailReads += 1;
+        return response({ ...(detailReads === 1 ? running : completed), messages: latest, messagePage: { total: 100, olderCount: 80, beforeId: "pending-80" } });
+      }
+      return response({});
+    };
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('[aria-label="Stop active agent run"]'), `${kind} initial run`);
+    const input = host.querySelector(".history-find input");
+    setControlValue(input, "Match 10"); await settle();
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await until(() => findRequested, `${kind} find pending`);
+    const event = kind === "completion" ? { type: "run.event", conversationId: "chat-A", runId: "run-pending", payload: { type: "run.completed" } }
+      : kind === "reconnect" ? { type: "runtime.connected", payload: { replay: { missed: true } } }
+        : { type: "conversation.updated", conversationId: "chat-A" };
+    fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
+    await until(() => detailReads > 1 && !host.querySelector('[aria-label="Stop active agent run"]'), `${kind} metadata before find`);
+    assert(host.querySelector('.history-find [role="status"]')?.textContent === "Searching…", `${kind} metadata reset the pending search`);
+    if (kind === "error") pendingFind.resolve(response({ error: "Search unavailable" }, 503));
+    else pendingFind.resolve(response({ matchId: kind === "no-match" ? null : "pending-10", messages: older, messagePage: { total: 100, olderCount: 0, newerCount: 80, hasLater: true, beforeId: "pending-0" } }));
+    if (kind === "no-match" || kind === "error") {
+      await until(() => host.querySelector('.history-find [role="status"]')?.textContent === (kind === "error" ? "Search failed; retry" : "No match"), `${kind} status after metadata`);
+      assert(host.querySelector('[data-message-id="pending-80"]') && !host.querySelector('.history-return') && host.querySelector('[aria-label="Send message"]'), `${kind} replaced the latest page or kept stale run metadata`);
+      continue;
+    }
+    await until(() => host.querySelector('[data-find-match="true"] [data-message-id="pending-10"]'), `${kind} found old page after metadata`);
+    const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+    const match = host.querySelector('[data-find-match="true"]');
+    assert(match.getBoundingClientRect().bottom > viewport.getBoundingClientRect().top && match.getBoundingClientRect().top < viewport.getBoundingClientRect().bottom, `${kind} did not align the found row`);
+    assert(host.querySelector('.history-return') && host.querySelector('[aria-label="Send message"]'), `${kind} lost the reading page or current run metadata`);
+  }
+}
+
 async function findInFlightEventRegression() {
   root.render(null); await settle();
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
@@ -2945,6 +2995,7 @@ try {
     ["background completion page ownership", backgroundCompletionKeepsExplicitPageRegression, "run completion cannot supersede an explicit Return to latest request"],
     ["latest before find ownership", latestBeforeFindOwnershipRegression, "an older Return to latest response cannot supersede a newer find"],
     ["find during metadata refresh", findWhileMetadataRefreshRegression, "completion, reconnect and list metadata survive a concurrent Find without replacing its page"],
+    ["metadata before find result", metadataBeforeFindResultRegression, "completion, reconnect and list metadata may settle before Find without clearing a match, miss, or error"],
     ["checkpoint reading page", checkpointReadingPageRegression, "reconnect, completion and list updates retain a reading page and unique checkpoint counts"],
     ["find in-flight event", findInFlightEventRegression, "an event during find remains reachable when the returned page claims to be latest"],
     ["typing during prepend", typingDuringPrependRegression, "editing a find query does not silently cancel an earlier-page request"],

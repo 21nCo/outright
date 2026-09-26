@@ -357,6 +357,10 @@ export function App() {
       return;
     }
     const requestedId = selectedConversationId;
+    // A metadata read that starts while Find is pending must keep that page
+    // intent even if the search resolves before this detail response does.
+    // The detail still refreshes run/recovery state, but never resets Find.
+    const preservePendingFind = preservePage && pendingFindRef.current?.conversationId === requestedId;
     pendingConversationLoadRef.current?.controller?.abort();
     const controller = new AbortController();
     const pendingLoad = { conversationId: requestedId, preservePage, events: [], eventBytes: 0, overflowed: false, controller };
@@ -381,7 +385,8 @@ export function App() {
       }
       pendingConversationLoadRef.current = null;
       const replayed = replayConversationEvents(nextConversation.messages, pendingLoad.events, MAX_RENDERED_MESSAGES);
-      const preserveReading = preservePage && (conversationRef.current?.messagePage?.hasLater || !stickToBottomRef.current
+      const preserveReading = preservePage && (preservePendingFind || pendingFindRef.current?.conversationId === requestedId
+        || conversationRef.current?.messagePage?.hasLater || !stickToBottomRef.current
         || startedHistoryGeneration !== historyGenerationRef.current);
       readyConversationRef.current = nextConversation;
       setConversationDetailReady(true);
