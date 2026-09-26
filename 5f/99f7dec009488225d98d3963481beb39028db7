@@ -1,0 +1,27 @@
+server/agent-manager.mjs
+  s_ee6f287c08acb3::t_53092cebf8ae18 1,264-271,291-293,333,336-344,648
+server/agent-manager.test.mjs
+  s_ee6f287c08acb3::t_b8d43b98b70994 5,29-82,251,272,771,790
+src/App.jsx
+  s_ee6f287c08acb3::t_f76a72de70e0b6 722-726,1026-1033,1057-1063
+tests/ui-races.jsx
+  s_ee6f287c08acb3::t_cf3967a720cdf0 1840-1859,2119-2162,2368-2408,2941,2947,2955
+tests/ui-races.test.mjs
+  s_ee6f287c08acb3::t_7c0a581101d0d2 603,606,612,667,825
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5f99f7dec009488225d98d3963481beb39028db7",
+  "prompts": {},
+  "sessions": {
+    "s_ee6f287c08acb3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0dbe8-d479-71a1-9012-f08e8b29a7ff",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
