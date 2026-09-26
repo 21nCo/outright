@@ -250,6 +250,25 @@ for (const operation of ["send", "recovery"]) {
   })());
 }
 
+for (const operation of ["send", "recovery"]) {
+  test(`provider removal denies ${operation} before durable side effects`, { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+    runtime.agents.providerAvailable = async () => false;
+    const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Removed provider", provider: "codex" });
+    let interrupted;
+    if (operation === "recovery") {
+      interrupted = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "codex", approvalPolicy: "read-only", prompt: "unfinished" });
+      runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+    }
+    const result = responseCapture();
+    await runtime.handleRequest(requestStream("POST", operation === "send" ? `/api/conversations/${conversation.id}/runs` : `/api/runs/${interrupted.id}/resume`, operation === "send" ? { prompt: "must not persist" } : { policy: "retry" }), result);
+    assert.equal(result.statusCode, 409);
+    assert.match(result.body.error, /CLI is not available/);
+    assert.deepEqual(runtime.database.listMessages(conversation.id), []);
+    assert.equal(runtime.database.listRuns(conversation.id).length, operation === "send" ? 0 : 1);
+    if (interrupted) assert.equal(runtime.database.getRun(interrupted.id).recoveryDecision, null);
+  }));
+}
+
 test("validation rendezvous fails promptly when an HTTP error settles before the gate", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
   const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Early rejection", provider: "codex" });
   const original = runtime.git.requireWorktree;

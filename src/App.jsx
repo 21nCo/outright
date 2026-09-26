@@ -86,6 +86,8 @@ export function App() {
   const messageViewportRef = useRef(null);
   const stickToBottomRef = useRef(true);
   const pendingPrependScrollRef = useRef(null);
+  const pendingEarlierRef = useRef(null);
+  const pendingLiveScrollRef = useRef(null);
   const historyGenerationRef = useRef(0);
   const sidebarRef = useRef(null);
   const sidebarFocusIntentRef = useRef(null);
@@ -143,8 +145,9 @@ export function App() {
   }, []);
 
   useEffect(() => { loadBootstrap(); }, [loadBootstrap]);
+  const providersChecking = Boolean(bootstrap?.providers?.some((provider) => provider.checking));
   useEffect(() => {
-    if (!bootstrap?.providers?.some((provider) => provider.checking)) return;
+    if (!providersChecking) return;
     let active = true;
     let pending = false;
     const refreshProviders = async () => {
@@ -159,7 +162,7 @@ export function App() {
     refreshProviders();
     const timer = window.setInterval(refreshProviders, 1000);
     return () => { active = false; window.clearInterval(timer); };
-  }, [bootstrap?.providers]);
+  }, [providersChecking]);
   useEffect(() => {
     if (!bootstrap?.projects.length) return;
     const project = bootstrap.projects.find((item) => item.id === selectedProjectId) ?? bootstrap.projects.find((item) => item.name === "superfunctions") ?? bootstrap.projects[0];
@@ -222,6 +225,11 @@ export function App() {
   }, [project?.id, worktree?.id]);
 
   function resetConversationContext() {
+    pendingLiveScrollRef.current = null;
+    pendingEarlierRef.current = null;
+    pendingPrependScrollRef.current = null;
+    ++historyGenerationRef.current;
+    setLoadingEarlier(false);
     ++conversationListRequestRef.current;
     pendingConversationLoadRef.current?.controller?.abort();
     pendingConversationLoadRef.current = null;
@@ -248,6 +256,10 @@ export function App() {
   useEffect(() => { if (selectedWorktreeId) localStorage.setItem("outright.selected-worktree", selectedWorktreeId); }, [selectedWorktreeId]);
   useEffect(() => { if (selectedConversationId) localStorage.setItem("outright.selected-conversation", selectedConversationId); }, [selectedConversationId]);
   const loadConversation = useCallback(async () => {
+    ++historyGenerationRef.current;
+    pendingPrependScrollRef.current = null;
+    pendingEarlierRef.current = null;
+    setLoadingEarlier(false);
     readyConversationRef.current = null;
     setConversationDetailReady(false);
     setConversationLoadFailed(false);
@@ -335,6 +347,9 @@ export function App() {
     if (shouldReloadConversationForResolvedRun(event, selectedConversationRef.current, selectedRecoveryRunId)) loadConversation();
     if (event.type === "message.created" && event.conversationId === selectedConversationRef.current) {
       if (isStaleCheckpointMessage(checkpointCursorsRef.current, event.payload)) return;
+      if (!stickToBottomRef.current && !pendingPrependScrollRef.current && messageViewportRef.current) {
+        pendingLiveScrollRef.current = { conversationId: event.conversationId, top: messageViewportRef.current.scrollTop };
+      }
       recordCheckpointCursor(checkpointCursorsRef.current, event.payload);
       applyStreamingText((current) => streamingTextAfterRuntimeEvent(current, event), true);
       setConversation((current) => {
@@ -547,6 +562,12 @@ export function App() {
     if (column) resize.observe(column);
     return () => { viewport.removeEventListener("scroll", updateStickiness); resize.disconnect(); };
   }, [conversation?.id]);
+  useLayoutEffect(() => {
+    const pending = pendingLiveScrollRef.current;
+    if (!pending || pending.conversationId !== conversation?.id) return;
+    pendingLiveScrollRef.current = null;
+    if (messageViewportRef.current) messageViewportRef.current.scrollTop = pending.top;
+  }, [conversation]);
   useLayoutEffect(() => {
     const pending = pendingPrependScrollRef.current;
     const viewport = messageViewportRef.current;
@@ -793,16 +814,18 @@ export function App() {
   async function stopRun() { try { await api(`/api/runs/${activeRun.id}/stop`, { method: "POST" }); } catch (nextError) { setError(nextError.message); } }
   async function loadEarlierMessages() {
     if (!conversation?.messagePage?.hasMore || loadingEarlier || !conversation.messages[0]) return;
-    const historyGeneration = historyGenerationRef.current;
+    const historyGeneration = ++historyGenerationRef.current;
     const viewport = messageViewportRef.current;
     const anchor = viewport?.querySelector(`[data-message-id="${CSS.escape(conversation.messages[0].id)}"]`);
-    pendingPrependScrollRef.current = { messageId: conversation.messages[0].id, top: anchor?.getBoundingClientRect().top };
+    const pendingPrepend = { messageId: conversation.messages[0].id, top: anchor?.getBoundingClientRect().top };
+    pendingPrependScrollRef.current = pendingPrepend;
+    pendingEarlierRef.current = pendingPrepend;
     stickToBottomRef.current = false;
     setLoadingEarlier(true);
     try {
       const result = await api(query(`/api/conversations/${conversation.id}/messages`, { before: conversation.messages[0].id, limit: 200 }));
       if (historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversation.id) return;
-      if (pendingPrependScrollRef.current?.messageId === conversation.messages[0].id) pendingPrependScrollRef.current.prependedCount = result.messages.length;
+      if (pendingPrependScrollRef.current === pendingPrepend) pendingPrepend.prependedCount = result.messages.length;
       checkpointCursorsRef.current = checkpointCursors(result.messages, checkpointCursorsRef.current);
       setConversation((current) => {
         if (current?.id !== conversation.id) return current;
@@ -818,20 +841,27 @@ export function App() {
           },
         };
       });
-    } catch (nextError) { pendingPrependScrollRef.current = null; setError(nextError.message); }
-    finally { setLoadingEarlier(false); }
+    } catch (nextError) {
+      if (pendingPrependScrollRef.current === pendingPrepend) pendingPrependScrollRef.current = null;
+      if (historyGeneration === historyGenerationRef.current && selectedConversationRef.current === conversation.id) setError(nextError.message);
+    } finally {
+      if (pendingPrependScrollRef.current === pendingPrepend && (historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversation.id)) pendingPrependScrollRef.current = null;
+      if (pendingEarlierRef.current === pendingPrepend) { pendingEarlierRef.current = null; setLoadingEarlier(false); }
+    }
   }
 
   async function findConversationMessage(needle, direction, afterId) {
     const conversationId = selectedConversationRef.current;
     if (!conversationId) return null;
     const historyGeneration = ++historyGenerationRef.current;
+    pendingPrependScrollRef.current = null;
+    pendingEarlierRef.current = null;
+    setLoadingEarlier(false);
     const result = await api(query(`/api/conversations/${conversationId}/messages/find`, {
       q: needle, after: afterId || undefined, direction: direction < 0 ? "previous" : "next",
     }));
     if (historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversationId) return null;
     if (!result.matchId) return null;
-    pendingPrependScrollRef.current = null;
     stickToBottomRef.current = false;
     checkpointCursorsRef.current = checkpointCursors(result.messages, checkpointCursorsRef.current);
     setConversation((current) => current?.id === conversationId ? { ...current, messages: result.messages, messagePage: result.messagePage } : current);
@@ -940,7 +970,7 @@ export function App() {
       <div className="work-area">
         <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
           <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} onManage={openManageChat} />
-          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages" }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? <WindowedMessages key={conversation.id} messages={conversation.messages} viewportRef={messageViewportRef} renderMessage={(message) => <Message message={message} />} onFind={findConversationMessage} onCancelFind={() => { ++historyGenerationRef.current; }} /> : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}{conversation?.messagePage?.hasLater && <button className="history-return" onClick={loadConversation}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button>}</div></ScrollArea>
+          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages" }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? <WindowedMessages key={conversation.id} messages={conversation.messages} viewportRef={messageViewportRef} renderMessage={(message) => <Message message={message} />} onFind={findConversationMessage} onCancelFind={() => { ++historyGenerationRef.current; pendingPrependScrollRef.current = null; pendingEarlierRef.current = null; setLoadingEarlier(false); }} /> : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}{conversation?.messagePage?.hasLater && <button className="history-return" onClick={loadConversation}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button>}</div></ScrollArea>
           {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}
           <form className="composer" onSubmit={sendPrompt}>{unsentCreatedChat && <div className="first-prompt-notice" role="status" aria-live="polite">Chat created, but your message was not sent. {unsentForOwner ? firstPromptAwaitingSelection ? "Open the created chat before sending again." : "Send again when the chat is ready." : "Return to its worktree before sending again."}{unsentForOwner && firstPromptAwaitingSelection && conversations.some((item) => item.id === unsentForOwner.id) && <Button type="button" variant="outline" size="sm" onClick={() => setSelectedConversationId(unsentForOwner.id)}>Open created chat</Button>}{!unsentForOwner && unsentProject && unsentWorktree && <Button type="button" variant="outline" size="sm" onClick={() => { pendingConversationRef.current = unsentCreatedChat.id; chooseProject(unsentProject, unsentWorktree); }}>Return to created chat</Button>}<Button type="button" variant="ghost" size="sm" onClick={() => { setUnsentCreatedChat(null); editDraft(""); }}>Discard unsent message</Button></div>}<textarea aria-label="Message the agent" disabled={Boolean(interruptedRun) || submissionUnavailable} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversationLoadFailed ? "Chat unavailable; retry loading…" : waitingForConversation ? "Loading selected chat…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={editDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running" role="status" aria-live="polite"><span className="status-dot demo" aria-hidden="true" />Agent is {activeRun.status}</span> : interruptedRun ? <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Recovery decision required</span> : waitingForConversation ? <span className="send-hint" role="status" aria-live="polite">{conversationLoadFailed ? "Chat unavailable; retry loading" : "Loading selected chat"}</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun) || submissionUnavailable || firstPromptAwaitingSelection} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
         </section>

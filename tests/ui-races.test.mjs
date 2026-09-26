@@ -814,7 +814,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       if (viewportError) throw viewportError;
       return send(method, params);
     }, deadline);
-    assert.match(state.text, /60 interaction regressions passed/);
+    assert.match(state.text, /63 interaction regressions passed/);
     const performanceFixture = state.text.match(/Performance fixture: (\{[^\n]+\})/);
     assert.ok(performanceFixture, "large fixture measurements were not recorded");
     console.log(`UI performance: ${performanceFixture[1]}`);

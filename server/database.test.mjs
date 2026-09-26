@@ -55,6 +55,19 @@ test("conversation find reaches old and new pages, wraps, and treats query text 
   } finally { database.close(); }
 });
 
+test("conversation find folds Unicode consistently across old and new pages", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Unicode", provider: "codex" });
+    const old = database.addMessage({ conversationId: chat.id, role: "user", body: "CAFÉ ÉTÉ" });
+    for (let index = 0; index < 205; index += 1) database.addMessage({ conversationId: chat.id, role: "user", body: `filler ${index}` });
+    const recent = database.addMessage({ conversationId: chat.id, role: "user", body: "Café été" });
+    assert.equal(database.findMessagePage(chat.id, "café", null).matchId, old.id);
+    assert.equal(database.findMessagePage(chat.id, "CAFÉ", old.id).matchId, recent.id);
+    assert.equal(database.findMessagePage(chat.id, "ÉTÉ", recent.id, -1).matchId, old.id);
+  } finally { database.close(); }
+});
+
 test("runs retain immutable worktree ownership and unresolved recovery blocks move or archive", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

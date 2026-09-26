@@ -12,13 +12,15 @@ export function WindowedMessages({ messages, viewportRef, renderMessage, onFind,
   const [needle, setNeedle] = useState("");
   const [foundIndex, setFoundIndex] = useState(-1);
   const [foundId, setFoundId] = useState(null);
+  const [findRequest, setFindRequest] = useState(0);
   const [searching, setSearching] = useState(false);
   const [searched, setSearched] = useState(false);
   const [searchError, setSearchError] = useState(false);
   const searchGenerationRef = useRef(0);
+  const pendingFoundRef = useRef(null);
 
   async function find(direction = 1) {
-    const query = needle.trim().toLocaleLowerCase();
+    const query = needle.trim();
     if (!query || !messages.length) return;
     if (onFind) {
       const generation = ++searchGenerationRef.current;
@@ -28,6 +30,8 @@ export function WindowedMessages({ messages, viewportRef, renderMessage, onFind,
         if (generation !== searchGenerationRef.current) return;
         setSearchError(false);
         setFoundId(id);
+        pendingFoundRef.current = id;
+        if (id) setFindRequest((current) => current + 1);
         setSearched(true);
         setFoundIndex(messages.findIndex((message) => message.id === id));
       } catch {
@@ -38,7 +42,7 @@ export function WindowedMessages({ messages, viewportRef, renderMessage, onFind,
     let index = foundIndex;
     for (let checked = 0; checked < messages.length; checked += 1) {
       index = (index + direction + messages.length) % messages.length;
-      if (!String(messages[index].body ?? "").toLocaleLowerCase().includes(query)) continue;
+      if (!String(messages[index].body ?? "").toLocaleLowerCase().includes(query.toLocaleLowerCase())) continue;
       setFoundIndex(index);
       setFoundId(messages[index].id);
       setSearched(true);
@@ -78,14 +82,16 @@ export function WindowedMessages({ messages, viewportRef, renderMessage, onFind,
     const index = messages.findIndex((message) => message.id === foundId);
     if (index < 0) return;
     setFoundIndex(index);
+    if (pendingFoundRef.current !== foundId) return;
     const viewport = viewportRef.current;
     const list = listRef.current;
     if (!viewport || !list) return;
     let offset = viewport.scrollTop + list.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
     for (let row = 0; row < index; row += 1) offset += heightsRef.current.get(messages[row].id) ?? ESTIMATED_MESSAGE_HEIGHT;
     viewport.scrollTop = Math.max(0, offset - viewport.clientHeight / 3);
+    pendingFoundRef.current = null;
     update();
-  }, [foundId, messages, viewportRef, update]);
+  }, [foundId, findRequest, messages, viewportRef, update]);
 
   useEffect(() => {
     const ids = new Set(messages.map((message) => message.id));
@@ -118,7 +124,7 @@ export function WindowedMessages({ messages, viewportRef, renderMessage, onFind,
     return () => resize.disconnect();
   }, [messages, range.start, range.end, update]);
 
-  return <><div className="history-find" role="search" aria-label="Find in conversation"><input aria-label="Find in conversation" maxLength={200} value={needle} onChange={(event) => { ++searchGenerationRef.current; onCancelFind?.(); setNeedle(event.target.value); setFoundIndex(-1); setFoundId(null); setSearching(false); setSearched(false); setSearchError(false); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle || searching} aria-label="Previous conversation match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle || searching} aria-label="Next conversation match">↓</button><span role="status">{searching ? "Searching…" : searchError ? "Search failed; retry" : needle && foundIndex >= 0 ? `Message ${foundIndex + 1} of ${messages.length}` : needle && searched ? "No match" : needle ? "Press Enter to find" : ""}</span></div><div ref={listRef} role="list" aria-label="Conversation history">
+  return <><div className="history-find" role="search" aria-label="Find in conversation"><input aria-label="Find in conversation" maxLength={200} value={needle} onChange={(event) => { ++searchGenerationRef.current; pendingFoundRef.current = null; onCancelFind?.(); setNeedle(event.target.value); setFoundIndex(-1); setFoundId(null); setSearching(false); setSearched(false); setSearchError(false); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle || searching} aria-label="Previous conversation match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle || searching} aria-label="Next conversation match">↓</button><span role="status">{searching ? "Searching…" : searchError ? "Search failed; retry" : needle && foundIndex >= 0 ? `Message ${foundIndex + 1} of ${messages.length}` : needle && searched ? "No match" : needle ? "Press Enter to find" : ""}</span></div><div ref={listRef} role="list" aria-label="Conversation history">
     {range.top > 0 && <div aria-hidden="true" style={{ height: range.top }} />}
     {messages.slice(range.start, range.end).map((message, offset) => <div key={message.id} data-window-id={message.id} data-find-match={range.start + offset === foundIndex ? "true" : undefined} role="listitem" aria-posinset={range.start + offset + 1} aria-setsize={messages.length} style={{ display: "flow-root" }}>{renderMessage(message)}</div>)}
     {range.bottom > 0 && <div aria-hidden="true" style={{ height: range.bottom }} />}

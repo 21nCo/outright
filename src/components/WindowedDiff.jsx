@@ -18,17 +18,18 @@ export function WindowedDiff({ diff, label }) {
   const foundOffsetRef = useRef(-1);
   const starts = useMemo(() => diff ? lineOffsets(diff) : [], [diff]);
   const searchable = useMemo(() => diff.toLocaleLowerCase(), [diff]);
+  const searchableStarts = useMemo(() => searchable ? lineOffsets(searchable) : [], [searchable]);
   function find(direction = 1, value = needle) {
     const query = value.trim().toLocaleLowerCase();
     if (!query) { setFoundLine(-1); setSearched(false); foundOffsetRef.current = -1; return; }
-    const offset = foundOffsetRef.current < 0 ? (direction > 0 ? 0 : diff.length - 1) : foundOffsetRef.current + direction;
+    const offset = foundOffsetRef.current < 0 ? (direction > 0 ? 0 : searchable.length - 1) : foundOffsetRef.current + direction;
     let match = direction > 0 ? searchable.indexOf(query, offset) : searchable.lastIndexOf(query, offset);
     if (match < 0) match = direction > 0 ? searchable.indexOf(query) : searchable.lastIndexOf(query);
     if (match < 0) { setFoundLine(-1); setSearched(true); foundOffsetRef.current = -1; return; }
     foundOffsetRef.current = match;
     setSearched(true);
-    let low = 0; let high = starts.length;
-    while (low < high) { const middle = (low + high) >>> 1; if (starts[middle] <= match) low = middle + 1; else high = middle; }
+    let low = 0; let high = searchableStarts.length;
+    while (low < high) { const middle = (low + high) >>> 1; if (searchableStarts[middle] <= match) low = middle + 1; else high = middle; }
     const line = low - 1;
     setFoundLine(line);
     if (viewportRef.current) {

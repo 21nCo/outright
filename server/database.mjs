@@ -72,6 +72,9 @@ export function createOutrightDatabase(options = {}) {
     throw error;
   }
 
+  db.function("unicode_contains", { deterministic: true }, (body, needle) =>
+    Number(String(body ?? "").toLocaleLowerCase().includes(String(needle).toLocaleLowerCase())));
+
   return {
     filename,
     launchDirectory,
@@ -198,7 +201,7 @@ export function createOutrightDatabase(options = {}) {
       const boundary = cursor?.rowid ?? (forward ? 0 : Number.MAX_SAFE_INTEGER);
       const order = forward ? "ASC" : "DESC";
       const comparison = forward ? ">" : "<";
-      const find = (wrapped) => db.prepare(`SELECT rowid, id FROM messages WHERE conversation_id = ? AND rowid ${comparison} ? AND instr(lower(body), lower(?)) > 0 ORDER BY rowid ${order} LIMIT 1`)
+      const find = (wrapped) => db.prepare(`SELECT rowid, id FROM messages WHERE conversation_id = ? AND rowid ${comparison} ? AND unicode_contains(body, ?) = 1 ORDER BY rowid ${order} LIMIT 1`)
         .get(conversationId, wrapped ? (forward ? 0 : Number.MAX_SAFE_INTEGER) : boundary, query);
       const match = find(false) ?? find(true);
       if (!match) return { matchId: null, messages: [], messagePage: null };

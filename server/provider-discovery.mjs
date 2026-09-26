@@ -48,14 +48,11 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
     async available(id) {
       const entry = snapshot.find((provider) => provider.id === id);
       if (!entry) return false;
-      // A negative snapshot is only display state. Authorization must retry a
-      // newly installed CLI or a transient probe failure on this attempt.
+      // The snapshot is display state, never authorization. A CLI may have
+      // been removed since a positive result or installed during a probe.
       const sharedProbe = pending;
-      if (entry.checking || !entry.available) {
-        await refresh(!entry.checking);
-        if (sharedProbe && !snapshot.find((provider) => provider.id === id)?.available) await refresh(true);
-      }
-      else if (Date.now() - lastChecked >= refreshMs) refresh();
+      if (sharedProbe) await sharedProbe;
+      await refresh(true);
       return snapshot.find((provider) => provider.id === id)?.available === true;
     },
     close() { closed = true; clearInterval(timer); },

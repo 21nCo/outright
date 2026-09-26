@@ -66,6 +66,24 @@ test("authorization retries a negative probe that was already in flight before i
   } finally { discovery.close(); }
 });
 
+test("authorization rechecks a positive snapshot after removal and recovers after reinstall", async () => {
+  let state = "installed";
+  const discovery = createProviderDiscovery({ probe: async (id) => {
+    if (id !== "codex" || state !== "installed") throw new Error("CLI unavailable");
+    return "codex ready";
+  } });
+  try {
+    await discovery.refresh();
+    assert.equal(discovery.list()[0].available, true);
+    state = "removed";
+    assert.equal(await discovery.available("codex"), false, "a cached positive must not authorize a removed CLI");
+    state = "failed";
+    assert.equal(await discovery.available("codex"), false, "probe failures deny authorization");
+    state = "installed";
+    assert.equal(await discovery.available("codex"), true, "the next attempt sees a reinstalled CLI");
+  } finally { discovery.close(); }
+});
+
 test("provider checks are bounded after shutdown and stale cache refreshes without blocking reads", async () => {
   let calls = 0;
   const discovery = createProviderDiscovery({ probe: async () => { calls += 1; return "v1"; }, refreshMs: 1 });

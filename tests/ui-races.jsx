@@ -1459,23 +1459,23 @@ async function staleDiffSelectionRegression() {
   assert(host.querySelector('.pane-toolbar strong')?.textContent === "B branch", "A stale worktree status replaced B's status");
 }
 
-async function changesMutationOwnerRegression(reject = false) {
+async function changesMutationOwnerRegression(reject = false, mode = "stage") {
   root.render(null); await settle();
   const pending = deferred();
   const requests = [];
   const errors = [];
   route = async (url) => {
     requests.push(`${url.pathname}:${url.searchParams.get("path") ?? ""}`);
-    if (url.pathname === "/api/git/status") return response({ branch: url.searchParams.get("path") === projects[0].worktrees[0].path ? "A branch" : "B branch", files: [{ path: "file.txt", status: " M", index: " ", worktree: "M" }], stagedCount: 0 });
+    if (url.pathname === "/api/git/status") return response({ branch: url.searchParams.get("path") === projects[0].worktrees[0].path ? "A branch" : "B branch", files: [{ path: "file.txt", status: mode === "unstage" ? "M " : " M", index: mode === "unstage" ? "M" : " ", worktree: mode === "unstage" ? " " : "M" }], stagedCount: mode === "unstage" ? 1 : 0 });
     if (url.pathname === "/api/git/diff") return response({ diff: "+current\n" });
-    if (url.pathname === "/api/git/stage") return pending.promise;
+    if (url.pathname === `/api/git/${mode}`) return pending.promise;
     return response({});
   };
   const pane = (tree) => <div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>;
   root.render(pane(projects[0].worktrees[0]));
   await until(() => host.querySelector('.pane-toolbar strong')?.textContent === "A branch", "A changes ready");
-  host.querySelector('[aria-label="Stage file.txt"]').click();
-  await until(() => requests.some((item) => item.startsWith("/api/git/stage")), "A stage pending");
+  host.querySelector(`[aria-label="${mode === "unstage" ? "Unstage" : "Stage"} file.txt"]`).click();
+  await until(() => requests.some((item) => item.startsWith(`/api/git/${mode}`)), `A ${mode} pending`);
   root.render(pane(projects[1].worktrees[0]));
   await until(() => host.querySelector('.pane-toolbar strong')?.textContent === "B branch", "B changes ready");
   const bStatusCount = requests.filter((item) => item === `/api/git/status:${projects[1].worktrees[0].path}`).length;
@@ -1619,6 +1619,18 @@ async function largeDiffWindowRegression() {
   window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), diff: { elapsedMs, mountedAtEnd: viewport.querySelectorAll("span").length, heapBytes: performance.memory?.usedJSHeapSize ?? null } };
 }
 
+async function unicodeDiffFindRegression() {
+  root.render(null); await settle();
+  const diff = "+İstanbul\n" + Array.from({ length: 400 }, (_, index) => `+filler ${index}\n`).join("") + "+CAFÉ target\n";
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={diff} label="Unicode diff" /></div>);
+  await until(() => host.querySelector('input[aria-label="Find in diff"]'), "Unicode diff find ready");
+  const input = host.querySelector('input[aria-label="Find in diff"]');
+  setControlValue(input, "café"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("CAFÉ target"), "Unicode match on the correct diff line");
+  assert(host.querySelector('.window-find [role="status"]')?.textContent === "Line 402", "Unicode case folding shifted the diff line coordinate");
+}
+
 async function manyWorktreeSessionRegression() {
   root.render(null);
   await settle();
@@ -1637,13 +1649,15 @@ async function manyWorktreeSessionRegression() {
   const heapBefore = performance.memory?.usedJSHeapSize ?? null;
   root.render(<TooltipProvider><App /></TooltipProvider>);
   await until(() => host.querySelector('#chat-tab-chat-W0[aria-selected="true"]'), "initial many-worktree chat");
-  for (let index = 0; index < 8; index += 1) {
+  let heapAtHalf = null;
+  for (let index = 0; index < 16; index += 1) {
     const id = index % 2 ? "W0" : "W199";
     const target = [...host.querySelectorAll(".worktree-row")].find((row) => row.textContent.includes(`Tree ${Number(id.slice(1))}`));
     assert(target, `Missing ${id} in worktree navigation`);
     target.click();
     await until(() => host.querySelector(`#chat-tab-chat-${id}[aria-selected="true"]`) && host.querySelector(`[data-message-id="message-${id}"]`), `selected ${id} chat`);
     assert(host.querySelectorAll(".message-scroll").length === 1 && host.querySelectorAll("[data-message-id]").length === 1, "Worktree navigation accumulated hidden conversations");
+    if (index === 7) heapAtHalf = performance.memory?.usedJSHeapSize ?? null;
   }
   const input = host.querySelector('textarea[aria-label="Message the agent"]');
   const inputStarted = performance.now();
@@ -1652,8 +1666,10 @@ async function manyWorktreeSessionRegression() {
   const inputFrameMs = Math.round(performance.now() - inputStarted);
   assert(host.querySelectorAll(".worktree-row").length === 200, "Fixture did not exercise all worktree rows");
   const elapsedMs = Math.round(performance.now() - started);
-  assert(elapsedMs < 3_000 && inputFrameMs < 250, `Many-worktree interaction exceeded its fixture budget: navigation ${elapsedMs}ms, input ${inputFrameMs}ms`);
-  window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), worktrees: { count: 200, switches: 8, elapsedMs, inputFrameMs, heapBefore, heapAfter: performance.memory?.usedJSHeapSize ?? null } };
+  const heapAfter = performance.memory?.usedJSHeapSize ?? null;
+  assert(elapsedMs < 6_000 && inputFrameMs < 250, `Many-worktree interaction exceeded its fixture budget: navigation ${elapsedMs}ms, input ${inputFrameMs}ms`);
+  if (heapBefore !== null && heapAfter !== null) assert(heapAfter - heapBefore < 64 * 1024 * 1024, "Repeated worktree switches grew the heap without bound");
+  window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), worktrees: { count: 200, switches: 16, elapsedMs, inputFrameMs, heapBefore, heapAtHalf, heapAfter } };
 }
 
 async function pagedTranscriptAnchorRegression() {
@@ -1697,15 +1713,24 @@ async function pagedTranscriptFindRegression() {
   const latest = Array.from({ length: 200 }, (_, index) => message(index + 800));
   const earliest = Array.from({ length: 200 }, (_, index) => message(index));
   const staleSearch = deferred();
+  const lateSearch = deferred();
+  const olderRequest = deferred();
   let staleRequested = false;
+  let lateRequested = false;
+  let olderRequested = false;
+  let olderRequests = 0;
   route = async (url) => {
     if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
     if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
     if (url.pathname.endsWith("/messages/find")) {
       if (url.searchParams.get("q") === "stale") { staleRequested = true; return staleSearch.promise; }
+      if (url.searchParams.get("q") === "late") { lateRequested = true; return lateSearch.promise; }
+      if (url.searchParams.get("q") === "none") return response({ matchId: null, messages: [], messagePage: null });
+      if (url.searchParams.get("q") === "failure") return response({ error: "Search unavailable" }, 503);
       const older = !url.searchParams.get("after") || url.searchParams.get("after") === "message-900";
       return response({ matchId: older ? "message-10" : "message-900", messages: older ? earliest : latest, messagePage: { hasMore: !older, olderCount: older ? 0 : 800, hasLater: older, newerCount: older ? 800 : 0, total: 1_000, beforeId: older ? "message-0" : "message-800" } });
     }
+    if (url.pathname === "/api/conversations/chat-A/messages") { olderRequested = true; olderRequests += 1; return olderRequests === 1 ? olderRequest.promise : response({ error: "Older page unavailable" }, 503); }
     if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: 800, total: 1_000, beforeId: "message-800" } });
     return response({});
   };
@@ -1719,6 +1744,23 @@ async function pagedTranscriptFindRegression() {
   assert(host.querySelector('.history-return'), "An older search page lost return-to-latest navigation");
   host.querySelector('[aria-label="Next conversation match"]').click();
   await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-900"]'), "newer persisted match");
+  const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+  input.focus();
+  const bounds = input.getBoundingClientRect();
+  const visible = viewport.getBoundingClientRect();
+  assert(document.activeElement === input && bounds.top >= visible.top && bounds.bottom <= visible.bottom, "Focused find control scrolled out of the transcript viewport");
+  viewport.scrollTop = Math.max(0, viewport.scrollTop - 350);
+  viewport.dispatchEvent(new Event("scroll"));
+  await settle();
+  const readingTop = viewport.scrollTop;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1_000) }) }));
+  await settle();
+  assert(Math.abs(viewport.scrollTop - readingTop) < 24, `A live append moved the reading position: before=${readingTop}, after=${viewport.scrollTop}, height=${viewport.scrollHeight}, sticky=${host.querySelector('.history-find [role="status"]')?.textContent}`);
+  host.querySelector('[aria-label="Previous conversation match"]').click();
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-10"]'), "previous persisted match");
+  assert(document.activeElement === input && input.getBoundingClientRect().top >= visible.top, "Find control disappeared during previous navigation");
+  host.querySelector('[aria-label="Next conversation match"]').click();
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-900"]'), "next persisted match");
   setControlValue(input, "stale"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => staleRequested, "stale search request pending");
@@ -1726,6 +1768,34 @@ async function pagedTranscriptFindRegression() {
   staleSearch.resolve(response({ matchId: "message-10", messages: earliest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } }));
   await settle();
   assert(host.querySelector('.history-loader')?.textContent.includes("800") && !host.querySelector('.history-return'), "A cancelled find replaced the current page");
+  host.querySelector('[aria-label="Previous conversation match"]').click();
+  await until(() => host.querySelector('.history-return'), "older page before return race");
+  setControlValue(input, "late"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => lateRequested, "late find started");
+  host.querySelector('.history-return').click();
+  await until(() => host.querySelector('.history-loader')?.textContent.includes("800"), "return to latest completed");
+  lateSearch.resolve(response({ matchId: "message-10", messages: earliest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } }));
+  await settle();
+  assert(!host.querySelector('.history-return'), "A late find replaced Return to latest");
+  host.querySelector('.history-loader').click();
+  await until(() => olderRequested, "older page request pending");
+  setControlValue(input, "none"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('.history-find [role="status"]')?.textContent === "No match", "no-match search completed");
+  olderRequest.resolve(response({ messages: earliest, messagePage: { hasMore: false, olderCount: 0, total: 1_000, beforeId: "message-0" } }));
+  await settle();
+  assert(host.querySelector('.history-loader')?.textContent.includes("800"), "Stale prepend replaced the selected page");
+  setControlValue(input, "failure"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('.history-find [role="status"]')?.textContent === "Search failed; retry", "find failure reported");
+  assert(host.querySelector('.history-loader')?.textContent.includes("800"), "Failed find replaced the current page");
+  host.querySelector('.history-loader').click();
+  await until(() => host.textContent.includes("Older page unavailable"), "failed prepend reported");
+  viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); await settle();
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1_001) }) }));
+  await settle();
+  assert(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96, "Stale prepend disabled bottom following");
 }
 
 async function providerBootstrapConvergenceRegression() {
@@ -1750,6 +1820,24 @@ async function providerBootstrapConvergenceRegression() {
   await until(() => document.querySelector('[role="dialog"] option[value="codex"]')?.disabled === false, "provider converged after missed event");
   assert(providerReads > 0, "Checking bootstrap did not refresh providers");
   document.querySelector('[role="dialog"] button[aria-label="Close"]')?.click();
+}
+
+async function providerCheckingRateRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  let providerReads = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: false, checking: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/providers") { providerReads += 1; return response({ providers: [{ id: "codex", available: false, checking: true }] }); }
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => providerReads > 0, "checking provider poll started");
+  await new Promise((resolve) => setTimeout(resolve, 1150));
+  assert(providerReads <= 2, `Checking provider polled ${providerReads} times in 1.15s`);
+  root.render(null); await settle();
 }
 
 async function sustainedOutputRegression() {
@@ -2175,16 +2263,19 @@ try {
     ["stale diff selection", staleDiffSelectionRegression, "a slow prior diff cannot replace the selected file"],
     ["changes mutation owner success", () => changesMutationOwnerRegression(false), "late stage completion cannot refresh another worktree"],
     ["changes mutation owner failure", () => changesMutationOwnerRegression(true), "late stage failure cannot report in another worktree"],
+    ["changes unstage owner failure", () => changesMutationOwnerRegression(true, "unstage"), "late unstage failure cannot report in another worktree"],
     ["changes commit owner success", () => changesCommitOwnerRegression(false), "late commit completion cannot update another worktree"],
     ["changes commit owner failure", () => changesCommitOwnerRegression(true), "late commit failure cannot report in another worktree"],
     ["long transcript window", longTranscriptWindowRegression, "a thousand messages keep a bounded DOM and remain scrollable"],
     ["large diff window", largeDiffWindowRegression, "fifty thousand diff lines keep a bounded DOM and preserve the last line"],
+    ["Unicode diff find", unicodeDiffFindRegression, "length-changing case folding keeps the correct diff line"],
     ["production diff viewport", productionDiffViewportRegression, "staged and unstaged large diffs stay bounded in the inspector"],
     ["paged transcript anchor", pagedTranscriptAnchorRegression, "loading earlier history preserves its visible reading anchor"],
     ["paged transcript find", pagedTranscriptFindRegression, "find navigates older persisted messages with bounded mounted rows"],
     ["provider bootstrap convergence", providerBootstrapConvergenceRegression, "a checking bootstrap converges after an earlier provider event"],
+    ["provider checking rate", providerCheckingRateRegression, "repeated checking snapshots keep a bounded poll cadence"],
     ["sustained output", sustainedOutputRegression, "small deltas coalesce without losing output or input responsiveness"],
-    ["many worktree sessions", manyWorktreeSessionRegression, "repeated switches across two hundred worktrees keep one conversation mounted"],
+    ["many worktree sessions", manyWorktreeSessionRegression, "two repeated switch cycles across two hundred worktrees keep one conversation mounted"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and inspector contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["initial terminal failure", terminalInitialFailureRegression, "failed initial terminal activation retains a keyboard-reachable tab"],
     ["terminal mutation failure", terminalMutationFailureRegression, "create, close and reconnect failures preserve terminal tab ownership"],
