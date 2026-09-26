@@ -34,6 +34,27 @@ export function WindowedDiff({ diff, label }) {
   const visibleRows = Math.max(1, Math.floor(position.height / LINE_HEIGHT));
   const maxFirst = Math.max(0, count - visibleRows);
   const maxScroll = Math.max(1, trackHeight - position.height);
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport || !compressed) return;
+    const wheel = (event) => {
+      if (!event.deltaY) return; // Keep native horizontal navigation.
+      event.preventDefault();
+      if (event.deltaX) viewport.scrollLeft += event.deltaX * (event.deltaMode === 1 ? LINE_HEIGHT : event.deltaMode === 2 ? viewport.clientWidth : 1);
+      const pixels = event.deltaY * (event.deltaMode === 1 ? LINE_HEIGHT : event.deltaMode === 2 ? viewport.clientHeight : 1);
+      wheelRemainderRef.current += pixels / LINE_HEIGHT;
+      const lines = Math.trunc(wheelRemainderRef.current);
+      wheelRemainderRef.current -= lines;
+      if (!lines) return;
+      // Read the physical position on every event; React may batch several
+      // wheels before it renders a new firstVisible value.
+      const first = Math.min(maxFirst, Math.round(viewport.scrollTop / maxScroll * maxFirst));
+      viewport.scrollTop = Math.max(0, Math.min(maxFirst, first + lines)) / maxFirst * maxScroll;
+      setPosition({ top: viewport.scrollTop, height: viewport.clientHeight });
+    };
+    viewport.addEventListener("wheel", wheel, { passive: false });
+    return () => viewport.removeEventListener("wheel", wheel);
+  }, [compressed, maxFirst, maxScroll]);
   function moveFirst(first) {
     const viewport = viewportRef.current;
     if (!viewport) return;
@@ -120,15 +141,7 @@ export function WindowedDiff({ diff, label }) {
     const line = content.slice(starts[index], endOffset);
     lines.push(<span className={line.startsWith("+") && !line.startsWith("+++") ? "added" : line.startsWith("-") && !line.startsWith("---") ? "removed" : line.startsWith("@@") ? "hunk" : ""} data-find-match={index === foundLine ? "true" : undefined} key={index}><i aria-hidden="true">{index + 1}</i>{line}{"\n"}</span>);
   }
-  return <div className="windowed-diff"><div className="window-find" role="search" aria-label={`Find in ${label}`}><input aria-label="Find in diff" value={needle} onChange={(event) => { setNeedle(event.target.value); setFoundLine(-1); setSearched(false); foundOffsetRef.current = -1; pendingFindAlignmentRef.current = null; }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle} aria-label="Previous diff match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle} aria-label="Next diff match">↓</button><span aria-hidden="true">{visibleStatus}</span><span className="sr-only" role="status">{announcedStatus}</span></div><pre ref={viewportRef} className="diff-view" tabIndex={0} aria-label={label} onScroll={(event) => setPosition({ top: event.currentTarget.scrollTop, height: event.currentTarget.clientHeight })} onWheel={(event) => {
-    if (!compressed) return;
-    event.preventDefault();
-    const pixels = event.deltaY * (event.deltaMode === 1 ? LINE_HEIGHT : event.deltaMode === 2 ? position.height : 1);
-    wheelRemainderRef.current += pixels / LINE_HEIGHT;
-    const lines = Math.trunc(wheelRemainderRef.current);
-    wheelRemainderRef.current -= lines;
-    if (lines) moveFirst(firstVisible + lines);
-  }} onKeyDown={(event) => {
+  return <div className="windowed-diff"><div className="window-find" role="search" aria-label={`Find in ${label}`}><input aria-label="Find in diff" value={needle} onChange={(event) => { setNeedle(event.target.value); setFoundLine(-1); setSearched(false); foundOffsetRef.current = -1; pendingFindAlignmentRef.current = null; }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle} aria-label="Previous diff match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle} aria-label="Next diff match">↓</button><span aria-hidden="true">{visibleStatus}</span><span className="sr-only" role="status">{announcedStatus}</span></div><pre ref={viewportRef} className="diff-view" tabIndex={0} aria-label={label} onScroll={(event) => setPosition({ top: event.currentTarget.scrollTop, height: event.currentTarget.clientHeight })} onKeyDown={(event) => {
     if (!compressed) return;
     const moves = { ArrowDown: 1, ArrowUp: -1, PageDown: visibleRows - 1, PageUp: 1 - visibleRows, Home: -maxFirst, End: maxFirst };
     if (!(event.key in moves)) return;

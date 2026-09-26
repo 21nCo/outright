@@ -770,7 +770,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
         window.addEventListener("fixture-key-ready", ready);
         window.__requestFixtureKey(key);
       });
-      window.__fixtureWheel = (x, y, deltaY) => new Promise((resolve) => {
+      window.__fixtureWheel = (x, y, deltaY, deltaX = 0) => new Promise((resolve) => {
         const id = Math.random().toString(36).slice(2);
         const ready = (event) => {
           if (event.detail !== id) return;
@@ -778,7 +778,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
           resolve();
         };
         window.addEventListener("fixture-wheel-ready", ready);
-        window.__requestFixtureWheel(JSON.stringify({ id, x, y, deltaY }));
+        window.__requestFixtureWheel(JSON.stringify({ id, x, y, deltaY, deltaX }));
       });
     ` });
     let viewportError;
@@ -793,7 +793,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       (async () => {
         if (event.params.name === "__requestFixtureWheel") {
           const wheel = JSON.parse(event.params.payload);
-          await send("Input.dispatchMouseEvent", { type: "mouseWheel", x: wheel.x, y: wheel.y, deltaX: 0, deltaY: wheel.deltaY });
+          await send("Input.dispatchMouseEvent", { type: "mouseWheel", x: wheel.x, y: wheel.y, deltaX: wheel.deltaX ?? 0, deltaY: wheel.deltaY });
           await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-wheel-ready", { detail: ${JSON.stringify(wheel.id)} }))` });
           return;
         }

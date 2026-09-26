@@ -391,7 +391,8 @@ export function App() {
         return;
       }
       pendingConversationLoadRef.current = null;
-      const replayed = replayConversationEvents(nextConversation.messages, pendingLoad.events, MAX_RENDERED_MESSAGES);
+      const replayed = replayConversationEvents(nextConversation.messages, pendingLoad.events, MAX_RENDERED_MESSAGES,
+        activeCursorOwners(nextConversation), conversationRef.current?.id === requestedId ? checkpointCursorsRef.current : new Map());
       const preserveReading = preservePage && (preservePendingFind || pendingFindRef.current?.conversationId === requestedId
         || conversationRef.current?.messagePage?.hasLater || !stickToBottomRef.current
         || startedHistoryGeneration !== historyGenerationRef.current);
@@ -493,8 +494,8 @@ export function App() {
       if (!olderThanPage && !stickToBottomRef.current && !pendingPrependScrollRef.current && messageViewportRef.current) {
         pendingLiveScrollRef.current = { conversationId: event.conversationId, top: messageViewportRef.current.scrollTop };
       }
-      if (!displayed?.messages.some((message) => message.id === event.payload.id)
-        || displayed?.messagePage?.hasLater || displayed?.messages.length >= MAX_RENDERED_MESSAGES) refreshMessageCount();
+      if (!displayed || olderThanPage || displayed.messagePage?.hasLater
+        || displayed.messages.length >= MAX_RENDERED_MESSAGES) refreshMessageCount();
       recordCheckpointCursor(checkpointCursorsRef.current, event.payload, activeCursorOwners(displayed));
       applyStreamingText((current) => streamingTextAfterRuntimeEvent(current, event), true);
       setConversation((current) => {

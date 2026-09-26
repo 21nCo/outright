@@ -134,6 +134,22 @@ test("an active run keeps its checkpoint cursor through more than 2048 other run
   assert.equal(isStaleCheckpointMessage(cursors, { payload: { runId: "long-run", checkpointEventSeq: 99 } }), true);
 });
 
+test("pending detail replay retains an active high-water mark through checkpoint turnover", () => {
+  const active = new Set(["long-run"]);
+  const checkpoint = { id: "long-message", role: "assistant", createdAt: "2026-09-22T00:00:00Z", payload: { runId: "long-run", checkpointEventSeq: 100 } };
+  const events = Array.from({ length: 2_100 }, (_, index) => ({
+    type: "message.created",
+    payload: { id: `short-${index}`, role: "assistant", createdAt: "2026-09-22T00:00:01Z", payload: { runId: `short-${index}`, checkpointEventSeq: 1 } },
+  }));
+  events.push({ type: "message.created", payload: { ...checkpoint, payload: { runId: "long-run", checkpointEventSeq: 99 }, body: "stale" } });
+  events.push({ type: "run.event", runId: "long-run", payload: { type: "assistant.delta", seq: 100, payload: { text: "duplicate" } } });
+  const replayed = replayConversationEvents([checkpoint], events, 3_000, active);
+  assert.equal(replayed.cursors.size, 2_048);
+  assert.equal(replayed.cursors.get("long-run"), 100);
+  assert.equal(replayed.streamingText, "");
+  assert.equal(replayed.messages.find((message) => message.id === "long-message")?.body, undefined);
+});
+
 test("conversation replay and its in-flight event buffer remain bounded", () => {
   const messages = Array.from({ length: 5 }, (_, index) => ({ id: `message-${index}`, role: "user", createdAt: `2026-09-22T00:00:0${index}Z` }));
   const replayed = replayConversationEvents(messages, [], 3);

@@ -81,17 +81,49 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
   };
 }
 
-async function defaultProbe(id, { signal } = {}) {
+export async function defaultProbe(id, { signal } = {}) {
   return new Promise((resolve, reject) => {
     let outcome;
     let closed = false;
+    let settled = false;
+    let terminationError;
+    let escalation;
+    const cleanup = () => {
+      clearTimeout(timeout);
+      clearTimeout(deadline);
+      clearTimeout(escalation);
+      signal?.removeEventListener("abort", abort);
+    };
+    const settle = (error, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve(value);
+    };
     const finish = () => {
       if (!closed || !outcome) return;
-      if (outcome.error) reject(outcome.error);
-      else resolve(outcome.stdout || outcome.stderr || "");
+      settle(terminationError ?? outcome.error, outcome.stdout || outcome.stderr || "");
     };
-    const child = execFile(id, ["--version"], { encoding: "utf8", timeout: 2500, maxBuffer: 16 * 1024, windowsHide: true, signal },
+    const child = execFile(id, ["--version"], { encoding: "utf8", maxBuffer: 16 * 1024, windowsHide: true },
       (error, stdout, stderr) => { outcome = { error, stdout, stderr }; finish(); });
     child.once("close", () => { closed = true; finish(); });
+    const terminate = (reason) => {
+      if (settled) return;
+      terminationError ??= reason;
+      try { child.kill("SIGTERM"); } catch { /* Already exited. */ }
+      escalation = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* Already exited. */ } }, 100);
+    };
+    const abort = () => terminate(new Error(`Provider version check aborted: ${id}`));
+    const timeout = setTimeout(() => terminate(new Error(`Provider version check timed out: ${id}`)), 2500);
+    // A child that never reports close cannot retain discovery shutdown.
+    // SIGKILL is attempted before this deadline; unresolved cleanup is an
+    // error rather than a successful version check.
+    const deadline = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch { /* Already exited. */ }
+      settle(new Error(`Provider version check did not close: ${id}`));
+    }, 3500);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
   });
 }

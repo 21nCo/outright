@@ -1,7 +1,36 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
-import { createProviderDiscovery } from "./provider-discovery.mjs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createProviderDiscovery, defaultProbe } from "./provider-discovery.mjs";
+
+test("aborting a version check reaps a CLI that ignores SIGTERM", { skip: process.platform === "win32" }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-"));
+  const executable = path.join(directory, "stubborn-probe");
+  const pidFile = path.join(directory, "pid");
+  writeFileSync(executable, `#!${process.execPath}\nprocess.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);\n`);
+  chmodSync(executable, 0o755);
+  const controller = new AbortController();
+  let pid;
+  try {
+    const pending = defaultProbe(executable, { signal: controller.signal });
+    const deadline = Date.now() + 2_000;
+    while (!existsSync(pidFile) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(existsSync(pidFile), "the CLI reached its SIGTERM handler");
+    pid = Number(readFileSync(pidFile, "utf8"));
+    const started = Date.now();
+    controller.abort();
+    await assert.rejects(pending, /aborted/);
+    assert.ok(Date.now() - started < 1_500, "abort completed within its cleanup bound");
+    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" }, "the version-check child is reaped");
+  } finally {
+    controller.abort();
+    if (pid) try { process.kill(pid, "SIGKILL"); } catch { /* Already gone. */ }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("shutdown aborts and reaps a running version-check child", async () => {
   let childPid;
@@ -15,9 +44,10 @@ test("shutdown aborts and reaps a running version-check child", async () => {
       child.once("close", () => error ? reject(error) : resolve("version"));
     });
   } });
-  await Promise.resolve();
-  assert.ok(childPid > 0);
-  await discovery.close();
+  try {
+    await Promise.resolve();
+    assert.ok(childPid > 0);
+  } finally { await discovery.close(); }
   assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" }, "shutdown resolved while the probe process still existed");
 });
 

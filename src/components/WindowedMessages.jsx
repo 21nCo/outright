@@ -11,6 +11,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
   messagesRef.current = messages;
   const rangeRef = useRef({ start: 0, end: Math.min(messages.length, FULL_RENDER_LIMIT), top: 0, bottom: Math.max(0, messages.length - FULL_RENDER_LIMIT) * ESTIMATED_MESSAGE_HEIGHT });
   const [range, setRange] = useState(rangeRef.current);
+  const rangeFrameRef = useRef(0);
   const [needle, setNeedle] = useState("");
   const [foundId, setFoundId] = useState(null);
   const foundIndex = foundId ? messages.findIndex((message) => message.id === foundId) : -1;
@@ -25,6 +26,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
   const cancelFindRef = useRef(onCancelFind);
   cancelFindRef.current = onCancelFind;
   const pendingFoundRef = useRef(null);
+  const visibleFindAnchorRef = useRef(false);
   const alignmentFramesRef = useRef(0);
 
   async function find(direction = 1) {
@@ -42,6 +44,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
         setSearchError(false);
         setFoundId(id);
         pendingFoundRef.current = id;
+        visibleFindAnchorRef.current = false;
         if (id) { alignmentFramesRef.current = 0; setFindRequest((current) => current + 1); }
         setSearched(true);
       } catch {
@@ -98,13 +101,19 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     const prior = rangeRef.current;
     if (prior.start !== next.start || prior.end !== next.end || prior.top !== next.top || prior.bottom !== next.bottom) {
       rangeRef.current = next;
-      setRange(next);
+      if (!rangeFrameRef.current) rangeFrameRef.current = window.requestAnimationFrame(() => {
+        rangeFrameRef.current = 0;
+        setRange(rangeRef.current);
+      });
     }
   }, [messages, viewportRef, foundId]);
+
+  useEffect(() => () => window.cancelAnimationFrame(rangeFrameRef.current), []);
 
   useLayoutEffect(() => {
     ++searchGenerationRef.current;
     pendingFoundRef.current = null;
+    visibleFindAnchorRef.current = false;
     setFoundId(null);
     setSearched(false);
     setPartial(false);
@@ -118,6 +127,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     const frame = window.requestAnimationFrame(() => {
       if (messagesRef.current.some((message) => message.id === foundId)) return;
       if (pendingFoundRef.current === foundId) pendingFoundRef.current = null;
+      visibleFindAnchorRef.current = false;
       setFoundId(null);
       setSearched(false);
     });
@@ -136,19 +146,19 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     let settled = 0;
     const align = () => {
       if (pendingFoundRef.current !== foundId) return;
-      if (++alignmentFramesRef.current > 16) { pendingFoundRef.current = null; return; }
+      if (++alignmentFramesRef.current > 16) { pendingFoundRef.current = null; visibleFindAnchorRef.current = false; return; }
       const row = [...list.querySelectorAll("[data-window-id]")].find((element) => element.dataset.windowId === foundId);
       if (!row) { update(); frame = window.requestAnimationFrame(align); return; }
       const delta = row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - viewport.clientHeight / 3;
       if (Math.abs(delta) > 2) {
         const before = viewport.scrollTop;
         viewport.scrollTop += delta;
-        if (Math.abs(viewport.scrollTop - before) < 1) { pendingFoundRef.current = null; return; }
+        if (Math.abs(viewport.scrollTop - before) < 1) { pendingFoundRef.current = null; visibleFindAnchorRef.current = false; return; }
         settled = 0; update();
       }
       else settled += 1;
       if (settled < 2) frame = window.requestAnimationFrame(align);
-      else pendingFoundRef.current = null;
+      else { pendingFoundRef.current = null; visibleFindAnchorRef.current = true; }
     };
     update();
     frame = window.requestAnimationFrame(align);
@@ -166,20 +176,18 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     const schedule = () => { if (!frame) frame = window.setTimeout(() => { frame = 0; update(); }, 16); };
     viewport.addEventListener("scroll", schedule, { passive: true });
     let lastHeight = viewport.clientHeight;
+    let lastWidth = viewport.clientWidth;
     const resize = new ResizeObserver(() => {
-      if (viewport.clientHeight === lastHeight) return;
+      if (viewport.clientHeight === lastHeight && viewport.clientWidth === lastWidth) return;
       lastHeight = viewport.clientHeight;
+      lastWidth = viewport.clientWidth;
       const list = listRef.current;
       if (!list) { schedule(); return; }
       const match = list.querySelector('[data-find-match="true"]');
-      if (match && foundId && !pendingFoundRef.current) {
-        const bounds = match.getBoundingClientRect();
-        const visible = viewport.getBoundingClientRect();
-        if (bounds.bottom > visible.top && bounds.top < visible.bottom) {
-          pendingFoundRef.current = foundId;
-          alignmentFramesRef.current = 0;
-          setFindRequest((current) => current + 1);
-        }
+      if (match && foundId && !pendingFoundRef.current && visibleFindAnchorRef.current) {
+        pendingFoundRef.current = foundId;
+        alignmentFramesRef.current = 0;
+        setFindRequest((current) => current + 1);
       }
       schedule();
     });
@@ -194,6 +202,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     const cancel = (event) => {
       if (event.target?.closest?.(".history-find")) return;
       pendingFoundRef.current = null;
+      visibleFindAnchorRef.current = false;
       if (!searchingRef.current) return;
       ++searchGenerationRef.current;
       cancelFindRef.current?.();
@@ -231,7 +240,13 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
   const olderCount = messagePage?.olderCount ?? 0;
   const total = messagePage?.total ?? messages.length;
   const position = (index) => olderCount + index + 1;
-  return <><div className="history-find" role="search" aria-label="Find in conversation"><input aria-label="Find in conversation" maxLength={200} value={needle} onChange={(event) => { ++searchGenerationRef.current; pendingFoundRef.current = null; onCancelFind?.(); setNeedle(event.target.value); setFoundId(null); setSearching(false); setSearched(false); setPartial(false); setSearchError(false); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle || searching} aria-label="Previous conversation match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle || searching} aria-label="Next conversation match">↓</button><span role="status">{searching ? "Searching…" : searchError ? "Search failed; retry" : partial ? "Search paused; press Enter to continue" : needle && foundIndex >= 0 ? `Message ${position(foundIndex)} of ${total}` : needle && searched ? "No match" : needle ? "Press Enter to find" : ""}</span></div><div ref={listRef} role="list" aria-label="Conversation history">
+  const visibleFindStatus = searching ? "Searching…" : searchError ? "Search failed; retry" : partial ? "Search paused; press Enter to continue" : needle && foundIndex >= 0 ? `Message ${position(foundIndex)} of ${total}` : needle && searched ? "No match" : needle ? "Press Enter to find" : "";
+  const [announcedFindStatus, setAnnouncedFindStatus] = useState("");
+  useEffect(() => {
+    const timer = window.setTimeout(() => setAnnouncedFindStatus(visibleFindStatus), 180);
+    return () => window.clearTimeout(timer);
+  }, [visibleFindStatus]);
+  return <><div className="history-find" role="search" aria-label="Find in conversation"><input aria-label="Find in conversation" maxLength={200} value={needle} onChange={(event) => { ++searchGenerationRef.current; pendingFoundRef.current = null; visibleFindAnchorRef.current = false; onCancelFind?.(); setNeedle(event.target.value); setFoundId(null); setSearching(false); setSearched(false); setPartial(false); setSearchError(false); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle || searching} aria-label="Previous conversation match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle || searching} aria-label="Next conversation match">↓</button><span className="history-find-status" aria-hidden="true">{visibleFindStatus}</span><span className="sr-only" role="status">{announcedFindStatus}</span></div><div ref={listRef} role="list" aria-label="Conversation history">
     {range.top > 0 && <div aria-hidden="true" style={{ height: range.top }} />}
     {messages.slice(range.start, range.end).map((message, offset) => <div key={message.id} data-window-id={message.id} data-find-match={range.start + offset === foundIndex ? "true" : undefined} role="listitem" aria-posinset={position(range.start + offset)} aria-setsize={total} style={{ display: "flow-root" }}>{renderMessage(message)}</div>)}
     {range.bottom > 0 && <div aria-hidden="true" style={{ height: range.bottom }} />}

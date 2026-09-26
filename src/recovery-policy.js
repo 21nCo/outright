@@ -100,15 +100,15 @@ export function bufferConversationRuntimeEvent(pendingLoad, event, maxBytes) {
   return "buffered";
 }
 
-export function replayConversationEvents(snapshotMessages = [], events = [], maxMessages = Number.POSITIVE_INFINITY) {
+export function replayConversationEvents(snapshotMessages = [], events = [], maxMessages = Number.POSITIVE_INFINITY, activeRunIds = new Set(), initialCursors = new Map()) {
   const messagesById = new Map(snapshotMessages.map((message) => [message.id, message]));
-  const cursors = checkpointCursors(snapshotMessages);
+  const cursors = checkpointCursors(snapshotMessages, initialCursors, activeRunIds);
   let streamingText = "";
   let runEvents = [];
   for (const event of events) {
     if (event?.type === "message.created") {
       if (isStaleCheckpointMessage(cursors, event.payload)) continue;
-      recordCheckpointCursor(cursors, event.payload);
+      recordCheckpointCursor(cursors, event.payload, activeRunIds);
       streamingText = streamingTextAfterRuntimeEvent(streamingText, event);
       messagesById.delete(event.payload.id);
       messagesById.set(event.payload.id, event.payload);

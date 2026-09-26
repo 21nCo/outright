@@ -112,7 +112,14 @@ test("large no-match find yields to other requests and stays in its conversation
       let result = await database.findMessagePage(chat.id, "unique sibling token", null);
       assert.equal(result.partial, true, "one request must stop after its text budget");
       assert.ok(result.nextAfterId, "a partial result must provide a durable resume cursor");
-      while (result.partial) result = await database.findMessagePage(chat.id, "unique sibling token", result.nextAfterId, 1, undefined, { originId: result.originId, wrapped: result.wrapped });
+      let requests = 1;
+      while (result.partial && requests < 100) {
+        const previousCursor = result.nextAfterId;
+        result = await database.findMessagePage(chat.id, "unique sibling token", result.nextAfterId, 1, undefined, { originId: result.originId, wrapped: result.wrapped });
+        requests += 1;
+        assert.notEqual(result.nextAfterId, previousCursor, "continuation must advance when still partial");
+      }
+      assert.ok(requests < 100, "continuation must finish within a bounded number of requests");
       assert.equal(result.matchId, null);
     } finally { clearInterval(timer); }
     assert.ok(ticks >= 1, `Search blocked the event loop: ${ticks} timer ticks`);

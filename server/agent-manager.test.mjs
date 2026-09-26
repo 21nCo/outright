@@ -934,7 +934,11 @@ test("shutdown retains ownership when a closed supervisor leaves a stale handsha
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-stale-handshake-"));
   const handshakePath = path.join(root, "run-1.json");
   const child = fakeChild();
-  child.pid = 4242;
+  // Shutdown signals the recorded process group on POSIX. Use a detached
+  // child owned by this test; a made-up PID could collide with a CI runner's
+  // unrelated process group and terminate the test job.
+  const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  child.pid = holder.pid;
   const originalWrite = child.stdin.write.bind(child.stdin);
   child.stdin.write = (chunk) => {
     const written = originalWrite(chunk);
@@ -960,6 +964,8 @@ test("shutdown retains ownership when a closed supervisor leaves a stale handsha
     assert.equal(database.getRun(run.id).status, "running");
     assert.deepEqual(manager.activeRuns(), [run.id], "the run slot remains owned until the supervisor proves its complete tree is gone");
   } finally {
+    if (process.platform === "win32") holder.kill("SIGKILL");
+    else try { process.kill(-holder.pid, "SIGKILL"); } catch { /* Already gone. */ }
     rmSync(root, { recursive: true, force: true });
   }
 });

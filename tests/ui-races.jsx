@@ -1785,7 +1785,7 @@ async function longTranscriptWindowRegression() {
   await settle();
   find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   try { await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-999"]'), "last offscreen message found"); }
-  catch (error) { throw new Error(`${error.message}; status=${host.querySelector('.history-find [role="status"]')?.textContent}; scroll=${viewport.current.scrollTop}/${viewport.current.scrollHeight}; rows=${[...host.querySelectorAll('[data-message-id]')].map((row) => row.dataset.messageId).join(",")}`); }
+  catch (error) { throw new Error(`${error.message}; status=${host.querySelector('.history-find .history-find-status')?.textContent}; scroll=${viewport.current.scrollTop}/${viewport.current.scrollHeight}; rows=${[...host.querySelectorAll('[data-message-id]')].map((row) => row.dataset.messageId).join(",")}`); }
   setControlValue(find, "Message 0");
   await settle();
   find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
@@ -1801,7 +1801,8 @@ async function variableHeightFindAnchorRegression() {
   root.render(null); await settle();
   const viewport = React.createRef();
   const messages = Array.from({ length: 200 }, (_, index) => ({ id: `variable-${index}`, body: `Variable ${index}`, height: index % 3 === 0 ? 360 : 54 }));
-  const render = (rows) => <div><div ref={viewport} style={{ height: 420, overflowY: "auto" }} tabIndex={0}><WindowedMessages messages={rows} viewportRef={viewport} onFind={(query) => `variable-${Number(query)}`} renderMessage={(message) => <article data-message-id={message.id} style={{ height: message.height }}>{message.body}</article>} /></div><div data-slot="scroll-area-scrollbar" /></div>;
+  messages[99].body += ` ${"wrapping text ".repeat(150)}`;
+  const render = (rows) => <div><div ref={viewport} style={{ height: 420, overflowY: "auto" }} tabIndex={0}><WindowedMessages messages={rows} viewportRef={viewport} onFind={(query) => `variable-${Number(query)}`} renderMessage={(message) => <article data-message-id={message.id} style={{ minHeight: message.height }}>{message.body}</article>} /></div><div data-slot="scroll-area-scrollbar" /></div>;
   root.render(render(messages));
   await until(() => host.querySelector('.history-find input'), "variable-height find ready");
   const input = host.querySelector('.history-find input');
@@ -1812,6 +1813,12 @@ async function variableHeightFindAnchorRegression() {
   const visible = () => { const row = host.querySelector('[data-find-match="true"]'); const bounds = row?.getBoundingClientRect(); const area = viewport.current.getBoundingClientRect(); return bounds && bounds.top >= area.top && bounds.top < area.bottom; };
   assert(visible(), "Measured tall rows displaced the found message");
   assert(host.querySelectorAll('[role="listitem"]').length < 40, "Variable-height find mounted too many rows");
+  viewport.current.style.width = "180px";
+  await settle(); await settle();
+  assert(visible(), "Width-only wrapping displaced the found message");
+  viewport.current.style.width = "";
+  await settle(); await settle();
+  assert(visible(), "Restoring viewport width lost the found message");
   viewport.current.style.height = "720px";
   await settle(); await settle();
   assert(visible(), "Growing the viewport lost the found message beyond the old overscan");
@@ -1891,7 +1898,7 @@ async function extremeDiffHeightRegression() {
   assert(bounds.top < viewport.getBoundingClientRect().bottom && bounds.bottom > viewport.getBoundingClientRect().top, `Tall diff find mark is outside the viewport: mark=${bounds.top}/${bounds.bottom}, viewport=${viewport.getBoundingClientRect().top}/${viewport.getBoundingClientRect().bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}`);
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={null} label="Empty diff" /></div>);
   await until(() => host.querySelector(".diff-empty"), "nullable diff shows its empty state");
-  const nearLimit = "+\n".repeat(2_900_000) + "+WHEEL A\n+WHEEL B\n" + "+\n".repeat(2_899_998) + "+NEAR LIMIT TAIL\n";
+  const nearLimit = "+\n".repeat(2_900_000) + `+WHEEL A ${"x".repeat(1_000)}\n+WHEEL B\n` + "+\n".repeat(2_899_998) + "+NEAR LIMIT TAIL\n";
   const heapBefore = performance.memory?.usedJSHeapSize ?? null;
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={nearLimit} label="Near-limit diff" /></div>);
   await until(() => host.querySelector('.diff-view')?.scrollHeight > 1_000_000, "near-limit diff track mounted");
@@ -1906,6 +1913,20 @@ async function extremeDiffHeightRegression() {
   nearViewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 14, bubbles: true, cancelable: true }));
   await until(() => nearViewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top < beforeWheel - 5, "compressed wheel advanced one logical line");
   assert(Math.abs(nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top - beforeWheel + 14) < 5, "Compressed wheel skipped logical lines");
+  const beforeBatch = nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top;
+  for (let step = 0; step < 3; step += 1) nearViewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 14, bubbles: true, cancelable: true }));
+  await until(() => nearViewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top < beforeBatch - 35, "batched wheels advanced three logical lines");
+  assert(Math.abs(nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top - beforeBatch + 42) < 5, "Batched wheels skipped or doubled logical lines");
+  if (window.__fixtureWheel) {
+    nearViewport.scrollIntoView({ block: "center" });
+    await frame();
+    const area = nearViewport.getBoundingClientRect();
+    const beforeNative = nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top;
+    await window.__fixtureWheel(area.left + area.width / 2, area.top + area.height / 2, 14, 80);
+    await until(() => nearViewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top < beforeNative - 5, "native compressed wheel advanced");
+    assert(Math.abs(nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top - beforeNative + 14) < 5, "Native wheel also performed a passive default scroll");
+    assert(nearViewport.scrollLeft > 0, "Combined horizontal wheel navigation was lost");
+  }
   nearViewport.scrollTop = nearViewport.scrollHeight;
   nearViewport.dispatchEvent(new Event("scroll"));
   await until(() => nearViewport.textContent.includes("NEAR LIMIT TAIL"), "near-limit End reaches the final line");
@@ -2059,24 +2080,24 @@ async function pagedTranscriptFindRegression() {
   setControlValue(input, "Needle"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   try { await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-10"]'), "old persisted match"); }
-  catch (error) { throw new Error(`${error.message}; status=${host.querySelector('.history-find [role="status"]')?.textContent}, scroll=${host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]')?.scrollTop}, rows=${[...host.querySelectorAll('[data-message-id]')].map((item) => item.dataset.messageId).slice(0, 4).join(',')}`); }
+  catch (error) { throw new Error(`${error.message}; status=${host.querySelector('.history-find .history-find-status')?.textContent}, scroll=${host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]')?.scrollTop}, rows=${[...host.querySelectorAll('[data-message-id]')].map((item) => item.dataset.messageId).slice(0, 4).join(',')}`); }
   await settle();
   const foundRow = host.querySelector('[data-find-match="true"]');
   const foundViewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
   assert(foundRow && foundRow.getBoundingClientRect().top < foundViewport.getBoundingClientRect().bottom && foundRow.getBoundingClientRect().bottom > foundViewport.getBoundingClientRect().top, `Initial found row was mounted but not visible: scroll=${foundViewport.scrollTop}, row=${foundRow?.getBoundingClientRect().top}`);
   assert(host.querySelectorAll('[role="listitem"]').length < 40, "Old search match mounted all history");
-  assert(host.querySelector('.history-find [role="status"]')?.textContent === "Message 11 of 1000", "Old match announced its page-local index");
+  assert(host.querySelector('.history-find .history-find-status')?.textContent === "Message 11 of 1000", "Old match announced its page-local index");
   assert(foundRow.getAttribute("aria-posinset") === "11" && foundRow.getAttribute("aria-setsize") === "1000", "Old match advertised a page-local list size");
   assert(host.querySelector('.history-return'), "An older search page lost return-to-latest navigation");
   for (const type of ["run.completed", "run.failed", "run.stopped"]) {
     fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: `run-${type}`, payload: { type } }) }));
     await new Promise((resolve) => setTimeout(resolve, 100));
     await settle();
-    assert(host.querySelector('.history-return') && host.querySelector('[data-find-match="true"] [data-message-id="message-10"]'), `${type} replaced the chosen history page or find highlight: return=${Boolean(host.querySelector('.history-return'))}, match=${host.querySelector('[data-find-match="true"] [data-message-id]')?.dataset.messageId}, status=${host.querySelector('.history-find [role="status"]')?.textContent}, scroll=${host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]')?.scrollTop}, rows=${[...host.querySelectorAll('[data-message-id]')].map((item) => item.dataset.messageId).slice(0, 3).join(',')}`);
+    assert(host.querySelector('.history-return') && host.querySelector('[data-find-match="true"] [data-message-id="message-10"]'), `${type} replaced the chosen history page or find highlight: return=${Boolean(host.querySelector('.history-return'))}, match=${host.querySelector('[data-find-match="true"] [data-message-id]')?.dataset.messageId}, status=${host.querySelector('.history-find .history-find-status')?.textContent}, scroll=${host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]')?.scrollTop}, rows=${[...host.querySelectorAll('[data-message-id]')].map((item) => item.dataset.messageId).slice(0, 3).join(',')}`);
   }
   host.querySelector('[aria-label="Next conversation match"]').click();
   await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-900"]'), "newer persisted match");
-  assert(host.querySelector('.history-find [role="status"]')?.textContent === "Message 901 of 1000", "New match announced its page-local index");
+  assert(host.querySelector('.history-find .history-find-status')?.textContent === "Message 901 of 1000", "New match announced its page-local index");
   const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
   input.focus();
   const bounds = input.getBoundingClientRect();
@@ -2089,7 +2110,7 @@ async function pagedTranscriptFindRegression() {
   const readingTop = viewport.scrollTop;
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1_000) }) }));
   await settle();
-  assert(Math.abs(viewport.scrollTop - readingTop) < 24, `A live append moved the reading position: before=${readingTop}, after=${viewport.scrollTop}, height=${viewport.scrollHeight}, sticky=${host.querySelector('.history-find [role="status"]')?.textContent}`);
+  assert(Math.abs(viewport.scrollTop - readingTop) < 24, `A live append moved the reading position: before=${readingTop}, after=${viewport.scrollTop}, height=${viewport.scrollHeight}, sticky=${host.querySelector('.history-find .history-find-status')?.textContent}`);
   host.querySelector('[aria-label="Previous conversation match"]').click();
   await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-10"]'), "previous persisted match");
   assert(document.activeElement === input && input.getBoundingClientRect().top >= visible.top, "Find control disappeared during previous navigation");
@@ -2113,18 +2134,18 @@ async function pagedTranscriptFindRegression() {
   lateSearch.resolve(response({ matchId: "message-10", messages: earliest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } }));
   await settle();
   assert(!host.querySelector('.history-return'), "A late find replaced Return to latest");
-  assert(host.querySelector('.history-find [role="status"]')?.textContent !== "No match", "A cancelled find announced a false miss");
+  assert(host.querySelector('.history-find .history-find-status')?.textContent !== "No match", "A cancelled find announced a false miss");
   host.querySelector('.history-loader').click();
   await until(() => olderRequested, "older page request pending");
   setControlValue(input, "none"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-  await until(() => host.querySelector('.history-find [role="status"]')?.textContent === "No match", "no-match search completed");
+  await until(() => host.querySelector('.history-find .history-find-status')?.textContent === "No match", "no-match search completed");
   olderRequest.resolve(response({ messages: earliest, messagePage: { hasMore: false, olderCount: 0, total: 1_000, beforeId: "message-0" } }));
   await settle();
   assert(host.querySelector('.history-loader')?.textContent.includes("800"), "Stale prepend replaced the selected page");
   setControlValue(input, "failure"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-  await until(() => host.querySelector('.history-find [role="status"]')?.textContent === "Search failed; retry", "find failure reported");
+  await until(() => host.querySelector('.history-find .history-find-status')?.textContent === "Search failed; retry", "find failure reported");
   assert(host.querySelector('.history-loader')?.textContent.includes("800"), "Failed find replaced the current page");
   host.querySelector('.history-loader').click();
   await until(() => host.textContent.includes("Older page unavailable"), "failed prepend reported");
@@ -2136,7 +2157,7 @@ async function pagedTranscriptFindRegression() {
   assert(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96, `Stale prepend disabled bottom following: top=${viewport.scrollTop}, height=${viewport.scrollHeight}, client=${viewport.clientHeight}, return=${host.querySelector('.history-return')?.textContent}, loader=${host.querySelector('.history-loader')?.textContent}`);
   setControlValue(input, "partial"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-  await until(() => host.querySelector('.history-find [role="status"]')?.textContent === "Search paused; press Enter to continue", "bounded search offered an explicit continuation");
+  await until(() => host.querySelector('.history-find .history-find-status')?.textContent === "Search paused; press Enter to continue", "bounded search offered an explicit continuation");
   assert(partialReads === 8, "one Find action exceeded its request budget");
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-10"]'), "continued search found an older message");
@@ -2148,7 +2169,7 @@ async function pagedTranscriptFindRegression() {
   await until(() => draggedSignal.aborted, "pointer navigation aborted its pending Find request");
   draggedSearch.resolve(response({ matchId: "message-10", messages: earliest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } }));
   await settle();
-  assert(!host.querySelector('.history-find [role="status"]')?.textContent.includes("Searching") && !host.querySelector('[data-find-match="true"]'), "A dragged Find response restored its stale match");
+  assert(!host.querySelector('.history-find .history-find-status')?.textContent.includes("Searching") && !host.querySelector('[data-find-match="true"]'), "A dragged Find response restored its stale match");
   setControlValue(input, "archive"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => archiveSignal, "archive search entered its server slot");
@@ -2424,7 +2445,7 @@ async function checkpointReadingPageRegression() {
   setControlValue(find, "checkpoint 10"); await settle();
   find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => host.querySelector('[data-message-id="checkpoint-10"]'), "older checkpoint page");
-  assert(host.querySelector('.history-find [role="status"]')?.textContent === "Message 11 of 1000", "An old off-page checkpoint inflated the persisted count");
+  assert(host.querySelector('.history-find .history-find-status')?.textContent === "Message 11 of 1000", "An old off-page checkpoint inflated the persisted count");
   for (let seq = 6; seq <= 8; seq += 1) {
     const updated = message(999, `Checkpoint ${seq}`, seq);
     latest = latest.map((item) => item.id === updated.id ? updated : item);
@@ -2572,11 +2593,11 @@ async function metadataBeforeFindResultRegression() {
         : { type: "conversation.updated", conversationId: "chat-A" };
     fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
     await until(() => detailReads > 1 && !host.querySelector('[aria-label="Stop active agent run"]'), `${kind} metadata before find`);
-    assert(host.querySelector('.history-find [role="status"]')?.textContent === "Searching…", `${kind} metadata reset the pending search`);
+    assert(host.querySelector('.history-find .history-find-status')?.textContent === "Searching…", `${kind} metadata reset the pending search`);
     if (kind === "error") pendingFind.resolve(response({ error: "Search unavailable" }, 503));
     else pendingFind.resolve(response({ matchId: kind === "no-match" ? null : "pending-10", messages: older, messagePage: { total: 100, olderCount: 0, newerCount: 80, hasLater: true, beforeId: "pending-0" } }));
     if (kind === "no-match" || kind === "error") {
-      await until(() => host.querySelector('.history-find [role="status"]')?.textContent === (kind === "error" ? "Search failed; retry" : "No match"), `${kind} status after metadata`);
+      await until(() => host.querySelector('.history-find .history-find-status')?.textContent === (kind === "error" ? "Search failed; retry" : "No match"), `${kind} status after metadata`);
       assert(host.querySelector('[data-message-id="pending-80"]') && !host.querySelector('.history-return') && host.querySelector('[aria-label="Send message"]'), `${kind} replaced the latest page or kept stale run metadata`);
       continue;
     }
@@ -2611,7 +2632,7 @@ async function findInFlightEventRegression() {
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(200) }) }));
   pending.resolve(response({ matchId: "race-10", messages: latest, messagePage: { hasMore: false, olderCount: 0, hasLater: false, newerCount: 0, total: 200, beforeId: "race-0" } }));
   await until(() => host.querySelector('.history-return'), "in-flight event offers return to latest");
-  assert(host.querySelector('[data-message-id="race-10"]'), "Find lost its match after a live event");
+  await until(() => host.querySelector('[data-message-id="race-10"]'), "Find retains its match after a live event");
 }
 
 async function typingDuringPrependRegression() {
