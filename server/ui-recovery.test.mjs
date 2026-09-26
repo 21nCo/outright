@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, isUnverifiableLegacyRecovery, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterDurableMessage, streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
+import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, isUnverifiableLegacyRecovery, messagePrecedesPage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterDurableMessage, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "../src/recovery-policy.js";
+
+test("live insertion and replay follow durable order across a backward clock jump", () => {
+  const first = { id: "first", createdAt: "2026-09-26T12:00:00Z", searchOrder: 1 };
+  const second = { id: "second", createdAt: "2026-09-26T11:00:00Z", searchOrder: 2 };
+  assert.equal(messagePrecedesPage(second, first), false);
+  assert.deepEqual(upsertRuntimeMessage([first], second).map((message) => message.id), ["first", "second"]);
+  assert.deepEqual(replayConversationEvents([first], [{ type: "message.created", payload: second }]).messages.map((message) => message.id), ["first", "second"]);
+});
 
 test("worktree recovery metadata gates sibling composers before conversation-local history", () => {
   const local = { id: "local", status: "interrupted" };
@@ -105,6 +113,25 @@ test("checkpoint cursors loaded from older pages only advance", () => {
   ], current);
   assert.equal(merged.get("run-1"), 9);
   assert.equal(merged.get("run-2"), 3);
+});
+
+test("older checkpoint replay cannot refresh eviction order or displace a newer high-water mark", () => {
+  const cursors = new Map();
+  for (let index = 0; index < 2_048; index += 1) recordCheckpointCursor(cursors, { payload: { runId: `run-${index}`, checkpointEventSeq: 9 } });
+  recordCheckpointCursor(cursors, { payload: { runId: "run-0", checkpointEventSeq: 4 } });
+  recordCheckpointCursor(cursors, { payload: { runId: "run-new", checkpointEventSeq: 1 } });
+  assert.equal(cursors.has("run-0"), false);
+  assert.equal(cursors.get("run-1"), 9);
+});
+
+test("an active run keeps its checkpoint cursor through more than 2048 other runs", () => {
+  const cursors = new Map();
+  const active = new Set(["long-run"]);
+  recordCheckpointCursor(cursors, { payload: { runId: "long-run", checkpointEventSeq: 100 } }, active);
+  for (let index = 0; index < 2_100; index += 1) recordCheckpointCursor(cursors, { payload: { runId: `short-${index}`, checkpointEventSeq: 1 } }, active);
+  assert.equal(cursors.size, 2_048);
+  assert.equal(cursors.get("long-run"), 100);
+  assert.equal(isStaleCheckpointMessage(cursors, { payload: { runId: "long-run", checkpointEventSeq: 99 } }), true);
 });
 
 test("conversation replay and its in-flight event buffer remain bounded", () => {

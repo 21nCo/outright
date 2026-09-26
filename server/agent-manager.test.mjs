@@ -80,6 +80,29 @@ test("a pending capability check cannot launch after trust revocation, target ch
   }
 });
 
+test("shutdown waits for an already stopped run's capability cleanup", async () => {
+  const database = fakeDatabase();
+  const run = database.createRun(codexRun("shutdown-capability"));
+  let release;
+  const capability = new Promise((resolve) => { release = resolve; });
+  let spawned = 0;
+  const manager = createAgentManager({ database, publish: () => {},
+    launchCommand: () => capability,
+    spawnProcess: () => { spawned += 1; return fakeChild(); },
+  });
+  const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  await new Promise((resolve) => setImmediate(resolve));
+  await manager.stop(run.id);
+  let settled = false;
+  const shutdown = manager.shutdown().then(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "stop released the active slot while the launch verifier still owned cleanup");
+  release({ executable: process.execPath, args: [], display: "test", handshakePath: "", ownsDescendants: true });
+  await Promise.all([scheduled, shutdown]);
+  assert.equal(spawned, 0);
+  assert.equal(database.getRun(run.id).status, "stopped");
+});
+
 function fakeChild({ autoAcknowledge = true } = {}) {
   const child = new PassThrough();
   child.stdout = new PassThrough();

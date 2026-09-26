@@ -1,7 +1,4 @@
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
 const PROVIDERS = [
   { id: "codex", label: "Codex", models: ["gpt-5.4", "gpt-5.3-codex"] },
   { id: "claude", label: "Claude Code", models: ["sonnet", "opus", "haiku"] },
@@ -10,6 +7,7 @@ const PROVIDERS = [
 export function createProviderDiscovery({ probe = defaultProbe, onChange = () => {}, refreshMs = 30_000, schedule = setInterval, cancel = clearInterval } = {}) {
   let snapshot = PROVIDERS.map((provider) => ({ ...provider, available: false, version: "", checking: true }));
   const pending = new Map();
+  const controllers = new Map();
   const lastChecked = new Map();
   let closed = false;
 
@@ -18,10 +16,12 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
     if (!provider) return Promise.resolve(false);
     if (pending.has(id)) return pending.get(id);
     if (!force && lastChecked.has(id) && Date.now() - lastChecked.get(id) < refreshMs) return Promise.resolve(snapshot.find((item) => item.id === id)?.available === true);
+    const controller = new AbortController();
+    controllers.set(id, controller);
     const task = (async () => {
       let next;
       try {
-        const version = await probe(id);
+        const version = await probe(id, { signal: controller.signal });
         next = { ...provider, available: true, version: String(version).trim(), checking: false };
       } catch {
         next = { ...provider, available: false, version: "", checking: false };
@@ -34,7 +34,7 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
         if (changed) onChange(snapshot);
       }
       return next.available;
-    })().finally(() => { if (pending.get(id) === task) pending.delete(id); });
+    })().finally(() => { if (pending.get(id) === task) pending.delete(id); if (controllers.get(id) === controller) controllers.delete(id); });
     pending.set(id, task);
     return task;
   }
@@ -72,11 +72,26 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
       if (closed) return false;
       return probeProvider(id, true);
     },
-    close() { closed = true; cancel(timer); },
+    async close() {
+      closed = true;
+      cancel(timer);
+      for (const controller of controllers.values()) controller.abort();
+      await Promise.allSettled([...pending.values()]);
+    },
   };
 }
 
-async function defaultProbe(id) {
-  const { stdout, stderr } = await execFileAsync(id, ["--version"], { encoding: "utf8", timeout: 2500, maxBuffer: 16 * 1024, windowsHide: true });
-  return stdout || stderr || "";
+async function defaultProbe(id, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    let outcome;
+    let closed = false;
+    const finish = () => {
+      if (!closed || !outcome) return;
+      if (outcome.error) reject(outcome.error);
+      else resolve(outcome.stdout || outcome.stderr || "");
+    };
+    const child = execFile(id, ["--version"], { encoding: "utf8", timeout: 2500, maxBuffer: 16 * 1024, windowsHide: true, signal },
+      (error, stdout, stderr) => { outcome = { error, stdout, stderr }; finish(); });
+    child.once("close", () => { closed = true; finish(); });
+  });
 }

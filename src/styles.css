@@ -393,12 +393,13 @@ select { height: 34px; padding: 0 28px 0 10px; border: 1px solid var(--input); b
 .changes-layout { min-height: 0; display: grid; grid-template-rows: minmax(120px, 38%) minmax(0, 1fr); }
 .changed-files { min-height: 0; padding: 5px; overflow-y: auto; border-bottom: 1px solid var(--line-soft); }
 .diff-column { min-height: 0; min-width: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; }
-.windowed-diff { min-height: 0; min-width: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); }
+.windowed-diff { grid-row: 2; min-height: 0; min-width: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); }
 .window-find, .history-find { min-width: 0; display: flex; align-items: center; gap: 4px; padding: 3px 6px; border-bottom: 1px solid var(--line-soft); font-size: 10px; }
 .window-find input, .history-find input { min-width: 0; flex: 1; height: 25px; padding: 0 5px; border: 1px solid var(--line-soft); border-radius: 4px; color: var(--foreground); background: var(--canvas); }
 .window-find button, .history-find button { flex: none; min-width: 25px; min-height: 25px; border: 0; border-radius: 4px; color: var(--foreground); background: var(--active); cursor: pointer; }
 .window-find button:disabled, .history-find button:disabled { opacity: .45; cursor: default; }
 .window-find span, .history-find span { flex: none; color: var(--muted-foreground); }
+.sr-only { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
 .history-find { position: sticky; top: 0; z-index: 2; max-width: 680px; margin: 0 auto 8px; background: var(--canvas); }
 [data-find-match="true"] { outline: 2px solid var(--ring); outline-offset: 2px; }
 .change-file { width: 100%; min-height: 31px; border-radius: 5px; display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; color: var(--muted-foreground); background: transparent; }

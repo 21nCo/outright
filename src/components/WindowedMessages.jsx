@@ -9,16 +9,21 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
   const heightsRef = useRef(new Map());
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
-  const rangeRef = useRef({ start: 0, end: Math.min(messages.length, FULL_RENDER_LIMIT), top: 0, bottom: 0 });
+  const rangeRef = useRef({ start: 0, end: Math.min(messages.length, FULL_RENDER_LIMIT), top: 0, bottom: Math.max(0, messages.length - FULL_RENDER_LIMIT) * ESTIMATED_MESSAGE_HEIGHT });
   const [range, setRange] = useState(rangeRef.current);
   const [needle, setNeedle] = useState("");
-  const [foundIndex, setFoundIndex] = useState(-1);
   const [foundId, setFoundId] = useState(null);
+  const foundIndex = foundId ? messages.findIndex((message) => message.id === foundId) : -1;
   const [findRequest, setFindRequest] = useState(0);
   const [searching, setSearching] = useState(false);
   const [searched, setSearched] = useState(false);
+  const [partial, setPartial] = useState(false);
   const [searchError, setSearchError] = useState(false);
   const searchGenerationRef = useRef(0);
+  const searchingRef = useRef(searching);
+  searchingRef.current = searching;
+  const cancelFindRef = useRef(onCancelFind);
+  cancelFindRef.current = onCancelFind;
   const pendingFoundRef = useRef(null);
   const alignmentFramesRef = useRef(0);
 
@@ -32,12 +37,13 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
         const id = await onFind(query, direction, foundId);
         if (generation !== searchGenerationRef.current) return;
         if (id === undefined) return; // A newer page action cancelled this request.
+        if (id?.partial) { setPartial(true); setSearched(false); setSearchError(false); return; }
+        setPartial(false);
         setSearchError(false);
         setFoundId(id);
         pendingFoundRef.current = id;
         if (id) { alignmentFramesRef.current = 0; setFindRequest((current) => current + 1); }
         setSearched(true);
-        setFoundIndex(messages.findIndex((message) => message.id === id));
       } catch {
         if (generation === searchGenerationRef.current) setSearchError(true);
       } finally { if (generation === searchGenerationRef.current) setSearching(false); }
@@ -47,7 +53,6 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     for (let checked = 0; checked < messages.length; checked += 1) {
       index = (index + direction + messages.length) % messages.length;
       if (!String(messages[index].body ?? "").toLocaleLowerCase().includes(query.toLocaleLowerCase())) continue;
-      setFoundIndex(index);
       setFoundId(messages[index].id);
       setSearched(true);
       const viewport = viewportRef.current;
@@ -60,7 +65,6 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
       }
       return;
     }
-    setFoundIndex(-1);
     setFoundId(null);
     setSearched(true);
   }
@@ -102,20 +106,19 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     ++searchGenerationRef.current;
     pendingFoundRef.current = null;
     setFoundId(null);
-    setFoundIndex(-1);
     setSearched(false);
+    setPartial(false);
     setSearching(false);
   }, [resetFindGeneration]);
 
   useEffect(() => {
     if (!foundId) return;
     const index = messages.findIndex((message) => message.id === foundId);
-    if (index >= 0) { setFoundIndex(index); return; }
+    if (index >= 0) return;
     const frame = window.requestAnimationFrame(() => {
       if (messagesRef.current.some((message) => message.id === foundId)) return;
       if (pendingFoundRef.current === foundId) pendingFoundRef.current = null;
       setFoundId(null);
-      setFoundIndex(-1);
       setSearched(false);
     });
     return () => window.cancelAnimationFrame(frame);
@@ -125,7 +128,6 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     if (!foundId) return;
     const index = messages.findIndex((message) => message.id === foundId);
     if (index < 0) return;
-    setFoundIndex(index);
     if (pendingFoundRef.current !== foundId) return;
     const viewport = viewportRef.current;
     const list = listRef.current;
@@ -153,6 +155,8 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     return () => window.cancelAnimationFrame(frame);
   }, [foundId, findRequest, messages, range.start, range.end, viewportRef, update]);
 
+  useLayoutEffect(() => { update(); }, [update]);
+
   useEffect(() => {
     const ids = new Set(messages.map((message) => message.id));
     for (const id of heightsRef.current.keys()) if (!ids.has(id)) heightsRef.current.delete(id);
@@ -161,7 +165,10 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     let frame = 0;
     const schedule = () => { if (!frame) frame = window.setTimeout(() => { frame = 0; update(); }, 16); };
     viewport.addEventListener("scroll", schedule, { passive: true });
+    let lastHeight = viewport.clientHeight;
     const resize = new ResizeObserver(() => {
+      if (viewport.clientHeight === lastHeight) return;
+      lastHeight = viewport.clientHeight;
       const list = listRef.current;
       if (!list) { schedule(); return; }
       const match = list.querySelector('[data-find-match="true"]');
@@ -184,7 +191,17 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
   useEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
-    const cancel = () => { pendingFoundRef.current = null; };
+    const cancel = (event) => {
+      if (event.target?.closest?.(".history-find")) return;
+      pendingFoundRef.current = null;
+      if (!searchingRef.current) return;
+      ++searchGenerationRef.current;
+      cancelFindRef.current?.();
+      searchingRef.current = false;
+      setSearching(false);
+      setPartial(false);
+      setSearched(false);
+    };
     const scrollbar = viewport.parentElement?.querySelector('[data-slot="scroll-area-scrollbar"]');
     scrollbar?.addEventListener("pointerdown", cancel, { passive: true });
     viewport.addEventListener("pointerdown", cancel, { passive: true });
@@ -214,7 +231,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
   const olderCount = messagePage?.olderCount ?? 0;
   const total = messagePage?.total ?? messages.length;
   const position = (index) => olderCount + index + 1;
-  return <><div className="history-find" role="search" aria-label="Find in conversation"><input aria-label="Find in conversation" maxLength={200} value={needle} onChange={(event) => { ++searchGenerationRef.current; pendingFoundRef.current = null; onCancelFind?.(); setNeedle(event.target.value); setFoundIndex(-1); setFoundId(null); setSearching(false); setSearched(false); setSearchError(false); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle || searching} aria-label="Previous conversation match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle || searching} aria-label="Next conversation match">↓</button><span role="status">{searching ? "Searching…" : searchError ? "Search failed; retry" : needle && foundIndex >= 0 ? `Message ${position(foundIndex)} of ${total}` : needle && searched ? "No match" : needle ? "Press Enter to find" : ""}</span></div><div ref={listRef} role="list" aria-label="Conversation history">
+  return <><div className="history-find" role="search" aria-label="Find in conversation"><input aria-label="Find in conversation" maxLength={200} value={needle} onChange={(event) => { ++searchGenerationRef.current; pendingFoundRef.current = null; onCancelFind?.(); setNeedle(event.target.value); setFoundId(null); setSearching(false); setSearched(false); setPartial(false); setSearchError(false); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle || searching} aria-label="Previous conversation match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle || searching} aria-label="Next conversation match">↓</button><span role="status">{searching ? "Searching…" : searchError ? "Search failed; retry" : partial ? "Search paused; press Enter to continue" : needle && foundIndex >= 0 ? `Message ${position(foundIndex)} of ${total}` : needle && searched ? "No match" : needle ? "Press Enter to find" : ""}</span></div><div ref={listRef} role="list" aria-label="Conversation history">
     {range.top > 0 && <div aria-hidden="true" style={{ height: range.top }} />}
     {messages.slice(range.start, range.end).map((message, offset) => <div key={message.id} data-window-id={message.id} data-find-match={range.start + offset === foundIndex ? "true" : undefined} role="listitem" aria-posinset={position(range.start + offset)} aria-setsize={total} style={{ display: "flow-root" }}>{renderMessage(message)}</div>)}
     {range.bottom > 0 && <div aria-hidden="true" style={{ height: range.bottom }} />}

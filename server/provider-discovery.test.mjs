@@ -1,6 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { spawn } from "node:child_process";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
+
+test("shutdown aborts and reaps a running version-check child", async () => {
+  let childPid;
+  const discovery = createProviderDiscovery({ probe: (id, { signal }) => {
+    if (id !== "codex") throw new Error("not installed");
+    return new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { signal, stdio: "ignore" });
+      childPid = child.pid;
+      let error;
+      child.once("error", (reason) => { error = reason; });
+      child.once("close", () => error ? reject(error) : resolve("version"));
+    });
+  } });
+  await Promise.resolve();
+  assert.ok(childPid > 0);
+  await discovery.close();
+  assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" }, "shutdown resolved while the probe process still existed");
+});
 
 test("provider reads stay responsive while an asynchronous probe is pending", async () => {
   let finish;

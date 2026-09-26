@@ -218,7 +218,13 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const abortFind = () => findController.abort();
         response.once?.("close", abortFind);
         try {
-          const result = await database.findMessagePage(conversationFindMatch[1], needle, url.searchParams.get("after"), direction === "previous" ? -1 : 1, findController.signal);
+          const originParam = url.searchParams.get("origin");
+          const wrappedParam = url.searchParams.get("wrapped");
+          if (wrappedParam && (wrappedParam !== "1" || originParam === null)) throw apiError(400, "Search continuation is invalid");
+          const result = await database.findMessagePage(
+            conversationFindMatch[1], needle, url.searchParams.get("after"), direction === "previous" ? -1 : 1, findController.signal,
+            originParam === null ? undefined : { originId: originParam === "none" ? null : originParam, wrapped: wrappedParam === "1" },
+          );
           if (response.destroyed) return true;
           return json(response, 200, result);
         } finally { response.off?.("close", abortFind); }

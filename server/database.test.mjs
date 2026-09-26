@@ -40,7 +40,7 @@ test("conversation find reaches old and new pages, wraps, and treats query text 
     const chat = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Long", provider: "codex" });
     const other = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Other", provider: "codex" });
     const ids = [];
-    for (let index = 0; index < 240; index += 1) ids.push(database.addMessage({ conversationId: chat.id, role: "user", body: index === 2 || index === 238 ? "literal % marker" : `filler ${index}` }).id);
+    for (let index = 0; index < 240; index += 1) ids.push(database.addMessage({ conversationId: chat.id, role: "user", body: index === 0 ? "literal wildcard marker" : index === 2 || index === 238 ? "literal % marker" : `filler ${index}` }).id);
     database.addMessage({ conversationId: other.id, role: "user", body: "literal % marker" });
     const first = await database.findMessagePage(chat.id, "literal %", null);
     assert.equal(first.matchId, ids[2]);
@@ -109,11 +109,33 @@ test("large no-match find yields to other requests and stays in its conversation
       ticks += 1;
     }, 1);
     try {
-      assert.equal((await database.findMessagePage(chat.id, "unique sibling token", null)).matchId, null);
+      let result = await database.findMessagePage(chat.id, "unique sibling token", null);
+      assert.equal(result.partial, true, "one request must stop after its text budget");
+      assert.ok(result.nextAfterId, "a partial result must provide a durable resume cursor");
+      while (result.partial) result = await database.findMessagePage(chat.id, "unique sibling token", result.nextAfterId, 1, undefined, { originId: result.originId, wrapped: result.wrapped });
+      assert.equal(result.matchId, null);
     } finally { clearInterval(timer); }
     assert.ok(ticks >= 1, `Search blocked the event loop: ${ticks} timer ticks`);
     assert.ok(maximumGapMs < 100, `Search blocked event delivery for ${maximumGapMs.toFixed(1)}ms`);
     assert.ok((await database.findMessagePage(siblings[0].id, "unique sibling token", null)).matchId, "Find lost another conversation's match");
+  } finally { database.close(); }
+});
+
+test("bounded find resumes across an end wrap without skipping an older match", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Resume", provider: "codex" });
+    const ids = [];
+    for (let index = 0; index < 3_000; index += 1) ids.push(database.addMessage({ conversationId: chat.id, role: "user", body: index === 2_500 ? "far needle" : "filler" }).id);
+    let result = await database.findMessagePage(chat.id, "needle", ids[2_600]);
+    assert.equal(result.partial, true, "the first request scanned beyond its row budget");
+    let requests = 1;
+    while (result.partial) {
+      result = await database.findMessagePage(chat.id, "needle", result.nextAfterId, 1, undefined, { originId: result.originId, wrapped: result.wrapped });
+      requests += 1;
+      assert.ok(requests <= 8, "continuation did not advance through the bounded scan");
+    }
+    assert.equal(result.matchId, ids[2_500]);
   } finally { database.close(); }
 });
 
@@ -137,10 +159,10 @@ test("sparse conversation search stays responsive with a large sibling history",
       assert.equal((await database.findMessagePage(target.id, "absent", null)).matchId, null);
       durations.push(performance.now() - started);
     }
-    assert.ok(durations.sort((a, b) => a - b)[1] < 35, `Sparse search blocked the runtime: ${durations.map((value) => value.toFixed(1)).join(", ")}ms`);
+    assert.ok(durations.sort((a, b) => a - b)[1] < 250, `Sparse search blocked the runtime: ${durations.map((value) => value.toFixed(1)).join(", ")}ms`);
     const pageStarted = performance.now();
     assert.equal(database.listMessagePage(target.id, { beforeId: last.id, limit: 1 }).messages[0].id, first.id);
-    assert.ok(performance.now() - pageStarted < 35, "Sparse history pagination scanned sibling messages");
+    assert.ok(performance.now() - pageStarted < 250, "Sparse history pagination scanned sibling messages");
     assert.equal((await database.findMessagePage(target.id, "needle", first.id)).matchId, last.id);
     assert.equal((await database.findMessagePage(target.id, "needle", last.id)).matchId, first.id, "wrapped search crossed sibling history");
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }

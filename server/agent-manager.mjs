@@ -312,6 +312,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   assertPrivateLaunchDirectory(resolvedLaunchDirectory);
   const active = new Map();
   const queue = [];
+  const launches = new Set();
   let shuttingDown = false;
   let shutdownPromise;
   const providerDiscovery = createProviderDiscovery({ onChange: onProvidersChanged });
@@ -650,6 +651,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
           if (!state.stopped && !error?.preserveActiveRun) finish(state, null, error);
         }
       })();
+      launches.add(state.launch);
+      state.launch.then(() => launches.delete(state.launch), () => launches.delete(state.launch));
     }
   }
 
@@ -752,9 +755,15 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     shutdown() {
       if (shutdownPromise) return shutdownPromise;
       shuttingDown = true;
-      providerDiscovery.close();
       const ids = [...queue.map((entry) => entry.run.id), ...active.keys()];
-      shutdownPromise = Promise.all(ids.map(stop));
+      shutdownPromise = Promise.allSettled([
+        ...ids.map(stop),
+        ...launches,
+        providerDiscovery.close(),
+      ]).then((results) => {
+        const failure = results.find((result) => result.status === "rejected");
+        if (failure) throw failure.reason;
+      });
       return shutdownPromise;
     },
   };

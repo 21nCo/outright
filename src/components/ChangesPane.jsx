@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ArrowSquareOut, ArrowsClockwise, Check, GitCommit, Minus, Plus } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -18,7 +18,9 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
   const refreshRef = useRef(null);
   const lastRuntimeEventRef = useRef(null);
   const ownerRef = useRef({ path: worktree.path, generation: 0 });
-  if (ownerRef.current.path !== worktree.path) ownerRef.current = { path: worktree.path, generation: ownerRef.current.generation + 1 };
+  useLayoutEffect(() => {
+    if (ownerRef.current.path !== worktree.path) ownerRef.current = { path: worktree.path, generation: ownerRef.current.generation + 1 };
+  }, [worktree.path]);
 
   useEffect(() => {
     ++statusRequestRef.current;
@@ -71,7 +73,7 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
     finally { if (ownerRef.current === owner && request === statusRequestRef.current) setLoading(false); }
   }, [worktree.path, loadDiff, onError]);
 
-  refreshRef.current = refresh;
+  useLayoutEffect(() => { refreshRef.current = refresh; }, [refresh]);
   useEffect(() => { refreshRef.current(); }, [worktree.path]);
   useEffect(() => {
     if (!runtimeEvent || lastRuntimeEventRef.current === runtimeEvent) return;

@@ -1,6 +1,6 @@
 // Open /tests/ui-races.html on the local Vite server. All API and socket traffic
 // is replaced in this page; no real project, conversation or terminal is changed.
-import React from "react";
+import React, { startTransition, Suspense } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "../src/App.jsx";
 import { ChangesPane } from "../src/components/ChangesPane.jsx";
@@ -1479,6 +1479,31 @@ async function changesLoadingRegression() {
   await until(() => host.querySelector(".clean-state"), "loaded clean tree status");
 }
 
+async function changesDiscardedRenderRegression() {
+  root.render(null); await settle();
+  const pendingStatus = deferred();
+  const pendingRender = deferred();
+  let attempted = false;
+  let released = false;
+  route = async (url) => {
+    if (url.pathname !== "/api/git/status") return response({ diff: "" });
+    return url.searchParams.get("path") === projects[0].worktrees[0].path
+      ? pendingStatus.promise : response({ branch: "B branch", files: [], stagedCount: 0 });
+  };
+  function Gate() { if (!released) { attempted = true; throw pendingRender.promise; } return null; }
+  const pane = (tree, gate = false) => <Suspense fallback={<div>Pending worktree</div>}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} />{gate && <Gate />}</Suspense>;
+  root.render(pane(projects[0].worktrees[0]));
+  await until(() => host.querySelector(".changes-pane"), "committed A changes pane");
+  startTransition(() => root.render(pane(projects[1].worktrees[0], true)));
+  await until(() => attempted, "B render reached the suspension boundary");
+  assert(host.querySelector(".changes-pane") && !host.textContent.includes("Pending worktree"), "The pending B render replaced committed A");
+  pendingStatus.resolve(response({ branch: "A branch", files: [], stagedCount: 0 }));
+  await until(() => host.querySelector(".pane-toolbar strong")?.textContent === "A branch", "committed A status survived discarded B render");
+  released = true;
+  pendingRender.resolve();
+  await until(() => host.querySelector(".pane-toolbar strong")?.textContent === "B branch", "B status loaded after commit");
+}
+
 async function staleDiffSelectionRegression() {
   root.render(null);
   await settle();
@@ -1839,7 +1864,7 @@ async function largeDiffWindowRegression() {
 
 async function extremeDiffHeightRegression() {
   root.render(null); await settle();
-  const diff = "+\n".repeat(1_250_000) + "+TAIL MATCH\n";
+  const diff = "+\n".repeat(600_000) + "+MIDDLE MATCH\n" + "+\n".repeat(650_000) + "+TAIL MATCH\n";
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={diff} label="Tall diff" /></div>);
   await until(() => host.querySelector(".diff-view"), "tall diff mounted");
   const viewport = host.querySelector(".diff-view");
@@ -1850,11 +1875,46 @@ async function extremeDiffHeightRegression() {
   assert(viewport.querySelectorAll("span").length < 200, "Tall diff mounted an unbounded line window");
   viewport.scrollTop = 0; viewport.dispatchEvent(new Event("scroll")); await settle();
   const input = host.querySelector('input[aria-label="Find in diff"]');
+  setControlValue(input, "MIDDLE MATCH"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("MIDDLE MATCH"), "Find reaches the middle of compressed diff");
+  let middleBounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+  assert(middleBounds.top < viewport.getBoundingClientRect().bottom && middleBounds.bottom > viewport.getBoundingClientRect().top, "Middle compressed diff match was mounted outside the viewport");
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={"+\n".repeat(10_000) + diff} label="Tall diff" /></div>);
+  await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("MIDDLE MATCH") && host.querySelector('.window-find [role="status"]')?.textContent === "Line 610001", "Refresh realigns a moved middle match");
+  middleBounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+  assert(middleBounds.top < viewport.getBoundingClientRect().bottom && middleBounds.bottom > viewport.getBoundingClientRect().top, "Refreshed compressed diff match was outside the viewport");
   setControlValue(input, "TAIL MATCH"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("TAIL MATCH"), "Find reaches final line of tall diff");
   const bounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
   assert(bounds.top < viewport.getBoundingClientRect().bottom && bounds.bottom > viewport.getBoundingClientRect().top, `Tall diff find mark is outside the viewport: mark=${bounds.top}/${bounds.bottom}, viewport=${viewport.getBoundingClientRect().top}/${viewport.getBoundingClientRect().bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}`);
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={null} label="Empty diff" /></div>);
+  await until(() => host.querySelector(".diff-empty"), "nullable diff shows its empty state");
+  const nearLimit = "+\n".repeat(2_900_000) + "+WHEEL A\n+WHEEL B\n" + "+\n".repeat(2_899_998) + "+NEAR LIMIT TAIL\n";
+  const heapBefore = performance.memory?.usedJSHeapSize ?? null;
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={nearLimit} label="Near-limit diff" /></div>);
+  await until(() => host.querySelector('.diff-view')?.scrollHeight > 1_000_000, "near-limit diff track mounted");
+  const nearViewport = host.querySelector('.diff-view');
+  assert(nearViewport.scrollHeight < 16_000_000, "near-limit diff exceeded browser scroll geometry");
+  const nearInput = host.querySelector('input[aria-label="Find in diff"]');
+  setControlValue(nearInput, "WHEEL A"); await settle();
+  nearInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => nearViewport.querySelector('[data-find-match="true"]')?.textContent.includes("WHEEL A"), "near-limit middle marker visible");
+  await settle();
+  const beforeWheel = nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top;
+  nearViewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 14, bubbles: true, cancelable: true }));
+  await until(() => nearViewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top < beforeWheel - 5, "compressed wheel advanced one logical line");
+  assert(Math.abs(nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top - beforeWheel + 14) < 5, "Compressed wheel skipped logical lines");
+  nearViewport.scrollTop = nearViewport.scrollHeight;
+  nearViewport.dispatchEvent(new Event("scroll"));
+  await until(() => nearViewport.textContent.includes("NEAR LIMIT TAIL"), "near-limit End reaches the final line");
+  nearViewport.scrollTop = 0; nearViewport.dispatchEvent(new Event("scroll"));
+  setControlValue(nearInput, "NEAR LIMIT TAIL"); await settle();
+  nearInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => nearViewport.querySelector('[data-find-match="true"]')?.textContent.includes("NEAR LIMIT TAIL"), "near-limit Find reaches the final line");
+  assert(nearViewport.querySelectorAll("span").length < 200, "near-limit diff mounted unbounded rows");
+  window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), nearLimitDiff: { bytes: nearLimit.length, lines: 5_800_001, heapBefore, heapAfter: performance.memory?.usedJSHeapSize ?? null, mountedAtEnd: nearViewport.querySelectorAll("span").length } };
 }
 
 async function unicodeDiffFindRegression() {
@@ -1866,6 +1926,7 @@ async function unicodeDiffFindRegression() {
   setControlValue(input, "café"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("CAFÉ target"), "Unicode match on the correct diff line");
+  await until(() => host.querySelector('.window-find [role="status"]')?.textContent === "Line 402", "Unicode find announcement settled");
   assert(host.querySelector('.window-find [role="status"]')?.textContent === "Line 402", "Unicode case folding shifted the diff line coordinate");
 }
 
@@ -1942,6 +2003,11 @@ async function pagedTranscriptAnchorRegression() {
   const anchor = host.querySelector('[data-message-id="message-1000"]');
   assert(anchor && Math.abs(anchor.getBoundingClientRect().top - before) < 10, `Loading earlier messages moved the reading anchor by ${anchor ? Math.round(anchor.getBoundingClientRect().top - before) : "missing"}px`);
   assert(host.querySelectorAll('[role="listitem"]').length < 40, "Paged transcript mounted too many messages");
+  viewport.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+  viewport.scrollTop = 1_500;
+  viewport.dispatchEvent(new Event("scroll"));
+  for (let frameIndex = 0; frameIndex < 9; frameIndex += 1) await frame();
+  assert(Math.abs(viewport.scrollTop - 1_500) < 24, "Anchor restoration overrode pointer navigation");
 }
 
 async function pagedTranscriptFindRegression() {
@@ -1954,13 +2020,28 @@ async function pagedTranscriptFindRegression() {
   const lateSearch = deferred();
   const olderRequest = deferred();
   let staleRequested = false;
+  let partialReads = 0;
+  let archived = false;
+  let archiveSignal;
+  const archiveSearch = deferred();
+  const draggedSearch = deferred();
+  let draggedSignal;
   let lateRequested = false;
   let olderRequested = false;
   let olderRequests = 0;
-  route = async (url) => {
+  route = async (url, options) => {
     if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
-    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations") return response({ conversations: archived ? [] : [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A" && options?.method === "PATCH") { archived = true; return response({ ...chats.A, archived: true }); }
     if (url.pathname.endsWith("/messages/find")) {
+      if (url.searchParams.get("q") === "archive") { archiveSignal = options.signal; return archiveSearch.promise; }
+      if (url.searchParams.get("q") === "drag") { draggedSignal = options.signal; return draggedSearch.promise; }
+      if (url.searchParams.get("q") === "partial") {
+        partialReads += 1;
+        return partialReads <= 8
+          ? response({ partial: true, nextAfterId: `message-${partialReads}`, originId: null, wrapped: false })
+          : response({ matchId: "message-10", messages: earliest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } });
+      }
       if (url.searchParams.get("q") === "stale") { staleRequested = true; return staleSearch.promise; }
       if (url.searchParams.get("q") === "late") { lateRequested = true; return lateSearch.promise; }
       if (url.searchParams.get("q") === "none") return response({ matchId: null, messages: [], messagePage: null });
@@ -2053,6 +2134,28 @@ async function pagedTranscriptFindRegression() {
   const bottomDeadline = performance.now() + 250;
   while (viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop >= 96 && performance.now() < bottomDeadline) await frame();
   assert(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96, `Stale prepend disabled bottom following: top=${viewport.scrollTop}, height=${viewport.scrollHeight}, client=${viewport.clientHeight}, return=${host.querySelector('.history-return')?.textContent}, loader=${host.querySelector('.history-loader')?.textContent}`);
+  setControlValue(input, "partial"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('.history-find [role="status"]')?.textContent === "Search paused; press Enter to continue", "bounded search offered an explicit continuation");
+  assert(partialReads === 8, "one Find action exceeded its request budget");
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-10"]'), "continued search found an older message");
+  assert(partialReads === 9, "continuation restarted the search rather than resuming it");
+  setControlValue(input, "drag"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => draggedSignal, "drag search entered its server slot");
+  viewport.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+  await until(() => draggedSignal.aborted, "pointer navigation aborted its pending Find request");
+  draggedSearch.resolve(response({ matchId: "message-10", messages: earliest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } }));
+  await settle();
+  assert(!host.querySelector('.history-find [role="status"]')?.textContent.includes("Searching") && !host.querySelector('[data-find-match="true"]'), "A dragged Find response restored its stale match");
+  setControlValue(input, "archive"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => archiveSignal, "archive search entered its server slot");
+  host.querySelector(".chat-tab.is-active .tab-close").click();
+  await until(() => archiveSignal.aborted, "archiving aborted its pending Find request");
+  archiveSearch.resolve(response({ matchId: null, messages: [], messagePage: null }));
+  await until(() => !host.querySelector('.chat-tab.is-active'), "archived chat released its visible owner");
 }
 
 async function backgroundLatestRefreshRegression() {
@@ -2060,15 +2163,29 @@ async function backgroundLatestRefreshRegression() {
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
   const first = { id: "fresh-1", role: "assistant", kind: "text", body: "First persisted output", createdAt: "2026-09-26T00:00:00Z" };
   let messages = [first];
+  let countTotal = 1;
+  let staleDetail;
   route = async (url) => {
     if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
     if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
-    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages, messagePage: { hasMore: false, olderCount: 0, total: messages.length, beforeId: messages[0].id } });
+    if (url.pathname === "/api/conversations/chat-A/messages/count") return response({ total: countTotal });
+    if (url.pathname === "/api/conversations/chat-A") return staleDetail?.promise ?? response({ ...chats.A, messages, messagePage: { hasMore: false, olderCount: 0, total: messages.length, beforeId: messages[0].id } });
     return response({});
   };
   root.render(<TooltipProvider><App /></TooltipProvider>);
   await until(() => host.querySelector('[data-message-id="fresh-1"]'), "initial latest page");
+  staleDetail = deferred();
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await settle();
+  const buffered = { ...first, id: "fresh-buffered", body: "Output between snapshot and replay", searchOrder: 2 };
+  countTotal = 2;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: buffered }) }));
+  staleDetail.resolve(response({ ...chats.A, messages: [first], messagePage: { hasMore: false, olderCount: 0, total: 1, beforeId: first.id } }));
+  staleDetail = null;
+  await until(() => host.querySelector('[data-message-id="fresh-buffered"]')?.closest('[role="listitem"]')?.getAttribute("aria-setsize") === "2", "replayed insert reconciled a stale snapshot total");
+  messages = [first, buffered];
   messages = [...messages, { ...first, id: "fresh-2", body: "Recovered missed output" }];
+  countTotal = 3;
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
   await until(() => host.querySelector('[data-message-id="fresh-2"]'), "missed latest output recovered");
   assert(!host.querySelector('.history-return'), "Latest refresh incorrectly became an older history page");
@@ -2208,7 +2325,7 @@ async function backgroundReadingRefreshRegression() {
 async function fullPageLiveAnchorRegression() {
   root.render(null); await settle();
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
-  const message = (index) => ({ id: `full-${index}`, role: "assistant", kind: "text", body: `Output ${index}`, createdAt: new Date(index * 1000).toISOString() });
+  const message = (index) => ({ id: `full-${index}`, role: "assistant", kind: "text", body: `Output ${index}`, createdAt: new Date(index * 1000).toISOString(), searchOrder: index + 1 });
   let all = Array.from({ length: 1000 }, (_, index) => message(index));
   route = async (url) => {
     if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
@@ -2231,6 +2348,10 @@ async function fullPageLiveAnchorRegression() {
   await until(() => !host.querySelector('.history-return'), "explicit latest after full-page append");
   viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll"));
   await until(() => host.querySelector('[data-message-id="full-1000"]'), "new durable row available at latest");
+  const backdated = { ...message(1001), createdAt: new Date(0).toISOString() };
+  all = [...all, backdated];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: backdated }) }));
+  await until(() => host.querySelector('[data-message-id="full-1001"]'), "backdated insertion remains at the durable latest end");
 }
 
 async function backgroundCompletionKeepsExplicitPageRegression() {
@@ -2279,12 +2400,13 @@ async function checkpointReadingPageRegression() {
   let latest = Array.from({ length: 200 }, (_, index) => message(index + 800));
   let persistedTotal = 1000;
   let reads = 0;
+  let heldDetail = null;
   route = async (url) => {
     if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
     if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
     if (url.pathname === "/api/conversations/chat-A/messages/count") return response({ total: persistedTotal });
     if (url.pathname.endsWith("/messages/find")) return response({ matchId: "checkpoint-10", messages: older, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1000, beforeId: "checkpoint-0" } });
-    if (url.pathname === "/api/conversations/chat-A") { reads += 1; return response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: persistedTotal - latest.length, total: persistedTotal, beforeId: latest[0].id } }); }
+    if (url.pathname === "/api/conversations/chat-A") { reads += 1; return heldDetail?.promise ?? response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: persistedTotal - latest.length, total: persistedTotal, beforeId: latest[0].id } }); }
     return response({});
   };
   root.render(<TooltipProvider><App /></TooltipProvider>);
@@ -2327,6 +2449,16 @@ async function checkpointReadingPageRegression() {
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(999, "Repeated checkpoint", 9) }) }));
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert(host.querySelector('.history-return')?.textContent === "Return to latest · 803 new", "Repeated off-page checkpoint inflated the live count");
+  heldDetail = deferred();
+  const staleDetail = heldDetail;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await until(() => reads >= 5, "preserved reading refresh pending before overflow");
+  heldDetail = null;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "noise", payload: { type: "noop", padding: "x".repeat(1_100_000) } }) }));
+  await until(() => reads >= 6, "overflow retried the detail read");
+  staleDetail.resolve(response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: persistedTotal - latest.length, total: persistedTotal, beforeId: latest[0].id } }));
+  await settle();
+  assert(host.querySelector('[data-message-id="checkpoint-10"]') && host.querySelector('.history-return'), "overflow retry replaced the chosen reading page");
 }
 
 async function latestBeforeFindOwnershipRegression() {
@@ -2971,6 +3103,7 @@ try {
     ["background terminal activation", terminalBackgroundActivationRegression, "background activation settles and fits when visible"],
     ["command search", commandPaletteRegression, "command search keeps asynchronous results current and selectable"],
     ["changes loading", changesLoadingRegression, "changes pane waits for status before announcing a clean tree"],
+    ["changes discarded render", changesDiscardedRenderRegression, "a suspended worktree render cannot steal a committed status request"],
     ["stale diff selection", staleDiffSelectionRegression, "a slow prior diff cannot replace the selected file"],
     ["changes refresh selection", changesSelectionRefreshRegression, "pending refreshes preserve current file and mode and retained events refresh once"],
     ["changes diff failure ownership", changesDiffFailureOwnershipRegression, "pending and failed file or mode requests never display a previous diff"],
