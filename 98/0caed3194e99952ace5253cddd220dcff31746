@@ -1,0 +1,36 @@
+docs/out-32-performance.md
+  h_a39f9495f9ec1d 50
+server/agent-manager.test.mjs
+  h_a39f9495f9ec1d 937-941,967-968
+server/database.test.mjs
+  h_a39f9495f9ec1d 115-122
+server/provider-discovery.mjs
+  h_a39f9495f9ec1d 84,88-103,106,108,111-127
+server/provider-discovery.test.mjs
+  h_a39f9495f9ec1d 4-33,47-50
+server/ui-recovery.test.mjs
+  h_a39f9495f9ec1d 137-152
+src/App.jsx
+  h_a39f9495f9ec1d 394-395,497-498
+src/components/WindowedDiff.jsx
+  h_a39f9495f9ec1d 37-57,144
+src/components/WindowedMessages.jsx
+  h_a39f9495f9ec1d 14,29,47,104-107,111-112,116,130,149,156,161,179,181,183,187-190,205,243-249
+src/recovery-policy.js
+  h_a39f9495f9ec1d 103,105,111
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 1788,1804-1805,1816-1821,1901,1916-1929,2083,2089,2096,2100,2113,2137,2142,2148,2160,2172,2448,2596,2600,2635
+tests/ui-races.test.mjs
+  h_a39f9495f9ec1d 773,781,796
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "980caed3194e99952ace5253cddd220dcff31746",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
