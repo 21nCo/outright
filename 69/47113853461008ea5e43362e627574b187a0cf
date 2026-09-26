@@ -1,0 +1,43 @@
+docs/out-32-performance.md
+  s_4e0e6cec9d8f32::t_52566079193d85 1-14
+src/components/ChangesPane.jsx
+  s_4dd10f7ee30353::t_f8410d9129ef6d 1,6,15-24,27,29-32,36,40,51-52,92
+src/components/WindowedMessages.jsx
+  s_6126673cc0a89e::t_db0862687278cd 1-65
+tests/ui-races.jsx
+  s_4e0e6cec9d8f32::t_d326a18a80fec8 7-8,1430-1610,1988-1993,2010
+tests/ui-races.test.mjs
+  s_4dd10f7ee30353::t_02a4defe9a1d56 800-803
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6947113853461008ea5e43362e627574b187a0cf",
+  "prompts": {},
+  "sessions": {
+    "s_4dd10f7ee30353": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0dbb0-8d23-7371-86e6-9fe5a2e1fd25",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_4e0e6cec9d8f32": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0db9a-51eb-7103-aa3b-7788a41ce0bf",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
