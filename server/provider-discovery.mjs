@@ -46,7 +46,15 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
     list() { return snapshot; },
     refresh,
     async available(id) {
-      if (snapshot.some((provider) => provider.checking)) await refresh();
+      const entry = snapshot.find((provider) => provider.id === id);
+      if (!entry) return false;
+      // A negative snapshot is only display state. Authorization must retry a
+      // newly installed CLI or a transient probe failure on this attempt.
+      const sharedProbe = pending;
+      if (entry.checking || !entry.available) {
+        await refresh(!entry.checking);
+        if (sharedProbe && !snapshot.find((provider) => provider.id === id)?.available) await refresh(true);
+      }
       else if (Date.now() - lastChecked >= refreshMs) refresh();
       return snapshot.find((provider) => provider.id === id)?.available === true;
     },

@@ -750,6 +750,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     await send("Page.enable");
     await send("Runtime.addBinding", { name: "__requestFixtureViewport" });
     await send("Runtime.addBinding", { name: "__requestFixtureKey" });
+    await send("Runtime.addBinding", { name: "__requestFixtureWheel" });
     await send("Page.addScriptToEvaluateOnNewDocument", { source: `
       window.__fixtureSetViewport = (width) => new Promise((resolve) => {
         const ready = (event) => {
@@ -769,14 +770,30 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
         window.addEventListener("fixture-key-ready", ready);
         window.__requestFixtureKey(key);
       });
+      window.__fixtureWheel = (x, y, deltaY) => new Promise((resolve) => {
+        const id = Math.random().toString(36).slice(2);
+        const ready = (event) => {
+          if (event.detail !== id) return;
+          window.removeEventListener("fixture-wheel-ready", ready);
+          resolve();
+        };
+        window.addEventListener("fixture-wheel-ready", ready);
+        window.__requestFixtureWheel(JSON.stringify({ id, x, y, deltaY }));
+      });
     ` });
     let viewportError;
     devtools.onEvent((event) => {
       if (event.method !== "Runtime.bindingCalled") return;
       (async () => {
+        if (event.params.name === "__requestFixtureWheel") {
+          const wheel = JSON.parse(event.params.payload);
+          await send("Input.dispatchMouseEvent", { type: "mouseWheel", x: wheel.x, y: wheel.y, deltaX: 0, deltaY: wheel.deltaY });
+          await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-wheel-ready", { detail: ${JSON.stringify(wheel.id)} }))` });
+          return;
+        }
         if (event.params.name === "__requestFixtureKey") {
-          if (!["Escape", "Tab"].includes(event.params.payload)) throw new Error("Unexpected fixture key");
-          const code = event.params.payload === "Tab" ? 9 : 27;
+          if (!["Escape", "Tab", "End"].includes(event.params.payload)) throw new Error("Unexpected fixture key");
+          const code = event.params.payload === "Tab" ? 9 : event.params.payload === "End" ? 35 : 27;
           const key = { key: event.params.payload, code: event.params.payload, windowsVirtualKeyCode: code, nativeVirtualKeyCode: code };
           await send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...key });
           await send("Input.dispatchKeyEvent", { type: "keyUp", ...key });
@@ -797,7 +814,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       if (viewportError) throw viewportError;
       return send(method, params);
     }, deadline);
-    assert.match(state.text, /53 interaction regressions passed/);
+    assert.match(state.text, /60 interaction regressions passed/);
     const performanceFixture = state.text.match(/Performance fixture: (\{[^\n]+\})/);
     assert.ok(performanceFixture, "large fixture measurements were not recorded");
     console.log(`UI performance: ${performanceFixture[1]}`);

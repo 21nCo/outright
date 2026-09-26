@@ -14,30 +14,37 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
   const [loading, setLoading] = useState(true);
   const diffRequestRef = useRef(0);
   const statusRequestRef = useRef(0);
+  const ownerRef = useRef({ path: worktree.path, generation: 0 });
+  if (ownerRef.current.path !== worktree.path) ownerRef.current = { path: worktree.path, generation: ownerRef.current.generation + 1 };
 
   useEffect(() => {
     ++statusRequestRef.current;
     ++diffRequestRef.current;
     setStatus(null);
     setDiff("");
+    setCommitMessage("");
     return () => { ++statusRequestRef.current; ++diffRequestRef.current; };
   }, [worktree.path]);
 
   const loadDiff = useCallback(async (filePath, mode) => {
+    const owner = ownerRef.current;
+    if (owner.path !== worktree.path) return;
     const request = ++diffRequestRef.current;
     if (!filePath) { setDiff(""); return; }
     try {
       const next = await api(query("/api/git/diff", { path: worktree.path, file: filePath, staged: mode === "staged" }));
-      if (request === diffRequestRef.current) setDiff(next.diff);
-    } catch (error) { if (request === diffRequestRef.current) onError(error); }
+      if (ownerRef.current === owner && request === diffRequestRef.current) setDiff(next.diff);
+    } catch (error) { if (ownerRef.current === owner && request === diffRequestRef.current) onError(error); }
   }, [worktree.path, onError]);
 
   const refresh = useCallback(async () => {
+    const owner = ownerRef.current;
+    if (owner.path !== worktree.path) return;
     const request = ++statusRequestRef.current;
     setLoading(true);
     try {
       const next = await api(query("/api/git/status", { path: worktree.path }));
-      if (request !== statusRequestRef.current) return;
+      if (ownerRef.current !== owner || request !== statusRequestRef.current) return;
       setStatus(next);
       const current = next.files.find((file) => file.path === selectedFile);
       const nextFile = current?.path ?? next.files[0]?.path ?? "";
@@ -48,11 +55,11 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
         setViewMode(mode);
         await loadDiff(nextFile, mode);
       } else setDiff("");
-    } catch (error) { if (request === statusRequestRef.current) onError(error); }
-    finally { if (request === statusRequestRef.current) setLoading(false); }
+    } catch (error) { if (ownerRef.current === owner && request === statusRequestRef.current) onError(error); }
+    finally { if (ownerRef.current === owner && request === statusRequestRef.current) setLoading(false); }
   }, [worktree.path, selectedFile, viewMode, loadDiff, onError]);
 
-  useEffect(() => { refresh(); }, [worktree.id]);
+  useEffect(() => { refresh(); }, [worktree.path]);
   useEffect(() => {
     // Completion events arrive nested as run.event payloads, not top-level types.
     const eventType = runtimeEvent?.type === "run.event" ? runtimeEvent.payload?.type : runtimeEvent?.type;
@@ -67,14 +74,21 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
   }
   async function chooseMode(mode) { setViewMode(mode); await loadDiff(selectedFile, mode); }
   async function mutate(endpoint, files) {
-    try { setStatus(await api(endpoint, { method: "POST", body: { path: worktree.path, files } })); await refresh(); }
-    catch (error) { onError(error); }
+    const owner = ownerRef.current;
+    const path = worktree.path;
+    try {
+      await api(endpoint, { method: "POST", body: { path, files } });
+      if (ownerRef.current === owner) await refresh();
+    } catch (error) { if (ownerRef.current === owner) onError(error); }
   }
   async function commit() {
+    const owner = ownerRef.current;
+    const path = worktree.path;
     try {
-      await api("/api/git/commit", { method: "POST", body: { path: worktree.path, message: commitMessage } });
+      await api("/api/git/commit", { method: "POST", body: { path, message: commitMessage } });
+      if (ownerRef.current !== owner) return;
       setCommitMessage(""); onToast("Commit created"); await refresh();
-    } catch (error) { onError(error); }
+    } catch (error) { if (ownerRef.current === owner) onError(error); }
   }
 
   const selected = status?.files.find((file) => file.path === selectedFile) ?? null;

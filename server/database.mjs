@@ -191,6 +191,29 @@ export function createOutrightDatabase(options = {}) {
         page: { hasMore, olderCount, total, beforeId: rows[0]?.id ?? null, limit },
       };
     },
+    findMessagePage(conversationId, query, afterId, direction = 1) {
+      const cursor = afterId ? db.prepare("SELECT rowid FROM messages WHERE conversation_id = ? AND id = ?").get(conversationId, afterId) : null;
+      if (afterId && !cursor) throw databaseError(400, "Message cursor was not found");
+      const forward = direction !== -1;
+      const boundary = cursor?.rowid ?? (forward ? 0 : Number.MAX_SAFE_INTEGER);
+      const order = forward ? "ASC" : "DESC";
+      const comparison = forward ? ">" : "<";
+      const find = (wrapped) => db.prepare(`SELECT rowid, id FROM messages WHERE conversation_id = ? AND rowid ${comparison} ? AND instr(lower(body), lower(?)) > 0 ORDER BY rowid ${order} LIMIT 1`)
+        .get(conversationId, wrapped ? (forward ? 0 : Number.MAX_SAFE_INTEGER) : boundary, query);
+      const match = find(false) ?? find(true);
+      if (!match) return { matchId: null, messages: [], messagePage: null };
+      const older = db.prepare(`SELECT rowid AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+        FROM messages WHERE conversation_id = ? AND rowid <= ? ORDER BY rowid DESC LIMIT 100`).all(conversationId, match.rowid).reverse();
+      const newer = db.prepare(`SELECT rowid AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+        FROM messages WHERE conversation_id = ? AND rowid > ? ORDER BY rowid ASC LIMIT 100`).all(conversationId, match.rowid);
+      const rows = [...older, ...newer];
+      const olderCount = db.prepare("SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ? AND rowid < ?").get(conversationId, rows[0].messageRowId).count;
+      const newerCount = db.prepare("SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ? AND rowid > ?").get(conversationId, rows.at(-1).messageRowId).count;
+      return { matchId: match.id, messages: rows.map(({ messageRowId: _rowid, ...row }) => hydratePayload(row)), messagePage: {
+        hasMore: olderCount > 0, olderCount, hasLater: newerCount > 0, newerCount,
+        total: olderCount + rows.length + newerCount, beforeId: rows[0].id, limit: 200,
+      } };
+    },
     addMessage(input) {
       const message = { id: input.id ?? randomUUID(), createdAt: input.createdAt ?? now(), ...input };
       db.prepare("INSERT INTO messages (id, conversation_id, role, kind, body, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")

@@ -201,6 +201,15 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         });
         return json(response, 200, { messages: messagePage.messages, messagePage: messagePage.page });
       }
+      const conversationFindMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages\/find$/);
+      if (conversationFindMatch && request.method === "GET") {
+        if (!database.getConversation(conversationFindMatch[1])) throw apiError(404, "Conversation not found");
+        const needle = requiredQuery(url, "q").trim();
+        if (!needle || needle.length > 200) throw apiError(400, "Search text must be 1 to 200 characters");
+        const direction = url.searchParams.get("direction") ?? "next";
+        if (!["next", "previous"].includes(direction)) throw apiError(400, "Search direction is invalid");
+        return json(response, 200, database.findMessagePage(conversationFindMatch[1], needle, url.searchParams.get("after"), direction === "previous" ? -1 : 1));
+      }
       const conversationMoveMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/move$/);
       if (conversationMoveMatch && request.method === "POST") {
         if (!database.getConversation(conversationMoveMatch[1])) throw apiError(404, "Conversation not found");
@@ -234,6 +243,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const settings = database.getSettings();
         const provider = body.provider || conversation.provider || settings.provider;
         if (!await agents.providerAvailable(provider)) throw apiError(409, `${provider} CLI is not available`);
+        if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         // Archive, move, or recovery can commit during either validation await.
         // Fence both message and run creation to the current durable target.
         const currentConversation = database.getConversation(conversation.id);
@@ -405,6 +415,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const target = await resolveWorktreeTarget({ projectId: conversation.projectId, worktreeId: conversation.worktreeId, worktreePath: conversation.worktreePath });
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         if (!await agents.providerAvailable(interrupted.provider)) throw apiError(409, `${interrupted.provider} CLI is not available`);
+        if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         // Recovery is bound to the immutable run session first. A mutable
         // conversation session is only a compatible fallback when the
         // conversation still targets the same provider.

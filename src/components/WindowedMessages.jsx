@@ -4,11 +4,58 @@ import { windowRange } from "@/lib/windowing";
 export const ESTIMATED_MESSAGE_HEIGHT = 110;
 const FULL_RENDER_LIMIT = 80;
 
-export function WindowedMessages({ messages, viewportRef, renderMessage }) {
+export function WindowedMessages({ messages, viewportRef, renderMessage, onFind, onCancelFind }) {
   const listRef = useRef(null);
   const heightsRef = useRef(new Map());
   const rangeRef = useRef({ start: 0, end: Math.min(messages.length, FULL_RENDER_LIMIT), top: 0, bottom: 0 });
   const [range, setRange] = useState(rangeRef.current);
+  const [needle, setNeedle] = useState("");
+  const [foundIndex, setFoundIndex] = useState(-1);
+  const [foundId, setFoundId] = useState(null);
+  const [searching, setSearching] = useState(false);
+  const [searched, setSearched] = useState(false);
+  const [searchError, setSearchError] = useState(false);
+  const searchGenerationRef = useRef(0);
+
+  async function find(direction = 1) {
+    const query = needle.trim().toLocaleLowerCase();
+    if (!query || !messages.length) return;
+    if (onFind) {
+      const generation = ++searchGenerationRef.current;
+      setSearching(true);
+      try {
+        const id = await onFind(query, direction, foundId);
+        if (generation !== searchGenerationRef.current) return;
+        setSearchError(false);
+        setFoundId(id);
+        setSearched(true);
+        setFoundIndex(messages.findIndex((message) => message.id === id));
+      } catch {
+        if (generation === searchGenerationRef.current) setSearchError(true);
+      } finally { if (generation === searchGenerationRef.current) setSearching(false); }
+      return;
+    }
+    let index = foundIndex;
+    for (let checked = 0; checked < messages.length; checked += 1) {
+      index = (index + direction + messages.length) % messages.length;
+      if (!String(messages[index].body ?? "").toLocaleLowerCase().includes(query)) continue;
+      setFoundIndex(index);
+      setFoundId(messages[index].id);
+      setSearched(true);
+      const viewport = viewportRef.current;
+      const list = listRef.current;
+      if (viewport && list) {
+        let offset = viewport.scrollTop + list.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
+        for (let row = 0; row < index; row += 1) offset += heightsRef.current.get(messages[row].id) ?? ESTIMATED_MESSAGE_HEIGHT;
+        viewport.scrollTop = Math.max(0, offset - viewport.clientHeight / 3);
+        update();
+      }
+      return;
+    }
+    setFoundIndex(-1);
+    setFoundId(null);
+    setSearched(true);
+  }
 
   const update = useCallback(() => {
     const viewport = viewportRef.current;
@@ -25,6 +72,20 @@ export function WindowedMessages({ messages, viewportRef, renderMessage }) {
       setRange(next);
     }
   }, [messages, viewportRef]);
+
+  useLayoutEffect(() => {
+    if (!foundId) return;
+    const index = messages.findIndex((message) => message.id === foundId);
+    if (index < 0) return;
+    setFoundIndex(index);
+    const viewport = viewportRef.current;
+    const list = listRef.current;
+    if (!viewport || !list) return;
+    let offset = viewport.scrollTop + list.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
+    for (let row = 0; row < index; row += 1) offset += heightsRef.current.get(messages[row].id) ?? ESTIMATED_MESSAGE_HEIGHT;
+    viewport.scrollTop = Math.max(0, offset - viewport.clientHeight / 3);
+    update();
+  }, [foundId, messages, viewportRef, update]);
 
   useEffect(() => {
     const ids = new Set(messages.map((message) => message.id));
@@ -57,9 +118,9 @@ export function WindowedMessages({ messages, viewportRef, renderMessage }) {
     return () => resize.disconnect();
   }, [messages, range.start, range.end, update]);
 
-  return <div ref={listRef} role="list" aria-label="Conversation history">
+  return <><div className="history-find" role="search" aria-label="Find in conversation"><input aria-label="Find in conversation" maxLength={200} value={needle} onChange={(event) => { ++searchGenerationRef.current; onCancelFind?.(); setNeedle(event.target.value); setFoundIndex(-1); setFoundId(null); setSearching(false); setSearched(false); setSearchError(false); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle || searching} aria-label="Previous conversation match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle || searching} aria-label="Next conversation match">↓</button><span role="status">{searching ? "Searching…" : searchError ? "Search failed; retry" : needle && foundIndex >= 0 ? `Message ${foundIndex + 1} of ${messages.length}` : needle && searched ? "No match" : needle ? "Press Enter to find" : ""}</span></div><div ref={listRef} role="list" aria-label="Conversation history">
     {range.top > 0 && <div aria-hidden="true" style={{ height: range.top }} />}
-    {messages.slice(range.start, range.end).map((message, offset) => <div key={message.id} data-window-id={message.id} role="listitem" aria-posinset={range.start + offset + 1} aria-setsize={messages.length} style={{ display: "flow-root" }}>{renderMessage(message)}</div>)}
+    {messages.slice(range.start, range.end).map((message, offset) => <div key={message.id} data-window-id={message.id} data-find-match={range.start + offset === foundIndex ? "true" : undefined} role="listitem" aria-posinset={range.start + offset + 1} aria-setsize={messages.length} style={{ display: "flow-root" }}>{renderMessage(message)}</div>)}
     {range.bottom > 0 && <div aria-hidden="true" style={{ height: range.bottom }} />}
-  </div>;
+  </div></>;
 }

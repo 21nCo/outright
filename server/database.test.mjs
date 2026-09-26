@@ -34,6 +34,27 @@ test("persists settings, groups, conversations, messages, runs, and search", () 
   }
 });
 
+test("conversation find reaches old and new pages, wraps, and treats query text literally", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Long", provider: "codex" });
+    const other = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Other", provider: "codex" });
+    const ids = [];
+    for (let index = 0; index < 240; index += 1) ids.push(database.addMessage({ conversationId: chat.id, role: "user", body: index === 2 || index === 238 ? "literal % marker" : `filler ${index}` }).id);
+    database.addMessage({ conversationId: other.id, role: "user", body: "literal % marker" });
+    const first = database.findMessagePage(chat.id, "literal %", null);
+    assert.equal(first.matchId, ids[2]);
+    assert.ok(first.messages.some((message) => message.id === ids[2]));
+    assert.ok(first.messages.length <= 200);
+    const last = database.findMessagePage(chat.id, "literal %", first.matchId);
+    assert.equal(last.matchId, ids[238]);
+    assert.equal(database.findMessagePage(chat.id, "literal %", last.matchId).matchId, ids[2], "next wraps across the full conversation");
+    assert.equal(database.findMessagePage(chat.id, "literal %", ids[2], -1).matchId, ids[238], "previous wraps backwards");
+    assert.equal(database.findMessagePage(chat.id, "no such text", null).matchId, null);
+    assert.throws(() => database.findMessagePage(chat.id, "marker", "not-a-message"), /cursor/);
+  } finally { database.close(); }
+});
+
 test("runs retain immutable worktree ownership and unresolved recovery blocks move or archive", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

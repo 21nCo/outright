@@ -170,6 +170,20 @@ test("archived conversations reject new runs before any message or agent schedul
   assert.deepEqual(runtime.database.listRuns(conversation.id), []);
 }));
 
+test("conversation find rejects malformed queries and foreign cursors", withRuntime(async (runtime) => {
+  const chat = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Find", provider: "codex" });
+  const other = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Other", provider: "codex" });
+  const foreign = runtime.database.addMessage({ conversationId: other.id, role: "user", body: "needle" });
+  for (const suffix of ["", "?q=%20", `?q=${"a".repeat(201)}`, "?q=needle&direction=sideways", `?q=needle&after=${foreign.id}`]) {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("GET", `/api/conversations/${chat.id}/messages/find${suffix}`), response);
+    assert.equal(response.statusCode, 400, suffix);
+  }
+  const missing = responseCapture();
+  await runtime.handleRequest(requestStream("GET", "/api/conversations/missing/messages/find?q=needle"), missing);
+  assert.equal(missing.statusCode, 404);
+}));
+
 async function waitForValidation(entered, pending) {
   let timer;
   try {
@@ -203,6 +217,38 @@ test("archiving during asynchronous worktree validation rejects a run without du
   assert.deepEqual(runtime.database.listMessages(conversation.id), []);
   assert.deepEqual(runtime.database.listRuns(conversation.id), []);
 }));
+
+for (const operation of ["send", "recovery"]) {
+  test(`revoking trust during provider discovery rejects ${operation} before a durable commit`, { skip: process.platform === "win32", timeout: 20000 }, (() => {
+    let releaseProbe;
+    let enteredProbe;
+    const waiting = new Promise((resolve) => { enteredProbe = resolve; });
+    const gate = new Promise((resolve) => { releaseProbe = resolve; });
+    return withWorktreeRuntime(async (runtime, { project, worktree }) => {
+      runtime.agents.providerAvailable = async () => { enteredProbe(); await gate; return true; };
+      const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Trust fence", provider: "codex" });
+      let interrupted;
+      if (operation === "recovery") {
+        interrupted = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "codex", approvalPolicy: "read-only", prompt: "unfinished" });
+        runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+      }
+      const response = responseCapture();
+      const endpoint = operation === "send" ? `/api/conversations/${conversation.id}/runs` : `/api/runs/${interrupted.id}/resume`;
+      const body = operation === "send" ? { prompt: "must not persist" } : { policy: "retry" };
+      const pending = runtime.handleRequest(requestStream("POST", endpoint, body), response);
+      try {
+        await waitForValidation(waiting, pending);
+        runtime.database.untrustProject(project.id);
+      } finally { releaseProbe(); }
+      await pending;
+      assert.equal(response.statusCode, 403);
+      assert.equal(response.body.code, "PROJECT_TRUST_REQUIRED");
+      assert.deepEqual(runtime.database.listMessages(conversation.id), []);
+      assert.equal(runtime.database.listRuns(conversation.id).length, operation === "send" ? 0 : 1);
+      if (interrupted) assert.equal(runtime.database.getRun(interrupted.id).recoveryDecision, null);
+    });
+  })());
+}
 
 test("validation rendezvous fails promptly when an HTTP error settles before the gate", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
   const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Early rejection", provider: "codex" });
