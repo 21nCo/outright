@@ -129,7 +129,7 @@ function withWorktreeRuntime(fn, options = {}) {
       const worktree = project?.worktrees.find((item) => !item.isLinked);
       if (!project || !worktree) throw new Error("the temp repo was not discovered as a project worktree");
       runtime.database.trustProject(project.id, project.path);
-      await fn(runtime, { project, worktree });
+      await fn(runtime, { project, worktree, bin });
     } finally {
       process.env.PATH = previousPath;
       if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
@@ -266,6 +266,30 @@ for (const operation of ["send", "recovery"]) {
     assert.deepEqual(runtime.database.listMessages(conversation.id), []);
     assert.equal(runtime.database.listRuns(conversation.id).length, operation === "send" ? 0 : 1);
     if (interrupted) assert.equal(runtime.database.getRun(interrupted.id).recoveryDecision, null);
+  }));
+}
+
+for (const operation of ["send", "recovery"]) {
+  test(`slow executable provider probe stays asynchronous and bounded for ${operation}`, { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
+    // Exercise the real execFile --version path through each HTTP endpoint.
+    writeFileSync(path.join(bin, "codex"), "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then sleep 0.25; echo 'codex test'; fi\n");
+    const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Probe latency", provider: "codex" });
+    let interrupted;
+    if (operation === "recovery") {
+      interrupted = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "codex", approvalPolicy: "read-only", prompt: "unfinished" });
+      runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+    }
+    const response = responseCapture();
+    let ticks = 0;
+    const timer = setInterval(() => { ticks += 1; }, 20);
+    const started = performance.now();
+    try {
+      await runtime.handleRequest(requestStream("POST", operation === "send" ? `/api/conversations/${conversation.id}/runs` : `/api/runs/${interrupted.id}/resume`, operation === "send" ? { prompt: "measure probe" } : { policy: "retry" }), response);
+    } finally { clearInterval(timer); }
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed >= 200 && elapsed < 2500, `${operation} took ${elapsed.toFixed(1)} ms with a 250 ms executable probe`);
+    assert.ok(ticks >= 5, `${operation} blocked the event loop during its executable probe`);
+    assert.equal(response.statusCode, 202);
   }));
 }
 

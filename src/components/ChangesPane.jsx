@@ -36,6 +36,9 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
     const owner = ownerRef.current;
     if (owner.path !== worktree.path) return;
     const request = ++diffRequestRef.current;
+    // The previous selection's text must never appear under the new label,
+    // including when this request fails.
+    setDiff("");
     if (!filePath) { setDiff(""); return; }
     try {
       const next = await api(query("/api/git/diff", { path: worktree.path, file: filePath, staged: mode === "staged" }));

@@ -20,6 +20,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
   const [searchError, setSearchError] = useState(false);
   const searchGenerationRef = useRef(0);
   const pendingFoundRef = useRef(null);
+  const alignmentFramesRef = useRef(0);
 
   async function find(direction = 1) {
     const query = needle.trim();
@@ -34,7 +35,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
         setSearchError(false);
         setFoundId(id);
         pendingFoundRef.current = id;
-        if (id) setFindRequest((current) => current + 1);
+        if (id) { alignmentFramesRef.current = 0; setFindRequest((current) => current + 1); }
         setSearched(true);
         setFoundIndex(messages.findIndex((message) => message.id === id));
       } catch {
@@ -133,10 +134,16 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     let settled = 0;
     const align = () => {
       if (pendingFoundRef.current !== foundId) return;
+      if (++alignmentFramesRef.current > 16) { pendingFoundRef.current = null; return; }
       const row = [...list.querySelectorAll("[data-window-id]")].find((element) => element.dataset.windowId === foundId);
       if (!row) { update(); frame = window.requestAnimationFrame(align); return; }
       const delta = row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - viewport.clientHeight / 3;
-      if (Math.abs(delta) > 2) { viewport.scrollTop += delta; settled = 0; update(); }
+      if (Math.abs(delta) > 2) {
+        const before = viewport.scrollTop;
+        viewport.scrollTop += delta;
+        if (Math.abs(viewport.scrollTop - before) < 1) { pendingFoundRef.current = null; return; }
+        settled = 0; update();
+      }
       else settled += 1;
       if (settled < 2) frame = window.requestAnimationFrame(align);
       else pendingFoundRef.current = null;
@@ -163,6 +170,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
         const visible = viewport.getBoundingClientRect();
         if (bounds.bottom > visible.top && bounds.top < visible.bottom) {
           pendingFoundRef.current = foundId;
+          alignmentFramesRef.current = 0;
           setFindRequest((current) => current + 1);
         }
       }
@@ -177,11 +185,13 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     const viewport = viewportRef.current;
     if (!viewport) return;
     const cancel = () => { pendingFoundRef.current = null; };
+    const scrollbar = viewport.parentElement?.querySelector('[data-slot="scroll-area-scrollbar"]');
+    scrollbar?.addEventListener("pointerdown", cancel, { passive: true });
     viewport.addEventListener("pointerdown", cancel, { passive: true });
     viewport.addEventListener("wheel", cancel, { passive: true });
     viewport.addEventListener("touchstart", cancel, { passive: true });
     viewport.addEventListener("keydown", cancel);
-    return () => { viewport.removeEventListener("pointerdown", cancel); viewport.removeEventListener("wheel", cancel); viewport.removeEventListener("touchstart", cancel); viewport.removeEventListener("keydown", cancel); };
+    return () => { scrollbar?.removeEventListener("pointerdown", cancel); viewport.removeEventListener("pointerdown", cancel); viewport.removeEventListener("wheel", cancel); viewport.removeEventListener("touchstart", cancel); viewport.removeEventListener("keydown", cancel); };
   }, [viewportRef]);
 
   useLayoutEffect(() => {
