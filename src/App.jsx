@@ -339,6 +339,9 @@ export function App() {
     }, 100);
   }, []);
   const loadConversation = useCallback(async (options = {}) => {
+    // An old render can dispatch a deferred reload after selection changed but
+    // before React committed the new callback. It must never claim the slot.
+    if (selectedConversationId !== selectedConversationRef.current) return;
     const preservePage = options.preservePage === true;
     // A background completion must not cancel an explicit Return to latest or
     // retry that is already loading the reader's chosen page.
@@ -392,7 +395,8 @@ export function App() {
       }
       pendingConversationLoadRef.current = null;
       const replayed = replayConversationEvents(nextConversation.messages, pendingLoad.events, MAX_RENDERED_MESSAGES,
-        activeCursorOwners(nextConversation), conversationRef.current?.id === requestedId ? checkpointCursorsRef.current : new Map());
+        activeCursorOwners(nextConversation), conversationRef.current?.id === requestedId ? checkpointCursorsRef.current : new Map(),
+        nextConversation.messagePage);
       const preserveReading = preservePage && (preservePendingFind || pendingFindRef.current?.conversationId === requestedId
         || conversationRef.current?.messagePage?.hasLater || !stickToBottomRef.current
         || startedHistoryGeneration !== historyGenerationRef.current);
@@ -402,7 +406,8 @@ export function App() {
       checkpointCursorsRef.current = checkpointCursors(replayed.messages, checkpointCursorsRef.current, activeCursorOwners(nextConversation));
       setConversation((current) => preserveReading && current?.id === requestedId ? (() => {
         const currentTotal = current.messagePage?.total ?? current.messages.length;
-        const latestTotal = nextConversation.messagePage?.total ?? nextConversation.messages.length;
+        const latestTotal = Math.max(nextConversation.messagePage?.total ?? nextConversation.messages.length,
+          (nextConversation.messagePage?.olderCount ?? 0) + replayed.messages.length + replayed.dropped);
         const latestById = new Map(replayed.messages.map((message) => [message.id, message]));
         const messages = current.messages.map((message) => {
           const refreshed = latestById.get(message.id);
@@ -424,6 +429,8 @@ export function App() {
         messages: replayed.messages,
         messagePage: {
           ...nextConversation.messagePage,
+          total: Math.max(nextConversation.messagePage?.total ?? nextConversation.messages.length,
+            (nextConversation.messagePage?.olderCount ?? 0) + replayed.messages.length + replayed.dropped),
           hasMore: Boolean(nextConversation.messagePage?.hasMore || replayed.dropped),
           olderCount: (nextConversation.messagePage?.olderCount ?? 0) + replayed.dropped,
           beforeId: replayed.messages[0]?.id ?? null,
@@ -443,6 +450,9 @@ export function App() {
         pendingConversationLoadRef.current = null;
         if (nextError.name !== "AbortError") { setConversationLoadFailed(true); setError(nextError.message); }
       }
+    }
+    finally {
+      if (pendingConversationLoadRef.current === pendingLoad) pendingConversationLoadRef.current = null;
     }
   }, [selectedConversationId, loadConversations, conversationListFailed, refreshMessageCount]);
   useEffect(() => {
@@ -497,7 +507,7 @@ export function App() {
       if (!displayed || olderThanPage || displayed.messagePage?.hasLater
         || displayed.messages.length >= MAX_RENDERED_MESSAGES) refreshMessageCount();
       recordCheckpointCursor(checkpointCursorsRef.current, event.payload, activeCursorOwners(displayed));
-      applyStreamingText((current) => streamingTextAfterRuntimeEvent(current, event), true);
+      if (!olderThanPage) applyStreamingText((current) => streamingTextAfterRuntimeEvent(current, event), true);
       setConversation((current) => {
         if (!current) return current;
         const alreadyPresent = current.messages.some((message) => message.id === event.payload.id);

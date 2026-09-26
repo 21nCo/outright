@@ -243,9 +243,15 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
   const visibleFindStatus = searching ? "Searching…" : searchError ? "Search failed; retry" : partial ? "Search paused; press Enter to continue" : needle && foundIndex >= 0 ? `Message ${position(foundIndex)} of ${total}` : needle && searched ? "No match" : needle ? "Press Enter to find" : "";
   const [announcedFindStatus, setAnnouncedFindStatus] = useState("");
   useEffect(() => {
+    // Only settled outcomes belong in the live region. The visual label can
+    // still show Searching and the input hint without narrating each phase.
+    if (searching || (!searchError && !partial && foundIndex < 0 && !searched)) {
+      setAnnouncedFindStatus("");
+      return;
+    }
     const timer = window.setTimeout(() => setAnnouncedFindStatus(visibleFindStatus), 180);
     return () => window.clearTimeout(timer);
-  }, [visibleFindStatus]);
+  }, [visibleFindStatus, searching, searchError, partial, foundIndex, searched]);
   return <><div className="history-find" role="search" aria-label="Find in conversation"><input aria-label="Find in conversation" maxLength={200} value={needle} onChange={(event) => { ++searchGenerationRef.current; pendingFoundRef.current = null; visibleFindAnchorRef.current = false; onCancelFind?.(); setNeedle(event.target.value); setFoundId(null); setSearching(false); setSearched(false); setPartial(false); setSearchError(false); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle || searching} aria-label="Previous conversation match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle || searching} aria-label="Next conversation match">↓</button><span className="history-find-status" aria-hidden="true">{visibleFindStatus}</span><span className="sr-only" role="status">{announcedFindStatus}</span></div><div ref={listRef} role="list" aria-label="Conversation history">
     {range.top > 0 && <div aria-hidden="true" style={{ height: range.top }} />}
     {messages.slice(range.start, range.end).map((message, offset) => <div key={message.id} data-window-id={message.id} data-find-match={range.start + offset === foundIndex ? "true" : undefined} role="listitem" aria-posinset={position(range.start + offset)} aria-setsize={total} style={{ display: "flow-root" }}>{renderMessage(message)}</div>)}

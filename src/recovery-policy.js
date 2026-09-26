@@ -100,7 +100,7 @@ export function bufferConversationRuntimeEvent(pendingLoad, event, maxBytes) {
   return "buffered";
 }
 
-export function replayConversationEvents(snapshotMessages = [], events = [], maxMessages = Number.POSITIVE_INFINITY, activeRunIds = new Set(), initialCursors = new Map()) {
+export function replayConversationEvents(snapshotMessages = [], events = [], maxMessages = Number.POSITIVE_INFINITY, activeRunIds = new Set(), initialCursors = new Map(), messagePage = null) {
   const messagesById = new Map(snapshotMessages.map((message) => [message.id, message]));
   const cursors = checkpointCursors(snapshotMessages, initialCursors, activeRunIds);
   let streamingText = "";
@@ -109,9 +109,15 @@ export function replayConversationEvents(snapshotMessages = [], events = [], max
     if (event?.type === "message.created") {
       if (isStaleCheckpointMessage(cursors, event.payload)) continue;
       recordCheckpointCursor(cursors, event.payload, activeRunIds);
-      streamingText = streamingTextAfterRuntimeEvent(streamingText, event);
-      messagesById.delete(event.payload.id);
-      messagesById.set(event.payload.id, event.payload);
+      // The HTTP detail contains a bounded latest page. A checkpoint for an
+      // unloaded predecessor updates durable state, not this page's boundary.
+      const first = snapshotMessages[0];
+      if (messagesById.has(event.payload.id) || !messagePage?.hasMore || !first
+        || !messagePrecedesPage(event.payload, first)) {
+        streamingText = streamingTextAfterRuntimeEvent(streamingText, event);
+        messagesById.delete(event.payload.id);
+        messagesById.set(event.payload.id, event.payload);
+      }
       continue;
     }
     if (event?.type !== "run.event") continue;

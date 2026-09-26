@@ -111,8 +111,14 @@ export function WindowedDiff({ diff, label }) {
     pendingFindAlignmentRef.current = { line, attempts: 0 };
     seekLine(line);
   }, [content]);
-  const firstVisible = compressed ? Math.min(maxFirst, Math.round(position.top / maxScroll * maxFirst))
+  const scrollFirst = compressed ? Math.min(maxFirst, Math.round(position.top / maxScroll * maxFirst))
     : Math.min(maxFirst, Math.floor(position.top / LINE_HEIGHT));
+  // A seek can race a queued native End/scroll event after a mode switch.
+  // Keep the target mounted until the layout pass can align its actual DOM row.
+  const pendingLine = pendingFindAlignmentRef.current?.line;
+  const firstVisible = !compressed && pendingLine != null
+    && (pendingLine < scrollFirst - OVERSCAN || pendingLine >= scrollFirst + visibleRows + OVERSCAN)
+    ? Math.max(0, Math.min(maxFirst, pendingLine - Math.floor(visibleRows / 3))) : scrollFirst;
   const start = Math.max(0, firstVisible - OVERSCAN);
   const end = Math.min(count, firstVisible + visibleRows + OVERSCAN);
   const visibleStatus = needle && foundLine >= 0 ? `Line ${foundLine + 1}` : needle && searched ? "No match" : needle ? "Press Enter to find" : "";

@@ -165,6 +165,33 @@ test("conversation replay and its in-flight event buffer remain bounded", () => 
   assert.equal(bufferConversationRuntimeEvent(pending, { ...event, conversationId: "another" }, 1000), "ignored");
 });
 
+test("replay keeps an unloaded checkpoint outside the latest page boundary", () => {
+  const message = (index, seq = 0) => ({ id: `message-${index}`, role: "assistant", body: `Body ${index}`,
+    searchOrder: index, createdAt: new Date(index * 1000).toISOString(),
+    payload: { runId: `run-${index}`, checkpointEventSeq: seq } });
+  const latest = Array.from({ length: 200 }, (_, index) => message(index + 800));
+  const events = [
+    { type: "message.created", payload: message(10, 2) },
+    { type: "message.created", payload: message(900, 3) },
+    { type: "message.created", payload: message(1000, 1) },
+  ];
+  const replayed = replayConversationEvents(latest, events, 200, new Set(), new Map(),
+    { hasMore: true, olderCount: 800, beforeId: "message-800" });
+  assert.equal(replayed.messages.length, 200);
+  assert.equal(replayed.messages[0].id, "message-801", "only the newest append may evict the oldest page row");
+  assert.equal(replayed.messages.at(-1).id, "message-1000");
+  assert.equal(replayed.messages.find((item) => item.id === "message-900")?.payload.checkpointEventSeq, 3);
+  assert.equal(replayed.messages.some((item) => item.id === "message-10"), false);
+  assert.equal(replayed.cursors.get("run-10"), 2, "off-page replay still owns the checkpoint cursor");
+  assert.equal(replayed.dropped, 1, "page accounting excludes an off-page update");
+  const live = replayConversationEvents(latest, [
+    { type: "run.event", runId: "run-10", payload: { type: "assistant.delta", seq: 1, payload: { text: "prefix" } } },
+    { type: "message.created", payload: message(10, 1) },
+    { type: "run.event", runId: "run-10", payload: { type: "assistant.delta", seq: 2, payload: { text: "suffix" } } },
+  ], 200, new Set(["run-10"]), new Map(), { hasMore: true, olderCount: 800 });
+  assert.equal(live.streamingText, "prefixsuffix", "an unloaded checkpoint cannot erase the visible live prefix");
+});
+
 test("only legacy rows without any process or worktree identity offer manual cleanup", () => {
   const legacy = { conversationId: "missing-owner", recoveryClass: "unknown", pid: null, worktreePath: null };
   assert.equal(isUnverifiableLegacyRecovery(legacy), true);
