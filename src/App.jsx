@@ -719,7 +719,11 @@ export function App() {
       const anchor = [...viewport.querySelectorAll("[data-message-id]")].find((element) => element.dataset.messageId === pending.messageId);
       if (anchor && pending.top !== undefined) viewport.scrollTop += anchor.getBoundingClientRect().top - pending.top;
       else if (!pending.restoredFallback) {
-        viewport.scrollTop += (pending.prependedCount ?? 0) * ESTIMATED_MESSAGE_HEIGHT;
+        // Recenter the virtualizer on the retained row's new index. Subtracting
+        // estimated heights from the old scroll offset can miss a row when the
+        // removed messages had variable measured heights.
+        if (pending.fallbackIndex !== undefined) viewport.scrollTop = pending.fallbackIndex * ESTIMATED_MESSAGE_HEIGHT;
+        else viewport.scrollTop += (pending.prependedCount ?? 0) * ESTIMATED_MESSAGE_HEIGHT;
         pending.restoredFallback = true;
       }
     };
@@ -1019,6 +1023,14 @@ export function App() {
         const merged = [...current.messages, ...result.messages.filter((message) => !current.messages.some((entry) => entry.id === message.id))];
         const dropped = Math.max(0, merged.length - MAX_RENDERED_MESSAGES);
         const messages = merged.slice(dropped);
+        if (dropped) pendingPage.fallbackIndex = Math.max(0, current.messages.findIndex((message) => message.id === pendingPage.messageId) - dropped);
+        // A forward page may evict the visible row. Move the anchor to the
+        // first surviving row explicitly; its predecessor remains reachable
+        // through Load earlier. Never run the prepend-only pixel fallback.
+        if (dropped && !messages.some((message) => message.id === pendingPage.messageId)) {
+          pendingPage.messageId = messages[0].id;
+          pendingPage.top = viewport?.getBoundingClientRect().top;
+        }
         const olderCount = (current.messagePage?.olderCount ?? 0) + dropped;
         const total = Math.max(result.messagePage.total, current.messagePage?.total ?? 0);
         const newerCount = Math.max(0, total - olderCount - messages.length);
@@ -1042,9 +1054,13 @@ export function App() {
     const conversationId = selectedConversationRef.current;
     if (!conversationId) return null;
     pendingFindRef.current?.abort();
-    pendingConversationLoadRef.current?.controller?.abort();
-    pendingConversationLoadRef.current = null;
-    if (readyConversationRef.current?.id === conversationId) setConversationDetailReady(true);
+    // Find owns only the message page. A completion, reconnect, or list read
+    // still owns fresh run and recovery metadata, even while Find is pending.
+    // Explicit page loads are superseded by this new navigation request.
+    if (pendingConversationLoadRef.current && !pendingConversationLoadRef.current.preservePage) {
+      pendingConversationLoadRef.current.controller.abort();
+      pendingConversationLoadRef.current = null;
+    }
     const controller = new AbortController();
     const pendingFind = { conversationId, controller, abort: () => controller.abort(), events: [], eventBytes: 0, overflowed: false };
     pendingFindRef.current = pendingFind;

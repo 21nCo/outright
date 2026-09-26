@@ -600,16 +600,16 @@ test("a vanished Windows launcher preserves verified descendants without adoptin
   assert.equal(launcher.ownedWindows.has(4103), false);
 });
 
-// The child has 120 seconds including its 95-second interaction phase and
+// The child has 180 seconds including its 155-second interaction phase and
 // cleanup. The parent must outlive that contract before invoking fallback
 // cleanup, and retain a separate reserve for its own tree/profile cleanup.
-const browserFixtureTimeout = 120_000;
+const browserFixtureTimeout = 180_000;
 const nestedStartupAllowance = 15_000;
 const nestedRunnerBudget = (childBudget, startupAllowance) => childBudget + startupAllowance;
 const nestedExitTimeout = nestedRunnerBudget(browserFixtureTimeout, nestedStartupAllowance);
 test("nested runner deadline exceeds its child's full browser budget", () => {
   assert(nestedExitTimeout > browserFixtureTimeout);
-  assert(nestedExitTimeout > 95_000 + 25_000);
+  assert(nestedExitTimeout > 155_000 + 25_000);
 });
 
 test("parent permits a slow child beyond the old shorter watchdog", { timeout: 5_000 }, async () => {
@@ -664,7 +664,7 @@ test("fixture assertion failures still clean Chrome, Vite and profile independen
 
 test("browser interaction regressions pass in headless Chrome", { timeout: browserFixtureTimeout }, async () => {
   // Reserve the last part of the test's own bound for independent cleanup.
-  const deadline = Date.now() + 95_000;
+  const deadline = Date.now() + 155_000;
   let phase = "allocate fixture";
   const remaining = () => {
     const duration = deadline - Date.now();
@@ -822,7 +822,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       return send(method, params);
     }, deadline);
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
-    assert.match(state.text, process.env.OUTRIGHT_UI_STEP ? /1 interaction regressions passed/ : /77 interaction regressions passed/);
+    assert.match(state.text, process.env.OUTRIGHT_UI_STEP ? /1 interaction regressions passed/ : /80 interaction regressions passed/);
     const performanceFixture = state.text.match(/Performance fixture: (\{[^\n]+\})/);
     if (!process.env.OUTRIGHT_UI_STEP) assert.ok(performanceFixture, "large fixture measurements were not recorded");
     if (performanceFixture) console.log(`UI performance: ${performanceFixture[1]}`);

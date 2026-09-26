@@ -1837,6 +1837,26 @@ async function largeDiffWindowRegression() {
   window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), diff: { elapsedMs, mountedAtEnd: viewport.querySelectorAll("span").length, heapBytes: performance.memory?.usedJSHeapSize ?? null } };
 }
 
+async function extremeDiffHeightRegression() {
+  root.render(null); await settle();
+  const diff = "+\n".repeat(1_250_000) + "+TAIL MATCH\n";
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={diff} label="Tall diff" /></div>);
+  await until(() => host.querySelector(".diff-view"), "tall diff mounted");
+  const viewport = host.querySelector(".diff-view");
+  assert(viewport.scrollHeight < 16_000_000, `Tall diff track was clamped: ${viewport.scrollHeight}px`);
+  viewport.scrollTop = viewport.scrollHeight;
+  viewport.dispatchEvent(new Event("scroll"));
+  await until(() => viewport.textContent.includes("TAIL MATCH"), "End reaches final line of tall diff");
+  assert(viewport.querySelectorAll("span").length < 200, "Tall diff mounted an unbounded line window");
+  viewport.scrollTop = 0; viewport.dispatchEvent(new Event("scroll")); await settle();
+  const input = host.querySelector('input[aria-label="Find in diff"]');
+  setControlValue(input, "TAIL MATCH"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("TAIL MATCH"), "Find reaches final line of tall diff");
+  const bounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+  assert(bounds.top < viewport.getBoundingClientRect().bottom && bounds.bottom > viewport.getBoundingClientRect().top, `Tall diff find mark is outside the viewport: mark=${bounds.top}/${bounds.bottom}, viewport=${viewport.getBoundingClientRect().top}/${viewport.getBoundingClientRect().bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}`);
+}
+
 async function unicodeDiffFindRegression() {
   root.render(null); await settle();
   const diff = "+İstanbul\n" + Array.from({ length: 400 }, (_, index) => `+filler ${index}\n`).join("") + "+CAFÉ target\n";
@@ -2096,6 +2116,50 @@ async function forwardHistoryPagingRegression() {
   assert(host.querySelectorAll('[role="listitem"]').length < 40, "Forward paging exceeded bounded mounted rows");
 }
 
+async function forwardPageEvictionAnchorRegression() {
+  for (const evicted of [false, true]) {
+    root.render(null); await settle();
+    keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+    const message = (index) => ({ id: `eviction-${index}`, role: "assistant", kind: "text", body: `Read ${index}`, createdAt: new Date(index * 1000).toISOString() });
+    const initial = Array.from({ length: 1000 }, (_, index) => message(index));
+    const later = Array.from({ length: 200 }, (_, index) => message(index + 1000));
+    route = async (url) => {
+      if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+      if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+      if (url.pathname === "/api/conversations/chat-A/messages/count") return response({ total: 1200 });
+      if (url.pathname === "/api/conversations/chat-A/messages") return response({ messages: later, messagePage: { total: 1200, olderCount: 1000, newerCount: 0, hasMore: true, hasLater: false, beforeId: "eviction-1000" } });
+      if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: initial, messagePage: { total: 1200, olderCount: 0, newerCount: 200, hasMore: false, hasLater: true, beforeId: "eviction-0" } });
+      return response({});
+    };
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector(".history-later"), "full forward page ready");
+    const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+    viewport.scrollTop = 0; viewport.dispatchEvent(new Event("scroll")); await settle();
+    viewport.scrollTop = evicted ? 0 : viewport.scrollHeight / 2;
+    viewport.dispatchEvent(new Event("scroll")); await settle();
+    const firstVisible = [...viewport.querySelectorAll("[data-message-id]")].find((element) => element.getBoundingClientRect().bottom > viewport.getBoundingClientRect().top);
+    assert(firstVisible, "Forward page fixture has no visible reading row");
+    const anchorId = firstVisible.dataset.messageId;
+    const top = firstVisible.getBoundingClientRect().top;
+    host.querySelector(".history-later").click();
+    await until(() => !host.querySelector(".history-later"), "forward page crossed bounded window");
+    await settle();
+    if (evicted) {
+      assert(!host.querySelector(`[data-message-id="${anchorId}"]`), "Eviction fixture did not evict the old row");
+      assert(host.querySelector('.history-loader'), "Evicted rows cannot be reached through Load earlier");
+      await until(() => host.querySelector('[data-message-id="eviction-200"]'), "first surviving row after forward eviction");
+      assert(host.querySelector('[data-message-id="eviction-200"]').getBoundingClientRect().top < viewport.getBoundingClientRect().bottom,
+        "The first surviving row was mounted outside the reading viewport");
+    } else {
+      await until(() => host.querySelector(`[data-message-id="${anchorId}"]`), `retained forward anchor ${anchorId}; scroll=${viewport.scrollTop}/${viewport.scrollHeight}; rows=${[...viewport.querySelectorAll('[data-message-id]')].map((element) => element.dataset.messageId).join(',')}`);
+      await until(() => Math.abs(host.querySelector(`[data-message-id="${anchorId}"]`)?.getBoundingClientRect().top - top) < 12, "retained forward anchor settled");
+      const delta = Math.abs(host.querySelector(`[data-message-id="${anchorId}"]`).getBoundingClientRect().top - top);
+      assert(delta < 12, `Forward page moved a retained reading anchor by ${Math.round(delta)}px`);
+    }
+    assert(host.querySelectorAll('[role="listitem"]').length < 40, "Forward page mounted unbounded rows");
+  }
+}
+
 async function backgroundReadingRefreshRegression() {
   root.render(null); await settle();
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
@@ -2299,6 +2363,47 @@ async function latestBeforeFindOwnershipRegression() {
   delayedLatest.resolve(response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: 800, total: 1000, beforeId: "order-800" } }));
   await settle();
   assert(host.querySelector('[data-find-match="true"] [data-message-id="order-10"]') && host.querySelector(".history-return"), "Late Return to latest replaced a newer find page");
+}
+
+async function findWhileMetadataRefreshRegression() {
+  for (const kind of ["completion", "reconnect", "list"]) {
+    root.render(null); await settle();
+    keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+    const message = (index) => ({ id: `metadata-${index}`, role: "assistant", kind: "text", body: `Match ${index}`, createdAt: new Date(index * 1000).toISOString() });
+    const older = Array.from({ length: 20 }, (_, index) => message(index));
+    const latest = Array.from({ length: 20 }, (_, index) => message(index + 80));
+    const running = { ...chats.A, runs: [{ id: "run-metadata", status: "running", conversationId: "chat-A" }] };
+    const completed = { ...running, runs: [{ id: "run-metadata", status: "completed", conversationId: "chat-A" }] };
+    const held = deferred();
+    let hold = false;
+    let requested = false;
+    route = async (url) => {
+      if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+      if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+      if (url.pathname.endsWith("/messages/find")) return response({ matchId: "metadata-10", messages: older, messagePage: { total: 100, olderCount: 0, newerCount: 80, hasLater: true, beforeId: "metadata-0" } });
+      if (url.pathname === "/api/conversations/chat-A/messages/count") return response({ total: 100 });
+      if (url.pathname === "/api/conversations/chat-A") {
+        if (hold) { requested = true; return held.promise; }
+        return response({ ...running, messages: latest, messagePage: { total: 100, olderCount: 80, beforeId: "metadata-80" } });
+      }
+      return response({});
+    };
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('[aria-label="Stop active agent run"]'), `${kind} initial active run`);
+    hold = true;
+    const event = kind === "completion" ? { type: "run.event", conversationId: "chat-A", runId: "run-metadata", payload: { type: "run.completed" } }
+      : kind === "reconnect" ? { type: "runtime.connected", payload: { replay: { missed: true } } }
+        : { type: "conversation.updated", conversationId: "chat-A" };
+    fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
+    await until(() => requested, `${kind} metadata refresh pending`);
+    const input = host.querySelector(".history-find input");
+    setControlValue(input, "Match 10"); await settle();
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await until(() => host.querySelector('[data-find-match="true"] [data-message-id="metadata-10"]'), `${kind} found old page`);
+    held.resolve(response({ ...completed, messages: latest, messagePage: { total: 100, olderCount: 80, beforeId: "metadata-80" } }));
+    await until(() => !host.querySelector('[aria-label="Stop active agent run"]') && host.querySelector('[aria-label="Send message"]'), `${kind} terminal metadata after find`);
+    assert(host.querySelector('[data-message-id="metadata-10"]') && host.querySelector(".history-return"), `${kind} metadata refresh replaced the found page`);
+  }
 }
 
 async function findInFlightEventRegression() {
@@ -2833,11 +2938,13 @@ try {
     ["paged transcript anchor", pagedTranscriptAnchorRegression, "loading earlier history preserves its visible reading anchor"],
     ["paged transcript find", pagedTranscriptFindRegression, "find navigates older persisted messages with bounded mounted rows"],
     ["forward history paging", forwardHistoryPagingRegression, "an old page can be read continuously through the persisted end within the 1000-row cap"],
+    ["forward page eviction anchor", forwardPageEvictionAnchorRegression, "a full-window forward page retains surviving reading rows and hands evicted rows to Load earlier"],
     ["background latest refresh", backgroundLatestRefreshRegression, "a missed event refreshes the latest page without keeping a stale snapshot"],
     ["background reading refresh", backgroundReadingRefreshRegression, "missed replay and completion expose later output without moving a reader"],
     ["full-page live anchor", fullPageLiveAnchorRegression, "a new row at the 1000-message cap keeps the reader's oldest visible anchor"],
     ["background completion page ownership", backgroundCompletionKeepsExplicitPageRegression, "run completion cannot supersede an explicit Return to latest request"],
     ["latest before find ownership", latestBeforeFindOwnershipRegression, "an older Return to latest response cannot supersede a newer find"],
+    ["find during metadata refresh", findWhileMetadataRefreshRegression, "completion, reconnect and list metadata survive a concurrent Find without replacing its page"],
     ["checkpoint reading page", checkpointReadingPageRegression, "reconnect, completion and list updates retain a reading page and unique checkpoint counts"],
     ["find in-flight event", findInFlightEventRegression, "an event during find remains reachable when the returned page claims to be latest"],
     ["typing during prepend", typingDuringPrependRegression, "editing a find query does not silently cancel an earlier-page request"],
@@ -2845,6 +2952,7 @@ try {
     ["provider checking rate", providerCheckingRateRegression, "repeated checking snapshots keep a bounded poll cadence"],
     ["sustained output", sustainedOutputRegression, "small deltas coalesce without losing output or input responsiveness"],
     ["many worktree sessions", manyWorktreeSessionRegression, "two repeated switch cycles across two hundred worktrees keep one conversation mounted"],
+    ["extreme diff height", extremeDiffHeightRegression, "a clamped-height diff still reaches its final line with End and Find"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and inspector contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["initial terminal failure", terminalInitialFailureRegression, "failed initial terminal activation retains a keyboard-reachable tab"],
     ["terminal mutation failure", terminalMutationFailureRegression, "create, close and reconnect failures preserve terminal tab ownership"],

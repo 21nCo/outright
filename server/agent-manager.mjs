@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
@@ -261,7 +261,14 @@ process.stdin.on("data", (chunk) => {
 process.stdin.on("end", () => { if (!authorized) { try { fs.unlinkSync(handshakePath); } catch {} process.exit(0); } });
 `;
 
-export function defaultLaunchCommand(command, run, launchDirectory) {
+function supervisorCommand(args, timeout) {
+  return new Promise((resolve) => {
+    execFile(AGENT_SUPERVISOR, args, { encoding: "utf8", timeout, killSignal: "SIGKILL", maxBuffer: 1024 },
+      (error, stdout) => resolve({ error, stdout }));
+  });
+}
+
+export async function defaultLaunchCommand(command, run, launchDirectory) {
   const handshakePath = path.join(launchDirectory, `${run.id}.json`);
   if (process.platform === "linux") {
     if (!existsSync(AGENT_SUPERVISOR)) {
@@ -281,9 +288,9 @@ export function defaultLaunchCommand(command, run, launchDirectory) {
   const ownershipToken = randomUUID();
   const platformOwnershipId = process.platform === "darwin" ? `com.21n.outright.${ownershipToken}` : "-";
   if (process.platform === "darwin") {
-    const capability = spawnSync(AGENT_SUPERVISOR, ["--self-test", platformOwnershipId], { encoding: "utf8", timeout: 5000, killSignal: "SIGKILL" });
-    if (capability.status !== 0 || capability.stdout?.trim() !== "supported") {
-      spawnSync(AGENT_SUPERVISOR, ["--terminate", platformOwnershipId], { stdio: "ignore", timeout: 1000, killSignal: "SIGKILL" });
+    const capability = await supervisorCommand(["--self-test", platformOwnershipId], 5000);
+    if (capability.error || capability.stdout?.trim() !== "supported") {
+      await supervisorCommand(["--terminate", platformOwnershipId], 1000);
       throw new Error("macOS agent supervision is unavailable because its kernel ownership contract could not be verified");
     }
   }
@@ -323,10 +330,18 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     return database.getRun(run.id);
   }
 
-  async function start(state) {
+  async function start(state, authorize) {
     const { conversation, run } = state;
     const command = buildProviderCommand(conversation, run);
-    const launch = launchCommand(command, run, resolvedLaunchDirectory);
+    const launch = await launchCommand(command, run, resolvedLaunchDirectory);
+    if (state.stopped || shuttingDown) return;
+    // The asynchronous capability check is a retry boundary: trust and the
+    // selected durable target may have changed while it was in flight.
+    const current = database.getConversation(run.conversationId);
+    if (!current || ["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== conversation[key])) {
+      throw new Error("Conversation target changed while preparing the run; submit again");
+    }
+    authorize?.();
     const startedAt = new Date().toISOString();
     // Crash-safe launch handshake, phase 1: this durable marker means "a spawn
     // may have been issued, but the provider was never authorized to run". A
@@ -630,7 +645,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
           state.conversation = entry.providerSessionId !== undefined
             ? { ...current, providerSessionId: entry.providerSessionId }
             : entry.forceFreshSession ? { ...current, providerSessionId: null } : current;
-          await start(state);
+          await start(state, authorize);
         } catch (error) {
           if (!state.stopped && !error?.preserveActiveRun) finish(state, null, error);
         }
