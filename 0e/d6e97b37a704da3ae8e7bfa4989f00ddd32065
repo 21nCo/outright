@@ -1,0 +1,50 @@
+docs/out-32-performance.md
+  h_a39f9495f9ec1d 41-57
+scripts/run-tests.mjs
+  h_a39f9495f9ec1d 18-20
+server/agent-manager.mjs
+  h_a39f9495f9ec1d 315,654-655,759-766
+server/agent-manager.test.mjs
+  h_a39f9495f9ec1d 83-105
+server/database.mjs
+  h_a39f9495f9ec1d 171-172,202,206,212-214,221,223-227,231,233-239,245-246,248-250,258,266,271,282
+server/database.test.mjs
+  h_a39f9495f9ec1d 43,112-116,124-141,162,165
+server/outright-runtime.mjs
+  h_a39f9495f9ec1d 221-227
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 177
+server/provider-discovery.mjs
+  h_a39f9495f9ec1d 10,19-20,24,37,75-80,84-96
+server/provider-discovery.test.mjs
+  h_a39f9495f9ec1d 3,6-23
+server/ui-recovery.test.mjs
+  h_a39f9495f9ec1d 3-11,118-136
+src/App.jsx
+  h_a39f9495f9ec1d 29,32-35,104,159,349,401,431,468,492,496-498,506,750-752,765-766,996,1038,1074-1078,1095-1115,1130,1166-1171,1257
+src/components/ChangesPane.jsx
+  h_a39f9495f9ec1d 1,21-23,76
+src/components/WindowedDiff.jsx
+  h_a39f9495f9ec1d 1,16,22,25-30,32-53,68,88-101,107-109,116,119-120,123-141
+src/components/WindowedMessages.jsx
+  h_a39f9495f9ec1d 12,16,20,23-26,40-41,110,117,158-159,168,170-171,194-204,234
+src/recovery-policy.js
+  h_a39f9495f9ec1d 37,41-42,44-54,59,61,74-84,125
+src/styles.css
+  h_a39f9495f9ec1d 396,402
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 3,1482-1506,1867,1878-1886,1892-1917,1929,2006-2010,2023-2028,2032,2034-2035,2037-2044,2137-2158,2166-2167,2171-2172,2177-2186,2188,2328,2351-2354,2403,2409,2452-2461,3106
+tests/ui-races.test.mjs
+  h_a39f9495f9ec1d 825
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0ed6e97b37a704da3ae8e7bfa4989f00ddd32065",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
