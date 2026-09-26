@@ -23,6 +23,7 @@ test("provider reads stay responsive while an asynchronous probe is pending", as
     assert.equal(calls, 2, "concurrent authorization shares the in-flight probe");
     finish("codex 1.2.3");
     assert.equal(await available, true);
+    assert.equal(calls, 2, "a successful in-flight probe must authorize without a second serial probe");
     assert.equal(await discovery.available("claude"), false);
     assert.equal(discovery.list().find((item) => item.id === "codex").version, "codex 1.2.3");
     assert.ok(changes.length >= 1);

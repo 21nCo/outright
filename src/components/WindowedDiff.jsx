@@ -38,9 +38,6 @@ export function WindowedDiff({ diff, label }) {
     }
   }
   useLayoutEffect(() => {
-    foundOffsetRef.current = -1;
-    setFoundLine(-1);
-    setSearched(false);
     const viewport = viewportRef.current;
     if (!viewport) return;
     const update = () => setPosition({ top: viewport.scrollTop, height: viewport.clientHeight });
@@ -48,6 +45,17 @@ export function WindowedDiff({ diff, label }) {
     const resize = new ResizeObserver(update);
     resize.observe(viewport);
     return () => resize.disconnect();
+  }, []);
+  useLayoutEffect(() => {
+    if (!needle.trim() || foundOffsetRef.current < 0) return;
+    const query = needle.trim().toLocaleLowerCase();
+    let match = searchable.indexOf(query, Math.min(foundOffsetRef.current, searchable.length));
+    if (match < 0) match = searchable.indexOf(query);
+    if (match < 0) { foundOffsetRef.current = -1; setFoundLine(-1); setSearched(true); return; }
+    foundOffsetRef.current = match;
+    let low = 0; let high = searchableStarts.length;
+    while (low < high) { const middle = (low + high) >>> 1; if (searchableStarts[middle] <= match) low = middle + 1; else high = middle; }
+    setFoundLine(low - 1);
   }, [diff]);
   const count = starts.length;
   const start = Math.max(0, Math.floor(position.top / LINE_HEIGHT) - OVERSCAN);

@@ -36,9 +36,9 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
     const owner = ownerRef.current;
     if (owner.path !== worktree.path) return;
     const request = ++diffRequestRef.current;
-    // The previous selection's text must never appear under the new label,
-    // including when this request fails.
-    setDiff("");
+    // A same-selection refresh retains the reader's line and find state.
+    // A different file or mode owns different text, even on failure.
+    if (selectionRef.current.file !== filePath || selectionRef.current.mode !== mode) return;
     if (!filePath) { setDiff(""); return; }
     try {
       const next = await api(query("/api/git/diff", { path: worktree.path, file: filePath, staged: mode === "staged" }));
@@ -60,6 +60,7 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
       const nextFile = current?.path ?? next.files[0]?.path ?? "";
       const entry = current ?? next.files[0];
       const mode = hasStaged(entry) ? selection.mode : "unstaged";
+      if (nextFile !== selection.file || mode !== selection.mode) setDiff("");
       selectionRef.current = { file: nextFile, mode };
       setSelectedFile(nextFile);
       setViewMode(mode);
@@ -83,11 +84,12 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
   async function chooseFile(file) {
     const mode = hasStaged(file) ? "staged" : "unstaged";
     selectionRef.current = { file: file.path, mode };
+    if (file.path !== selectedFile || mode !== viewMode) setDiff("");
     setSelectedFile(file.path);
     setViewMode(mode);
     await loadDiff(file.path, mode);
   }
-  async function chooseMode(mode) { const file = selectionRef.current.file; selectionRef.current = { file, mode }; setViewMode(mode); await loadDiff(file, mode); }
+  async function chooseMode(mode) { const file = selectionRef.current.file; selectionRef.current = { file, mode }; if (mode !== viewMode) setDiff(""); setViewMode(mode); await loadDiff(file, mode); }
   async function mutate(endpoint, files) {
     const owner = ownerRef.current;
     const path = worktree.path;

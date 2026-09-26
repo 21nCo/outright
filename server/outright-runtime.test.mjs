@@ -184,6 +184,30 @@ test("conversation find rejects malformed queries and foreign cursors", withRunt
   assert.equal(missing.statusCode, 404);
 }));
 
+test("conversation forward pages and count endpoint remain scoped to one conversation", withRuntime(async (runtime) => {
+  const chat = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Forward", provider: "codex" });
+  const other = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Other", provider: "codex" });
+  const ids = Array.from({ length: 5 }, (_, index) => runtime.database.addMessage({ conversationId: chat.id, role: "user", body: `row ${index}` }).id);
+  const foreign = runtime.database.addMessage({ conversationId: other.id, role: "user", body: "foreign" });
+  const count = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `/api/conversations/${chat.id}/messages/count`), count);
+  assert.equal(count.statusCode, 200);
+  assert.deepEqual(count.body, { total: 5 });
+  const page = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `/api/conversations/${chat.id}/messages?after=${ids[1]}&limit=2`), page);
+  assert.equal(page.statusCode, 200);
+  assert.deepEqual(page.body.messages.map((message) => message.id), ids.slice(2, 4));
+  assert.equal(page.body.messagePage.newerCount, 1);
+  for (const suffix of [`?after=${foreign.id}`, `?before=${ids[0]}&after=${ids[1]}`]) {
+    const invalid = responseCapture();
+    await runtime.handleRequest(requestStream("GET", `/api/conversations/${chat.id}/messages${suffix}`), invalid);
+    assert.equal(invalid.statusCode, 400);
+  }
+  const missing = responseCapture();
+  await runtime.handleRequest(requestStream("GET", "/api/conversations/missing/messages/count"), missing);
+  assert.equal(missing.statusCode, 404);
+}));
+
 async function waitForValidation(entered, pending) {
   let timer;
   try {

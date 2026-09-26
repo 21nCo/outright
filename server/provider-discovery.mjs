@@ -60,7 +60,13 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
       // The snapshot is display state, never authorization. A CLI may have
       // been removed since a positive result or installed during a probe.
       const sharedProbe = pending.get(id);
-      if (sharedProbe) await sharedProbe;
+      if (sharedProbe) {
+        const available = await sharedProbe;
+        if (closed) return false;
+        // A successful probe already in flight is the freshest possible
+        // authorization result. A failed one may have started before install.
+        if (available) return true;
+      }
       if (closed) return false;
       return probeProvider(id, true);
     },

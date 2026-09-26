@@ -193,10 +193,16 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         return json(response, conversation ? 200 : 404, conversation);
       }
       const conversationMessagesMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages$/);
+      const conversationCountMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages\/count$/);
+      if (conversationCountMatch && request.method === "GET") {
+        if (!database.getConversation(conversationCountMatch[1])) throw apiError(404, "Conversation not found");
+        return json(response, 200, { total: database.messageCount(conversationCountMatch[1]) });
+      }
       if (conversationMessagesMatch && request.method === "GET") {
         if (!database.getConversation(conversationMessagesMatch[1])) throw apiError(404, "Conversation not found");
         const messagePage = database.listMessagePage(conversationMessagesMatch[1], {
           beforeId: url.searchParams.get("before") || undefined,
+          afterId: url.searchParams.get("after") || undefined,
           limit: Number(url.searchParams.get("limit") || 200),
         });
         return json(response, 200, { messages: messagePage.messages, messagePage: messagePage.page });

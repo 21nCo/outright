@@ -171,26 +171,36 @@ export function createOutrightDatabase(options = {}) {
       return db.prepare(`SELECT id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
         FROM messages WHERE conversation_id = ? ORDER BY created_at, rowid`).all(conversationId).map(hydratePayload);
     },
+    messageCount(conversationId) {
+      return db.prepare("SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?").get(conversationId).count;
+    },
     listMessagePage(conversationId, options = {}) {
       const limit = Math.max(1, Math.min(500, Number(options.limit) || 200));
+      if (options.beforeId && options.afterId) throw databaseError(400, "Choose one message cursor");
       let rows;
       if (options.beforeId) {
         const cursor = db.prepare("SELECT search_order AS rowid FROM messages WHERE conversation_id = ? AND id = ?").get(conversationId, options.beforeId);
         if (!cursor) throw databaseError(400, "Message cursor was not found");
         rows = db.prepare(`SELECT search_order AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
           FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order < ? ORDER BY search_order DESC LIMIT ?`).all(conversationId, cursor.rowid, limit);
+      } else if (options.afterId) {
+        const cursor = db.prepare("SELECT search_order AS rowid FROM messages WHERE conversation_id = ? AND id = ?").get(conversationId, options.afterId);
+        if (!cursor) throw databaseError(400, "Message cursor was not found");
+        rows = db.prepare(`SELECT search_order AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order > ? ORDER BY search_order ASC LIMIT ?`).all(conversationId, cursor.rowid, limit);
       } else {
         rows = db.prepare(`SELECT search_order AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
           FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? ORDER BY search_order DESC LIMIT ?`).all(conversationId, limit);
       }
-      rows.reverse();
-      const oldestRowId = rows[0]?.messageRowId;
-      const olderCount = oldestRowId ? db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order < ?").get(conversationId, oldestRowId).count : 0;
-      const hasMore = olderCount > 0;
+      if (!options.afterId) rows.reverse();
       const total = db.prepare("SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?").get(conversationId).count;
+      const oldestRowId = rows[0]?.messageRowId;
+      const olderCount = oldestRowId ? db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order < ?").get(conversationId, oldestRowId).count : options.afterId ? total : 0;
+      const hasMore = olderCount > 0;
+      const newerCount = Math.max(0, total - olderCount - rows.length);
       return {
         messages: rows.map(({ messageRowId: _messageRowId, ...row }) => hydratePayload(row)),
-        page: { hasMore, olderCount, total, beforeId: rows[0]?.id ?? null, limit },
+        page: { hasMore, olderCount, hasLater: newerCount > 0, newerCount, total, beforeId: rows[0]?.id ?? null, limit },
       };
     },
     async findMessagePage(conversationId, query, afterId, direction = 1, signal) {

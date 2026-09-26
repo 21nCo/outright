@@ -1533,6 +1533,51 @@ async function changesDiffFailureOwnershipRegression() {
   await until(() => host.querySelector('.diff-view')?.textContent.includes("B unstaged"), "new mode diff loaded");
 }
 
+async function diffRefreshAnchorRegression() {
+  root.render(null); await settle();
+  const original = Array.from({ length: 5_000 }, (_, index) => `+line ${index}\n`).join("");
+  const changed = original.replace("+line 2500", "+LINE 2500");
+  const pending = [];
+  let hold = false;
+  const errors = [];
+  route = async (url) => {
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [{ path: "large.txt", status: "MM", index: "M", worktree: "M" }], stagedCount: 1 });
+    if (url.pathname === "/api/git/diff") {
+      if (hold) { const request = deferred(); pending.push(request); return request.promise; }
+      return response({ diff: original });
+    }
+    return response({});
+  };
+  const tree = projects[0].worktrees[0];
+  const pane = (event) => <div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>;
+  root.render(pane(null));
+  await until(() => host.querySelector(".diff-view")?.textContent.includes("line 0"), "large diff ready");
+  const viewport = host.querySelector(".diff-view");
+  const find = host.querySelector('input[aria-label="Find in diff"]');
+  setControlValue(find, "line 2500");
+  find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("2500"), "large diff find");
+  const anchor = viewport.scrollTop;
+  hold = true;
+  root.render(pane({ type: "projects.changed" }));
+  await until(() => pending.length === 1, "background diff refresh pending");
+  assert(viewport.textContent.includes("line 2500") && viewport.querySelector('[data-find-match="true"]'), "Background refresh erased the reader's diff or find");
+  assert(Math.abs(viewport.scrollTop - anchor) < 24, "Background refresh moved the diff anchor before its response");
+  pending.shift().resolve(response({ diff: original }));
+  await settle();
+  assert(Math.abs(viewport.scrollTop - anchor) < 24 && viewport.querySelector('[data-find-match="true"]'), "Identical diff refresh lost the anchor or find");
+  host.querySelector('[aria-label="Refresh changes"]').click();
+  await until(() => pending.length === 1, "changed diff refresh pending");
+  pending.shift().resolve(response({ diff: changed }));
+  await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("LINE 2500"), "changed diff find retained");
+  assert(Math.abs(viewport.scrollTop - anchor) < 24, "Changed diff refresh moved the reader's line");
+  host.querySelector('[aria-label="Refresh changes"]').click();
+  await until(() => pending.length === 1, "failed same-selection refresh pending");
+  pending.shift().reject(new Error("Diff offline"));
+  await until(() => errors.includes("Diff offline"), "same-selection failure reported");
+  assert(viewport.textContent.includes("LINE 2500") && Math.abs(viewport.scrollTop - anchor) < 24, "Failed same-selection refresh erased the last valid diff");
+}
+
 async function changesMutationOwnerRegression(reject = false, mode = "stage") {
   root.render(null); await settle();
   const pending = deferred();
@@ -1957,6 +2002,48 @@ async function backgroundLatestRefreshRegression() {
   assert(!host.querySelector('.history-return'), "Latest refresh incorrectly became an older history page");
 }
 
+async function forwardHistoryPagingRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (index) => ({ id: `forward-${index}`, role: "assistant", kind: "text", body: `Read ${index}`, createdAt: new Date(index * 1000).toISOString() });
+  const all = Array.from({ length: 1_001 }, (_, index) => message(index));
+  const requested = [];
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A/messages/count") return response({ total: 1_001 });
+    if (url.pathname === "/api/conversations/chat-A/messages") {
+      const after = Number(url.searchParams.get("after")?.split("-")[1]);
+      requested.push(after);
+      const page = all.slice(after + 1, after + 201);
+      return response({ messages: page, messagePage: { total: 1_001, olderCount: after + 1, newerCount: 1_001 - (after + 1) - page.length, hasMore: true, hasLater: after + 1 + page.length < 1_001, beforeId: page[0]?.id } });
+    }
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: all.slice(0, 200), messagePage: { total: 1_001, olderCount: 0, newerCount: 801, hasMore: false, hasLater: true, beforeId: "forward-0" } });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector(".history-later")?.textContent.includes("801"), "old page has forward affordance");
+  for (const [step, remaining] of [[0, 601], [1, 401], [2, 201], [3, 1]]) {
+    await until(() => !host.querySelector(".history-later")?.disabled, `forward page ${step + 1} enabled`);
+    host.querySelector(".history-later").click();
+    await until(() => host.querySelector(".history-later")?.textContent.includes(`${remaining} remaining`) && !host.querySelector(".history-later")?.disabled, `forward page ${step + 1}`);
+    assert(host.querySelectorAll('[role="listitem"]').length < 40, "Forward paging mounted the full transcript");
+  }
+  assert(requested.join(",") === "199,399,599,799", `Forward cursors skipped or repeated a page: ${requested}`);
+  const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+  for (let attempt = 0; attempt < 4 && !host.querySelector('[data-message-id="forward-999"]'); attempt += 1) {
+    viewport.scrollTop = viewport.scrollHeight;
+    viewport.dispatchEvent(new Event("scroll"));
+    await settle();
+  }
+  await until(() => host.querySelector('[data-message-id="forward-999"]'), "forward page committed through 999");
+  host.querySelector(".history-later").click();
+  await until(() => !host.querySelector(".history-later"), "forward read to persisted end");
+  assert(requested.at(-1) === 999, "Final forward cursor did not continue from the loaded page");
+  assert(host.querySelector('[role="listitem"][aria-posinset="1001"]') || host.querySelector('.history-return') === null, "Final forward page lost the persisted end");
+  assert(host.querySelectorAll('[role="listitem"]').length < 40, "Forward paging exceeded bounded mounted rows");
+}
+
 async function backgroundReadingRefreshRegression() {
   root.render(null); await settle();
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
@@ -2074,12 +2161,14 @@ async function checkpointReadingPageRegression() {
     payload: index === 999 ? { runId: "run-checkpoint", checkpointEventSeq: seq } : {}, createdAt: new Date(index * 1000).toISOString() });
   const older = Array.from({ length: 200 }, (_, index) => message(index));
   let latest = Array.from({ length: 200 }, (_, index) => message(index + 800));
+  let persistedTotal = 1000;
   let reads = 0;
   route = async (url) => {
     if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
     if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A/messages/count") return response({ total: persistedTotal });
     if (url.pathname.endsWith("/messages/find")) return response({ matchId: "checkpoint-10", messages: older, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1000, beforeId: "checkpoint-0" } });
-    if (url.pathname === "/api/conversations/chat-A") { reads += 1; return response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: 800, total: 1000, beforeId: "checkpoint-800" } }); }
+    if (url.pathname === "/api/conversations/chat-A") { reads += 1; return response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: persistedTotal - latest.length, total: persistedTotal, beforeId: latest[0].id } }); }
     return response({});
   };
   root.render(<TooltipProvider><App /></TooltipProvider>);
@@ -2112,6 +2201,52 @@ async function checkpointReadingPageRegression() {
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "conversation.updated", conversationId: "chat-A" }) }));
   await until(() => reads >= 4, "list update detail read");
   assert(host.querySelector('[data-message-id="checkpoint-10"]') && host.querySelector('.history-return')?.textContent === "Return to latest · 800 new", "List update replaced the reader's older page");
+  for (let index = 1000; index <= 1002; index += 1) {
+    persistedTotal += 1;
+    latest = [...latest, message(index)].slice(-200);
+    fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(index) }) }));
+  }
+  await until(() => host.querySelector('.history-return')?.textContent === "Return to latest · 803 new", "three durable new ids counted after old page");
+  latest = latest.map((item) => item.id === "checkpoint-999" ? message(999, "Repeated checkpoint", 9) : item);
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(999, "Repeated checkpoint", 9) }) }));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert(host.querySelector('.history-return')?.textContent === "Return to latest · 803 new", "Repeated off-page checkpoint inflated the live count");
+}
+
+async function latestBeforeFindOwnershipRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (index) => ({ id: `order-${index}`, role: "assistant", kind: "text", body: `Find ${index}`, createdAt: new Date(index * 1000).toISOString() });
+  const latest = Array.from({ length: 200 }, (_, index) => message(index + 800));
+  const oldest = Array.from({ length: 200 }, (_, index) => message(index));
+  const delayedLatest = deferred();
+  let holdLatest = false;
+  let latestRequested = false;
+  let findRequests = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname.endsWith("/messages/find")) { findRequests += 1; return response({ matchId: "order-10", messages: oldest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1000, beforeId: "order-0" } }); }
+    if (url.pathname === "/api/conversations/chat-A") {
+      if (holdLatest) { latestRequested = true; return delayedLatest.promise; }
+      return response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: 800, total: 1000, beforeId: "order-800" } });
+    }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector(".history-find input"), "latest/find ownership ready");
+  const input = host.querySelector(".history-find input");
+  setControlValue(input, "Find 10"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="order-10"]'), "initial old match");
+  holdLatest = true;
+  host.querySelector(".history-return").click();
+  await until(() => latestRequested, "return to latest pending before find");
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => findRequests === 2 && host.querySelector('[data-find-match="true"] [data-message-id="order-10"]') && host.querySelector(".history-return"), "new find owns old page");
+  delayedLatest.resolve(response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: 800, total: 1000, beforeId: "order-800" } }));
+  await settle();
+  assert(host.querySelector('[data-find-match="true"] [data-message-id="order-10"]') && host.querySelector(".history-return"), "Late Return to latest replaced a newer find page");
 }
 
 async function findInFlightEventRegression() {
@@ -2631,6 +2766,7 @@ try {
     ["stale diff selection", staleDiffSelectionRegression, "a slow prior diff cannot replace the selected file"],
     ["changes refresh selection", changesSelectionRefreshRegression, "pending refreshes preserve current file and mode and retained events refresh once"],
     ["changes diff failure ownership", changesDiffFailureOwnershipRegression, "pending and failed file or mode requests never display a previous diff"],
+    ["diff refresh anchor", diffRefreshAnchorRegression, "same-selection refresh keeps the visible diff line and find through success and failure"],
     ["changes mutation owner success", () => changesMutationOwnerRegression(false), "late stage completion cannot refresh another worktree"],
     ["changes mutation owner failure", () => changesMutationOwnerRegression(true), "late stage failure cannot report in another worktree"],
     ["changes unstage owner failure", () => changesMutationOwnerRegression(true, "unstage"), "late unstage failure cannot report in another worktree"],
@@ -2643,10 +2779,12 @@ try {
     ["production diff viewport", productionDiffViewportRegression, "staged and unstaged large diffs stay bounded in the inspector"],
     ["paged transcript anchor", pagedTranscriptAnchorRegression, "loading earlier history preserves its visible reading anchor"],
     ["paged transcript find", pagedTranscriptFindRegression, "find navigates older persisted messages with bounded mounted rows"],
+    ["forward history paging", forwardHistoryPagingRegression, "an old page can be read continuously through the persisted end within the 1000-row cap"],
     ["background latest refresh", backgroundLatestRefreshRegression, "a missed event refreshes the latest page without keeping a stale snapshot"],
     ["background reading refresh", backgroundReadingRefreshRegression, "missed replay and completion expose later output without moving a reader"],
     ["full-page live anchor", fullPageLiveAnchorRegression, "a new row at the 1000-message cap keeps the reader's oldest visible anchor"],
     ["background completion page ownership", backgroundCompletionKeepsExplicitPageRegression, "run completion cannot supersede an explicit Return to latest request"],
+    ["latest before find ownership", latestBeforeFindOwnershipRegression, "an older Return to latest response cannot supersede a newer find"],
     ["checkpoint reading page", checkpointReadingPageRegression, "reconnect, completion and list updates retain a reading page and unique checkpoint counts"],
     ["find in-flight event", findInFlightEventRegression, "an event during find remains reachable when the returned page claims to be latest"],
     ["typing during prepend", typingDuringPrependRegression, "editing a find query does not silently cancel an earlier-page request"],

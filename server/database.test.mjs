@@ -55,6 +55,28 @@ test("conversation find reaches old and new pages, wraps, and treats query text 
   } finally { database.close(); }
 });
 
+test("forward message pages continue from a found page with exact persisted counts", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Long", provider: "codex" });
+    const sibling = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Sibling", provider: "codex" });
+    const ids = Array.from({ length: 405 }, (_, index) => database.addMessage({ conversationId: chat.id, role: "user", body: `row ${index}` }).id);
+    database.addMessage({ conversationId: sibling.id, role: "user", body: "sibling" });
+    const first = database.listMessagePage(chat.id, { afterId: ids[4], limit: 200 });
+    assert.deepEqual(first.messages.map((message) => message.id), ids.slice(5, 205));
+    assert.deepEqual([first.page.olderCount, first.page.newerCount, first.page.total], [5, 200, 405]);
+    const second = database.listMessagePage(chat.id, { afterId: first.messages.at(-1).id, limit: 200 });
+    assert.deepEqual(second.messages.map((message) => message.id), ids.slice(205));
+    assert.deepEqual([second.page.olderCount, second.page.newerCount], [205, 0]);
+    const exhausted = database.listMessagePage(chat.id, { afterId: ids.at(-1), limit: 200 });
+    assert.deepEqual(exhausted.messages, []);
+    assert.deepEqual([exhausted.page.olderCount, exhausted.page.newerCount, exhausted.page.hasLater], [405, 0, false]);
+    assert.equal(database.messageCount(chat.id), 405);
+    assert.throws(() => database.listMessagePage(chat.id, { afterId: "foreign" }), /cursor/);
+    assert.throws(() => database.listMessagePage(chat.id, { afterId: ids[0], beforeId: ids[2] }), /one message cursor/);
+  } finally { database.close(); }
+});
+
 test("conversation find folds Unicode consistently across old and new pages", async () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
@@ -794,7 +816,7 @@ test("pages messages newest-first at the boundary while returning each page chro
 
     const latest = database.listMessagePage(conversation.id, { limit: 2 });
     assert.deepEqual(latest.messages.map((message) => message.id), ["message-4", "message-5"]);
-    assert.deepEqual(latest.page, { hasMore: true, olderCount: 3, total: 5, beforeId: "message-4", limit: 2 });
+    assert.deepEqual(latest.page, { hasMore: true, olderCount: 3, hasLater: false, newerCount: 0, total: 5, beforeId: "message-4", limit: 2 });
 
     const middle = database.listMessagePage(conversation.id, { beforeId: latest.page.beforeId, limit: 2 });
     assert.deepEqual(middle.messages.map((message) => message.id), ["message-2", "message-3"]);
