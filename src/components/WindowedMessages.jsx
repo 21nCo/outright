@@ -4,7 +4,7 @@ import { windowRange } from "@/lib/windowing";
 export const ESTIMATED_MESSAGE_HEIGHT = 110;
 const FULL_RENDER_LIMIT = 80;
 
-export function WindowedMessages({ messages, viewportRef, renderMessage, onFind, onCancelFind, resetFindGeneration = 0 }) {
+export function WindowedMessages({ messages, messagePage, viewportRef, renderMessage, onFind, onCancelFind, resetFindGeneration = 0 }) {
   const listRef = useRef(null);
   const heightsRef = useRef(new Map());
   const messagesRef = useRef(messages);
@@ -155,6 +155,8 @@ export function WindowedMessages({ messages, viewportRef, renderMessage, onFind,
     const schedule = () => { if (!frame) frame = window.setTimeout(() => { frame = 0; update(); }, 16); };
     viewport.addEventListener("scroll", schedule, { passive: true });
     const resize = new ResizeObserver(() => {
+      const list = listRef.current;
+      if (!list) { schedule(); return; }
       const match = list.querySelector('[data-find-match="true"]');
       if (match && foundId && !pendingFoundRef.current) {
         const bounds = match.getBoundingClientRect();
@@ -199,9 +201,12 @@ export function WindowedMessages({ messages, viewportRef, renderMessage, onFind,
     return () => resize.disconnect();
   }, [messages, range.start, range.end, update]);
 
-  return <><div className="history-find" role="search" aria-label="Find in conversation"><input aria-label="Find in conversation" maxLength={200} value={needle} onChange={(event) => { ++searchGenerationRef.current; pendingFoundRef.current = null; onCancelFind?.(); setNeedle(event.target.value); setFoundIndex(-1); setFoundId(null); setSearching(false); setSearched(false); setSearchError(false); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle || searching} aria-label="Previous conversation match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle || searching} aria-label="Next conversation match">↓</button><span role="status">{searching ? "Searching…" : searchError ? "Search failed; retry" : needle && foundIndex >= 0 ? `Message ${foundIndex + 1} of ${messages.length}` : needle && searched ? "No match" : needle ? "Press Enter to find" : ""}</span></div><div ref={listRef} role="list" aria-label="Conversation history">
+  const olderCount = messagePage?.olderCount ?? 0;
+  const total = messagePage?.total ?? messages.length;
+  const position = (index) => olderCount + index + 1;
+  return <><div className="history-find" role="search" aria-label="Find in conversation"><input aria-label="Find in conversation" maxLength={200} value={needle} onChange={(event) => { ++searchGenerationRef.current; pendingFoundRef.current = null; onCancelFind?.(); setNeedle(event.target.value); setFoundIndex(-1); setFoundId(null); setSearching(false); setSearched(false); setSearchError(false); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle || searching} aria-label="Previous conversation match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle || searching} aria-label="Next conversation match">↓</button><span role="status">{searching ? "Searching…" : searchError ? "Search failed; retry" : needle && foundIndex >= 0 ? `Message ${position(foundIndex)} of ${total}` : needle && searched ? "No match" : needle ? "Press Enter to find" : ""}</span></div><div ref={listRef} role="list" aria-label="Conversation history">
     {range.top > 0 && <div aria-hidden="true" style={{ height: range.top }} />}
-    {messages.slice(range.start, range.end).map((message, offset) => <div key={message.id} data-window-id={message.id} data-find-match={range.start + offset === foundIndex ? "true" : undefined} role="listitem" aria-posinset={range.start + offset + 1} aria-setsize={messages.length} style={{ display: "flow-root" }}>{renderMessage(message)}</div>)}
+    {messages.slice(range.start, range.end).map((message, offset) => <div key={message.id} data-window-id={message.id} data-find-match={range.start + offset === foundIndex ? "true" : undefined} role="listitem" aria-posinset={position(range.start + offset)} aria-setsize={total} style={{ display: "flow-root" }}>{renderMessage(message)}</div>)}
     {range.bottom > 0 && <div aria-hidden="true" style={{ height: range.bottom }} />}
   </div></>;
 }

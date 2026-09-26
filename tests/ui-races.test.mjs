@@ -782,7 +782,13 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       });
     ` });
     let viewportError;
+    const pageErrors = [];
     devtools.onEvent((event) => {
+      if (event.method === "Runtime.exceptionThrown") {
+        const details = event.params.exceptionDetails;
+        pageErrors.push(`${details.text}: ${details.exception?.description ?? details.url ?? "unknown source"}`);
+        return;
+      }
       if (event.method !== "Runtime.bindingCalled") return;
       (async () => {
         if (event.params.name === "__requestFixtureWheel") {
@@ -812,9 +818,11 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     phase = "run browser interaction fixtures";
     const state = await waitForFixture(async (method, params) => {
       if (viewportError) throw viewportError;
+      if (pageErrors.length) throw new Error(`Uncaught browser error: ${pageErrors.join("; ")}`);
       return send(method, params);
     }, deadline);
-    assert.match(state.text, process.env.OUTRIGHT_UI_STEP ? /1 interaction regressions passed/ : /67 interaction regressions passed/);
+    assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
+    assert.match(state.text, process.env.OUTRIGHT_UI_STEP ? /1 interaction regressions passed/ : /68 interaction regressions passed/);
     const performanceFixture = state.text.match(/Performance fixture: (\{[^\n]+\})/);
     if (!process.env.OUTRIGHT_UI_STEP) assert.ok(performanceFixture, "large fixture measurements were not recorded");
     if (performanceFixture) console.log(`UI performance: ${performanceFixture[1]}`);

@@ -1659,6 +1659,9 @@ async function variableHeightFindAnchorRegression() {
   const visible = () => { const row = host.querySelector('[data-find-match="true"]'); const bounds = row?.getBoundingClientRect(); const area = viewport.current.getBoundingClientRect(); return bounds && bounds.top >= area.top && bounds.top < area.bottom; };
   assert(visible(), "Measured tall rows displaced the found message");
   assert(host.querySelectorAll('[role="listitem"]').length < 40, "Variable-height find mounted too many rows");
+  viewport.current.style.height = "720px";
+  await settle(); await settle();
+  assert(visible(), "Growing the viewport lost the found message beyond the old overscan");
   viewport.current.style.height = "300px";
   await settle(); await settle();
   assert(visible(), "Viewport resize lost the found message");
@@ -1815,6 +1818,8 @@ async function pagedTranscriptFindRegression() {
   const foundViewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
   assert(foundRow && foundRow.getBoundingClientRect().top < foundViewport.getBoundingClientRect().bottom && foundRow.getBoundingClientRect().bottom > foundViewport.getBoundingClientRect().top, `Initial found row was mounted but not visible: scroll=${foundViewport.scrollTop}, row=${foundRow?.getBoundingClientRect().top}`);
   assert(host.querySelectorAll('[role="listitem"]').length < 40, "Old search match mounted all history");
+  assert(host.querySelector('.history-find [role="status"]')?.textContent === "Message 11 of 1000", "Old match announced its page-local index");
+  assert(foundRow.getAttribute("aria-posinset") === "11" && foundRow.getAttribute("aria-setsize") === "1000", "Old match advertised a page-local list size");
   assert(host.querySelector('.history-return'), "An older search page lost return-to-latest navigation");
   for (const type of ["run.completed", "run.failed", "run.stopped"]) {
     fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: `run-${type}`, payload: { type } }) }));
@@ -1824,6 +1829,7 @@ async function pagedTranscriptFindRegression() {
   }
   host.querySelector('[aria-label="Next conversation match"]').click();
   await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-900"]'), "newer persisted match");
+  assert(host.querySelector('.history-find [role="status"]')?.textContent === "Message 901 of 1000", "New match announced its page-local index");
   const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
   input.focus();
   const bounds = input.getBoundingClientRect();
@@ -1898,6 +1904,51 @@ async function backgroundLatestRefreshRegression() {
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
   await until(() => host.querySelector('[data-message-id="fresh-2"]'), "missed latest output recovered");
   assert(!host.querySelector('.history-return'), "Latest refresh incorrectly became an older history page");
+}
+
+async function backgroundReadingRefreshRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (index) => ({ id: `reading-${index}`, role: "assistant", kind: "text", body: `Persisted ${index}`, createdAt: new Date(index * 1000).toISOString() });
+  let all = Array.from({ length: 200 }, (_, index) => message(index));
+  let reads = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") {
+      reads += 1;
+      return response({ ...chats.A, messages: all, messagePage: { hasMore: false, olderCount: 0, total: all.length, beforeId: all[0].id } });
+    }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[data-message-id="reading-199"]'), "reading page loaded");
+  const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+  const scrollAway = async () => {
+    viewport.scrollTop = viewport.scrollHeight;
+    viewport.dispatchEvent(new Event("scroll"));
+    await settle();
+    viewport.scrollTop = 0;
+    viewport.dispatchEvent(new Event("scroll"));
+    await settle();
+  };
+  await scrollAway();
+  all = [...all, message(200)];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await until(() => reads === 2 && host.querySelector('.history-return'), "missed output offered return to latest");
+  assert(!host.querySelector('[data-message-id="reading-200"]') && viewport.scrollTop < 50, "Reconnect replaced the reading anchor");
+  const returnButton = host.querySelector('.history-return');
+  const composerTop = host.querySelector('.composer').getBoundingClientRect().top;
+  assert(returnButton.getBoundingClientRect().top >= viewport.getBoundingClientRect().bottom - 1
+    && returnButton.getBoundingClientRect().bottom <= composerTop,
+  `Return control is offscreen while reading history: button=${returnButton.getBoundingClientRect().top}/${returnButton.getBoundingClientRect().bottom}, viewport=${viewport.getBoundingClientRect().bottom}, composer=${composerTop}`);
+  returnButton.click();
+  await until(() => host.querySelector('[data-message-id="reading-200"]') && !host.querySelector('.history-return'), "explicit latest after reconnect");
+  await scrollAway();
+  all = [...all, message(201)];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-reading", payload: { type: "run.completed" } }) }));
+  await until(() => reads === 4 && host.querySelector('.history-return')?.textContent.includes("1 new"), "completed run offered later output");
+  assert(!host.querySelector('[data-message-id="reading-201"]') && viewport.scrollTop < 50, "Completion replaced the reading anchor");
 }
 
 async function backgroundCompletionKeepsExplicitPageRegression() {
@@ -2414,6 +2465,7 @@ try {
     ["paged transcript anchor", pagedTranscriptAnchorRegression, "loading earlier history preserves its visible reading anchor"],
     ["paged transcript find", pagedTranscriptFindRegression, "find navigates older persisted messages with bounded mounted rows"],
     ["background latest refresh", backgroundLatestRefreshRegression, "a missed event refreshes the latest page without keeping a stale snapshot"],
+    ["background reading refresh", backgroundReadingRefreshRegression, "missed replay and completion expose later output without moving a reader"],
     ["background completion page ownership", backgroundCompletionKeepsExplicitPageRegression, "run completion cannot supersede an explicit Return to latest request"],
     ["provider bootstrap convergence", providerBootstrapConvergenceRegression, "a checking bootstrap converges after an earlier provider event"],
     ["provider checking rate", providerCheckingRateRegression, "repeated checking snapshots keep a bounded poll cadence"],

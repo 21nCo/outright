@@ -9,31 +9,40 @@ const PROVIDERS = [
 
 export function createProviderDiscovery({ probe = defaultProbe, onChange = () => {}, refreshMs = 30_000 } = {}) {
   let snapshot = PROVIDERS.map((provider) => ({ ...provider, available: false, version: "", checking: true }));
-  let pending = null;
-  let lastChecked = 0;
+  const pending = new Map();
+  const lastChecked = new Map();
   let closed = false;
 
-  function refresh(force = false) {
-    if (closed) return Promise.resolve(snapshot);
-    if (pending) return pending;
-    if (!force && lastChecked && Date.now() - lastChecked < refreshMs) return Promise.resolve(snapshot);
-    pending = Promise.all(PROVIDERS.map(async (provider) => {
+  function probeProvider(id, force = false) {
+    const provider = PROVIDERS.find((item) => item.id === id);
+    if (!provider) return Promise.resolve(false);
+    if (pending.has(id)) return pending.get(id);
+    if (!force && lastChecked.has(id) && Date.now() - lastChecked.get(id) < refreshMs) return Promise.resolve(snapshot.find((item) => item.id === id)?.available === true);
+    const task = (async () => {
+      let next;
       try {
-        const version = await probe(provider.id);
-        return { ...provider, available: true, version: String(version).trim(), checking: false };
+        const version = await probe(id);
+        next = { ...provider, available: true, version: String(version).trim(), checking: false };
       } catch {
-        return { ...provider, available: false, version: "", checking: false };
+        next = { ...provider, available: false, version: "", checking: false };
       }
-    })).then((next) => {
       if (!closed) {
-        const changed = JSON.stringify(next) !== JSON.stringify(snapshot);
-        snapshot = next;
-        lastChecked = Date.now();
+        const index = snapshot.findIndex((item) => item.id === id);
+        const changed = JSON.stringify(snapshot[index]) !== JSON.stringify(next);
+        snapshot = snapshot.map((item) => item.id === id ? next : item);
+        lastChecked.set(id, Date.now());
         if (changed) onChange(snapshot);
       }
-      return snapshot;
-    }).finally(() => { pending = null; });
-    return pending;
+      return next.available;
+    })().finally(() => { if (pending.get(id) === task) pending.delete(id); });
+    pending.set(id, task);
+    return task;
+  }
+
+  async function refresh(force = false) {
+    if (closed) return Promise.resolve(snapshot);
+    await Promise.all(PROVIDERS.map((provider) => probeProvider(provider.id, force)));
+    return snapshot;
   }
 
   // Discovery starts independently of HTTP requests. A failed probe remains a
@@ -50,10 +59,10 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
       if (!entry) return false;
       // The snapshot is display state, never authorization. A CLI may have
       // been removed since a positive result or installed during a probe.
-      const sharedProbe = pending;
+      const sharedProbe = pending.get(id);
       if (sharedProbe) await sharedProbe;
-      await refresh(true);
-      return snapshot.find((provider) => provider.id === id)?.available === true;
+      if (closed) return false;
+      return probeProvider(id, true);
     },
     close() { closed = true; clearInterval(timer); },
   };

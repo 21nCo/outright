@@ -95,6 +95,57 @@ test("large no-match find yields to other requests and stays in its conversation
   } finally { database.close(); }
 });
 
+test("sparse conversation search stays responsive with a large sibling history", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-sparse-find-"));
+  const filename = path.join(directory, "history.db");
+  const database = createOutrightDatabase({ filename });
+  try {
+    const target = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Target", provider: "codex" });
+    const sibling = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Sibling", provider: "codex" });
+    const first = database.addMessage({ conversationId: target.id, role: "assistant", body: "needle first" });
+    const bulk = new Database(filename);
+    try {
+      const insert = bulk.prepare("INSERT INTO messages (id, conversation_id, role, body, created_at) VALUES (?, ?, 'assistant', 'unrelated body', '2026-09-26')");
+      bulk.transaction(() => { for (let index = 0; index < 500_000; index += 1) insert.run(`sibling-${index}`, sibling.id); })();
+    } finally { bulk.close(); }
+    const last = database.addMessage({ conversationId: target.id, role: "assistant", body: "needle last" });
+    const durations = [];
+    for (let index = 0; index < 3; index += 1) {
+      const started = performance.now();
+      assert.equal((await database.findMessagePage(target.id, "absent", null)).matchId, null);
+      durations.push(performance.now() - started);
+    }
+    assert.ok(durations.sort((a, b) => a - b)[1] < 35, `Sparse search blocked the runtime: ${durations.map((value) => value.toFixed(1)).join(", ")}ms`);
+    const pageStarted = performance.now();
+    assert.equal(database.listMessagePage(target.id, { beforeId: last.id, limit: 1 }).messages[0].id, first.id);
+    assert.ok(performance.now() - pageStarted < 35, "Sparse history pagination scanned sibling messages");
+    assert.equal((await database.findMessagePage(target.id, "needle", first.id)).matchId, last.id);
+    assert.equal((await database.findMessagePage(target.id, "needle", last.id)).matchId, first.id, "wrapped search crossed sibling history");
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("existing message rows gain indexed search order and new writes preserve it", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-search-migrate-"));
+  const filename = path.join(directory, "legacy.db");
+  const raw = new Database(filename);
+  try {
+    raw.exec(`CREATE TABLE conversations (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, worktree_path TEXT NOT NULL,
+      title TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', provider_session_id TEXT, tab_position INTEGER NOT NULL DEFAULT 0,
+      archived INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      role TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'text', body TEXT NOT NULL DEFAULT '', payload TEXT, created_at TEXT NOT NULL);
+      INSERT INTO conversations (id, project_id, worktree_id, worktree_path, title, provider, created_at, updated_at)
+        VALUES ('old-chat', 'p', 'w', '/tmp/w', 'Old', 'codex', '2026-09-26', '2026-09-26');
+      INSERT INTO messages (id, conversation_id, role, body, created_at) VALUES ('old-one', 'old-chat', 'user', 'needle', '2026-09-26');`);
+  } finally { raw.close(); }
+  const database = createOutrightDatabase({ filename });
+  try {
+    const newer = database.addMessage({ conversationId: "old-chat", role: "user", body: "needle again" });
+    assert.equal((await database.findMessagePage("old-chat", "needle", null)).matchId, "old-one");
+    assert.equal((await database.findMessagePage("old-chat", "needle", "old-one")).matchId, newer.id);
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("conversation find bounds concurrent scans and releases aborted work", async () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

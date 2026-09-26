@@ -84,6 +84,22 @@ test("authorization rechecks a positive snapshot after removal and recovers afte
   } finally { discovery.close(); }
 });
 
+test("a slow unrelated CLI cannot delay authorization of the requested provider", async () => {
+  let releaseSibling;
+  const discovery = createProviderDiscovery({ probe: (id) => id === "codex"
+    ? Promise.resolve("codex ready")
+    : new Promise((resolve) => { releaseSibling = resolve; }) });
+  try {
+    await Promise.resolve(); // Start background display discovery with both CLIs.
+    const result = await Promise.race([
+      discovery.available("codex"),
+      new Promise((resolve) => setTimeout(() => resolve("timed out"), 100)),
+    ]);
+    assert.equal(result, true);
+    assert.equal(discovery.list().find((entry) => entry.id === "claude").checking, true);
+  } finally { releaseSibling?.("claude ready"); discovery.close(); }
+});
+
 test("provider checks are bounded after shutdown and stale cache refreshes without blocking reads", async () => {
   let calls = 0;
   const discovery = createProviderDiscovery({ probe: async () => { calls += 1; return "v1"; }, refreshMs: 1 });
