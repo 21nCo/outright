@@ -7,7 +7,7 @@ const PROVIDERS = [
   { id: "claude", label: "Claude Code", models: ["sonnet", "opus", "haiku"] },
 ];
 
-export function createProviderDiscovery({ probe = defaultProbe, onChange = () => {}, refreshMs = 30_000 } = {}) {
+export function createProviderDiscovery({ probe = defaultProbe, onChange = () => {}, refreshMs = 30_000, schedule = setInterval, cancel = clearInterval } = {}) {
   let snapshot = PROVIDERS.map((provider) => ({ ...provider, available: false, version: "", checking: true }));
   const pending = new Map();
   const lastChecked = new Map();
@@ -48,7 +48,9 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
   // Discovery starts independently of HTTP requests. A failed probe remains a
   // normal unavailable result and is retried by the bounded timer.
   queueMicrotask(() => { if (!closed) refresh(); });
-  const timer = setInterval(() => { refresh(); }, refreshMs);
+  // The timer is a display deadline measured from startup. A probe that
+  // finishes just after a tick must not make the next tick skip discovery.
+  const timer = schedule(() => { refresh(true); }, refreshMs);
   timer.unref?.();
 
   return {
@@ -70,7 +72,7 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
       if (closed) return false;
       return probeProvider(id, true);
     },
-    close() { closed = true; clearInterval(timer); },
+    close() { closed = true; cancel(timer); },
   };
 }
 

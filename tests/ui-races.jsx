@@ -179,6 +179,58 @@ async function chatTabControlRegression() {
   await until(() => host.querySelector('#inspector-tab-terminal[aria-selected="true"]'), "left arrow selects terminal inspector tab");
 }
 
+async function sameWorktreeChatSelectionRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (id, body) => ({ id, role: "user", kind: "text", body, createdAt: "2026-09-24T00:00:00Z" });
+  const first = { ...chats.A, messages: [message("message-A", "First chat content")] };
+  const second = { ...chats.A, id: "chat-A2", title: "Second chat", provider: "claude", messages: [message("message-A2", "Second chat content")] };
+  const created = { ...chats.A, id: "chat-A3", title: "Created chat", messages: [message("message-A3", "Created chat content")] };
+  const heldSecond = deferred();
+  const heldCreated = deferred();
+  let list = [first, second];
+  let secondRequests = 0;
+  const runs = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: list });
+    if (url.pathname === "/api/conversations/chat-A") return response(first);
+    if (url.pathname === "/api/conversations/chat-A2") return ++secondRequests === 1 ? heldSecond.promise : response(second);
+    if (url.pathname === "/api/conversations/chat-A3") return heldCreated.promise;
+    if (url.pathname.endsWith("/runs")) { runs.push({ path: url.pathname, body: JSON.parse(options.body) }); return response({ id: "run", status: "queued" }, 202); }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.message-text')?.textContent.includes("First chat content"), "first chat loaded");
+  setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "Only second chat may send");
+  host.querySelector('#chat-tab-chat-A2').click();
+  await until(() => host.querySelector('#chat-tab-chat-A2[aria-selected="true"]'), "second chat tab selected");
+  assert(!host.querySelector('.conversation-header h1')?.textContent.includes(first.title), "Old header stayed under second tab");
+  assert(!host.querySelector('.message-text')?.textContent.includes("First chat content"), "Old transcript stayed under second tab");
+  assert(host.querySelector('textarea[aria-label="Message the agent"]')?.disabled, "Composer stayed enabled before second detail loaded");
+  host.querySelector('.composer').requestSubmit();
+  assert(runs.length === 0, "Pending second chat submitted through first chat");
+  heldSecond.resolve(response(second));
+  await until(() => host.querySelector('.conversation-header h1')?.textContent === second.title && host.querySelector('.message-text')?.textContent.includes("Second chat content"), "second chat detail loaded");
+  assert(!host.querySelector('[aria-label="Send message"]')?.disabled, "Second chat composer did not become ready");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => runs.length === 1, "second chat send");
+  assert(runs[0].path === "/api/conversations/chat-A2/runs" && runs[0].body.provider === "claude", "Send used the prior chat owner");
+  const secondTab = host.querySelector('#chat-tab-chat-A2');
+  secondTab.focus();
+  secondTab.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true }));
+  await until(() => host.querySelector('#chat-tab-chat-A[aria-selected="true"]') && host.querySelector('.message-text')?.textContent.includes("First chat content"), "keyboard returned to first detail");
+  assert(!host.querySelector('.message-text')?.textContent.includes("Second chat content"), "Keyboard selection retained second transcript");
+  list = [first, second, created];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "conversation.created", conversationId: created.id }) }));
+  await until(() => host.querySelector('#chat-tab-chat-A3[aria-selected="true"]'), "created chat selected from list");
+  assert(!host.querySelector('.message-text')?.textContent.includes("First chat content"), "Created chat tab showed prior transcript");
+  assert(host.querySelector('textarea[aria-label="Message the agent"]')?.disabled, "Created chat composer enabled before detail");
+  heldCreated.resolve(response(created));
+  await until(() => host.querySelector('.conversation-header h1')?.textContent === created.title && host.querySelector('.message-text')?.textContent.includes("Created chat content"), "created chat detail loaded");
+}
+
 async function chatSettingsArchiveRegression() {
   root.render(null);
   await settle();
@@ -2723,6 +2775,7 @@ try {
     ["current conversation send", () => chatRace(false, false), "sending in the current conversation shows its run"],
     ["delayed send", () => chatRace(false), "delayed send cannot attach A's run to B"],
     ["delayed trust response", () => chatRace(true), "delayed trust response cannot target another conversation"],
+    ["same-worktree chat selection", sameWorktreeChatSelectionRegression, "click, keyboard and created-chat selection load only the selected detail and fence sends"],
     ["chat tab controls", chatTabControlRegression, "chat tab navigation ignores nested archive controls"],
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
     ["archived chat ownership", archivedChatOwnershipRegression, "an archived chat cannot keep a pane or accept runs during held or failed refresh"],

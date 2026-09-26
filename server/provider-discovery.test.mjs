@@ -116,3 +116,41 @@ test("provider checks are bounded after shutdown and stale cache refreshes witho
   await discovery.refresh(true);
   assert.equal(calls, closedCalls);
 });
+
+test("the periodic display tick observes install and removal after a slow initial probe", async () => {
+  let tick;
+  let cancelled = false;
+  let releaseInitial;
+  let installed = false;
+  const calls = [];
+  const discovery = createProviderDiscovery({
+    refreshMs: 30_000,
+    schedule(callback, delay) { assert.equal(delay, 30_000); tick = callback; return 1; },
+    cancel(timer) { assert.equal(timer, 1); cancelled = true; },
+    probe: async (id) => {
+      calls.push(id);
+      if (id !== "codex") throw new Error("missing");
+      if (calls.filter((item) => item === id).length === 1) await new Promise((resolve) => { releaseInitial = resolve; });
+      if (!installed) throw new Error("missing");
+      return "codex ready";
+    },
+  });
+  try {
+    await Promise.resolve();
+    tick(); // A scheduled tick while the initial probe is still running shares it.
+    installed = true;
+    releaseInitial();
+    await discovery.refresh();
+    assert.equal(discovery.list()[0].available, true);
+    installed = false;
+    tick();
+    await discovery.refresh();
+    assert.equal(discovery.list()[0].available, false, "removal must appear on the first post-probe tick");
+    installed = true;
+    tick();
+    await discovery.refresh();
+    assert.equal(discovery.list()[0].available, true, "installation must appear on the next tick");
+    assert.equal(calls.filter((item) => item === "codex").length, 3);
+  } finally { discovery.close(); }
+  assert.equal(cancelled, true);
+});
