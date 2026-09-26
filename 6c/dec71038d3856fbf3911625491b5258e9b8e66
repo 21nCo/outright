@@ -1,0 +1,19 @@
+docs/out-32-performance.md
+  s_062481a62a0416::t_515c8c8686c4ea 7-9,14-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6cdec71038d3856fbf3911625491b5258e9b8e66",
+  "prompts": {},
+  "sessions": {
+    "s_062481a62a0416": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0dc9c-5fbe-7c31-a014-ff5ecc64716b",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
