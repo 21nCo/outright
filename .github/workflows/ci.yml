@@ -26,5 +26,19 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+        if: runner.os != 'macOS'
+      - name: Run npm test
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          trap 'printf "CI npm test shell received SIGTERM: shell=%s parent=%s\n" "$$" "$PPID"; ps -o pid,ppid,pgid,stat,command -p "$$" -p "$PPID" || true' TERM
+          set +e
+          npm test
+          result=$?
+          if [[ "$result" -ne 0 ]]; then
+            printf 'CI npm test exited: status=%s shell=%s parent=%s\n' "$result" "$$" "$PPID"
+            ps -o pid,ppid,pgid,stat,command -p "$$" -p "$PPID" || true
+          fi
+          exit "$result"
       - run: npm run build
       - run: npm run test:sites

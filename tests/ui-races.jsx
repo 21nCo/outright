@@ -2346,7 +2346,12 @@ async function forwardPageEvictionAnchorRegression() {
         "The first surviving row was mounted outside the reading viewport");
     } else {
       await until(() => host.querySelector(`[data-message-id="${anchorId}"]`), `retained forward anchor ${anchorId}; scroll=${viewport.scrollTop}/${viewport.scrollHeight}; rows=${[...viewport.querySelectorAll('[data-message-id]')].map((element) => element.dataset.messageId).join(',')}`);
-      await until(() => Math.abs(host.querySelector(`[data-message-id="${anchorId}"]`)?.getBoundingClientRect().top - top) < 12, "retained forward anchor settled");
+      try { await until(() => Math.abs(host.querySelector(`[data-message-id="${anchorId}"]`)?.getBoundingClientRect().top - top) < 12, "retained forward anchor settled"); }
+      catch (error) {
+        const rows = [...viewport.querySelectorAll('[data-message-id]')];
+        const anchor = rows.find((element) => element.dataset.messageId === anchorId);
+        throw new Error(`${error.message}; anchor=${anchorId} top=${top}/${anchor?.getBoundingClientRect().top}; scroll=${viewport.scrollTop}/${viewport.scrollHeight}; mounted=${rows[0]?.dataset.messageId}..${rows.at(-1)?.dataset.messageId}; heights=${rows.map((element) => Math.round(element.getBoundingClientRect().height)).join(',')}`);
+      }
       const delta = Math.abs(host.querySelector(`[data-message-id="${anchorId}"]`).getBoundingClientRect().top - top);
       assert(delta < 12, `Forward page moved a retained reading anchor by ${Math.round(delta)}px`);
     }
@@ -2553,6 +2558,71 @@ async function checkpointReadingPageRegression() {
   host.querySelector('.history-return').click();
   await until(() => !host.querySelector('.history-return') && host.querySelector('[data-message-id="checkpoint-999"]')?.textContent.includes("Bounded end"), "latest page after older live output");
   assert(!host.querySelector('.history-live-tail'), "Returning to latest retained a duplicate live tail");
+}
+
+async function consecutiveRunLivePreviewRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const older = [{ id: "old-0", role: "assistant", kind: "text", body: "Old reading row", createdAt: new Date(0).toISOString() }];
+  const latest = [{ id: "latest-1", role: "assistant", kind: "text", body: "A checkpoint", payload: { runId: "run-A", checkpointEventSeq: 1 }, createdAt: new Date(1000).toISOString() }];
+  let runBStarted = false;
+  const runBResponse = deferred();
+  let detailReads = 0;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A/messages/find") return response({ matchId: "old-0", messages: older, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 1, total: 2, beforeId: "old-0" } });
+    if (url.pathname === "/api/conversations/chat-A/runs" && options?.method === "POST") { runBStarted = true; return runBResponse.promise; }
+    if (url.pathname === "/api/conversations/chat-A") {
+      detailReads += 1;
+      return response({ ...chats.A, runs: runBStarted ? [{ id: "run-B", status: "running" }, { id: "run-A", status: "completed" }] : [{ id: "run-A", status: detailReads === 1 ? "running" : "completed" }], messages: latest,
+        messagePage: { hasMore: true, olderCount: 1, hasLater: false, newerCount: 0, total: 2, beforeId: "latest-1" } });
+    }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[data-message-id="latest-1"]'), "first run loaded");
+  const find = host.querySelector('.history-find input');
+  setControlValue(find, "Old reading row"); await settle();
+  find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-message-id="old-0"]') && host.querySelector('.history-return'), "older page selected");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: latest[0] }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("A checkpoint"), "first run preview visible");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-A", payload: { type: "run.completed" } }) }));
+  await until(() => detailReads >= 2, "completed run detail refreshed");
+  await until(() => host.querySelector('.history-live-tail strong')?.textContent === "Recent output", "completed run preview relabeled");
+  const input = host.querySelector('textarea[aria-label="Message the agent"]');
+  setControlValue(input, "Start B");
+  await until(() => host.querySelector('[aria-label="Send message"]')?.disabled === false, "second run send available");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => runBStarted, "second run POST pending");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-B", payload: { type: "assistant.delta", seq: 1, payload: { text: "B first delta" } } }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("B first delta"), "second run early delta visible");
+  assert(!host.querySelector('.history-live-tail').textContent.includes("A checkpoint"), "Previous run checkpoint was mixed with B's first delta");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: { id: "latest-2", role: "assistant", kind: "text", body: "B checkpoint", payload: { runId: "run-B", checkpointEventSeq: 2 }, createdAt: new Date(2000).toISOString() } }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("B checkpoint"), "second run checkpoint visible before POST response");
+  runBResponse.resolve(response({ id: "run-B", conversationId: "chat-A", status: "running" }));
+  await until(() => host.querySelector('[aria-label="Stop active agent run"]'), "second run accepted");
+  assert(host.querySelector('.history-live-tail')?.textContent.includes("B checkpoint"), "Accepted run discarded its already visible checkpoint");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-B", payload: { type: "assistant.delta", seq: 3, payload: { text: " after checkpoint" } } }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("B checkpoint after checkpoint"), "accepted run retains its checkpoint and later delta");
+  assert(!host.querySelector('.history-live-tail').textContent.includes("A checkpoint"), "Previous run checkpoint returned after B checkpoint");
+  if (window.__fixtureSetViewport) {
+    await window.__fixtureSetViewport(390);
+    await settle();
+    const previewWidth = host.querySelector('.history-live-tail').getBoundingClientRect().width;
+    const messageWidth = host.querySelector('.message-column').getBoundingClientRect().width;
+    assert(Math.abs(previewWidth - messageWidth) < 2, `Narrow live preview width ${previewWidth} differs from message width ${messageWidth}`);
+    await window.__fixtureSetViewport(1280);
+  }
+  host.querySelector('.history-return').click();
+  await until(() => !host.querySelector('.history-return'), "second run latest page restored");
+  const repeatFind = host.querySelector('.history-find input');
+  setControlValue(repeatFind, "Old reading row"); await settle();
+  repeatFind.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-message-id="old-0"]') && host.querySelector('.history-return'), "second run older page restored");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: { id: "latest-2", role: "assistant", kind: "text", body: "B resumed checkpoint", payload: { runId: "run-B", checkpointEventSeq: 4 }, createdAt: new Date(2000).toISOString() } }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("B resumed checkpoint"), "accepted run checkpoint survives Return and Find");
 }
 
 async function replayKeepsLatestPageBoundaryRegression() {
@@ -3191,10 +3261,11 @@ async function archivePagingLoadingRegression() {
       const messages = [{ id: "page-50", role: "assistant", kind: "text", body: "Reading page", createdAt: new Date(0).toISOString() }];
       const held = deferred();
       let pageStarted = false;
+      let archived = false;
       route = async (url, options) => {
         if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
-        if (url.pathname === "/api/conversations") return response({ conversations: [chats.A, sibling] });
-        if (url.pathname === "/api/conversations/chat-A" && options?.method === "PATCH") return response({ ...chats.A, archived: true });
+        if (url.pathname === "/api/conversations") return response({ conversations: archived ? [sibling] : [chats.A, sibling] });
+        if (url.pathname === "/api/conversations/chat-A" && options?.method === "PATCH") { archived = true; return response({ ...chats.A, archived: true }); }
         if (url.pathname === "/api/conversations/chat-A/messages") { pageStarted = true; return held.promise; }
         if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages, messagePage: page });
         if (url.pathname === "/api/conversations/chat-B") return response({ ...sibling, messages, messagePage: page });
@@ -3206,6 +3277,7 @@ async function archivePagingLoadingRegression() {
       await until(() => pageStarted, "old page request pending");
       host.querySelector('.chat-tab.is-active .tab-close').click();
       await until(() => host.querySelector('.chat-tab.is-active')?.textContent.includes("Conversation B") && host.querySelector('.history-later'), "sibling selected after archive");
+      assert(archived && !host.querySelector('#chat-tab-chat-A'), "Archived A reappeared after the post-PATCH list refresh");
       assert(!host.querySelector('.history-loader').disabled && !host.querySelector('.history-later').disabled,
         `Archiving during ${direction} left sibling paging disabled`);
       held.resolve(failed ? response({ error: "Old page failed" }, 503) : response({ messages, messagePage: page }));
@@ -3278,6 +3350,7 @@ try {
     ["dialog private list failure", () => dialogCreateSuccessorRegression(false, true), "dialog creation reports a current list failure once and retains retry"],
     ["inline archive sibling focus", () => inlineArchiveFocusRegression(false, false), "inline archive focuses the selected sibling tab"],
     ["archive paging ownership", archivePagingLoadingRegression, "archiving releases pending earlier and later loading through stale success and failure"],
+    ["consecutive run live preview", consecutiveRunLivePreviewRegression, "a new run owns off-page deltas and checkpoints after completion"],
     ["inline archive nonselected focus", () => inlineArchiveFocusRegression(false, false, true), "inline archive of an inactive tab focuses the still-selected tab"],
     ["inline archive last-tab focus", () => inlineArchiveFocusRegression(true, false), "inline archive focuses New chat after the final tab"],
     ["inline archive newer focus", () => inlineArchiveFocusRegression(false, true), "inline archive preserves a newer focus choice"],
