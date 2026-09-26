@@ -1,0 +1,30 @@
+docs/out-32-performance.md
+  h_a39f9495f9ec1d 7,9,12,14
+server/database.mjs
+  h_a39f9495f9ec1d 178,180-181,183-184,188,200,205-208,227-230,232-233,531-532,551-561
+server/database.test.mjs
+  h_a39f9495f9ec1d 98-148
+server/provider-discovery.mjs
+  h_a39f9495f9ec1d 12-13,16-22,24-25,27,30-33,36-45,62,64-65
+server/provider-discovery.test.mjs
+  h_a39f9495f9ec1d 87-102
+src/App.jsx
+  h_a39f9495f9ec1d 314-327,1016-1017
+src/components/WindowedMessages.jsx
+  h_a39f9495f9ec1d 7,158-159,204-207,209
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 1662-1664,1821-1822,1832,1909-1953,2468
+tests/ui-races.test.mjs
+  h_a39f9495f9ec1d 785,787-791,821,824-825
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2e016c258f3cb7a61eba2c7b7e0638b986a18646",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
