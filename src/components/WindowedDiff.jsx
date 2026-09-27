@@ -7,8 +7,11 @@ const OVERSCAN = 40;
 const MAX_TRACK_HEIGHT = 8_000_000;
 
 function lineOffsets(diff) {
-  const starts = [0];
-  for (let index = 0; index < diff.length; index += 1) if (diff.charCodeAt(index) === 10 && index + 1 < diff.length) starts.push(index + 1);
+  let count = 1;
+  for (let index = 0; index + 1 < diff.length; index += 1) if (diff.charCodeAt(index) === 10) count += 1;
+  const starts = new Uint32Array(count);
+  let next = 1;
+  for (let index = 0; index + 1 < diff.length; index += 1) if (diff.charCodeAt(index) === 10) starts[next++] = index + 1;
   return starts;
 }
 

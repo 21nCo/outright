@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { windowRange } from "@/lib/windowing";
+import { scheduleLayoutTick, windowRange } from "@/lib/windowing";
 
 export const ESTIMATED_MESSAGE_HEIGHT = 110;
 const FULL_RENDER_LIMIT = 80;
@@ -11,7 +11,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
   messagesRef.current = messages;
   const rangeRef = useRef({ start: 0, end: Math.min(messages.length, FULL_RENDER_LIMIT), top: 0, bottom: Math.max(0, messages.length - FULL_RENDER_LIMIT) * ESTIMATED_MESSAGE_HEIGHT });
   const [range, setRange] = useState(rangeRef.current);
-  const rangeFrameRef = useRef(0);
+  const rangeFrameRef = useRef(null);
   const [needle, setNeedle] = useState("");
   const [foundId, setFoundId] = useState(null);
   const foundIndex = foundId ? messages.findIndex((message) => message.id === foundId) : -1;
@@ -72,6 +72,15 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     setSearched(true);
   }
 
+  const commitRange = useCallback(() => {
+    rangeFrameRef.current = null;
+    setRange(rangeRef.current);
+  }, []);
+  const scheduleRange = useCallback(() => {
+    if (rangeFrameRef.current) return;
+    rangeFrameRef.current = scheduleLayoutTick(commitRange);
+  }, [commitRange]);
+
   const update = useCallback(() => {
     const viewport = viewportRef.current;
     const list = listRef.current;
@@ -101,14 +110,15 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     const prior = rangeRef.current;
     if (prior.start !== next.start || prior.end !== next.end || prior.top !== next.top || prior.bottom !== next.bottom) {
       rangeRef.current = next;
-      if (!rangeFrameRef.current) rangeFrameRef.current = window.requestAnimationFrame(() => {
-        rangeFrameRef.current = 0;
-        setRange(rangeRef.current);
-      });
+      scheduleRange();
     }
-  }, [messages, viewportRef, foundId]);
+  }, [messages, viewportRef, foundId, scheduleRange]);
 
-  useEffect(() => () => window.cancelAnimationFrame(rangeFrameRef.current), []);
+  useEffect(() => () => { rangeFrameRef.current?.(); rangeFrameRef.current = null; }, []);
+
+  useLayoutEffect(() => {
+    viewportRef.current?.dispatchEvent(new Event("windowed-range-change"));
+  }, [range, viewportRef]);
 
   useLayoutEffect(() => {
     ++searchGenerationRef.current;
@@ -124,14 +134,14 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     if (!foundId) return;
     const index = messages.findIndex((message) => message.id === foundId);
     if (index >= 0) return;
-    const frame = window.requestAnimationFrame(() => {
+    const cancelTick = scheduleLayoutTick(() => {
       if (messagesRef.current.some((message) => message.id === foundId)) return;
       if (pendingFoundRef.current === foundId) pendingFoundRef.current = null;
       visibleFindAnchorRef.current = false;
       setFoundId(null);
       setSearched(false);
     });
-    return () => window.cancelAnimationFrame(frame);
+    return cancelTick;
   }, [messages, foundId]);
 
   useLayoutEffect(() => {
@@ -142,13 +152,13 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     const viewport = viewportRef.current;
     const list = listRef.current;
     if (!viewport || !list) return;
-    let frame;
+    let cancelTick = () => {};
     let settled = 0;
     const align = () => {
       if (pendingFoundRef.current !== foundId) return;
       if (++alignmentFramesRef.current > 16) { pendingFoundRef.current = null; visibleFindAnchorRef.current = false; return; }
       const row = [...list.querySelectorAll("[data-window-id]")].find((element) => element.dataset.windowId === foundId);
-      if (!row) { update(); frame = window.requestAnimationFrame(align); return; }
+      if (!row) { update(); cancelTick = scheduleLayoutTick(align); return; }
       const delta = row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - viewport.clientHeight / 3;
       if (Math.abs(delta) > 2) {
         const before = viewport.scrollTop;
@@ -157,12 +167,12 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
         settled = 0; update();
       }
       else settled += 1;
-      if (settled < 2) frame = window.requestAnimationFrame(align);
+      if (settled < 2) cancelTick = scheduleLayoutTick(align);
       else { pendingFoundRef.current = null; visibleFindAnchorRef.current = true; }
     };
     update();
-    frame = window.requestAnimationFrame(align);
-    return () => window.cancelAnimationFrame(frame);
+    cancelTick = scheduleLayoutTick(align);
+    return () => cancelTick();
   }, [foundId, findRequest, messages, range.start, range.end, viewportRef, update]);
 
   useLayoutEffect(() => { update(); }, [update]);
@@ -172,8 +182,10 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     for (const id of heightsRef.current.keys()) if (!ids.has(id)) heightsRef.current.delete(id);
     const viewport = viewportRef.current;
     if (!viewport) return;
-    let frame = 0;
-    const schedule = () => { if (!frame) frame = window.setTimeout(() => { frame = 0; update(); }, 16); };
+    let cancelUpdate = null;
+    const schedule = () => {
+      if (!cancelUpdate) cancelUpdate = scheduleLayoutTick(() => { cancelUpdate = null; update(); });
+    };
     viewport.addEventListener("scroll", schedule, { passive: true });
     let lastHeight = viewport.clientHeight;
     let lastWidth = viewport.clientWidth;
@@ -193,7 +205,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     });
     resize.observe(viewport);
     update();
-    return () => { viewport.removeEventListener("scroll", schedule); resize.disconnect(); clearTimeout(frame); };
+    return () => { viewport.removeEventListener("scroll", schedule); resize.disconnect(); cancelUpdate?.(); };
   }, [messages, update, viewportRef, foundId]);
 
   useEffect(() => {

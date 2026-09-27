@@ -26,9 +26,18 @@ import { SettingsDialog } from "@/components/SettingsDialog";
 import { TerminalPane } from "@/components/TerminalPane";
 import { domId, nextTabIndex } from "@/lib/accessibility";
 import { api, connectRuntime, query } from "@/lib/runtime-api";
+import { scheduleLayoutTick } from "@/lib/windowing";
 import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, messagePrecedesPage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "@/recovery-policy";
 
 const MAX_RENDERED_MESSAGES = 1000;
+function moveMessageViewport(viewport, top) {
+  if (!viewport) return;
+  const previous = viewport.scrollTop;
+  viewport.scrollTop = top;
+  // Hidden browsers may defer native scroll events. The virtualizer still
+  // needs the new position when an explicit page or anchor move commits.
+  if (Math.abs(viewport.scrollTop - previous) > 0.5) viewport.dispatchEvent(new Event("scroll"));
+}
 const ACTIVE_RUN_STATUSES = new Set(["queued", "launching", "running"]);
 function activeCursorOwners(conversation) {
   return new Set((conversation?.runs ?? []).filter((run) => ACTIVE_RUN_STATUSES.has(run.status)).map((run) => run.id));
@@ -131,17 +140,17 @@ export function App() {
   const applyStreamingText = useCallback((change, immediate = false) => {
     streamingTextRef.current = change(streamingTextRef.current);
     if (immediate) {
-      clearTimeout(streamingFlushRef.current);
+      streamingFlushRef.current?.();
       streamingFlushRef.current = null;
       setStreamingText(streamingTextRef.current);
     } else if (!streamingFlushRef.current) {
-      streamingFlushRef.current = window.setTimeout(() => {
+      streamingFlushRef.current = scheduleLayoutTick(() => {
         streamingFlushRef.current = null;
         setStreamingText(streamingTextRef.current);
-      }, 32);
+      });
     }
   }, []);
-  useEffect(() => () => clearTimeout(streamingFlushRef.current), []);
+  useEffect(() => () => streamingFlushRef.current?.(), []);
 
   function stageConversations(next) {
     conversationsRef.current = next;
@@ -499,9 +508,9 @@ export function App() {
         ? LIVE_OMITTED_PREFIX : ""}${replayed.streamingText}`), true);
       else if (!preserveReading) applyStreamingText(() => "", true);
       setRunEvents(replayed.runEvents);
-      if (!preserveReading) window.requestAnimationFrame(() => {
+      if (!preserveReading) scheduleLayoutTick(() => {
         const viewport = messageViewportRef.current;
-        if (viewport) viewport.scrollTop = viewport.scrollHeight;
+        if (viewport && selectedConversationRef.current === requestedId && stickToBottomRef.current) moveMessageViewport(viewport, viewport.scrollHeight);
       });
     }
     catch (nextError) {
@@ -566,7 +575,7 @@ export function App() {
       if (atLatestBottom && !pendingPrependScrollRef.current) {
         stickToBottomRef.current = true;
         pendingLiveScrollRef.current = null;
-      } else if (!olderThanPage && !stickToBottomRef.current && !pendingPrependScrollRef.current && viewport) {
+      } else if (!displayed?.messagePage?.hasLater && !olderThanPage && !stickToBottomRef.current && !pendingPrependScrollRef.current && viewport) {
         pendingLiveScrollRef.current = { conversationId: event.conversationId, top: viewport.scrollTop };
       }
       if (!displayed || olderThanPage || displayed.messagePage?.hasLater
@@ -661,7 +670,7 @@ export function App() {
       if (["run.completed", "run.failed", "run.stopped"].includes(runEvent.type)) {
         if (acceptedPreviewRunRef.current === event.runId) acceptedPreviewRunRef.current = null;
         if (liveDeltaEventsRef.current.runId === event.runId) liveDeltaEventsRef.current = emptyLiveDeltaEvents();
-        window.setTimeout(() => loadConversation({ preservePage: true }), 80);
+        scheduleLayoutTick(() => loadConversation({ preservePage: true }));
         if (document.hidden && settings.notifications && Notification.permission === "granted") new Notification(`Outright run ${runEvent.type.split(".")[1]}`, { body: conversation?.title ?? "Agent run" });
       }
     }
@@ -689,7 +698,7 @@ export function App() {
         inspectorInvokerRef.current = document.querySelector('[aria-label="Terminal"]');
         setInspector("terminal");
       }
-      if (event.key === "Escape" && !document.querySelector('[role="dialog"]:not(#project-sidebar)')) {
+      if (event.key === "Escape" && !document.querySelector('[role="dialog"][data-open]:not(#project-sidebar)')) {
         if (isNarrow && sidebarOpen) closeSidebar();
         else if (inspector && !event.target.closest?.(".terminal-host")
           && (inspectorRef.current?.contains(event.target) || event.target.closest?.(".composer") || event.target === inspectorInvokerRef.current)) closeInspector();
@@ -759,8 +768,8 @@ export function App() {
   useLayoutEffect(() => {
     const intent = sidebarFocusIntentRef.current;
     if (!intent || (intent === "opener" && sidebarOpen) || (intent === "sidebar" && !sidebarOpen)) return;
-    let frame;
-    const deadline = performance.now() + 500;
+    let cancelRetry = () => {};
+    const deadline = performance.now() + 3_000;
     const transfer = () => {
       if (sidebarFocusIntentRef.current !== intent) return;
       const target = intent === "opener" ? document.querySelector('[aria-label="Open projects sidebar"]')
@@ -783,10 +792,22 @@ export function App() {
           return;
         }
       }
-      if (performance.now() < deadline) frame = requestAnimationFrame(transfer);
+      if (performance.now() < deadline) {
+        let pending = true;
+        let frame;
+        let timer;
+        const retry = () => {
+          if (!pending) return;
+          cancelRetry();
+          transfer();
+        };
+        frame = requestAnimationFrame(retry);
+        timer = window.setTimeout(retry, 100);
+        cancelRetry = () => { pending = false; cancelAnimationFrame(frame); clearTimeout(timer); };
+      }
     };
     transfer();
-    return () => cancelAnimationFrame(frame);
+    return () => cancelRetry();
   }, [isNarrow, sidebarOpen]);
   useLayoutEffect(() => {
     if (!inspector) return;
@@ -823,28 +844,50 @@ export function App() {
     if (!viewport) return;
     if (conversation?.messagePage?.hasLater) stickToBottomRef.current = false;
     let lastScrollTop = viewport.scrollTop;
+    let lastMaximum = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    let growingFrom = null;
+    let growingUntil = 0;
     const updateStickiness = () => {
       const top = viewport.scrollTop;
+      const maximum = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+      const now = performance.now();
+      if (maximum > lastMaximum + 1) {
+        growingFrom = now > growingUntil ? lastMaximum : Math.min(growingFrom ?? lastMaximum, lastMaximum);
+        growingUntil = now + 750;
+      }
       if (!pendingPrependScrollRef.current) {
         if (conversationRef.current?.messagePage?.hasLater) stickToBottomRef.current = false;
-        else if (viewport.scrollHeight - viewport.clientHeight - top < 96) stickToBottomRef.current = true;
+        // A virtual row can be measured between a scroll-to-end and this
+        // event. The previous end is still the reader's destination even if
+        // the new spacer makes the current end much farther away.
+        else if (maximum - top < 96
+          || (now < growingUntil && growingFrom !== null && Math.abs(growingFrom - top) < 96)
+          || (top > lastScrollTop + 1 && lastMaximum - top < 96)) stickToBottomRef.current = true;
         else if (top < lastScrollTop - 1) stickToBottomRef.current = false;
       }
       lastScrollTop = top;
+      lastMaximum = maximum;
     };
     viewport.addEventListener("scroll", updateStickiness, { passive: true });
-    const resize = new ResizeObserver(() => {
-      if (stickToBottomRef.current && !pendingPrependScrollRef.current && !conversationRef.current?.messagePage?.hasLater) viewport.scrollTop = viewport.scrollHeight;
-    });
+    const followLatest = () => {
+      if (stickToBottomRef.current && !pendingPrependScrollRef.current && !conversationRef.current?.messagePage?.hasLater) {
+        if (viewport.scrollTop < lastScrollTop - 1) { stickToBottomRef.current = false; return; }
+        moveMessageViewport(viewport, viewport.scrollHeight);
+        lastMaximum = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+      }
+    };
+    const resize = new ResizeObserver(followLatest);
     const column = viewport.querySelector(".message-column");
     if (column) resize.observe(column);
-    return () => { viewport.removeEventListener("scroll", updateStickiness); resize.disconnect(); };
+    viewport.addEventListener("windowed-range-change", followLatest);
+    followLatest();
+    return () => { viewport.removeEventListener("scroll", updateStickiness); viewport.removeEventListener("windowed-range-change", followLatest); resize.disconnect(); };
   }, [conversation?.id, conversation?.messagePage?.hasLater]);
   useLayoutEffect(() => {
     const pending = pendingLiveScrollRef.current;
     if (!pending || pending.conversationId !== conversation?.id) return;
     pendingLiveScrollRef.current = null;
-    if (messageViewportRef.current) messageViewportRef.current.scrollTop = pending.top;
+    if (messageViewportRef.current) moveMessageViewport(messageViewportRef.current, pending.top);
   }, [conversation]);
   useLayoutEffect(() => {
     const pending = pendingPrependScrollRef.current;
@@ -852,13 +895,13 @@ export function App() {
     if (!pending || !viewport || pending.conversationId !== conversation?.id || pending.generation !== historyGenerationRef.current) return;
     const restoreAnchor = () => {
       const anchor = [...viewport.querySelectorAll("[data-message-id]")].find((element) => element.dataset.messageId === pending.messageId);
-      if (anchor && pending.top !== undefined) viewport.scrollTop += anchor.getBoundingClientRect().top - pending.top;
+      if (anchor && pending.top !== undefined) moveMessageViewport(viewport, viewport.scrollTop + anchor.getBoundingClientRect().top - pending.top);
       else if (!pending.restoredFallback) {
         // Recenter the virtualizer on the retained row's new index. Subtracting
         // estimated heights from the old scroll offset can miss a row when the
         // removed messages had variable measured heights.
-        if (pending.fallbackIndex !== undefined) viewport.scrollTop = pending.fallbackIndex * ESTIMATED_MESSAGE_HEIGHT;
-        else viewport.scrollTop += (pending.prependedCount ?? 0) * ESTIMATED_MESSAGE_HEIGHT;
+        if (pending.fallbackIndex !== undefined) moveMessageViewport(viewport, pending.fallbackIndex * ESTIMATED_MESSAGE_HEIGHT);
+        else moveMessageViewport(viewport, viewport.scrollTop + (pending.prependedCount ?? 0) * ESTIMATED_MESSAGE_HEIGHT);
         pending.restoredFallback = true;
       }
     };
@@ -867,10 +910,10 @@ export function App() {
     let framesElapsed = 0;
     let stableFrames = 0;
     let previousTop = null;
-    let frame;
+    let cancelTick = () => {};
     const cancelForUserScroll = () => {
       if (pendingPrependScrollRef.current === pending) pendingPrependScrollRef.current = null;
-      window.cancelAnimationFrame(frame);
+      cancelTick();
     };
     const scrollbar = viewport.parentElement?.querySelector('[data-slot="scroll-area-scrollbar"]');
     viewport.addEventListener("pointerdown", cancelForUserScroll, { passive: true });
@@ -887,12 +930,12 @@ export function App() {
         ? stableFrames + 1 : 0;
       previousTop = top;
       framesElapsed += 1;
-      if (--framesRemaining > 0 && (framesElapsed < 12 || stableFrames < 3)) frame = window.requestAnimationFrame(keepAnchor);
+      if (--framesRemaining > 0 && (framesElapsed < 12 || stableFrames < 3)) cancelTick = scheduleLayoutTick(keepAnchor);
       else if (pendingPrependScrollRef.current === pending) pendingPrependScrollRef.current = null;
     };
-    frame = window.requestAnimationFrame(keepAnchor);
+    cancelTick = scheduleLayoutTick(keepAnchor);
     return () => {
-      window.cancelAnimationFrame(frame);
+      cancelTick();
       viewport.removeEventListener("pointerdown", cancelForUserScroll);
       scrollbar?.removeEventListener("pointerdown", cancelForUserScroll);
       viewport.removeEventListener("wheel", cancelForUserScroll);
@@ -902,11 +945,19 @@ export function App() {
   }, [conversation?.messages[0]?.id]);
   useEffect(() => {
     if (!stickToBottomRef.current || pendingPrependScrollRef.current || conversation?.messagePage?.hasLater) return;
-    window.requestAnimationFrame(() => {
+    scheduleLayoutTick(() => {
       const viewport = messageViewportRef.current;
-      if (viewport && stickToBottomRef.current && !pendingPrependScrollRef.current) viewport.scrollTop = viewport.scrollHeight;
+      if (viewport && stickToBottomRef.current && !pendingPrependScrollRef.current) moveMessageViewport(viewport, viewport.scrollHeight);
     });
   }, [conversation?.messages.at(-1)?.id, conversation?.messagePage?.hasLater, streamingText]);
+
+  function handleMessageViewportKeyDown(event) {
+    if (event.target !== event.currentTarget || event.key !== "End" || conversation?.messagePage?.hasLater) return;
+    const viewport = event.currentTarget;
+    stickToBottomRef.current = true;
+    pendingLiveScrollRef.current = null;
+    scheduleLayoutTick(() => { if (stickToBottomRef.current && viewport.isConnected) moveMessageViewport(viewport, viewport.scrollHeight); });
+  }
 
   const activeRun = conversation?.runs?.find((run) => ["queued", "launching", "running"].includes(run.status));
   const readingLiveText = conversation?.messagePage?.hasLater
@@ -1399,7 +1450,7 @@ export function App() {
       <div className="work-area">
         <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
           <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} onManage={openManageChat} />
-          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages" }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? <WindowedMessages key={conversation.id} messages={conversation.messages} messagePage={conversation.messagePage} viewportRef={messageViewportRef} renderMessage={(message) => <Message message={message} />} onFind={findConversationMessage} onCancelFind={() => { pendingFindRef.current?.abort(); pendingFindRef.current = null; findProgressRef.current = null; }} resetFindGeneration={findResetGeneration} /> : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{!conversation?.messagePage?.hasLater && activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}</div></ScrollArea>
+          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? <WindowedMessages key={conversation.id} messages={conversation.messages} messagePage={conversation.messagePage} viewportRef={messageViewportRef} renderMessage={(message) => <Message message={message} />} onFind={findConversationMessage} onCancelFind={() => { pendingFindRef.current?.abort(); pendingFindRef.current = null; findProgressRef.current = null; }} resetFindGeneration={findResetGeneration} /> : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{!conversation?.messagePage?.hasLater && activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}</div></ScrollArea>
           {readingLiveText && <section className="history-live-tail" aria-label={activeRun ? "Live output while reading history" : "Recent output while reading history"} tabIndex={0}><strong>{activeRun ? "Live output" : "Recent output"}</strong><p>{readingLiveText}</p></section>}
           {conversation?.messagePage?.hasLater && <div className="history-forward"><button className="history-later" onClick={loadLaterMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading later messages…" : `Load later messages · ${conversation.messagePage.newerCount} remaining`}</button><button className="history-return" onClick={loadConversation}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button></div>}
           {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}

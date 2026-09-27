@@ -330,10 +330,13 @@ async function closeDevTools(devtools) {
 async function waitForFixture(send, deadline) {
   let state;
   while (Date.now() < deadline) {
-    const evaluated = await send("Runtime.evaluate", {
-      expression: "({ title: document.title, text: document.getElementById('results')?.textContent ?? '', progress: window.__fixtureProgress && { ...window.__fixtureProgress, elapsedMs: Math.round(performance.now() - window.__fixtureStartedAt), stepElapsedMs: Math.round(performance.now() - window.__fixtureProgress.stepStartedAt) } })",
-      returnByValue: true,
-    });
+    let evaluated;
+    try {
+      evaluated = await send("Runtime.evaluate", {
+        expression: "({ title: document.title, text: document.getElementById('results')?.textContent ?? '', progress: window.__fixtureProgress && { ...window.__fixtureProgress, elapsedMs: Math.round(performance.now() - window.__fixtureStartedAt), stepElapsedMs: Math.round(performance.now() - window.__fixtureProgress.stepStartedAt) } })",
+        returnByValue: true,
+      });
+    } catch (error) { throw new Error(`${error.message}; ${fixtureProgress(state)}`, { cause: error }); }
     const next = evaluated?.exceptionDetails ? null : evaluated?.result?.value;
     if (next && typeof next.title === "string") {
       state = next;
@@ -822,7 +825,8 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       return send(method, params);
     }, deadline);
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
-    assert.match(state.text, process.env.OUTRIGHT_UI_STEP ? /1 interaction regressions passed/ : /87 interaction regressions passed/);
+    const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
+    assert.match(state.text, new RegExp(`${selectedCount ?? 89} interaction regressions passed`));
     const performanceFixture = state.text.match(/Performance fixture: (\{[^\n]+\})/);
     if (!process.env.OUTRIGHT_UI_STEP) assert.ok(performanceFixture, "large fixture measurements were not recorded");
     if (performanceFixture) console.log(`UI performance: ${performanceFixture[1]}`);
