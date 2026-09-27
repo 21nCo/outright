@@ -37,6 +37,7 @@ const MAX_STREAMING_CHARACTERS = 1024 * 1024;
 const MAX_READING_LIVE_PREVIEW_CHARACTERS = 8192;
 const MAX_PENDING_RUNTIME_EVENT_BYTES = 2 * 1024 * 1024;
 const LIVE_TRUNCATION_MARKER = "\n\n[Live output truncated]";
+const LIVE_OMITTED_PREFIX = "[Earlier live output omitted]\n";
 
 export function App() {
   const [bootstrap, setBootstrap] = useState(null);
@@ -98,6 +99,7 @@ export function App() {
   const pendingLiveScrollRef = useRef(null);
   const livePreviewRunRef = useRef(null);
   const acceptedPreviewRunRef = useRef(null);
+  const liveDeltaEventsRef = useRef(emptyLiveDeltaEvents());
   const historyGenerationRef = useRef(0);
   const messageCountRefreshRef = useRef({ generation: 0, timer: null, conversationId: null, inFlight: false });
   useEffect(() => () => {
@@ -180,6 +182,7 @@ export function App() {
     setLiveCheckpoint(null);
     livePreviewRunRef.current = null;
     acceptedPreviewRunRef.current = null;
+    liveDeltaEventsRef.current = emptyLiveDeltaEvents();
     setRunEvents([]);
     setSelectedConversationId(nextId);
   }
@@ -307,6 +310,7 @@ export function App() {
     setLiveCheckpoint(null);
     livePreviewRunRef.current = null;
     acceptedPreviewRunRef.current = null;
+    liveDeltaEventsRef.current = emptyLiveDeltaEvents();
   }
   useEffect(() => { loadConversations(); }, [project?.id, worktree?.id, loadConversations]);
   useLayoutEffect(() => { selectedConversationRef.current = selectedConversationId; }, [selectedConversationId]);
@@ -384,7 +388,13 @@ export function App() {
     const preservePendingFind = preservePage && pendingFindRef.current?.conversationId === requestedId;
     pendingConversationLoadRef.current?.controller?.abort();
     const controller = new AbortController();
-    const pendingLoad = { conversationId: requestedId, preservePage, events: [], eventBytes: 0, overflowed: false, controller };
+    // Carry already received, uncheckpointed deltas across a metadata read.
+    // The request buffer alone only sees events that arrive after this point.
+    const retained = conversationRef.current?.id === requestedId ? liveDeltaEventsRef.current : null;
+    const pendingLoad = { conversationId: requestedId, preservePage, acceptedRunId: acceptedPreviewRunRef.current,
+      liveRunId: livePreviewRunRef.current, omittedThroughSeq: retained?.omittedThroughSeq ?? 0,
+      events: retained ? retained.events.slice(retained.start) : [],
+      eventBytes: retained?.bytes ?? 0, overflowed: false, controller };
     pendingConversationLoadRef.current = pendingLoad;
     setConversation((current) => current?.id === requestedId && !current.archived ? current : null);
     try {
@@ -405,15 +415,41 @@ export function App() {
         return;
       }
       pendingConversationLoadRef.current = null;
-      const replayed = replayConversationEvents(nextConversation.messages, pendingLoad.events, MAX_RENDERED_MESSAGES,
-        activeCursorOwners(nextConversation), conversationRef.current?.id === requestedId ? checkpointCursorsRef.current : new Map(),
-        nextConversation.messagePage);
       const activeRunIds = activeCursorOwners(nextConversation);
+      const acceptedRunId = acceptedPreviewRunRef.current;
+      const serverRunId = [...activeRunIds][0] ?? null;
+      // A server snapshot is authoritative once it has a different active run.
+      // A request started before POST may still return an older snapshot, so
+      // keep the locally accepted run while that submission is in flight.
+      const newlyAcceptedRun = acceptedRunId && acceptedRunId !== pendingLoad.acceptedRunId ? acceptedRunId : null;
+      const pendingSubmissionRun = submissionPendingRef.current && livePreviewRunRef.current !== pendingLoad.liveRunId
+        ? livePreviewRunRef.current : null;
+      const previewRunId = newlyAcceptedRun ?? pendingSubmissionRun ?? serverRunId;
+      if (acceptedRunId && acceptedRunId !== previewRunId) acceptedPreviewRunRef.current = null;
+      const changedPreviewRun = previewRunId && livePreviewRunRef.current !== previewRunId;
+      if (changedPreviewRun) {
+        livePreviewRunRef.current = previewRunId;
+        liveDeltaEventsRef.current = emptyLiveDeltaEvents(previewRunId);
+        setLiveCheckpoint(null);
+        applyStreamingText(() => "", true);
+        setRunEvents([]);
+      }
+      const replayEvents = pendingLoad.events.filter((event) => event.type === "message.created"
+        || (event.type === "run.event" && event.runId === previewRunId));
+      const previewRunIds = previewRunId ? new Set([...activeRunIds, previewRunId]) : activeRunIds;
+      const replayed = replayConversationEvents(nextConversation.messages, replayEvents, MAX_RENDERED_MESSAGES,
+        previewRunIds, conversationRef.current?.id === requestedId ? checkpointCursorsRef.current : new Map(),
+        nextConversation.messagePage);
+      const replayCursor = replayed.cursors.get(previewRunId) ?? 0;
+      const retainedDeltas = replayEvents.filter((event) => event.type === "run.event" && event.payload?.type === "assistant.delta"
+        && (!Number.isSafeInteger(event.payload.seq) || event.payload.seq > replayCursor));
+      const omittedThroughSeq = pendingLoad.omittedThroughSeq > replayCursor ? pendingLoad.omittedThroughSeq : 0;
+      liveDeltaEventsRef.current = boundedLiveDeltaEvents(previewRunId, retainedDeltas, omittedThroughSeq);
       const latestActiveCheckpoint = [...replayed.messages].reverse().find((message) =>
-        message.role === "assistant" && activeRunIds.has(message.payload?.runId));
+        message.role === "assistant" && message.payload?.runId === previewRunId);
       if (latestActiveCheckpoint) setLiveCheckpoint((current) => {
         const candidate = readingLiveCheckpoint(latestActiveCheckpoint);
-        if (acceptedPreviewRunRef.current && acceptedPreviewRunRef.current !== candidate.runId) return current;
+        if (previewRunId !== candidate.runId) return current;
         livePreviewRunRef.current = candidate.runId;
         return current?.runId === candidate.runId && current.seq > candidate.seq ? current : candidate;
       });
@@ -459,7 +495,9 @@ export function App() {
       });
       refreshMessageCount();
       if (!preserveReading) setFindResetGeneration((current) => current + 1);
-      applyStreamingText(() => boundStreamingText(replayed.streamingText), true);
+      if (previewRunId) applyStreamingText(() => boundStreamingText(`${liveDeltaEventsRef.current.omittedThroughSeq
+        ? LIVE_OMITTED_PREFIX : ""}${replayed.streamingText}`), true);
+      else if (!preserveReading) applyStreamingText(() => "", true);
       setRunEvents(replayed.runEvents);
       if (!preserveReading) window.requestAnimationFrame(() => {
         const viewport = messageViewportRef.current;
@@ -534,6 +572,13 @@ export function App() {
       if (!displayed || olderThanPage || displayed.messagePage?.hasLater
         || displayed.messages.length >= MAX_RENDERED_MESSAGES) refreshMessageCount();
       recordCheckpointCursor(checkpointCursorsRef.current, event.payload, activeCursorOwners(displayed));
+      if (event.payload?.payload?.runId === liveDeltaEventsRef.current.runId) {
+        const cursor = checkpointCursorsRef.current.get(liveDeltaEventsRef.current.runId) ?? 0;
+        const events = liveDeltaEventsRef.current.events.slice(liveDeltaEventsRef.current.start).filter((entry) =>
+          !Number.isSafeInteger(entry.payload?.seq) || entry.payload.seq > cursor);
+        liveDeltaEventsRef.current = boundedLiveDeltaEvents(liveDeltaEventsRef.current.runId, events,
+          liveDeltaEventsRef.current.omittedThroughSeq > cursor ? liveDeltaEventsRef.current.omittedThroughSeq : 0);
+      }
       if (!olderThanPage && event.payload.role === "assistant" && event.payload.payload?.runId) {
         if (submissionPendingRef.current && !acceptedPreviewRunRef.current
           && livePreviewRunRef.current !== event.payload.payload.runId) {
@@ -592,6 +637,7 @@ export function App() {
       if (ownsLiveOutput && (runEvent.type === "assistant.delta" || runEvent.type === "assistant.message")
         && livePreviewRunRef.current !== event.runId) {
         livePreviewRunRef.current = event.runId;
+        liveDeltaEventsRef.current = emptyLiveDeltaEvents(event.runId);
         setLiveCheckpoint(null);
         applyStreamingText(() => "", true);
         setRunEvents([]);
@@ -599,13 +645,22 @@ export function App() {
       if (runEvent.type === "assistant.delta") {
         const checkpointEventSeq = checkpointCursorsRef.current.get(event.runId) ?? 0;
         if (ownsLiveOutput) {
+          if (!Number.isSafeInteger(runEvent.seq) || runEvent.seq > checkpointEventSeq) {
+            const retained = liveDeltaEventsRef.current.runId === event.runId ? liveDeltaEventsRef.current
+              : emptyLiveDeltaEvents(event.runId);
+            liveDeltaEventsRef.current = appendLiveDeltaEvent(retained, event);
+          }
           applyStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event, checkpointEventSeq)));
         }
       }
-      if (runEvent.type === "assistant.message" && ownsLiveOutput) applyStreamingText((current) => streamingTextAfterRuntimeEvent(current, event), true);
+      if (runEvent.type === "assistant.message" && ownsLiveOutput) {
+        liveDeltaEventsRef.current = emptyLiveDeltaEvents(event.runId);
+        applyStreamingText((current) => streamingTextAfterRuntimeEvent(current, event), true);
+      }
       if (runEvent.type.startsWith("tool.") && ownsLiveOutput) setRunEvents((current) => [...current, runEvent].slice(-20));
       if (["run.completed", "run.failed", "run.stopped"].includes(runEvent.type)) {
         if (acceptedPreviewRunRef.current === event.runId) acceptedPreviewRunRef.current = null;
+        if (liveDeltaEventsRef.current.runId === event.runId) liveDeltaEventsRef.current = emptyLiveDeltaEvents();
         window.setTimeout(() => loadConversation({ preservePage: true }), 80);
         if (document.hidden && settings.notifications && Notification.permission === "granted") new Notification(`Outright run ${runEvent.type.split(".")[1]}`, { body: conversation?.title ?? "Agent run" });
       }
@@ -1022,7 +1077,10 @@ export function App() {
       const previewAlreadyOwnedByRun = livePreviewRunRef.current === run.id;
       livePreviewRunRef.current = run.id;
       acceptedPreviewRunRef.current = run.id;
-      if (!previewAlreadyOwnedByRun) { setLiveCheckpoint(null); applyStreamingText(() => "", true); setRunEvents([]); }
+      if (!previewAlreadyOwnedByRun) {
+        liveDeltaEventsRef.current = emptyLiveDeltaEvents(run.id);
+        setLiveCheckpoint(null); applyStreamingText(() => "", true); setRunEvents([]);
+      }
       setConversation((current) => {
         if (current && current.id !== target.id) return current;
         const next = current ?? { ...target, messages: [], runs: [] };
@@ -1411,6 +1469,31 @@ function compactPath(value = "") { return value.replace(/^\/Users\/[^/]+/, "~");
 function defaultSettings() { return { provider: "codex", model: "", reasoningEffort: "medium", approvalPolicy: "workspace-write", editor: "zed", notifications: true, maxConcurrentRuns: 3 }; }
 function focusableElements(container) { return container ? [...container.querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')].filter((element) => element.getClientRects().length && element.getAttribute("aria-hidden") !== "true") : []; }
 function boundStreamingText(value) { return value.length > MAX_STREAMING_CHARACTERS ? `${value.slice(0, MAX_STREAMING_CHARACTERS)}${LIVE_TRUNCATION_MARKER}` : value; }
+
+function emptyLiveDeltaEvents(runId = null) { return { runId, events: [], start: 0, bytes: 0, omittedThroughSeq: 0 }; }
+
+function appendLiveDeltaEvent(state, event) {
+  state.events.push(event);
+  state.bytes += JSON.stringify(event).length * 2;
+  while (state.bytes > MAX_PENDING_RUNTIME_EVENT_BYTES / 2 && state.events.length - state.start > 1) {
+    const removed = state.events[state.start++];
+    state.bytes -= JSON.stringify(removed).length * 2;
+    state.omittedThroughSeq = Number.isSafeInteger(removed.payload?.seq)
+      ? Math.max(state.omittedThroughSeq, removed.payload.seq) : Number.POSITIVE_INFINITY;
+  }
+  if (state.start > 128 && state.start * 2 > state.events.length) {
+    state.events = state.events.slice(state.start);
+    state.start = 0;
+  }
+  return state;
+}
+
+function boundedLiveDeltaEvents(runId, events, omittedThroughSeq = 0) {
+  const state = emptyLiveDeltaEvents(runId);
+  state.omittedThroughSeq = omittedThroughSeq;
+  for (const event of events) appendLiveDeltaEvent(state, event);
+  return state;
+}
 
 function readingLiveCheckpoint(message) {
   const body = String(message.body ?? "");

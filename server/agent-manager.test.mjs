@@ -935,6 +935,9 @@ test("a failed running-state commit reaps the unauthorized wrapper before releas
 });
 
 test("shutdown racing the running-state commit never authorizes the provider", async () => {
+  if (process.env.CI && process.platform !== "win32") {
+    console.error(`POSIX shutdown race begin: test=${process.pid}/${processGroupId(process.pid)} parent=${process.ppid}`);
+  }
   const database = fakeDatabase();
   const child = fakeChild();
   const writes = [];
@@ -961,6 +964,7 @@ test("shutdown racing the running-state commit never authorizes the provider", a
   assert.equal(writes.includes("go\n"), false, "shutdown cannot authorize a provider after cancellation");
   assert.equal(database.getRun(run.id).status, "stopped");
   assert.deepEqual(manager.activeRuns(), []);
+  if (process.env.CI && process.platform !== "win32") console.error("POSIX shutdown race complete: fake child had no process-group identity");
 });
 
 test("shutdown retains ownership when a closed supervisor leaves a stale handshake", async () => {

@@ -2331,7 +2331,14 @@ async function forwardPageEvictionAnchorRegression() {
     viewport.scrollTop = 0; viewport.dispatchEvent(new Event("scroll")); await settle();
     viewport.scrollTop = evicted ? 0 : viewport.scrollHeight / 2;
     viewport.dispatchEvent(new Event("scroll")); await settle();
-    const firstVisible = [...viewport.querySelectorAll("[data-message-id]")].find((element) => element.getBoundingClientRect().bottom > viewport.getBoundingClientRect().top);
+    const visibleRow = () => [...viewport.querySelectorAll("[data-message-id]")].find((element) => {
+      const row = element.getBoundingClientRect();
+      const frame = viewport.getBoundingClientRect();
+      return row.bottom > frame.top + 2 && row.top < frame.bottom - 2;
+    });
+    await until(() => (evicted || viewport.scrollTop > viewport.clientHeight) && visibleRow(),
+      `a genuinely visible ${evicted ? "evicted" : "retained"} reading row; scroll=${viewport.scrollTop}/${viewport.scrollHeight}; frame=${viewport.getBoundingClientRect().top}/${viewport.getBoundingClientRect().bottom}`);
+    const firstVisible = visibleRow();
     assert(firstVisible, "Forward page fixture has no visible reading row");
     const anchorId = firstVisible.dataset.messageId;
     const top = firstVisible.getBoundingClientRect().top;
@@ -2566,6 +2573,7 @@ async function consecutiveRunLivePreviewRegression() {
   const older = [{ id: "old-0", role: "assistant", kind: "text", body: "Old reading row", createdAt: new Date(0).toISOString() }];
   const latest = [{ id: "latest-1", role: "assistant", kind: "text", body: "A checkpoint", payload: { runId: "run-A", checkpointEventSeq: 1 }, createdAt: new Date(1000).toISOString() }];
   let runBStarted = false;
+  let runCActive = false;
   const runBResponse = deferred();
   let detailReads = 0;
   route = async (url, options) => {
@@ -2575,8 +2583,13 @@ async function consecutiveRunLivePreviewRegression() {
     if (url.pathname === "/api/conversations/chat-A/runs" && options?.method === "POST") { runBStarted = true; return runBResponse.promise; }
     if (url.pathname === "/api/conversations/chat-A") {
       detailReads += 1;
-      return response({ ...chats.A, runs: runBStarted ? [{ id: "run-B", status: "running" }, { id: "run-A", status: "completed" }] : [{ id: "run-A", status: detailReads === 1 ? "running" : "completed" }], messages: latest,
-        messagePage: { hasMore: true, olderCount: 1, hasLater: false, newerCount: 0, total: 2, beforeId: "latest-1" } });
+      return response({ ...chats.A, runs: runCActive ? [{ id: "run-C", status: "running" }, { id: "run-B", status: "completed" }]
+        : runBStarted ? [{ id: "run-B", status: "running" }, { id: "run-A", status: "completed" }]
+          : [{ id: "run-A", status: detailReads === 1 ? "running" : "completed" }],
+        messages: runCActive ? [{ id: "latest-3", role: "assistant", kind: "text", body: "C checkpoint",
+          payload: { runId: "run-C", checkpointEventSeq: 1 }, createdAt: new Date(3000).toISOString() }] : latest,
+        messagePage: { hasMore: true, olderCount: 1, hasLater: false, newerCount: 0, total: 2,
+          beforeId: runCActive ? "latest-3" : latest[0].id } });
     }
     return response({});
   };
@@ -2621,8 +2634,34 @@ async function consecutiveRunLivePreviewRegression() {
   setControlValue(repeatFind, "Old reading row"); await settle();
   repeatFind.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => host.querySelector('[data-message-id="old-0"]') && host.querySelector('.history-return'), "second run older page restored");
-  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: { id: "latest-2", role: "assistant", kind: "text", body: "B resumed checkpoint", payload: { runId: "run-B", checkpointEventSeq: 4 }, createdAt: new Date(2000).toISOString() } }) }));
+  const resumedCheckpoint = { id: "latest-2", role: "assistant", kind: "text", body: "B resumed checkpoint",
+    payload: { runId: "run-B", checkpointEventSeq: 4 }, createdAt: new Date(2000).toISOString() };
+  latest[0] = resumedCheckpoint;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: resumedCheckpoint }) }));
   await until(() => host.querySelector('.history-live-tail')?.textContent.includes("B resumed checkpoint"), "accepted run checkpoint survives Return and Find");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-B", payload: { type: "assistant.delta", seq: 5, payload: { text: " uncheckpointed" } } }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("B resumed checkpoint uncheckpointed"), "uncheckpointed suffix visible before refresh");
+  const beforeRefresh = detailReads;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await until(() => detailReads > beforeRefresh, "preserved detail refreshed after missed replay");
+  await settle(); await settle();
+  assert(host.querySelector('.history-live-tail')?.textContent.includes("B resumed checkpoint uncheckpointed"),
+    `Preserved refresh lost pre-request deltas after the checkpoint: ${host.querySelector('.history-live-tail')?.textContent}`);
+  host.querySelector('.history-return').click();
+  await until(() => !host.querySelector('.history-return') && host.querySelector('[data-message-id="latest-2"]'), "Return restored B's durable checkpoint");
+  assert(host.querySelector('.message.is-streaming')?.textContent.includes("uncheckpointed"), "Return to latest dropped the active run's suffix");
+  const findAgain = host.querySelector('.history-find input');
+  setControlValue(findAgain, "Old reading row"); await settle();
+  findAgain.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-message-id="old-0"]') && host.querySelector('.history-return'), "older page restored before missed completion");
+  runCActive = true;
+  const beforeRunC = detailReads;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await until(() => detailReads > beforeRunC && host.querySelector('.history-live-tail')?.textContent.includes("C checkpoint"),
+    "missed completion reconciled preview to the newer active run");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-C", payload: { type: "assistant.delta", seq: 2, payload: { text: " C tail" } } }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("C checkpoint C tail"), "newly accepted run retained live deltas");
+  assert(!host.querySelector('.history-live-tail').textContent.includes("B resumed checkpoint"), "completed run leaked into C's preview");
 }
 
 async function replayKeepsLatestPageBoundaryRegression() {
