@@ -1,0 +1,19 @@
+src/App.jsx
+  s_3058aa458d6557::t_298280a5be6666 1508,1535-1560
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "547ccbb86b9dad8e6ba2e9007c72b9155e2ad073",
+  "prompts": {},
+  "sessions": {
+    "s_3058aa458d6557": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e214-820d-7fa0-a0ea-0fdea628637e",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
