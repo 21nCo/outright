@@ -1965,8 +1965,18 @@ async function extremeDiffHeightRegression() {
   await until(() => nearViewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top < beforeWheel - 5, "compressed wheel advanced one logical line");
   assert(Math.abs(nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top - beforeWheel + 14) < 5, "Compressed wheel skipped logical lines");
   const beforeBatch = nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top;
-  for (let step = 0; step < 3; step += 1) nearViewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 14, bubbles: true, cancelable: true }));
-  await until(() => nearViewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top < beforeBatch - 35, "batched wheels advanced three logical lines");
+  const wheelTrace = [];
+  for (let step = 0; step < 3; step += 1) {
+    nearViewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 14, bubbles: true, cancelable: true }));
+    wheelTrace.push({ top: nearViewport.scrollTop, first: nearViewport.dataset.firstLine,
+      mounted: [nearViewport.dataset.mountedStart, nearViewport.dataset.mountedEnd] });
+  }
+  try {
+    await until(() => nearViewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top < beforeBatch - 35, "batched wheels advanced three logical lines");
+  } catch (error) {
+    throw new Error(`Batched diff wheel lost a logical line: ${JSON.stringify({ beforeBatch, after: nearViewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top,
+      physicalTop: nearViewport.scrollTop, first: nearViewport.dataset.firstLine, mounted: [nearViewport.dataset.mountedStart, nearViewport.dataset.mountedEnd], wheelTrace })}`, { cause: error });
+  }
   assert(Math.abs(nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top - beforeBatch + 42) < 5, "Batched wheels skipped or doubled logical lines");
   if (window.__fixtureWheel) {
     nearViewport.scrollIntoView({ block: "center" });
@@ -2582,7 +2592,8 @@ async function checkpointReadingPageRegression() {
     latest = latest.map((item) => item.id === updated.id ? updated : item);
     fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: updated }) }));
   }
-  await settle();
+  // Deliver the delta in the same browser task as the checkpoint burst.
+  // Run ownership must be committed before React flushes queued state.
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", runId: "run-checkpoint", conversationId: "chat-A", payload: { type: "assistant.delta", seq: 9, payload: { text: " after eight" } } }) }));
   try { await until(() => host.querySelector('.history-live-tail')?.textContent.includes("Checkpoint 8 after eight"), "older page shows checkpoint and following delta"); }
   catch (error) { throw new Error(`${error.message}; tail=${host.querySelector('.history-live-tail')?.textContent}, return=${host.querySelector('.history-return')?.textContent}, reads=${reads}, socket=${fixtureSockets.length - socketsBefore}`); }

@@ -26,10 +26,22 @@ export function WindowedDiff({ diff, label }) {
   const foundOffsetRef = useRef(-1);
   const pendingFindAlignmentRef = useRef(null);
   const wheelRemainderRef = useRef(0);
-  const updatePosition = (viewport) => {
+  const logicalFirstRef = useRef(0);
+  const programmaticTopRef = useRef(null);
+  const updatePosition = (viewport, logicalFirst = null) => {
     const top = viewport.scrollTop;
     const height = viewport.clientHeight;
-    setPosition((current) => current.top === top && current.height === height ? current : { top, height });
+    // A compressed track has fewer physical pixels than logical lines. Keep
+    // line moves exact, even when the browser rounds a programmatic scroll.
+    const first = logicalFirst ?? (programmaticTopRef.current != null && Math.abs(top - programmaticTopRef.current) <= 1
+      ? logicalFirstRef.current : null);
+    if (first == null) {
+      programmaticTopRef.current = null;
+      logicalFirstRef.current = compressed ? Math.min(maxFirst, Math.round(top / maxScroll * maxFirst))
+        : Math.min(maxFirst, Math.floor(top / LINE_HEIGHT));
+    } else logicalFirstRef.current = first;
+    setPosition((current) => current.top === top && current.height === height && current.first === first
+      ? current : { top, height, first });
   };
   const starts = useMemo(() => content ? lineOffsets(content) : [], [content]);
   const searchable = useMemo(() => content.toLocaleLowerCase(), [content]);
@@ -42,6 +54,14 @@ export function WindowedDiff({ diff, label }) {
   const visibleRows = Math.max(1, Math.floor(position.height / LINE_HEIGHT));
   const maxFirst = Math.max(0, count - visibleRows);
   const maxScroll = Math.max(1, trackHeight - position.height);
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    // A refreshed diff starts a new line coordinate system. Adopt its actual
+    // physical viewport before a later wheel uses the logical cursor.
+    programmaticTopRef.current = null;
+    updatePosition(viewport);
+  }, [content]);
   useEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport || !compressed) return;
@@ -55,11 +75,13 @@ export function WindowedDiff({ diff, label }) {
       const lines = Math.trunc(wheelRemainderRef.current);
       wheelRemainderRef.current -= lines;
       if (!lines) return;
-      // Read the physical position on every event; React may batch several
-      // wheels before it renders a new firstVisible value.
-      const first = Math.min(maxFirst, Math.round(viewport.scrollTop / maxScroll * maxFirst));
-      viewport.scrollTop = Math.max(0, Math.min(maxFirst, first + lines)) / maxFirst * maxScroll;
-      updatePosition(viewport);
+      // Physical pixels cannot represent every line near the diff size cap.
+      // Wheel batches must advance the logical cursor, not round-trip through
+      // scrollTop on each event before React renders.
+      const first = Math.max(0, Math.min(maxFirst, logicalFirstRef.current + lines));
+      viewport.scrollTop = maxFirst ? first / maxFirst * maxScroll : 0;
+      programmaticTopRef.current = viewport.scrollTop;
+      updatePosition(viewport, first);
     };
     viewport.addEventListener("wheel", wheel, { passive: false });
     return () => viewport.removeEventListener("wheel", wheel);
@@ -67,8 +89,10 @@ export function WindowedDiff({ diff, label }) {
   function moveFirst(first) {
     const viewport = viewportRef.current;
     if (!viewport) return;
-    viewport.scrollTop = maxFirst ? Math.max(0, Math.min(maxFirst, first)) / maxFirst * maxScroll : 0;
-    updatePosition(viewport);
+    const next = Math.max(0, Math.min(maxFirst, first));
+    viewport.scrollTop = maxFirst ? next / maxFirst * maxScroll : 0;
+    programmaticTopRef.current = viewport.scrollTop;
+    updatePosition(viewport, next);
   }
   function seekLine(line) {
     const viewport = viewportRef.current;
@@ -120,7 +144,7 @@ export function WindowedDiff({ diff, label }) {
     pendingFindAlignmentRef.current = { line, attempts: 0 };
     seekLine(line);
   }, [content]);
-  const scrollFirst = compressed ? Math.min(maxFirst, Math.round(position.top / maxScroll * maxFirst))
+  const scrollFirst = compressed ? Math.min(maxFirst, position.first ?? Math.round(position.top / maxScroll * maxFirst))
     : Math.min(maxFirst, Math.floor(position.top / LINE_HEIGHT));
   // A seek can race a queued native End/scroll event after a mode switch.
   // Keep the target mounted while the browser delivers that event and align
@@ -164,7 +188,7 @@ export function WindowedDiff({ diff, label }) {
     const line = content.slice(starts[index], endOffset);
     lines.push(<span className={line.startsWith("+") && !line.startsWith("+++") ? "added" : line.startsWith("-") && !line.startsWith("---") ? "removed" : line.startsWith("@@") ? "hunk" : ""} data-find-match={index === foundLine ? "true" : undefined} key={index}><i aria-hidden="true">{index + 1}</i>{line}{"\n"}</span>);
   }
-  return <div className="windowed-diff"><div className="window-find" role="search" aria-label={`Find in ${label}`}><input aria-label="Find in diff" value={needle} onChange={(event) => { setNeedle(event.target.value); setFoundLine(-1); setSearched(false); foundOffsetRef.current = -1; pendingFindAlignmentRef.current = null; }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle} aria-label="Previous diff match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle} aria-label="Next diff match">↓</button><span aria-hidden="true">{visibleStatus}</span><span className="sr-only" role="status">{announcedStatus}</span></div><pre ref={viewportRef} className="diff-view" tabIndex={0} aria-label={label} onScroll={(event) => updatePosition(event.currentTarget)} onPointerDown={() => { pendingFindAlignmentRef.current = null; }} onTouchStart={() => { pendingFindAlignmentRef.current = null; }} onWheelCapture={() => { pendingFindAlignmentRef.current = null; }} onKeyDown={(event) => {
+  return <div className="windowed-diff"><div className="window-find" role="search" aria-label={`Find in ${label}`}><input aria-label="Find in diff" value={needle} onChange={(event) => { setNeedle(event.target.value); setFoundLine(-1); setSearched(false); foundOffsetRef.current = -1; pendingFindAlignmentRef.current = null; }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle} aria-label="Previous diff match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle} aria-label="Next diff match">↓</button><span aria-hidden="true">{visibleStatus}</span><span className="sr-only" role="status">{announcedStatus}</span></div><pre ref={viewportRef} className="diff-view" tabIndex={0} aria-label={label} data-first-line={firstVisible} data-mounted-start={start} data-mounted-end={end} onScroll={(event) => updatePosition(event.currentTarget)} onPointerDown={() => { pendingFindAlignmentRef.current = null; }} onTouchStart={() => { pendingFindAlignmentRef.current = null; }} onWheelCapture={() => { pendingFindAlignmentRef.current = null; }} onKeyDown={(event) => {
     pendingFindAlignmentRef.current = null;
     if (!compressed) return;
     const moves = { ArrowDown: 1, ArrowUp: -1, PageDown: visibleRows - 1, PageUp: 1 - visibleRows, Home: -maxFirst, End: maxFirst };

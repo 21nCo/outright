@@ -55,6 +55,33 @@ test("conversation find reaches old and new pages, wraps, and treats query text 
   } finally { database.close(); }
 });
 
+test("conversation Find bounds hydrated neighbors and keeps page cursors exact", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Large Find", provider: "codex" });
+    const ids = Array.from({ length: 32 }, (_, index) => database.addMessage({ conversationId: chat.id,
+      role: "assistant", body: `${index === 16 ? "unique needle " : ""}${"x".repeat(1024 * 1024)}`,
+      payload: { detail: "y".repeat(1024 * 1024) } }).id);
+    const result = await database.findMessagePage(chat.id, "unique needle", ids[15]);
+    assert.equal(result.matchId, ids[16]);
+    assert.ok(result.messages.some((message) => message.id === ids[16]));
+    assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 8 * 1024 * 1024 + 1024, "Find hydrated too much context");
+    assert.equal(result.messagePage.olderCount + result.messages.length + result.messagePage.newerCount, 32);
+    assert.equal(result.messagePage.beforeId, result.messages[0].id);
+    const older = database.listMessagePage(chat.id, { beforeId: result.messages[0].id });
+    const newer = database.listMessagePage(chat.id, { afterId: result.messages.at(-1).id });
+    assert.equal(older.page.total, 32);
+    assert.equal(newer.page.total, 32);
+    const hugeMatch = database.addMessage({ conversationId: chat.id, role: "assistant",
+      body: `${"a".repeat(5 * 1024 * 1024)}unique huge needle${"b".repeat(5 * 1024 * 1024)}` });
+    const huge = await database.findMessagePage(chat.id, "unique huge needle", ids.at(-1));
+    assert.equal(huge.matchId, hugeMatch.id);
+    assert.equal(huge.messages.find((message) => message.id === hugeMatch.id).findExcerpt, true);
+    assert.ok(huge.messages.find((message) => message.id === hugeMatch.id).body.includes("unique huge needle"));
+    assert.ok(Buffer.byteLength(JSON.stringify(huge)) <= 8 * 1024 * 1024 + 1024);
+  } finally { database.close(); }
+});
+
 test("forward message pages continue from a found page with exact persisted counts", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

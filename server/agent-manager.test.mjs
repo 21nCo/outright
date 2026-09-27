@@ -895,7 +895,10 @@ test("shutdown between the authorization write and owner acknowledgement still c
     setImmediate(() => child.emit("close", null, signal));
     return true;
   };
-  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child, terminationTimeoutMs: 1000 });
+  // This is an authorization race with a fake child. Keep launch capability
+  // fake too: the Darwin default runs a real launchd self-test and bootout.
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child,
+    launchCommand: (command) => ({ ...command, handshakePath: "", ownsDescendants: true }), terminationTimeoutMs: 1000 });
   const run = database.createRun(codexRun("run-1"));
   const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run });
 
@@ -924,7 +927,8 @@ test("a failed running-state commit reaps the unauthorized wrapper before releas
     setImmediate(() => child.emit("close", null, signal));
     return true;
   };
-  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child, terminationTimeoutMs: 1000 });
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child,
+    launchCommand: (command) => ({ ...command, handshakePath: "", ownsDescendants: true }), terminationTimeoutMs: 1000 });
   const run = database.createRun(codexRun("run-1"));
   await manager.schedule({ conversation: database.getConversation("conv-1"), run });
 
@@ -956,7 +960,8 @@ test("shutdown racing the running-state commit never authorizes the provider", a
     if (patch.status === "running" && !shutdownPromise) shutdownPromise = manager.shutdown();
     return updated;
   };
-  manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child, terminationTimeoutMs: 1000 });
+  manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child,
+    launchCommand: (command) => ({ ...command, handshakePath: "", ownsDescendants: true }), terminationTimeoutMs: 1000 });
   const run = database.createRun(codexRun("run-1"));
   await manager.schedule({ conversation: database.getConversation("conv-1"), run });
   await shutdownPromise;

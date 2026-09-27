@@ -140,6 +140,10 @@ export async function defaultProbe(id, { signal } = {}) {
       if (length > MAX_VERSION_BYTES) terminate(new Error(`Provider version output exceeded limit: ${id}`));
     });
     child.once("close", (code, childSignal) => {
+      // A successful CLI may have forked a helper with redirected stdio, so
+      // close of the direct child alone is not proof the probe tree is gone.
+      // The detached group is still ours until this version check settles.
+      if (process.platform !== "win32" && child.pid) terminateTree(true);
       settle(terminationError ?? spawnError ?? (code === 0 ? null : new Error(`Provider version check exited ${code ?? childSignal}: ${id}`)), (stdout.length ? stdout : stderr).toString("utf8"));
     });
     const terminateTree = (force = false) => {

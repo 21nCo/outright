@@ -1,10 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createProviderDiscovery, defaultProbe } from "./provider-discovery.mjs";
+
+function probeProcessRunning(pid) {
+  const result = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8", timeout: 1000 });
+  return result.status === 0 && !/^Z/.test(result.stdout.trim());
+}
+
+async function waitForProbeExit(pid) {
+  const deadline = Date.now() + 1000;
+  while (probeProcessRunning(pid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(probeProcessRunning(pid), false, `probe descendant ${pid} is still running`);
+}
 
 test("aborting a version check reaps a CLI that ignores SIGTERM", { skip: process.platform === "win32" }, async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-"));
@@ -53,8 +64,7 @@ test("abort and timeout reap a pipe-holding CLI descendant", { skip: process.pla
         if (mode === "abort") controller.abort();
         await assert.rejects(pending, mode === "abort" ? /aborted|did not close/ : /timed out|did not close/);
         assert.ok(Date.now() - started < 4_000, `${mode} remains bounded`);
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        assert.throws(() => process.kill(descendantPid, 0), { code: "ESRCH" }, `the whole probe tree must be gone after ${mode}`);
+        await waitForProbeExit(descendantPid);
       } finally {
         controller.abort();
         if (descendantPid) try { process.kill(descendantPid, "SIGKILL"); } catch { /* Already gone. */ }
@@ -62,6 +72,25 @@ test("abort and timeout reap a pipe-holding CLI descendant", { skip: process.pla
       }
     }
   } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("successful version checks also close their detached helper tree", { skip: process.platform === "win32" }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-success-"));
+  const executable = path.join(directory, "successful-probe");
+  const pidFile = path.join(directory, "descendant-pid");
+  const helper = `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`;
+  writeFileSync(executable, `#!${process.execPath}\nconst { spawn } = require("node:child_process"); spawn(process.execPath, ["-e", ${JSON.stringify(helper)}], { stdio: "ignore" }); console.log("version 1"); setTimeout(() => process.exit(0), 100);\n`);
+  chmodSync(executable, 0o755);
+  let descendantPid;
+  try {
+    assert.equal((await defaultProbe(executable)).trim(), "version 1");
+    assert.ok(existsSync(pidFile), "the helper started before the CLI exited");
+    descendantPid = Number(readFileSync(pidFile, "utf8"));
+    await waitForProbeExit(descendantPid);
+  } finally {
+    if (descendantPid) try { process.kill(descendantPid, "SIGKILL"); } catch { /* Already gone. */ }
     rmSync(directory, { recursive: true, force: true });
   }
 });

@@ -248,16 +248,70 @@ export function createOutrightDatabase(options = {}) {
         if (result?.partial) return result;
         if (!result) return { matchId: null, messages: [], messagePage: null };
         const match = result.match;
-        const older = db.prepare(`SELECT search_order AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
-          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order <= ? ORDER BY search_order DESC LIMIT 100`).all(conversationId, match.rowid).reverse();
-        const newer = db.prepare(`SELECT search_order AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
-          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order > ? ORDER BY search_order ASC LIMIT 100`).all(conversationId, match.rowid);
-        const rows = [...older, ...newer];
-        const olderCount = db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order < ?").get(conversationId, rows[0].messageRowId).count;
-        const newerCount = db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order > ?").get(conversationId, rows.at(-1).messageRowId).count;
-        return { matchId: match.id, messages: rows.map(({ messageRowId, ...row }) => hydratePayload({ ...row, searchOrder: messageRowId })), messagePage: {
+        // Select by stored byte lengths before hydrating message bodies. A
+        // 200-row Find window can otherwise serialize hundreds of MiB even
+        // though the search scan itself has an 8 MiB work limit.
+        const sizes = `SELECT search_order AS rowid, id, LENGTH(CAST(body AS BLOB)) + LENGTH(CAST(payload AS BLOB)) + 512 AS bytes
+          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order`;
+        const olderCandidates = db.prepare(`${sizes} <= ? ORDER BY search_order DESC LIMIT 100`).all(conversationId, match.rowid);
+        const newerCandidates = db.prepare(`${sizes} > ? ORDER BY search_order ASC LIMIT 100`).all(conversationId, match.rowid);
+        const maxBytes = 8 * 1024 * 1024;
+        let remaining = maxBytes;
+        const chosen = [olderCandidates[0]];
+        remaining -= Math.min(olderCandidates[0].bytes, maxBytes);
+        let olderIndex = 1; let newerIndex = 0;
+        let olderBlocked = false; let newerBlocked = false;
+        while (chosen.length < 200 && (!olderBlocked || !newerBlocked)) {
+          for (const side of ["older", "newer"]) {
+            if (side === "older" && !olderBlocked) {
+              const candidate = olderCandidates[olderIndex];
+              if (!candidate || candidate.bytes > remaining) olderBlocked = true;
+              else { chosen.push(candidate); remaining -= candidate.bytes; olderIndex += 1; }
+            } else if (side === "newer" && !newerBlocked) {
+              const candidate = newerCandidates[newerIndex];
+              if (!candidate || candidate.bytes > remaining) newerBlocked = true;
+              else { chosen.push(candidate); remaining -= candidate.bytes; newerIndex += 1; }
+            }
+            if (chosen.length >= 200) break;
+          }
+        }
+        const firstRow = Math.min(...chosen.map((row) => row.rowid));
+        const lastRow = Math.max(...chosen.map((row) => row.rowid));
+        const rows = db.prepare(`SELECT search_order AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order BETWEEN ? AND ? ORDER BY search_order`).all(conversationId, firstRow, lastRow);
+        let messages = rows.map(({ messageRowId, ...row }) => hydratePayload({ ...row, searchOrder: messageRowId }));
+        // The matched message itself may be larger than the context budget.
+        // Return an explicit excerpt containing the match, then let normal
+        // paging retrieve its complete body when the reader asks for it.
+        const matchedMessage = messages.find((message) => message.id === match.id);
+        if (matchedMessage && Buffer.byteLength(JSON.stringify(matchedMessage)) > maxBytes) {
+          const body = String(matchedMessage.body ?? "");
+          const foldedIndex = body.toLocaleLowerCase().indexOf(foldedQuery);
+          // Locale folding can expand a character, so map the folded match
+          // offset back to the original UTF-16 body before taking an excerpt.
+          let originalIndex = 0; let foldedPosition = 0;
+          for (const point of body) {
+            if (foldedPosition >= foldedIndex) break;
+            foldedPosition += point.toLocaleLowerCase().length;
+            originalIndex += point.length;
+          }
+          const start = Math.max(0, originalIndex - 250_000);
+          matchedMessage.body = `${start ? "[Earlier text omitted from Find result]\n" : ""}${body.slice(start, start + 500_000)}${start + 500_000 < body.length ? "\n[Later text omitted from Find result]" : ""}`;
+          matchedMessage.payload = null;
+          matchedMessage.findExcerpt = true;
+        }
+        let serializedBytes = 2 + messages.reduce((bytes, message) => bytes + Buffer.byteLength(JSON.stringify(message)) + 1, 0);
+        while (serializedBytes > maxBytes && messages.length > 1) {
+          // Drop the farther edge and preserve a contiguous page around match.
+          const removed = messages.findIndex((message) => message.id === match.id) >= messages.length / 2
+            ? messages.shift() : messages.pop();
+          serializedBytes -= Buffer.byteLength(JSON.stringify(removed)) + 1;
+        }
+        const olderCount = db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order < ?").get(conversationId, messages[0].searchOrder).count;
+        const newerCount = db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order > ?").get(conversationId, messages.at(-1).searchOrder).count;
+        return { matchId: match.id, messages, messagePage: {
           hasMore: olderCount > 0, olderCount, hasLater: newerCount > 0, newerCount,
-          total: olderCount + rows.length + newerCount, beforeId: rows[0].id, limit: 200,
+          total: olderCount + messages.length + newerCount, beforeId: messages[0].id, limit: 200,
         } };
       } finally { activeMessageFinds -= 1; }
     },

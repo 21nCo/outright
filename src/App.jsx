@@ -462,7 +462,6 @@ export function App() {
       if (latestActiveCheckpoint) setLiveCheckpoint((current) => {
         const candidate = readingLiveCheckpoint(latestActiveCheckpoint);
         if (previewRunId !== candidate.runId) return current;
-        livePreviewRunRef.current = candidate.runId;
         return current?.runId === candidate.runId && current.seq > candidate.seq ? current : candidate;
       });
       else if (!preservePage) { setLiveCheckpoint(null); livePreviewRunRef.current = null; }
@@ -603,20 +602,21 @@ export function App() {
           liveDeltaEventsRef.current.omittedThroughSeq > cursor ? liveDeltaEventsRef.current.omittedThroughSeq : 0);
       }
       if (!olderThanPage && event.payload.role === "assistant" && event.payload.payload?.runId) {
+        const candidate = readingLiveCheckpoint(event.payload);
         if (submissionPendingRef.current && !acceptedPreviewRunRef.current
-          && livePreviewRunRef.current !== event.payload.payload.runId) {
-          livePreviewRunRef.current = event.payload.payload.runId;
+          && livePreviewRunRef.current !== candidate.runId) {
+          livePreviewRunRef.current = candidate.runId;
           applyStreamingText(() => "", true);
           setRunEvents([]);
         }
-        setLiveCheckpoint((current) => {
-          const candidate = readingLiveCheckpoint(event.payload);
-          if (acceptedPreviewRunRef.current && acceptedPreviewRunRef.current !== candidate.runId) return current;
-          if (!activeCursorOwners(displayed).has(candidate.runId) && livePreviewRunRef.current !== candidate.runId
-            && acceptedPreviewRunRef.current !== candidate.runId) return current;
+        if ((!acceptedPreviewRunRef.current || acceptedPreviewRunRef.current === candidate.runId)
+          && (activeCursorOwners(displayed).has(candidate.runId) || livePreviewRunRef.current === candidate.runId
+            || acceptedPreviewRunRef.current === candidate.runId)) {
+          // The following delta can arrive in the same browser task. Claim
+          // the run before React processes the queued checkpoint state.
           livePreviewRunRef.current = candidate.runId;
-          return current?.runId === candidate.runId && current.seq > candidate.seq ? current : candidate;
-        });
+          setLiveCheckpoint((current) => current?.runId === candidate.runId && current.seq > candidate.seq ? current : candidate);
+        }
       }
       if (!olderThanPage) applyStreamingText((current) => streamingTextAfterRuntimeEvent(current, event), true);
       setConversation((current) => {
@@ -673,7 +673,11 @@ export function App() {
               : emptyLiveDeltaEvents(event.runId);
             liveDeltaEventsRef.current = appendLiveDeltaEvent(retained, event);
           }
-          applyStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event, checkpointEventSeq)));
+          // Browser timer throttling can delay a 32 ms stream flush while the
+          // reader is on an older page. Show the first suffix byte after each
+          // durable checkpoint now; coalesce the following deltas as usual.
+          const firstReadingDelta = Boolean(conversationRef.current?.messagePage?.hasLater) && !streamingTextRef.current;
+          applyStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event, checkpointEventSeq)), firstReadingDelta);
         }
       }
       if (runEvent.type === "assistant.message" && ownsLiveOutput) {
