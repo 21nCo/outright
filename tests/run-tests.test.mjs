@@ -71,6 +71,7 @@ test("test launcher reaps its detached runner and a SIGTERM-ignoring descendant"
     const stopped = Date.now() + 3000;
     while (running(workerPid) && Date.now() < stopped) await new Promise((resolve) => setTimeout(resolve, 25));
     assert.equal(running(workerPid), false, `Test worker survived launcher interruption: ${output}`);
+    while (running(descendantPid) && Date.now() < stopped) await new Promise((resolve) => setTimeout(resolve, 25));
     assert.equal(running(descendantPid), false, `SIGTERM-ignoring descendant survived launcher interruption: ${output}`);
     assert.equal(groupRunning(runnerPid), false, `Detached test runner group survived launcher interruption: ${output}`);
     assert.match(output, /CI test launcher received SIGTERM/);

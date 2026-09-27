@@ -7,13 +7,25 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { AGENT_SUPERVISOR, buildProviderCommand, consumeBoundedLines, createAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_AUTHORIZED_CONTROL, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
+import { AGENT_SUPERVISOR, buildProviderCommand, consumeBoundedLines, createAgentManager as createRuntimeAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_AUTHORIZED_CONTROL, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
 import { streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
 
 const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
 const fakeLaunchDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-agent-test-"));
 const WRAPPER_OWNERSHIP_TOKEN = "00000000-0000-4000-8000-000000000001";
 const platformSupervisor = AGENT_SUPERVISOR;
+// These manager fixtures exercise launch and shutdown ownership. Provider
+// discovery has its own OS-visible tests; spawning two unrelated CLI probes
+// for every fake manager makes shutdown timing depend on CI host process load.
+const createAgentManager = (options) => createRuntimeAgentManager({
+  ...options,
+  providerDiscoveryFactory: () => ({
+    list: () => [],
+    refresh: async () => [],
+    available: async () => false,
+    close: async () => {},
+  }),
+});
 // Direct wrapper probes are trusted leaf-only fixtures, never production
 // launches. Production requires the platform supervisor's owned boundary.
 process.env.OUTRIGHT_TEST_DIRECT_WRAPPER = "1";

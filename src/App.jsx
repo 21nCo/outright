@@ -1313,10 +1313,11 @@ export function App() {
       const result = await api(query(`/api/conversations/${conversation.id}/messages`, { before: conversation.messages[0].id, limit: 200 }));
       if (historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversation.id) return;
       if (pendingPrependScrollRef.current === pendingPrepend) pendingPrepend.prependedCount = result.messages.length;
-      checkpointCursorsRef.current = checkpointCursors(result.messages, checkpointCursorsRef.current, activeCursorOwners(conversation));
+      const pageMessages = result.messages.map(boundPageMessage);
+      checkpointCursorsRef.current = checkpointCursors(pageMessages, checkpointCursorsRef.current, activeCursorOwners(conversation));
       setConversation((current) => {
         if (current?.id !== conversation.id) return current;
-        const merged = [...result.messages, ...current.messages];
+        const merged = [...pageMessages, ...current.messages];
         const messages = merged.slice(0, MAX_RENDERED_MESSAGES);
         const total = Math.max(result.messagePage.total, current.messagePage?.total ?? 0);
         const olderCount = result.messagePage.olderCount;
@@ -1355,10 +1356,11 @@ export function App() {
     try {
       const result = await api(query(`/api/conversations/${conversation.id}/messages`, { after: conversation.messages.at(-1).id, limit: 200 }));
       if (historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversation.id) return;
-      checkpointCursorsRef.current = checkpointCursors(result.messages, checkpointCursorsRef.current, activeCursorOwners(conversation));
+      const pageMessages = result.messages.map(boundPageMessage);
+      checkpointCursorsRef.current = checkpointCursors(pageMessages, checkpointCursorsRef.current, activeCursorOwners(conversation));
       setConversation((current) => {
         if (current?.id !== conversation.id) return current;
-        const merged = [...current.messages, ...result.messages.filter((message) => !current.messages.some((entry) => entry.id === message.id))];
+        const merged = [...current.messages, ...pageMessages.filter((message) => !current.messages.some((entry) => entry.id === message.id))];
         const dropped = Math.max(0, merged.length - MAX_RENDERED_MESSAGES);
         const messages = merged.slice(dropped);
         if (dropped) pendingPage.fallbackIndex = Math.max(0, current.messages.findIndex((message) => message.id === pendingPage.messageId) - dropped);
@@ -1436,7 +1438,7 @@ export function App() {
       if (controller.signal.aborted || historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversationId) return undefined;
       if (!result.matchId) return null;
       stickToBottomRef.current = false;
-      const pageById = new Map(result.messages.map((message) => [message.id, message]));
+      const pageById = new Map(result.messages.map((message) => [message.id, boundPageMessage(message)]));
       let unseenEvent = false;
       for (const event of pendingFind.events) {
         if (event.type !== "message.created") continue;
@@ -1444,7 +1446,7 @@ export function App() {
         if (!previous) { unseenEvent = true; continue; }
         const oldSeq = previous.payload?.checkpointEventSeq;
         const newSeq = event.payload?.payload?.checkpointEventSeq;
-        if (!Number.isSafeInteger(oldSeq) || !Number.isSafeInteger(newSeq) || newSeq > oldSeq) pageById.set(event.payload.id, event.payload);
+        if (!Number.isSafeInteger(oldSeq) || !Number.isSafeInteger(newSeq) || newSeq > oldSeq) pageById.set(event.payload.id, boundPageMessage(event.payload));
       }
       const messages = result.messages.map((message) => pageById.get(message.id));
       checkpointCursorsRef.current = checkpointCursors(messages, checkpointCursorsRef.current, activeCursorOwners(conversationRef.current));

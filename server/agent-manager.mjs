@@ -309,7 +309,7 @@ export async function defaultLaunchCommand(command, run, launchDirectory) {
   };
 }
 
-export function createAgentManager({ database, publish, onProvidersChanged = () => {}, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
+export function createAgentManager({ database, publish, onProvidersChanged = () => {}, providerDiscoveryFactory = createProviderDiscovery, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
   const resolvedLaunchDirectory = launchDirectory
     ?? database.launchDirectory;
   assertPrivateLaunchDirectory(resolvedLaunchDirectory);
@@ -318,7 +318,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   const launches = new Set();
   let shuttingDown = false;
   let shutdownPromise;
-  const providerDiscovery = createProviderDiscovery({ onChange: onProvidersChanged });
+  const providerDiscovery = providerDiscoveryFactory({ onChange: onProvidersChanged });
 
   function providers() {
     return providerDiscovery.list();

@@ -1040,23 +1040,24 @@ async function terminalExitRejectionRegression() {
   const errors = [];
   const sent = [];
   let hold = true;
+  let candidateRequests = 0;
   const onError = (error) => errors.push(error);
   const sendRuntime = (message) => sent.push(message);
   route = async (url) => {
     if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("A2")] });
-    if (url.pathname === "/api/terminals/term-A2" && hold) return pending.promise;
+    if (url.pathname === "/api/terminals/term-A2" && hold) { candidateRequests += 1; return pending.promise; }
     return response({ buffer: "Running output\r\n", status: "running" });
   };
   const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} onError={onError} sendRuntime={sendRuntime} />);
   show();
   await until(() => terminalReady("Terminal A"), "running A before rejected exit");
   host.querySelector('[data-tab-id="term-A2"]').click();
-  await until(() => host.querySelector('.terminal-tabs[aria-busy="true"]'), "pending candidate before rejection");
+  await until(() => candidateRequests === 1 && host.querySelector('.terminal-tabs[aria-busy="true"]'), "pending candidate before rejection");
   show({ type: "terminal.exit", terminalId: "term-A2", payload: { exitCode: 7 } });
-  await settle();
-  assert(host.querySelector('[data-tab-id="term-A2"]').getAttribute("aria-label").includes("process exited 7"), "Candidate exit disappeared before activation failed");
+  await until(() => host.querySelector('[data-tab-id="term-A2"]')?.getAttribute("aria-label").includes("process exited 7"), "candidate exit retained during held activation");
+  assert(host.querySelector('.terminal-tabs[aria-busy="true"]'), "candidate exit released the held activation");
   show({ type: "terminal.exit", terminalId: "term-A", payload: { exitCode: 8 } });
-  await settle();
+  await until(() => host.querySelector('[data-tab-id="term-A"]')?.getAttribute("aria-label").includes("process exited 8"), "active exit retained during held activation");
   pending.reject(new Error("Buffer unavailable"));
   await until(() => errors.length === 1 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "rejected candidate after both exits");
   assert(host.querySelector('[data-tab-id="term-A"]').getAttribute("aria-label").includes("process exited 8"), "Active exit disappeared on recovery");
@@ -1575,9 +1576,13 @@ async function changesSelectionRefreshRegression() {
   await until(() => requests.some((item) => item.startsWith("/api/git/unstage")), "same-worktree mutation pending");
   [...host.querySelectorAll('.change-file-select')].find((button) => button.textContent.includes("a.txt")).click();
   host.querySelector('.diff-mode button').click();
+  const beforeMutationRefresh = requests.filter((item) => item.startsWith("/api/git/status")).length;
+  const beforeMutationDiff = requests.filter((item) => item.startsWith("/api/git/diff")).length;
   pendingMutation.resolve(response({ ok: true }));
-  await settle();
-  assert(host.querySelector('.change-file.is-active')?.textContent.includes("a.txt") && host.querySelector('.diff-view')?.textContent.includes("a.txt:false"), "Mutation follow-up restored the previous file or mode");
+  await until(() => requests.filter((item) => item.startsWith("/api/git/status")).length > beforeMutationRefresh
+    && requests.filter((item) => item.startsWith("/api/git/diff")).length > beforeMutationDiff
+    && host.querySelector('.change-file.is-active')?.textContent.includes("a.txt")
+    && host.querySelector('.diff-view')?.textContent.includes("a.txt:false"), "mutation follow-up preserved the selected file and mode");
 }
 
 async function changesDiffFailureOwnershipRegression() {
@@ -2623,7 +2628,13 @@ async function fullPageLiveAnchorRegression() {
   // A scroll event can arrive before native wheel movement. It must not
   // release upward ownership merely because the old position is near bottom.
   viewport.dispatchEvent(new Event("scroll"));
-  await new Promise((resolve) => setTimeout(resolve, 1050));
+  const readerIntentDeadline = Date.now() + 1050;
+  let readerIntentEvaluations = 0;
+  while (Date.now() < readerIntentDeadline) {
+    readerIntentEvaluations += 1;
+    await settle();
+  }
+  assert(readerIntentEvaluations >= 2, "upward reader intent was not observed over multiple updates");
   viewport.scrollTop = maximum - 48; viewport.dispatchEvent(new Event("scroll")); await settle();
   const readerTop = viewport.scrollTop;
   const frame = viewport.getBoundingClientRect();
@@ -2680,8 +2691,53 @@ async function largeLiveMessageRetentionRegression() {
   assert(row.querySelector('.message-run')?.textContent.includes("large-ru"), "bounded payload lost run identity");
 }
 
+async function largePageMessageRetentionRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const messages = Array.from({ length: 3 }, (_, index) => ({
+    id: `page-large-${index}`, role: "assistant", kind: "text",
+    body: `needle ${index} ` + "🙂".repeat(270_000), createdAt: new Date(index * 1000).toISOString(),
+    payload: { runId: `page-run-${index}`, provider: "codex", detail: "x".repeat(1024 * 1024) },
+  }));
+  const page = (rows, olderCount, newerCount) => ({ messages: rows,
+    messagePage: { hasMore: olderCount > 0, olderCount, hasLater: newerCount > 0, newerCount, total: 3, beforeId: rows[0]?.id } });
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname.endsWith("/messages/find")) return response({ matchId: messages[0].id, ...page(messages.slice(0, 1), 0, 2) });
+    if (url.pathname.endsWith("/messages")) return response(url.searchParams.has("before")
+      ? page(messages.slice(0, 2), 0, 1) : page(messages.slice(1), 1, 0));
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, ...page(messages.slice(2), 2, 0) });
+    return response({});
+  };
+  const assertBounded = (id) => {
+    const row = host.querySelector(`[data-message-id="${id}"]`);
+    assert(row, `missing ${id}`);
+    assert(row.querySelector('.message-text')?.textContent.length < 17_000, `${id} retained an oversized body`);
+    assert(row.querySelector('.message-full-reader button')?.textContent === "Read full message", `${id} lost full-body access`);
+    assert(row.querySelector('.message-run')?.textContent.includes("page-ru"), `${id} lost run identity`);
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[data-message-id="page-large-2"]'), "latest large page");
+  assertBounded("page-large-2");
+  host.querySelector('.history-loader').click();
+  await until(() => host.querySelector('[data-message-id="page-large-0"]'), "older large page");
+  assertBounded("page-large-0");
+  assert(!host.querySelector('.history-loader'), "older page cursor did not reach the start");
+  const input = host.querySelector('.history-find input');
+  setControlValue(input, "needle 0"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="page-large-0"]'), "large Find result");
+  assertBounded("page-large-0");
+  host.querySelector('.history-later').click();
+  await until(() => host.querySelector('[data-message-id="page-large-2"]'), "later large page");
+  assertBounded("page-large-2");
+  assert(!host.querySelector('.history-later'), "later page cursor did not reach the end");
+}
+
 async function transcriptObserverStabilityRegression() {
   root.render(null); await settle();
+  const socketCount = fixtureSockets.length;
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
   const messages = Array.from({ length: 300 }, (_, index) => ({ id: `stable-${index}`, role: "assistant", kind: "text",
     body: `History ${index}`, createdAt: new Date(index * 1000).toISOString() }));
@@ -2703,6 +2759,7 @@ async function transcriptObserverStabilityRegression() {
     };
     root.render(<TooltipProvider><App /></TooltipProvider>);
     await until(() => host.querySelector('[data-message-id="stable-299"]'), "long transcript ready");
+    await until(() => fixtureSockets.length > socketCount, "long transcript socket ready");
     const emit = (seq) => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({
       type: "run.event", conversationId: "chat-A", runId: "run-stable",
       payload: { type: "assistant.delta", seq, payload: { text: ` fragment ${seq}` } },
@@ -3776,6 +3833,7 @@ try {
     ["background reading refresh", backgroundReadingRefreshRegression, "missed replay and completion expose later output without moving a reader"],
     ["full-page live anchor", fullPageLiveAnchorRegression, "a new row at the 1000-message cap keeps the reader's oldest visible anchor"],
     ["large live message retention", largeLiveMessageRetentionRegression, "large live messages retain bounded excerpts and full-reader identity"],
+    ["large page message retention", largePageMessageRetentionRegression, "initial, earlier, Find and later pages retain bounded rows, IDs and full-body access"],
     ["transcript observer stability", transcriptObserverStabilityRegression, "stream paints do not restart row observation for an unchanged long transcript"],
     ["background completion page ownership", backgroundCompletionKeepsExplicitPageRegression, "run completion cannot supersede an explicit Return to latest request"],
     ["replay latest page boundary", replayKeepsLatestPageBoundaryRegression, "a buffered older checkpoint cannot make intervening history unreachable"],

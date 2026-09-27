@@ -212,13 +212,18 @@ test("ordinary conversation HTTP pages bound serialized bytes in both directions
   const chat = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Large pages", provider: "codex" });
   const ids = Array.from({ length: 12 }, () => runtime.database.addMessage({ conversationId: chat.id,
     role: "assistant", body: "x".repeat(1024 * 1024), payload: { detail: "y".repeat(1024 * 1024) } }).id);
-  for (const suffix of ["", `/messages?before=${ids[9]}&limit=5`, `/messages?after=${ids[1]}&limit=5`]) {
+  for (const [suffix, expected] of [
+    ["", ids.slice(9, 12)],
+    [`/messages?before=${ids[9]}&limit=5`, ids.slice(6, 9)],
+    [`/messages?after=${ids[1]}&limit=5`, ids.slice(2, 5)],
+  ]) {
     const response = responseCapture();
     await runtime.handleRequest(requestStream("GET", `/api/conversations/${chat.id}${suffix}`), response);
     assert.equal(response.statusCode, 200);
     assert.ok(Buffer.byteLength(response.raw) <= 8 * 1024 * 1024 + 2048, `${suffix || "detail"} exceeded its HTTP byte budget`);
     assert.equal(response.body.messagePage.total, ids.length);
     assert.equal(response.body.messagePage.olderCount + response.body.messages.length + response.body.messagePage.newerCount, ids.length);
+    assert.deepEqual(response.body.messages.map((message) => message.id), expected, `${suffix || "detail"} returned the wrong contiguous window`);
     assert.equal(response.body.messages.every((message) => message.findExcerpt && message.payloadOmitted), true);
   }
 }));
