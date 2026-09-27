@@ -1,0 +1,28 @@
+scripts/run-tests.mjs
+  h_a39f9495f9ec1d 31,33-35,46,59-63,67,70-79
+server/database.mjs
+  h_a39f9495f9ec1d 19-20,182-188,192,197,200,203-249,251,254,256-257,742-758
+server/database.test.mjs
+  h_a39f9495f9ec1d 115-175
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 32,211-225
+src/App.jsx
+  h_a39f9495f9ec1d 488,501,513,655,884-885,896-908,929,932,935,937,940,945-949,954,967,977-978,997-1000,1005,1013,1038-1039,1043-1046,1048,1068,1679-1695
+tests/run-tests.test.mjs
+  h_a39f9495f9ec1d 38,41,43-44,52,56,63,74,81,87,90-92,95-99,101,109-116,119
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 2608-2619,2623-2626,2637-2638,2640,2644-2680,3778
+tests/ui-races.test.mjs
+  h_a39f9495f9ec1d 832
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ca9d935d0fc18e6f084522e8097cd25fcb720857",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
