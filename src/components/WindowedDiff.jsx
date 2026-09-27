@@ -116,7 +116,10 @@ export function WindowedDiff({ diff, label }) {
     const query = value.trim().toLocaleLowerCase();
     if (!query) { setFoundLine(-1); setSearched(false); foundOffsetRef.current = -1; return; }
     const offset = foundOffsetRef.current < 0 ? (direction > 0 ? 0 : searchable.length - 1) : foundOffsetRef.current + direction;
-    let match = direction > 0 ? searchable.indexOf(query, offset) : searchable.lastIndexOf(query, offset);
+    // lastIndexOf treats a negative fromIndex as zero, so wrap explicitly
+    // when Previous moves left of a match at the start of the diff.
+    const searchOffset = direction < 0 && offset < 0 ? searchable.length - 1 : offset;
+    let match = direction > 0 ? searchable.indexOf(query, searchOffset) : searchable.lastIndexOf(query, searchOffset);
     if (match < 0) match = direction > 0 ? searchable.indexOf(query) : searchable.lastIndexOf(query);
     if (match < 0) { setFoundLine(-1); setSearched(true); foundOffsetRef.current = -1; return; }
     foundOffsetRef.current = match;

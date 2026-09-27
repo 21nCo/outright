@@ -317,14 +317,29 @@ export function createOutrightDatabase(options = {}) {
     },
     getMessageBodyChunk(conversationId, messageId, offset) {
       // Find returns excerpts for oversized matches. Read the full body by
-      // identity in fixed-size sections without hydrating it into JS at once.
-      const row = db.prepare(`SELECT id, LENGTH(body) AS totalCharacters,
-        SUBSTR(body, ? + 1, 65536) AS body
+      // identity in fixed-size byte sections. SQLite's TEXT LENGTH and SUBSTR
+      // stop at an embedded NUL and count characters from the start of a row.
+      // BLOB offsets include NULs and make consecutive reads linear in size.
+      const row = db.prepare(`SELECT id, LENGTH(COALESCE(CAST(body AS BLOB), X'')) AS totalBytes,
+        SUBSTR(COALESCE(CAST(body AS BLOB), X''), ? + 1, 65540) AS body
         FROM messages WHERE conversation_id = ? AND id = ?`).get(offset, conversationId, messageId);
       if (!row) return null;
-      if (offset > row.totalCharacters) throw databaseError(400, "Message body offset is invalid");
-      const nextOffset = offset + [...row.body].length;
-      return { id: row.id, body: row.body, offset, nextOffset, totalCharacters: row.totalCharacters, hasMore: nextOffset < row.totalCharacters };
+      if (offset > row.totalBytes) throw databaseError(400, "Message body offset is invalid");
+      const bytes = Buffer.from(row.body);
+      let start = 0;
+      while (start < Math.min(4, bytes.length) && bytes[start] >= 0x80 && bytes[start] < 0xc0) start += 1;
+      if (start === 4 || (start === bytes.length && offset < row.totalBytes)) throw databaseError(400, "Message body offset is invalid");
+      let end = Math.min(bytes.length, start + 65536);
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      let body;
+      while (end > start) {
+        try { body = decoder.decode(bytes.subarray(start, end)); break; }
+        catch { end -= 1; }
+      }
+      if (body === undefined && bytes.length > start) throw databaseError(400, "Message body is not valid UTF-8");
+      const actualOffset = offset + start;
+      const nextOffset = offset + end;
+      return { id: row.id, body: body ?? "", offset: actualOffset, nextOffset, totalBytes: row.totalBytes, hasMore: nextOffset < row.totalBytes };
     },
     addMessage(input) {
       const message = { id: input.id ?? randomUUID(), createdAt: input.createdAt ?? now(), ...input };

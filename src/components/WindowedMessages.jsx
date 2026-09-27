@@ -4,7 +4,7 @@ import { scheduleLayoutTick, windowRange } from "@/lib/windowing";
 export const ESTIMATED_MESSAGE_HEIGHT = 110;
 const FULL_RENDER_LIMIT = 80;
 
-export function WindowedMessages({ messages, messagePage, viewportRef, renderMessage, onFind, onCancelFind, resetFindGeneration = 0 }) {
+export function WindowedMessages({ messages, messagePage, viewportRef, renderMessage, onFind, onCancelFind, restoreAnchorId, resetFindGeneration = 0 }) {
   const listRef = useRef(null);
   const heightsRef = useRef(new Map());
   const messagesRef = useRef(messages);
@@ -90,7 +90,8 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     let next = messages.length <= FULL_RENDER_LIMIT
       ? { start: 0, end: messages.length, top: 0, bottom: 0 }
       : windowRange(messages.length, (index) => known.get(messages[index].id) ?? ESTIMATED_MESSAGE_HEIGHT, Math.max(0, -localOffset), viewport.clientHeight);
-    let pinned = pendingFoundRef.current;
+    const restoreId = restoreAnchorId?.();
+    let pinned = restoreId && messages.some((message) => message.id === restoreId) ? restoreId : pendingFoundRef.current;
     if (!pinned && foundId) {
       const marked = list.querySelector('[data-find-match="true"]');
       const bounds = marked?.getBoundingClientRect();
@@ -112,7 +113,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
       rangeRef.current = next;
       scheduleRange();
     }
-  }, [messages, viewportRef, foundId, scheduleRange]);
+  }, [messages, viewportRef, foundId, restoreAnchorId, scheduleRange]);
 
   useEffect(() => () => { rangeFrameRef.current?.(); rangeFrameRef.current = null; }, []);
 

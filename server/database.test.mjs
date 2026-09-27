@@ -82,15 +82,32 @@ test("conversation Find bounds hydrated neighbors and keeps page cursors exact",
     const firstChunk = database.getMessageBodyChunk(chat.id, hugeMatch.id, 0);
     assert.equal(firstChunk.body.length, 65536);
     assert.equal(firstChunk.hasMore, true);
-    const lastChunk = database.getMessageBodyChunk(chat.id, hugeMatch.id, firstChunk.totalCharacters - 100);
+    const lastChunk = database.getMessageBodyChunk(chat.id, hugeMatch.id, firstChunk.totalBytes - 100);
     assert.equal(lastChunk.body, "b".repeat(100));
     assert.equal(lastChunk.hasMore, false);
     const unicode = database.addMessage({ conversationId: chat.id, role: "assistant", body: "🙂".repeat(65537) });
     const unicodeFirst = database.getMessageBodyChunk(chat.id, unicode.id, 0);
     const unicodeLast = database.getMessageBodyChunk(chat.id, unicode.id, unicodeFirst.nextOffset);
     assert.equal(unicodeFirst.nextOffset, 65536);
-    assert.equal(unicodeLast.body, "🙂");
-    assert.equal(unicodeLast.hasMore, false);
+    assert.equal(unicodeLast.body, "🙂".repeat(16384));
+    let section = unicodeLast;
+    let reconstructed = unicodeFirst.body + unicodeLast.body;
+    while (section.hasMore) {
+      section = database.getMessageBodyChunk(chat.id, unicode.id, section.nextOffset);
+      reconstructed += section.body;
+    }
+    assert.equal(reconstructed, "🙂".repeat(65537));
+    const nul = database.addMessage({ conversationId: chat.id, role: "assistant", body: `start\0${"🙂".repeat(20000)}\0end` });
+    let cursor = 0;
+    let complete = "";
+    do {
+      const part = database.getMessageBodyChunk(chat.id, nul.id, cursor);
+      assert.ok(Buffer.byteLength(part.body) <= 65536);
+      assert.ok(part.nextOffset > cursor);
+      complete += part.body;
+      cursor = part.nextOffset;
+    } while (cursor < database.getMessageBodyChunk(chat.id, nul.id, 0).totalBytes);
+    assert.equal(complete, `start\0${"🙂".repeat(20000)}\0end`);
     assert.equal(database.getMessageBodyChunk(chat.id, "foreign", 0), null);
   } finally { database.close(); }
 });

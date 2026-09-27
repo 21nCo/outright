@@ -223,6 +223,16 @@ test("full Find body sections stay bounded and scoped to the selected conversati
   await runtime.handleRequest(requestStream("GET", `${path}?offset=${first.body.nextOffset}`), second);
   assert.equal(second.statusCode, 200);
   assert.ok(second.body.body.includes("needle"));
+  const mixed = runtime.database.addMessage({ conversationId: chat.id, role: "assistant", body: `${"x".repeat(65534)}🙂\0tail` });
+  const mixedPath = `/api/conversations/${chat.id}/messages/${mixed.id}/body`;
+  const mixedFirst = responseCapture();
+  await runtime.handleRequest(requestStream("GET", mixedPath), mixedFirst);
+  const mixedNext = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `${mixedPath}?offset=${mixedFirst.body.nextOffset}`), mixedNext);
+  assert.equal(mixedFirst.statusCode, 200);
+  assert.equal(mixedNext.statusCode, 200);
+  assert.equal(mixedFirst.body.body + mixedNext.body.body, `${"x".repeat(65534)}🙂\0tail`);
+  assert.ok(Buffer.byteLength(JSON.stringify(mixedFirst.body)) < 65536 + 1024);
   for (const invalid of [`/api/conversations/${other.id}/messages/${message.id}/body`, `${path}?offset=-1`, `${path}?offset=1.5`, `${path}?offset=999999`, `/api/conversations/${chat.id}/messages/%ZZ/body`]) {
     const reply = responseCapture();
     await runtime.handleRequest(requestStream("GET", invalid), reply);

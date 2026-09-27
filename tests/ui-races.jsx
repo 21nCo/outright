@@ -2018,6 +2018,22 @@ async function unicodeDiffFindRegression() {
   assert(host.querySelector('.window-find [role="status"]')?.textContent === "Line 402", "Unicode case folding shifted the diff line coordinate");
 }
 
+async function reverseDiffFindWrapRegression() {
+  root.render(null); await settle();
+  root.render(<div style={{ height: 420 }}><WindowedDiff diff={"needle first\nneedle middle\nneedle last\n"} label="Reverse Find diff" /></div>);
+  await until(() => host.querySelector('input[aria-label="Find in diff"]'), "reverse Find ready");
+  const input = host.querySelector('input[aria-label="Find in diff"]');
+  setControlValue(input, "needle"); await settle();
+  const next = host.querySelector('[aria-label="Next diff match"]');
+  const previous = host.querySelector('[aria-label="Previous diff match"]');
+  next.click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("first"), "first diff match");
+  previous.click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("last"), "Previous wraps from offset zero to the final match");
+  previous.click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("middle"), "Previous continues from the wrapped match");
+}
+
 async function manyWorktreeSessionRegression() {
   root.render(null);
   await settle();
@@ -2261,6 +2277,8 @@ async function pagedTranscriptFindRegression({ endOnly = false, measuredOnly = f
     row.style.minHeight = `${row.getBoundingClientRect().height + 900}px`;
     viewport.scrollTop = oldEnd;
     viewport.dispatchEvent(new Event("scroll"));
+    await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96,
+      "latest page followed the newly measured row before the next message");
     fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1_001) }) }));
     try { await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96, "latest page followed a newly measured row and live append"); }
     catch (error) { throw new Error(`${error.message}; oldEnd=${oldEnd}, top=${viewport.scrollTop}, height=${viewport.scrollHeight}, client=${viewport.clientHeight}, rows=${[...viewport.querySelectorAll('[data-message-id]')].map((item) => item.dataset.messageId).join(',')}`); }
@@ -2550,12 +2568,18 @@ async function fullPageLiveAnchorRegression() {
   const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
   viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); await settle();
   viewport.scrollTop = 0; viewport.dispatchEvent(new Event("scroll"));
-  await until(() => host.querySelector('[data-message-id="full-0"]'), "first row while reading full page");
+  await until(() => {
+    const row = host.querySelector('[data-message-id="full-0"]');
+    return row && row.getBoundingClientRect().bottom > viewport.getBoundingClientRect().top
+      && row.getBoundingClientRect().top < viewport.getBoundingClientRect().bottom && viewport.scrollTop < 50;
+  }, "first row visibly read at the top of the full page");
   const anchorTop = host.querySelector('[data-message-id="full-0"]').getBoundingClientRect().top;
   all = [...all, message(1000)];
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1000) }) }));
   await until(() => host.querySelector('.history-return')?.textContent.includes("1 new"), "new row offered after full-page append");
-  assert(host.querySelector('[data-message-id="full-0"]') && Math.abs(host.querySelector('[data-message-id="full-0"]').getBoundingClientRect().top - anchorTop) < 24, "A full-page live append evicted the reader's anchor");
+  await until(() => host.querySelector('[data-message-id="full-0"]')
+    && Math.abs(host.querySelector('[data-message-id="full-0"]').getBoundingClientRect().top - anchorTop) < 24,
+  "A full-page live append retained the visible reader anchor");
   host.querySelector('.history-return').click();
   await until(() => !host.querySelector('.history-return'), "explicit latest after full-page append");
   viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll"));
@@ -3584,6 +3608,7 @@ try {
     ["large diff window", largeDiffWindowRegression, "fifty thousand diff lines keep a bounded DOM and preserve the last line"],
     ["extreme diff height", extremeDiffHeightRegression, "a clamped-height diff still reaches its final line with End and Find"],
     ["Unicode diff find", unicodeDiffFindRegression, "length-changing case folding keeps the correct diff line"],
+    ["reverse diff Find wrap", reverseDiffFindWrapRegression, "Previous wraps left of offset zero and continues through earlier matches"],
     ["production diff viewport", productionDiffViewportRegression, "staged and unstaged large diffs stay bounded in the inspector"],
     ["paged transcript anchor", pagedTranscriptAnchorRegression, "loading earlier history preserves its visible reading anchor"],
     ["stale page measured follow", () => pagedTranscriptFindRegression({ measuredOnly: true }), "a newly measured row cannot erase latest-page bottom intent before a live append"],
