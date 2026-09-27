@@ -251,7 +251,7 @@ export function createOutrightDatabase(options = {}) {
         // Select by stored byte lengths before hydrating message bodies. A
         // 200-row Find window can otherwise serialize hundreds of MiB even
         // though the search scan itself has an 8 MiB work limit.
-        const sizes = `SELECT search_order AS rowid, id, LENGTH(CAST(body AS BLOB)) + LENGTH(CAST(payload AS BLOB)) + 512 AS bytes
+        const sizes = `SELECT search_order AS rowid, id, COALESCE(LENGTH(CAST(body AS BLOB)), 0) + COALESCE(LENGTH(CAST(payload AS BLOB)), 0) + 512 AS bytes
           FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order`;
         const olderCandidates = db.prepare(`${sizes} <= ? ORDER BY search_order DESC LIMIT 100`).all(conversationId, match.rowid);
         const newerCandidates = db.prepare(`${sizes} > ? ORDER BY search_order ASC LIMIT 100`).all(conversationId, match.rowid);
@@ -314,6 +314,17 @@ export function createOutrightDatabase(options = {}) {
           total: olderCount + messages.length + newerCount, beforeId: messages[0].id, limit: 200,
         } };
       } finally { activeMessageFinds -= 1; }
+    },
+    getMessageBodyChunk(conversationId, messageId, offset) {
+      // Find returns excerpts for oversized matches. Read the full body by
+      // identity in fixed-size sections without hydrating it into JS at once.
+      const row = db.prepare(`SELECT id, LENGTH(body) AS totalCharacters,
+        SUBSTR(body, ? + 1, 65536) AS body
+        FROM messages WHERE conversation_id = ? AND id = ?`).get(offset, conversationId, messageId);
+      if (!row) return null;
+      if (offset > row.totalCharacters) throw databaseError(400, "Message body offset is invalid");
+      const nextOffset = offset + [...row.body].length;
+      return { id: row.id, body: row.body, offset, nextOffset, totalCharacters: row.totalCharacters, hasMore: nextOffset < row.totalCharacters };
     },
     addMessage(input) {
       const message = { id: input.id ?? randomUUID(), createdAt: input.createdAt ?? now(), ...input };

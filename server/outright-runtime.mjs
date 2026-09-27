@@ -207,6 +207,17 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         });
         return json(response, 200, { messages: messagePage.messages, messagePage: messagePage.page });
       }
+      const messageBodyMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages\/([^/]+)\/body$/);
+      if (messageBodyMatch && request.method === "GET") {
+        if (!database.getConversation(messageBodyMatch[1])) throw apiError(404, "Conversation not found");
+        const offsetText = url.searchParams.get("offset") ?? "0";
+        if (!/^(0|[1-9][0-9]*)$/.test(offsetText) || !Number.isSafeInteger(Number(offsetText))) throw apiError(400, "Message body offset is invalid");
+        let messageId;
+        try { messageId = decodeURIComponent(messageBodyMatch[2]); }
+        catch { throw apiError(400, "Message id is invalid"); }
+        const body = database.getMessageBodyChunk(messageBodyMatch[1], messageId, Number(offsetText));
+        return json(response, body ? 200 : 404, body);
+      }
       const conversationFindMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages\/find$/);
       if (conversationFindMatch && request.method === "GET") {
         if (!database.getConversation(conversationFindMatch[1])) throw apiError(404, "Conversation not found");

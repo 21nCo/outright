@@ -208,6 +208,28 @@ test("conversation forward pages and count endpoint remain scoped to one convers
   assert.equal(missing.statusCode, 404);
 }));
 
+test("full Find body sections stay bounded and scoped to the selected conversation", withRuntime(async (runtime) => {
+  const chat = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Large", provider: "codex" });
+  const other = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Other", provider: "codex" });
+  const message = runtime.database.addMessage({ conversationId: chat.id, role: "assistant", body: `${"x".repeat(70000)}needle${"y".repeat(70000)}` });
+  const path = `/api/conversations/${chat.id}/messages/${message.id}/body`;
+  const first = responseCapture();
+  await runtime.handleRequest(requestStream("GET", path), first);
+  assert.equal(first.statusCode, 200);
+  assert.equal(first.body.body.length, 65536);
+  assert.equal(first.body.nextOffset, 65536);
+  assert.equal(first.body.hasMore, true);
+  const second = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `${path}?offset=${first.body.nextOffset}`), second);
+  assert.equal(second.statusCode, 200);
+  assert.ok(second.body.body.includes("needle"));
+  for (const invalid of [`/api/conversations/${other.id}/messages/${message.id}/body`, `${path}?offset=-1`, `${path}?offset=1.5`, `${path}?offset=999999`, `/api/conversations/${chat.id}/messages/%ZZ/body`]) {
+    const reply = responseCapture();
+    await runtime.handleRequest(requestStream("GET", invalid), reply);
+    assert.equal(reply.statusCode, invalid.includes(other.id) ? 404 : 400);
+  }
+}));
+
 async function waitForValidation(entered, pending) {
   let timer;
   try {

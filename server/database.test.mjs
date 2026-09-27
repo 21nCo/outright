@@ -79,7 +79,44 @@ test("conversation Find bounds hydrated neighbors and keeps page cursors exact",
     assert.equal(huge.messages.find((message) => message.id === hugeMatch.id).findExcerpt, true);
     assert.ok(huge.messages.find((message) => message.id === hugeMatch.id).body.includes("unique huge needle"));
     assert.ok(Buffer.byteLength(JSON.stringify(huge)) <= 8 * 1024 * 1024 + 1024);
+    const firstChunk = database.getMessageBodyChunk(chat.id, hugeMatch.id, 0);
+    assert.equal(firstChunk.body.length, 65536);
+    assert.equal(firstChunk.hasMore, true);
+    const lastChunk = database.getMessageBodyChunk(chat.id, hugeMatch.id, firstChunk.totalCharacters - 100);
+    assert.equal(lastChunk.body, "b".repeat(100));
+    assert.equal(lastChunk.hasMore, false);
+    const unicode = database.addMessage({ conversationId: chat.id, role: "assistant", body: "🙂".repeat(65537) });
+    const unicodeFirst = database.getMessageBodyChunk(chat.id, unicode.id, 0);
+    const unicodeLast = database.getMessageBodyChunk(chat.id, unicode.id, unicodeFirst.nextOffset);
+    assert.equal(unicodeFirst.nextOffset, 65536);
+    assert.equal(unicodeLast.body, "🙂");
+    assert.equal(unicodeLast.hasMore, false);
+    assert.equal(database.getMessageBodyChunk(chat.id, "foreign", 0), null);
   } finally { database.close(); }
+});
+
+test("nullable legacy payloads obey Find's byte cap and preserve both cursor edges", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-find-null-"));
+  const filename = path.join(root, "messages.db");
+  const database = createOutrightDatabase({ filename });
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Legacy", provider: "codex" });
+    const ids = Array.from({ length: 20 }, (_, index) => database.addMessage({ conversationId: chat.id, role: "user",
+      body: `${index === 10 ? "needle " : ""}${"x".repeat(1024 * 1024)}` }).id);
+    const legacy = new Database(filename);
+    try { legacy.prepare("UPDATE messages SET payload = NULL WHERE conversation_id = ?").run(chat.id); }
+    finally { legacy.close(); }
+    const found = await database.findMessagePage(chat.id, "needle", ids[9]);
+    assert.equal(found.matchId, ids[10]);
+    assert.ok(Buffer.byteLength(JSON.stringify(found)) <= 8 * 1024 * 1024 + 1024);
+    const first = ids.indexOf(found.messages[0].id);
+    const last = ids.indexOf(found.messages.at(-1).id);
+    assert.deepEqual(found.messages.map((message) => message.id), ids.slice(first, last + 1));
+    assert.equal(found.messagePage.olderCount, first);
+    assert.equal(found.messagePage.newerCount, 19 - last);
+    assert.equal(database.listMessagePage(chat.id, { beforeId: found.messages[0].id, limit: 1 }).messages[0]?.id, ids[first - 1]);
+    assert.equal(database.listMessagePage(chat.id, { afterId: found.messages.at(-1).id, limit: 1 }).messages[0]?.id, ids[last + 1]);
+  } finally { database.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test("forward message pages continue from a found page with exact persisted counts", () => {

@@ -1959,6 +1959,12 @@ async function extremeDiffHeightRegression() {
   setControlValue(nearInput, "WHEEL A"); await settle();
   nearInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => nearViewport.querySelector('[data-find-match="true"]')?.textContent.includes("WHEEL A"), "near-limit middle marker visible");
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 360 }}><WindowedDiff diff={nearLimit} label="Near-limit diff" /></div>);
+  await until(() => nearViewport.clientHeight < 400 && nearViewport.querySelector('[data-find-match="true"]')?.textContent.includes("WHEEL A"), "refreshed diff resized");
+  for (let tick = 0; tick < 4; tick += 1) await frame();
+  const resizedMark = nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+  const resizedViewport = nearViewport.getBoundingClientRect();
+  assert(resizedMark.top < resizedViewport.bottom && resizedMark.bottom > resizedViewport.top, "resizing a refreshed compressed diff lost its matched line");
   await settle();
   const beforeWheel = nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top;
   nearViewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 14, bubbles: true, cancelable: true }));
@@ -2291,6 +2297,53 @@ async function pagedTranscriptFindRegression({ endOnly = false, measuredOnly = f
   await until(() => archiveSignal.aborted, "archiving aborted its pending Find request");
   archiveSearch.resolve(response({ matchId: null, messages: [], messagePage: null }));
   await until(() => !host.querySelector('.chat-tab.is-active'), "archived chat released its visible owner");
+}
+
+async function fullFindMessageReaderRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const full = { id: "large-match", role: "assistant", kind: "text", body: "startneedle-end", createdAt: new Date().toISOString() };
+  const excerpt = { ...full, body: "needle [Later text omitted from Find result]", findExcerpt: true };
+  const later = { ...full, id: "later-message", body: "Later response" };
+  let failedNext = false;
+  let bodyRequests = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname.endsWith("/messages/find")) return response({ matchId: full.id, messages: [excerpt], messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 1, total: 2, beforeId: full.id } });
+    if (url.pathname.endsWith(`/messages/${full.id}/body`)) {
+      bodyRequests += 1;
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      if (offset === 5 && !failedNext) { failedNext = true; return response({ error: "Section unavailable" }, 503); }
+      return response(offset ? { id: full.id, body: "needle-end", offset: 5, nextOffset: 15, totalCharacters: 15, hasMore: false }
+        : { id: full.id, body: "start", offset: 0, nextOffset: 5, totalCharacters: 15, hasMore: true });
+    }
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: [later], messagePage: { hasMore: true, olderCount: 1, total: 2, beforeId: later.id } });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.history-find input'), "Find reader ready");
+  setControlValue(host.querySelector('.history-find input'), "needle"); await settle();
+  host.querySelector('.history-find input').dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('.message-full-reader button'), "excerpt offers full message");
+  const open = host.querySelector('.message-full-reader button');
+  open.focus();
+  assert(document.activeElement === open, "full message action is keyboard reachable");
+  if (window.__fixtureSendKey) await window.__fixtureSendKey("Enter"); else open.click();
+  try { await until(() => host.querySelector('.message-full-reader pre')?.textContent === "start", "first body section loaded"); }
+  catch (error) { throw new Error(`${error.message}; requests=${bodyRequests}, reader=${host.querySelector('.message-full-reader')?.textContent?.slice(0, 300)}, active=${document.activeElement?.outerHTML?.slice(0, 150)}`); }
+  const next = [...host.querySelectorAll('.message-full-reader button')].find((button) => button.textContent === "Next section");
+  next.click();
+  await until(() => host.querySelector('.message-full-reader [role="alert"]')?.textContent.includes("Section unavailable"), "body section failure exposed retry");
+  assert(host.querySelector('.message-full-reader pre')?.textContent === "start", "failed section did not discard the readable section");
+  next.click();
+  await until(() => host.querySelector('.message-full-reader pre')?.textContent === "needle-end", "next body section readable");
+  assert(host.querySelector('.message-full-reader pre')?.textContent.length < 20, "reader did not accumulate old sections");
+  const previous = [...host.querySelectorAll('.message-full-reader button')].find((button) => button.textContent === "Previous section");
+  previous.click();
+  await until(() => host.querySelector('.message-full-reader pre')?.textContent === "start", "previous body section readable");
+  host.querySelector('.history-return')?.click();
+  await until(() => !host.querySelector('.message-full-reader'), "full body reader cleared on return to latest");
 }
 
 async function backgroundLatestRefreshRegression() {
@@ -3535,6 +3588,7 @@ try {
     ["paged transcript anchor", pagedTranscriptAnchorRegression, "loading earlier history preserves its visible reading anchor"],
     ["stale page measured follow", () => pagedTranscriptFindRegression({ measuredOnly: true }), "a newly measured row cannot erase latest-page bottom intent before a live append"],
     ["paged transcript find", pagedTranscriptFindRegression, "find navigates older persisted messages with bounded mounted rows"],
+    ["full Find message reader", fullFindMessageReaderRegression, "an excerpted match opens bounded full-body sections with keyboard, retry and navigation"],
     ["stale page End follow", () => pagedTranscriptFindRegression({ endOnly: true }), "End reaches the latest row after stale and failed page loads and follows new output"],
     ["forward history paging", forwardHistoryPagingRegression, "an old page can be read continuously through the persisted end within the 1000-row cap"],
     ["forward page eviction anchor", forwardPageEvictionAnchorRegression, "a full-window forward page retains surviving reading rows and hands evicted rows to Load earlier"],

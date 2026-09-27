@@ -28,9 +28,11 @@ export function WindowedDiff({ diff, label }) {
   const wheelRemainderRef = useRef(0);
   const logicalFirstRef = useRef(0);
   const programmaticTopRef = useRef(null);
+  const layoutRef = useRef({ compressed: false, maxFirst: 0, maxScroll: 1 });
   const updatePosition = (viewport, logicalFirst = null) => {
     const top = viewport.scrollTop;
     const height = viewport.clientHeight;
+    const { compressed, maxFirst, maxScroll } = layoutRef.current;
     // A compressed track has fewer physical pixels than logical lines. Keep
     // line moves exact, even when the browser rounds a programmatic scroll.
     const first = logicalFirst ?? (programmaticTopRef.current != null && Math.abs(top - programmaticTopRef.current) <= 1
@@ -54,6 +56,11 @@ export function WindowedDiff({ diff, label }) {
   const visibleRows = Math.max(1, Math.floor(position.height / LINE_HEIGHT));
   const maxFirst = Math.max(0, count - visibleRows);
   const maxScroll = Math.max(1, trackHeight - position.height);
+  useLayoutEffect(() => {
+    // Only committed geometry can own scroll events. A discarded render must
+    // not change the observer's coordinate model.
+    layoutRef.current = { compressed, maxFirst, maxScroll };
+  }, [compressed, maxFirst, maxScroll]);
   useLayoutEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
@@ -124,6 +131,8 @@ export function WindowedDiff({ diff, label }) {
   useLayoutEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
+    // ResizeObserver survives same-component diff refreshes. Read the latest
+    // coordinate model, rather than retaining the layout from the first diff.
     const update = () => updatePosition(viewport);
     update();
     const resize = new ResizeObserver(update);

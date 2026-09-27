@@ -6,10 +6,24 @@ import os from "node:os";
 import path from "node:path";
 import { createProviderDiscovery, defaultProbe } from "./provider-discovery.mjs";
 
-function probeProcessRunning(pid) {
-  const result = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8", timeout: 1000 });
-  return result.status === 0 && !/^Z/.test(result.stdout.trim());
+function probeProcessRunning(pid, inspect = spawnSync) {
+  const result = inspect("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8", timeout: 1000 });
+  if (result.error || (result.status !== 0 && result.status !== 1)) throw result.error ?? new Error(`ps inspection failed: ${result.status}: ${result.stderr}`);
+  if (result.status === 1) {
+    assert.equal(result.stdout.trim(), "", "ps returned a missing PID with process output");
+    assert.equal(result.stderr.trim(), "", "ps reported an inspection error rather than a missing PID");
+    return false;
+  }
+  const state = result.stdout.trim();
+  assert.match(state, /^[A-Z]/, "ps returned no process state for an existing PID");
+  return !state.startsWith("Z");
 }
+
+test("a failed process inspection cannot prove probe cleanup", () => {
+  assert.throws(() => probeProcessRunning(123, () => ({ status: null, error: new Error("ps timed out") })), /ps timed out/);
+  assert.throws(() => probeProcessRunning(123, () => ({ status: 2, stderr: "permission denied" })), /ps inspection failed/);
+  assert.throws(() => probeProcessRunning(123, () => ({ status: 1, stdout: "", stderr: "permission denied" })), /inspection error/);
+});
 
 async function waitForProbeExit(pid) {
   const deadline = Date.now() + 1000;

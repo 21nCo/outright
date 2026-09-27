@@ -804,10 +804,10 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
           return;
         }
         if (event.params.name === "__requestFixtureKey") {
-          if (!["Escape", "Tab", "End"].includes(event.params.payload)) throw new Error("Unexpected fixture key");
-          const code = event.params.payload === "Tab" ? 9 : event.params.payload === "End" ? 35 : 27;
+          if (!["Escape", "Tab", "End", "Enter"].includes(event.params.payload)) throw new Error("Unexpected fixture key");
+          const code = event.params.payload === "Tab" ? 9 : event.params.payload === "End" ? 35 : event.params.payload === "Enter" ? 13 : 27;
           const key = { key: event.params.payload, code: event.params.payload, windowsVirtualKeyCode: code, nativeVirtualKeyCode: code };
-          await send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...key });
+          await send("Input.dispatchKeyEvent", { type: event.params.payload === "Enter" ? "keyDown" : "rawKeyDown", ...(event.params.payload === "Enter" ? { text: "\r" } : {}), ...key });
           await send("Input.dispatchKeyEvent", { type: "keyUp", ...key });
           await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-key-ready", { detail: ${JSON.stringify(event.params.payload)} }))` });
           return;
@@ -829,7 +829,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     }, deadline);
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
     const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
-    assert.match(state.text, new RegExp(`${selectedCount ?? 89} interaction regressions passed`));
+    assert.match(state.text, new RegExp(`${selectedCount ?? 90} interaction regressions passed`));
     const performanceFixture = state.text.match(/Performance fixture: (\{[^\n]+\})/);
     if (!process.env.OUTRIGHT_UI_STEP) assert.ok(performanceFixture, "large fixture measurements were not recorded");
     if (performanceFixture) console.log(`UI performance: ${performanceFixture[1]}`);
