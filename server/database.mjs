@@ -16,6 +16,8 @@ const DEFAULT_SETTINGS = {
 };
 
 const MAX_RUN_EVENT_PAYLOAD_BYTES = 256 * 1024;
+const MAX_MESSAGE_PAGE_BYTES = 8 * 1024 * 1024;
+const MAX_INLINE_MESSAGE_BYTES = 64 * 1024;
 
 const SETTING_RULES = {
   provider: (value) => typeof value === "string" && ["codex", "claude"].includes(value),
@@ -177,30 +179,82 @@ export function createOutrightDatabase(options = {}) {
     listMessagePage(conversationId, options = {}) {
       const limit = Math.max(1, Math.min(500, Number(options.limit) || 200));
       if (options.beforeId && options.afterId) throw databaseError(400, "Choose one message cursor");
-      let rows;
+      // Select a contiguous cursor window by stored byte lengths before any
+      // body or payload crosses into JavaScript. Each row also has an inline
+      // ceiling, so five retained pages cannot grow with legacy large rows.
+      const candidateColumns = `search_order AS messageRowId, id,
+        COALESCE(LENGTH(CAST(body AS BLOB)), 0) AS bodyBytes,
+        COALESCE(LENGTH(CAST(payload AS BLOB)), 0) AS payloadBytes`;
+      let candidates;
       if (options.beforeId) {
         const cursor = db.prepare("SELECT search_order AS rowid FROM messages WHERE conversation_id = ? AND id = ?").get(conversationId, options.beforeId);
         if (!cursor) throw databaseError(400, "Message cursor was not found");
-        rows = db.prepare(`SELECT search_order AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+        candidates = db.prepare(`SELECT ${candidateColumns}
           FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order < ? ORDER BY search_order DESC LIMIT ?`).all(conversationId, cursor.rowid, limit);
       } else if (options.afterId) {
         const cursor = db.prepare("SELECT search_order AS rowid FROM messages WHERE conversation_id = ? AND id = ?").get(conversationId, options.afterId);
         if (!cursor) throw databaseError(400, "Message cursor was not found");
-        rows = db.prepare(`SELECT search_order AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+        candidates = db.prepare(`SELECT ${candidateColumns}
           FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order > ? ORDER BY search_order ASC LIMIT ?`).all(conversationId, cursor.rowid, limit);
       } else {
-        rows = db.prepare(`SELECT search_order AS messageRowId, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+        candidates = db.prepare(`SELECT ${candidateColumns}
           FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? ORDER BY search_order DESC LIMIT ?`).all(conversationId, limit);
       }
-      if (!options.afterId) rows.reverse();
+      let selectedBytes = 2048;
+      const selected = [];
+      for (const candidate of candidates) {
+        // Count stored bytes, including fields projected only as excerpts.
+        // Otherwise JSON metadata extraction could scan dozens of giant
+        // legacy payloads even though the HTTP response itself is short.
+        const bytes = candidate.bodyBytes + candidate.payloadBytes + 512;
+        if (selected.length && selectedBytes + bytes > MAX_MESSAGE_PAGE_BYTES) break;
+        selected.push(candidate);
+        selectedBytes += bytes;
+      }
+      if (!options.afterId) selected.reverse();
+      let messages = [];
+      if (selected.length) {
+        const rows = db.prepare(`SELECT search_order AS messageRowId, id, conversation_id AS conversationId, role, kind,
+          CASE WHEN COALESCE(LENGTH(CAST(body AS BLOB)), 0) > ? THEN SUBSTR(CAST(body AS BLOB), 1, ?) ELSE body END AS body,
+          CASE WHEN COALESCE(LENGTH(CAST(body AS BLOB)), 0) > ? THEN SUBSTR(CAST(body AS BLOB), -?) ELSE NULL END AS bodySuffix,
+          CASE WHEN COALESCE(LENGTH(CAST(payload AS BLOB)), 0) > ? THEN NULL ELSE payload END AS payload,
+          CASE WHEN COALESCE(LENGTH(CAST(payload AS BLOB)), 0) BETWEEN ? AND ? THEN CASE WHEN json_valid(payload) THEN json_extract(payload, '$.runId') END END AS runId,
+          CASE WHEN COALESCE(LENGTH(CAST(payload AS BLOB)), 0) BETWEEN ? AND ? THEN CASE WHEN json_valid(payload) THEN json_extract(payload, '$.provider') END END AS provider,
+          CASE WHEN COALESCE(LENGTH(CAST(payload AS BLOB)), 0) BETWEEN ? AND ? THEN CASE WHEN json_valid(payload) THEN json_extract(payload, '$.checkpointEventSeq') END END AS checkpointEventSeq,
+          created_at AS createdAt
+          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order BETWEEN ? AND ? ORDER BY search_order`)
+          .all(MAX_INLINE_MESSAGE_BYTES, MAX_INLINE_MESSAGE_BYTES / 2,
+            MAX_INLINE_MESSAGE_BYTES, MAX_INLINE_MESSAGE_BYTES / 2, MAX_INLINE_MESSAGE_BYTES,
+            MAX_INLINE_MESSAGE_BYTES + 1, MAX_MESSAGE_PAGE_BYTES,
+            MAX_INLINE_MESSAGE_BYTES + 1, MAX_MESSAGE_PAGE_BYTES,
+            MAX_INLINE_MESSAGE_BYTES + 1, MAX_MESSAGE_PAGE_BYTES,
+            conversationId, selected[0].messageRowId, selected.at(-1).messageRowId);
+        const sizes = new Map(selected.map((row) => [row.id, row]));
+        messages = rows.map(({ messageRowId, bodySuffix, runId, provider, checkpointEventSeq, ...row }) => {
+          const size = sizes.get(row.id);
+          const bodyExcerpt = size.bodyBytes > MAX_INLINE_MESSAGE_BYTES;
+          const payloadOmitted = size.payloadBytes > MAX_INLINE_MESSAGE_BYTES;
+          const body = Buffer.isBuffer(row.body) ? decodeMessagePrefix(row.body) : row.body;
+          const payload = payloadOmitted ? { runId, provider, checkpointEventSeq } : parseJson(row.payload, null);
+          const suffix = Buffer.isBuffer(bodySuffix) ? decodeMessageSuffix(bodySuffix) : "";
+          return { ...row, body: bodyExcerpt ? `${body}\n[Middle text omitted from this page]\n${suffix}` : body,
+            payload, searchOrder: messageRowId, ...(bodyExcerpt ? { findExcerpt: true } : {}),
+            ...(payloadOmitted ? { payloadOmitted: true } : {}) };
+        });
+        let serializedBytes = 2 + messages.reduce((bytes, message) => bytes + Buffer.byteLength(JSON.stringify(message)) + 1, 0);
+        while (messages.length > 1 && serializedBytes > MAX_MESSAGE_PAGE_BYTES - 2048) {
+          const removed = options.afterId ? messages.pop() : messages.shift();
+          serializedBytes -= Buffer.byteLength(JSON.stringify(removed)) + 1;
+        }
+      }
       const total = db.prepare("SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?").get(conversationId).count;
-      const oldestRowId = rows[0]?.messageRowId;
+      const oldestRowId = messages[0]?.searchOrder;
       const olderCount = oldestRowId ? db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order < ?").get(conversationId, oldestRowId).count : options.afterId ? total : 0;
       const hasMore = olderCount > 0;
-      const newerCount = Math.max(0, total - olderCount - rows.length);
+      const newerCount = Math.max(0, total - olderCount - messages.length);
       return {
-        messages: rows.map(({ messageRowId, ...row }) => hydratePayload({ ...row, searchOrder: messageRowId })),
-        page: { hasMore, olderCount, hasLater: newerCount > 0, newerCount, total, beforeId: rows[0]?.id ?? null, limit },
+        messages,
+        page: { hasMore, olderCount, hasLater: newerCount > 0, newerCount, total, beforeId: messages[0]?.id ?? null, limit },
       };
     },
     async findMessagePage(conversationId, query, afterId, direction = 1, signal, { originId = afterId, wrapped = false } = {}) {
@@ -685,6 +739,23 @@ function conversationColumns() {
 }
 
 function hydratePayload(row) { return { ...row, payload: parseJson(row.payload, null) }; }
+
+function decodeMessagePrefix(bytes) {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  for (let length = bytes.length; length >= Math.max(0, bytes.length - 3); length -= 1) {
+    try { return decoder.decode(bytes.subarray(0, length)); }
+    catch { /* The byte cap may split a UTF-8 character. */ }
+  }
+  throw databaseError(400, "Message body is not valid UTF-8");
+}
+function decodeMessageSuffix(bytes) {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  for (let start = 0; start <= Math.min(3, bytes.length); start += 1) {
+    try { return decoder.decode(bytes.subarray(start)); }
+    catch { /* The byte cap may start inside a UTF-8 character. */ }
+  }
+  throw databaseError(400, "Message body is not valid UTF-8");
+}
 function hydrateDetails(row) { return { ...row, details: parseJson(row.details, {}) }; }
 function parseJson(value, fallback) { try { return JSON.parse(value); } catch { return fallback; } }
 function now() { return new Date().toISOString(); }

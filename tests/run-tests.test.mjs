@@ -35,11 +35,13 @@ function groupRunning(groupId) {
   });
 }
 
-test("test launcher forwards interruption to its detached runner and worker", { skip: process.platform === "win32", timeout: 15000 }, async () => {
+test("test launcher reaps its detached runner and a SIGTERM-ignoring descendant", { skip: process.platform === "win32", timeout: 15000 }, async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-test-runner-"));
   const marker = path.join(root, "worker.pid");
+  const descendantMarker = path.join(root, "descendant.pid");
   const fixture = path.join(root, "hold.test.mjs");
-  writeFileSync(fixture, `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`);
+  const descendant = `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(descendantMarker)}, String(process.pid)); setInterval(() => {}, 1000);`;
+  writeFileSync(fixture, `import { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nspawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], { stdio: "ignore" });\nwriteFileSync(${JSON.stringify(marker)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`);
   const env = { ...process.env, CI: "1" };
   delete env.NODE_TEST_CONTEXT;
   const child = spawn(process.execPath, [launcher, fixture], { stdio: ["ignore", "pipe", "pipe"], env });
@@ -47,16 +49,18 @@ test("test launcher forwards interruption to its detached runner and worker", { 
   child.stdout.on("data", (chunk) => { output += chunk; });
   child.stderr.on("data", (chunk) => { output += chunk; });
   let workerPid;
+  let descendantPid;
   let runnerPid;
   try {
     const deadline = Date.now() + 5000;
-    while ((!existsSync(marker) || !runnerPid) && Date.now() < deadline) {
+    while ((!existsSync(marker) || !existsSync(descendantMarker) || !runnerPid) && Date.now() < deadline) {
       runnerPid ??= runnerFor(child.pid);
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     assert.ok(existsSync(marker), `Test worker did not start: ${output}`);
     assert.ok(runnerPid, `Detached test runner did not start: ${output}`);
     workerPid = Number(readFileSync(marker, "utf8"));
+    descendantPid = Number(readFileSync(descendantMarker, "utf8"));
     child.kill("SIGTERM");
     let timer;
     const result = await Promise.race([
@@ -67,25 +71,34 @@ test("test launcher forwards interruption to its detached runner and worker", { 
     const stopped = Date.now() + 3000;
     while (running(workerPid) && Date.now() < stopped) await new Promise((resolve) => setTimeout(resolve, 25));
     assert.equal(running(workerPid), false, `Test worker survived launcher interruption: ${output}`);
+    assert.equal(running(descendantPid), false, `SIGTERM-ignoring descendant survived launcher interruption: ${output}`);
     assert.equal(groupRunning(runnerPid), false, `Detached test runner group survived launcher interruption: ${output}`);
     assert.match(output, /CI test launcher received SIGTERM/);
     assert.match(output, /CI test runner closed:/);
   } finally {
     if (runnerPid && groupRunning(runnerPid)) try { process.kill(-runnerPid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
     if (workerPid && running(workerPid)) try { process.kill(workerPid, "SIGKILL"); } catch { /* Already gone. */ }
+    if (descendantPid && running(descendantPid)) try { process.kill(descendantPid, "SIGKILL"); } catch { /* Already gone. */ }
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("test launcher fixture reaps its detached group when worker startup fails", { skip: process.platform === "win32", timeout: 10000 }, async () => {
+test("test launcher reaps its detached group when a test worker fails to start", { skip: process.platform === "win32", timeout: 10000 }, async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-test-runner-startup-"));
   const fixture = path.join(root, "silent.test.mjs");
-  writeFileSync(fixture, "setInterval(() => {}, 1000);\n");
+  const descendantMarker = path.join(root, "descendant.pid");
+  const descendant = `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(descendantMarker)}, String(process.pid)); setInterval(() => {}, 1000);`;
+  writeFileSync(fixture, `import { spawn } from "node:child_process";\nspawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], { stdio: "ignore" });\nawait new Promise((resolve) => setTimeout(resolve, 500));\nthrow new Error('induced worker startup failure');\n`);
   const env = { ...process.env, CI: "1" };
   delete env.NODE_TEST_CONTEXT;
-  const child = spawn(process.execPath, [launcher, fixture], { stdio: "ignore", env });
+  const child = spawn(process.execPath, [launcher, fixture], { stdio: ["ignore", "pipe", "pipe"], env });
+  let output = "";
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stderr.on("data", (chunk) => { output += chunk; });
+  const closed = new Promise((resolve) => child.once("close", (status, signal) => resolve({ status, signal })));
   let runnerPid;
+  let descendantPid;
   try {
     const deadline = Date.now() + 3000;
     while (!runnerPid && Date.now() < deadline) {
@@ -93,11 +106,18 @@ test("test launcher fixture reaps its detached group when worker startup fails",
       if (!runnerPid) await new Promise((resolve) => setTimeout(resolve, 20));
     }
     assert.ok(runnerPid, "startup fixture never exposed its detached runner");
-    assert.equal(groupRunning(runnerPid), true, "startup fixture did not exercise a live runner group");
+    assert.deepEqual(await closed, { status: 1, signal: null }, output);
+    assert.match(output, /induced worker startup failure/);
+    assert.ok(existsSync(descendantMarker), "startup fixture did not create its stubborn descendant");
+    descendantPid = Number(readFileSync(descendantMarker, "utf8"));
+    const stopped = Date.now() + 3000;
+    while (running(descendantPid) && Date.now() < stopped) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(running(descendantPid), false, "failed worker left a SIGTERM-ignoring descendant executing");
+    assert.equal(groupRunning(runnerPid), false, "a failed worker left the detached runner group executing");
   } finally {
     if (runnerPid && groupRunning(runnerPid)) try { process.kill(-runnerPid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+    if (descendantPid && running(descendantPid)) try { process.kill(descendantPid, "SIGKILL"); } catch { /* Already gone. */ }
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     rmSync(root, { recursive: true, force: true });
   }
-  assert.equal(groupRunning(runnerPid), false, "failed startup leaked the detached runner group");
 });

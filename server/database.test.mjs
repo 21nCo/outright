@@ -112,6 +112,67 @@ test("conversation Find bounds hydrated neighbors and keeps page cursors exact",
   } finally { database.close(); }
 });
 
+test("ordinary message pages bound bytes and preserve both cursor directions", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Large history", provider: "codex" });
+    const body = `start\0${"🙂".repeat(270_000)}\0end`;
+    const ids = Array.from({ length: 24 }, (_, index) => database.addMessage({ conversationId: chat.id,
+      role: "assistant", body, payload: { runId: `run-${index}`, provider: "codex", checkpointEventSeq: index, detail: "x".repeat(1024 * 1024) } }).id);
+    const latest = database.listMessagePage(chat.id);
+    assert.ok(Buffer.byteLength(JSON.stringify(latest)) <= 8 * 1024 * 1024, "latest page exceeded the serialized byte budget");
+    assert.equal(latest.page.total, ids.length);
+    assert.equal(latest.page.olderCount + latest.messages.length + latest.page.newerCount, ids.length);
+    assert.ok(latest.messages.length < ids.length, "stored bytes bypassed the pre-hydration page cap");
+    assert.deepEqual(latest.messages.map((message) => message.id), ids.slice(-latest.messages.length));
+    assert.equal(latest.messages[0].findExcerpt, true);
+    assert.equal(latest.messages[0].payload.runId, `run-${ids.indexOf(latest.messages[0].id)}`);
+    assert.equal(latest.messages[0].payloadOmitted, true);
+    assert.equal(latest.messages[0].body.includes("\uFFFD"), false, "inline excerpt split a Unicode character");
+    assert.equal(latest.messages[0].body.endsWith("\0end"), true, "inline excerpt hid the latest output tail");
+    assert.equal(database.getMessageBodyChunk(chat.id, ids[0], 0).body.startsWith("start\0"), true);
+    const backward = [];
+    let beforeId;
+    do {
+      const page = database.listMessagePage(chat.id, { beforeId, limit: 3 });
+      assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 8 * 1024 * 1024);
+      backward.unshift(...page.messages.map((message) => message.id));
+      beforeId = page.page.beforeId;
+      if (!page.page.hasMore) break;
+    } while (beforeId);
+    assert.deepEqual(backward, ids, "backward paging skipped or repeated an id");
+    const forward = [];
+    let afterId = ids[0];
+    while (afterId !== ids.at(-1)) {
+      const page = database.listMessagePage(chat.id, { afterId, limit: 3 });
+      assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 8 * 1024 * 1024);
+      assert.ok(page.messages.length > 0, "forward cursor stopped early");
+      forward.push(...page.messages.map((message) => message.id));
+      afterId = page.messages.at(-1).id;
+    }
+    assert.deepEqual(forward, ids.slice(1), "forward paging skipped or repeated an id");
+
+    const cumulative = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Many medium rows", provider: "codex" });
+    const mediumBody = "b".repeat(60_000);
+    const mediumPayload = { detail: "p".repeat(60_000) };
+    const mediumIds = Array.from({ length: 100 }, () => database.addMessage({ conversationId: cumulative.id,
+      role: "assistant", body: mediumBody, payload: mediumPayload }).id);
+    const boundedLatest = database.listMessagePage(cumulative.id);
+    assert.ok(boundedLatest.messages.length < mediumIds.length, "the page ignored its cumulative byte cap");
+    assert.ok(Buffer.byteLength(JSON.stringify(boundedLatest)) <= 8 * 1024 * 1024);
+    assert.deepEqual(boundedLatest.messages.map((message) => message.id), mediumIds.slice(-boundedLatest.messages.length));
+    const boundedOlder = database.listMessagePage(cumulative.id, { beforeId: boundedLatest.page.beforeId });
+    assert.deepEqual([...boundedOlder.messages.map((message) => message.id), ...boundedLatest.messages.map((message) => message.id)], mediumIds);
+
+    const huge = database.addMessage({ conversationId: cumulative.id, role: "assistant", body: "large payload body",
+      payload: { runId: "too-large-to-parse-inline", detail: "q".repeat(9 * 1024 * 1024) } });
+    const hugePage = database.listMessagePage(cumulative.id);
+    assert.deepEqual(hugePage.messages.map((message) => message.id), [huge.id]);
+    assert.equal(hugePage.messages[0].payloadOmitted, true);
+    assert.ok(Buffer.byteLength(JSON.stringify(hugePage)) < 8 * 1024 * 1024);
+  } finally { database.close(); }
+});
+
 test("nullable legacy payloads obey Find's byte cap and preserve both cursor edges", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-find-null-"));
   const filename = path.join(root, "messages.db");

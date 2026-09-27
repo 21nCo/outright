@@ -2605,9 +2605,25 @@ async function fullPageLiveAnchorRegression() {
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: backdated }) }));
   try { await until(() => host.querySelector('[data-message-id="full-1001"]'), "backdated insertion remains at the durable latest end"); }
   catch (error) { throw new Error(`${error.message}; return=${host.querySelector('.history-return')?.textContent}; scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}; mounted=${[...viewport.querySelectorAll('[data-message-id]')].map((element) => element.dataset.messageId).slice(-4).join(',')}`); }
+  viewport.scrollTop = viewport.scrollHeight;
+  viewport.dispatchEvent(new Event("scroll"));
+  await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 2, "latest follow settled before Find key");
+  await settle();
+  const findInput = host.querySelector('.history-find input');
+  findInput.focus();
+  findInput.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true }));
+  all = [...all, message(1002)];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1002) }) }));
+  try { await until(() => host.querySelector('[data-message-id="full-1002"]') && !host.querySelector('.history-return'),
+    "Find control arrow key left latest following with the reader"); }
+  catch (error) { throw new Error(`${error.message}; return=${host.querySelector('.history-return')?.textContent}, scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}, row=${Boolean(host.querySelector('[data-message-id="full-1002"]'))}`); }
   viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); await settle();
   const maximum = viewport.scrollHeight - viewport.clientHeight;
   viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -48 }));
+  // A scroll event can arrive before native wheel movement. It must not
+  // release upward ownership merely because the old position is near bottom.
+  viewport.dispatchEvent(new Event("scroll"));
+  await new Promise((resolve) => setTimeout(resolve, 1050));
   viewport.scrollTop = maximum - 48; viewport.dispatchEvent(new Event("scroll")); await settle();
   const readerTop = viewport.scrollTop;
   const frame = viewport.getBoundingClientRect();
@@ -2618,13 +2634,50 @@ async function fullPageLiveAnchorRegression() {
   assert(readingRow, "near-bottom reader had no visible anchor");
   const readingRowId = readingRow.dataset.messageId;
   const readingRowTop = readingRow.getBoundingClientRect().top;
-  all = [...all, message(1002)];
-  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1002) }) }));
+  all = [...all, message(1003)];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1003) }) }));
   try { await until(() => host.querySelector('.history-return')?.textContent.includes("1 new"), "upward reader intent retained a later-message affordance"); }
-  catch (error) { throw new Error(`${error.message}; before=${readerTop}, after=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}, return=${host.querySelector('.history-return')?.textContent}, newRow=${Boolean(host.querySelector('[data-message-id="full-1002"]'))}`); }
+  catch (error) { throw new Error(`${error.message}; before=${readerTop}, after=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}, return=${host.querySelector('.history-return')?.textContent}, newRow=${Boolean(host.querySelector('[data-message-id="full-1003"]'))}`); }
   const retainedRow = viewport.querySelector(`[data-message-id="${readingRowId}"]`);
   assert(retainedRow && Math.abs(retainedRow.getBoundingClientRect().top - readingRowTop) < 24,
     `an append moved the upward reader ${readingRowId}: top=${readingRowTop} -> ${retainedRow?.getBoundingClientRect().top}, scroll=${readerTop} -> ${viewport.scrollTop}, max=${viewport.scrollHeight - viewport.clientHeight}`);
+  host.querySelector('.history-return').click();
+  await until(() => host.querySelector('[data-message-id="full-1003"]') && !host.querySelector('.history-return'), "explicit latest after upward reading");
+  viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); await settle();
+  const resumeMaximum = viewport.scrollHeight - viewport.clientHeight;
+  viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -48 }));
+  viewport.scrollTop = resumeMaximum - 48; viewport.dispatchEvent(new Event("scroll")); await settle();
+  viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: 48 }));
+  viewport.scrollTop = viewport.scrollHeight - viewport.clientHeight;
+  viewport.dispatchEvent(new Event("scroll")); await settle();
+  all = [...all, message(1004)];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1004) }) }));
+  try { await until(() => host.querySelector('[data-message-id="full-1004"]') && !host.querySelector('.history-return'),
+    "downward return inside the bottom zone resumed latest following"); }
+  catch (error) { throw new Error(`${error.message}; return=${host.querySelector('.history-return')?.textContent}, scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}, row=${Boolean(host.querySelector('[data-message-id="full-1004"]'))}`); }
+}
+
+async function largeLiveMessageRetentionRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const initial = [{ id: "bounded-0", role: "assistant", kind: "text", body: "Before large output", createdAt: new Date(0).toISOString() }];
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: initial, messagePage: { hasMore: false, olderCount: 0, total: 1, beforeId: initial[0].id } });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[data-message-id="bounded-0"]'), "initial bounded chat");
+  const body = "🙂".repeat(270_000);
+  const large = { id: "bounded-1", role: "assistant", kind: "text", body, createdAt: new Date(1000).toISOString(),
+    payload: { runId: "large-run", provider: "codex", detail: "x".repeat(1024 * 1024) } };
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: large }) }));
+  await until(() => host.querySelector('[data-message-id="bounded-1"]'), "large live message retained");
+  const row = host.querySelector('[data-message-id="bounded-1"]');
+  assert(row.querySelector('.message-text').textContent.length < 17_000, "live body bypassed the retained-row ceiling");
+  assert(row.querySelector('.message-full-reader button')?.textContent === "Read full message", "large live body lost bounded full-reader access");
+  assert(row.querySelector('.message-run')?.textContent.includes("large-ru"), "bounded payload lost run identity");
 }
 
 async function transcriptObserverStabilityRegression() {
@@ -3722,6 +3775,7 @@ try {
     ["background latest refresh", backgroundLatestRefreshRegression, "a missed event refreshes the latest page without keeping a stale snapshot"],
     ["background reading refresh", backgroundReadingRefreshRegression, "missed replay and completion expose later output without moving a reader"],
     ["full-page live anchor", fullPageLiveAnchorRegression, "a new row at the 1000-message cap keeps the reader's oldest visible anchor"],
+    ["large live message retention", largeLiveMessageRetentionRegression, "large live messages retain bounded excerpts and full-reader identity"],
     ["transcript observer stability", transcriptObserverStabilityRegression, "stream paints do not restart row observation for an unchanged long transcript"],
     ["background completion page ownership", backgroundCompletionKeepsExplicitPageRegression, "run completion cannot supersede an explicit Return to latest request"],
     ["replay latest page boundary", replayKeepsLatestPageBoundaryRegression, "a buffered older checkpoint cannot make intervening history unreachable"],

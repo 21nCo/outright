@@ -485,6 +485,7 @@ export function App() {
       if (!preserveReading) {
         stickToBottomRef.current = true;
         readerAwayFromBottomRef.current = false;
+        readerScrollInputUntilRef.current = 0;
       }
       checkpointCursorsRef.current = checkpointCursors(replayed.messages, checkpointCursorsRef.current, activeCursorOwners(nextConversation));
       setConversation((current) => preserveReading && current?.id === requestedId ? (() => {
@@ -497,7 +498,7 @@ export function App() {
           if (!refreshed) return message;
           const oldSeq = message.payload?.checkpointEventSeq;
           const newSeq = refreshed.payload?.checkpointEventSeq;
-          return Number.isSafeInteger(oldSeq) && Number.isSafeInteger(newSeq) && oldSeq > newSeq ? message : refreshed;
+          return Number.isSafeInteger(oldSeq) && Number.isSafeInteger(newSeq) && oldSeq > newSeq ? message : boundPageMessage(refreshed);
         });
         const total = Math.max(currentTotal, latestTotal);
         const newerCount = Math.max(0, total - (current.messagePage?.olderCount ?? 0) - messages.length);
@@ -509,7 +510,7 @@ export function App() {
         };
       })() : {
         ...nextConversation,
-        messages: replayed.messages,
+        messages: replayed.messages.map(boundPageMessage),
         messagePage: {
           ...nextConversation.messagePage,
           total: Math.max(nextConversation.messagePage?.total ?? nextConversation.messages.length,
@@ -651,7 +652,7 @@ export function App() {
           ...current,
           messagePage: { ...current.messagePage, total, hasLater: true, newerCount: 1 },
         };
-        const merged = upsertRuntimeMessage(current.messages, event.payload);
+        const merged = upsertRuntimeMessage(current.messages, boundPageMessage(event.payload));
         const dropped = Math.max(0, merged.length - MAX_RENDERED_MESSAGES);
         const messages = merged.slice(-MAX_RENDERED_MESSAGES);
         return {
@@ -880,6 +881,8 @@ export function App() {
     let lastMaximum = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
     let growingFrom = null;
     let growingUntil = 0;
+    let readerTowardBottom = false;
+    let pointerReader = false;
     const updateStickiness = () => {
       const top = viewport.scrollTop;
       const maximum = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
@@ -890,7 +893,19 @@ export function App() {
       }
       if (!pendingPrependScrollRef.current) {
         if (conversationRef.current?.messagePage?.hasLater) stickToBottomRef.current = false;
-        else if (readerAwayFromBottomRef.current && maximum - top > 2) stickToBottomRef.current = false;
+        else if (readerAwayFromBottomRef.current) {
+          // An upward gesture owns the reader even inside the 96px return
+          // zone. Only later reader input toward the bottom can resume follow;
+          // a new row or measured virtual spacer cannot make that choice.
+          const pointerMovedDown = pointerReader && now < readerScrollInputUntilRef.current
+            && top > lastScrollTop + 1 && maximum <= lastMaximum + 1;
+          if ((readerTowardBottom || pointerMovedDown) && maximum - top < 96) {
+            readerAwayFromBottomRef.current = false;
+            stickToBottomRef.current = true;
+            readerTowardBottom = false;
+            pointerReader = false;
+          } else stickToBottomRef.current = false;
+        }
         // A virtual row can be measured between a scroll-to-end and this
         // event. The previous end is still the reader's destination even if
         // the new spacer makes the current end much farther away.
@@ -911,26 +926,32 @@ export function App() {
     const readerWheel = (event) => {
       readerScrollInputUntilRef.current = performance.now() + 1000;
       if (event.deltaY < 0) {
+        readerTowardBottom = false;
         readerAwayFromBottomRef.current = true;
         stickToBottomRef.current = false;
-      }
+      } else if (event.deltaY > 0) readerTowardBottom = true;
     };
     const readerKey = (event) => {
+      if (event.target !== viewport) return;
       if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+        readerTowardBottom = false;
         readerAwayFromBottomRef.current = true;
         stickToBottomRef.current = false;
-      }
+      } else if (["ArrowDown", "PageDown", "End"].includes(event.key)) readerTowardBottom = true;
       if (["ArrowUp", "PageUp", "Home", "ArrowDown", "PageDown", "End"].includes(event.key)) {
         readerScrollInputUntilRef.current = performance.now() + 1000;
       }
     };
-    const readerPointer = () => { readerScrollInputUntilRef.current = performance.now() + 2000; };
-    const scrollbar = viewport.parentElement?.querySelector('[data-slot="scroll-area-scrollbar"]');
+    const readerPointer = () => { pointerReader = true; readerTowardBottom = false; readerScrollInputUntilRef.current = performance.now() + 2000; };
+    const scrollOwner = viewport.parentElement;
+    const scrollbarPointer = (event) => {
+      if (event.target.closest?.('[data-slot="scroll-area-scrollbar"]')) readerPointer();
+    };
     viewport.addEventListener("scroll", updateStickiness, { passive: true });
     viewport.addEventListener("wheel", readerWheel, { passive: true });
     viewport.addEventListener("keydown", readerKey);
     viewport.addEventListener("touchstart", readerPointer, { passive: true });
-    scrollbar?.addEventListener("pointerdown", readerPointer, { passive: true });
+    scrollOwner?.addEventListener("pointerdown", scrollbarPointer, { passive: true });
     const followLatest = () => {
       if (stickToBottomRef.current && !pendingPrependScrollRef.current && !conversationRef.current?.messagePage?.hasLater) {
         if (readerAwayFromBottomRef.current) { stickToBottomRef.current = false; return; }
@@ -943,7 +964,7 @@ export function App() {
     if (column) resize.observe(column);
     viewport.addEventListener("windowed-range-change", followLatest);
     followLatest();
-    return () => { viewport.removeEventListener("scroll", updateStickiness); viewport.removeEventListener("wheel", readerWheel); viewport.removeEventListener("keydown", readerKey); viewport.removeEventListener("touchstart", readerPointer); scrollbar?.removeEventListener("pointerdown", readerPointer); viewport.removeEventListener("windowed-range-change", followLatest); resize.disconnect(); };
+    return () => { viewport.removeEventListener("scroll", updateStickiness); viewport.removeEventListener("wheel", readerWheel); viewport.removeEventListener("keydown", readerKey); viewport.removeEventListener("touchstart", readerPointer); scrollOwner?.removeEventListener("pointerdown", scrollbarPointer); viewport.removeEventListener("windowed-range-change", followLatest); resize.disconnect(); };
   }, [conversation?.id, conversation?.messagePage?.hasLater]);
   useLayoutEffect(() => {
     const pending = pendingLiveScrollRef.current;
@@ -953,7 +974,8 @@ export function App() {
     let cancelTick = () => {};
     let remaining = 24;
     let stable = 0;
-    const cancelForReader = () => {
+    const cancelForReader = (event) => {
+      if (event.type === "keydown" && event.target !== viewport) return;
       if (pendingLiveScrollRef.current === pending) pendingLiveScrollRef.current = null;
       cancelTick();
     };
@@ -972,12 +994,15 @@ export function App() {
       if (--remaining > 0 && stable < 3) cancelTick = scheduleLayoutTick(restore);
       else if (pendingLiveScrollRef.current === pending) pendingLiveScrollRef.current = null;
     };
-    const scrollbar = viewport.parentElement?.querySelector('[data-slot="scroll-area-scrollbar"]');
+    const scrollOwner = viewport.parentElement;
+    const cancelForScrollbar = (event) => {
+      if (event.target.closest?.('[data-slot="scroll-area-scrollbar"]')) cancelForReader(event);
+    };
     viewport.addEventListener("wheel", cancelForReader, { passive: true });
     viewport.addEventListener("touchstart", cancelForReader, { passive: true });
     viewport.addEventListener("pointerdown", cancelForReader, { passive: true });
     viewport.addEventListener("keydown", cancelForReader);
-    scrollbar?.addEventListener("pointerdown", cancelForReader, { passive: true });
+    scrollOwner?.addEventListener("pointerdown", cancelForScrollbar, { passive: true });
     restore();
     return () => {
       cancelTick();
@@ -985,7 +1010,7 @@ export function App() {
       viewport.removeEventListener("touchstart", cancelForReader);
       viewport.removeEventListener("pointerdown", cancelForReader);
       viewport.removeEventListener("keydown", cancelForReader);
-      scrollbar?.removeEventListener("pointerdown", cancelForReader);
+      scrollOwner?.removeEventListener("pointerdown", cancelForScrollbar);
     };
   }, [conversation]);
   useLayoutEffect(() => {
@@ -1010,13 +1035,17 @@ export function App() {
     let stableFrames = 0;
     let previousTop = null;
     let cancelTick = () => {};
-    const cancelForUserScroll = () => {
+    const cancelForUserScroll = (event) => {
+      if (event.type === "keydown" && event.target !== viewport) return;
       if (pendingPrependScrollRef.current === pending) pendingPrependScrollRef.current = null;
       cancelTick();
     };
-    const scrollbar = viewport.parentElement?.querySelector('[data-slot="scroll-area-scrollbar"]');
+    const scrollOwner = viewport.parentElement;
+    const cancelForScrollbar = (event) => {
+      if (event.target.closest?.('[data-slot="scroll-area-scrollbar"]')) cancelForUserScroll(event);
+    };
     viewport.addEventListener("pointerdown", cancelForUserScroll, { passive: true });
-    scrollbar?.addEventListener("pointerdown", cancelForUserScroll, { passive: true });
+    scrollOwner?.addEventListener("pointerdown", cancelForScrollbar, { passive: true });
     viewport.addEventListener("wheel", cancelForUserScroll, { passive: true });
     viewport.addEventListener("touchstart", cancelForUserScroll, { passive: true });
     viewport.addEventListener("keydown", cancelForUserScroll);
@@ -1036,7 +1065,7 @@ export function App() {
     return () => {
       cancelTick();
       viewport.removeEventListener("pointerdown", cancelForUserScroll);
-      scrollbar?.removeEventListener("pointerdown", cancelForUserScroll);
+      scrollOwner?.removeEventListener("pointerdown", cancelForScrollbar);
       viewport.removeEventListener("wheel", cancelForUserScroll);
       viewport.removeEventListener("touchstart", cancelForUserScroll);
       viewport.removeEventListener("keydown", cancelForUserScroll);
@@ -1646,6 +1675,23 @@ function compactPath(value = "") { return value.replace(/^\/Users\/[^/]+/, "~");
 function defaultSettings() { return { provider: "codex", model: "", reasoningEffort: "medium", approvalPolicy: "workspace-write", editor: "zed", notifications: true, maxConcurrentRuns: 3 }; }
 function focusableElements(container) { return container ? [...container.querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')].filter((element) => element.getClientRects().length && element.getAttribute("aria-hidden") !== "true") : []; }
 function boundStreamingText(value) { return value.length > MAX_STREAMING_CHARACTERS ? `${value.slice(0, MAX_STREAMING_CHARACTERS)}${LIVE_TRUNCATION_MARKER}` : value; }
+
+function boundPageMessage(message) {
+  const body = String(message.body ?? "");
+  let bounded = message;
+  // HTTP pages apply the same ceiling before hydration. Live events and
+  // buffered replay must not bypass the retained 1000-row memory bound.
+  if (body.length > 16_000) {
+    const prefix = body.slice(0, 8_000).replace(/[\uD800-\uDBFF]$/, "");
+    const suffix = body.slice(-8_000).replace(/^[\uDC00-\uDFFF]/, "");
+    bounded = { ...bounded, body: `${prefix}\n[Middle text omitted from this page]\n${suffix}`, findExcerpt: true };
+  }
+  if (message.payload && JSON.stringify(message.payload).length > 32_000) {
+    bounded = { ...bounded, payload: { runId: message.payload.runId, provider: message.payload.provider,
+      checkpointEventSeq: message.payload.checkpointEventSeq }, payloadOmitted: true };
+  }
+  return bounded;
+}
 
 function emptyLiveDeltaEvents(runId = null) { return { runId, events: [], start: 0, bytes: 0, omittedThroughSeq: 0 }; }
 
