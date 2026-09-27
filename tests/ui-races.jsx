@@ -2095,6 +2095,7 @@ async function pagedTranscriptAnchorRegression() {
   const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
   try { await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96, "latest messages on open"); }
   catch (error) { throw new Error(`${error.message}: scroll=${viewport.scrollTop}, height=${viewport.scrollHeight}, client=${viewport.clientHeight}`); }
+  viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1000 }));
   viewport.scrollTop = 0;
   viewport.dispatchEvent(new Event("scroll"));
   await until(() => host.querySelector('[data-message-id="message-1000"]'), "first anchor visible");
@@ -2271,14 +2272,24 @@ async function pagedTranscriptFindRegression({ endOnly = false, measuredOnly = f
     return;
   }
   if (measuredOnly) {
+    viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -300 }));
+    viewport.scrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight - 300);
+    viewport.dispatchEvent(new Event("scroll"));
+    await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop > 200,
+      "reader moved away before End reestablished latest intent");
+    viewport.focus();
+    await window.__fixtureSendKey("End");
+    await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96,
+      "End established latest-page intent before the row grew");
     const row = viewport.querySelector('[data-window-id]');
     assert(row, "Measured-height fixture has no mounted row");
     const oldEnd = viewport.scrollHeight - viewport.clientHeight;
     row.style.minHeight = `${row.getBoundingClientRect().height + 900}px`;
     viewport.scrollTop = oldEnd;
     viewport.dispatchEvent(new Event("scroll"));
-    await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96,
-      "latest page followed the newly measured row before the next message");
+    try { await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96,
+      "latest page followed the newly measured row before the next message"); }
+    catch (error) { throw new Error(`${error.message}; oldEnd=${oldEnd}, top=${viewport.scrollTop}, max=${viewport.scrollHeight - viewport.clientHeight}, rowHeight=${row.getBoundingClientRect().height}, return=${host.querySelector('.history-return')?.textContent}`); }
     fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1_001) }) }));
     try { await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96, "latest page followed a newly measured row and live append"); }
     catch (error) { throw new Error(`${error.message}; oldEnd=${oldEnd}, top=${viewport.scrollTop}, height=${viewport.scrollHeight}, client=${viewport.clientHeight}, rows=${[...viewport.querySelectorAll('[data-message-id]')].map((item) => item.dataset.messageId).join(',')}`); }
@@ -2333,8 +2344,8 @@ async function fullFindMessageReaderRegression() {
       bodyRequests += 1;
       const offset = Number(url.searchParams.get("offset") ?? 0);
       if (offset === 5 && !failedNext) { failedNext = true; return response({ error: "Section unavailable" }, 503); }
-      return response(offset ? { id: full.id, body: "needle-end", offset: 5, nextOffset: 15, totalCharacters: 15, hasMore: false }
-        : { id: full.id, body: "start", offset: 0, nextOffset: 5, totalCharacters: 15, hasMore: true });
+      return response(offset ? { id: full.id, body: "needle-end", offset: 5, nextOffset: 15, totalBytes: 15, hasMore: false }
+        : { id: full.id, body: "start", offset: 0, nextOffset: 5, totalBytes: 15, hasMore: true });
     }
     if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: [later], messagePage: { hasMore: true, olderCount: 1, total: 2, beforeId: later.id } });
     return response({});
@@ -2350,16 +2361,19 @@ async function fullFindMessageReaderRegression() {
   if (window.__fixtureSendKey) await window.__fixtureSendKey("Enter"); else open.click();
   try { await until(() => host.querySelector('.message-full-reader pre')?.textContent === "start", "first body section loaded"); }
   catch (error) { throw new Error(`${error.message}; requests=${bodyRequests}, reader=${host.querySelector('.message-full-reader')?.textContent?.slice(0, 300)}, active=${document.activeElement?.outerHTML?.slice(0, 150)}`); }
+  assert(host.querySelector('.message-full-reader p')?.textContent === "Bytes 1–5 of 15", "first section did not show its byte range");
   const next = [...host.querySelectorAll('.message-full-reader button')].find((button) => button.textContent === "Next section");
   next.click();
   await until(() => host.querySelector('.message-full-reader [role="alert"]')?.textContent.includes("Section unavailable"), "body section failure exposed retry");
   assert(host.querySelector('.message-full-reader pre')?.textContent === "start", "failed section did not discard the readable section");
   next.click();
   await until(() => host.querySelector('.message-full-reader pre')?.textContent === "needle-end", "next body section readable");
+  assert(host.querySelector('.message-full-reader p')?.textContent === "Bytes 6–15 of 15", "next section did not show its byte range");
   assert(host.querySelector('.message-full-reader pre')?.textContent.length < 20, "reader did not accumulate old sections");
   const previous = [...host.querySelectorAll('.message-full-reader button')].find((button) => button.textContent === "Previous section");
   previous.click();
   await until(() => host.querySelector('.message-full-reader pre')?.textContent === "start", "previous body section readable");
+  assert(host.querySelector('.message-full-reader p')?.textContent === "Bytes 1–5 of 15", "previous section did not restore its byte range");
   host.querySelector('.history-return')?.click();
   await until(() => !host.querySelector('.message-full-reader'), "full body reader cleared on return to latest");
 }
@@ -2529,6 +2543,7 @@ async function backgroundReadingRefreshRegression() {
     viewport.scrollTop = viewport.scrollHeight;
     viewport.dispatchEvent(new Event("scroll"));
     await settle();
+    viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1000 }));
     viewport.scrollTop = 0;
     viewport.dispatchEvent(new Event("scroll"));
     await settle();
@@ -2567,6 +2582,7 @@ async function fullPageLiveAnchorRegression() {
   await until(() => host.querySelector('.history-find input'), "full page ready");
   const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
   viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); await settle();
+  viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1000 }));
   viewport.scrollTop = 0; viewport.dispatchEvent(new Event("scroll"));
   await until(() => {
     const row = host.querySelector('[data-message-id="full-0"]');
@@ -2587,7 +2603,73 @@ async function fullPageLiveAnchorRegression() {
   const backdated = { ...message(1001), createdAt: new Date(0).toISOString() };
   all = [...all, backdated];
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: backdated }) }));
-  await until(() => host.querySelector('[data-message-id="full-1001"]'), "backdated insertion remains at the durable latest end");
+  try { await until(() => host.querySelector('[data-message-id="full-1001"]'), "backdated insertion remains at the durable latest end"); }
+  catch (error) { throw new Error(`${error.message}; return=${host.querySelector('.history-return')?.textContent}; scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}; mounted=${[...viewport.querySelectorAll('[data-message-id]')].map((element) => element.dataset.messageId).slice(-4).join(',')}`); }
+  viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); await settle();
+  const maximum = viewport.scrollHeight - viewport.clientHeight;
+  viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -48 }));
+  viewport.scrollTop = maximum - 48; viewport.dispatchEvent(new Event("scroll")); await settle();
+  const readerTop = viewport.scrollTop;
+  const frame = viewport.getBoundingClientRect();
+  const readingRow = [...viewport.querySelectorAll('[data-message-id]')].find((element) => {
+    const row = element.getBoundingClientRect();
+    return row.bottom > frame.top && row.top < frame.bottom;
+  });
+  assert(readingRow, "near-bottom reader had no visible anchor");
+  const readingRowId = readingRow.dataset.messageId;
+  const readingRowTop = readingRow.getBoundingClientRect().top;
+  all = [...all, message(1002)];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1002) }) }));
+  try { await until(() => host.querySelector('.history-return')?.textContent.includes("1 new"), "upward reader intent retained a later-message affordance"); }
+  catch (error) { throw new Error(`${error.message}; before=${readerTop}, after=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}, return=${host.querySelector('.history-return')?.textContent}, newRow=${Boolean(host.querySelector('[data-message-id="full-1002"]'))}`); }
+  const retainedRow = viewport.querySelector(`[data-message-id="${readingRowId}"]`);
+  assert(retainedRow && Math.abs(retainedRow.getBoundingClientRect().top - readingRowTop) < 24,
+    `an append moved the upward reader ${readingRowId}: top=${readingRowTop} -> ${retainedRow?.getBoundingClientRect().top}, scroll=${readerTop} -> ${viewport.scrollTop}, max=${viewport.scrollHeight - viewport.clientHeight}`);
+}
+
+async function transcriptObserverStabilityRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const messages = Array.from({ length: 300 }, (_, index) => ({ id: `stable-${index}`, role: "assistant", kind: "text",
+    body: `History ${index}`, createdAt: new Date(index * 1000).toISOString() }));
+  const NativeResizeObserver = window.ResizeObserver;
+  let rowObservations = 0;
+  window.ResizeObserver = class extends NativeResizeObserver {
+    observe(target, options) {
+      if (target.dataset.windowId) rowObservations += 1;
+      return super.observe(target, options);
+    }
+  };
+  try {
+    route = async (url) => {
+      if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+      if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+      if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, runs: [{ id: "run-stable", status: "running" }], messages,
+        messagePage: { hasMore: false, olderCount: 0, total: messages.length, beforeId: messages[0].id } });
+      return response({});
+    };
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('[data-message-id="stable-299"]'), "long transcript ready");
+    const emit = (seq) => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({
+      type: "run.event", conversationId: "chat-A", runId: "run-stable",
+      payload: { type: "assistant.delta", seq, payload: { text: ` fragment ${seq}` } },
+    }) }));
+    emit(1);
+    await until(() => host.querySelector('.message.is-streaming')?.textContent.includes("fragment 1"), "first stream paint");
+    await settle();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const baseline = rowObservations;
+    for (let seq = 2; seq <= 8; seq += 1) {
+      emit(seq);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    await until(() => host.querySelector('.message.is-streaming')?.textContent.includes("fragment 8"), "sustained stream paint");
+    assert(rowObservations - baseline <= 40,
+      `unchanged history rows were reobserved ${rowObservations - baseline} times during seven stream paints`);
+  } finally {
+    root.render(null); await settle();
+    window.ResizeObserver = NativeResizeObserver;
+  }
 }
 
 async function backgroundCompletionKeepsExplicitPageRegression() {
@@ -2663,6 +2745,18 @@ async function checkpointReadingPageRegression() {
   setControlValue(find, "checkpoint 10"); await settle();
   find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => host.querySelector('[data-message-id="checkpoint-10"]'), "older checkpoint page");
+  const loadedCheckpoint = { ...message(10, "Visible checkpoint refreshed"), payload: { runId: "run-loaded", checkpointEventSeq: 1 } };
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: loadedCheckpoint }) }));
+  await until(() => host.querySelector('[data-message-id="checkpoint-10"]')?.textContent.includes("Visible checkpoint refreshed"), "loaded older checkpoint updated in place");
+  const staleRefresh = deferred();
+  heldDetail = staleRefresh;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await until(() => reads >= 3, "stale detail response held after loaded checkpoint");
+  heldDetail = null;
+  staleRefresh.resolve(response({ ...chats.A, runs: [{ id: "run-checkpoint", status: "running" }], messages: latest,
+    messagePage: { hasMore: true, olderCount: 800, total: 1000, beforeId: "checkpoint-800" } }));
+  await settle();
+  assert(host.querySelector('[data-message-id="checkpoint-10"]')?.textContent.includes("Visible checkpoint refreshed"), "stale HTTP detail rolled back a loaded checkpoint");
   assert(host.querySelector('.history-find .history-find-status')?.textContent === "Message 11 of 1000", "An old off-page checkpoint inflated the persisted count");
   for (let seq = 6; seq <= 8; seq += 1) {
     const updated = message(999, `Checkpoint ${seq}`, seq);
@@ -2683,10 +2777,10 @@ async function checkpointReadingPageRegression() {
   runStatus = "completed";
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-checkpoint", payload: { type: "run.completed" } }) }));
   await new Promise((resolve) => setTimeout(resolve, 120));
-  await until(() => reads >= 3, "checkpoint completion read");
+  await until(() => reads >= 4, "checkpoint completion read");
   assert(host.querySelector('.history-return')?.textContent === "Return to latest · 800 new", "Persisted total failed to reconcile after checkpoint completion");
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "conversation.updated", conversationId: "chat-A" }) }));
-  await until(() => reads >= 4, "list update detail read");
+  await until(() => reads >= 5, "list update detail read");
   assert(host.querySelector('[data-message-id="checkpoint-10"]') && host.querySelector('.history-return')?.textContent === "Return to latest · 800 new", "List update replaced the reader's older page");
   for (let index = 1000; index <= 1002; index += 1) {
     persistedTotal += 1;
@@ -2706,10 +2800,10 @@ async function checkpointReadingPageRegression() {
   heldDetail = deferred();
   const staleDetail = heldDetail;
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
-  await until(() => reads >= 5, "preserved reading refresh pending before overflow");
+  await until(() => reads >= 6, "preserved reading refresh pending before overflow");
   heldDetail = null;
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "noise", payload: { type: "noop", padding: "x".repeat(1_100_000) } }) }));
-  await until(() => reads >= 6, "overflow retried the detail read");
+  await until(() => reads >= 7, "overflow retried the detail read");
   staleDetail.resolve(response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: persistedTotal - latest.length, total: persistedTotal, beforeId: latest[0].id } }));
   await settle();
   assert(host.querySelector('[data-message-id="checkpoint-10"]') && host.querySelector('.history-return'), "overflow retry replaced the chosen reading page");
@@ -2763,6 +2857,14 @@ async function consecutiveRunLivePreviewRegression() {
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-B", payload: { type: "assistant.delta", seq: 1, payload: { text: "B first delta" } } }) }));
   await until(() => host.querySelector('.history-live-tail')?.textContent.includes("B first delta"), "second run early delta visible");
   assert(!host.querySelector('.history-live-tail').textContent.includes("A checkpoint"), "Previous run checkpoint was mixed with B's first delta");
+  host.querySelector('.history-return').click();
+  await until(() => !host.querySelector('.history-return'), "latest page loaded before B checkpoint");
+  const beforeCheckpointFind = host.querySelector('.history-find input');
+  setControlValue(beforeCheckpointFind, "Old reading row"); await settle();
+  beforeCheckpointFind.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-message-id="old-0"]') && host.querySelector('.history-return'), "older page restored before B checkpoint");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-B", payload: { type: "assistant.delta", seq: 2, payload: { text: " plus next delta" } } }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("B first delta plus next delta"), "reload retained pre-checkpoint run ownership and suffix");
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: { id: "latest-2", role: "assistant", kind: "text", body: "B checkpoint", payload: { runId: "run-B", checkpointEventSeq: 2 }, createdAt: new Date(2000).toISOString() } }) }));
   await until(() => host.querySelector('.history-live-tail')?.textContent.includes("B checkpoint"), "second run checkpoint visible before POST response");
   runBResponse.resolve(response({ id: "run-B", conversationId: "chat-A", status: "running" }));
@@ -3620,6 +3722,7 @@ try {
     ["background latest refresh", backgroundLatestRefreshRegression, "a missed event refreshes the latest page without keeping a stale snapshot"],
     ["background reading refresh", backgroundReadingRefreshRegression, "missed replay and completion expose later output without moving a reader"],
     ["full-page live anchor", fullPageLiveAnchorRegression, "a new row at the 1000-message cap keeps the reader's oldest visible anchor"],
+    ["transcript observer stability", transcriptObserverStabilityRegression, "stream paints do not restart row observation for an unchanged long transcript"],
     ["background completion page ownership", backgroundCompletionKeepsExplicitPageRegression, "run completion cannot supersede an explicit Return to latest request"],
     ["replay latest page boundary", replayKeepsLatestPageBoundaryRegression, "a buffered older checkpoint cannot make intervening history unreachable"],
     ["deferred reload selection", deferredReloadSelectionOwnershipRegression, "a queued old selection reload cannot claim the new chat's detail slot"],

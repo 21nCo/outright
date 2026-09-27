@@ -103,9 +103,13 @@ export function App() {
   const runtimeHandlerRef = useRef(null);
   const messageViewportRef = useRef(null);
   const stickToBottomRef = useRef(true);
+  const readerAwayFromBottomRef = useRef(false);
+  const readerScrollInputUntilRef = useRef(0);
   const pendingPrependScrollRef = useRef(null);
   const pendingEarlierRef = useRef(null);
   const pendingLiveScrollRef = useRef(null);
+  const restoreMessageAnchorId = useCallback(() => pendingPrependScrollRef.current?.conversationId === selectedConversationRef.current
+    ? pendingPrependScrollRef.current.messageId : null, []);
   const livePreviewRunRef = useRef(null);
   const acceptedPreviewRunRef = useRef(null);
   const liveDeltaEventsRef = useRef(emptyLiveDeltaEvents());
@@ -184,6 +188,8 @@ export function App() {
     ++historyGenerationRef.current;
     readyConversationRef.current = null;
     stickToBottomRef.current = true;
+    readerAwayFromBottomRef.current = false;
+    readerScrollInputUntilRef.current = 0;
     checkpointCursorsRef.current.clear();
     setConversation(null);
     setConversationDetailReady(false);
@@ -464,13 +470,22 @@ export function App() {
         if (previewRunId !== candidate.runId) return current;
         return current?.runId === candidate.runId && current.seq > candidate.seq ? current : candidate;
       });
-      else if (!preservePage) { setLiveCheckpoint(null); livePreviewRunRef.current = null; }
+      else if (!preservePage) {
+        setLiveCheckpoint(null);
+        // The active run can have deltas before its first durable checkpoint.
+        // Keep its owner across a latest-page reload so the next delta extends
+        // the replayed suffix instead of starting a new preview.
+        if (!previewRunId) livePreviewRunRef.current = null;
+      }
       const preserveReading = preservePage && (preservePendingFind || pendingFindRef.current?.conversationId === requestedId
         || conversationRef.current?.messagePage?.hasLater || !stickToBottomRef.current
         || startedHistoryGeneration !== historyGenerationRef.current);
       readyConversationRef.current = nextConversation;
       setConversationDetailReady(true);
-      if (!preserveReading) stickToBottomRef.current = true;
+      if (!preserveReading) {
+        stickToBottomRef.current = true;
+        readerAwayFromBottomRef.current = false;
+      }
       checkpointCursorsRef.current = checkpointCursors(replayed.messages, checkpointCursorsRef.current, activeCursorOwners(nextConversation));
       setConversation((current) => preserveReading && current?.id === requestedId ? (() => {
         const currentTotal = current.messagePage?.total ?? current.messages.length;
@@ -572,7 +587,7 @@ export function App() {
       const olderThanPage = displayed?.messagePage?.hasMore && displayed.messages.length
         && messagePrecedesPage(event.payload, displayed.messages[0]);
       const viewport = messageViewportRef.current;
-      const atLatestBottom = !displayed?.messagePage?.hasLater && viewport
+      const atLatestBottom = !readerAwayFromBottomRef.current && !displayed?.messagePage?.hasLater && viewport
         && viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96;
       if (atLatestBottom && !pendingPrependScrollRef.current) {
         stickToBottomRef.current = true;
@@ -626,9 +641,9 @@ export function App() {
         // message at the latest end of this bounded page.
         const olderThanPage = current.messagePage?.hasMore && current.messages.length
           && messagePrecedesPage(event.payload, current.messages[0]);
-        if (olderThanPage) return current;
+        if (olderThanPage && !alreadyPresent) return current;
         const total = (current.messagePage?.total ?? current.messages.length) + (alreadyPresent || current.messagePage?.hasLater ? 0 : 1);
-        if (current.messagePage?.hasLater) return {
+        if (current.messagePage?.hasLater && !alreadyPresent) return {
           ...current,
           messagePage: { ...current.messagePage, total },
         };
@@ -875,21 +890,50 @@ export function App() {
       }
       if (!pendingPrependScrollRef.current) {
         if (conversationRef.current?.messagePage?.hasLater) stickToBottomRef.current = false;
+        else if (readerAwayFromBottomRef.current && maximum - top > 2) stickToBottomRef.current = false;
         // A virtual row can be measured between a scroll-to-end and this
         // event. The previous end is still the reader's destination even if
         // the new spacer makes the current end much farther away.
+        else if (top < lastScrollTop - 1 && maximum - top > 2 && now < readerScrollInputUntilRef.current) {
+          stickToBottomRef.current = false;
+          readerAwayFromBottomRef.current = true;
+        }
         else if (maximum - top < 96
           || (now < growingUntil && growingFrom !== null && Math.abs(growingFrom - top) < 96)
-          || (lastMaximum > 0 && Math.abs(lastMaximum - top) < 96)) stickToBottomRef.current = true;
-        else if (top < lastScrollTop - 1) stickToBottomRef.current = false;
+          || (lastMaximum > 0 && Math.abs(lastMaximum - top) < 96)) {
+          stickToBottomRef.current = true;
+          readerAwayFromBottomRef.current = false;
+        }
       }
       lastScrollTop = top;
       lastMaximum = maximum;
     };
+    const readerWheel = (event) => {
+      readerScrollInputUntilRef.current = performance.now() + 1000;
+      if (event.deltaY < 0) {
+        readerAwayFromBottomRef.current = true;
+        stickToBottomRef.current = false;
+      }
+    };
+    const readerKey = (event) => {
+      if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+        readerAwayFromBottomRef.current = true;
+        stickToBottomRef.current = false;
+      }
+      if (["ArrowUp", "PageUp", "Home", "ArrowDown", "PageDown", "End"].includes(event.key)) {
+        readerScrollInputUntilRef.current = performance.now() + 1000;
+      }
+    };
+    const readerPointer = () => { readerScrollInputUntilRef.current = performance.now() + 2000; };
+    const scrollbar = viewport.parentElement?.querySelector('[data-slot="scroll-area-scrollbar"]');
     viewport.addEventListener("scroll", updateStickiness, { passive: true });
+    viewport.addEventListener("wheel", readerWheel, { passive: true });
+    viewport.addEventListener("keydown", readerKey);
+    viewport.addEventListener("touchstart", readerPointer, { passive: true });
+    scrollbar?.addEventListener("pointerdown", readerPointer, { passive: true });
     const followLatest = () => {
       if (stickToBottomRef.current && !pendingPrependScrollRef.current && !conversationRef.current?.messagePage?.hasLater) {
-        if (viewport.scrollTop < lastScrollTop - 1) { stickToBottomRef.current = false; return; }
+        if (readerAwayFromBottomRef.current) { stickToBottomRef.current = false; return; }
         moveMessageViewport(viewport, viewport.scrollHeight);
         lastMaximum = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
       }
@@ -899,7 +943,7 @@ export function App() {
     if (column) resize.observe(column);
     viewport.addEventListener("windowed-range-change", followLatest);
     followLatest();
-    return () => { viewport.removeEventListener("scroll", updateStickiness); viewport.removeEventListener("windowed-range-change", followLatest); resize.disconnect(); };
+    return () => { viewport.removeEventListener("scroll", updateStickiness); viewport.removeEventListener("wheel", readerWheel); viewport.removeEventListener("keydown", readerKey); viewport.removeEventListener("touchstart", readerPointer); scrollbar?.removeEventListener("pointerdown", readerPointer); viewport.removeEventListener("windowed-range-change", followLatest); resize.disconnect(); };
   }, [conversation?.id, conversation?.messagePage?.hasLater]);
   useLayoutEffect(() => {
     const pending = pendingLiveScrollRef.current;
@@ -1010,6 +1054,8 @@ export function App() {
     if (event.target !== event.currentTarget || event.key !== "End" || conversation?.messagePage?.hasLater) return;
     const viewport = event.currentTarget;
     stickToBottomRef.current = true;
+    readerAwayFromBottomRef.current = false;
+    readerScrollInputUntilRef.current = 0;
     pendingLiveScrollRef.current = null;
     scheduleLayoutTick(() => { if (stickToBottomRef.current && viewport.isConnected) moveMessageViewport(viewport, viewport.scrollHeight); });
   }
@@ -1505,7 +1551,7 @@ export function App() {
       <div className="work-area">
         <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
           <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} onManage={openManageChat} />
-          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? <WindowedMessages key={conversation.id} messages={conversation.messages} messagePage={conversation.messagePage} viewportRef={messageViewportRef} restoreAnchorId={() => pendingPrependScrollRef.current?.conversationId === conversation.id ? pendingPrependScrollRef.current.messageId : null} renderMessage={(message) => <Message message={message} conversationId={conversation.id} />} onFind={findConversationMessage} onCancelFind={() => { pendingFindRef.current?.abort(); pendingFindRef.current = null; findProgressRef.current = null; }} resetFindGeneration={findResetGeneration} /> : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{!conversation?.messagePage?.hasLater && activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}</div></ScrollArea>
+          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? <WindowedMessages key={conversation.id} messages={conversation.messages} messagePage={conversation.messagePage} viewportRef={messageViewportRef} restoreAnchorId={restoreMessageAnchorId} renderMessage={(message) => <Message message={message} conversationId={conversation.id} />} onFind={findConversationMessage} onCancelFind={() => { pendingFindRef.current?.abort(); pendingFindRef.current = null; findProgressRef.current = null; }} resetFindGeneration={findResetGeneration} /> : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{!conversation?.messagePage?.hasLater && activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}</div></ScrollArea>
           {readingLiveText && <section className="history-live-tail" aria-label={activeRun ? "Live output while reading history" : "Recent output while reading history"} tabIndex={0}><strong>{activeRun ? "Live output" : "Recent output"}</strong><p>{readingLiveText}</p></section>}
           {conversation?.messagePage?.hasLater && <div className="history-forward"><button className="history-later" onClick={loadLaterMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading later messages…" : `Load later messages · ${conversation.messagePage.newerCount} remaining`}</button><button className="history-return" onClick={loadConversation}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button></div>}
           {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}

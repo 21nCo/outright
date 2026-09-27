@@ -153,6 +153,8 @@ if (process.env.CI && process.platform !== "win32") {
     writeSync(2, `Agent-manager test received SIGTERM: pid=${process.pid} ppid=${process.ppid} pgid=${processGroupId(process.pid)}\n`);
     process.exit(143);
   });
+  process.on("exit", (code) => writeSync(2, `Agent-manager test process exited: pid=${process.pid} code=${code}\n`));
+  process.on("uncaughtExceptionMonitor", (error) => writeSync(2, `Agent-manager test uncaught exception: pid=${process.pid} ${error.stack ?? error}\n`));
 }
 
 function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/project" }) {
@@ -944,6 +946,7 @@ test("shutdown racing the running-state commit never authorizes the provider", a
   }
   const database = fakeDatabase();
   const child = fakeChild();
+  if (process.env.CI && process.platform !== "win32") console.error(`POSIX shutdown race fake child: pid=${child.pid ?? "none"} group=${child.pid ? processGroupId(child.pid) : "none"}`);
   const writes = [];
   const originalWrite = child.stdin.write.bind(child.stdin);
   child.stdin.write = (chunk) => { writes.push(String(chunk)); return originalWrite(chunk); };
@@ -963,7 +966,9 @@ test("shutdown racing the running-state commit never authorizes the provider", a
   manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child,
     launchCommand: (command) => ({ ...command, handshakePath: "", ownsDescendants: true }), terminationTimeoutMs: 1000 });
   const run = database.createRun(codexRun("run-1"));
+  if (process.env.CI && process.platform !== "win32") console.error(`POSIX shutdown race scheduling: test=${process.pid}`);
   await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  if (process.env.CI && process.platform !== "win32") console.error(`POSIX shutdown race scheduled: test=${process.pid} childSignals=${child.signals.join(",")}`);
   await shutdownPromise;
 
   assert.equal(writes.includes("go\n"), false, "shutdown cannot authorize a provider after cancellation");
