@@ -263,8 +263,11 @@ process.stdin.on("end", () => { if (!authorized) { try { fs.unlinkSync(handshake
 
 function supervisorCommand(args, timeout) {
   return new Promise((resolve) => {
-    execFile(AGENT_SUPERVISOR, args, { encoding: "utf8", timeout, killSignal: "SIGKILL", maxBuffer: 1024 },
-      (error, stdout) => resolve({ error, stdout }));
+    execFile(AGENT_SUPERVISOR, args, { encoding: "utf8", timeout, killSignal: "SIGKILL", maxBuffer: 4096 },
+      (error, stdout, stderr) => {
+        if (process.env.CI && stderr) console.error(stderr.trimEnd());
+        resolve({ error, stdout });
+      });
   });
 }
 

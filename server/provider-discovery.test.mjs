@@ -32,6 +32,40 @@ test("aborting a version check reaps a CLI that ignores SIGTERM", { skip: proces
   }
 });
 
+test("abort and timeout reap a pipe-holding CLI descendant", { skip: process.platform === "win32" }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-tree-"));
+  const executable = path.join(directory, "tree-probe");
+  const pidFile = path.join(directory, "descendant-pid");
+  const childSource = `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`;
+  writeFileSync(executable, `#!${process.execPath}\nconst { spawn } = require("node:child_process"); spawn(process.execPath, ["-e", ${JSON.stringify(childSource)}], { stdio: "inherit" }); setInterval(() => {}, 1000);\n`);
+  chmodSync(executable, 0o755);
+  try {
+    for (const mode of ["abort", "timeout"]) {
+      const controller = new AbortController();
+      let descendantPid;
+      try {
+        const pending = defaultProbe(executable, { signal: controller.signal });
+        const readyUntil = Date.now() + 2_000;
+        while (!existsSync(pidFile) && Date.now() < readyUntil) await new Promise((resolve) => setTimeout(resolve, 10));
+        assert.ok(existsSync(pidFile), "the descendant inherited the probe pipes");
+        descendantPid = Number(readFileSync(pidFile, "utf8"));
+        const started = Date.now();
+        if (mode === "abort") controller.abort();
+        await assert.rejects(pending, mode === "abort" ? /aborted|did not close/ : /timed out|did not close/);
+        assert.ok(Date.now() - started < 4_000, `${mode} remains bounded`);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        assert.throws(() => process.kill(descendantPid, 0), { code: "ESRCH" }, `the whole probe tree must be gone after ${mode}`);
+      } finally {
+        controller.abort();
+        if (descendantPid) try { process.kill(descendantPid, "SIGKILL"); } catch { /* Already gone. */ }
+        rmSync(pidFile, { force: true });
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("shutdown aborts and reaps a running version-check child", async () => {
   let childPid;
   const discovery = createProviderDiscovery({ probe: (id, { signal }) => {

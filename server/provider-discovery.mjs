@@ -1,8 +1,27 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 const PROVIDERS = [
   { id: "codex", label: "Codex", models: ["gpt-5.4", "gpt-5.3-codex"] },
   { id: "claude", label: "Claude Code", models: ["sonnet", "opus", "haiku"] },
 ];
+const MAX_VERSION_BYTES = 16 * 1024;
+
+function windowsProbeCommand(id) {
+  if (!PROVIDERS.some((provider) => provider.id === id)) throw new Error(`Unknown provider: ${id}`);
+  let executable = process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH;
+  if (!executable) {
+    const manifest = JSON.parse(readFileSync(new URL("./bin/agent-supervisor.json", import.meta.url), "utf8"));
+    if (typeof manifest.filename !== "string" || !/^agent-supervisor-[0-9a-f]{16}\.exe$/.test(manifest.filename)) {
+      throw new Error("Windows agent supervisor manifest is invalid");
+    }
+    executable = fileURLToPath(new URL(`./bin/${manifest.filename}`, import.meta.url));
+  }
+  return {
+    executable,
+    args: [process.env.ComSpec || "cmd.exe", "/d", "/s", "/c", `${id} --version`],
+  };
+}
 
 export function createProviderDiscovery({ probe = defaultProbe, onChange = () => {}, refreshMs = 30_000, schedule = setInterval, cancel = clearInterval } = {}) {
   let snapshot = PROVIDERS.map((provider) => ({ ...provider, available: false, version: "", checking: true }));
@@ -83,8 +102,6 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
 
 export async function defaultProbe(id, { signal } = {}) {
   return new Promise((resolve, reject) => {
-    let outcome;
-    let closed = false;
     let settled = false;
     let terminationError;
     let escalation;
@@ -101,18 +118,46 @@ export async function defaultProbe(id, { signal } = {}) {
       if (error) reject(error);
       else resolve(value);
     };
-    const finish = () => {
-      if (!closed || !outcome) return;
-      settle(terminationError ?? outcome.error, outcome.stdout || outcome.stderr || "");
+    let spawnError;
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
+    // The Windows supervisor owns a Job Object. Its handle closing kills even
+    // detached descendants of a .cmd shim; a numeric taskkill of cmd.exe alone
+    // cannot prove that cleanup once the shim has exited.
+    const command = process.platform === "win32" ? windowsProbeCommand(id) : { executable: id, args: ["--version"] };
+    const child = spawn(command.executable, command.args, {
+      stdio: ["ignore", "pipe", "pipe"], windowsHide: true, detached: process.platform !== "win32",
+    });
+    child.once("error", (error) => { spawnError = error; });
+    child.stdout?.on("data", (chunk) => {
+      const length = stdout.length + chunk.length;
+      stdout = Buffer.concat([stdout, chunk], Math.min(length, MAX_VERSION_BYTES + 1));
+      if (length > MAX_VERSION_BYTES) terminate(new Error(`Provider version output exceeded limit: ${id}`));
+    });
+    child.stderr?.on("data", (chunk) => {
+      const length = stderr.length + chunk.length;
+      stderr = Buffer.concat([stderr, chunk], Math.min(length, MAX_VERSION_BYTES + 1));
+      if (length > MAX_VERSION_BYTES) terminate(new Error(`Provider version output exceeded limit: ${id}`));
+    });
+    child.once("close", (code, childSignal) => {
+      settle(terminationError ?? spawnError ?? (code === 0 ? null : new Error(`Provider version check exited ${code ?? childSignal}: ${id}`)), (stdout.length ? stdout : stderr).toString("utf8"));
+    });
+    const terminateTree = (force = false) => {
+      if (process.platform === "win32") {
+        try { child.kill("SIGKILL"); } catch { /* Supervisor already exited. */ }
+      } else if (child.pid) {
+        // The detached probe owns its process group, including pipe-holding
+        // descendants after the direct CLI exits.
+        try { process.kill(-child.pid, force ? "SIGKILL" : "SIGTERM"); } catch { /* Group already exited. */ }
+      } else {
+        try { child.kill(force ? "SIGKILL" : "SIGTERM"); } catch { /* Already exited. */ }
+      }
     };
-    const child = execFile(id, ["--version"], { encoding: "utf8", maxBuffer: 16 * 1024, windowsHide: true },
-      (error, stdout, stderr) => { outcome = { error, stdout, stderr }; finish(); });
-    child.once("close", () => { closed = true; finish(); });
     const terminate = (reason) => {
       if (settled) return;
       terminationError ??= reason;
-      try { child.kill("SIGTERM"); } catch { /* Already exited. */ }
-      escalation = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* Already exited. */ } }, 100);
+      terminateTree();
+      if (!escalation) escalation = setTimeout(() => terminateTree(true), 100);
     };
     const abort = () => terminate(new Error(`Provider version check aborted: ${id}`));
     const timeout = setTimeout(() => terminate(new Error(`Provider version check timed out: ${id}`)), 2500);
@@ -120,7 +165,7 @@ export async function defaultProbe(id, { signal } = {}) {
     // SIGKILL is attempted before this deadline; unresolved cleanup is an
     // error rather than a successful version check.
     const deadline = setTimeout(() => {
-      try { child.kill("SIGKILL"); } catch { /* Already exited. */ }
+      terminateTree(true);
       settle(new Error(`Provider version check did not close: ${id}`));
     }, 3500);
     signal?.addEventListener("abort", abort, { once: true });

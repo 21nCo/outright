@@ -165,6 +165,8 @@ static void relay(int fd, int destination) {
 }
 
 static void bootout(const char *target) {
+  if (getenv("CI") != NULL) dprintf(STDERR_FILENO, "Outright launchd bootout: sender=%ld/%ld parent=%ld target=%s\n",
+    (long)getpid(), (long)getpgrp(), (long)getppid(), target);
   char *arguments[] = { "launchctl", "bootout", (char *)target, NULL };
   run_launchctl(arguments, NULL, 0);
 }
@@ -223,7 +225,12 @@ static bool terminate_coalition(const char *target, uint64_t coalition_id) {
     if (count < 0) return false;
     if (count == 0) { bootout(target); return true; }
     for (int index = 0; index < count; index++) {
-      if (pids[index] > 0 && pids[index] != getpid()) kill(pids[index], SIGKILL);
+      if (pids[index] > 0 && pids[index] != getpid()) {
+        if (getenv("CI") != NULL && attempt == 0 && index < 12) dprintf(STDERR_FILENO, "Outright coalition signal: sender=%ld/%ld parent=%ld coalition=%llu members=%d target=%ld/%ld signal=SIGKILL\n",
+          (long)getpid(), (long)getpgrp(), (long)getppid(), (unsigned long long)coalition_id,
+          count, (long)pids[index], (long)getpgid(pids[index]));
+        kill(pids[index], SIGKILL);
+      }
     }
     struct timespec delay = { .tv_sec = 0, .tv_nsec = 25 * 1000 * 1000 };
     nanosleep(&delay, NULL);

@@ -634,7 +634,10 @@ test("parent permits a slow child beyond the old shorter watchdog", { timeout: 5
 test("fixture assertion failures still clean Chrome, Vite and profile independently", { timeout: nestedExitTimeout + 25_000 }, async (context) => {
   if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE) { context.skip("Nested injected-failure run"); return; }
   const profile = mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
-  const env = { ...process.env, OUTRIGHT_TEST_UI_ASSERTION_FAILURE: "1", OUTRIGHT_TEST_UI_PROFILE: profile };
+  // Cleanup is the contract here; one completed interaction distinguishes a
+  // post-fixture assertion from an early startup failure without coupling this
+  // owner test to the entire long-session interaction sequence.
+  const env = { ...process.env, OUTRIGHT_TEST_UI_ASSERTION_FAILURE: "1", OUTRIGHT_TEST_UI_PROFILE: profile, OUTRIGHT_UI_STEP: "sustained output" };
   delete env.NODE_TEST_CONTEXT;
   const child = spawn(process.execPath, ["--test", "--test-name-pattern=browser interaction regressions", fileURLToPath(import.meta.url)], {
     cwd: root, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true,

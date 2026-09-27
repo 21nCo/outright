@@ -3048,13 +3048,22 @@ async function sustainedOutputRegression() {
   const observer = new MutationObserver(() => { paints += 1; });
   observer.observe(text, { subtree: true, characterData: true, childList: true });
   const started = performance.now();
-  for (let seq = 2; seq <= 201; seq += 1) {
-    sendDelta(seq);
-    // Keep output arriving across tasks without relying on throttled timers
-    // in a hidden headless browser.
-    if (seq % 2 === 1) await frame();
+  const priorHidden = Object.getOwnPropertyDescriptor(document, "hidden");
+  try {
+    Object.defineProperty(document, "hidden", { configurable: true, value: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    for (let seq = 2; seq <= 201; seq += 1) {
+      sendDelta(seq);
+      // Exercise hidden-tab posted tasks while stream paints keep their own
+      // 32 ms cadence. Every delta must still reach the eventual flush.
+      if (seq % 2 === 1) await frame();
+    }
+    await until(() => text.textContent.length === 201 * 256, "sustained output complete");
+  } finally {
+    if (priorHidden) Object.defineProperty(document, "hidden", priorHidden);
+    else delete document.hidden;
+    document.dispatchEvent(new Event("visibilitychange"));
   }
-  await until(() => text.textContent.length === 201 * 256, "sustained output complete");
   observer.disconnect();
   const input = host.querySelector('textarea[aria-label="Message the agent"]');
   const inputStarted = performance.now();

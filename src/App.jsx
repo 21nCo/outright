@@ -144,10 +144,13 @@ export function App() {
       streamingFlushRef.current = null;
       setStreamingText(streamingTextRef.current);
     } else if (!streamingFlushRef.current) {
-      streamingFlushRef.current = scheduleLayoutTick(() => {
+      // Stream paints have their own cadence. Layout ticks can run immediately
+      // through MessageChannel in a hidden tab, turning each delta into a paint.
+      const timer = window.setTimeout(() => {
         streamingFlushRef.current = null;
         setStreamingText(streamingTextRef.current);
-      });
+      }, 32);
+      streamingFlushRef.current = () => window.clearTimeout(timer);
     }
   }, []);
   useEffect(() => () => streamingFlushRef.current?.(), []);
@@ -575,8 +578,19 @@ export function App() {
       if (atLatestBottom && !pendingPrependScrollRef.current) {
         stickToBottomRef.current = true;
         pendingLiveScrollRef.current = null;
-      } else if (!displayed?.messagePage?.hasLater && !olderThanPage && !stickToBottomRef.current && !pendingPrependScrollRef.current && viewport) {
-        pendingLiveScrollRef.current = { conversationId: event.conversationId, top: viewport.scrollTop };
+      } else if (!displayed?.messagePage?.hasLater && !olderThanPage && !stickToBottomRef.current
+        && !pendingPrependScrollRef.current && !pendingLiveScrollRef.current && viewport) {
+        const frame = viewport.getBoundingClientRect();
+        const anchor = [...viewport.querySelectorAll("[data-message-id]")].find((element) => {
+          const row = element.getBoundingClientRect();
+          return row.bottom > frame.top && row.top < frame.bottom;
+        });
+        pendingLiveScrollRef.current = {
+          conversationId: event.conversationId,
+          messageId: anchor?.dataset.messageId,
+          top: anchor?.getBoundingClientRect().top,
+          scrollTop: viewport.scrollTop,
+        };
       }
       if (!displayed || olderThanPage || displayed.messagePage?.hasLater
         || displayed.messages.length >= MAX_RENDERED_MESSAGES) refreshMessageCount();
@@ -886,8 +900,45 @@ export function App() {
   useLayoutEffect(() => {
     const pending = pendingLiveScrollRef.current;
     if (!pending || pending.conversationId !== conversation?.id) return;
-    pendingLiveScrollRef.current = null;
-    if (messageViewportRef.current) moveMessageViewport(messageViewportRef.current, pending.top);
+    const viewport = messageViewportRef.current;
+    if (!viewport) return;
+    let cancelTick = () => {};
+    let remaining = 24;
+    let stable = 0;
+    const cancelForReader = () => {
+      if (pendingLiveScrollRef.current === pending) pendingLiveScrollRef.current = null;
+      cancelTick();
+    };
+    const restore = () => {
+      if (pendingLiveScrollRef.current !== pending) return;
+      const anchor = pending.messageId && [...viewport.querySelectorAll("[data-message-id]")].find((element) => element.dataset.messageId === pending.messageId);
+      if (anchor && pending.top !== undefined) {
+        const delta = anchor.getBoundingClientRect().top - pending.top;
+        if (Math.abs(delta) > 1) moveMessageViewport(viewport, viewport.scrollTop + delta);
+        stable = Math.abs(anchor.getBoundingClientRect().top - pending.top) < 2 ? stable + 1 : 0;
+      } else {
+        // The virtual range may need one tick before the retained row mounts.
+        if (remaining === 24) moveMessageViewport(viewport, pending.scrollTop);
+        stable = 0;
+      }
+      if (--remaining > 0 && stable < 3) cancelTick = scheduleLayoutTick(restore);
+      else if (pendingLiveScrollRef.current === pending) pendingLiveScrollRef.current = null;
+    };
+    const scrollbar = viewport.parentElement?.querySelector('[data-slot="scroll-area-scrollbar"]');
+    viewport.addEventListener("wheel", cancelForReader, { passive: true });
+    viewport.addEventListener("touchstart", cancelForReader, { passive: true });
+    viewport.addEventListener("pointerdown", cancelForReader, { passive: true });
+    viewport.addEventListener("keydown", cancelForReader);
+    scrollbar?.addEventListener("pointerdown", cancelForReader, { passive: true });
+    restore();
+    return () => {
+      cancelTick();
+      viewport.removeEventListener("wheel", cancelForReader);
+      viewport.removeEventListener("touchstart", cancelForReader);
+      viewport.removeEventListener("pointerdown", cancelForReader);
+      viewport.removeEventListener("keydown", cancelForReader);
+      scrollbar?.removeEventListener("pointerdown", cancelForReader);
+    };
   }, [conversation]);
   useLayoutEffect(() => {
     const pending = pendingPrependScrollRef.current;
