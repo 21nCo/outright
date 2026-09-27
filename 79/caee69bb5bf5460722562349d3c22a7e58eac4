@@ -1,0 +1,21 @@
+src/App.jsx
+  s_3058aa458d6557::t_06ae9271ad5eeb 883,1508,1557
+tests/ui-races.jsx
+  s_3058aa458d6557::t_fe8c5a322f6c75 2021-2036,2280-2281,2571-2575,2580-2582,3611
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "79caee69bb5bf5460722562349d3c22a7e58eac4",
+  "prompts": {},
+  "sessions": {
+    "s_3058aa458d6557": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e214-820d-7fa0-a0ea-0fdea628637e",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
