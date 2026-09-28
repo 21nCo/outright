@@ -94,8 +94,10 @@ test("successful version checks also close their detached helper tree", { skip: 
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-success-"));
   const executable = path.join(directory, "successful-probe");
   const pidFile = path.join(directory, "descendant-pid");
-  const helper = `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`;
-  writeFileSync(executable, `#!${process.execPath}\nconst { spawn } = require("node:child_process"); spawn(process.execPath, ["-e", ${JSON.stringify(helper)}], { stdio: "ignore" }); console.log("version 1"); setTimeout(() => process.exit(0), 100);\n`);
+  // Delay readiness beyond the old fixed 100 ms exit to prove that success
+  // waits for the helper, rather than merely winning a scheduling race.
+  const helper = `setTimeout(() => { require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); process.send("ready"); }, 250); setInterval(() => {}, 1000);`;
+  writeFileSync(executable, `#!${process.execPath}\nconst { spawn } = require("node:child_process"); const helper = spawn(process.execPath, ["-e", ${JSON.stringify(helper)}], { stdio: ["ignore", "ignore", "ignore", "ipc"] }); helper.once("message", (message) => { if (message === "ready") { console.log("version 1"); process.exit(0); } });\n`);
   chmodSync(executable, 0o755);
   let descendantPid;
   try {

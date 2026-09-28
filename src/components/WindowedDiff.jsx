@@ -143,6 +143,14 @@ export function WindowedDiff({ diff, label }) {
     return () => resize.disconnect();
   }, []);
   useLayoutEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    // Scroll and resize callbacks can enqueue a position from an older frame.
+    // Reconcile the committed row placement with the physical viewport before
+    // paint, including while a compressed Find seek is still pending.
+    if (viewport.scrollTop !== position.top || viewport.clientHeight !== position.height) updatePosition(viewport);
+  });
+  useLayoutEffect(() => {
     if (!needle.trim() || foundOffsetRef.current < 0) return;
     const query = needle.trim().toLocaleLowerCase();
     let match = searchable.indexOf(query, Math.min(foundOffsetRef.current, searchable.length));

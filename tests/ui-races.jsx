@@ -1960,7 +1960,7 @@ async function extremeDiffHeightRegression() {
     const mark = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
     const view = viewport.getBoundingClientRect();
     assert(mark.top < view.bottom && mark.bottom > view.top,
-      `Pending compressed Find placed its row at an unobserved scroll position: mark=${mark.top}/${mark.bottom}, viewport=${view.top}/${view.bottom}, scroll=${viewport.scrollTop}, first=${viewport.dataset.firstLine}`);
+      `Pending compressed Find placed its row at an unobserved scroll position: mark=${mark.top}/${mark.bottom}, viewport=${view.top}/${view.bottom}, scroll=${viewport.scrollTop}, first=${viewport.dataset.firstLine}, mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}, rowTop=${viewport.firstElementChild?.firstElementChild?.style.top}`);
   } finally {
     holdPhysicalScroll = false;
     delete viewport.scrollTop;
