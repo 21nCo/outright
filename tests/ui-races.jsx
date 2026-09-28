@@ -1766,16 +1766,32 @@ async function productionDiffViewportRegression() {
     const wheelTrace = [];
     let attemptBudget = 1;
     let minimumProgress = Infinity;
-    const wheelDeadline = Date.now() + 60_000;
-    for (let step = 0; step < attemptBudget && Date.now() < wheelDeadline
-      && viewport.scrollTop < viewport.scrollHeight - viewport.clientHeight - 1; step += 1) {
+    const wheelBudgetMs = window.__fixtureWheelCap > 0 && window.__fixtureWheelCap <= 1000 ? 300_000 : 120_000;
+    const wheelDeadline = Date.now() + wheelBudgetMs;
+    let exitReason = "budget-or-deadline";
+    for (let step = 0; step < attemptBudget && Date.now() < wheelDeadline; step += 1) {
+      // Virtual rows and the browser's scroll geometry can commit after a
+      // wheel acknowledgement. Only the settled viewport and final row can
+      // establish that native navigation reached the tail.
+      await settle();
+      if (viewport.scrollTop >= viewport.scrollHeight - viewport.clientHeight - 1) {
+        if (viewport.textContent.includes("staged 49999")) { exitReason = "tail-visible"; break; }
+        const atEnd = viewport.scrollHeight - viewport.clientHeight;
+        for (let pendingFrame = 0; pendingFrame < 8 && viewport.scrollTop >= viewport.scrollHeight - viewport.clientHeight - 1
+          && !viewport.textContent.includes("staged 49999"); pendingFrame += 1) await frame();
+        if (viewport.textContent.includes("staged 49999")) { exitReason = "tail-visible-after-commit"; break; }
+        if (viewport.scrollTop >= viewport.scrollHeight - viewport.clientHeight - 1) {
+          exitReason = `physical-end-without-tail:${atEnd}->${viewport.scrollHeight - viewport.clientHeight}`;
+          break;
+        }
+      }
       const bounds = viewport.getBoundingClientRect();
       const before = viewport.scrollTop;
       const delivery = await window.__fixtureWheel(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2, 120_000);
       assert(delivery.viewport === viewport, `Large wheel missed the diff viewport at step ${step}`);
       try { await until(() => viewport.scrollTop > before, `large native wheel scroll at step ${step}`); }
       catch (error) { throw new Error(`${error.message}; trace=${JSON.stringify(wheelTrace)}; delivered=${delivery.deltaY}; canceled=${delivery.defaultPrevented}; physical=${viewport.scrollTop}; logical=${viewport.dataset.firstLine}; mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`, { cause: error }); }
-      await frame();
+      await settle();
       const progress = viewport.scrollTop - before;
       const frameBounds = viewport.getBoundingClientRect();
       const mountedRows = viewport.querySelectorAll("span");
@@ -1788,12 +1804,15 @@ async function productionDiffViewportRegression() {
         `Native wheel lost progress or mounted unbounded rows: ${JSON.stringify(wheelTrace)}`);
       minimumProgress = Math.min(minimumProgress, progress);
       const remaining = Math.max(0, viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop);
-      attemptBudget = Math.min(256, Math.max(attemptBudget, step + 1 + Math.ceil(remaining / minimumProgress) + 4));
+      attemptBudget = Math.min(2048, Math.max(attemptBudget, step + 1 + Math.ceil(remaining / minimumProgress) + 8));
     }
-    assert(viewport.scrollTop >= viewport.scrollHeight - viewport.clientHeight - 1,
-      `Native wheels did not reach the staged diff end within observed-progress budget: ${JSON.stringify({
-        initialRemaining, attempts: wheelTrace.length, attemptBudget, elapsedLimitMs: 60_000,
-        remaining: viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop, trace: wheelTrace.slice(-16) })}`);
+    await settle();
+    assert(viewport.scrollTop >= viewport.scrollHeight - viewport.clientHeight - 1 && viewport.textContent.includes("staged 49999"),
+      `Native wheels did not reach the staged diff tail: ${JSON.stringify({
+        exitReason, initialRemaining, attempts: wheelTrace.length, attemptBudget, elapsedLimitMs: wheelBudgetMs,
+        remaining: viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop,
+        physical: viewport.scrollTop, logical: viewport.dataset.firstLine,
+        mounted: [viewport.dataset.mountedStart, viewport.dataset.mountedEnd], trace: wheelTrace.slice(-16) })}`);
   } else { viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); }
   try { await until(() => viewport.textContent.includes("staged 49999"), "staged final line"); }
   catch (error) { throw new Error(`${error.message}; scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}`); }
@@ -2148,7 +2167,7 @@ async function extremeDiffHeightRegression() {
 
 async function unicodeDiffFindRegression() {
   root.render(null); await settle();
-  const diff = "+İstanbul\n" + Array.from({ length: 400 }, (_, index) => `+filler ${index}\n`).join("") + "+CAFÉ target\n+ΟΣ final\n+ΑΣΑ medial\n";
+  const diff = "+İstanbul\n" + Array.from({ length: 400 }, (_, index) => `+filler ${index}\n`).join("") + "+CAFÉ target\n+ΟΣ final\n+ΑΣΑ medial\n+I token\n";
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={diff} label="Unicode diff" /></div>);
   await until(() => host.querySelector('input[aria-label="Find in diff"]'), "Unicode diff find ready");
   const input = host.querySelector('input[aria-label="Find in diff"]');
@@ -2164,6 +2183,13 @@ async function unicodeDiffFindRegression() {
   await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("ΑΣΑ medial"), "diff Find matches medial sigma");
   host.querySelector('[aria-label="Next diff match"]').click();
   await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("ΟΣ final"), "diff Find wraps sigma forms");
+  const originalLocaleLower = String.prototype.toLocaleLowerCase;
+  try {
+    String.prototype.toLocaleLowerCase = function () { return originalLocaleLower.call(this, "tr"); };
+    setControlValue(input, "i token"); await settle();
+    host.querySelector('[aria-label="Next diff match"]').click();
+    await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("I token"), "diff Find ignores host locale");
+  } finally { String.prototype.toLocaleLowerCase = originalLocaleLower; }
 }
 
 async function reverseDiffFindWrapRegression() {

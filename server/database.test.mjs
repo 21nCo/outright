@@ -71,6 +71,23 @@ test("conversation Find folds final and medial sigma through persisted sections 
   } finally { database.close(); }
 });
 
+test("persisted Find uses the same keys under a Turkish host locale", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  const original = String.prototype.toLocaleLowerCase;
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Locale", provider: "codex" });
+    const first = database.addMessage({ conversationId: chat.id, role: "user", body: "I token" });
+    const second = database.addMessage({ conversationId: chat.id, role: "user", body: "ΟΣ final" });
+    String.prototype.toLocaleLowerCase = function () { return original.call(this, "tr"); };
+    assert.equal((await database.findMessagePage(chat.id, "i token", null)).matchId, first.id);
+    assert.equal((await database.findMessagePage(chat.id, "Σ", first.id)).matchId, second.id);
+    assert.equal((await database.findMessagePage(chat.id, "i token", second.id)).matchId, first.id);
+  } finally {
+    String.prototype.toLocaleLowerCase = original;
+    database.close();
+  }
+});
+
 test("conversation Find bounds hydrated neighbors and keeps page cursors exact", async () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

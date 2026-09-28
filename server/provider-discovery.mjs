@@ -1,5 +1,9 @@
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { constants, readFileSync, rmSync } from "node:fs";
+import { access } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 const PROVIDERS = [
   { id: "codex", label: "Codex", models: ["gpt-5.4", "gpt-5.3-codex"] },
@@ -7,20 +11,33 @@ const PROVIDERS = [
 ];
 const MAX_VERSION_BYTES = 16 * 1024;
 
-function windowsProbeCommand(id) {
-  if (!PROVIDERS.some((provider) => provider.id === id)) throw new Error(`Unknown provider: ${id}`);
-  let executable = process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH;
-  if (!executable) {
+async function providerExecutable(id) {
+  if (id.includes("/")) return resolve(id);
+  for (const directory of (process.env.PATH || "").split(delimiter)) {
+    const candidate = resolve(directory || ".", id);
+    try { await access(candidate, constants.X_OK); return candidate; }
+    catch { /* Keep searching the caller's PATH. */ }
+  }
+  return id;
+}
+
+function probeCommand(id, providerPath) {
+  if (process.platform === "win32" && !PROVIDERS.some((provider) => provider.id === id)) throw new Error(`Unknown provider: ${id}`);
+  let supervisor = process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH;
+  if (!supervisor && process.platform === "win32") {
     const manifest = JSON.parse(readFileSync(new URL("./bin/agent-supervisor.json", import.meta.url), "utf8"));
     if (typeof manifest.filename !== "string" || !/^agent-supervisor-[0-9a-f]{16}\.exe$/.test(manifest.filename)) {
       throw new Error("Windows agent supervisor manifest is invalid");
     }
-    executable = fileURLToPath(new URL(`./bin/${manifest.filename}`, import.meta.url));
+    supervisor = fileURLToPath(new URL(`./bin/${manifest.filename}`, import.meta.url));
   }
-  return {
-    executable,
-    args: [process.env.ComSpec || "cmd.exe", "/d", "/s", "/c", `${id} --version`],
-  };
+  supervisor ??= fileURLToPath(new URL("./bin/agent-supervisor", import.meta.url));
+  if (process.platform === "win32") return { executable: supervisor, args: [process.env.ComSpec || "cmd.exe", "/d", "/s", "/c", `${id} --version`], stdio: ["ignore", "pipe", "pipe"] };
+  // The platform supervisor owns descendants even after setsid/reparenting.
+  // The Linux handshake and macOS launch gate are private to this one probe.
+  const token = randomUUID();
+  if (process.platform === "darwin") return { executable: supervisor, args: [`com.21n.outright.probe.${token}`, providerPath, "--version"], stdio: ["ignore", "pipe", "pipe", "pipe"], env: { ...process.env, OUTRIGHT_LAUNCH_GATE_FD: "3" } };
+  return { executable: supervisor, args: [join(tmpdir(), `outright-probe-${token}.json`), providerPath, "--version"], stdio: ["pipe", "pipe", "pipe", "pipe"] };
 }
 
 export function createProviderDiscovery({ probe = defaultProbe, onChange = () => {}, refreshMs = 30_000, schedule = setInterval, cancel = clearInterval } = {}) {
@@ -101,14 +118,14 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
 }
 
 export async function defaultProbe(id, { signal } = {}) {
+  const executable = process.platform === "win32" ? id : await providerExecutable(id);
+  if (signal?.aborted) throw new Error(`Provider version check aborted: ${id}`);
   return new Promise((resolve, reject) => {
     let settled = false;
     let terminationError;
-    let escalation;
     const cleanup = () => {
       clearTimeout(timeout);
       clearTimeout(deadline);
-      clearTimeout(escalation);
       signal?.removeEventListener("abort", abort);
     };
     const settle = (error, value) => {
@@ -121,13 +138,17 @@ export async function defaultProbe(id, { signal } = {}) {
     let spawnError;
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
-    // The Windows supervisor owns a Job Object. Its handle closing kills even
-    // detached descendants of a .cmd shim; a numeric taskkill of cmd.exe alone
-    // cannot prove that cleanup once the shim has exited.
-    const command = process.platform === "win32" ? windowsProbeCommand(id) : { executable: id, args: ["--version"] };
+    // Every platform supervisor owns descendants beyond the direct CLI's
+    // process group. A version is valid only after that owner exits cleanly.
+    const command = probeCommand(id, executable);
     const child = spawn(command.executable, command.args, {
-      stdio: ["ignore", "pipe", "pipe"], windowsHide: true, detached: process.platform !== "win32",
+      stdio: command.stdio, env: command.env, windowsHide: true, detached: process.platform !== "win32",
     });
+    if (process.platform === "darwin") child.stdio[3]?.end("go\n");
+    if (process.platform === "linux") child.stdin?.end("go\n");
+    child.stdio[3]?.resume();
+    child.stdin?.on("error", () => {});
+    child.stdio[3]?.on("error", () => {});
     // A failed spawn can emit again if shutdown races its close callback.
     // Keep ownership of the error channel until this child is fully closed.
     child.on("error", (error) => { spawnError ??= error; });
@@ -142,36 +163,28 @@ export async function defaultProbe(id, { signal } = {}) {
       if (length > MAX_VERSION_BYTES) terminate(new Error(`Provider version output exceeded limit: ${id}`));
     });
     child.once("close", (code, childSignal) => {
-      // A successful CLI may have forked a helper with redirected stdio, so
-      // close of the direct child alone is not proof the probe tree is gone.
-      // The detached group is still ours until this version check settles.
-      if (process.platform !== "win32" && child.pid) terminateTree(true);
+      if (process.platform === "linux") rmSync(command.args[0], { force: true });
       settle(terminationError ?? spawnError ?? (code === 0 ? null : new Error(`Provider version check exited ${code ?? childSignal}: ${id}`)), (stdout.length ? stdout : stderr).toString("utf8"));
     });
-    const terminateTree = (force = false) => {
-      if (process.platform === "win32") {
-        try { child.kill("SIGKILL"); } catch { /* Supervisor already exited. */ }
-      } else if (child.pid) {
-        // The detached probe owns its process group, including pipe-holding
-        // descendants after the direct CLI exits.
-        try { process.kill(-child.pid, force ? "SIGKILL" : "SIGTERM"); } catch { /* Group already exited. */ }
-      }
+    const terminateTree = () => {
+      // Let the native owner reap its tree. Killing the owner first can leave
+      // an escaped helper alive, especially after its direct CLI exits.
+      try { child.kill("SIGTERM"); } catch { /* Already exited. */ }
     };
     const terminate = (reason) => {
       if (settled) return;
       terminationError ??= reason;
       terminateTree();
-      if (!escalation) escalation = setTimeout(() => terminateTree(true), 100);
     };
     const abort = () => terminate(new Error(`Provider version check aborted: ${id}`));
     const timeout = setTimeout(() => terminate(new Error(`Provider version check timed out: ${id}`)), 2500);
     // A child that never reports close cannot retain discovery shutdown.
-    // SIGKILL is attempted before this deadline; unresolved cleanup is an
+    // The owner gets a bounded cleanup interval; unresolved cleanup is an
     // error rather than a successful version check.
     const deadline = setTimeout(() => {
-      terminateTree(true);
+      terminateTree();
       settle(new Error(`Provider version check did not close: ${id}`));
-    }, 3500);
+    }, 8_000);
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
   });

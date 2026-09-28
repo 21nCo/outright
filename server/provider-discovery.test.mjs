@@ -111,6 +111,28 @@ test("successful version checks also close their detached helper tree", { skip: 
   }
 });
 
+test("a new-session helper cannot survive a completed provider probe", { skip: process.platform === "win32" }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-session-"));
+  const executable = path.join(directory, "session-probe");
+  const pidFile = path.join(directory, "helper-pid");
+  const helper = `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`;
+  writeFileSync(executable, `#!${process.execPath}\nconst { spawn } = require("node:child_process"); const { existsSync } = require("node:fs"); const child = spawn(process.execPath, ["-e", ${JSON.stringify(helper)}], { detached: true, stdio: "ignore" }); child.unref(); const timer = setInterval(() => { if (existsSync(${JSON.stringify(pidFile)})) { clearInterval(timer); console.log("version 1"); process.exit(0); } }, 10);\n`);
+  chmodSync(executable, 0o755);
+  let pid;
+  try {
+    // The old direct probe returned "version 1" and left this helper alive.
+    // The supervised probe may instead reject an unclosed version check, but
+    // it cannot report availability until the OS-visible helper is gone.
+    await defaultProbe(executable).catch((error) => { assert.match(error.message, /timed out|did not close/); });
+    assert.ok(existsSync(pidFile), "the detached helper started");
+    pid = Number(readFileSync(pidFile, "utf8"));
+    await waitForProbeExit(pid);
+  } finally {
+    if (pid) try { process.kill(pid, "SIGKILL"); } catch { /* Already gone. */ }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("shutdown aborts and reaps a running version-check child", async () => {
   let childPid;
   const discovery = createProviderDiscovery({ probe: (id, { signal }) => {

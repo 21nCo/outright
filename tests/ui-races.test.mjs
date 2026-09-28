@@ -603,16 +603,20 @@ test("a vanished Windows launcher preserves verified descendants without adoptin
   assert.equal(launcher.ownedWindows.has(4103), false);
 });
 
-// The child has 180 seconds including its 155-second interaction phase and
-// cleanup. The parent must outlive that contract before invoking fallback
-// cleanup, and retain a separate reserve for its own tree/profile cleanup.
-const browserFixtureTimeout = 180_000;
+// The normal child has 180 seconds including its 155-second interaction phase
+// and cleanup. A focused 1000px full-span wheel fixture gets a larger finite
+// phase bound. The parent must outlive either child contract and reserve its
+// own tree/profile cleanup time.
+const smallWheelCap = Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) > 0
+  && Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) <= 1000;
+const browserPhaseTimeout = smallWheelCap ? 330_000 : 155_000;
+const browserFixtureTimeout = browserPhaseTimeout + 25_000;
 const nestedStartupAllowance = 15_000;
 const nestedRunnerBudget = (childBudget, startupAllowance) => childBudget + startupAllowance;
 const nestedExitTimeout = nestedRunnerBudget(browserFixtureTimeout, nestedStartupAllowance);
 test("nested runner deadline exceeds its child's full browser budget", () => {
   assert(nestedExitTimeout > browserFixtureTimeout);
-  assert(nestedExitTimeout > 155_000 + 25_000);
+  assert(nestedExitTimeout > browserPhaseTimeout + 25_000);
 });
 
 test("parent permits a slow child beyond the old shorter watchdog", { timeout: 5_000 }, async () => {
@@ -670,7 +674,7 @@ test("fixture assertion failures still clean Chrome, Vite and profile independen
 
 test("browser interaction regressions pass in headless Chrome", { timeout: browserFixtureTimeout }, async () => {
   // Reserve the last part of the test's own bound for independent cleanup.
-  const deadline = Date.now() + 155_000;
+  const deadline = Date.now() + browserPhaseTimeout;
   let phase = "allocate fixture";
   const remaining = () => {
     const duration = deadline - Date.now();
@@ -758,6 +762,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     await send("Runtime.addBinding", { name: "__requestFixtureKey" });
     await send("Runtime.addBinding", { name: "__requestFixtureWheel" });
     await send("Page.addScriptToEvaluateOnNewDocument", { source: `
+      window.__fixtureWheelCap = ${Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) || 0};
       window.__fixtureSetViewport = (width) => new Promise((resolve) => {
         const ready = (event) => {
           if (event.detail !== width) return;
