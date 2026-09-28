@@ -1,0 +1,28 @@
+scripts/run-tests.mjs
+  h_a39f9495f9ec1d 38-41,111
+server/database.test.mjs
+  h_a39f9495f9ec1d 74-106,115
+server/provider-discovery.mjs
+  h_a39f9495f9ec1d 13,15-26,29,31,34,62,77-78,132,137-159,180,206,209,217-220,222-230
+server/provider-discovery.test.mjs
+  h_a39f9495f9ec1d 28-105,209,211
+src/components/WindowedDiff.jsx
+  h_a39f9495f9ec1d 75,82-89
+src/lib/find-text.js
+  h_a39f9495f9ec1d 1-5,7-8
+src/lib/unicode-casefold-17.js
+  h_a39f9495f9ec1d 1-1590
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 1819-1832,1947-1964,2202,2218-2226
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ac2a79502ef8bfbf848c323665d50116c9f44de2",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
