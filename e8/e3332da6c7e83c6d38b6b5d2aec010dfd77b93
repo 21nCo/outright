@@ -1,0 +1,16 @@
+src/components/WindowedDiff.jsx
+  h_a39f9495f9ec1d 170-174
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 1947-1983,1988,1994
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e8e3332da6c7e83c6d38b6b5d2aec010dfd77b93",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
