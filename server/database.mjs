@@ -3,6 +3,7 @@ import { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, unl
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { foldFindText } from "../src/lib/find-text.js";
 
 const DEFAULT_SETTINGS = {
   provider: "codex",
@@ -283,7 +284,7 @@ export function createOutrightDatabase(options = {}) {
         const wrappedBatch = origin && db.prepare(`SELECT ${columns} FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order ${comparison} ? AND search_order ${forward ? "<=" : ">="} ? ORDER BY search_order ${order} LIMIT 8`);
         const resumeRow = db.prepare(`SELECT ${columns} FROM messages WHERE conversation_id = ? AND id = ?`);
         const bodyChunk = db.prepare("SELECT SUBSTR(CAST(COALESCE(body, '') AS BLOB), ?, ?) AS bytes FROM messages WHERE conversation_id = ? AND id = ?");
-        const foldedQuery = query.toLocaleLowerCase();
+        const foldedQuery = foldFindText(query);
         const overlap = Math.max(1024, Buffer.byteLength(query) * 4 + 16);
         // One HTTP request scans a bounded amount of text. The client carries
         // the cursor forward until the full conversation has been searched.
@@ -400,14 +401,14 @@ export function createOutrightDatabase(options = {}) {
                     originId: originId ?? null, wrapped: inWrappedSegment };
                   rightContext = contextCased ? "A" : ".";
                 }
-                const foldedText = `${leftContext}${source}${rightContext}`.toLocaleLowerCase();
+                const foldedText = foldFindText(`${leftContext}${source}${rightContext}`);
                 const folded = foldedText.slice(leftContext ? 1 : 0, rightContext ? -1 : undefined);
                 let found = folded.indexOf(foldedQuery);
                 while (found >= 0) {
                   let character = 0; let matchEnd = 0; let foldedPosition = 0;
                   for (const point of source) {
                     if (foldedPosition >= found + foldedQuery.length) break;
-                    const nextFolded = foldedPosition + point.toLocaleLowerCase().length;
+                    const nextFolded = foldedPosition + foldFindText(point).length;
                     if (nextFolded <= found) character += point.length;
                     matchEnd += point.length;
                     foldedPosition = nextFolded;

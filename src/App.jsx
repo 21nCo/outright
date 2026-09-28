@@ -27,6 +27,7 @@ import { TerminalPane } from "@/components/TerminalPane";
 import { domId, nextTabIndex } from "@/lib/accessibility";
 import { api, connectRuntime, query } from "@/lib/runtime-api";
 import { scheduleLayoutTick } from "@/lib/windowing";
+import { foldFindText } from "@/lib/find-text";
 import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, messagePrecedesPage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "@/recovery-policy";
 
 const MAX_RENDERED_MESSAGES = 1000;
@@ -1785,7 +1786,7 @@ function boundPageMessage(message, matchNeedle = "") {
   // HTTP pages apply the same ceiling before hydration. Live events and
   // buffered replay must not bypass the retained 1000-row memory bound.
   if (body.length > 16_000) {
-    const foldedIndex = matchNeedle ? body.toLocaleLowerCase().indexOf(matchNeedle.toLocaleLowerCase()) : -1;
+    const foldedIndex = matchNeedle ? foldFindText(body).indexOf(foldFindText(matchNeedle)) : -1;
     if (foldedIndex >= 0) {
       // Find may return a server excerpt centered on a match far from both
       // ends. Keep that context when applying the smaller client heap cap.
@@ -1793,7 +1794,7 @@ function boundPageMessage(message, matchNeedle = "") {
       let foldedPosition = 0;
       for (const point of body) {
         if (foldedPosition >= foldedIndex) break;
-        foldedPosition += point.toLocaleLowerCase().length;
+        foldedPosition += foldFindText(point).length;
         originalIndex += point.length;
       }
       let start = Math.max(0, originalIndex - 7_500);

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { scheduleLayoutTick, windowRange } from "@/lib/windowing";
+import { foldFindText } from "@/lib/find-text";
 
 export const ESTIMATED_MESSAGE_HEIGHT = 110;
 const FULL_RENDER_LIMIT = 80;
@@ -62,7 +63,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     let index = foundIndex < 0 ? (direction < 0 ? 0 : -1) : foundIndex;
     for (let checked = 0; checked < messages.length; checked += 1) {
       index = (index + direction + messages.length) % messages.length;
-      if (!String(messages[index].body ?? "").toLocaleLowerCase().includes(query.toLocaleLowerCase())) continue;
+      if (!foldFindText(String(messages[index].body ?? "")).includes(foldFindText(query))) continue;
       setFoundId(messages[index].id);
       setSearched(true);
       const viewport = viewportRef.current;

@@ -1764,8 +1764,11 @@ async function productionDiffViewportRegression() {
     await frame();
     const initialRemaining = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop;
     const wheelTrace = [];
-    let attemptBudget = 64;
-    for (let step = 0; step < attemptBudget && viewport.scrollTop < viewport.scrollHeight - viewport.clientHeight - 1; step += 1) {
+    let attemptBudget = 1;
+    let minimumProgress = Infinity;
+    const wheelDeadline = Date.now() + 60_000;
+    for (let step = 0; step < attemptBudget && Date.now() < wheelDeadline
+      && viewport.scrollTop < viewport.scrollHeight - viewport.clientHeight - 1; step += 1) {
       const bounds = viewport.getBoundingClientRect();
       const before = viewport.scrollTop;
       const delivery = await window.__fixtureWheel(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2, 120_000);
@@ -1774,15 +1777,23 @@ async function productionDiffViewportRegression() {
       catch (error) { throw new Error(`${error.message}; trace=${JSON.stringify(wheelTrace)}; delivered=${delivery.deltaY}; canceled=${delivery.defaultPrevented}; physical=${viewport.scrollTop}; logical=${viewport.dataset.firstLine}; mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`, { cause: error }); }
       await frame();
       const progress = viewport.scrollTop - before;
+      const frameBounds = viewport.getBoundingClientRect();
+      const mountedRows = viewport.querySelectorAll("span");
       wheelTrace.push({ requested: 120_000, delivered: delivery.deltaY, canceled: delivery.defaultPrevented,
         before, after: viewport.scrollTop, max: viewport.scrollHeight - viewport.clientHeight,
-        logical: viewport.dataset.firstLine, mounted: [viewport.dataset.mountedStart, viewport.dataset.mountedEnd] });
+        frame: [frameBounds.top, frameBounds.bottom], logical: viewport.dataset.firstLine,
+        mounted: [viewport.dataset.mountedStart, viewport.dataset.mountedEnd],
+        row: [mountedRows[0]?.getBoundingClientRect().top, mountedRows[0]?.getBoundingClientRect().bottom] });
       assert(progress > 0 && viewport.querySelectorAll("span").length < 200,
         `Native wheel lost progress or mounted unbounded rows: ${JSON.stringify(wheelTrace)}`);
-      if (step === 0) attemptBudget = Math.min(64, Math.max(4, Math.ceil(initialRemaining / progress) + 4));
+      minimumProgress = Math.min(minimumProgress, progress);
+      const remaining = Math.max(0, viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop);
+      attemptBudget = Math.min(256, Math.max(attemptBudget, step + 1 + Math.ceil(remaining / minimumProgress) + 4));
     }
     assert(viewport.scrollTop >= viewport.scrollHeight - viewport.clientHeight - 1,
-      `Native wheels did not reach the staged diff end within observed-progress budget: ${JSON.stringify(wheelTrace)}`);
+      `Native wheels did not reach the staged diff end within observed-progress budget: ${JSON.stringify({
+        initialRemaining, attempts: wheelTrace.length, attemptBudget, elapsedLimitMs: 60_000,
+        remaining: viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop, trace: wheelTrace.slice(-16) })}`);
   } else { viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); }
   try { await until(() => viewport.textContent.includes("staged 49999"), "staged final line"); }
   catch (error) { throw new Error(`${error.message}; scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}`); }
@@ -1891,6 +1902,15 @@ async function previousFindStartRegression() {
   await until(() => host.querySelector('[data-find-match="true"]'), "initial Previous found a row");
   assert(host.querySelector('[data-find-match="true"] [data-message-id]')?.dataset.messageId === "last",
     "Initial Previous must start at the final matching row");
+  setControlValue(host.querySelector('.history-find input'), "Σ");
+  messages[0].body = "ΟΣ";
+  root.render(<div ref={viewport} style={{ height: 350, overflowY: "auto" }}><WindowedMessages
+    messages={[...messages]} viewportRef={viewport}
+    renderMessage={(message) => <p data-message-id={message.id}>{message.body}</p>}
+  /></div>);
+  await settle();
+  host.querySelector('[aria-label="Next conversation match"]').click();
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="first"]'), "loaded transcript matches final sigma");
 }
 
 async function variableHeightFindAnchorRegression() {
@@ -2128,7 +2148,7 @@ async function extremeDiffHeightRegression() {
 
 async function unicodeDiffFindRegression() {
   root.render(null); await settle();
-  const diff = "+İstanbul\n" + Array.from({ length: 400 }, (_, index) => `+filler ${index}\n`).join("") + "+CAFÉ target\n";
+  const diff = "+İstanbul\n" + Array.from({ length: 400 }, (_, index) => `+filler ${index}\n`).join("") + "+CAFÉ target\n+ΟΣ final\n+ΑΣΑ medial\n";
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={diff} label="Unicode diff" /></div>);
   await until(() => host.querySelector('input[aria-label="Find in diff"]'), "Unicode diff find ready");
   const input = host.querySelector('input[aria-label="Find in diff"]');
@@ -2137,6 +2157,13 @@ async function unicodeDiffFindRegression() {
   await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("CAFÉ target"), "Unicode match on the correct diff line");
   await until(() => host.querySelector('.window-find [role="status"]')?.textContent === "Line 402", "Unicode find announcement settled");
   assert(host.querySelector('.window-find [role="status"]')?.textContent === "Line 402", "Unicode case folding shifted the diff line coordinate");
+  setControlValue(input, "Σ"); await settle();
+  host.querySelector('[aria-label="Next diff match"]').click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("ΟΣ final"), "diff Find matches final sigma");
+  host.querySelector('[aria-label="Next diff match"]').click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("ΑΣΑ medial"), "diff Find matches medial sigma");
+  host.querySelector('[aria-label="Next diff match"]').click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("ΟΣ final"), "diff Find wraps sigma forms");
 }
 
 async function reverseDiffFindWrapRegression() {
@@ -2875,7 +2902,7 @@ async function largeLiveMessageRetentionRegression() {
 async function largePageMessageRetentionRegression() {
   root.render(null); await settle();
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
-  const middleMatch = "ΩNeEdLe\0more";
+  const middleMatch = "ΩΟΣ\0more";
   const messages = Array.from({ length: 3 }, (_, index) => ({
     id: `page-large-${index}`, role: "assistant", kind: "text",
     body: index === 0 ? "🙂".repeat(125_000) + middleMatch + "🙂".repeat(125_000)
@@ -2913,7 +2940,7 @@ async function largePageMessageRetentionRegression() {
   assertBounded("page-large-0");
   assert(!host.querySelector('.history-loader'), "older page cursor did not reach the start");
   const input = host.querySelector('.history-find input');
-  setControlValue(input, "Ωneedle"); await settle();
+  setControlValue(input, "Σ"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => host.querySelector('[data-find-match="true"] [data-message-id="page-large-0"]'), "large Find result");
   assertBounded("page-large-0");

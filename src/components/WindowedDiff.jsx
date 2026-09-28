@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { foldFindText } from "@/lib/find-text";
 
 const LINE_HEIGHT = 14;
 const OVERSCAN = 40;
@@ -46,7 +47,7 @@ export function WindowedDiff({ diff, label }) {
       ? current : { top, height, first });
   };
   const starts = useMemo(() => content ? lineOffsets(content) : [], [content]);
-  const searchable = useMemo(() => content.toLocaleLowerCase(), [content]);
+  const searchable = useMemo(() => foldFindText(content), [content]);
   // ASCII case folding leaves every newline offset unchanged. Large diffs
   // are commonly ASCII and should not retain a second million-entry index.
   const searchableStarts = useMemo(() => /[^\x00-\x7f]/.test(content) ? lineOffsets(searchable) : starts, [content, searchable, starts]);
@@ -115,7 +116,7 @@ export function WindowedDiff({ diff, label }) {
     updatePosition(viewport);
   }
   function find(direction = 1, value = needle) {
-    const query = value.trim().toLocaleLowerCase();
+    const query = foldFindText(value.trim());
     if (!query) { setFoundLine(-1); setSearched(false); foundOffsetRef.current = -1; return; }
     const offset = foundOffsetRef.current < 0 ? (direction > 0 ? 0 : searchable.length - 1) : foundOffsetRef.current + direction;
     // lastIndexOf treats a negative fromIndex as zero, so wrap explicitly
@@ -154,7 +155,7 @@ export function WindowedDiff({ diff, label }) {
   });
   useLayoutEffect(() => {
     if (!needle.trim() || foundOffsetRef.current < 0) return;
-    const query = needle.trim().toLocaleLowerCase();
+    const query = foldFindText(needle.trim());
     let match = searchable.indexOf(query, Math.min(foundOffsetRef.current, searchable.length));
     if (match < 0) match = searchable.indexOf(query);
     if (match < 0) { foundOffsetRef.current = -1; setFoundLine(-1); setSearched(true); return; }
