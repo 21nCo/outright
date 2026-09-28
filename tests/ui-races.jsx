@@ -2640,13 +2640,26 @@ async function fullPageLiveAnchorRegression() {
   }
   assert(readerIntentEvaluations >= 2, "upward reader intent was not observed over multiple updates");
   viewport.scrollTop = maximum - 48; viewport.dispatchEvent(new Event("scroll")); await settle();
+  const visibleRow = () => {
+    const frame = viewport.getBoundingClientRect();
+    return [...viewport.querySelectorAll('[data-message-id]')].find((element) => {
+      const row = element.getBoundingClientRect();
+      return row.bottom > frame.top && row.top < frame.bottom;
+    });
+  };
+  // Windows may commit the scroll event before React commits the measured
+  // virtual range. Judge the settled viewport, not an intermediate spacer.
+  try { await until(visibleRow, "near-bottom reader has a visible anchor"); }
+  catch (error) {
+    const rows = [...viewport.querySelectorAll('[data-message-id]')].map((element) => {
+      const bounds = element.getBoundingClientRect();
+      return `${element.dataset.messageId}:${Math.round(bounds.top)}..${Math.round(bounds.bottom)}`;
+    });
+    const list = viewport.querySelector('[aria-label="Conversation history"]');
+    throw new Error(`${error.message}; scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}, frame=${Math.round(viewport.getBoundingClientRect().top)}..${Math.round(viewport.getBoundingClientRect().bottom)}, range=${rows.slice(0, 3).join(',')}|${rows.slice(-3).join(',')}, spacers=${[...list.children].filter((element) => element.getAttribute('aria-hidden') === 'true').map((element) => element.style.height).join(',')}`);
+  }
+  const readingRow = visibleRow();
   const readerTop = viewport.scrollTop;
-  const frame = viewport.getBoundingClientRect();
-  const readingRow = [...viewport.querySelectorAll('[data-message-id]')].find((element) => {
-    const row = element.getBoundingClientRect();
-    return row.bottom > frame.top && row.top < frame.bottom;
-  });
-  assert(readingRow, "near-bottom reader had no visible anchor");
   const readingRowId = readingRow.dataset.messageId;
   const readingRowTop = readingRow.getBoundingClientRect().top;
   all = [...all, message(1003)];

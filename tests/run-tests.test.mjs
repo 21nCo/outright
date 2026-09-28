@@ -122,3 +122,61 @@ test("test launcher reaps its detached group when a test worker fails to start",
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a prior file's group-bound helper cannot interrupt the next test file", { skip: process.platform === "win32", timeout: 15000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-test-file-groups-"));
+  const first = path.join(root, "first.test.mjs");
+  const second = path.join(root, "second.test.mjs");
+  const helperMarker = path.join(root, "helper.pid");
+  const secondMarker = path.join(root, "second.started");
+  const helper = `const { spawnSync } = require('node:child_process');
+const { existsSync, writeFileSync } = require('node:fs');
+const group = Number(spawnSync('/bin/ps', ['-o', 'pgid=', '-p', String(process.pid)], { encoding: 'utf8' }).stdout.trim());
+writeFileSync(${JSON.stringify(helperMarker)}, String(process.pid));
+const deadline = Date.now() + 5000;
+const timer = setInterval(() => {
+  if (existsSync(${JSON.stringify(secondMarker)})) { clearInterval(timer); process.kill(-group, 'SIGKILL'); }
+  else if (Date.now() > deadline) { clearInterval(timer); process.exit(0); }
+}, 10);`;
+  writeFileSync(first, `import test from 'node:test';
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+test('first file owns a helper', async () => {
+  const child = spawn(process.execPath, ['-e', ${JSON.stringify(helper)}], { stdio: 'ignore' });
+  child.unref();
+  const deadline = Date.now() + 2000;
+  while (!existsSync(${JSON.stringify(helperMarker)}) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  if (!existsSync(${JSON.stringify(helperMarker)})) throw new Error('helper did not start');
+});
+`);
+  writeFileSync(second, `import test from 'node:test';
+import { writeFileSync } from 'node:fs';
+test('second file survives its predecessor', async () => {
+  writeFileSync(${JSON.stringify(secondMarker)}, 'started');
+  await new Promise((resolve) => setTimeout(resolve, 200));
+});
+`);
+  const env = { ...process.env, CI: "1" };
+  delete env.NODE_TEST_CONTEXT;
+  const child = spawn(process.execPath, [launcher, first, second], { stdio: ["ignore", "pipe", "pipe"], env });
+  let output = "";
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stderr.on("data", (chunk) => { output += chunk; });
+  let helperPid;
+  try {
+    const closed = new Promise((resolve) => child.once("close", (status, signal) => resolve({ status, signal })));
+    let timer;
+    const result = await Promise.race([closed, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("File-isolated launcher did not finish")), 10_000); })])
+      .finally(() => clearTimeout(timer));
+    assert.deepEqual(result, { status: 0, signal: null }, output);
+    assert.ok(existsSync(secondMarker), `second file never started: ${output}`);
+    assert.match(output, /second file survives its predecessor/);
+    helperPid = Number(readFileSync(helperMarker, "utf8"));
+    assert.equal(running(helperPid), false, "prior file's helper survived its group cleanup");
+  } finally {
+    if (!helperPid && existsSync(helperMarker)) helperPid = Number(readFileSync(helperMarker, "utf8"));
+    if (helperPid && running(helperPid)) try { process.kill(helperPid, "SIGKILL"); } catch { /* Already gone. */ }
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    rmSync(root, { recursive: true, force: true });
+  }
+});

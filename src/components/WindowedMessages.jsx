@@ -90,6 +90,23 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     let next = messages.length <= FULL_RENDER_LIMIT
       ? { start: 0, end: messages.length, top: 0, bottom: 0 }
       : windowRange(messages.length, (index) => known.get(messages[index].id) ?? ESTIMATED_MESSAGE_HEIGHT, Math.max(0, -localOffset), viewport.clientHeight);
+    // Measured row heights can move the real scrollbar end before a pending
+    // range commit lands. At the end, always mount the tail so the viewport
+    // cannot rest entirely on an estimated spacer after a reader gesture.
+    if (messages.length > FULL_RENDER_LIMIT
+      && viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96) {
+      const frame = viewport.getBoundingClientRect();
+      const visible = [...list.querySelectorAll("[data-window-id]")].some((row) => {
+        const bounds = row.getBoundingClientRect();
+        return bounds.bottom > frame.top && bounds.top < frame.bottom;
+      });
+      if (next.end < messages.length || !visible) {
+        const start = Math.max(0, messages.length - 32);
+        let top = 0;
+        for (let index = 0; index < start; index += 1) top += known.get(messages[index].id) ?? ESTIMATED_MESSAGE_HEIGHT;
+        next = { start, end: messages.length, top, bottom: 0 };
+      }
+    }
     const restoreId = restoreAnchorId?.();
     let pinned = restoreId && messages.some((message) => message.id === restoreId) ? restoreId : pendingFoundRef.current;
     if (!pinned && foundId) {
