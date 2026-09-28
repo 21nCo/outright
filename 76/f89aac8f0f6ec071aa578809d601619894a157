@@ -1,0 +1,16 @@
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 192-194
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 1571-1576
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "76f89aac8f0f6ec071aa578809d601619894a157",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
