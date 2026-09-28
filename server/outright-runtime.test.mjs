@@ -189,7 +189,9 @@ test("conversation find rejects malformed queries and foreign cursors", withRunt
     "?q=needle&contextOffset=1", `?q=needle&after=${own.id}&contextOffset=1`,
     `?q=needle&after=${own.id}&origin=none&contextOffset=0`, `?q=needle&after=${own.id}&origin=none&contextOffset=99999999999999999999`,
     "?q=needle&leftContextOffset=1", `?q=needle&after=${own.id}&leftContextOffset=1`,
-    `?q=needle&after=${own.id}&origin=none&leftContextOffset=0`, `?q=needle&after=${own.id}&origin=none&leftContextCased=1`]) {
+    `?q=needle&after=${own.id}&origin=none&leftContextOffset=0`,
+    `?q=needle&after=${own.id}&origin=none&leftContextOffset=99999999999999999999`,
+    `?q=needle&after=${own.id}&origin=none&leftContextCased=1`]) {
     const response = responseCapture();
     await runtime.handleRequest(requestStream("GET", `/api/conversations/${chat.id}/messages/find${suffix}`), response);
     assert.equal(response.statusCode, 400, suffix);

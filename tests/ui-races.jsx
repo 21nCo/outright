@@ -1568,7 +1568,12 @@ async function changesSelectionRefreshRegression() {
   assert(host.querySelector('.change-file.is-active')?.textContent.includes("b.txt") && host.querySelector('.diff-mode button[aria-pressed="true"]')?.textContent === "Unstaged", "Pending status restored an obsolete file or mode");
   assert(host.querySelector('.diff-view')?.textContent.includes("b.txt:false"), "Pending status restored an obsolete diff");
   const event = { type: "run.event", payload: { type: "run.completed" } };
-  root.render(pane(event)); await settle();
+  const beforeCompletion = requests.filter((item) => item.startsWith("/api/git/status")).length;
+  root.render(pane(event));
+  await until(() => requests.filter((item) => item.startsWith("/api/git/status")).length === beforeCompletion + 1,
+    "committed completion event status refresh");
+  await until(() => host.querySelector('.changed-files')?.getAttribute('aria-busy') === 'false'
+    && host.querySelector('.diff-view')?.textContent.includes("b.txt:false"), "completion refresh settled");
   const statusCount = requests.filter((item) => item.startsWith("/api/git/status")).length;
   root.render(pane(event)); await settle();
   assert(requests.filter((item) => item.startsWith("/api/git/status")).length === statusCount, "Retained completion event retriggered status on selection rerender");
