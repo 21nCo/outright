@@ -2152,6 +2152,8 @@ async function pagedTranscriptFindRegression({ endOnly = false, measuredOnly = f
   const olderRequest = deferred();
   let staleRequested = false;
   let partialReads = 0;
+  let contextReads = 0;
+  let leftReads = 0;
   let archived = false;
   let archiveSignal;
   const archiveSearch = deferred();
@@ -2175,6 +2177,32 @@ async function pagedTranscriptFindRegression({ endOnly = false, measuredOnly = f
         return partialReads <= 8
           ? response({ partial: true, nextAfterId: "message-1", nextByteOffset: partialReads * 1024, originId: null, wrapped: false })
           : response({ matchId: "message-10", messages: earliest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } });
+      }
+      if (url.searchParams.get("q") === "context") {
+        contextReads += 1;
+        if (contextReads > 1) assert(url.searchParams.get("after") === "message-1"
+          && Number(url.searchParams.get("contextOffset")) === (contextReads - 1) * 1024,
+        "Unicode context continuation lost its same-row cursor");
+        return contextReads <= 2
+          ? response({ partial: true, nextAfterId: "message-1", nextByteOffset: 0, nextContextOffset: contextReads * 1024, originId: null, wrapped: false })
+          : response({ matchId: "message-10", messages: earliest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } });
+      }
+      if (url.searchParams.get("q") === "left") {
+        leftReads += 1;
+        if (leftReads === 2) assert(url.searchParams.get("after") === "message-1"
+          && Number(url.searchParams.get("leftContextOffset")) === 8192,
+        "left Unicode context cursor did not resume");
+        if (leftReads === 3) assert(Number(url.searchParams.get("leftContextOffset")) === 4096,
+        "left Unicode context cursor did not advance backwards");
+        if (leftReads === 4) assert(Number(url.searchParams.get("contextOffset")) === 1024
+          && url.searchParams.get("leftContextCased") === "1",
+        "right Unicode context lost resolved left state");
+        if (leftReads <= 2) return response({ partial: true, nextAfterId: "message-1", nextByteOffset: 0,
+          nextLeftContextOffset: leftReads === 1 ? 8192 : 4096, originId: null, wrapped: false });
+        if (leftReads === 3) return response({ partial: true, nextAfterId: "message-1", nextByteOffset: 0,
+          nextContextOffset: 1024, nextLeftContextCased: true, originId: null, wrapped: false });
+        return response({ matchId: "message-10", messages: earliest,
+          messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } });
       }
       if (url.searchParams.get("q") === "stale") { staleRequested = true; return staleSearch.promise; }
       if (url.searchParams.get("q") === "late") { lateRequested = true; return lateSearch.promise; }
@@ -2335,6 +2363,14 @@ async function pagedTranscriptFindRegression({ endOnly = false, measuredOnly = f
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-10"]'), "continued search found an older message");
   assert(partialReads === 9, "continuation restarted the search rather than resuming it");
+  setControlValue(input, "context"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-10"]') && contextReads === 3,
+    "bounded Unicode context continued within the same row");
+  setControlValue(input, "left"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-10"]') && leftReads === 4,
+    "both bounded Unicode contexts continued within the same row");
   setControlValue(input, "drag"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => draggedSignal, "drag search entered its server slot");
@@ -3699,7 +3735,10 @@ async function acceptedFirstPromptOwnerSwitchRegression(sameWorktree = false) {
   if (sameWorktree) setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "");
   setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), newerDraft);
   heldRun.resolve(response({ id: "run-new", conversationId: "chat-new", status: "queued" }, 202));
-  await settle();
+  // The held POST settling and React's state commit are separate turns.
+  await until(() => !host.querySelector('.first-prompt-notice')
+    && host.querySelector('textarea[aria-label="Message the agent"]')?.value === newerDraft,
+  "accepted first prompt visibly settled after owner switch");
   assert(runs.length === 1, "Accepted retry duplicated while settling");
   assert(!host.querySelector(".first-prompt-notice"), "Accepted retry left a false unsent first-prompt marker after owner switch");
   assert(host.querySelector('textarea[aria-label="Message the agent"]')?.value === newerDraft, "Accepted retry erased a newer draft");

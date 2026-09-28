@@ -1493,6 +1493,9 @@ export function App() {
     try {
       let cursor = continuation ? priorProgress.nextAfterId : afterId;
       let byteOffset = continuation ? priorProgress.nextByteOffset ?? 0 : 0;
+      let contextOffset = continuation ? priorProgress.nextContextOffset ?? 0 : 0;
+      let leftContextOffset = continuation ? priorProgress.nextLeftContextOffset ?? 0 : 0;
+      let leftContextCased = continuation ? priorProgress.nextLeftContextCased ?? null : null;
       let originId = continuation ? priorProgress.originId : afterId;
       let wrapped = continuation ? priorProgress.wrapped : false;
       let result;
@@ -1502,18 +1505,29 @@ export function App() {
           origin: page || continuation ? originId ?? "none" : undefined,
           wrapped: wrapped ? "1" : undefined,
           byteOffset: byteOffset || undefined,
+          contextOffset: contextOffset || undefined,
+          leftContextOffset: leftContextOffset || undefined,
+          leftContextCased: leftContextCased === null ? undefined : leftContextCased ? "1" : "0",
         }), { signal: controller.signal });
         if (!result.partial) break;
         if (!result.nextAfterId || (result.nextAfterId === cursor
-          && !(result.nextByteOffset > byteOffset || (byteOffset > 0 && !result.nextByteOffset)))) throw new Error("Search continuation did not advance");
+          && !(result.nextByteOffset > byteOffset || (byteOffset > 0 && !result.nextByteOffset)
+            || (result.nextByteOffset === byteOffset && result.nextContextOffset > contextOffset)
+            || (result.nextByteOffset === byteOffset && result.nextLeftContextOffset > 0
+              && (!leftContextOffset || result.nextLeftContextOffset < leftContextOffset))))) throw new Error("Search continuation did not advance");
         cursor = result.nextAfterId;
         byteOffset = result.nextByteOffset ?? 0;
+        contextOffset = result.nextContextOffset ?? 0;
+        leftContextOffset = result.nextLeftContextOffset ?? 0;
+        leftContextCased = result.nextLeftContextCased ?? null;
         originId = result.originId;
         wrapped = result.wrapped;
         if (page === 7) {
           if (controller.signal.aborted || historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversationId) return undefined;
           findProgressRef.current = { conversationId, needle, direction, afterId, nextAfterId: cursor,
-            nextByteOffset: byteOffset, originId, wrapped, generation: historyGeneration };
+            nextByteOffset: byteOffset, nextContextOffset: contextOffset,
+            nextLeftContextOffset: leftContextOffset, nextLeftContextCased: leftContextCased,
+            originId, wrapped, generation: historyGeneration };
           return { partial: true };
         }
       }

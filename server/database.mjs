@@ -259,7 +259,8 @@ export function createOutrightDatabase(options = {}) {
         page: { hasMore, olderCount, hasLater: newerCount > 0, newerCount, total, beforeId: messages[0]?.id ?? null, limit },
       };
     },
-    async findMessagePage(conversationId, query, afterId, direction = 1, signal, { originId = afterId, wrapped = false, byteOffset = 0 } = {}) {
+    async findMessagePage(conversationId, query, afterId, direction = 1, signal,
+      { originId = afterId, wrapped = false, byteOffset = 0, contextOffset = 0, leftContextOffset = 0, leftContextCased = null } = {}) {
       if (activeMessageFinds >= 8) throw databaseError(429, "Too many conversation searches; retry");
       activeMessageFinds += 1;
       try {
@@ -269,6 +270,9 @@ export function createOutrightDatabase(options = {}) {
         if (originId && !origin) throw databaseError(400, "Message cursor was not found");
         if (wrapped && !origin) throw databaseError(400, "Wrapped search requires an origin cursor");
         if (!Number.isSafeInteger(byteOffset) || byteOffset < 0 || (byteOffset && !cursor)) throw databaseError(400, "Search byte offset is invalid");
+        if (!Number.isSafeInteger(contextOffset) || contextOffset < 0 || (contextOffset && (!cursor || contextOffset <= byteOffset))) throw databaseError(400, "Search context offset is invalid");
+        if (!Number.isSafeInteger(leftContextOffset) || leftContextOffset < 0 || (leftContextOffset && !cursor)
+          || (leftContextCased !== null && (typeof leftContextCased !== "boolean" || !contextOffset))) throw databaseError(400, "Search left context is invalid");
         const forward = direction !== -1;
         const order = forward ? "ASC" : "DESC";
         const comparison = forward ? ">" : "<";
@@ -288,21 +292,35 @@ export function createOutrightDatabase(options = {}) {
         const scan = async (initial, inWrappedSegment) => {
           let boundary = initial;
           let resumeOffset = inWrappedSegment === wrapped ? byteOffset : 0;
+          let resumeContextOffset = inWrappedSegment === wrapped ? contextOffset : 0;
+          let resumeLeftContextOffset = inWrappedSegment === wrapped ? leftContextOffset : 0;
+          let resumeLeftContextCased = inWrappedSegment === wrapped ? leftContextCased : null;
           while (true) {
             if (signal?.aborted || closing) return null;
-            const rows = resumeOffset
+            const rows = resumeOffset || resumeContextOffset || resumeLeftContextOffset
               ? [resumeRow.get(conversationId, afterId)]
               : inWrappedSegment ? wrappedBatch.all(conversationId, boundary, origin.rowid) : batch.all(conversationId, boundary);
             if (!rows.length) return null;
             for (const row of rows) {
               if (!row) throw databaseError(400, "Message cursor was not found");
               let offset = resumeOffset;
+              let contextResume = resumeContextOffset;
+              let leftContextResume = resumeLeftContextOffset;
+              let leftCasedResume = resumeLeftContextCased;
               resumeOffset = 0;
+              resumeContextOffset = 0;
+              resumeLeftContextOffset = 0;
+              resumeLeftContextCased = null;
               if (offset > row.bodyBytes) throw databaseError(400, "Search byte offset is invalid");
+              if (contextResume > row.bodyBytes) throw databaseError(400, "Search context offset is invalid");
+              if (leftContextResume > row.bodyBytes) throw databaseError(400, "Search left context is invalid");
               while (offset < row.bodyBytes) {
                 if (signal?.aborted || closing) return null;
                 const start = Math.max(0, offset - overlap);
-                const length = Math.min(row.bodyBytes - start, FIND_CHUNK_BYTES + offset - start);
+                // Include enough right context for Unicode lowercasing at the
+                // charged chunk edge (notably Greek final sigma). The next
+                // chunk charges these overlap bytes when it advances.
+                const length = Math.min(row.bodyBytes - start, FIND_CHUNK_BYTES + offset - start + overlap);
                 const stored = bodyChunk.get(start + 1, length, conversationId, row.id);
                 if (!stored) return null; // The conversation was deleted during a yielded scan.
                 const bytes = stored.bytes;
@@ -311,7 +329,79 @@ export function createOutrightDatabase(options = {}) {
                 let skip = 0;
                 while (skip < bytes.length && (bytes[skip] & 0xc0) === 0x80) skip += 1;
                 const source = decodeMessagePrefix(bytes.subarray(skip));
-                const folded = source.toLocaleLowerCase();
+                let leftContext = "";
+                const needsLeftContext = start + skip > 0 && /^\p{Case_Ignorable}*Σ/u.test(source);
+                if ((leftContextResume || leftCasedResume !== null) && !needsLeftContext) throw databaseError(409, "Search context changed; retry");
+                if (needsLeftContext && leftCasedResume !== null) leftContext = leftCasedResume ? "A" : ".";
+                else if (needsLeftContext) {
+                  let contextEnd = leftContextResume || start + skip;
+                  let decided = false;
+                  while (contextEnd > 0 && scannedBytes < FIND_SCAN_BYTES) {
+                    if (signal?.aborted || closing) return null;
+                    const length = Math.min(FIND_CHUNK_BYTES, contextEnd, Math.max(4, FIND_SCAN_BYTES - scannedBytes));
+                    const chunkStart = contextEnd - length;
+                    const context = bodyChunk.get(chunkStart + 1, length, conversationId, row.id);
+                    if (!context) return null;
+                    let skipped = 0;
+                    while (skipped < context.bytes.length && (context.bytes[skipped] & 0xc0) === 0x80) skipped += 1;
+                    const contextText = decodeMessageSuffix(context.bytes);
+                    for (const point of [...contextText].reverse()) {
+                      if (/\p{Case_Ignorable}/u.test(point)) continue;
+                      leftContext = /\p{Cased}/u.test(point) ? "A" : ".";
+                      decided = true;
+                      break;
+                    }
+                    contextEnd = chunkStart + skipped;
+                    scannedBytes += length;
+                    if (decided) break;
+                    await new Promise((resolve) => setImmediate(resolve));
+                  }
+                  if (!decided && contextEnd > 0) return { partial: true, nextAfterId: row.id,
+                    nextByteOffset: offset, nextLeftContextOffset: contextEnd, originId: originId ?? null, wrapped: inWrappedSegment };
+                  if (!leftContext) leftContext = ".";
+                }
+                leftContextResume = 0;
+                leftCasedResume = null;
+                let rightContext = "";
+                const decodedEnd = start + skip + Buffer.byteLength(source);
+                const pendingContextOffset = contextResume;
+                contextResume = 0;
+                const needsRightContext = /Σ\p{Case_Ignorable}*$/u.test(source) && decodedEnd < row.bodyBytes;
+                if (pendingContextOffset && !needsRightContext) throw databaseError(409, "Search context changed; retry");
+                // Greek sigma lowercasing depends on the next non-ignorable
+                // character. A run of combining marks can extend beyond the
+                // ordinary overlap, so inspect it in yielded bounded reads.
+                if (needsRightContext) {
+                  let contextReadOffset = pendingContextOffset || decodedEnd;
+                  let contextCased = false;
+                  let decided = false;
+                  while (contextReadOffset < row.bodyBytes && scannedBytes < FIND_SCAN_BYTES) {
+                    if (signal?.aborted || closing) return null;
+                    const context = bodyChunk.get(contextReadOffset + 1,
+                      Math.min(FIND_CHUNK_BYTES, row.bodyBytes - contextReadOffset, Math.max(4, FIND_SCAN_BYTES - scannedBytes)), conversationId, row.id);
+                    if (!context) return null;
+                    const contextText = decodeMessagePrefix(context.bytes);
+                    const contextBytes = Buffer.byteLength(contextText);
+                    if (!contextBytes) throw databaseError(400, "Message body is not valid UTF-8");
+                    for (const point of contextText) {
+                      if (/\p{Case_Ignorable}/u.test(point)) continue;
+                      contextCased = /\p{Cased}/u.test(point);
+                      decided = true;
+                      break;
+                    }
+                    contextReadOffset += contextBytes;
+                    scannedBytes += contextBytes;
+                    if (decided) break;
+                    await new Promise((resolve) => setImmediate(resolve));
+                  }
+                  if (!decided && contextReadOffset < row.bodyBytes) return { partial: true, nextAfterId: row.id,
+                    nextByteOffset: offset, nextContextOffset: contextReadOffset,
+                    ...(leftContext ? { nextLeftContextCased: leftContext === "A" } : {}),
+                    originId: originId ?? null, wrapped: inWrappedSegment };
+                  rightContext = contextCased ? "A" : ".";
+                }
+                const foldedText = `${leftContext}${source}${rightContext}`.toLocaleLowerCase();
+                const folded = foldedText.slice(leftContext ? 1 : 0, rightContext ? -1 : undefined);
                 let found = folded.indexOf(foldedQuery);
                 while (found >= 0) {
                   let character = 0; let matchEnd = 0; let foldedPosition = 0;
@@ -326,12 +416,16 @@ export function createOutrightDatabase(options = {}) {
                   const matchEndByteOffset = start + skip + Buffer.byteLength(source.slice(0, matchEnd));
                   // The overlap may contain a match already scanned by the
                   // previous request; only new or crossing matches count.
-                  if (matchEndByteOffset > offset) return { match: row, matchByteOffset };
+                  if (matchEndByteOffset > offset && matchByteOffset < offset + FIND_CHUNK_BYTES) return { match: row, matchByteOffset };
                   found = folded.indexOf(foldedQuery, found + 1);
                 }
                 const advance = Math.min(FIND_CHUNK_BYTES, row.bodyBytes - offset);
                 offset += advance;
                 scannedBytes += advance;
+                // The wrapped origin is inclusive and is the final row. If
+                // its last byte exhausts the budget, the search is complete;
+                // a same-ID, zero-offset continuation would be ambiguous.
+                if (scannedBytes >= FIND_SCAN_BYTES && inWrappedSegment && row.id === originId && offset === row.bodyBytes) return null;
                 if (scannedBytes >= FIND_SCAN_BYTES) return { partial: true, nextAfterId: row.id,
                   nextByteOffset: offset < row.bodyBytes ? offset : 0, originId: originId ?? null, wrapped: inWrappedSegment };
                 await new Promise((resolve) => setImmediate(resolve));
@@ -414,7 +508,7 @@ export function createOutrightDatabase(options = {}) {
           const start = Math.max(0, result.matchByteOffset - 7_500);
           const length = Math.min(match.bodyBytes - start, 15_000 + Buffer.byteLength(query));
           const bytes = bodyChunk.get(start + 1, length, conversationId, match.id).bytes;
-          matchedMessage.body = `${start ? "[Earlier text omitted from Find result]\n" : ""}${bytes.toString("utf8")}${start + bytes.length < match.bodyBytes ? "\n[Later text omitted from Find result]" : ""}`;
+          matchedMessage.body = `${start ? "[Earlier text omitted from Find result]\n" : ""}${decodeMessageWindow(bytes)}${start + bytes.length < match.bodyBytes ? "\n[Later text omitted from Find result]" : ""}`;
         }
         let serializedBytes = 2 + messages.reduce((bytes, message) => bytes + Buffer.byteLength(JSON.stringify(message)) + 1, 0);
         while (serializedBytes > maxBytes && messages.length > 1) {
@@ -815,6 +909,16 @@ function decodeMessageSuffix(bytes) {
   for (let start = 0; start <= Math.min(3, bytes.length); start += 1) {
     try { return decoder.decode(bytes.subarray(start)); }
     catch { /* The byte cap may start inside a UTF-8 character. */ }
+  }
+  throw databaseError(400, "Message body is not valid UTF-8");
+}
+function decodeMessageWindow(bytes) {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  for (let start = 0; start <= Math.min(3, bytes.length); start += 1) {
+    for (let end = bytes.length; end >= Math.max(start, bytes.length - 3); end -= 1) {
+      try { return decoder.decode(bytes.subarray(start, end)); }
+      catch { /* A bounded window may split a code point at either edge. */ }
+    }
   }
   throw databaseError(400, "Message body is not valid UTF-8");
 }

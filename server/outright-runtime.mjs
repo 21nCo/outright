@@ -232,15 +232,30 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           const originParam = url.searchParams.get("origin");
           const wrappedParam = url.searchParams.get("wrapped");
           const byteOffsetParam = url.searchParams.get("byteOffset");
+          const contextOffsetParam = url.searchParams.get("contextOffset");
+          const leftContextOffsetParam = url.searchParams.get("leftContextOffset");
+          const leftContextCasedParam = url.searchParams.get("leftContextCased");
           if (wrappedParam && (wrappedParam !== "1" || originParam === null)) throw apiError(400, "Search continuation is invalid");
           if (byteOffsetParam !== null && (!/^[1-9][0-9]*$/.test(byteOffsetParam)
             || !Number.isSafeInteger(Number(byteOffsetParam)) || !url.searchParams.get("after") || originParam === null)) {
             throw apiError(400, "Search byte offset is invalid");
           }
+          if (contextOffsetParam !== null && (!/^[1-9][0-9]*$/.test(contextOffsetParam)
+            || !Number.isSafeInteger(Number(contextOffsetParam)) || !url.searchParams.get("after") || originParam === null)) {
+            throw apiError(400, "Search context offset is invalid");
+          }
+          if (leftContextOffsetParam !== null && (!/^[1-9][0-9]*$/.test(leftContextOffsetParam)
+            || !Number.isSafeInteger(Number(leftContextOffsetParam)) || !url.searchParams.get("after") || originParam === null)) {
+            throw apiError(400, "Search left context offset is invalid");
+          }
+          if (leftContextCasedParam !== null && (!["0", "1"].includes(leftContextCasedParam) || contextOffsetParam === null)) {
+            throw apiError(400, "Search left context state is invalid");
+          }
           const result = await database.findMessagePage(
             conversationFindMatch[1], needle, url.searchParams.get("after"), direction === "previous" ? -1 : 1, findController.signal,
             originParam === null ? undefined : { originId: originParam === "none" ? null : originParam,
-              wrapped: wrappedParam === "1", byteOffset: Number(byteOffsetParam ?? 0) },
+              wrapped: wrappedParam === "1", byteOffset: Number(byteOffsetParam ?? 0), contextOffset: Number(contextOffsetParam ?? 0),
+              leftContextOffset: Number(leftContextOffsetParam ?? 0), leftContextCased: leftContextCasedParam === null ? null : leftContextCasedParam === "1" },
           );
           if (response.destroyed) return true;
           return json(response, 200, result);

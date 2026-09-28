@@ -185,7 +185,11 @@ test("conversation find rejects malformed queries and foreign cursors", withRunt
   const own = runtime.database.addMessage({ conversationId: chat.id, role: "user", body: "own" });
   for (const suffix of ["", "?q=%20", `?q=${"a".repeat(201)}`, "?q=needle&direction=sideways", `?q=needle&after=${foreign.id}`, `?q=needle&after=${foreign.id}&origin=none`, `?q=needle&origin=${foreign.id}`, "?q=needle&wrapped=1", "?q=needle&origin=none&wrapped=1",
     "?q=needle&byteOffset=1", `?q=needle&after=${own.id}&byteOffset=1`,
-    `?q=needle&after=${own.id}&origin=none&byteOffset=0`, `?q=needle&after=${own.id}&origin=none&byteOffset=99999999999999999999`]) {
+    `?q=needle&after=${own.id}&origin=none&byteOffset=0`, `?q=needle&after=${own.id}&origin=none&byteOffset=99999999999999999999`,
+    "?q=needle&contextOffset=1", `?q=needle&after=${own.id}&contextOffset=1`,
+    `?q=needle&after=${own.id}&origin=none&contextOffset=0`, `?q=needle&after=${own.id}&origin=none&contextOffset=99999999999999999999`,
+    "?q=needle&leftContextOffset=1", `?q=needle&after=${own.id}&leftContextOffset=1`,
+    `?q=needle&after=${own.id}&origin=none&leftContextOffset=0`, `?q=needle&after=${own.id}&origin=none&leftContextCased=1`]) {
     const response = responseCapture();
     await runtime.handleRequest(requestStream("GET", `/api/conversations/${chat.id}/messages/find${suffix}`), response);
     assert.equal(response.statusCode, 400, suffix);
@@ -193,6 +197,35 @@ test("conversation find rejects malformed queries and foreign cursors", withRunt
   const missing = responseCapture();
   await runtime.handleRequest(requestStream("GET", "/api/conversations/missing/messages/find?q=needle"), missing);
   assert.equal(missing.statusCode, 404);
+}));
+
+test("conversation Find HTTP carries a bounded Unicode context cursor", withRuntime(async (runtime) => {
+  const chat = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Unicode context", provider: "codex" });
+  const row = runtime.database.addMessage({ conversationId: chat.id, role: "assistant",
+    body: `${"a".repeat(65534)}Σ${"\u0301".repeat(4_300_000)}A` });
+  let cursor = null;
+  let contextOffset = 0;
+  let byteOffset = 0;
+  let result;
+  for (let request = 0; request < 5; request += 1) {
+    const params = new URLSearchParams({ q: "σ" });
+    if (cursor) {
+      params.set("after", cursor);
+      params.set("origin", "none");
+    }
+    if (contextOffset) params.set("contextOffset", String(contextOffset));
+    if (byteOffset) params.set("byteOffset", String(byteOffset));
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("GET", `/api/conversations/${chat.id}/messages/find?${params}`), response);
+    assert.equal(response.statusCode, 200);
+    result = response.body;
+    if (!result.partial) break;
+    assert.equal(result.nextAfterId, row.id);
+    cursor = result.nextAfterId;
+    contextOffset = result.nextContextOffset ?? 0;
+    byteOffset = result.nextByteOffset ?? 0;
+  }
+  assert.equal(result.matchId, row.id);
 }));
 
 test("conversation forward pages and count endpoint remain scoped to one conversation", withRuntime(async (runtime) => {

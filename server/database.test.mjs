@@ -180,6 +180,110 @@ test("oversized Find bodies resume by byte before a match or miss without blocki
   } finally { database.close(); }
 });
 
+test("Find preserves Unicode context, completes wrapped exact-budget rows, and returns readable excerpts", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Unicode edges", provider: "codex" });
+    const sigma = database.addMessage({ conversationId: chat.id, role: "assistant", body: `${"a".repeat(65534)}ΣA` });
+    assert.equal((await database.findMessagePage(chat.id, "ς", null)).matchId, null,
+      "a section edge made medial sigma look final");
+    assert.equal((await database.findMessagePage(chat.id, "σ", null)).matchId, sigma.id);
+    const markedSigma = database.addMessage({ conversationId: chat.id, role: "assistant",
+      body: `${"a".repeat(65534)}Σ${"\u0301".repeat(12)}A` });
+    assert.equal((await database.findMessagePage(chat.id, "ς", sigma.id)).matchId, null,
+      "case-ignorable marks after the section edge changed sigma context");
+    assert.equal((await database.findMessagePage(chat.id, "σ", sigma.id)).matchId, markedSigma.id);
+    const longMarks = database.addMessage({ conversationId: chat.id, role: "assistant",
+      body: `${"a".repeat(65534)}Σ${"\u0301".repeat(600)}A` });
+    assert.equal((await database.findMessagePage(chat.id, "ς", markedSigma.id)).matchId, null,
+      "a long ignorable run beyond the overlap created a false final sigma");
+    assert.equal((await database.findMessagePage(chat.id, "σ", markedSigma.id)).matchId, longMarks.id);
+    const leftChat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Left context", provider: "codex" });
+    const leftMarks = database.addMessage({ conversationId: leftChat.id, role: "assistant",
+      body: `A${"\u0301".repeat(33_000)}Σ.` });
+    assert.equal((await database.findMessagePage(leftChat.id, "σ", null)).matchId, null,
+      "a distant cased character before sigma created a false medial match");
+    assert.equal((await database.findMessagePage(leftChat.id, "ς", null)).matchId, leftMarks.id);
+
+    const body = `${"x".repeat(10000)}🙂${"x".repeat(7499)}xneedle${"x".repeat(7499)}🙂${"x".repeat(100000)}`;
+    const large = database.addMessage({ conversationId: chat.id, role: "assistant", body });
+    const result = await database.findMessagePage(chat.id, "xneedle", longMarks.id);
+    const excerpt = result.messages.find((message) => message.id === large.id);
+    assert.equal(result.matchId, large.id);
+    assert.equal(excerpt.findExcerpt, true);
+    assert.ok(excerpt.body.includes("xneedle"));
+    assert.equal(excerpt.body.includes("\uFFFD"), false, "the bounded excerpt split a UTF-8 code point");
+    assert.ok(Buffer.byteLength(excerpt.body) < 16_000);
+    assert.equal(database.getMessageBodyChunk(chat.id, large.id, 0).totalBytes, Buffer.byteLength(body),
+      "the complete body remains available by identity");
+
+    const exactChat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Exact budget", provider: "codex" });
+    const exact = database.addMessage({ conversationId: exactChat.id, role: "assistant", body: "z".repeat(8 * 1024 * 1024) });
+    for (const direction of [1, -1]) {
+      const ended = await database.findMessagePage(exactChat.id, "missing", exact.id, direction);
+      assert.equal(ended.matchId, null, "a wrapped origin ending at the exact byte budget must complete");
+      assert.equal(ended.partial, undefined);
+    }
+  } finally { database.close(); }
+});
+
+test("Find continues Unicode context across a full byte budget", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Long context", provider: "codex" });
+    const row = database.addMessage({ conversationId: chat.id, role: "assistant",
+      body: `${"a".repeat(65534)}Σ${"\u0301".repeat(4_300_000)}A` });
+    for (const direction of [1, -1]) {
+      for (const [needle, expected] of [["ς", null], ["σ", row.id]]) {
+        let result = await database.findMessagePage(chat.id, needle, null, direction);
+        let lastContext = 0;
+        let lastByte = 0;
+        let requests = 0;
+        while (result.partial) {
+          assert.ok((result.nextContextOffset ?? 0) > lastContext || (result.nextByteOffset ?? 0) > lastByte,
+            "Unicode context continuation did not advance");
+          lastContext = result.nextContextOffset ?? 0;
+          lastByte = result.nextByteOffset ?? 0;
+          result = await database.findMessagePage(chat.id, needle, result.nextAfterId, direction, undefined,
+            { originId: result.originId, wrapped: result.wrapped, byteOffset: result.nextByteOffset, contextOffset: result.nextContextOffset });
+          assert.ok(++requests < 5, "Unicode context continuation did not converge");
+        }
+        assert.equal(result.matchId, expected);
+      }
+    }
+  } finally { database.close(); }
+});
+
+test("Find carries both Unicode contexts through separate bounded requests", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Both contexts", provider: "codex" });
+    const row = database.addMessage({ conversationId: chat.id, role: "assistant",
+      body: `A${"\u0301".repeat(4_300_000)}Σ${"\u0301".repeat(4_300_000)}A` });
+    let cursor = { nextAfterId: null, nextByteOffset: 0, nextContextOffset: 0, nextLeftContextOffset: 0 };
+    let sawLeft = false;
+    let sawRight = false;
+    let result;
+    for (let request = 0; request < 10; request += 1) {
+      result = await database.findMessagePage(chat.id, "σ", cursor.nextAfterId, 1, undefined,
+        cursor.nextAfterId ? { originId: null, wrapped: false, byteOffset: cursor.nextByteOffset,
+          contextOffset: cursor.nextContextOffset, leftContextOffset: cursor.nextLeftContextOffset,
+          leftContextCased: cursor.nextLeftContextCased ?? null } : undefined);
+      if (!result.partial) break;
+      assert.ok(result.nextAfterId !== cursor.nextAfterId || result.nextByteOffset > cursor.nextByteOffset
+        || (result.nextContextOffset ?? 0) > (cursor.nextContextOffset ?? 0)
+        || (result.nextLeftContextOffset > 0 && (!cursor.nextLeftContextOffset || result.nextLeftContextOffset < cursor.nextLeftContextOffset)),
+      `combined Unicode context cursor did not advance: ${JSON.stringify({ cursor, result })}`);
+      sawLeft ||= Boolean(result.nextLeftContextOffset);
+      sawRight ||= Boolean(result.nextContextOffset);
+      cursor = result;
+    }
+    assert.equal(result.matchId, row.id);
+    assert.equal(sawLeft, true);
+    assert.equal(sawRight, true);
+  } finally { database.close(); }
+});
+
 test("conversation Find skips nullable legacy bodies and preserves NUL text", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-find-null-body-"));
   const filename = path.join(root, "messages.db");
