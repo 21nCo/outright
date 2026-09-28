@@ -1,0 +1,19 @@
+scripts/run-tests.mjs
+  s_6126673cc0a89e::t_11746cc67afab0 19-23,25,27-34,39-41,44,46-47,50-112,115-117
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0cce2808fca4c288a9ee951e8adc6cc0c881ba95",
+  "prompts": {},
+  "sessions": {
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
