@@ -35,6 +35,58 @@ function groupRunning(groupId) {
   });
 }
 
+function windowsProcessIdentity(pid) {
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+    `Get-CimInstance Win32_Process -Filter 'ProcessId = ${Number(pid)}' | Select-Object ProcessId,@{Name='CreatedMs';Expression={([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds()}} | ConvertTo-Json -Compress`],
+  { encoding: "utf8", timeout: 8000, windowsHide: true });
+  assert.equal(result.status, 0, `Could not inspect Windows test helper: ${result.stderr || result.error}`);
+  return result.stdout.trim() ? JSON.parse(result.stdout) : null;
+}
+
+test("Windows launcher removes owned helpers after success, failure and cancellation", { skip: process.platform !== "win32", timeout: 45000 }, async () => {
+  for (const outcome of ["success", "failure", "cancel"]) {
+    const root = mkdtempSync(path.join(os.tmpdir(), `outright-win-runner-${outcome}-`));
+    const marker = path.join(root, "helper.pid");
+    const release = path.join(root, "release");
+    const fixture = path.join(root, "owned.test.mjs");
+    const helper = `require('node:fs').writeFileSync(${JSON.stringify(marker)}, String(process.pid)); setInterval(() => {}, 1000);`;
+    writeFileSync(fixture, `import test from 'node:test';\nimport { spawn } from 'node:child_process';\nimport { existsSync } from 'node:fs';\ntest('owned helper', async () => {\n const child = spawn(process.execPath, ['-e', ${JSON.stringify(helper)}], { stdio: 'ignore' }); child.unref();\n const until = Date.now() + 5000; while (!existsSync(${JSON.stringify(marker)}) && Date.now() < until) await new Promise(r => setTimeout(r, 20));\n if (!existsSync(${JSON.stringify(marker)})) throw new Error('helper did not start');\n ${outcome === "cancel" ? "await new Promise(() => setInterval(() => {}, 1000));" : `while (!existsSync(${JSON.stringify(release)})) await new Promise(r => setTimeout(r, 20));` }\n ${outcome === "failure" ? "throw new Error('induced failure');" : ""}\n});\n`);
+    const env = { ...process.env, CI: "1", ...(outcome === "cancel" ? { OUTRIGHT_TEST_SUITE_TIMEOUT_MS: "8000" } : {}) };
+    delete env.NODE_TEST_CONTEXT;
+    const launcherChild = spawn(process.execPath, [launcher, fixture], { stdio: ["ignore", "pipe", "pipe"], env });
+    const closed = new Promise((resolve) => launcherChild.once("close", (status) => resolve(status)));
+    let output = "";
+    launcherChild.stdout.on("data", (chunk) => { output += chunk; });
+    launcherChild.stderr.on("data", (chunk) => { output += chunk; });
+    let identity;
+    try {
+      const deadline = Date.now() + 7000;
+      while (!existsSync(marker) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+      assert.ok(existsSync(marker), `Windows helper did not start: ${output}`);
+      const pid = Number(readFileSync(marker, "utf8"));
+      identity = windowsProcessIdentity(pid);
+      assert.ok(identity?.CreatedMs, `Windows helper identity was not captured: ${output}`);
+      if (outcome !== "cancel") writeFileSync(release, "go");
+      let timer;
+      const status = await Promise.race([closed, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Windows launcher hung: ${output}`)), 12000); })])
+        .finally(() => clearTimeout(timer));
+      assert.equal(status, outcome === "success" ? 0 : 1, output);
+      if (outcome === "cancel") assert.match(output, /Test suite timed out after 8000ms/);
+      const stopped = Date.now() + 3000;
+      while (windowsProcessIdentity(pid)?.CreatedMs === identity.CreatedMs && Date.now() < stopped) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      assert.notEqual(windowsProcessIdentity(pid)?.CreatedMs, identity.CreatedMs, `Owned helper survived ${outcome}: ${output}`);
+    } finally {
+      if (identity && windowsProcessIdentity(identity.ProcessId)?.CreatedMs === identity.CreatedMs) {
+        spawnSync("taskkill", ["/PID", String(identity.ProcessId), "/T", "/F"], { windowsHide: true });
+      }
+      if (launcherChild.exitCode === null && launcherChild.signalCode === null) launcherChild.kill("SIGKILL");
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("test launcher reaps its detached runner and a SIGTERM-ignoring descendant", { skip: process.platform === "win32", timeout: 15000 }, async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-test-runner-"));
   const marker = path.join(root, "worker.pid");

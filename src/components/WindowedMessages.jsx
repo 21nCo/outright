@@ -9,11 +9,15 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
   const heightsRef = useRef(new Map());
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
+  const foundIdRef = useRef(null);
+  const restoreAnchorRef = useRef(restoreAnchorId);
+  restoreAnchorRef.current = restoreAnchorId;
   const rangeRef = useRef({ start: 0, end: Math.min(messages.length, FULL_RENDER_LIMIT), top: 0, bottom: Math.max(0, messages.length - FULL_RENDER_LIMIT) * ESTIMATED_MESSAGE_HEIGHT });
   const [range, setRange] = useState(rangeRef.current);
   const rangeFrameRef = useRef(null);
   const [needle, setNeedle] = useState("");
   const [foundId, setFoundId] = useState(null);
+  foundIdRef.current = foundId;
   const foundIndex = foundId ? messages.findIndex((message) => message.id === foundId) : -1;
   const [findRequest, setFindRequest] = useState(0);
   const [searching, setSearching] = useState(false);
@@ -82,6 +86,8 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
   }, [commitRange]);
 
   const update = useCallback(() => {
+    const messages = messagesRef.current;
+    const foundId = foundIdRef.current;
     const viewport = viewportRef.current;
     const list = listRef.current;
     if (!viewport || !list) return;
@@ -107,8 +113,9 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
         next = { start, end: messages.length, top, bottom: 0 };
       }
     }
-    const restoreId = restoreAnchorId?.();
+    const restoreId = restoreAnchorRef.current?.();
     let pinned = restoreId && messages.some((message) => message.id === restoreId) ? restoreId : pendingFoundRef.current;
+    if (!pinned && visibleFindAnchorRef.current) pinned = foundId;
     if (!pinned && foundId) {
       const marked = list.querySelector('[data-find-match="true"]');
       const bounds = marked?.getBoundingClientRect();
@@ -130,7 +137,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
       rangeRef.current = next;
       scheduleRange();
     }
-  }, [messages, viewportRef, foundId, restoreAnchorId, scheduleRange]);
+  }, [viewportRef, scheduleRange]);
 
   useEffect(() => () => { rangeFrameRef.current?.(); rangeFrameRef.current = null; }, []);
 
@@ -174,7 +181,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     let settled = 0;
     const align = () => {
       if (pendingFoundRef.current !== foundId) return;
-      if (++alignmentFramesRef.current > 16) { pendingFoundRef.current = null; visibleFindAnchorRef.current = false; return; }
+      if (++alignmentFramesRef.current > 32) { pendingFoundRef.current = null; visibleFindAnchorRef.current = false; return; }
       const row = [...list.querySelectorAll("[data-window-id]")].find((element) => element.dataset.windowId === foundId);
       if (!row) { update(); cancelTick = scheduleLayoutTick(align); return; }
       const delta = row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - viewport.clientHeight / 3;
@@ -196,8 +203,6 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
   useLayoutEffect(() => { update(); }, [update]);
 
   useEffect(() => {
-    const ids = new Set(messages.map((message) => message.id));
-    for (const id of heightsRef.current.keys()) if (!ids.has(id)) heightsRef.current.delete(id);
     const viewport = viewportRef.current;
     if (!viewport) return;
     let cancelUpdate = null;
@@ -211,10 +216,8 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
       if (viewport.clientHeight === lastHeight && viewport.clientWidth === lastWidth) return;
       lastHeight = viewport.clientHeight;
       lastWidth = viewport.clientWidth;
-      const list = listRef.current;
-      if (!list) { schedule(); return; }
-      const match = list.querySelector('[data-find-match="true"]');
-      if (match && foundId && !pendingFoundRef.current && visibleFindAnchorRef.current) {
+      const foundId = foundIdRef.current;
+      if (foundId && !pendingFoundRef.current && visibleFindAnchorRef.current) {
         pendingFoundRef.current = foundId;
         alignmentFramesRef.current = 0;
         setFindRequest((current) => current + 1);
@@ -224,7 +227,13 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     resize.observe(viewport);
     update();
     return () => { viewport.removeEventListener("scroll", schedule); resize.disconnect(); cancelUpdate?.(); };
-  }, [messages, update, viewportRef, foundId]);
+  }, [update, viewportRef]);
+
+  useEffect(() => {
+    const ids = new Set(messages.map((message) => message.id));
+    for (const id of heightsRef.current.keys()) if (!ids.has(id)) heightsRef.current.delete(id);
+    update();
+  }, [messages, update]);
 
   useEffect(() => {
     const viewport = viewportRef.current;
@@ -250,6 +259,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     return () => { scrollbar?.removeEventListener("pointerdown", cancel); viewport.removeEventListener("pointerdown", cancel); viewport.removeEventListener("wheel", cancel); viewport.removeEventListener("touchstart", cancel); viewport.removeEventListener("keydown", cancel); };
   }, [viewportRef]);
 
+  const observedRowIds = messages.slice(range.start, range.end).map((message) => message.id).join("\u0000");
   useLayoutEffect(() => {
     if (messages.length <= FULL_RENDER_LIMIT) return;
     const list = listRef.current;
@@ -265,7 +275,7 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     });
     for (const row of list.querySelectorAll("[data-window-id]")) resize.observe(row);
     return () => resize.disconnect();
-  }, [messages, range.start, range.end, update]);
+  }, [observedRowIds, update]);
 
   const olderCount = messagePage?.olderCount ?? 0;
   const total = messagePage?.total ?? messages.length;

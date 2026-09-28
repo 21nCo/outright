@@ -128,7 +128,9 @@ export async function defaultProbe(id, { signal } = {}) {
     const child = spawn(command.executable, command.args, {
       stdio: ["ignore", "pipe", "pipe"], windowsHide: true, detached: process.platform !== "win32",
     });
-    child.once("error", (error) => { spawnError = error; });
+    // A failed spawn can emit again if shutdown races its close callback.
+    // Keep ownership of the error channel until this child is fully closed.
+    child.on("error", (error) => { spawnError ??= error; });
     child.stdout?.on("data", (chunk) => {
       const length = stdout.length + chunk.length;
       stdout = Buffer.concat([stdout, chunk], Math.min(length, MAX_VERSION_BYTES + 1));
@@ -153,8 +155,6 @@ export async function defaultProbe(id, { signal } = {}) {
         // The detached probe owns its process group, including pipe-holding
         // descendants after the direct CLI exits.
         try { process.kill(-child.pid, force ? "SIGKILL" : "SIGTERM"); } catch { /* Group already exited. */ }
-      } else {
-        try { child.kill(force ? "SIGKILL" : "SIGTERM"); } catch { /* Already exited. */ }
       }
     };
     const terminate = (reason) => {

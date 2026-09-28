@@ -2801,6 +2801,8 @@ async function transcriptObserverStabilityRegression() {
     root.render(<TooltipProvider><App /></TooltipProvider>);
     await until(() => host.querySelector('[data-message-id="stable-299"]'), "long transcript ready");
     await until(() => fixtureSockets.length > socketCount, "long transcript socket ready");
+    await until(() => host.querySelector('[aria-label="Stop active agent run"]'), "long transcript run ready");
+    await settle();
     const emit = (seq) => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({
       type: "run.event", conversationId: "chat-A", runId: "run-stable",
       payload: { type: "assistant.delta", seq, payload: { text: ` fragment ${seq}` } },

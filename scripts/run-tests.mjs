@@ -1,9 +1,15 @@
-import { readdirSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
+const windowsSupervisor = process.platform === "win32"
+  ? (() => {
+    const manifest = JSON.parse(readFileSync(new URL("../server/bin/agent-supervisor.json", import.meta.url), "utf8"));
+    if (typeof manifest.filename !== "string" || !/^agent-supervisor-[0-9a-f]{16}\.exe$/.test(manifest.filename)) throw new Error("Windows test supervisor manifest is invalid");
+    return fileURLToPath(new URL(`../server/bin/${manifest.filename}`, import.meta.url));
+  })() : null;
 const directories = ["server", path.join("automation", "hermes")];
 const tests = directories.flatMap((directory) => readdirSync(path.join(root, directory))
   .filter((name) => name.endsWith(".test.mjs"))
@@ -24,11 +30,14 @@ let child = null;
 let forwardedSignal = null;
 let timedOut = false;
 let escalation;
+const requestedTimeout = Number(process.env.OUTRIGHT_TEST_SUITE_TIMEOUT_MS);
+const suiteTimeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+  ? Math.min(600_000, Math.max(1000, requestedTimeout)) : 600_000;
 const deadline = setTimeout(() => {
   timedOut = true;
-  console.error("Test suite timed out after 600 seconds");
+  console.error(`Test suite timed out after ${suiteTimeoutMs}ms`);
   signalRunner("SIGKILL");
-}, 600_000);
+}, suiteTimeoutMs);
 
 function signalRunner(signal) {
   if (!child?.pid || (process.platform === "win32" && (child.exitCode !== null || child.signalCode !== null))) return;
@@ -60,6 +69,9 @@ function liveGroupMembers(groupId) {
 }
 
 async function reapGroup(groupId) {
+  // The Windows runner is inside a native Job Object. Its supervisor closes
+  // only after the job has no active processes; cancellation closes the job
+  // handle and the kernel kills the remaining members.
   if (process.platform === "win32") return true;
   // Inspect independently of the signal helper: a closed runner is not proof
   // that a SIGTERM-ignoring descendant stopped executing.
@@ -76,7 +88,10 @@ async function reapGroup(groupId) {
 
 async function runFile(file) {
   if (process.env.CI) console.error(`CI test runner starting: file=${path.basename(file)} launcher=${process.pid}`);
-  child = spawn(process.execPath, ["--test", "--test-concurrency=1", "--test-timeout=300000", file], {
+  child = spawn(windowsSupervisor ?? process.execPath, [
+    ...(windowsSupervisor ? ["--test-runner", process.execPath] : []),
+    "--test", "--test-concurrency=1", "--test-timeout=300000", file,
+  ], {
     stdio: "inherit",
     detached: process.platform !== "win32",
   });
