@@ -1,0 +1,24 @@
+server/database.test.mjs
+  h_a39f9495f9ec1d 74-90
+server/provider-discovery.mjs
+  h_a39f9495f9ec1d 2-6,14-27,32,34-40,121-122,141-143,145,147-151,166,169-172,182,185,187
+server/provider-discovery.test.mjs
+  h_a39f9495f9ec1d 114-135
+src/lib/find-text.js
+  h_a39f9495f9ec1d 1,5
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 1769-1787,1794,1807,1809-1815,2170,2186-2192
+tests/ui-races.test.mjs
+  h_a39f9495f9ec1d 606-613,619,677,765
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9baa41281b7c7c3e647990b6ea008e857c308428",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
