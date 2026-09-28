@@ -32,6 +32,9 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
   const pendingFoundRef = useRef(null);
   const visibleFindAnchorRef = useRef(false);
   const alignmentFramesRef = useRef(0);
+  const tailRangeRef = useRef(false);
+  const rowObserverRef = useRef(null);
+  const observedRowsRef = useRef(new Map());
 
   async function find(direction = 1) {
     const query = needle.trim();
@@ -99,19 +102,14 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     // Measured row heights can move the real scrollbar end before a pending
     // range commit lands. At the end, always mount the tail so the viewport
     // cannot rest entirely on an estimated spacer after a reader gesture.
-    if (messages.length > FULL_RENDER_LIMIT
-      && viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96) {
-      const frame = viewport.getBoundingClientRect();
-      const visible = [...list.querySelectorAll("[data-window-id]")].some((row) => {
-        const bounds = row.getBoundingClientRect();
-        return bounds.bottom > frame.top && bounds.top < frame.bottom;
-      });
-      if (next.end < messages.length || !visible) {
-        const start = Math.max(0, messages.length - 32);
-        let top = 0;
-        for (let index = 0; index < start; index += 1) top += known.get(messages[index].id) ?? ESTIMATED_MESSAGE_HEIGHT;
-        next = { start, end: messages.length, top, bottom: 0 };
-      }
+    const distanceFromEnd = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop;
+    tailRangeRef.current = messages.length > FULL_RENDER_LIMIT
+      && distanceFromEnd < (tailRangeRef.current ? 192 : 96);
+    if (tailRangeRef.current) {
+      const start = Math.max(0, messages.length - 32);
+      let top = 0;
+      for (let index = 0; index < start; index += 1) top += known.get(messages[index].id) ?? ESTIMATED_MESSAGE_HEIGHT;
+      next = { start, end: messages.length, top, bottom: 0 };
     }
     const restoreId = restoreAnchorRef.current?.();
     let pinned = restoreId && messages.some((message) => message.id === restoreId) ? restoreId : pendingFoundRef.current;
@@ -259,11 +257,8 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
     return () => { scrollbar?.removeEventListener("pointerdown", cancel); viewport.removeEventListener("pointerdown", cancel); viewport.removeEventListener("wheel", cancel); viewport.removeEventListener("touchstart", cancel); viewport.removeEventListener("keydown", cancel); };
   }, [viewportRef]);
 
-  const observedRowIds = messages.slice(range.start, range.end).map((message) => message.id).join("\u0000");
   useLayoutEffect(() => {
     if (messages.length <= FULL_RENDER_LIMIT) return;
-    const list = listRef.current;
-    if (!list) return;
     const resize = new ResizeObserver((entries) => {
       let changed = false;
       for (const entry of entries) {
@@ -273,9 +268,20 @@ export function WindowedMessages({ messages, messagePage, viewportRef, renderMes
       }
       if (changed) update();
     });
-    for (const row of list.querySelectorAll("[data-window-id]")) resize.observe(row);
-    return () => resize.disconnect();
-  }, [observedRowIds, update]);
+    rowObserverRef.current = resize;
+    return () => { resize.disconnect(); rowObserverRef.current = null; observedRowsRef.current.clear(); };
+  }, [update, messages.length > FULL_RENDER_LIMIT]);
+  useLayoutEffect(() => {
+    const resize = rowObserverRef.current;
+    if (!resize) return;
+    const next = new Map();
+    for (const row of listRef.current?.querySelectorAll("[data-window-id]") ?? []) {
+      next.set(row.dataset.windowId, row);
+      if (observedRowsRef.current.get(row.dataset.windowId) !== row) resize.observe(row);
+    }
+    for (const [id, row] of observedRowsRef.current) if (next.get(id) !== row) resize.unobserve(row);
+    observedRowsRef.current = next;
+  });
 
   const olderCount = messagePage?.olderCount ?? 0;
   const total = messagePage?.total ?? messages.length;

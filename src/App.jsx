@@ -493,7 +493,7 @@ export function App() {
         if (!previewRunId) livePreviewRunRef.current = null;
       }
       const preserveReading = preservePage && (preservePendingFind || pendingFindRef.current?.conversationId === requestedId
-        || conversationRef.current?.messagePage?.hasLater || !stickToBottomRef.current
+        || conversationRef.current?.messagePage?.hasLater || readerAwayFromBottomRef.current || !stickToBottomRef.current
         || startedHistoryGeneration !== historyGenerationRef.current);
       readyConversationRef.current = nextConversation;
       setConversationDetailReady(true);
@@ -667,7 +667,10 @@ export function App() {
           ...current,
           messagePage: { ...current.messagePage, total },
         };
-        if (!alreadyPresent && !stickToBottomRef.current && current.messages.length >= MAX_RENDERED_MESSAGES) return {
+        // Reader intent owns the page boundary. A stale bottom-follow bit can
+        // survive a near-bottom upward gesture until the next scroll event.
+        if (!alreadyPresent && current.messages.length >= MAX_RENDERED_MESSAGES
+          && (readerAwayFromBottomRef.current || !stickToBottomRef.current || pendingLiveScrollRef.current)) return {
           ...current,
           messagePage: { ...current.messagePage, total, hasLater: true, newerCount: 1 },
         };
@@ -1091,10 +1094,10 @@ export function App() {
     };
   }, [conversation?.messages[0]?.id]);
   useEffect(() => {
-    if (!stickToBottomRef.current || pendingPrependScrollRef.current || conversation?.messagePage?.hasLater) return;
+    if (!stickToBottomRef.current || readerAwayFromBottomRef.current || pendingPrependScrollRef.current || conversation?.messagePage?.hasLater) return;
     scheduleLayoutTick(() => {
       const viewport = messageViewportRef.current;
-      if (viewport && stickToBottomRef.current && !pendingPrependScrollRef.current) moveMessageViewport(viewport, viewport.scrollHeight);
+      if (viewport && stickToBottomRef.current && !readerAwayFromBottomRef.current && !pendingPrependScrollRef.current) moveMessageViewport(viewport, viewport.scrollHeight);
     });
   }, [conversation?.messages.at(-1)?.id, conversation?.messagePage?.hasLater, streamingText]);
   useLayoutEffect(() => {

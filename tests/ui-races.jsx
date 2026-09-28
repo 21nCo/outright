@@ -2808,7 +2808,8 @@ async function transcriptObserverStabilityRegression() {
       payload: { type: "assistant.delta", seq, payload: { text: ` fragment ${seq}` } },
     }) }));
     emit(1);
-    await until(() => host.querySelector('.message.is-streaming')?.textContent.includes("fragment 1"), "first stream paint");
+    try { await until(() => host.querySelector('.message.is-streaming')?.textContent.includes("fragment 1"), "first stream paint"); }
+    catch (error) { throw new Error(`${error.message}; sockets=${fixtureSockets.slice(socketCount).map((socket) => socket.readyState).join(',')}, activeRun=${host.querySelector('[aria-label="Stop active agent run"]')?.outerHTML?.slice(0, 120)}, stream=${host.querySelector('.message.is-streaming')?.textContent?.slice(0, 120)}, selected=${localStorage.getItem(keys[2])}`); }
     await settle();
     await new Promise((resolve) => setTimeout(resolve, 150));
     const baseline = rowObservations;
@@ -2819,6 +2820,20 @@ async function transcriptObserverStabilityRegression() {
     await until(() => host.querySelector('.message.is-streaming')?.textContent.includes("fragment 8"), "sustained stream paint");
     assert(rowObservations - baseline <= 40,
       `unchanged history rows were reobserved ${rowObservations - baseline} times during seven stream paints`);
+    const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+    viewport.scrollTop = viewport.scrollHeight;
+    viewport.dispatchEvent(new Event("scroll"));
+    await settle();
+    const nearBottomBaseline = rowObservations;
+    for (let index = 0; index < 7; index += 1) {
+      // Small reader movements across the old 96px boundary must retain the
+      // same mounted tail and its row observers while output is streaming.
+      viewport.scrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight - (index % 2 ? 120 : 80));
+      viewport.dispatchEvent(new Event("scroll"));
+      await settle();
+    }
+    assert(rowObservations - nearBottomBaseline <= 40,
+      `near-bottom reader movement reobserved ${rowObservations - nearBottomBaseline} unchanged rows`);
   } finally {
     root.render(null); await settle();
     window.ResizeObserver = NativeResizeObserver;

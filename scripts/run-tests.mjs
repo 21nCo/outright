@@ -1,4 +1,5 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -27,6 +28,7 @@ tests.push(
 // file starts; browser measurements also stay uncontended.
 const files = process.argv.length > 2 ? process.argv.slice(2).map((file) => path.resolve(file)) : tests;
 let child = null;
+let cancelFile = null;
 let forwardedSignal = null;
 let timedOut = false;
 let escalation;
@@ -42,7 +44,11 @@ const deadline = setTimeout(() => {
 function signalRunner(signal) {
   if (!child?.pid || (process.platform === "win32" && (child.exitCode !== null || child.signalCode !== null))) return;
   try {
-    if (process.platform === "win32") child.kill(signal);
+    // The Windows supervisor must remain alive to terminate its Job Object
+    // and observe that every helper has stopped before the launcher exits.
+    if (process.platform === "win32") {
+      if (cancelFile) writeFileSync(cancelFile, signal);
+    }
     else process.kill(-child.pid, signal);
   } catch (error) { if (error?.code !== "ESRCH") console.error(`Test runner signal failed: ${error.message}`); }
 }
@@ -52,10 +58,16 @@ function onSignal(signal) {
   forwardedSignal = signal;
   if (process.env.CI) console.error(`CI test launcher received ${signal}: launcher=${process.pid} parent=${process.ppid} runner=${child?.pid ?? "none"}`);
   signalRunner(signal);
-  escalation = setTimeout(() => signalRunner("SIGKILL"), 3000);
+  if (process.platform !== "win32") escalation = setTimeout(() => signalRunner("SIGKILL"), 3000);
 }
 const signalHandlers = new Map(["SIGINT", "SIGTERM"].map((signal) => [signal, () => onSignal(signal)]));
 for (const [signal, handler] of signalHandlers) process.on(signal, handler);
+// A supervising test process can request the same graceful cancellation path
+// over its owned IPC channel, including on Windows where kill() is forced.
+if (process.send) {
+  process.on("message", (message) => { if (message === "cancel") onSignal("SIGTERM"); });
+  process.channel?.unref();
+}
 
 function liveGroupMembers(groupId) {
   if (process.platform === "win32") return [];
@@ -88,8 +100,10 @@ async function reapGroup(groupId) {
 
 async function runFile(file) {
   if (process.env.CI) console.error(`CI test runner starting: file=${path.basename(file)} launcher=${process.pid}`);
+  const cancelDirectory = windowsSupervisor ? mkdtempSync(path.join(os.tmpdir(), "outright-test-cancel-")) : null;
+  cancelFile = cancelDirectory ? path.join(cancelDirectory, "cancel") : null;
   child = spawn(windowsSupervisor ?? process.execPath, [
-    ...(windowsSupervisor ? ["--test-runner", process.execPath] : []),
+    ...(windowsSupervisor ? ["--test-runner", cancelFile, process.execPath] : []),
     "--test", "--test-concurrency=1", "--test-timeout=300000", file,
   ], {
     stdio: "inherit",
@@ -108,6 +122,8 @@ async function runFile(file) {
   if (process.platform !== "win32") signalRunner("SIGKILL");
   const groupGone = runner.pid ? await reapGroup(runner.pid) : true;
   child = null;
+  cancelFile = null;
+  if (cancelDirectory) rmSync(cancelDirectory, { recursive: true, force: true });
   return { groupGone, passed: groupGone && closed.status === 0 && !closed.signal };
 }
 

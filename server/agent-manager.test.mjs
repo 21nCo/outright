@@ -150,6 +150,15 @@ function processGroupId(pid) {
   return result.status === 0 && Number.isSafeInteger(group) && group > 0 ? group : null;
 }
 
+function liveProcessGroupMembers(groupId) {
+  const result = spawnSync("/bin/ps", ["-axo", "pgid=,stat="], { encoding: "utf8", timeout: 1000 });
+  assert.equal(result.status, 0, `Could not inspect process group ${groupId}: ${result.error?.message ?? result.stderr}`);
+  return result.stdout.split("\n").filter((line) => {
+    const fields = line.trim().match(/^(\d+)\s+(\S+)/);
+    return fields && Number(fields[1]) === groupId && !fields[2].startsWith("Z");
+  });
+}
+
 if (process.env.CI && process.platform !== "win32") {
   const signalGroup = process.kill.bind(process);
   process.kill = (pid, signal) => {
@@ -754,10 +763,10 @@ for (const action of ["stop", "shutdown"]) {
     await once(child, "close");
     assert.equal(resolved, false, "provider close is not process-tree completion");
     assert.equal(database.getRun(run.id).status, "running");
-    assert.doesNotThrow(() => process.kill(-child.pid, 0));
+    assert.ok(liveProcessGroupMembers(child.pid).length, "a live descendant keeps the detached group active");
     await stopping;
     assert.equal(database.getRun(run.id).status, "stopped");
-    assert.throws(() => process.kill(-child.pid, 0), { code: "ESRCH" });
+    assert.deepEqual(liveProcessGroupMembers(child.pid), [], "stop waits for every executing group member");
     assert.deepEqual(manager.activeRuns(), []);
   });
 }
@@ -1506,7 +1515,7 @@ test("wrapper teardown kills the provider and the wrapper reaps it", { skip: pro
 
     assert.equal(await stopping, true, "stop completes instead of timing out on the tree");
     assert.equal(database.getRun(run.id).status, "stopped");
-    assert.throws(() => process.kill(-child.pid, 0), { code: "ESRCH" }, "the whole owned process group is gone");
+    assert.deepEqual(liveProcessGroupMembers(child.pid), [], "the whole owned process group has stopped executing");
     assert.deepEqual(manager.activeRuns(), []);
   } finally {
     rmSync(root, { recursive: true, force: true });
