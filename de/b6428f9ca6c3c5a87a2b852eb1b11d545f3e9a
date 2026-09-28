@@ -1,0 +1,18 @@
+src/components/WindowedDiff.jsx
+  h_a39f9495f9ec1d 180-183,226
+src/styles.css
+  h_a39f9495f9ec1d 433,445
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 931,934,940-943,958,976,979-980,983,986,988,993-994,999-1005,2073-2074,2076-2077,2086
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "deb6428f9ca6c3c5a87a2b852eb1b11d545f3e9a",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
