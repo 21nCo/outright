@@ -61,10 +61,12 @@ test("conversation Find bounds hydrated neighbors and keeps page cursors exact",
     const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Large Find", provider: "codex" });
     const ids = Array.from({ length: 32 }, (_, index) => database.addMessage({ conversationId: chat.id,
       role: "assistant", body: `${index === 16 ? "unique needle " : ""}${"x".repeat(1024 * 1024)}`,
-      payload: { detail: "y".repeat(1024 * 1024) } }).id);
+      payload: { runId: `run-${index}`, detail: "y".repeat(1024 * 1024) } }).id);
     const result = await database.findMessagePage(chat.id, "unique needle", ids[15]);
     assert.equal(result.matchId, ids[16]);
     assert.ok(result.messages.some((message) => message.id === ids[16]));
+    assert.equal(result.messages.find((message) => message.id === ids[16]).payload.runId, "run-16",
+      "Find dropped bounded run metadata while excerpting a large body");
     assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 8 * 1024 * 1024 + 1024, "Find hydrated too much context");
     assert.equal(result.messagePage.olderCount + result.messages.length + result.messagePage.newerCount, 32);
     assert.equal(result.messagePage.beforeId, result.messages[0].id);
@@ -112,6 +114,90 @@ test("conversation Find bounds hydrated neighbors and keeps page cursors exact",
     assert.equal(complete, `start\0${"🙂".repeat(20000)}\0end`);
     assert.equal(database.getMessageBodyChunk(chat.id, "foreign", 0), null);
   } finally { database.close(); }
+});
+
+test("oversized Find bodies resume by byte before a match or miss without blocking other work", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Large body", provider: "codex" });
+    const other = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Other", provider: "codex" });
+    const first = database.addMessage({ conversationId: chat.id, role: "user", body: "wrap target" });
+    const body = `${"a".repeat(16 * 1024 * 1024 + 65_534)}CAFÉ\0tail needle${"z".repeat(1024 * 1024)}`;
+    const huge = database.addMessage({ conversationId: chat.id, role: "assistant", body });
+    database.addMessage({ conversationId: other.id, role: "assistant", body: "foreign token" });
+    let timerTicks = 0;
+    let maximumGapMs = 0;
+    let lastTick = performance.now();
+    const timer = setInterval(() => {
+      const current = performance.now();
+      maximumGapMs = Math.max(maximumGapMs, current - lastTick);
+      lastTick = current;
+      timerTicks += 1;
+    }, 1);
+    try {
+      let result = await database.findMessagePage(chat.id, "tail needle", first.id);
+      assert.equal(result.partial, true, "a matching oversized row must stop before hydrating its full body");
+      assert.equal(result.nextAfterId, huge.id);
+      assert.ok(result.nextByteOffset > 0 && result.nextByteOffset <= 8 * 1024 * 1024);
+      let requests = 1;
+      while (result.partial) {
+        const prior = result.nextByteOffset;
+        result = await database.findMessagePage(chat.id, "tail needle", result.nextAfterId, 1, undefined,
+          { originId: result.originId, wrapped: result.wrapped, byteOffset: prior });
+        requests += 1;
+        assert.ok(requests <= 4, "oversized match continuation did not converge");
+        if (result.partial) assert.ok(result.nextByteOffset > prior);
+      }
+      assert.equal(result.matchId, huge.id);
+      assert.ok(result.messages.find((message) => message.id === huge.id).body.includes("CAFÉ\0tail needle"));
+      assert.ok(Buffer.byteLength(JSON.stringify(result)) < 8 * 1024 * 1024);
+
+      let miss = await database.findMessagePage(chat.id, "absent term", first.id);
+      let missRequests = 1;
+      while (miss.partial) {
+        miss = await database.findMessagePage(chat.id, "absent term", miss.nextAfterId, 1, undefined,
+          { originId: miss.originId, wrapped: miss.wrapped, byteOffset: miss.nextByteOffset ?? 0 });
+        assert.ok(++missRequests <= 5, "oversized no-match continuation did not converge");
+      }
+      assert.equal(miss.matchId, null);
+      let unicode = await database.findMessagePage(chat.id, "café", first.id);
+      assert.equal(unicode.partial, true);
+      while (unicode.partial) unicode = await database.findMessagePage(chat.id, "café", unicode.nextAfterId, 1, undefined,
+        { originId: unicode.originId, wrapped: unicode.wrapped, byteOffset: unicode.nextByteOffset ?? 0 });
+      assert.equal(unicode.matchId, huge.id, "a Unicode match crossing a byte section was skipped");
+      let foreign = await database.findMessagePage(chat.id, "foreign token", null);
+      while (foreign.partial) foreign = await database.findMessagePage(chat.id, "foreign token", foreign.nextAfterId, 1, undefined,
+        { originId: foreign.originId, wrapped: foreign.wrapped, byteOffset: foreign.nextByteOffset ?? 0 });
+      assert.equal(foreign.matchId, null);
+      assert.equal((await database.findMessagePage(chat.id, "wrap target", huge.id)).matchId, first.id);
+      const abort = new AbortController();
+      const pending = database.findMessagePage(chat.id, "absent term", first.id, 1, abort.signal);
+      abort.abort();
+      assert.equal((await pending).matchId, null);
+    } finally { clearInterval(timer); }
+    assert.ok(timerTicks > 0, "large body scan held the event loop");
+    assert.ok(maximumGapMs < 250, `large body scan delayed the event loop for ${maximumGapMs.toFixed(1)}ms`);
+  } finally { database.close(); }
+});
+
+test("conversation Find skips nullable legacy bodies and preserves NUL text", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-find-null-body-"));
+  const filename = path.join(root, "messages.db");
+  const legacy = new Database(filename);
+  try { legacy.exec(`CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'text', body TEXT, payload TEXT, created_at TEXT NOT NULL)`); }
+  finally { legacy.close(); }
+  const database = createOutrightDatabase({ filename });
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Legacy body", provider: "codex" });
+    const empty = database.addMessage({ conversationId: chat.id, role: "user", body: "old" });
+    const nul = database.addMessage({ conversationId: chat.id, role: "user", body: "before\0CAFÉ after" });
+    const raw = new Database(filename);
+    try { raw.prepare("UPDATE messages SET body = NULL WHERE id = ?").run(empty.id); }
+    finally { raw.close(); }
+    assert.equal((await database.findMessagePage(chat.id, "café", null)).matchId, nul.id);
+    assert.equal((await database.findMessagePage(chat.id, "missing", null)).matchId, null);
+  } finally { database.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test("ordinary message pages bound bytes and preserve both cursor directions", () => {

@@ -231,10 +231,16 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         try {
           const originParam = url.searchParams.get("origin");
           const wrappedParam = url.searchParams.get("wrapped");
+          const byteOffsetParam = url.searchParams.get("byteOffset");
           if (wrappedParam && (wrappedParam !== "1" || originParam === null)) throw apiError(400, "Search continuation is invalid");
+          if (byteOffsetParam !== null && (!/^[1-9][0-9]*$/.test(byteOffsetParam)
+            || !Number.isSafeInteger(Number(byteOffsetParam)) || !url.searchParams.get("after") || originParam === null)) {
+            throw apiError(400, "Search byte offset is invalid");
+          }
           const result = await database.findMessagePage(
             conversationFindMatch[1], needle, url.searchParams.get("after"), direction === "previous" ? -1 : 1, findController.signal,
-            originParam === null ? undefined : { originId: originParam === "none" ? null : originParam, wrapped: wrappedParam === "1" },
+            originParam === null ? undefined : { originId: originParam === "none" ? null : originParam,
+              wrapped: wrappedParam === "1", byteOffset: Number(byteOffsetParam ?? 0) },
           );
           if (response.destroyed) return true;
           return json(response, 200, result);

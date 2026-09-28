@@ -155,7 +155,7 @@ setInterval(() => {}, 1000);
   let helperPid;
   try {
     const deadline = Date.now() + 5000;
-    while (!existsSync(marker) && Date.now() < deadline) {
+    while ((!existsSync(marker) || !runnerPid) && Date.now() < deadline) {
       runnerPid ??= runnerFor(child.pid);
       await new Promise((resolve) => setTimeout(resolve, 20));
     }

@@ -182,7 +182,10 @@ test("conversation find rejects malformed queries and foreign cursors", withRunt
   const chat = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Find", provider: "codex" });
   const other = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Other", provider: "codex" });
   const foreign = runtime.database.addMessage({ conversationId: other.id, role: "user", body: "needle" });
-  for (const suffix of ["", "?q=%20", `?q=${"a".repeat(201)}`, "?q=needle&direction=sideways", `?q=needle&after=${foreign.id}`, `?q=needle&after=${foreign.id}&origin=none`, `?q=needle&origin=${foreign.id}`, "?q=needle&wrapped=1", "?q=needle&origin=none&wrapped=1"]) {
+  const own = runtime.database.addMessage({ conversationId: chat.id, role: "user", body: "own" });
+  for (const suffix of ["", "?q=%20", `?q=${"a".repeat(201)}`, "?q=needle&direction=sideways", `?q=needle&after=${foreign.id}`, `?q=needle&after=${foreign.id}&origin=none`, `?q=needle&origin=${foreign.id}`, "?q=needle&wrapped=1", "?q=needle&origin=none&wrapped=1",
+    "?q=needle&byteOffset=1", `?q=needle&after=${own.id}&byteOffset=1`,
+    `?q=needle&after=${own.id}&origin=none&byteOffset=0`, `?q=needle&after=${own.id}&origin=none&byteOffset=99999999999999999999`]) {
     const response = responseCapture();
     await runtime.handleRequest(requestStream("GET", `/api/conversations/${chat.id}/messages/find${suffix}`), response);
     assert.equal(response.statusCode, 400, suffix);

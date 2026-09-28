@@ -167,6 +167,9 @@ export function WindowedDiff({ diff, label }) {
     ? Math.max(0, Math.min(maxFirst, pendingLine - Math.floor(visibleRows / 3))) : scrollFirst;
   const start = Math.max(0, firstVisible - OVERSCAN);
   const end = Math.min(count, firstVisible + visibleRows + OVERSCAN);
+  // The mounted rows and the scrollbar must use the same logical origin,
+  // including the render before a pending Find has moved scrollTop.
+  const compressedRowTop = (maxFirst ? firstVisible / maxFirst * maxScroll : 0) + (start - firstVisible) * LINE_HEIGHT;
   const visibleStatus = needle && foundLine >= 0 ? `Line ${foundLine + 1}` : needle && searched ? "No match" : needle ? "Press Enter to find" : "";
   useEffect(() => {
     const timer = window.setTimeout(() => setAnnouncedStatus(visibleStatus), 180);
@@ -209,7 +212,7 @@ export function WindowedDiff({ diff, label }) {
     moveFirst(event.key === "Home" ? 0 : event.key === "End" ? maxFirst : firstVisible + moves[event.key]);
   }}>
     {content ? compressed
-      ? <div style={{ height: trackHeight, position: "relative" }}><div style={{ position: "absolute", top: position.top + (start - firstVisible) * LINE_HEIGHT, left: 0, right: 0 }}>{lines}</div></div>
+      ? <div style={{ height: trackHeight, position: "relative" }}><div style={{ position: "absolute", top: compressedRowTop, left: 0, right: 0 }}>{lines}</div></div>
       : <>{start > 0 && <span aria-hidden="true" style={{ height: start * LINE_HEIGHT }} />}{lines}{end < count && <span aria-hidden="true" style={{ height: (count - end) * LINE_HEIGHT }} />}</>
       : <span className="diff-empty">Select a changed file to inspect its diff.</span>}
   </pre></div>;

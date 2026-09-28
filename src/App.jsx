@@ -1492,6 +1492,7 @@ export function App() {
     setLoadingEarlier(false);
     try {
       let cursor = continuation ? priorProgress.nextAfterId : afterId;
+      let byteOffset = continuation ? priorProgress.nextByteOffset ?? 0 : 0;
       let originId = continuation ? priorProgress.originId : afterId;
       let wrapped = continuation ? priorProgress.wrapped : false;
       let result;
@@ -1500,15 +1501,19 @@ export function App() {
           q: needle, after: cursor || undefined, direction: direction < 0 ? "previous" : "next",
           origin: page || continuation ? originId ?? "none" : undefined,
           wrapped: wrapped ? "1" : undefined,
+          byteOffset: byteOffset || undefined,
         }), { signal: controller.signal });
         if (!result.partial) break;
-        if (!result.nextAfterId || result.nextAfterId === cursor) throw new Error("Search continuation did not advance");
+        if (!result.nextAfterId || (result.nextAfterId === cursor
+          && !(result.nextByteOffset > byteOffset || (byteOffset > 0 && !result.nextByteOffset)))) throw new Error("Search continuation did not advance");
         cursor = result.nextAfterId;
+        byteOffset = result.nextByteOffset ?? 0;
         originId = result.originId;
         wrapped = result.wrapped;
         if (page === 7) {
           if (controller.signal.aborted || historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversationId) return undefined;
-          findProgressRef.current = { conversationId, needle, direction, afterId, nextAfterId: cursor, originId, wrapped, generation: historyGeneration };
+          findProgressRef.current = { conversationId, needle, direction, afterId, nextAfterId: cursor,
+            nextByteOffset: byteOffset, originId, wrapped, generation: historyGeneration };
           return { partial: true };
         }
       }

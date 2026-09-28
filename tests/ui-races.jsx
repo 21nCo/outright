@@ -1952,6 +1952,23 @@ async function extremeDiffHeightRegression() {
   await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("TAIL MATCH"), "Find reaches final line of tall diff");
   const bounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
   assert(bounds.top < viewport.getBoundingClientRect().bottom && bounds.bottom > viewport.getBoundingClientRect().top, `Tall diff find mark is outside the viewport: mark=${bounds.top}/${bounds.bottom}, viewport=${viewport.getBoundingClientRect().top}/${viewport.getBoundingClientRect().bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}`);
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 300 }}><WindowedDiff diff={"+\n".repeat(10_000) + diff} label="Tall diff" /></div>);
+  await until(() => viewport.clientHeight < 400 && viewport.querySelector('[data-find-match="true"]')?.textContent.includes("TAIL MATCH"), "tail Find survives compressed resize");
+  for (let tick = 0; tick < 4; tick += 1) await frame();
+  const resizedTail = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+  const resizedTrack = viewport.getBoundingClientRect();
+  assert(resizedTail.top < resizedTrack.bottom && resizedTail.bottom > resizedTrack.top,
+    `Compressed tail Find lost physical alignment after resize: mark=${resizedTail.top}, viewport=${resizedTrack.top}/${resizedTrack.bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}, first=${viewport.dataset.firstLine}, mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`);
+  viewport.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+  viewport.scrollTop = 0;
+  viewport.dispatchEvent(new Event("scroll"));
+  await until(() => Number(viewport.dataset.firstLine) < 100, "scrollbar takes compressed diff ownership after Find");
+  host.querySelector('[aria-label="Next diff match"]').click();
+  await until(() => {
+    const mark = viewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect();
+    const view = viewport.getBoundingClientRect();
+    return mark && mark.top < view.bottom && mark.bottom > view.top;
+  }, "Find returns to tail after scrollbar movement");
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={null} label="Empty diff" /></div>);
   await until(() => host.querySelector(".diff-empty"), "nullable diff shows its empty state");
   const nearLimit = "+\n".repeat(2_900_000) + `+WHEEL A ${"x".repeat(1_000)}\n+WHEEL B\n` + "+\n".repeat(2_899_998) + "+NEAR LIMIT TAIL\n";
@@ -2152,8 +2169,11 @@ async function pagedTranscriptFindRegression({ endOnly = false, measuredOnly = f
       if (url.searchParams.get("q") === "drag") { draggedSignal = options.signal; return draggedSearch.promise; }
       if (url.searchParams.get("q") === "partial") {
         partialReads += 1;
+        if (partialReads > 1) assert(url.searchParams.get("after") === "message-1"
+          && Number(url.searchParams.get("byteOffset")) === (partialReads - 1) * 1024,
+        "A continuation lost its byte offset inside the oversized row");
         return partialReads <= 8
-          ? response({ partial: true, nextAfterId: `message-${partialReads}`, originId: null, wrapped: false })
+          ? response({ partial: true, nextAfterId: "message-1", nextByteOffset: partialReads * 1024, originId: null, wrapped: false })
           : response({ matchId: "message-10", messages: earliest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } });
       }
       if (url.searchParams.get("q") === "stale") { staleRequested = true; return staleSearch.promise; }
