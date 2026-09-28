@@ -1,0 +1,18 @@
+server/provider-discovery.test.mjs
+  h_a39f9495f9ec1d 97-100
+src/components/WindowedDiff.jsx
+  h_a39f9495f9ec1d 145-152
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 1963
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "887684aa87b0f5ac5d3fc7280e4631cfcd16fa04",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
