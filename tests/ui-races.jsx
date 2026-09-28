@@ -1762,14 +1762,27 @@ async function productionDiffViewportRegression() {
   if (window.__fixtureWheel) {
     viewport.scrollIntoView({ block: "center" });
     await frame();
-    for (let step = 0; step < 12 && viewport.scrollTop < viewport.scrollHeight - viewport.clientHeight; step += 1) {
+    const initialRemaining = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop;
+    const wheelTrace = [];
+    let attemptBudget = 64;
+    for (let step = 0; step < attemptBudget && viewport.scrollTop < viewport.scrollHeight - viewport.clientHeight - 1; step += 1) {
       const bounds = viewport.getBoundingClientRect();
       const before = viewport.scrollTop;
       const delivery = await window.__fixtureWheel(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2, 120_000);
       assert(delivery.viewport === viewport, `Large wheel missed the diff viewport at step ${step}`);
-      await until(() => viewport.scrollTop > before || viewport.scrollTop >= viewport.scrollHeight - viewport.clientHeight,
-        `large native wheel scroll at step ${step}`);
+      try { await until(() => viewport.scrollTop > before, `large native wheel scroll at step ${step}`); }
+      catch (error) { throw new Error(`${error.message}; trace=${JSON.stringify(wheelTrace)}; delivered=${delivery.deltaY}; canceled=${delivery.defaultPrevented}; physical=${viewport.scrollTop}; logical=${viewport.dataset.firstLine}; mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`, { cause: error }); }
+      await frame();
+      const progress = viewport.scrollTop - before;
+      wheelTrace.push({ requested: 120_000, delivered: delivery.deltaY, canceled: delivery.defaultPrevented,
+        before, after: viewport.scrollTop, max: viewport.scrollHeight - viewport.clientHeight,
+        logical: viewport.dataset.firstLine, mounted: [viewport.dataset.mountedStart, viewport.dataset.mountedEnd] });
+      assert(progress > 0 && viewport.querySelectorAll("span").length < 200,
+        `Native wheel lost progress or mounted unbounded rows: ${JSON.stringify(wheelTrace)}`);
+      if (step === 0) attemptBudget = Math.min(64, Math.max(4, Math.ceil(initialRemaining / progress) + 4));
     }
+    assert(viewport.scrollTop >= viewport.scrollHeight - viewport.clientHeight - 1,
+      `Native wheels did not reach the staged diff end within observed-progress budget: ${JSON.stringify(wheelTrace)}`);
   } else { viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); }
   try { await until(() => viewport.textContent.includes("staged 49999"), "staged final line"); }
   catch (error) { throw new Error(`${error.message}; scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}`); }
@@ -1959,9 +1972,14 @@ async function extremeDiffHeightRegression() {
   await until(() => host.querySelector(".diff-view"), "tall diff mounted");
   const viewport = host.querySelector(".diff-view");
   assert(viewport.scrollHeight < 16_000_000, `Tall diff track was clamped: ${viewport.scrollHeight}px`);
+  const stickyInset = () => viewport.firstElementChild?.firstElementChild?.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
+  assert(Math.abs(stickyInset() - parseFloat(getComputedStyle(viewport).paddingTop)) < 1,
+    `Compressed diff lost its top inset before scrolling: inset=${stickyInset()}`);
   viewport.scrollTop = viewport.scrollHeight;
   viewport.dispatchEvent(new Event("scroll"));
   await until(() => viewport.textContent.includes("TAIL MATCH"), "End reaches final line of tall diff");
+  assert(Math.abs(stickyInset() - parseFloat(getComputedStyle(viewport).paddingTop)) < 1,
+    `Compressed diff lost its top inset after scrolling: inset=${stickyInset()}`);
   assert(viewport.querySelectorAll("span").length < 200, "Tall diff mounted an unbounded line window");
   viewport.scrollTop = 0; viewport.dispatchEvent(new Event("scroll")); await settle();
   const input = host.querySelector('input[aria-label="Find in diff"]');

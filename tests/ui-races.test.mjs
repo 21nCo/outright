@@ -818,7 +818,10 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       (async () => {
         if (event.params.name === "__requestFixtureWheel") {
           const wheel = JSON.parse(event.params.payload);
-          await send("Input.dispatchMouseEvent", { type: "mouseWheel", x: wheel.x, y: wheel.y, deltaX: wheel.deltaX ?? 0, deltaY: wheel.deltaY });
+          const configuredCap = Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP);
+          const deliveredDelta = configuredCap > 0
+            ? Math.sign(wheel.deltaY) * Math.min(Math.abs(wheel.deltaY), configuredCap) : wheel.deltaY;
+          await send("Input.dispatchMouseEvent", { type: "mouseWheel", x: wheel.x, y: wheel.y, deltaX: wheel.deltaX ?? 0, deltaY: deliveredDelta });
           await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-wheel-ready", { detail: ${JSON.stringify(wheel.id)} }))` });
           return;
         }
