@@ -108,8 +108,11 @@ export function App() {
   const pendingPrependScrollRef = useRef(null);
   const pendingEarlierRef = useRef(null);
   const pendingLiveScrollRef = useRef(null);
+  const pendingLatestScrollRef = useRef(null);
   const restoreMessageAnchorId = useCallback(() => pendingPrependScrollRef.current?.conversationId === selectedConversationRef.current
-    ? pendingPrependScrollRef.current.messageId : null, []);
+    ? pendingPrependScrollRef.current.messageId
+    : pendingLatestScrollRef.current?.conversationId === selectedConversationRef.current
+      ? pendingLatestScrollRef.current.messageId : null, []);
   const livePreviewRunRef = useRef(null);
   const acceptedPreviewRunRef = useRef(null);
   const liveDeltaEventsRef = useRef(emptyLiveDeltaEvents());
@@ -120,6 +123,12 @@ export function App() {
     messageCountRefreshRef.current = { generation: messageCountRefreshRef.current.generation + 1, timer: null, conversationId: null, inFlight: false };
   }, []);
   const pendingFindRef = useRef(null);
+  const activeFindMatchRef = useRef(null);
+  const boundVisibleMessage = useCallback((message) => {
+    const match = activeFindMatchRef.current;
+    return boundPageMessage(message, match?.conversationId === selectedConversationRef.current && match.messageId === message.id
+      ? match.needle : "");
+  }, []);
   const findProgressRef = useRef(null);
   const sidebarRef = useRef(null);
   const sidebarFocusIntentRef = useRef(null);
@@ -178,10 +187,12 @@ export function App() {
     pendingConversationLoadRef.current = null;
     pendingFindRef.current?.abort();
     pendingFindRef.current = null;
+    activeFindMatchRef.current = null;
     findProgressRef.current = null;
     pendingEarlierRef.current = null;
     pendingPrependScrollRef.current = null;
     pendingLiveScrollRef.current = null;
+    pendingLatestScrollRef.current = null;
     pendingListDetailRefreshRef.current = null;
     window.clearTimeout(messageCountRefreshRef.current.timer);
     messageCountRefreshRef.current = { generation: messageCountRefreshRef.current.generation + 1, timer: null, conversationId: null, inFlight: false };
@@ -308,7 +319,9 @@ export function App() {
     messageCountRefreshRef.current = { generation: messageCountRefreshRef.current.generation + 1, timer: null, conversationId: null, inFlight: false };
     pendingFindRef.current?.abort();
     pendingFindRef.current = null;
+    activeFindMatchRef.current = null;
     pendingLiveScrollRef.current = null;
+    pendingLatestScrollRef.current = null;
     pendingEarlierRef.current = null;
     pendingPrependScrollRef.current = null;
     ++historyGenerationRef.current;
@@ -381,11 +394,13 @@ export function App() {
     if (!preservePage) {
       pendingFindRef.current?.abort();
       pendingFindRef.current = null;
+      activeFindMatchRef.current = null;
       findProgressRef.current = null;
       ++historyGenerationRef.current;
       pendingPrependScrollRef.current = null;
       pendingEarlierRef.current = null;
       pendingLiveScrollRef.current = null;
+      pendingLatestScrollRef.current = null;
       setLoadingEarlier(false);
     }
     const startedHistoryGeneration = historyGenerationRef.current;
@@ -488,6 +503,10 @@ export function App() {
         readerScrollInputUntilRef.current = 0;
       }
       checkpointCursorsRef.current = checkpointCursors(replayed.messages, checkpointCursorsRef.current, activeCursorOwners(nextConversation));
+      if (options.returnToLatest && !preserveReading && replayed.messages.length) {
+        pendingLatestScrollRef.current = { conversationId: requestedId, generation: startedHistoryGeneration,
+          messageId: replayed.messages.at(-1).id };
+      }
       setConversation((current) => preserveReading && current?.id === requestedId ? (() => {
         const currentTotal = current.messagePage?.total ?? current.messages.length;
         const latestTotal = Math.max(nextConversation.messagePage?.total ?? nextConversation.messages.length,
@@ -498,7 +517,7 @@ export function App() {
           if (!refreshed) return message;
           const oldSeq = message.payload?.checkpointEventSeq;
           const newSeq = refreshed.payload?.checkpointEventSeq;
-          return Number.isSafeInteger(oldSeq) && Number.isSafeInteger(newSeq) && oldSeq > newSeq ? message : boundPageMessage(refreshed);
+          return Number.isSafeInteger(oldSeq) && Number.isSafeInteger(newSeq) && oldSeq > newSeq ? message : boundVisibleMessage(refreshed);
         });
         const total = Math.max(currentTotal, latestTotal);
         const newerCount = Math.max(0, total - (current.messagePage?.olderCount ?? 0) - messages.length);
@@ -510,7 +529,7 @@ export function App() {
         };
       })() : {
         ...nextConversation,
-        messages: replayed.messages.map(boundPageMessage),
+        messages: replayed.messages.map((message) => boundVisibleMessage(message)),
         messagePage: {
           ...nextConversation.messagePage,
           total: Math.max(nextConversation.messagePage?.total ?? nextConversation.messages.length,
@@ -652,7 +671,7 @@ export function App() {
           ...current,
           messagePage: { ...current.messagePage, total, hasLater: true, newerCount: 1 },
         };
-        const merged = upsertRuntimeMessage(current.messages, boundPageMessage(event.payload));
+        const merged = upsertRuntimeMessage(current.messages, boundVisibleMessage(event.payload));
         const dropped = Math.max(0, merged.length - MAX_RENDERED_MESSAGES);
         const messages = merged.slice(-MAX_RENDERED_MESSAGES);
         return {
@@ -1078,6 +1097,56 @@ export function App() {
       if (viewport && stickToBottomRef.current && !pendingPrependScrollRef.current) moveMessageViewport(viewport, viewport.scrollHeight);
     });
   }, [conversation?.messages.at(-1)?.id, conversation?.messagePage?.hasLater, streamingText]);
+  useLayoutEffect(() => {
+    const pending = pendingLatestScrollRef.current;
+    const viewport = messageViewportRef.current;
+    if (!pending || !viewport || pending.conversationId !== conversation?.id
+      || pending.generation !== historyGenerationRef.current || conversation.messagePage?.hasLater) return;
+    let cancelTick = () => {};
+    let remaining = 32;
+    let stable = 0;
+    const cancelForReader = (event) => {
+      if (event.type === "keydown" && event.target !== viewport) return;
+      if (pendingLatestScrollRef.current === pending) pendingLatestScrollRef.current = null;
+      cancelTick();
+    };
+    const scrollOwner = viewport.parentElement;
+    const cancelForScrollbar = (event) => {
+      if (event.target.closest?.('[data-slot="scroll-area-scrollbar"]')) cancelForReader(event);
+    };
+    const restore = () => {
+      if (pendingLatestScrollRef.current !== pending) return;
+      const row = [...viewport.querySelectorAll("[data-message-id]")].find((element) => element.dataset.messageId === pending.messageId);
+      const frame = viewport.getBoundingClientRect();
+      const bounds = row?.getBoundingClientRect();
+      const visible = bounds && bounds.bottom > frame.top && bounds.top < frame.bottom;
+      const atBottom = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 2;
+      if (visible && atBottom) stable += 1;
+      else {
+        stable = 0;
+        // The virtual range and measured spacers can change after the first
+        // scroll-to-end. Keep the explicit Return destination through them.
+        moveMessageViewport(viewport, viewport.scrollHeight);
+      }
+      if (stable >= 2 || --remaining <= 0) {
+        if (pendingLatestScrollRef.current === pending) pendingLatestScrollRef.current = null;
+      } else cancelTick = scheduleLayoutTick(restore);
+    };
+    viewport.addEventListener("wheel", cancelForReader, { passive: true });
+    viewport.addEventListener("touchstart", cancelForReader, { passive: true });
+    viewport.addEventListener("pointerdown", cancelForReader, { passive: true });
+    viewport.addEventListener("keydown", cancelForReader);
+    scrollOwner?.addEventListener("pointerdown", cancelForScrollbar, { passive: true });
+    restore();
+    return () => {
+      cancelTick();
+      viewport.removeEventListener("wheel", cancelForReader);
+      viewport.removeEventListener("touchstart", cancelForReader);
+      viewport.removeEventListener("pointerdown", cancelForReader);
+      viewport.removeEventListener("keydown", cancelForReader);
+      scrollOwner?.removeEventListener("pointerdown", cancelForScrollbar);
+    };
+  }, [conversation?.id, conversation?.messages.at(-1)?.id, conversation?.messagePage?.hasLater]);
 
   function handleMessageViewportKeyDown(event) {
     if (event.target !== event.currentTarget || event.key !== "End" || conversation?.messagePage?.hasLater) return;
@@ -1299,6 +1368,8 @@ export function App() {
   async function stopRun() { try { await api(`/api/runs/${activeRun.id}/stop`, { method: "POST" }); } catch (nextError) { setError(nextError.message); } }
   async function loadEarlierMessages() {
     if (!conversation?.messagePage?.hasMore || loadingEarlier || !conversation.messages[0]) return;
+    pendingLatestScrollRef.current = null;
+    activeFindMatchRef.current = null;
     pendingFindRef.current?.abort();
     pendingFindRef.current = null;
     const historyGeneration = ++historyGenerationRef.current;
@@ -1313,7 +1384,7 @@ export function App() {
       const result = await api(query(`/api/conversations/${conversation.id}/messages`, { before: conversation.messages[0].id, limit: 200 }));
       if (historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversation.id) return;
       if (pendingPrependScrollRef.current === pendingPrepend) pendingPrepend.prependedCount = result.messages.length;
-      const pageMessages = result.messages.map(boundPageMessage);
+      const pageMessages = result.messages.map((message) => boundPageMessage(message));
       checkpointCursorsRef.current = checkpointCursors(pageMessages, checkpointCursorsRef.current, activeCursorOwners(conversation));
       setConversation((current) => {
         if (current?.id !== conversation.id) return current;
@@ -1343,6 +1414,8 @@ export function App() {
 
   async function loadLaterMessages() {
     if (!conversation?.messagePage?.hasLater || loadingEarlier || !conversation.messages.at(-1)) return;
+    pendingLatestScrollRef.current = null;
+    activeFindMatchRef.current = null;
     pendingFindRef.current?.abort();
     pendingFindRef.current = null;
     const historyGeneration = ++historyGenerationRef.current;
@@ -1356,7 +1429,7 @@ export function App() {
     try {
       const result = await api(query(`/api/conversations/${conversation.id}/messages`, { after: conversation.messages.at(-1).id, limit: 200 }));
       if (historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversation.id) return;
-      const pageMessages = result.messages.map(boundPageMessage);
+      const pageMessages = result.messages.map((message) => boundPageMessage(message));
       checkpointCursorsRef.current = checkpointCursors(pageMessages, checkpointCursorsRef.current, activeCursorOwners(conversation));
       setConversation((current) => {
         if (current?.id !== conversation.id) return current;
@@ -1391,6 +1464,7 @@ export function App() {
   }
 
   async function findConversationMessage(needle, direction, afterId) {
+    pendingLatestScrollRef.current = null;
     const conversationId = selectedConversationRef.current;
     if (!conversationId) return null;
     const priorProgress = findProgressRef.current;
@@ -1436,9 +1510,11 @@ export function App() {
         }
       }
       if (controller.signal.aborted || historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversationId) return undefined;
-      if (!result.matchId) return null;
+      if (!result.matchId) { activeFindMatchRef.current = null; return null; }
+      activeFindMatchRef.current = { conversationId, messageId: result.matchId, needle };
       stickToBottomRef.current = false;
-      const pageById = new Map(result.messages.map((message) => [message.id, boundPageMessage(message)]));
+      const pageById = new Map(result.messages.map((message) => [message.id,
+        boundPageMessage(message, message.id === result.matchId ? needle : "")]));
       let unseenEvent = false;
       for (const event of pendingFind.events) {
         if (event.type !== "message.created") continue;
@@ -1446,7 +1522,8 @@ export function App() {
         if (!previous) { unseenEvent = true; continue; }
         const oldSeq = previous.payload?.checkpointEventSeq;
         const newSeq = event.payload?.payload?.checkpointEventSeq;
-        if (!Number.isSafeInteger(oldSeq) || !Number.isSafeInteger(newSeq) || newSeq > oldSeq) pageById.set(event.payload.id, boundPageMessage(event.payload));
+        if (!Number.isSafeInteger(oldSeq) || !Number.isSafeInteger(newSeq) || newSeq > oldSeq) pageById.set(event.payload.id,
+          boundPageMessage(event.payload, event.payload.id === result.matchId ? needle : ""));
       }
       const messages = result.messages.map((message) => pageById.get(message.id));
       checkpointCursorsRef.current = checkpointCursors(messages, checkpointCursorsRef.current, activeCursorOwners(conversationRef.current));
@@ -1487,10 +1564,12 @@ export function App() {
     pendingConversationLoadRef.current = null;
     pendingFindRef.current?.abort();
     pendingFindRef.current = null;
+    activeFindMatchRef.current = null;
     findProgressRef.current = null;
     pendingEarlierRef.current = null;
     pendingPrependScrollRef.current = null;
     pendingLiveScrollRef.current = null;
+    pendingLatestScrollRef.current = null;
     ++historyGenerationRef.current;
     stickToBottomRef.current = true;
     setLoadingEarlier(false);
@@ -1582,9 +1661,9 @@ export function App() {
       <div className="work-area">
         <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
           <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} onManage={openManageChat} />
-          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? <WindowedMessages key={conversation.id} messages={conversation.messages} messagePage={conversation.messagePage} viewportRef={messageViewportRef} restoreAnchorId={restoreMessageAnchorId} renderMessage={(message) => <Message message={message} conversationId={conversation.id} />} onFind={findConversationMessage} onCancelFind={() => { pendingFindRef.current?.abort(); pendingFindRef.current = null; findProgressRef.current = null; }} resetFindGeneration={findResetGeneration} /> : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{!conversation?.messagePage?.hasLater && activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}</div></ScrollArea>
+          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? <WindowedMessages key={conversation.id} messages={conversation.messages} messagePage={conversation.messagePage} viewportRef={messageViewportRef} restoreAnchorId={restoreMessageAnchorId} renderMessage={(message) => <Message message={message} conversationId={conversation.id} />} onFind={findConversationMessage} onCancelFind={() => { pendingFindRef.current?.abort(); pendingFindRef.current = null; activeFindMatchRef.current = null; findProgressRef.current = null; }} resetFindGeneration={findResetGeneration} /> : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{!conversation?.messagePage?.hasLater && activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}</div></ScrollArea>
           {readingLiveText && <section className="history-live-tail" aria-label={activeRun ? "Live output while reading history" : "Recent output while reading history"} tabIndex={0}><strong>{activeRun ? "Live output" : "Recent output"}</strong><p>{readingLiveText}</p></section>}
-          {conversation?.messagePage?.hasLater && <div className="history-forward"><button className="history-later" onClick={loadLaterMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading later messages…" : `Load later messages · ${conversation.messagePage.newerCount} remaining`}</button><button className="history-return" onClick={loadConversation}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button></div>}
+          {conversation?.messagePage?.hasLater && <div className="history-forward"><button className="history-later" onClick={loadLaterMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading later messages…" : `Load later messages · ${conversation.messagePage.newerCount} remaining`}</button><button className="history-return" onClick={() => loadConversation({ returnToLatest: true })}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button></div>}
           {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}
           <form className="composer" onSubmit={sendPrompt}>{unsentCreatedChat && <div className="first-prompt-notice" role="status" aria-live="polite">Chat created, but your message was not sent. {unsentForOwner ? firstPromptAwaitingSelection ? "Open the created chat before sending again." : "Send again when the chat is ready." : "Return to its worktree before sending again."}{unsentForOwner && firstPromptAwaitingSelection && conversations.some((item) => item.id === unsentForOwner.id) && <Button type="button" variant="outline" size="sm" onClick={() => selectConversation(unsentForOwner.id)}>Open created chat</Button>}{!unsentForOwner && unsentProject && unsentWorktree && <Button type="button" variant="outline" size="sm" onClick={() => { pendingConversationRef.current = unsentCreatedChat.id; chooseProject(unsentProject, unsentWorktree); }}>Return to created chat</Button>}<Button type="button" variant="ghost" size="sm" onClick={() => { setUnsentCreatedChat(null); editDraft(""); }}>Discard unsent message</Button></div>}<textarea aria-label="Message the agent" disabled={Boolean(interruptedRun) || submissionUnavailable} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversationLoadFailed ? "Chat unavailable; retry loading…" : waitingForConversation ? "Loading selected chat…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={editDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running" role="status" aria-live="polite"><span className="status-dot demo" aria-hidden="true" />Agent is {activeRun.status}</span> : interruptedRun ? <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Recovery decision required</span> : waitingForConversation ? <span className="send-hint" role="status" aria-live="polite">{conversationLoadFailed ? "Chat unavailable; retry loading" : "Loading selected chat"}</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun) || submissionUnavailable || firstPromptAwaitingSelection} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
         </section>
@@ -1678,15 +1757,33 @@ function defaultSettings() { return { provider: "codex", model: "", reasoningEff
 function focusableElements(container) { return container ? [...container.querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')].filter((element) => element.getClientRects().length && element.getAttribute("aria-hidden") !== "true") : []; }
 function boundStreamingText(value) { return value.length > MAX_STREAMING_CHARACTERS ? `${value.slice(0, MAX_STREAMING_CHARACTERS)}${LIVE_TRUNCATION_MARKER}` : value; }
 
-function boundPageMessage(message) {
+function boundPageMessage(message, matchNeedle = "") {
   const body = String(message.body ?? "");
   let bounded = message;
   // HTTP pages apply the same ceiling before hydration. Live events and
   // buffered replay must not bypass the retained 1000-row memory bound.
   if (body.length > 16_000) {
-    const prefix = body.slice(0, 8_000).replace(/[\uD800-\uDBFF]$/, "");
-    const suffix = body.slice(-8_000).replace(/^[\uDC00-\uDFFF]/, "");
-    bounded = { ...bounded, body: `${prefix}\n[Middle text omitted from this page]\n${suffix}`, findExcerpt: true };
+    const foldedIndex = matchNeedle ? body.toLocaleLowerCase().indexOf(matchNeedle.toLocaleLowerCase()) : -1;
+    if (foldedIndex >= 0) {
+      // Find may return a server excerpt centered on a match far from both
+      // ends. Keep that context when applying the smaller client heap cap.
+      let originalIndex = 0;
+      let foldedPosition = 0;
+      for (const point of body) {
+        if (foldedPosition >= foldedIndex) break;
+        foldedPosition += point.toLocaleLowerCase().length;
+        originalIndex += point.length;
+      }
+      let start = Math.max(0, originalIndex - 7_500);
+      if (start && /[\uDC00-\uDFFF]/.test(body[start])) start -= 1;
+      let end = Math.min(body.length, start + 15_000);
+      if (end < body.length && /[\uD800-\uDBFF]/.test(body[end - 1])) end -= 1;
+      bounded = { ...bounded, body: `${start ? "[Earlier text omitted from this page]\n" : ""}${body.slice(start, end)}${end < body.length ? "\n[Later text omitted from this page]" : ""}`, findExcerpt: true };
+    } else {
+      const prefix = body.slice(0, 8_000).replace(/[\uD800-\uDBFF]$/, "");
+      const suffix = body.slice(-8_000).replace(/^[\uDC00-\uDFFF]/, "");
+      bounded = { ...bounded, body: `${prefix}\n[Middle text omitted from this page]\n${suffix}`, findExcerpt: true };
+    }
   }
   if (message.payload && JSON.stringify(message.payload).length > 32_000) {
     bounded = { ...bounded, payload: { runId: message.payload.runId, provider: message.payload.provider,

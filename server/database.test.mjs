@@ -78,6 +78,8 @@ test("conversation Find bounds hydrated neighbors and keeps page cursors exact",
     assert.equal(huge.matchId, hugeMatch.id);
     assert.equal(huge.messages.find((message) => message.id === hugeMatch.id).findExcerpt, true);
     assert.ok(huge.messages.find((message) => message.id === hugeMatch.id).body.includes("unique huge needle"));
+    assert.ok(huge.messages.find((message) => message.id === hugeMatch.id).body.length < 16_000,
+      "Find transfers only the context that a bounded client row can retain");
     assert.ok(Buffer.byteLength(JSON.stringify(huge)) <= 8 * 1024 * 1024 + 1024);
     const firstChunk = database.getMessageBodyChunk(chat.id, hugeMatch.id, 0);
     assert.equal(firstChunk.body.length, 65536);

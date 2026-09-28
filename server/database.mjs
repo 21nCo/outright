@@ -349,8 +349,11 @@ export function createOutrightDatabase(options = {}) {
             foldedPosition += point.toLocaleLowerCase().length;
             originalIndex += point.length;
           }
-          const start = Math.max(0, originalIndex - 250_000);
-          matchedMessage.body = `${start ? "[Earlier text omitted from Find result]\n" : ""}${body.slice(start, start + 500_000)}${start + 500_000 < body.length ? "\n[Later text omitted from Find result]" : ""}`;
+          let start = Math.max(0, originalIndex - 7_500);
+          if (start && body.charCodeAt(start) >= 0xDC00 && body.charCodeAt(start) <= 0xDFFF) start -= 1;
+          let end = Math.min(body.length, originalIndex + query.length + 7_500);
+          if (end < body.length && body.charCodeAt(end - 1) >= 0xD800 && body.charCodeAt(end - 1) <= 0xDBFF) end -= 1;
+          matchedMessage.body = `${start ? "[Earlier text omitted from Find result]\n" : ""}${body.slice(start, end)}${end < body.length ? "\n[Later text omitted from Find result]" : ""}`;
           matchedMessage.payload = null;
           matchedMessage.findExcerpt = true;
         }

@@ -11,6 +11,14 @@ import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAliv
 import { createOutrightDatabase } from "./database.mjs";
 import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
 
+if (process.env.CI && process.platform !== "win32") {
+  const group = spawnSync("/bin/ps", ["-o", "pgid=", "-p", String(process.pid)], { encoding: "utf8", timeout: 1000 });
+  const pgid = group.status === 0 ? group.stdout.trim() : "unavailable";
+  console.error(`POSIX runtime test module ready: test=${process.pid}/${pgid} parent=${process.ppid} supervisor=${AGENT_SUPERVISOR}`);
+  process.on("exit", (code) => console.error(`POSIX runtime test process exited: test=${process.pid} code=${code}`));
+  process.on("uncaughtExceptionMonitor", (error) => console.error(`POSIX runtime test uncaught exception: test=${process.pid} ${error.stack ?? error}`));
+}
+
 function request(host, origin) {
   return { headers: { host, ...(origin ? { origin } : {}) } };
 }

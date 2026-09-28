@@ -1,6 +1,6 @@
 import { readdirSync } from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
@@ -70,6 +70,17 @@ const finish = () => {
 };
 child.on("close", (status, signal) => {
   closed = { status, signal };
+  if (process.env.CI && process.platform !== "win32" && (status !== 0 || signal)) {
+    const snapshot = spawnSync("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat=,command="],
+      { encoding: "utf8", timeout: 1000 });
+    if (snapshot.status === 0) {
+      const members = snapshot.stdout.split("\n").filter((line) => {
+        const fields = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+/);
+        return fields && Number(fields[3]) === child.pid;
+      });
+      console.error(`CI failed test runner group: runner=${child.pid} members=${JSON.stringify(members.slice(0, 32))}`);
+    } else console.error(`CI failed test runner group inspection: ${snapshot.error?.message ?? snapshot.stderr?.trim() ?? snapshot.status}`);
+  }
   // A worker can fail after starting a helper with redirected stdio. Node's
   // test runner then closes while that helper still executes in its group.
   // Reap the owned group on every terminal runner outcome, including failure.

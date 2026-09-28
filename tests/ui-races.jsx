@@ -2577,10 +2577,14 @@ async function fullPageLiveAnchorRegression() {
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
   const message = (index) => ({ id: `full-${index}`, role: "assistant", kind: "text", body: `Output ${index}`, createdAt: new Date(index * 1000).toISOString(), searchOrder: index + 1 });
   let all = Array.from({ length: 1000 }, (_, index) => message(index));
+  let detailReads = 0;
   route = async (url) => {
     if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
     if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
-    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: all.slice(-1000), messagePage: { hasMore: all.length > 1000, olderCount: Math.max(0, all.length - 1000), total: all.length, beforeId: all.at(-1000).id } });
+    if (url.pathname === "/api/conversations/chat-A") {
+      detailReads += 1;
+      return response({ ...chats.A, messages: all.slice(-1000), messagePage: { hasMore: all.length > 1000, olderCount: Math.max(0, all.length - 1000), total: all.length, beforeId: all.at(-1000).id } });
+    }
     return response({});
   };
   root.render(<TooltipProvider><App /></TooltipProvider>);
@@ -2652,8 +2656,17 @@ async function fullPageLiveAnchorRegression() {
   const retainedRow = viewport.querySelector(`[data-message-id="${readingRowId}"]`);
   assert(retainedRow && Math.abs(retainedRow.getBoundingClientRect().top - readingRowTop) < 24,
     `an append moved the upward reader ${readingRowId}: top=${readingRowTop} -> ${retainedRow?.getBoundingClientRect().top}, scroll=${readerTop} -> ${viewport.scrollTop}, max=${viewport.scrollHeight - viewport.clientHeight}`);
+  const readsBeforeReturn = detailReads;
   host.querySelector('.history-return').click();
-  await until(() => host.querySelector('[data-message-id="full-1003"]') && !host.querySelector('.history-return'), "explicit latest after upward reading");
+  await until(() => detailReads > readsBeforeReturn, "explicit latest request after upward reading");
+  await until(() => !host.querySelector('.history-return'), "explicit latest page after upward reading");
+  try { await until(() => {
+    const row = host.querySelector('[data-message-id="full-1003"]');
+    const bounds = row?.getBoundingClientRect();
+    const frame = viewport.getBoundingClientRect();
+    return bounds && bounds.bottom > frame.top && bounds.top < frame.bottom;
+  }, "explicit latest row after upward reading"); }
+  catch (error) { throw new Error(`${error.message}; detailReads=${detailReads}, return=${host.querySelector('.history-return')?.textContent}, scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}, mounted=${[...viewport.querySelectorAll('[data-message-id]')].map((row) => row.dataset.messageId).slice(-6).join(',')}`); }
   viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); await settle();
   const resumeMaximum = viewport.scrollHeight - viewport.clientHeight;
   viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -48 }));
@@ -2694,19 +2707,25 @@ async function largeLiveMessageRetentionRegression() {
 async function largePageMessageRetentionRegression() {
   root.render(null); await settle();
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const middleMatch = "ΩNeEdLe\0more";
   const messages = Array.from({ length: 3 }, (_, index) => ({
     id: `page-large-${index}`, role: "assistant", kind: "text",
-    body: `needle ${index} ` + "🙂".repeat(270_000), createdAt: new Date(index * 1000).toISOString(),
+    body: index === 0 ? "🙂".repeat(125_000) + middleMatch + "🙂".repeat(125_000)
+      : `needle ${index} ` + "🙂".repeat(270_000), createdAt: new Date(index * 1000).toISOString(),
     payload: { runId: `page-run-${index}`, provider: "codex", detail: "x".repeat(1024 * 1024) },
   }));
+  let beforeRequests = 0;
   const page = (rows, olderCount, newerCount) => ({ messages: rows,
     messagePage: { hasMore: olderCount > 0, olderCount, hasLater: newerCount > 0, newerCount, total: 3, beforeId: rows[0]?.id } });
   route = async (url) => {
     if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
     if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
     if (url.pathname.endsWith("/messages/find")) return response({ matchId: messages[0].id, ...page(messages.slice(0, 1), 0, 2) });
-    if (url.pathname.endsWith("/messages")) return response(url.searchParams.has("before")
+    if (url.pathname.endsWith("/messages")) {
+      if (url.searchParams.has("before")) beforeRequests += 1;
+      return response(url.searchParams.has("before")
       ? page(messages.slice(0, 2), 0, 1) : page(messages.slice(1), 1, 0));
+    }
     if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, ...page(messages.slice(2), 2, 0) });
     return response({});
   };
@@ -2721,14 +2740,23 @@ async function largePageMessageRetentionRegression() {
   await until(() => host.querySelector('[data-message-id="page-large-2"]'), "latest large page");
   assertBounded("page-large-2");
   host.querySelector('.history-loader').click();
-  await until(() => host.querySelector('[data-message-id="page-large-0"]'), "older large page");
+  try { await until(() => host.querySelector('[data-message-id="page-large-0"]'), "older large page"); }
+  catch (error) { throw new Error(`${error.message}; requests=${beforeRequests}, loader=${host.querySelector('.history-loader')?.textContent}, mounted=${[...host.querySelectorAll('[data-message-id]')].map((row) => row.dataset.messageId).join(',')}, alert=${host.querySelector('[role="alert"]')?.textContent}`); }
   assertBounded("page-large-0");
   assert(!host.querySelector('.history-loader'), "older page cursor did not reach the start");
   const input = host.querySelector('.history-find input');
-  setControlValue(input, "needle 0"); await settle();
+  setControlValue(input, "Ωneedle"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => host.querySelector('[data-find-match="true"] [data-message-id="page-large-0"]'), "large Find result");
   assertBounded("page-large-0");
+  assert(host.querySelector('[data-message-id="page-large-0"] .message-text')?.textContent.includes(middleMatch),
+    "a far-middle Unicode and NUL Find match was lost after bounded client retention");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created",
+    conversationId: "chat-A", payload: { ...messages[0], body: messages[0].body + " updated" } }) }));
+  await settle();
+  assertBounded("page-large-0");
+  assert(host.querySelector('[data-message-id="page-large-0"] .message-text')?.textContent.includes(middleMatch),
+    "a live replacement erased the visible Find match context");
   host.querySelector('.history-later').click();
   await until(() => host.querySelector('[data-message-id="page-large-2"]'), "later large page");
   assertBounded("page-large-2");
