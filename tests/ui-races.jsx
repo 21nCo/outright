@@ -1944,17 +1944,54 @@ async function extremeDiffHeightRegression() {
   viewport.scrollTop = 0; viewport.dispatchEvent(new Event("scroll")); await settle();
   const input = host.querySelector('input[aria-label="Find in diff"]');
   setControlValue(input, "MIDDLE MATCH"); await settle();
-  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-  await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("MIDDLE MATCH"), "Find reaches the middle of compressed diff");
+  // Hold the physical scrollbar for one commit, as a browser can do while a
+  // large track relayout settles. The mounted Find row must use the observed
+  // viewport position even when the logical seek is already committed.
+  const nativeScrollTop = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop");
+  let holdPhysicalScroll = true;
+  Object.defineProperty(viewport, "scrollTop", {
+    configurable: true,
+    get: () => nativeScrollTop.get.call(viewport),
+    set: (value) => { if (!holdPhysicalScroll) nativeScrollTop.set.call(viewport, value); },
+  });
+  try {
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("MIDDLE MATCH"), "Find reaches the middle of compressed diff");
+    const mark = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+    const view = viewport.getBoundingClientRect();
+    assert(mark.top < view.bottom && mark.bottom > view.top,
+      `Pending compressed Find placed its row at an unobserved scroll position: mark=${mark.top}/${mark.bottom}, viewport=${view.top}/${view.bottom}, scroll=${viewport.scrollTop}, first=${viewport.dataset.firstLine}`);
+  } finally {
+    holdPhysicalScroll = false;
+    delete viewport.scrollTop;
+  }
+  const visibleCompressedMark = (text) => {
+    const mark = viewport.querySelector('[data-find-match="true"]');
+    if (!mark?.textContent.includes(text)) return false;
+    const row = mark.getBoundingClientRect();
+    const view = viewport.getBoundingClientRect();
+    return row.top < view.bottom && row.bottom > view.top;
+  };
+  const awaitCompressedMark = async (text, label) => {
+    try { await until(() => visibleCompressedMark(text), label); }
+    catch (error) {
+      const row = viewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect();
+      const view = viewport.getBoundingClientRect();
+      throw new Error(`${error.message}; mark=${row?.top}/${row?.bottom}, viewport=${view.top}/${view.bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}, first=${viewport.dataset.firstLine}, mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`);
+    }
+  };
+  await awaitCompressedMark("MIDDLE MATCH", "middle compressed diff alignment");
   let middleBounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
   assert(middleBounds.top < viewport.getBoundingClientRect().bottom && middleBounds.bottom > viewport.getBoundingClientRect().top, "Middle compressed diff match was mounted outside the viewport");
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={"+\n".repeat(10_000) + diff} label="Tall diff" /></div>);
   await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("MIDDLE MATCH") && host.querySelector('.window-find [role="status"]')?.textContent === "Line 610001", "Refresh realigns a moved middle match");
+  await awaitCompressedMark("MIDDLE MATCH", "refreshed compressed diff alignment");
   middleBounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
   assert(middleBounds.top < viewport.getBoundingClientRect().bottom && middleBounds.bottom > viewport.getBoundingClientRect().top, "Refreshed compressed diff match was outside the viewport");
   setControlValue(input, "TAIL MATCH"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("TAIL MATCH"), "Find reaches final line of tall diff");
+  await awaitCompressedMark("TAIL MATCH", "compressed tail Find alignment");
   const bounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
   assert(bounds.top < viewport.getBoundingClientRect().bottom && bounds.bottom > viewport.getBoundingClientRect().top, `Tall diff find mark is outside the viewport: mark=${bounds.top}/${bounds.bottom}, viewport=${viewport.getBoundingClientRect().top}/${viewport.getBoundingClientRect().bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}`);
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 300 }}><WindowedDiff diff={"+\n".repeat(10_000) + diff} label="Tall diff" /></div>);

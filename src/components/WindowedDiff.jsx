@@ -167,9 +167,11 @@ export function WindowedDiff({ diff, label }) {
     ? Math.max(0, Math.min(maxFirst, pendingLine - Math.floor(visibleRows / 3))) : scrollFirst;
   const start = Math.max(0, firstVisible - OVERSCAN);
   const end = Math.min(count, firstVisible + visibleRows + OVERSCAN);
-  // The mounted rows and the scrollbar must use the same logical origin,
-  // including the render before a pending Find has moved scrollTop.
-  const compressedRowTop = (maxFirst ? firstVisible / maxFirst * maxScroll : 0) + (start - firstVisible) * LINE_HEIGHT;
+  // Place mounted rows at the last observed physical scroll position. A Find
+  // can mount its target before the browser applies the requested scroll; the
+  // logical first line still owns which rows mount, but must not invent a
+  // physical position that the viewport has not reached yet.
+  const compressedRowTop = position.top + (start - firstVisible) * LINE_HEIGHT;
   const visibleStatus = needle && foundLine >= 0 ? `Line ${foundLine + 1}` : needle && searched ? "No match" : needle ? "Press Enter to find" : "";
   useEffect(() => {
     const timer = window.setTimeout(() => setAnnouncedStatus(visibleStatus), 180);
