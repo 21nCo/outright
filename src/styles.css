@@ -430,7 +430,7 @@ select { height: 34px; padding: 0 28px 0 10px; border: 1px solid var(--input); b
 .commit-bar { padding: 8px; display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 6px; border-top: 1px solid var(--line-soft); }
 
 /* Terminal */
-.terminal-pane { height: 100%; display: grid; grid-template-rows: 38px minmax(0, 1fr); background: var(--canvas); }
+.terminal-pane { min-width: 0; height: 100%; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: 38px minmax(0, 1fr); background: var(--canvas); }
 .terminal-tabs { padding: 0 7px; display: flex; align-items: center; gap: 3px; overflow-x: auto; border-bottom: 1px solid var(--line-soft); }
 .terminal-tab { height: 29px; max-width: 160px; display: grid; grid-template-columns: minmax(0, 1fr) 24px; align-items: center; overflow: hidden; border-radius: 5px; color: var(--muted-foreground); }
 .terminal-tab.is-active { color: var(--foreground); background: var(--active); }
@@ -442,7 +442,7 @@ select { height: 34px; padding: 0 28px 0 10px; border: 1px solid var(--input); b
 .terminal-tabs button svg { width: 13px; height: 13px; flex: none; }
 .terminal-loading { margin-left: auto; display: inline-flex; align-items: center; gap: 5px; color: var(--muted-foreground); font-size: 9px; }
 .terminal-loading svg { width: 13px; height: 13px; }
-.terminal-host { min-height: 0; padding: 8px 3px 3px 9px; overflow: hidden; }
+.terminal-host { min-width: 0; min-height: 0; padding: 8px 3px 3px 9px; overflow: hidden; }
 .terminal-host .xterm { height: 100%; }
 .terminal-host .xterm-viewport { scrollbar-width: thin; }
 

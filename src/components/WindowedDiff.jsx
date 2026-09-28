@@ -177,11 +177,10 @@ export function WindowedDiff({ diff, label }) {
     ? Math.max(0, Math.min(maxFirst, pendingLine - Math.floor(visibleRows / 3))) : scrollFirst;
   const start = Math.max(0, firstVisible - OVERSCAN);
   const end = Math.min(count, firstVisible + visibleRows + OVERSCAN);
-  // Place mounted rows at the last observed physical scroll position. A Find
-  // can mount its target before the browser applies the requested scroll; the
-  // logical first line still owns which rows mount, but must not invent a
-  // physical position that the viewport has not reached yet.
-  const compressedRowTop = position.top + (start - firstVisible) * LINE_HEIGHT;
+  // Keep the mounted window attached to the physical viewport. Large CSS top
+  // coordinates lose precision across engines at multi-million-pixel scroll
+  // positions; a sticky zero-height anchor avoids that coordinate conversion.
+  const compressedRowOffset = (start - firstVisible) * LINE_HEIGHT;
   const visibleStatus = needle && foundLine >= 0 ? `Line ${foundLine + 1}` : needle && searched ? "No match" : needle ? "Press Enter to find" : "";
   useEffect(() => {
     const timer = window.setTimeout(() => setAnnouncedStatus(visibleStatus), 180);
@@ -224,7 +223,7 @@ export function WindowedDiff({ diff, label }) {
     moveFirst(event.key === "Home" ? 0 : event.key === "End" ? maxFirst : firstVisible + moves[event.key]);
   }}>
     {content ? compressed
-      ? <div style={{ height: trackHeight, position: "relative" }}><div style={{ position: "absolute", top: compressedRowTop, left: 0, right: 0 }}>{lines}</div></div>
+      ? <div style={{ height: trackHeight }}><div style={{ position: "sticky", top: 0, height: 0 }}><div style={{ position: "relative", top: compressedRowOffset }}>{lines}</div></div></div>
       : <>{start > 0 && <span aria-hidden="true" style={{ height: start * LINE_HEIGHT }} />}{lines}{end < count && <span aria-hidden="true" style={{ height: (count - end) * LINE_HEIGHT }} />}</>
       : <span className="diff-empty">Select a changed file to inspect its diff.</span>}
   </pre></div>;

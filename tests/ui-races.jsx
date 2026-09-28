@@ -928,14 +928,19 @@ async function terminalActivationOwnershipRegression() {
   show();
   await until(() => terminalReady("Terminal A"), "ownership fixture initial terminal ready");
   const initialSize = sent.findLast((message) => message.type === "terminal.resize");
+  const initialRootWidth = host.getBoundingClientRect().width;
   const initialHostWidth = host.querySelector(".terminal-host").getBoundingClientRect().width;
   assert(initialSize?.terminalId === "term-A", "Initial activation did not synchronize the selected PTY size");
+  assert(Math.abs(initialHostWidth - initialRootWidth) < 2, `Terminal host exceeded its narrow pane: root=${initialRootWidth}, host=${initialHostWidth}`);
   host.querySelector('[data-tab-id="term-A2"]').click();
   await until(() => host.querySelector('.terminal-tabs[aria-busy="true"]'), "pending terminal activation");
   assert(host.querySelector('[role="tab"][aria-selected="true"]')?.dataset.tabId === "term-A", "Pending candidate was selected before its buffer was installed");
   await until(() => host.querySelector(".xterm-rows")?.textContent.includes("Old A output"), "committed terminal output");
   host.style.width = "540px";
-  await until(() => host.querySelector(".terminal-host")?.getBoundingClientRect().width > initialHostWidth + 100, "terminal host expanded during activation");
+  try { await until(() => host.querySelector(".terminal-host")?.getBoundingClientRect().width > initialHostWidth + 100, "terminal host expanded during activation"); }
+  catch (error) {
+    throw new Error(`${error.message}: root=${host.getBoundingClientRect().width}, pane=${host.querySelector('.terminal-pane')?.getBoundingClientRect().width}, tabs=${host.querySelector('.terminal-tabs')?.getBoundingClientRect().width}, host=${host.querySelector('.terminal-host')?.getBoundingClientRect().width}, initial=${initialHostWidth}, loading=${host.querySelector('.terminal-tabs')?.getAttribute('aria-busy')}`, { cause: error });
+  }
   await settle();
   show({ type: "terminal.output", terminalId: "term-A2", payload: { data: "Included snapshot\r\n", cursor: 1 } });
   await settle();
@@ -950,6 +955,7 @@ async function terminalActivationOwnershipRegression() {
   const sizes = sent.filter((message) => message.type === "terminal.resize" && message.terminalId === "term-A2");
   const currentHostWidth = host.querySelector(".terminal-host").getBoundingClientRect().width;
   const currentGridWidth = host.querySelector(".xterm-screen").getBoundingClientRect().width;
+  assert(Math.abs(currentHostWidth - host.getBoundingClientRect().width) < 2, `Activated terminal host did not track its pane: host=${currentHostWidth}, root=${host.getBoundingClientRect().width}`);
   assert(sizes.length && sizes.at(-1).cols > initialSize.cols && sizes.at(-1).rows > 0,
     `Activation lost fitted PTY size: initial=${JSON.stringify(initialSize)}, next=${JSON.stringify(sizes)}, host=${initialHostWidth}->${currentHostWidth}, grid=${currentGridWidth}`);
   host.querySelector('[aria-label="New terminal"]').click();
@@ -967,23 +973,36 @@ async function terminalActivationOwnershipRegression() {
 async function terminalRejectedSwitchRegression() {
   root.render(null);
   await settle();
+  host.style.width = "320px";
   const pending = deferred();
   const errors = [];
+  const sent = [];
+  let retry = false;
   route = async (url) => {
     if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("A2")] });
-    if (url.pathname === "/api/terminals/term-A2") return pending.promise;
+    if (url.pathname === "/api/terminals/term-A2") return retry ? response({ buffer: "Retry output\r\n" }) : pending.promise;
     return response({ buffer: "Terminal A output\r\n" });
   };
-  root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => errors.push(error)} sendRuntime={() => {}} />);
+  root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => errors.push(error)} sendRuntime={(message) => sent.push(message)} />);
   await until(() => terminalReady("Terminal A"), "rejection fixture terminal A ready");
+  const narrowSize = sent.findLast((message) => message.type === "terminal.resize");
   const first = [...host.querySelectorAll('[role="tab"]')].find((tab) => tab.textContent === "Terminal A");
   first.focus();
   first.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
   await until(() => document.activeElement?.textContent === "Terminal A2", "pending rejected terminal");
+  host.style.width = "540px";
+  await until(() => host.querySelector('.terminal-host')?.getBoundingClientRect().width > 500, "terminal host widens during rejected activation");
   pending.reject(new Error("Buffer failed"));
   await until(() => errors.length === 1 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "rejected terminal response");
   assert(host.querySelector('[role="tab"][aria-selected="true"]') === first && first.tabIndex === 0, "Failed terminal switch changed selection");
   assert(document.activeElement === first, "Failed terminal switch left focus on an unselected tab");
+  retry = true;
+  host.querySelector('[data-tab-id="term-A2"]').click();
+  await until(() => terminalReady("Terminal A2"), "rejected activation retry");
+  const retrySize = sent.findLast((message) => message.type === "terminal.resize");
+  assert(retrySize?.terminalId === "term-A2" && retrySize.cols > narrowSize.cols,
+    `Retried terminal did not fit the current pane: narrow=${JSON.stringify(narrowSize)}, retry=${JSON.stringify(retrySize)}`);
+  host.style.width = "";
 }
 
 async function terminalExitDuringActivationRegression() {
@@ -2051,9 +2070,11 @@ async function extremeDiffHeightRegression() {
       physicalTop: nearViewport.scrollTop, first: nearViewport.dataset.firstLine, mounted: [nearViewport.dataset.mountedStart, nearViewport.dataset.mountedEnd], wheelTrace })}`, { cause: error });
   }
   assert(Math.abs(nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top - beforeBatch + 42) < 5, "Batched wheels skipped or doubled logical lines");
-  // Model an asynchronous native default queued during capture. The diff
-  // handler must cancel before that queue can take scroll ownership.
+  // Model an asynchronous native default queued during capture. Record both
+  // coordinate systems even if cancellation succeeds but row placement drifts.
   const beforeEarlyDefault = nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top;
+  const beforeEarlyCoordinates = { physical: nearViewport.scrollTop, logical: nearViewport.dataset.firstLine,
+    mounted: [nearViewport.dataset.mountedStart, nearViewport.dataset.mountedEnd], rowTop: nearViewport.firstElementChild?.firstElementChild?.getBoundingClientRect().top };
   let earlyDefaultQueued = false;
   const queueEarlyDefault = (event) => { if (!event.defaultPrevented) earlyDefaultQueued = true; };
   nearViewport.addEventListener("wheel", queueEarlyDefault, { capture: true });
@@ -2062,7 +2083,7 @@ async function extremeDiffHeightRegression() {
   if (earlyDefaultQueued) nearViewport.scrollTop += 14;
   await settle();
   assert(!earlyDefaultQueued && Math.abs(nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top - beforeEarlyDefault + 14) < 5,
-    `A queued native default duplicated compressed wheel navigation: queued=${earlyDefaultQueued}, before=${beforeEarlyDefault}, after=${nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top}`);
+    `Compressed wheel displaced the Find mark: queued=${earlyDefaultQueued}, before=${beforeEarlyDefault}, after=${nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top}, beforeCoordinates=${JSON.stringify(beforeEarlyCoordinates)}, afterCoordinates=${JSON.stringify({ physical: nearViewport.scrollTop, logical: nearViewport.dataset.firstLine, mounted: [nearViewport.dataset.mountedStart, nearViewport.dataset.mountedEnd], rowTop: nearViewport.firstElementChild?.firstElementChild?.getBoundingClientRect().top })}`);
   if (window.__fixtureWheel) {
     nearViewport.scrollIntoView({ block: "center" });
     await frame();
