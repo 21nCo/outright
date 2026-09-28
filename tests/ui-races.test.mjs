@@ -776,13 +776,32 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
         window.addEventListener("fixture-key-ready", ready);
         window.__requestFixtureKey(key);
       });
-      window.__fixtureWheel = (x, y, deltaY, deltaX = 0) => new Promise((resolve) => {
+      window.__fixtureWheel = (x, y, deltaY, deltaX = 0) => new Promise((resolve, reject) => {
         const id = Math.random().toString(36).slice(2);
+        let delivered;
+        let acknowledged = false;
+        const cleanup = () => {
+          clearTimeout(timer);
+          document.removeEventListener("wheel", onWheel);
+          window.removeEventListener("fixture-wheel-ready", ready);
+        };
+        const finish = () => {
+          if (!delivered || !acknowledged) return;
+          cleanup();
+          resolve(delivered);
+        };
+        const onWheel = (event) => {
+          delivered = { viewport: event.target.closest?.(".diff-view") ?? null,
+            defaultPrevented: event.defaultPrevented, deltaY: event.deltaY };
+          finish();
+        };
         const ready = (event) => {
           if (event.detail !== id) return;
-          window.removeEventListener("fixture-wheel-ready", ready);
-          resolve();
+          acknowledged = true;
+          finish();
         };
+        const timer = setTimeout(() => { cleanup(); reject(new Error("Native wheel was acknowledged without a DOM wheel event")); }, 2500);
+        document.addEventListener("wheel", onWheel);
         window.addEventListener("fixture-wheel-ready", ready);
         window.__requestFixtureWheel(JSON.stringify({ id, x, y, deltaY, deltaX }));
       });

@@ -90,8 +90,10 @@ export function WindowedDiff({ diff, label }) {
       programmaticTopRef.current = viewport.scrollTop;
       updatePosition(viewport, first);
     };
-    viewport.addEventListener("wheel", wheel, { passive: false });
-    return () => viewport.removeEventListener("wheel", wheel);
+    // Capture before a platform's asynchronous scroll default can be queued.
+    // A bubble listener can arrive after native movement on large tracks.
+    viewport.addEventListener("wheel", wheel, { capture: true, passive: false });
+    return () => viewport.removeEventListener("wheel", wheel, { capture: true });
   }, [compressed, maxFirst, maxScroll]);
   function moveFirst(first) {
     const viewport = viewportRef.current;

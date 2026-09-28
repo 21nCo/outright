@@ -1743,10 +1743,13 @@ async function productionDiffViewportRegression() {
   if (window.__fixtureWheel) {
     viewport.scrollIntoView({ block: "center" });
     await frame();
-    const bounds = viewport.getBoundingClientRect();
-    for (let step = 0; step < 8 && viewport.scrollTop < viewport.scrollHeight - viewport.clientHeight; step += 1) {
-      await window.__fixtureWheel(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2, 120_000);
-      await frame();
+    for (let step = 0; step < 12 && viewport.scrollTop < viewport.scrollHeight - viewport.clientHeight; step += 1) {
+      const bounds = viewport.getBoundingClientRect();
+      const before = viewport.scrollTop;
+      const delivery = await window.__fixtureWheel(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2, 120_000);
+      assert(delivery.viewport === viewport, `Large wheel missed the diff viewport at step ${step}`);
+      await until(() => viewport.scrollTop > before || viewport.scrollTop >= viewport.scrollHeight - viewport.clientHeight,
+        `large native wheel scroll at step ${step}`);
     }
   } else { viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); }
   try { await until(() => viewport.textContent.includes("staged 49999"), "staged final line"); }
@@ -2048,13 +2051,28 @@ async function extremeDiffHeightRegression() {
       physicalTop: nearViewport.scrollTop, first: nearViewport.dataset.firstLine, mounted: [nearViewport.dataset.mountedStart, nearViewport.dataset.mountedEnd], wheelTrace })}`, { cause: error });
   }
   assert(Math.abs(nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top - beforeBatch + 42) < 5, "Batched wheels skipped or doubled logical lines");
+  // Model an asynchronous native default queued during capture. The diff
+  // handler must cancel before that queue can take scroll ownership.
+  const beforeEarlyDefault = nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top;
+  let earlyDefaultQueued = false;
+  const queueEarlyDefault = (event) => { if (!event.defaultPrevented) earlyDefaultQueued = true; };
+  nearViewport.addEventListener("wheel", queueEarlyDefault, { capture: true });
+  nearViewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 14, bubbles: true, cancelable: true }));
+  nearViewport.removeEventListener("wheel", queueEarlyDefault, { capture: true });
+  if (earlyDefaultQueued) nearViewport.scrollTop += 14;
+  await settle();
+  assert(!earlyDefaultQueued && Math.abs(nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top - beforeEarlyDefault + 14) < 5,
+    `A queued native default duplicated compressed wheel navigation: queued=${earlyDefaultQueued}, before=${beforeEarlyDefault}, after=${nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top}`);
   if (window.__fixtureWheel) {
     nearViewport.scrollIntoView({ block: "center" });
     await frame();
     const area = nearViewport.getBoundingClientRect();
     const beforeNative = nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top;
-    await window.__fixtureWheel(area.left + area.width / 2, area.top + area.height / 2, 14, 80);
+    const delivery = await window.__fixtureWheel(area.left + area.width / 2, area.top + area.height / 2, 14, 80);
+    assert(delivery.viewport === nearViewport && delivery.defaultPrevented,
+      `Native compressed wheel was not canceled at its target: ${JSON.stringify({ target: delivery.viewport?.className, canceled: delivery.defaultPrevented })}`);
     await until(() => nearViewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top < beforeNative - 5, "native compressed wheel advanced");
+    await settle();
     assert(Math.abs(nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top - beforeNative + 14) < 5, "Native wheel also performed a passive default scroll");
     assert(nearViewport.scrollLeft > 0, "Combined horizontal wheel navigation was lost");
   }
