@@ -1,0 +1,24 @@
+scripts/run-tests.mjs
+  h_a39f9495f9ec1d 1,7-12,33-35,38,40,72-74,91-94
+server/agent-supervisor-windows.c
+  h_a39f9495f9ec1d 39,43,50-51,61-62,69,92-97
+server/provider-discovery.mjs
+  h_a39f9495f9ec1d 131-133
+src/components/WindowedMessages.jsx
+  h_a39f9495f9ec1d 12-14,20,89-90,116,118,140,184,219-220,230-236,262,278
+tests/run-tests.test.mjs
+  h_a39f9495f9ec1d 38-89
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 2804-2805
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e7a14055b8c5a5e6ccc5a3c1fb6fafad15a016ed",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
