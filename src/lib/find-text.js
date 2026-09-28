@@ -1,6 +1,9 @@
-// Use the same locale-independent lowercase behavior at every Find boundary,
-// then merge the two lowercase forms of Greek sigma. Unicode lowercasing
-// chooses final sigma from word context, while a standalone query cannot.
+import { UNICODE_CASEFOLD_17 } from "./unicode-casefold-17.js";
+
+// Full, locale-independent Unicode 17 case folding is applied per code point.
+// In particular, a character may expand (ß -> ss), so consumers must keep
+// offsets in the folded string distinct from offsets in the source string.
 export function foldFindText(value) {
-  return value.toLowerCase().replace(/ς/g, "σ");
+  return String(value).replace(/[A-Z]|[^\x00-\x7f]/gu,
+    (point) => UNICODE_CASEFOLD_17.get(point.codePointAt(0)) ?? point);
 }

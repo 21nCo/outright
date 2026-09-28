@@ -72,13 +72,21 @@ export function WindowedDiff({ diff, label }) {
   }, [content]);
   useEffect(() => {
     const viewport = viewportRef.current;
-    if (!viewport || !compressed) return;
+    if (!viewport) return;
     const wheel = (event) => {
       if (!event.deltaY) return; // Keep native horizontal navigation.
       pendingFindAlignmentRef.current = null;
       event.preventDefault();
       if (event.deltaX) viewport.scrollLeft += event.deltaX * (event.deltaMode === 1 ? LINE_HEIGHT : event.deltaMode === 2 ? viewport.clientWidth : 1);
       const pixels = event.deltaY * (event.deltaMode === 1 ? LINE_HEIGHT : event.deltaMode === 2 ? viewport.clientHeight : 1);
+      if (!compressed) {
+        // Some engines cap the native movement from a large delivered wheel
+        // to a few pixels after the virtual range changes. Apply the wheel's
+        // delivered delta to the stable scroll track before changing rows.
+        viewport.scrollTop += pixels;
+        updatePosition(viewport);
+        return;
+      }
       wheelRemainderRef.current += pixels / LINE_HEIGHT;
       const lines = Math.trunc(wheelRemainderRef.current);
       wheelRemainderRef.current -= lines;

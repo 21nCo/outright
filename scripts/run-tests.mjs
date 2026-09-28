@@ -35,6 +35,10 @@ let escalation;
 const requestedTimeout = Number(process.env.OUTRIGHT_TEST_SUITE_TIMEOUT_MS);
 const suiteTimeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
   ? Math.min(600_000, Math.max(1000, requestedTimeout)) : 600_000;
+// The focused 1000px wheel fixture has a 330-second interaction phase and a
+// separate cleanup allowance. Its per-file runner must outlive both.
+const smallWheelCap = Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP);
+const testFileTimeoutMs = smallWheelCap > 0 && smallWheelCap <= 1000 ? 390_000 : 300_000;
 const deadline = setTimeout(() => {
   timedOut = true;
   console.error(`Test suite timed out after ${suiteTimeoutMs}ms`);
@@ -104,7 +108,7 @@ async function runFile(file) {
   cancelFile = cancelDirectory ? path.join(cancelDirectory, "cancel") : null;
   child = spawn(windowsSupervisor ?? process.execPath, [
     ...(windowsSupervisor ? ["--test-runner", cancelFile, process.execPath] : []),
-    "--test", "--test-concurrency=1", "--test-timeout=300000", file,
+    "--test", "--test-concurrency=1", `--test-timeout=${testFileTimeoutMs}`, file,
   ], {
     stdio: "inherit",
     detached: process.platform !== "win32",

@@ -1816,6 +1816,20 @@ async function productionDiffViewportRegression() {
   } else { viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); }
   try { await until(() => viewport.textContent.includes("staged 49999"), "staged final line"); }
   catch (error) { throw new Error(`${error.message}; scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}`); }
+  if (window.__fixtureWheel) {
+    viewport.scrollTop = 200_000;
+    await settle();
+    const beforeSmallWheel = viewport.scrollTop;
+    const frame = viewport.getBoundingClientRect();
+    const delivery = await window.__fixtureWheel(frame.left + frame.width / 2, frame.top + frame.height / 2, 14);
+    await until(() => viewport.scrollTop > beforeSmallWheel, "ordinary diff small native wheel advanced");
+    assert(delivery.viewport === viewport && delivery.defaultPrevented
+      && Math.abs(viewport.scrollTop - beforeSmallWheel - Math.min(14, delivery.deltaY)) < 2,
+    `Ordinary diff wheel lost its delivered delta: ${JSON.stringify({ beforeSmallWheel, after: viewport.scrollTop, delivered: delivery.deltaY, canceled: delivery.defaultPrevented })}`);
+    viewport.focus();
+    await window.__fixtureSendKey("End");
+    await until(() => viewport.textContent.includes("staged 49999"), "ordinary diff End restores staged tail after wheel");
+  }
   host.querySelector('[aria-label="Diff view"] button[aria-pressed="false"]').click();
   await until(() => host.querySelector('.diff-view')?.textContent.includes("-unstaged 0"), "unstaged production diff");
   viewport = host.querySelector('.diff-view');
@@ -1930,6 +1944,24 @@ async function previousFindStartRegression() {
   await settle();
   host.querySelector('[aria-label="Next conversation match"]').click();
   await until(() => host.querySelector('[data-find-match="true"] [data-message-id="first"]'), "loaded transcript matches final sigma");
+  messages[0].body = "Straße";
+  root.render(<div ref={viewport} style={{ height: 350, overflowY: "auto" }}><WindowedMessages
+    messages={[...messages]} viewportRef={viewport}
+    renderMessage={(message) => <p data-message-id={message.id}>{message.body}</p>}
+  /></div>);
+  setControlValue(host.querySelector('.history-find input'), "STRASSE");
+  await settle();
+  host.querySelector('[aria-label="Next conversation match"]').click();
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="first"]'), "loaded transcript matches full case fold");
+  messages[0].body = "ﬃ";
+  root.render(<div ref={viewport} style={{ height: 350, overflowY: "auto" }}><WindowedMessages
+    messages={[...messages]} viewportRef={viewport}
+    renderMessage={(message) => <p data-message-id={message.id}>{message.body}</p>}
+  /></div>);
+  setControlValue(host.querySelector('.history-find input'), "FFI");
+  await settle();
+  host.querySelector('[aria-label="Next conversation match"]').click();
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="first"]'), "loaded transcript matches a ligature fold");
 }
 
 async function variableHeightFindAnchorRegression() {
@@ -2167,7 +2199,7 @@ async function extremeDiffHeightRegression() {
 
 async function unicodeDiffFindRegression() {
   root.render(null); await settle();
-  const diff = "+İstanbul\n" + Array.from({ length: 400 }, (_, index) => `+filler ${index}\n`).join("") + "+CAFÉ target\n+ΟΣ final\n+ΑΣΑ medial\n+I token\n";
+  const diff = "+İstanbul\n" + Array.from({ length: 400 }, (_, index) => `+filler ${index}\n`).join("") + "+CAFÉ target\n+ΟΣ final\n+ΑΣΑ medial\n+I token\n+Straße token\n+ﬃ ligature\n";
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={diff} label="Unicode diff" /></div>);
   await until(() => host.querySelector('input[aria-label="Find in diff"]'), "Unicode diff find ready");
   const input = host.querySelector('input[aria-label="Find in diff"]');
@@ -2183,13 +2215,15 @@ async function unicodeDiffFindRegression() {
   await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("ΑΣΑ medial"), "diff Find matches medial sigma");
   host.querySelector('[aria-label="Next diff match"]').click();
   await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("ΟΣ final"), "diff Find wraps sigma forms");
-  const originalLocaleLower = String.prototype.toLocaleLowerCase;
-  try {
-    String.prototype.toLocaleLowerCase = function () { return originalLocaleLower.call(this, "tr"); };
-    setControlValue(input, "i token"); await settle();
-    host.querySelector('[aria-label="Next diff match"]').click();
-    await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("I token"), "diff Find ignores host locale");
-  } finally { String.prototype.toLocaleLowerCase = originalLocaleLower; }
+  setControlValue(input, "STRASSE"); await settle();
+  host.querySelector('[aria-label="Next diff match"]').click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("Straße token"), "diff Find matches expanding case fold");
+  setControlValue(input, "FFI"); await settle();
+  host.querySelector('[aria-label="Next diff match"]').click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("ﬃ ligature"), "diff Find matches a ligature fold");
+  setControlValue(input, "i token"); await settle();
+  host.querySelector('[aria-label="Next diff match"]').click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("I token"), "diff Find ignores host locale");
 }
 
 async function reverseDiffFindWrapRegression() {

@@ -71,21 +71,48 @@ test("conversation Find folds final and medial sigma through persisted sections 
   } finally { database.close(); }
 });
 
-test("persisted Find uses the same keys under a Turkish host locale", async () => {
+test("conversation Find preserves full-fold expansions across sections and wrap", async () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
-  const original = String.prototype.toLocaleLowerCase;
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Case fold", provider: "codex" });
+    const first = database.addMessage({ conversationId: chat.id, role: "user", body: `${"x".repeat(65_532)}Straße marker` });
+    const second = database.addMessage({ conversationId: chat.id, role: "user", body: "STRASSE marker" });
+    const ligature = database.addMessage({ conversationId: chat.id, role: "user", body: "ﬃ ligature" });
+    const found = await database.findMessagePage(chat.id, "STRASSE", null);
+    assert.equal(found.matchId, first.id);
+    assert.ok(found.messages.find((message) => message.id === first.id)?.body.includes("Straße"));
+    assert.equal((await database.findMessagePage(chat.id, "straße", first.id)).matchId, second.id);
+    assert.equal((await database.findMessagePage(chat.id, "STRASSE", second.id)).matchId, first.id);
+    assert.equal((await database.findMessagePage(chat.id, "strasse", first.id, -1)).matchId, second.id);
+    assert.equal((await database.findMessagePage(chat.id, "FFI", null)).matchId, ligature.id);
+  } finally { database.close(); }
+});
+
+test("full-fold Find keeps its match across a bounded byte continuation", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Case fold continuation", provider: "codex" });
+    const row = database.addMessage({ conversationId: chat.id, role: "assistant", body: `${"x".repeat(8 * 1024 * 1024)}Straße` });
+    const first = await database.findMessagePage(chat.id, "STRASSE", null);
+    assert.equal(first.partial, true);
+    assert.equal(first.nextAfterId, row.id);
+    const continued = await database.findMessagePage(chat.id, "STRASSE", first.nextAfterId, 1, undefined,
+      { originId: first.originId, wrapped: first.wrapped, byteOffset: first.nextByteOffset });
+    assert.equal(continued.matchId, row.id);
+    assert.ok(continued.messages.find((message) => message.id === row.id)?.body.includes("Straße"));
+  } finally { database.close(); }
+});
+
+test("persisted Find uses deterministic Unicode keys across case variants", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
   try {
     const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Locale", provider: "codex" });
     const first = database.addMessage({ conversationId: chat.id, role: "user", body: "I token" });
     const second = database.addMessage({ conversationId: chat.id, role: "user", body: "ΟΣ final" });
-    String.prototype.toLocaleLowerCase = function () { return original.call(this, "tr"); };
     assert.equal((await database.findMessagePage(chat.id, "i token", null)).matchId, first.id);
     assert.equal((await database.findMessagePage(chat.id, "Σ", first.id)).matchId, second.id);
     assert.equal((await database.findMessagePage(chat.id, "i token", second.id)).matchId, first.id);
-  } finally {
-    String.prototype.toLocaleLowerCase = original;
-    database.close();
-  }
+  } finally { database.close(); }
 });
 
 test("conversation Find bounds hydrated neighbors and keeps page cursors exact", async () => {

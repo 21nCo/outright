@@ -10,14 +10,28 @@ const PROVIDERS = [
   { id: "claude", label: "Claude Code", models: ["sonnet", "opus", "haiku"] },
 ];
 const MAX_VERSION_BYTES = 16 * 1024;
+const pendingAccess = new Map();
 
-async function providerExecutable(id) {
+function executableAccess(candidate) {
+  let task = pendingAccess.get(candidate);
+  if (!task) {
+    task = access(candidate, constants.X_OK).finally(() => {
+      if (pendingAccess.get(candidate) === task) pendingAccess.delete(candidate);
+    });
+    pendingAccess.set(candidate, task);
+  }
+  return task;
+}
+
+async function providerExecutable(id, signal) {
   if (id.includes("/")) return resolve(id);
   for (const directory of (process.env.PATH || "").split(delimiter)) {
+    if (signal?.aborted) throw signal.reason;
     const candidate = resolve(directory || ".", id);
-    try { await access(candidate, constants.X_OK); return candidate; }
+    try { await executableAccess(candidate); return candidate; }
     catch { /* Keep searching the caller's PATH. */ }
   }
+  if (signal?.aborted) throw signal.reason;
   return id;
 }
 
@@ -45,6 +59,7 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
   const pending = new Map();
   const controllers = new Map();
   const lastChecked = new Map();
+  const cleanupErrors = new Set();
   let closed = false;
 
   function probeProvider(id, force = false) {
@@ -59,7 +74,8 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
       try {
         const version = await probe(id, { signal: controller.signal });
         next = { ...provider, available: true, version: String(version).trim(), checking: false };
-      } catch {
+      } catch (error) {
+        if (error?.code === "OUTRIGHT_PROBE_CLEANUP_UNCERTAIN") cleanupErrors.add(error);
         next = { ...provider, available: false, version: "", checking: false };
       }
       if (!closed) {
@@ -113,13 +129,34 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
       cancel(timer);
       for (const controller of controllers.values()) controller.abort();
       await Promise.allSettled([...pending.values()]);
+      if (cleanupErrors.size) throw new AggregateError([...cleanupErrors], "Provider probe cleanup could not be verified");
     },
   };
 }
 
-export async function defaultProbe(id, { signal } = {}) {
-  const executable = process.platform === "win32" ? id : await providerExecutable(id);
-  if (signal?.aborted) throw new Error(`Provider version check aborted: ${id}`);
+export async function defaultProbe(id, { signal, resolveExecutable = providerExecutable, commandForProbe = probeCommand, cleanupMs = 8_000 } = {}) {
+  const started = Date.now();
+  const lookupDeadline = new AbortController();
+  const lookupTimer = setTimeout(() => lookupDeadline.abort(), 2_500);
+  const lookupSignal = signal ? AbortSignal.any([signal, lookupDeadline.signal]) : lookupDeadline.signal;
+  let executable;
+  try {
+    executable = process.platform === "win32" ? id : await new Promise((resolveLookup, rejectLookup) => {
+      let finished = false;
+      const finish = (callback, value) => {
+        if (finished) return;
+        finished = true;
+        lookupSignal.removeEventListener("abort", abortLookup);
+        callback(value);
+      };
+      const abortLookup = () => finish(rejectLookup, new Error(`Provider version check ${signal?.aborted ? "aborted" : "timed out"}: ${id}`));
+      lookupSignal.addEventListener("abort", abortLookup, { once: true });
+      Promise.resolve().then(() => resolveExecutable(id, lookupSignal))
+        .then((value) => finish(resolveLookup, value), (error) => finish(rejectLookup, error));
+      if (lookupSignal.aborted) abortLookup();
+    });
+  } finally { clearTimeout(lookupTimer); }
+  if (lookupSignal.aborted) throw new Error(`Provider version check ${signal?.aborted ? "aborted" : "timed out"}: ${id}`);
   return new Promise((resolve, reject) => {
     let settled = false;
     let terminationError;
@@ -140,7 +177,7 @@ export async function defaultProbe(id, { signal } = {}) {
     let stderr = Buffer.alloc(0);
     // Every platform supervisor owns descendants beyond the direct CLI's
     // process group. A version is valid only after that owner exits cleanly.
-    const command = probeCommand(id, executable);
+    const command = commandForProbe(id, executable);
     const child = spawn(command.executable, command.args, {
       stdio: command.stdio, env: command.env, windowsHide: true, detached: process.platform !== "win32",
     });
@@ -166,10 +203,10 @@ export async function defaultProbe(id, { signal } = {}) {
       if (process.platform === "linux") rmSync(command.args[0], { force: true });
       settle(terminationError ?? spawnError ?? (code === 0 ? null : new Error(`Provider version check exited ${code ?? childSignal}: ${id}`)), (stdout.length ? stdout : stderr).toString("utf8"));
     });
-    const terminateTree = () => {
+    const terminateTree = (hard = false) => {
       // Let the native owner reap its tree. Killing the owner first can leave
       // an escaped helper alive, especially after its direct CLI exits.
-      try { child.kill("SIGTERM"); } catch { /* Already exited. */ }
+      try { child.kill(hard ? "SIGKILL" : "SIGTERM"); } catch { /* Already exited. */ }
     };
     const terminate = (reason) => {
       if (settled) return;
@@ -177,14 +214,20 @@ export async function defaultProbe(id, { signal } = {}) {
       terminateTree();
     };
     const abort = () => terminate(new Error(`Provider version check aborted: ${id}`));
-    const timeout = setTimeout(() => terminate(new Error(`Provider version check timed out: ${id}`)), 2500);
-    // A child that never reports close cannot retain discovery shutdown.
-    // The owner gets a bounded cleanup interval; unresolved cleanup is an
-    // error rather than a successful version check.
+    const timeout = setTimeout(() => terminate(new Error(`Provider version check timed out: ${id}`)), Math.max(0, 2_500 - (Date.now() - started)));
+    // Keep the promise owned until the supervisor has actually exited. A
+    // deadline may escalate its signal, but must never report cleanup while
+    // an OS-visible owner can still be running.
     const deadline = setTimeout(() => {
-      terminateTree();
-      settle(new Error(`Provider version check did not close: ${id}`));
-    }, 8_000);
+      const incomplete = new Error(`Provider version check did not close with verified cleanup: ${id}`, { cause: terminationError });
+      incomplete.code = "OUTRIGHT_PROBE_CLEANUP_UNCERTAIN";
+      terminationError = incomplete;
+      terminateTree(true);
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.stdio[3]?.destroy();
+    }, cleanupMs);
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
   });
