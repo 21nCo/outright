@@ -1,0 +1,26 @@
+server/database.mjs
+  h_a39f9495f9ec1d 6,287,404,411
+server/database.test.mjs
+  h_a39f9495f9ec1d 58-73,199,204,208,212,217,249
+src/App.jsx
+  h_a39f9495f9ec1d 30,1789,1797
+src/components/WindowedDiff.jsx
+  h_a39f9495f9ec1d 2,50,119,158
+src/components/WindowedMessages.jsx
+  h_a39f9495f9ec1d 3,66
+src/lib/find-text.js
+  h_a39f9495f9ec1d 1-6
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 1767-1771,1780-1781,1784-1786,1789-1791,1794-1796,1905-1913,2151,2160-2166,2905,2943
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "36ea9f7c2f6aa236833f96ff71faaf4d6653b921",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
