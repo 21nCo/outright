@@ -108,11 +108,11 @@ export function createOutrightDatabase(options = {}) {
     try { return db.transaction(() => {
       const result = write();
       const limit = Math.max(0, Number(db.prepare("SELECT value FROM settings WHERE key = 'maxRetainedMiB'").get()?.value ?? DEFAULT_SETTINGS.maxRetainedMiB) * 1024 * 1024 - reserve);
-      if (retainedBytes(db) > limit) throw databaseError(507, "Retained history is full; archive old conversations and clean up history");
+      if (retainedBytes(db) > limit) throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
       return result;
     }).immediate(); }
     catch (error) {
-      if (error?.message?.includes("OUTRIGHT_RETAINED_LIMIT")) throw databaseError(507, "Retained history is full; archive old conversations and clean up history");
+      if (error?.message?.includes("OUTRIGHT_RETAINED_LIMIT")) throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
       throw error;
     }
   }
@@ -153,6 +153,32 @@ export function createOutrightDatabase(options = {}) {
         maxRunEventBytes: MAX_RUN_EVENT_RETAINED_BYTES,
       }, cpuUsage: null, memoryUsage: null, diskAllocatedBytes: null };
     },
+    listDeletableArchivedConversations(limit = 100) {
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw databaseError(400, "Archived history page size must be 1 to 100");
+      return db.prepare(`SELECT id, title, worktree_path AS worktreePath, updated_at AS updatedAt FROM conversations
+        WHERE archived = 1 AND NOT EXISTS (SELECT 1 FROM runs WHERE conversation_id = conversations.id
+          AND (status IN ('queued', 'launching', 'running') OR (status = 'interrupted' AND recovery_decision IS NULL)))
+        ORDER BY updated_at DESC, id LIMIT ?`).all(limit);
+    },
+    deleteArchivedConversation(id, confirmation) {
+      if (typeof id !== "string" || !id || id.length > 200 || confirmation !== id) {
+        throw databaseError(400, "Confirm the exact archived conversation id before deleting it");
+      }
+      const remove = db.transaction(() => {
+        const deleted = db.prepare(`DELETE FROM conversations WHERE id = ? AND archived = 1
+          AND NOT EXISTS (SELECT 1 FROM runs WHERE conversation_id = conversations.id
+            AND (status IN ('queued', 'launching', 'running') OR (status = 'interrupted' AND recovery_decision IS NULL)))`).run(id).changes;
+        if (!deleted) {
+          if (!db.prepare("SELECT 1 FROM conversations WHERE id = ?").get(id)) throw databaseError(404, "Conversation not found");
+          throw databaseError(409, "Only archived conversations without active or unresolved recovery work can be deleted");
+        }
+        if (retainedBytes(db) <= this.getSettings().maxRetainedMiB * 1024 * 1024) {
+          db.prepare("UPDATE retained_usage SET legacy_ceiling = 0 WHERE id = 1").run();
+        }
+        return { deleted: 1, id };
+      });
+      return remove.immediate();
+    },
     // Only archived conversations without pending or recoverable work may be
     // removed. This is one transaction so a failed deletion cannot leave
     // messages, run events, or recovery ownership half-pruned.
@@ -184,7 +210,7 @@ export function createOutrightDatabase(options = {}) {
     },
     createGroup(name) {
       if (retainedBytes(db) >= this.getSettings().maxRetainedMiB * 1024 * 1024) {
-        throw databaseError(507, "Retained history is full; archive old conversations and clean up history");
+        throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
       }
       const id = randomUUID();
       const position = db.prepare("SELECT COALESCE(MAX(position), -1) + 1 AS position FROM project_groups").get().position;
@@ -215,7 +241,7 @@ export function createOutrightDatabase(options = {}) {
     },
     createConversation(input) {
       if (retainedBytes(db) >= this.getSettings().maxRetainedMiB * 1024 * 1024) {
-        throw databaseError(507, "Retained history is full; archive old conversations and clean up history");
+        throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
       }
       const id = randomUUID();
       const timestamp = now();
@@ -673,7 +699,7 @@ export function createOutrightDatabase(options = {}) {
           throw databaseError(429, "Run queue is full; stop a queued run or wait for capacity");
         }
         if (retainedBytes(db) >= settings.maxRetainedMiB * 1024 * 1024) {
-          throw databaseError(507, "Retained history is full; archive old conversations and clean up history");
+          throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
         }
         const run = { id: randomUUID(), status: "queued", createdAt: now(), ...input };
         const worktreePath = run.worktreePath ?? this.getConversation(run.conversationId)?.worktreePath;
@@ -682,7 +708,7 @@ export function createOutrightDatabase(options = {}) {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
           .run(run.id, run.conversationId, worktreePath, run.provider, run.model ?? "", run.reasoningEffort ?? "medium", run.approvalPolicy, run.prompt, run.status, run.providerSessionId ?? null, run.createdAt);
         if (retainedBytes(db) > settings.maxRetainedMiB * 1024 * 1024 - retainedReserveBytes) {
-          throw databaseError(507, "Retained history is full; archive old conversations and clean up history");
+          throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
         }
         return this.getRun(run.id);
       });
@@ -962,7 +988,7 @@ export function createOutrightDatabase(options = {}) {
     listTemplates() { return db.prepare("SELECT id, title, prompt, created_at AS createdAt FROM prompt_templates ORDER BY title").all(); },
     saveTemplate(input) {
       if (retainedBytes(db) >= this.getSettings().maxRetainedMiB * 1024 * 1024) {
-        throw databaseError(507, "Retained history is full; archive old conversations and clean up history");
+        throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
       }
       const id = input.id ?? randomUUID();
       withinRetainedBudget(() => db.prepare("INSERT INTO prompt_templates (id, title, prompt, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title = excluded.title, prompt = excluded.prompt")

@@ -83,6 +83,41 @@ test("retention HTTP rejects invalid and future cutoffs without deleting fresh a
   assert.ok(runtime.database.getConversation(chat.id));
 }));
 
+test("explicit archived deletion at the HTTP boundary restores admission without exposing protected siblings", withRuntime(async (runtime) => {
+  const database = runtime.database;
+  database.updateSettings({ maxRetainedMiB: 64 });
+  const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Recent archive", provider: "codex" });
+  const live = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Live", provider: "codex" });
+  const protectedChat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Recoverable", provider: "codex" });
+  database.updateConversation(protectedChat.id, { archived: true });
+  const recovery = database.createRun({ conversationId: protectedChat.id, provider: "codex", approvalPolicy: "read-only", prompt: "recover" });
+  database.updateRun(recovery.id, { status: "interrupted" });
+  const filler = database.addMessage({ conversationId: archived.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+  const remaining = 63 * 1024 * 1024 - database.capacity().retainedBytes;
+  database.upsertMessage({ ...filler, body: `${filler.body}${"x".repeat(remaining - 8)}` });
+  database.updateConversation(archived.id, { archived: true });
+  const ordinary = responseCapture();
+  await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", {}), ordinary);
+  assert.equal(ordinary.body.deleted, 0);
+  assert.throws(() => database.submitRun({ conversationId: live.id, provider: "codex", approvalPolicy: "read-only", prompt: "work" }, "work"), (error) => error.statusCode === 507);
+  const listing = responseCapture();
+  await runtime.handleRequest(requestStream("GET", "/api/retention/archived"), listing);
+  assert.deepEqual(listing.body.conversations.map((item) => item.id), [archived.id]);
+  assert.equal(listing.body.conversations[0].worktreePath, "/tmp/w");
+  for (const body of [{ id: archived.id }, { id: live.id, confirmation: live.id }, { id: protectedChat.id, confirmation: protectedChat.id }]) {
+    const denied = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived", body), denied);
+    assert.equal(denied.statusCode, body.confirmation ? 409 : 400);
+  }
+  const deleted = responseCapture();
+  await runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived", { id: archived.id, confirmation: archived.id }), deleted);
+  assert.equal(deleted.statusCode, 200);
+  assert.equal(deleted.body.deleted, 1);
+  assert.ok(deleted.body.capacity.availableForNewWorkBytes > 1024);
+  assert.equal(database.submitRun({ conversationId: live.id, provider: "codex", approvalPolicy: "read-only", prompt: "work" }, "work").run.status, "queued");
+  assert.ok(database.getRun(recovery.id));
+}));
+
 function seedLegacyUnknownTargetDatabase(filename) {
   const legacy = new Database(filename);
   legacy.exec(`

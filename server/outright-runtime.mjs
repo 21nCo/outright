@@ -140,6 +140,15 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/settings" && request.method === "GET") return json(response, 200, database.getSettings());
       if (url.pathname === "/api/settings" && request.method === "PATCH") return json(response, 200, database.updateSettings(await readJson(request)));
       if (url.pathname === "/api/capacity" && request.method === "GET") return json(response, 200, database.capacity());
+      if (url.pathname === "/api/retention/archived" && request.method === "GET") {
+        return json(response, 200, { conversations: database.listDeletableArchivedConversations() });
+      }
+      if (url.pathname === "/api/retention/delete-archived" && request.method === "POST") {
+        const body = await readJson(request);
+        const result = database.deleteArchivedConversation(body.id, body.confirmation);
+        database.audit("retention.archived.deleted", { conversationId: result.id });
+        return json(response, 200, { deleted: result.deleted, capacity: database.capacity() });
+      }
       if (url.pathname === "/api/retention/cleanup" && request.method === "POST") {
         const body = await readJson(request);
         const result = database.pruneHistory({ before: body.before, limit: 100 });
@@ -534,7 +543,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       throw apiError(404, "API route not found");
     } catch (error) {
       if (response.destroyed) return true;
-      if (error?.message?.includes("OUTRIGHT_RETAINED_LIMIT")) return json(response, 507, { error: "Retained history is full; archive old conversations and clean up history" });
+      if (error?.message?.includes("OUTRIGHT_RETAINED_LIMIT")) return json(response, 507, { error: "Retained history is full; archive conversations, then delete selected archived chats or clean up older history" });
       return json(response, error.statusCode ?? 500, { error: error.message || "Internal server error", ...(error.details ?? {}) });
     }
   }

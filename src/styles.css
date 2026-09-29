@@ -500,6 +500,10 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
 .template-settings { padding-top: 15px; border-top: 1px solid var(--line-soft); }
 .template-settings > header strong { display: block; font-size: 11px; }
 .template-settings > header small { color: var(--muted-foreground); font-size: 9px; }
+.archived-history-list { max-height: 160px; overflow-y: auto; }
+.archive-delete-confirm { margin-top: 9px; padding: 10px; border: 1px solid var(--destructive); border-radius: 6px; font-size: 11px; }
+.archive-delete-confirm p { margin: 0 0 8px; }
+.archive-delete-confirm > div { display: flex; flex-wrap: wrap; gap: 8px; }
 .template-list { margin: 9px 0; display: grid; gap: 4px; }
 .template-list > div { min-height: 38px; padding: 4px 5px 4px 9px; display: flex; align-items: center; border: 1px solid var(--line-soft); border-radius: 6px; }
 .template-list > div > span { min-width: 0; display: flex; flex: 1; flex-direction: column; }

@@ -123,10 +123,42 @@ test("aggregate retained history denies new work until eligible history is clean
       assert.throws(() => admin.prepare("UPDATE conversations SET title = ? WHERE id = ?").run("x".repeat(2 * 1024 * 1024), current.id), /OUTRIGHT_RETAINED_LIMIT/);
     } finally { admin.close(); }
     database.updateConversation(old.id, { archived: true });
-    ageArchived(filename, [old.id]);
-    database.pruneHistory();
+    assert.equal(database.pruneHistory().deleted, 0, "ordinary cleanup respects the saved age");
+    assert.throws(() => database.submitRun(runInput(current.id), "still refused"), (error) => error.statusCode === 507);
+    assert.throws(() => database.deleteArchivedConversation(old.id, "wrong id"), (error) => error.statusCode === 400);
+    assert.equal(database.deleteArchivedConversation(old.id, old.id).deleted, 1);
+    assert.ok(database.getRun(interrupted.id), "a sibling's recovery evidence survives selected cleanup");
     assert.equal(database.submitRun(runInput(current.id), "accepted").run.status, "queued");
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("selected cleanup rechecks archived and run state at deletion, including cancellation and recovery", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const visible = chat(database, "visible");
+    const queued = chat(database, "queued");
+    const active = chat(database, "active");
+    const interrupted = chat(database, "interrupted");
+    for (const item of [queued, active, interrupted]) database.updateConversation(item.id, { archived: true });
+    const queuedRun = database.createRun(runInput(queued.id));
+    const activeRun = database.createRun(runInput(active.id));
+    database.updateRun(activeRun.id, { status: "running" });
+    const interruptedRun = database.createRun(runInput(interrupted.id));
+    database.updateRun(interruptedRun.id, { status: "interrupted" });
+    assert.deepEqual(database.listDeletableArchivedConversations(), []);
+    for (const item of [visible, queued, active, interrupted]) {
+      assert.throws(() => database.deleteArchivedConversation(item.id, item.id), (error) => error.statusCode === 409);
+    }
+    database.updateRun(queuedRun.id, { status: "stopped" });
+    database.updateRun(activeRun.id, { status: "completed" });
+    database.resolveInterruptedRun(interruptedRun.id, "discard");
+    assert.equal(database.listDeletableArchivedConversations().length, 3);
+    for (const item of [queued, active, interrupted]) assert.equal(database.deleteArchivedConversation(item.id, item.id).deleted, 1);
+    assert.ok(database.getConversation(visible.id));
+    assert.equal(database.getRun(queuedRun.id), undefined);
+    assert.equal(database.getRun(activeRun.id), undefined);
+    assert.equal(database.getRun(interruptedRun.id), undefined);
+  } finally { database.close(); }
 });
 
 test("migration preserves recovery transitions for legacy data already over quota", () => {
