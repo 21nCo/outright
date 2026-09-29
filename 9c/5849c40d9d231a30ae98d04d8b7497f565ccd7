@@ -1,0 +1,41 @@
+server/agent-manager.mjs
+  s_110c7532cf7634::t_37452fa893af51 476,514,526,528-529,531,681-683,737-740,755-757,764,768,771-772,777-778,786,796-801
+server/database.mjs
+  s_43b056a12de861::t_7fc91487ed9f33 103-119,137-138,147-149,151,160-164,170,173-175,191,195,204,223,225,232-234,248-250,646-647,652-653,657-658,665,667,684-686,697,847-849,887-891,919-920,925-930,941-942,951-953,956,968-969,1046-1049,1060-1072
+server/outright-runtime.test.mjs
+  s_110c7532cf7634::t_d8baf34267531c 70-85
+server/resource-budgets.test.mjs
+  s_450bc0bce405cf::t_1f00abbe60c52b 17-23,55-57,70-71,79-80,84-86,91-104,106-112,116-124,126-127,129-156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9c5849c40d9d231a30ae98d04d8b7497f565ccd7",
+  "prompts": {},
+  "sessions": {
+    "s_110c7532cf7634": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ee25-fef3-7643-b3da-8732f3cec764",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_43b056a12de861": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ed5d-b588-7483-b5b8-e907d9952fb2",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_450bc0bce405cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ee94-5c8b-7f80-9749-4ef3aa946da8",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
