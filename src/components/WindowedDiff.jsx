@@ -74,6 +74,9 @@ export function WindowedDiff({ diff, label }) {
     const viewport = viewportRef.current;
     if (!viewport) return;
     const wheel = (event) => {
+      // Browser zoom (including trackpad pinch) and shifted horizontal wheel
+      // gestures belong to the browser, not to diff row navigation.
+      if (event.ctrlKey || event.metaKey || event.shiftKey) return;
       if (!event.deltaY) return; // Keep native horizontal navigation.
       pendingFindAlignmentRef.current = null;
       event.preventDefault();
@@ -184,12 +187,11 @@ export function WindowedDiff({ diff, label }) {
   const firstVisible = pendingLine != null
     && (pendingLine < scrollFirst - OVERSCAN || pendingLine >= scrollFirst + visibleRows + OVERSCAN)
     ? Math.max(0, Math.min(maxFirst, pendingLine - Math.floor(visibleRows / 3))) : scrollFirst;
-  const start = Math.max(0, firstVisible - OVERSCAN);
+  const start = compressed ? firstVisible : Math.max(0, firstVisible - OVERSCAN);
   const end = Math.min(count, firstVisible + visibleRows + OVERSCAN);
   // Keep the mounted window attached to the physical viewport. Large CSS top
   // coordinates lose precision across engines at multi-million-pixel scroll
   // positions; a sticky zero-height anchor avoids that coordinate conversion.
-  const compressedRowOffset = (start - firstVisible) * LINE_HEIGHT;
   const visibleStatus = needle && foundLine >= 0 ? `Line ${foundLine + 1}` : needle && searched ? "No match" : needle ? "Press Enter to find" : "";
   useEffect(() => {
     const timer = window.setTimeout(() => setAnnouncedStatus(visibleStatus), 180);
@@ -223,7 +225,7 @@ export function WindowedDiff({ diff, label }) {
     const line = content.slice(starts[index], endOffset);
     lines.push(<span className={line.startsWith("+") && !line.startsWith("+++") ? "added" : line.startsWith("-") && !line.startsWith("---") ? "removed" : line.startsWith("@@") ? "hunk" : ""} data-find-match={index === foundLine ? "true" : undefined} key={index}><i aria-hidden="true">{index + 1}</i>{line}{"\n"}</span>);
   }
-  return <div className="windowed-diff"><div className="window-find" role="search" aria-label={`Find in ${label}`}><input aria-label="Find in diff" value={needle} onChange={(event) => { setNeedle(event.target.value); setFoundLine(-1); setSearched(false); foundOffsetRef.current = -1; pendingFindAlignmentRef.current = null; }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle} aria-label="Previous diff match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle} aria-label="Next diff match">↓</button><span aria-hidden="true">{visibleStatus}</span><span className="sr-only" role="status">{announcedStatus}</span></div><pre ref={viewportRef} className="diff-view" tabIndex={0} aria-label={label} data-first-line={firstVisible} data-mounted-start={start} data-mounted-end={end} onScroll={(event) => updatePosition(event.currentTarget)} onPointerDown={() => { pendingFindAlignmentRef.current = null; }} onTouchStart={() => { pendingFindAlignmentRef.current = null; }} onWheelCapture={() => { pendingFindAlignmentRef.current = null; }} onKeyDown={(event) => {
+  return <div className="windowed-diff"><div className="window-find" role="search" aria-label={`Find in ${label}`}><input aria-label="Find in diff" value={needle} onChange={(event) => { setNeedle(event.target.value); setFoundLine(-1); setSearched(false); foundOffsetRef.current = -1; pendingFindAlignmentRef.current = null; }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle} aria-label="Previous diff match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle} aria-label="Next diff match">↓</button><span aria-hidden="true">{visibleStatus}</span><span className="sr-only" role="status">{announcedStatus}</span></div><pre ref={viewportRef} className="diff-view" tabIndex={0} aria-label={label} data-first-line={firstVisible} data-mounted-start={start} data-mounted-end={end} onScroll={(event) => updatePosition(event.currentTarget)} onPointerDown={() => { pendingFindAlignmentRef.current = null; }} onTouchStart={() => { pendingFindAlignmentRef.current = null; }} onWheelCapture={(event) => { if (event.deltaY && !event.ctrlKey && !event.metaKey && !event.shiftKey) pendingFindAlignmentRef.current = null; }} onKeyDown={(event) => {
     pendingFindAlignmentRef.current = null;
     if (!compressed) return;
     const moves = { ArrowDown: 1, ArrowUp: -1, PageDown: visibleRows - 1, PageUp: 1 - visibleRows, Home: -maxFirst, End: maxFirst };
@@ -232,8 +234,8 @@ export function WindowedDiff({ diff, label }) {
     moveFirst(event.key === "Home" ? 0 : event.key === "End" ? maxFirst : firstVisible + moves[event.key]);
   }}>
     {content ? compressed
-      ? <div style={{ height: trackHeight }}><div style={{ position: "sticky", top: 0, height: 0 }}><div style={{ position: "relative", top: compressedRowOffset }}>{lines}</div></div></div>
-      : <>{start > 0 && <span aria-hidden="true" style={{ height: start * LINE_HEIGHT }} />}{lines}{end < count && <span aria-hidden="true" style={{ height: (count - end) * LINE_HEIGHT }} />}</>
+      ? <div style={{ height: trackHeight }}><div style={{ position: "sticky", top: 0, height: 0 }}>{lines}</div></div>
+      : <div style={{ height: trackHeight, position: "relative" }}><div style={{ position: "absolute", top: start * LINE_HEIGHT, left: 0, right: 0 }}>{lines}</div></div>
       : <span className="diff-empty">Select a changed file to inspect its diff.</span>}
   </pre></div>;
 }

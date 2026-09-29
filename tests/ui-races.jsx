@@ -1759,6 +1759,10 @@ async function productionDiffViewportRegression() {
   let viewport = host.querySelector('.diff-view');
   assert(viewport.clientHeight > 0 && viewport.clientHeight < 600, `Production diff viewport grew to ${viewport.clientHeight}px`);
   assert(viewport.querySelectorAll("span").length < 200, "Production diff mounted all staged lines");
+  const ordinaryBeforeZoom = viewport.scrollTop;
+  assert(viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 120, ctrlKey: true, bubbles: true, cancelable: true })),
+    "Ordinary diff intercepted browser zoom");
+  assert(viewport.scrollTop === ordinaryBeforeZoom, "Ordinary diff scrolled during browser zoom");
   if (window.__fixtureWheel) {
     viewport.scrollIntoView({ block: "center" });
     await frame();
@@ -2130,6 +2134,10 @@ async function extremeDiffHeightRegression() {
   await until(() => host.querySelector('.diff-view')?.scrollHeight > 1_000_000, "near-limit diff track mounted");
   const nearViewport = host.querySelector('.diff-view');
   assert(nearViewport.scrollHeight < 16_000_000, "near-limit diff exceeded browser scroll geometry");
+  const compressedBeforeZoom = nearViewport.scrollTop;
+  assert(nearViewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 120, ctrlKey: true, bubbles: true, cancelable: true })),
+    "Compressed diff intercepted browser zoom");
+  assert(nearViewport.scrollTop === compressedBeforeZoom, "Compressed diff scrolled during browser zoom");
   const nearInput = host.querySelector('input[aria-label="Find in diff"]');
   setControlValue(nearInput, "WHEEL A"); await settle();
   nearInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));

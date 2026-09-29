@@ -25,7 +25,7 @@ test("a failed process inspection cannot prove probe cleanup", () => {
   assert.throws(() => probeProcessRunning(123, () => ({ status: 1, stdout: "", stderr: "permission denied" })), /inspection error/);
 });
 
-test("provider lookup belongs to the abortable probe operation", async () => {
+test("provider lookup belongs to the abortable probe operation", { skip: process.platform === "win32" }, async () => {
   const controller = new AbortController();
   let finishLookup;
   const pending = defaultProbe("missing-provider", { signal: controller.signal,
@@ -36,7 +36,7 @@ test("provider lookup belongs to the abortable probe operation", async () => {
   finishLookup("missing-provider");
 });
 
-test("provider lookup consumes the probe timeout before any child starts", async () => {
+test("provider lookup consumes the probe timeout before any child starts", { skip: process.platform === "win32" }, async () => {
   const started = Date.now();
   await assert.rejects(defaultProbe("missing-provider", { resolveExecutable: () => new Promise(() => {}) }), /timed out/);
   assert.ok(Date.now() - started < 3_500, "stalled PATH lookup exceeded the probe deadline");
@@ -52,7 +52,7 @@ test("a stuck supervisor is observed stopped before probe cleanup settles", { sk
   try {
     const pending = defaultProbe("unused", { cleanupMs: 800, resolveExecutable: async () => supervisor,
       commandForProbe: () => ({ executable: supervisor, args: [], stdio: ["pipe", "pipe", "pipe", "pipe"] }) });
-    const stopped = assert.rejects(pending, (error) => error.code === "OUTRIGHT_PROBE_CLEANUP_UNCERTAIN");
+    const stopped = assert.rejects(pending, /cleanup deadline/);
     const readyUntil = Date.now() + 2_000;
     while (!existsSync(pidFile) && Date.now() < readyUntil) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.ok(existsSync(pidFile), "stuck owner started");
@@ -76,7 +76,25 @@ test("discovery shutdown reports an owner whose cleanup was not verified", async
   await assert.rejects(discovery.close(), /cleanup could not be verified/);
 });
 
-test("probe fixture reaps a helper after an unexpected rejection", { skip: process.platform === "win32" }, async () => {
+test("an uncertain probe owner quarantines its provider without accumulating cleanup errors", async () => {
+  let calls = 0;
+  const discovery = createProviderDiscovery({ probe: async (id) => {
+    if (id !== "codex") throw new Error("not installed");
+    calls += 1;
+    const error = new Error("owner cleanup is uncertain");
+    error.code = "OUTRIGHT_PROBE_CLEANUP_UNCERTAIN";
+    throw error;
+  } });
+  await discovery.refresh();
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    assert.equal(await discovery.available("codex"), false);
+    await discovery.refresh(true);
+  }
+  assert.equal(calls, 1, "an uncertain owner must not spawn another probe");
+  await assert.rejects(discovery.close(), (error) => error instanceof AggregateError && error.errors.length === 1);
+});
+
+test("hard shutdown reaps an escaped helper before probe cleanup settles", { skip: process.platform === "win32" }, async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-fixture-"));
   const supervisor = path.join(directory, "supervisor");
   const pidFile = path.join(directory, "helper-pid");
@@ -84,22 +102,24 @@ test("probe fixture reaps a helper after an unexpected rejection", { skip: proce
   writeFileSync(supervisor, `#!${process.execPath}\nconst { spawn } = require("node:child_process"); const child = spawn(process.execPath, ["-e", ${JSON.stringify(helper)}], { detached: true, stdio: "ignore" }); child.unref(); process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);\n`);
   chmodSync(supervisor, 0o755);
   let recoveredPid;
-  let unexpectedRejection = false;
+  let helperStopped = false;
   try {
     const check = assert.rejects(defaultProbe("unused", { cleanupMs: 800, resolveExecutable: async () => supervisor,
-      commandForProbe: () => ({ executable: supervisor, args: [], stdio: ["pipe", "pipe", "pipe", "pipe"] }) }), /unexpected success/)
-      .then(() => false, () => true);
+      commandForProbe: () => ({ executable: supervisor, args: [], stdio: ["pipe", "pipe", "pipe", "pipe"] }) }),
+    /cleanup deadline/);
     const readyUntil = Date.now() + 2_000;
     while (!existsSync(pidFile) && Date.now() < readyUntil) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.ok(existsSync(pidFile), "detached helper started before the rejection");
-    unexpectedRejection = await check;
+    await check;
+    recoveredPid = Number(readFileSync(pidFile, "utf8"));
+    helperStopped = !probeProcessRunning(recoveredPid);
   } finally {
     if (existsSync(pidFile)) recoveredPid = Number(readFileSync(pidFile, "utf8"));
     if (recoveredPid) try { process.kill(recoveredPid, "SIGKILL"); } catch { /* Already gone. */ }
     if (recoveredPid) await waitForProbeExit(recoveredPid);
     rmSync(directory, { recursive: true, force: true });
   }
-  assert.ok(unexpectedRejection && recoveredPid, "fixture did not exercise its unexpected-rejection cleanup");
+  assert.ok(helperStopped && recoveredPid, "an escaped helper survived its supervisor's hard shutdown");
   assert.equal(existsSync(directory), false, "probe fixture left a temporary artifact");
 });
 
