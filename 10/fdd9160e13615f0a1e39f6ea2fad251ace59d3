@@ -1,0 +1,25 @@
+server/database.mjs
+  s_110c7532cf7634::t_e384070a06efa5 7,16-18,24,29-41,50-52,123-152,159-161,190-192,634-658,852-873,902-905,908-909,913-915,960,965-966,992-1006,1045-1050
+src/components/SettingsDialog.jsx
+  s_110c7532cf7634::t_d7fc7e665be5bc 11-19,28-35,44-47
+server/resource-budgets.mjs
+  s_110c7532cf7634::t_4eefe053fb2ade 1-10
+server/resource-budgets.test.mjs
+  s_110c7532cf7634::t_65b66e2bf26d14 1-132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "10fdd9160e13615f0a1e39f6ea2fad251ace59d3",
+  "prompts": {},
+  "sessions": {
+    "s_110c7532cf7634": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ee25-fef3-7643-b3da-8732f3cec764",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
