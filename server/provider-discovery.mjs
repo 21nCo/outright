@@ -1,15 +1,17 @@
-import { spawn, spawnSync } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { constants, readFileSync, rmSync } from "node:fs";
 import { access } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 const PROVIDERS = [
   { id: "codex", label: "Codex", models: ["gpt-5.4", "gpt-5.3-codex"] },
   { id: "claude", label: "Claude Code", models: ["sonnet", "opus", "haiku"] },
 ];
 const MAX_VERSION_BYTES = 16 * 1024;
+const execFileAsync = promisify(execFile);
 const pendingAccess = new Map();
 
 function executableAccess(candidate) {
@@ -62,12 +64,12 @@ function probeCommand(id, providerPath) {
 // A detached child leaves its parent's process group but remains in the
 // parent's tree. Inspect that tree while the owner is still alive, then kill
 // descendants before the owner so a forced shutdown cannot orphan a helper.
-function probeDescendants(ownerPid) {
-  const result = spawnSync("ps", ["-A", "-o", "pid=,ppid=,stat="], { encoding: "utf8", timeout: 1_000 });
-  if (result.error || result.status !== 0) throw result.error ?? new Error(`Unable to inspect probe tree: ${result.stderr}`);
+async function probeDescendants(ownerPid) {
+  const { stdout } = await execFileAsync("/bin/ps", ["-A", "-o", "pid=,ppid=,stat="],
+    { encoding: "utf8", timeout: 1_000, maxBuffer: 4 * 1024 * 1024 });
   const children = new Map();
   let ownerState;
-  for (const line of result.stdout.split("\n")) {
+  for (const line of stdout.split("\n")) {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)/);
     if (!match) continue;
     const pid = Number(match[1]);
@@ -94,8 +96,8 @@ async function forceProbeCleanup(child, command) {
   if (process.platform === "darwin" && command.ownershipLabel) {
     // The launchd resource coalition survives setsid and reparenting. Its
     // control command proves that every member has left before returning.
-    const result = spawnSync(command.executable, ["--terminate", command.ownershipLabel], { timeout: 5_000 });
-    if (result.error || result.status !== 0) throw result.error ?? new Error("Unable to terminate probe coalition");
+    await execFileAsync(command.executable, ["--terminate", command.ownershipLabel],
+      { timeout: 5_000, maxBuffer: MAX_VERSION_BYTES });
   } else if (process.platform !== "win32") {
     // Linux's native supervisor is a subreaper, so double-forked helpers are
     // adopted back into this tree. Stop the owner before the final snapshot so
@@ -105,14 +107,14 @@ async function forceProbeCleanup(child, command) {
     // reparented and this ancestry snapshot cannot prove their absence.
     process.kill(child.pid, "SIGSTOP");
     for (let attempt = 0; attempt < 20; attempt += 1) {
-      const descendants = probeDescendants(child.pid);
+      const descendants = await probeDescendants(child.pid);
       if (descendants.length === 0) break;
       for (const pid of descendants) {
         try { process.kill(pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
       }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    if (probeDescendants(child.pid).length) throw new Error("Probe descendants survived hard shutdown");
+    if ((await probeDescendants(child.pid)).length) throw new Error("Probe descendants survived hard shutdown");
   }
   child.kill("SIGKILL");
 }

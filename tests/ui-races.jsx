@@ -1663,13 +1663,25 @@ async function diffRefreshAnchorRegression() {
   const find = host.querySelector('input[aria-label="Find in diff"]');
   setControlValue(find, "line 2500");
   find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-  await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("2500"), "large diff find");
+  const foundRowIsAligned = () => {
+    const row = viewport.querySelector('[data-find-match="true"]');
+    if (!row?.textContent.includes("2500")) return false;
+    const bounds = row.getBoundingClientRect();
+    const frame = viewport.getBoundingClientRect();
+    return Math.abs(bounds.top - (frame.top + viewport.clientHeight / 3)) < 2;
+  };
+  await until(foundRowIsAligned, "large diff find aligned in viewport");
+  // The mark may mount before the queued Find alignment settles on slower
+  // hosts. Start the refresh comparison from the completed reading position.
+  await settle();
+  assert(foundRowIsAligned(), "Large diff Find lost its aligned row before refresh");
   const anchor = viewport.scrollTop;
   hold = true;
   root.render(pane({ type: "projects.changed" }));
   await until(() => pending.length === 1, "background diff refresh pending");
   assert(viewport.textContent.includes("line 2500") && viewport.querySelector('[data-find-match="true"]'), "Background refresh erased the reader's diff or find");
-  assert(Math.abs(viewport.scrollTop - anchor) < 24, "Background refresh moved the diff anchor before its response");
+  assert(Math.abs(viewport.scrollTop - anchor) < 24 && foundRowIsAligned(),
+    `Background refresh moved the diff anchor before its response: ${anchor} -> ${viewport.scrollTop}, row=${viewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top}, viewport=${viewport.getBoundingClientRect().top}`);
   pending.shift().resolve(response({ diff: original }));
   await settle();
   assert(Math.abs(viewport.scrollTop - anchor) < 24 && viewport.querySelector('[data-find-match="true"]'), "Identical diff refresh lost the anchor or find");
@@ -2057,6 +2069,16 @@ async function extremeDiffHeightRegression() {
     `Compressed diff lost its top inset after scrolling: inset=${stickyInset()}`);
   assert(viewport.querySelectorAll("span").length < 200, "Tall diff mounted an unbounded line window");
   viewport.scrollTop = 0; viewport.dispatchEvent(new Event("scroll")); await settle();
+  // Safari can report a negative physical position during top-edge bounce.
+  // The virtual window must never turn that into a negative line index.
+  Object.defineProperty(viewport, "scrollTop", { configurable: true, get: () => -14, set: () => {} });
+  try {
+    viewport.dispatchEvent(new Event("scroll"));
+    await settle();
+    assert(Number(viewport.dataset.firstLine) === 0 && Number(viewport.dataset.mountedStart) === 0
+      && viewport.textContent.includes("+"), "Top-edge overscroll mounted a negative diff row");
+  } finally { delete viewport.scrollTop; }
+  viewport.dispatchEvent(new Event("scroll")); await settle();
   const input = host.querySelector('input[aria-label="Find in diff"]');
   setControlValue(input, "MIDDLE MATCH"); await settle();
   // Hold the physical scrollbar for one commit, as a browser can do while a

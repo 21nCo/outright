@@ -40,8 +40,8 @@ export function WindowedDiff({ diff, label }) {
       ? logicalFirstRef.current : null);
     if (first == null) {
       programmaticTopRef.current = null;
-      logicalFirstRef.current = compressed ? Math.min(maxFirst, Math.round(top / maxScroll * maxFirst))
-        : Math.min(maxFirst, Math.floor(top / LINE_HEIGHT));
+      logicalFirstRef.current = compressed ? Math.max(0, Math.min(maxFirst, Math.round(top / maxScroll * maxFirst)))
+        : Math.max(0, Math.min(maxFirst, Math.floor(top / LINE_HEIGHT)));
     } else logicalFirstRef.current = first;
     setPosition((current) => current.top === top && current.height === height && current.first === first
       ? current : { top, height, first });
@@ -178,8 +178,8 @@ export function WindowedDiff({ diff, label }) {
     pendingFindAlignmentRef.current = { line, attempts: 0 };
     seekLine(line);
   }, [content]);
-  const scrollFirst = compressed ? Math.min(maxFirst, position.first ?? Math.round(position.top / maxScroll * maxFirst))
-    : Math.min(maxFirst, Math.floor(position.top / LINE_HEIGHT));
+  const scrollFirst = compressed ? Math.max(0, Math.min(maxFirst, position.first ?? Math.round(position.top / maxScroll * maxFirst)))
+    : Math.max(0, Math.min(maxFirst, Math.floor(position.top / LINE_HEIGHT)));
   // A seek can race a queued native End/scroll event after a mode switch.
   // Keep the target mounted while the browser delivers that event and align
   // again over several frames. A fresh user gesture releases this intent.
