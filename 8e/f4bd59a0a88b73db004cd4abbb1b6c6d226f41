@@ -1,0 +1,25 @@
+tests/ui-races.jsx
+  s_6126673cc0a89e::t_89c68942fa08eb 1666,1671,1673,1677,1683
+  s_6126673cc0a89e::t_c1ab338d9650af 1667-1670,1672,1674-1676,1684
+  s_6126673cc0a89e::t_8586ffcd92ee4d 2072-2081
+src/components/WindowedDiff.jsx
+  s_6126673cc0a89e::t_8586ffcd92ee4d 43-44,181-182
+server/provider-discovery.mjs
+  s_6126673cc0a89e::t_8586ffcd92ee4d 1,8,14,67-69,72,99-100,110,117
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8ef4bd59a0a88b73db004cd4abbb1b6c6d226f41",
+  "prompts": {},
+  "sessions": {
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
