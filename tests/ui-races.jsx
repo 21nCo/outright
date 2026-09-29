@@ -7,6 +7,7 @@ import { ChangesPane } from "../src/components/ChangesPane.jsx";
 import { WindowedMessages } from "../src/components/WindowedMessages.jsx";
 import { WindowedDiff } from "../src/components/WindowedDiff.jsx";
 import { CommandPalette } from "../src/components/CommandPalette.jsx";
+import { SettingsDialog } from "../src/components/SettingsDialog.jsx";
 import { TerminalPane } from "../src/components/TerminalPane.jsx";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
 import { scheduleLayoutTick } from "../src/lib/windowing.js";
@@ -283,6 +284,64 @@ async function chatSettingsArchiveRegression() {
   host.querySelector('[aria-label="Archive Conversation A2"]').click();
   await until(() => archivedSibling && !host.querySelector('.chat-tabs [role="tab"]') && host.querySelector('.conversation-header h1')?.textContent === "No conversation selected", "inline archive of last chat");
   assert(!host.querySelector('#conversation-panel')?.hasAttribute('aria-labelledby'), "Empty conversation panel still references an archived tab");
+}
+
+async function settingsRetentionDraftRegression() {
+  root.render(null);
+  await settle();
+  const initial = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
+    editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
+  let saved = initial;
+  let cleanupCalls = 0;
+  let patchCalls = 0;
+  route = async (url, options) => {
+    if (url.pathname === "/api/capacity") return response({ queued: 0, active: 0, recoverable: 0,
+      retainedBytes: 0, availableForNewWorkBytes: 63 * 1048576,
+      limits: { maxQueuedRuns: 32, maxConcurrentRuns: 2, maxRetainedBytes: 64 * 1048576, reservedRetainedBytes: 1048576 } });
+    if (url.pathname === "/api/retention/archived") return response({});
+    if (url.pathname === "/api/retention/cleanup") {
+      cleanupCalls++;
+      assert(JSON.stringify(JSON.parse(options.body)) === "{}", "Cleanup sent an unsaved draft cutoff");
+      assert(saved.retentionDays === 90, "Cleanup changed the saved retention window");
+      return response({ deleted: 0, capacity: { limits: null } });
+    }
+    if (url.pathname === "/api/settings" && options.method === "PATCH") {
+      patchCalls++;
+      saved = { ...saved, ...JSON.parse(options.body) };
+      return response(saved);
+    }
+    return response({});
+  };
+  function Fixture() {
+    const [open, setOpen] = React.useState(false);
+    const [settings, setSettings] = React.useState(initial);
+    return <><button onClick={() => setOpen(true)}>Open settings fixture</button><SettingsDialog open={open}
+      onOpenChange={setOpen} settings={settings} providers={[{ id: "codex", label: "Codex", available: true }]}
+      templates={[]} onSaved={(nextSettings, refresh) => { if (refresh !== "history") setSettings(nextSettings); }}
+      onError={(error) => { throw error; }} /></>;
+  }
+  root.render(<TooltipProvider><Fixture /></TooltipProvider>);
+  await until(() => host.querySelector("button"), "settings fixture mounted");
+  const open = () => host.querySelector("button").click();
+  const age = () => document.querySelector('[role="dialog"] label:last-of-type input');
+  open();
+  await until(() => age()?.value === "90", "saved retention age in settings");
+  setControlValue(age(), "1");
+  await until(() => age()?.value === "1", "edited retention age");
+  [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent.trim() === "Cancel").click();
+  await until(() => !document.querySelector('[role="dialog"]'), "settings cancelled");
+  open();
+  await until(() => age()?.value === "90", "cancelled draft reset to saved age");
+  [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent.includes("Clean old archived history")).click();
+  await until(() => cleanupCalls === 1 && document.querySelector('[role="dialog"]')?.textContent.includes("Deleted 0 old archived chats"), "cleanup used saved age");
+  assert(!document.querySelector(".archived-history-list"), "Missing archived array crashed or rendered a list");
+  setControlValue(age(), "60");
+  [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent.includes("Save settings")).click();
+  await until(() => !document.querySelector('[role="dialog"]'), "saved settings closed");
+  open();
+  try { await until(() => age()?.value === "60", "saved retention age reloaded"); }
+  catch (error) { throw new Error(`${error.message}; patchCalls=${patchCalls}, saved=${saved.retentionDays}, visible=${age()?.value}, dialog=${Boolean(document.querySelector('[role="dialog"]'))}`); }
+  assert(patchCalls === 1 && saved.retentionDays === 60, "Settings save did not persist the new age once");
 }
 
 async function archivedChatOwnershipRegression() {
@@ -4093,6 +4152,7 @@ try {
     ["same-worktree chat selection", sameWorktreeChatSelectionRegression, "click, keyboard and created-chat selection load only the selected detail and fence sends"],
     ["chat tab controls", chatTabControlRegression, "chat tab navigation ignores nested archive controls"],
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
+    ["settings retention draft", settingsRetentionDraftRegression, "missing archived data stays safe and cancel, cleanup and save use the persisted retention age"],
     ["archived chat ownership", archivedChatOwnershipRegression, "an archived chat cannot keep a pane or accept runs during held or failed refresh"],
     ["same-owner archive refresh", sameOwnerArchiveRefreshRegression, "a held archive cannot overwrite a newer same-worktree list after refresh failure"],
     ["chat detail refresh ownership", chatDetailRefreshOwnershipRegression, "failed and pending same-chat detail blocks submission and trust until fresh detail loads"],

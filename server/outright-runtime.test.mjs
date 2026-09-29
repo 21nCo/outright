@@ -118,6 +118,35 @@ test("explicit archived deletion at the HTTP boundary restores admission without
   assert.ok(database.getRun(recovery.id));
 }));
 
+test("bootstrap and retention remain reachable when default groups cannot fit the retained budget", async () => {
+  const configDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-budget-config-"));
+  const configFile = path.join(configDirectory, "outright.config.json");
+  writeFileSync(configFile, JSON.stringify({ scanRoots: [], maxDepth: 1, maxProjects: 1 }));
+  try {
+    await withRuntime(async (runtime) => {
+  const database = runtime.database;
+  database.updateSettings({ maxRetainedMiB: 64 });
+  const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Reclaimable", provider: "codex" });
+  const filler = database.addMessage({ conversationId: archived.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+  const remaining = 63 * 1024 * 1024 - database.capacity().retainedBytes;
+  database.upsertMessage({ ...filler, body: `${filler.body}${"x".repeat(remaining - 8)}` });
+  database.updateConversation(archived.id, { archived: true });
+  assert.throws(() => database.createGroup("Core systems"), (error) => error.statusCode === 507);
+  const bootstrap = responseCapture();
+  await runtime.handleRequest(requestStream("GET", "/api/bootstrap"), bootstrap);
+  assert.equal(bootstrap.statusCode, 200);
+  assert.equal(bootstrap.body.capacity.availableForNewWorkBytes < 64 * 1024, true);
+  const listing = responseCapture();
+  await runtime.handleRequest(requestStream("GET", "/api/retention/archived"), listing);
+  assert.deepEqual(listing.body.conversations.map((row) => row.id), [archived.id]);
+  const deleted = responseCapture();
+  await runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived", { id: archived.id, confirmation: archived.id }), deleted);
+  assert.equal(deleted.statusCode, 200);
+  assert.equal(database.canLaunchRun(), true);
+    }, { configUrl: pathToFileURL(configFile) })();
+  } finally { rmSync(configDirectory, { recursive: true, force: true }); }
+});
+
 function seedLegacyUnknownTargetDatabase(filename) {
   const legacy = new Database(filename);
   legacy.exec(`

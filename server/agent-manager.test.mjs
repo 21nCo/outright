@@ -404,6 +404,80 @@ test("aggregate event refusal does not crash a streaming run", async () => {
   assert.equal(database.getRun("aggregate-stream-run").status, "completed");
 });
 
+test("a terminal run still notifies connected clients when its event cannot be retained", async () => {
+  const database = fakeDatabase();
+  const published = [];
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: (event) => published.push(event), spawnProcess: () => child });
+  database.createRun(codexRun("terminal-at-quota"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun("terminal-at-quota") });
+  database.appendRunEvent = () => null;
+  child.emit("close", 0, null);
+  assert.equal(database.getRun("terminal-at-quota").status, "completed");
+  assert.ok(published.some((event) => event.type === "run.event" && event.payload?.type === "run.completed"
+    && event.payload?.transient === true && event.runId === "terminal-at-quota"));
+});
+
+test("queued siblings defer after output exhausts quota, then resume or cancel safely", async () => {
+  const database = fakeDatabase();
+  let room = true;
+  database.getSettings = () => ({ maxConcurrentRuns: 1 });
+  database.canLaunchRun = () => room;
+  database.createRun(codexRun("first"));
+  database.createRun({ ...codexRun("second"), conversationId: "conv-2", worktreePath: "/tmp/second" });
+  database.getConversation = (id) => ({ id, worktreePath: id === "conv-1" ? "/tmp/project" : "/tmp/second" });
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => {
+    const child = fakeChild(); children.push(child); return child;
+  } });
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun("first") });
+  await manager.schedule({ conversation: database.getConversation("conv-2"), run: database.getRun("second") });
+  room = false;
+  children[0].emit("close", 0, null);
+  assert.equal(database.getRun("first").status, "completed");
+  assert.equal(database.getRun("second").status, undefined);
+  assert.equal(children.length, 1, "queued sibling spawned after its budget was spent");
+  room = true;
+  manager.resumeQueued();
+  for (let retry = 0; children.length < 2 && retry < 100; retry += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(children.length, 2);
+  assert.equal(database.getRun("second").status, "running");
+  children[1].emit("close", 0, null);
+
+  database.createRun({ ...codexRun("cancelled"), conversationId: "conv-2", worktreePath: "/tmp/second" });
+  room = false;
+  await manager.schedule({ conversation: database.getConversation("conv-2"), run: database.getRun("cancelled") });
+  assert.equal(await manager.stop("cancelled"), true);
+  room = true;
+  manager.resumeQueued();
+  assert.equal(children.length, 2, "cancelled queued run was launched after capacity returned");
+  assert.equal(database.getRun("cancelled").status, "stopped");
+});
+
+test("capacity spent during asynchronous capability setup cannot authorize a queued launch", async () => {
+  const database = fakeDatabase();
+  let room = true;
+  let release;
+  const capability = new Promise((resolve) => { release = resolve; });
+  database.canLaunchRun = () => room;
+  const run = database.createRun(codexRun("late-budget"));
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {}, launchCommand: () => capability,
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  room = false;
+  release({ executable: process.execPath, args: [], display: "test", handshakePath: "", ownsDescendants: true });
+  await scheduled;
+  assert.equal(children.length, 0);
+  assert.equal(database.getRun(run.id).status, undefined, "deferred run crossed the durable launch transition");
+  room = true;
+  manager.resumeQueued();
+  for (let retry = 0; children.length < 1 && retry < 100; retry += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(children.length, 1);
+  children[0].emit("close", 0, null);
+});
+
 test("many assistant segments share one durable transcript byte budget", async () => {
   const database = fakeDatabase();
   const child = fakeChild();

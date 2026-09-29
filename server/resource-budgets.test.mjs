@@ -101,6 +101,7 @@ test("aggregate retained history denies new work until eligible history is clean
     const remaining = 63 * 1024 * 1024 - database.capacity().retainedBytes;
     database.upsertMessage({ ...filler, body: `${filler.body}${"z".repeat(remaining - 8)}` });
     assert.ok(database.capacity().availableForNewWorkBytes < 64);
+    assert.equal(database.canLaunchRun(), false, "previously queued work waits when a sibling spends its output budget");
     assert.equal(database.capacity().limits.reservedRetainedBytes, 1024 * 1024);
     assert.throws(() => database.submitRun(runInput(current.id), "refused"), (error) => error.statusCode === 507);
     assert.equal(database.appendRunEvent(admitted.id, "tool.output", { text: "not retained" }), null);
@@ -127,6 +128,7 @@ test("aggregate retained history denies new work until eligible history is clean
     assert.throws(() => database.submitRun(runInput(current.id), "still refused"), (error) => error.statusCode === 507);
     assert.throws(() => database.deleteArchivedConversation(old.id, "wrong id"), (error) => error.statusCode === 400);
     assert.equal(database.deleteArchivedConversation(old.id, old.id).deleted, 1);
+    assert.equal(database.canLaunchRun(), true, "selected cleanup reopens the launch gate");
     assert.ok(database.getRun(interrupted.id), "a sibling's recovery evidence survives selected cleanup");
     assert.equal(database.submitRun(runInput(current.id), "accepted").run.status, "queued");
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }

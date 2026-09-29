@@ -14,18 +14,19 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
   const [pendingDelete, setPendingDelete] = useState(null);
   const [deleting, setDeleting] = useState(false);
   const cancelDeleteRef = useRef(null);
-  useEffect(() => { setDraft(settings); }, [settings]);
+  useEffect(() => { if (open) setDraft(settings); }, [open, settings]);
   useEffect(() => { if (open) { setCleanupResult(null); setPendingDelete(null); } }, [open]);
   useEffect(() => { if (pendingDelete) cancelDeleteRef.current?.focus(); }, [pendingDelete]);
   useEffect(() => {
     if (!open) return;
     let current = true;
     api("/api/capacity").then((value) => { if (current) setCapacity(value); }).catch(onError);
-    api("/api/retention/archived").then((value) => { if (current) setArchived(value.conversations); }).catch(onError);
+    api("/api/retention/archived").then((value) => { if (current) setArchived(Array.isArray(value?.conversations) ? value.conversations : []); }).catch(onError);
     return () => { current = false; };
   }, [open, onError]);
   async function refreshArchived() {
-    setArchived((await api("/api/retention/archived")).conversations);
+    const value = await api("/api/retention/archived");
+    setArchived(Array.isArray(value?.conversations) ? value.conversations : []);
   }
   async function save() {
     try { onSaved(await api("/api/settings", { method: "PATCH", body: draft })); onOpenChange(false); }

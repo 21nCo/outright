@@ -153,6 +153,12 @@ export function createOutrightDatabase(options = {}) {
         maxRunEventBytes: MAX_RUN_EVENT_RETAINED_BYTES,
       }, cpuUsage: null, memoryUsage: null, diskAllocatedBytes: null };
     },
+    canLaunchRun() {
+      // Keep enough ordinary retained space for a newly launched run to
+      // record its first output. The separate reserve remains for recovery
+      // and terminal transitions.
+      return this.capacity().availableForNewWorkBytes >= 64 * 1024;
+    },
     listDeletableArchivedConversations(limit = 100) {
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw databaseError(400, "Archived history page size must be 1 to 100");
       return db.prepare(`SELECT id, title, worktree_path AS worktreePath, updated_at AS updatedAt FROM conversations

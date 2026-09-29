@@ -108,10 +108,16 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   function ensureDefaultGroups(projectList) {
     const current = database.listGroups();
     if (current.groups.length) return;
-    const core = database.createGroup("Core systems");
-    const experiments = database.createGroup("Experiments");
-    for (const project of projectList) {
-      database.setProjectGroup(project.id, /experiment|prototype|playground/i.test(`${project.name} ${project.path}`) ? experiments.id : core.id);
+    try {
+      const core = database.createGroup("Core systems");
+      const experiments = database.createGroup("Experiments");
+      for (const project of projectList) {
+        database.setProjectGroup(project.id, /experiment|prototype|playground/i.test(`${project.name} ${project.path}`) ? experiments.id : core.id);
+      }
+    } catch (error) {
+      // An over-quota legacy database still needs bootstrap and retention UI.
+      // The next scan can finish creating defaults once space is reclaimed.
+      if (error.statusCode !== 507) throw error;
     }
   }
 
@@ -138,7 +144,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/projects" && ["GET", "POST"].includes(request.method)) return json(response, 200, await projects(request.method === "POST"));
       if (url.pathname === "/api/providers" && request.method === "GET") return json(response, 200, { providers: agents.providers() });
       if (url.pathname === "/api/settings" && request.method === "GET") return json(response, 200, database.getSettings());
-      if (url.pathname === "/api/settings" && request.method === "PATCH") return json(response, 200, database.updateSettings(await readJson(request)));
+      if (url.pathname === "/api/settings" && request.method === "PATCH") {
+        const settings = database.updateSettings(await readJson(request));
+        agents.resumeQueued();
+        return json(response, 200, settings);
+      }
       if (url.pathname === "/api/capacity" && request.method === "GET") return json(response, 200, database.capacity());
       if (url.pathname === "/api/retention/archived" && request.method === "GET") {
         return json(response, 200, { conversations: database.listDeletableArchivedConversations() });
@@ -147,12 +157,14 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const body = await readJson(request);
         const result = database.deleteArchivedConversation(body.id, body.confirmation);
         database.audit("retention.archived.deleted", { conversationId: result.id });
+        agents.resumeQueued();
         return json(response, 200, { deleted: result.deleted, capacity: database.capacity() });
       }
       if (url.pathname === "/api/retention/cleanup" && request.method === "POST") {
         const body = await readJson(request);
         const result = database.pruneHistory({ before: body.before, limit: 100 });
         database.audit("retention.cleaned", { deleted: result.deleted, before: body.before ?? "saved retention window" });
+        agents.resumeQueued();
         return json(response, 200, { deleted: result.deleted, capacity: database.capacity() });
       }
 

@@ -350,6 +350,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       throw new Error("Conversation target changed while preparing the run; submit again");
     }
     authorize?.();
+    // Validation and capability setup can yield while a sibling spends the
+    // remaining retained budget. Defer before the durable launch transition.
+    if (database.canLaunchRun?.() === false) return "deferred";
     const startedAt = new Date().toISOString();
     // Crash-safe launch handshake, phase 1: this durable marker means "a spawn
     // may have been issued, but the provider was never authorized to run". A
@@ -624,6 +627,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if (shuttingDown) return;
     const max = database.getSettings().maxConcurrentRuns;
     while (active.size < max && queue.length) {
+      if (database.canLaunchRun?.() === false) return;
       const index = queue.findIndex((entry) => ![...active.values()].some((state) => {
         const activeWorktree = state.run.worktreePath ?? state.conversation.worktreePath;
         const queuedWorktree = entry.run.worktreePath ?? entry.conversation.worktreePath;
@@ -655,7 +659,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
           state.conversation = entry.providerSessionId !== undefined
             ? { ...current, providerSessionId: entry.providerSessionId }
             : entry.forceFreshSession ? { ...current, providerSessionId: null } : current;
-          await start(state, authorize);
+          if (await start(state, authorize) === "deferred") {
+            active.delete(entry.run.id);
+            queue.unshift(entry);
+          }
         } catch (error) {
           if (!state.stopped && !error?.preserveActiveRun) finish(state, null, error);
         }
@@ -761,7 +768,11 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   function emit(runId, type, payload) {
     const event = database.appendRunEvent(runId, type, payload);
     const run = database.getRun(runId);
-    if (event) publish({ type: "run.event", conversationId: run?.conversationId, runId, payload: event });
+    // Terminal state is already durable even if the event log is full. Send a
+    // bounded runtime notification so connected clients refresh that state.
+    const terminal = ["run.completed", "run.failed", "run.stopped"].includes(type);
+    if (event || terminal) publish({ type: "run.event", conversationId: run?.conversationId, runId,
+      payload: event ?? { runId, type, payload, seq: null, transient: true, createdAt: new Date().toISOString() } });
     return event;
   }
 
@@ -805,6 +816,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     providers,
     providerAvailable: providerDiscovery.available,
     schedule,
+    resumeQueued: drain,
     stop,
     activeRuns: () => [...active.keys()],
     shutdown() {
