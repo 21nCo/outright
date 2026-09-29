@@ -190,10 +190,14 @@ export function createOutrightDatabase(options = {}) {
     // messages, run events, or recovery ownership half-pruned.
     pruneHistory({ before, limit = 100 } = {}) {
       const maximum = Date.now() - this.getSettings().retentionDays * 86_400_000;
-      const cutoff = before ?? new Date(maximum).toISOString();
-      if (typeof cutoff !== "string" || !Number.isFinite(Date.parse(cutoff)) || Date.parse(cutoff) > maximum) {
+      const requested = before ?? new Date(maximum).toISOString();
+      const cutoffTime = typeof requested === "string" ? Date.parse(requested) : NaN;
+      if (!Number.isFinite(cutoffTime) || cutoffTime > maximum) {
         throw databaseError(400, "Retention cutoff must be a valid date within the saved retention window");
       }
+      // SQLite compares updated_at as ISO text, so bind the parsed instant in
+      // the same format rather than a caller's locale or timezone spelling.
+      const cutoff = new Date(cutoffTime).toISOString();
       if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw databaseError(400, "Retention limit must be 1 to 1000");
       const prune = db.transaction(() => {
         const ids = db.prepare(`SELECT id FROM conversations WHERE archived = 1 AND updated_at < ?

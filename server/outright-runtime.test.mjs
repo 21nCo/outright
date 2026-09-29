@@ -54,7 +54,9 @@ function withRuntime(fn, options = {}) {
   return async () => {
     const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-"));
     process.env.OUTRIGHT_DATA_DIR = dataDirectory;
-    const runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json", ...options });
+    const { seed, ...runtimeOptions } = options;
+    seed?.(dataDirectory);
+    const runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json", ...runtimeOptions });
     try {
       // The runtime wires its own database, manager, and event hub, so the
       // recovery endpoint is exercised exactly as in production.
@@ -70,10 +72,20 @@ function withRuntime(fn, options = {}) {
 test("retention HTTP rejects invalid and future cutoffs without deleting fresh archived history", withRuntime(async (runtime) => {
   const chat = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Fresh archive", provider: "codex" });
   runtime.database.updateConversation(chat.id, { archived: true });
-  for (const before of ["nonsense", "9999-01-01T00:00:00.000Z", new Date(Date.now() + 60_000).toISOString()]) {
+  for (const before of ["nonsense", "9999-01-01T00:00:00.000Z", new Date(Date.now() + 60_000).toISOString(),
+    new Date(Date.now() + 86_400_000).toISOString().replace("Z", "+00:00")]) {
     const response = responseCapture();
     await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", { before }), response);
     assert.equal(response.statusCode, 400);
+    assert.ok(runtime.database.getConversation(chat.id));
+  }
+  const oldInstant = new Date(Date.now() - 95 * 86_400_000);
+  const offsetCutoff = `${new Date(oldInstant.getTime() + 5.5 * 3_600_000).toISOString().slice(0, 19)}+05:30`;
+  for (const before of ["Jan 1 2000", offsetCutoff]) {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", { before }), response);
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.deleted, 0);
     assert.ok(runtime.database.getConversation(chat.id));
   }
   const normal = responseCapture();
@@ -82,6 +94,49 @@ test("retention HTTP rejects invalid and future cutoffs without deleting fresh a
   assert.equal(normal.body.deleted, 0);
   assert.ok(runtime.database.getConversation(chat.id));
 }));
+
+test("retention HTTP normalizes timezone cutoffs and keeps unfinished archived runs", withRuntime(async (runtime) => {
+  const database = runtime.database;
+  const rows = Object.fromEntries(database.listConversations({ archived: true }).map((item) => [item.title, item]));
+  const requestCleanup = async (before) => {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", { before }), response);
+    assert.equal(response.statusCode, 200);
+    return response.body;
+  };
+  assert.equal((await requestCleanup("Jan 1 2000")).deleted, 0);
+  assert.ok(database.getConversation(rows.fresh.id));
+  const cutoff = new Date(Date.now() - 95 * 86_400_000);
+  const offsetCutoff = `${new Date(cutoff.getTime() + 5.5 * 3_600_000).toISOString().slice(0, 19)}+05:30`;
+  assert.equal((await requestCleanup(offsetCutoff)).deleted, 1);
+  assert.equal(database.getConversation(rows.settled.id), undefined);
+  for (const name of ["fresh", "queued", "active", "interrupted"]) assert.ok(database.getConversation(rows[name].id));
+  const runs = Object.fromEntries(["queued", "active", "interrupted"].map((name) => [name, database.listRuns(rows[name].id)[0]]));
+  database.updateRun(runs.queued.id, { status: "stopped" });
+  database.updateRun(runs.active.id, { status: "completed" });
+  database.resolveInterruptedRun(runs.interrupted.id, "discard");
+  assert.equal((await requestCleanup(offsetCutoff)).deleted, 3);
+  assert.ok(database.getConversation(rows.fresh.id));
+}, { seed(dataDirectory) {
+  const filename = path.join(dataDirectory, "outright.db");
+  const database = createOutrightDatabase({ filename });
+  try {
+    const rows = Object.fromEntries(["fresh", "settled", "queued", "active", "interrupted"].map((title) => [title,
+      database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title, provider: "codex" })]));
+    for (const item of Object.values(rows)) database.updateConversation(item.id, { archived: true });
+    for (const name of ["queued", "active", "interrupted"]) {
+      const run = database.createRun({ conversationId: rows[name].id, provider: "codex", approvalPolicy: "read-only", prompt: name });
+      if (name !== "queued") database.updateRun(run.id, { status: name === "active" ? "running" : "interrupted" });
+    }
+  } finally { database.close(); }
+  const admin = new Database(filename);
+  try {
+    const old = new Date(Date.now() - 100 * 86_400_000).toISOString();
+    for (const title of ["settled", "queued", "active", "interrupted"]) {
+      admin.prepare("UPDATE conversations SET updated_at = ? WHERE title = ?").run(old, title);
+    }
+  } finally { admin.close(); }
+} }));
 
 test("explicit archived deletion at the HTTP boundary restores admission without exposing protected siblings", withRuntime(async (runtime) => {
   const database = runtime.database;

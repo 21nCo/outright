@@ -80,6 +80,41 @@ test("retention removes only archived history with settled recovery and cascades
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("retention compares parsed cutoff instants and protects unsettled run transitions", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-retention-cutoff-"));
+  const filename = path.join(directory, "outright.db");
+  const database = createOutrightDatabase({ filename });
+  try {
+    const fresh = chat(database, "fresh");
+    const settled = chat(database, "settled");
+    const queued = chat(database, "queued");
+    const active = chat(database, "active");
+    const interrupted = chat(database, "interrupted");
+    for (const item of [fresh, settled, queued, active, interrupted]) database.updateConversation(item.id, { archived: true });
+    const queuedRun = database.createRun(runInput(queued.id));
+    const activeRun = database.createRun(runInput(active.id));
+    database.updateRun(activeRun.id, { status: "running" });
+    const interruptedRun = database.createRun(runInput(interrupted.id));
+    database.updateRun(interruptedRun.id, { status: "interrupted" });
+    ageArchived(filename, [settled.id, queued.id, active.id, interrupted.id]);
+
+    assert.deepEqual(database.pruneHistory({ before: "Jan 1 2000" }).ids, [], "locale date cannot compare lexically after fresh ISO rows");
+    for (const before of ["nonsense", "9999-01-01", new Date(Date.now() + 86_400_000).toISOString()]) {
+      assert.throws(() => database.pruneHistory({ before }), (error) => error.statusCode === 400);
+    }
+    const cutoff = new Date(Date.now() - 95 * 86_400_000);
+    const offsetCutoff = `${new Date(cutoff.getTime() + 5.5 * 3_600_000).toISOString().slice(0, 19)}+05:30`;
+    assert.deepEqual(database.pruneHistory({ before: offsetCutoff }).ids, [settled.id]);
+    for (const item of [fresh, queued, active, interrupted]) assert.ok(database.getConversation(item.id));
+
+    database.updateRun(queuedRun.id, { status: "stopped" });
+    database.updateRun(activeRun.id, { status: "completed" });
+    database.resolveInterruptedRun(interruptedRun.id, "discard");
+    assert.deepEqual(new Set(database.pruneHistory({ before: offsetCutoff }).ids), new Set([queued.id, active.id, interrupted.id]));
+    assert.ok(database.getConversation(fresh.id));
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("aggregate retained history denies new work until eligible history is cleaned", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-aggregate-"));
   const filename = path.join(directory, "outright.db");
