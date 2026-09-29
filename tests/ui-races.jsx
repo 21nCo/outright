@@ -1,12 +1,15 @@
 // Open /tests/ui-races.html on the local Vite server. All API and socket traffic
 // is replaced in this page; no real project, conversation or terminal is changed.
-import React from "react";
+import React, { startTransition, Suspense } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "../src/App.jsx";
 import { ChangesPane } from "../src/components/ChangesPane.jsx";
+import { WindowedMessages } from "../src/components/WindowedMessages.jsx";
+import { WindowedDiff } from "../src/components/WindowedDiff.jsx";
 import { CommandPalette } from "../src/components/CommandPalette.jsx";
 import { TerminalPane } from "../src/components/TerminalPane.jsx";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
+import { scheduleLayoutTick } from "../src/lib/windowing.js";
 import "../src/styles.css";
 
 const host = document.getElementById("root");
@@ -20,7 +23,7 @@ const projects = ["A", "B"].map((id) => ({ id, name: `Review ${id}`, path: `/fix
 const chats = Object.fromEntries(projects.map(({ id }) => [id, { id: `chat-${id}`, title: `Conversation ${id}`, projectId: id, worktreeId: id, worktreePath: `/fixture/${id}`, provider: "codex", messages: [], runs: [] }]));
 const terminal = (id) => ({ id: `term-${id}`, name: `Terminal ${id}`, cwd: `/fixture/${id[0]}`, status: "running" });
 const response = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
-const frame = () => new Promise((resolve) => document.hidden ? setTimeout(resolve, 16) : requestAnimationFrame(resolve));
+const frame = () => new Promise((resolve) => scheduleLayoutTick(resolve));
 async function settle() { await frame(); await frame(); }
 function terminalReady(name) { return host.querySelector('.terminal-tabs[aria-busy="false"] [role="tab"][aria-selected="true"]')?.textContent === name; }
 async function until(check, label) {
@@ -175,6 +178,58 @@ async function chatTabControlRegression() {
   await until(() => host.querySelector('#inspector-tab-context[aria-selected="true"]'), "End selects final inspector tab");
   host.querySelector("#inspector-tab-context").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
   await until(() => host.querySelector('#inspector-tab-terminal[aria-selected="true"]'), "left arrow selects terminal inspector tab");
+}
+
+async function sameWorktreeChatSelectionRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (id, body) => ({ id, role: "user", kind: "text", body, createdAt: "2026-09-24T00:00:00Z" });
+  const first = { ...chats.A, messages: [message("message-A", "First chat content")] };
+  const second = { ...chats.A, id: "chat-A2", title: "Second chat", provider: "claude", messages: [message("message-A2", "Second chat content")] };
+  const created = { ...chats.A, id: "chat-A3", title: "Created chat", messages: [message("message-A3", "Created chat content")] };
+  const heldSecond = deferred();
+  const heldCreated = deferred();
+  let list = [first, second];
+  let secondRequests = 0;
+  const runs = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: list });
+    if (url.pathname === "/api/conversations/chat-A") return response(first);
+    if (url.pathname === "/api/conversations/chat-A2") return ++secondRequests === 1 ? heldSecond.promise : response(second);
+    if (url.pathname === "/api/conversations/chat-A3") return heldCreated.promise;
+    if (url.pathname.endsWith("/runs")) { runs.push({ path: url.pathname, body: JSON.parse(options.body) }); return response({ id: "run", status: "queued" }, 202); }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.message-text')?.textContent.includes("First chat content"), "first chat loaded");
+  setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "Only second chat may send");
+  host.querySelector('#chat-tab-chat-A2').click();
+  await until(() => host.querySelector('#chat-tab-chat-A2[aria-selected="true"]'), "second chat tab selected");
+  assert(!host.querySelector('.conversation-header h1')?.textContent.includes(first.title), "Old header stayed under second tab");
+  assert(!host.querySelector('.message-text')?.textContent.includes("First chat content"), "Old transcript stayed under second tab");
+  assert(host.querySelector('textarea[aria-label="Message the agent"]')?.disabled, "Composer stayed enabled before second detail loaded");
+  host.querySelector('.composer').requestSubmit();
+  assert(runs.length === 0, "Pending second chat submitted through first chat");
+  heldSecond.resolve(response(second));
+  await until(() => host.querySelector('.conversation-header h1')?.textContent === second.title && host.querySelector('.message-text')?.textContent.includes("Second chat content"), "second chat detail loaded");
+  assert(!host.querySelector('[aria-label="Send message"]')?.disabled, "Second chat composer did not become ready");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => runs.length === 1, "second chat send");
+  assert(runs[0].path === "/api/conversations/chat-A2/runs" && runs[0].body.provider === "claude", "Send used the prior chat owner");
+  const secondTab = host.querySelector('#chat-tab-chat-A2');
+  secondTab.focus();
+  secondTab.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true }));
+  await until(() => host.querySelector('#chat-tab-chat-A[aria-selected="true"]') && host.querySelector('.message-text')?.textContent.includes("First chat content"), "keyboard returned to first detail");
+  assert(!host.querySelector('.message-text')?.textContent.includes("Second chat content"), "Keyboard selection retained second transcript");
+  list = [first, second, created];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "conversation.created", conversationId: created.id }) }));
+  await until(() => host.querySelector('#chat-tab-chat-A3[aria-selected="true"]'), "created chat selected from list");
+  assert(!host.querySelector('.message-text')?.textContent.includes("First chat content"), "Created chat tab showed prior transcript");
+  assert(host.querySelector('textarea[aria-label="Message the agent"]')?.disabled, "Created chat composer enabled before detail");
+  heldCreated.resolve(response(created));
+  await until(() => host.querySelector('.conversation-header h1')?.textContent === created.title && host.querySelector('.message-text')?.textContent.includes("Created chat content"), "created chat detail loaded");
 }
 
 async function chatSettingsArchiveRegression() {
@@ -873,14 +928,19 @@ async function terminalActivationOwnershipRegression() {
   show();
   await until(() => terminalReady("Terminal A"), "ownership fixture initial terminal ready");
   const initialSize = sent.findLast((message) => message.type === "terminal.resize");
+  const initialRootWidth = host.getBoundingClientRect().width;
   const initialHostWidth = host.querySelector(".terminal-host").getBoundingClientRect().width;
   assert(initialSize?.terminalId === "term-A", "Initial activation did not synchronize the selected PTY size");
+  assert(Math.abs(initialHostWidth - initialRootWidth) < 2, `Terminal host exceeded its narrow pane: root=${initialRootWidth}, host=${initialHostWidth}`);
   host.querySelector('[data-tab-id="term-A2"]').click();
   await until(() => host.querySelector('.terminal-tabs[aria-busy="true"]'), "pending terminal activation");
   assert(host.querySelector('[role="tab"][aria-selected="true"]')?.dataset.tabId === "term-A", "Pending candidate was selected before its buffer was installed");
   await until(() => host.querySelector(".xterm-rows")?.textContent.includes("Old A output"), "committed terminal output");
   host.style.width = "540px";
-  await until(() => host.querySelector(".terminal-host")?.getBoundingClientRect().width > initialHostWidth + 100, "terminal host expanded during activation");
+  try { await until(() => host.querySelector(".terminal-host")?.getBoundingClientRect().width > initialHostWidth + 100, "terminal host expanded during activation"); }
+  catch (error) {
+    throw new Error(`${error.message}: root=${host.getBoundingClientRect().width}, pane=${host.querySelector('.terminal-pane')?.getBoundingClientRect().width}, tabs=${host.querySelector('.terminal-tabs')?.getBoundingClientRect().width}, host=${host.querySelector('.terminal-host')?.getBoundingClientRect().width}, initial=${initialHostWidth}, loading=${host.querySelector('.terminal-tabs')?.getAttribute('aria-busy')}`, { cause: error });
+  }
   await settle();
   show({ type: "terminal.output", terminalId: "term-A2", payload: { data: "Included snapshot\r\n", cursor: 1 } });
   await settle();
@@ -895,6 +955,7 @@ async function terminalActivationOwnershipRegression() {
   const sizes = sent.filter((message) => message.type === "terminal.resize" && message.terminalId === "term-A2");
   const currentHostWidth = host.querySelector(".terminal-host").getBoundingClientRect().width;
   const currentGridWidth = host.querySelector(".xterm-screen").getBoundingClientRect().width;
+  assert(Math.abs(currentHostWidth - host.getBoundingClientRect().width) < 2, `Activated terminal host did not track its pane: host=${currentHostWidth}, root=${host.getBoundingClientRect().width}`);
   assert(sizes.length && sizes.at(-1).cols > initialSize.cols && sizes.at(-1).rows > 0,
     `Activation lost fitted PTY size: initial=${JSON.stringify(initialSize)}, next=${JSON.stringify(sizes)}, host=${initialHostWidth}->${currentHostWidth}, grid=${currentGridWidth}`);
   host.querySelector('[aria-label="New terminal"]').click();
@@ -912,23 +973,36 @@ async function terminalActivationOwnershipRegression() {
 async function terminalRejectedSwitchRegression() {
   root.render(null);
   await settle();
+  host.style.width = "320px";
   const pending = deferred();
   const errors = [];
+  const sent = [];
+  let retry = false;
   route = async (url) => {
     if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("A2")] });
-    if (url.pathname === "/api/terminals/term-A2") return pending.promise;
+    if (url.pathname === "/api/terminals/term-A2") return retry ? response({ buffer: "Retry output\r\n" }) : pending.promise;
     return response({ buffer: "Terminal A output\r\n" });
   };
-  root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => errors.push(error)} sendRuntime={() => {}} />);
+  root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => errors.push(error)} sendRuntime={(message) => sent.push(message)} />);
   await until(() => terminalReady("Terminal A"), "rejection fixture terminal A ready");
+  const narrowSize = sent.findLast((message) => message.type === "terminal.resize");
   const first = [...host.querySelectorAll('[role="tab"]')].find((tab) => tab.textContent === "Terminal A");
   first.focus();
   first.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
   await until(() => document.activeElement?.textContent === "Terminal A2", "pending rejected terminal");
+  host.style.width = "540px";
+  await until(() => host.querySelector('.terminal-host')?.getBoundingClientRect().width > 500, "terminal host widens during rejected activation");
   pending.reject(new Error("Buffer failed"));
   await until(() => errors.length === 1 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "rejected terminal response");
   assert(host.querySelector('[role="tab"][aria-selected="true"]') === first && first.tabIndex === 0, "Failed terminal switch changed selection");
   assert(document.activeElement === first, "Failed terminal switch left focus on an unselected tab");
+  retry = true;
+  host.querySelector('[data-tab-id="term-A2"]').click();
+  await until(() => terminalReady("Terminal A2"), "rejected activation retry");
+  const retrySize = sent.findLast((message) => message.type === "terminal.resize");
+  assert(retrySize?.terminalId === "term-A2" && retrySize.cols > narrowSize.cols,
+    `Retried terminal did not fit the current pane: narrow=${JSON.stringify(narrowSize)}, retry=${JSON.stringify(retrySize)}`);
+  host.style.width = "";
 }
 
 async function terminalExitDuringActivationRegression() {
@@ -985,23 +1059,24 @@ async function terminalExitRejectionRegression() {
   const errors = [];
   const sent = [];
   let hold = true;
+  let candidateRequests = 0;
   const onError = (error) => errors.push(error);
   const sendRuntime = (message) => sent.push(message);
   route = async (url) => {
     if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("A2")] });
-    if (url.pathname === "/api/terminals/term-A2" && hold) return pending.promise;
+    if (url.pathname === "/api/terminals/term-A2" && hold) { candidateRequests += 1; return pending.promise; }
     return response({ buffer: "Running output\r\n", status: "running" });
   };
   const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} onError={onError} sendRuntime={sendRuntime} />);
   show();
   await until(() => terminalReady("Terminal A"), "running A before rejected exit");
   host.querySelector('[data-tab-id="term-A2"]').click();
-  await until(() => host.querySelector('.terminal-tabs[aria-busy="true"]'), "pending candidate before rejection");
+  await until(() => candidateRequests === 1 && host.querySelector('.terminal-tabs[aria-busy="true"]'), "pending candidate before rejection");
   show({ type: "terminal.exit", terminalId: "term-A2", payload: { exitCode: 7 } });
-  await settle();
-  assert(host.querySelector('[data-tab-id="term-A2"]').getAttribute("aria-label").includes("process exited 7"), "Candidate exit disappeared before activation failed");
+  await until(() => host.querySelector('[data-tab-id="term-A2"]')?.getAttribute("aria-label").includes("process exited 7"), "candidate exit retained during held activation");
+  assert(host.querySelector('.terminal-tabs[aria-busy="true"]'), "candidate exit released the held activation");
   show({ type: "terminal.exit", terminalId: "term-A", payload: { exitCode: 8 } });
-  await settle();
+  await until(() => host.querySelector('[data-tab-id="term-A"]')?.getAttribute("aria-label").includes("process exited 8"), "active exit retained during held activation");
   pending.reject(new Error("Buffer unavailable"));
   await until(() => errors.length === 1 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "rejected candidate after both exits");
   assert(host.querySelector('[data-tab-id="term-A"]').getAttribute("aria-label").includes("process exited 8"), "Active exit disappeared on recovery");
@@ -1425,6 +1500,2215 @@ async function changesLoadingRegression() {
   await until(() => host.querySelector(".clean-state"), "loaded clean tree status");
 }
 
+async function changesDiscardedRenderRegression() {
+  root.render(null); await settle();
+  const pendingStatus = deferred();
+  const pendingRender = deferred();
+  let attempted = false;
+  let released = false;
+  route = async (url) => {
+    if (url.pathname !== "/api/git/status") return response({ diff: "" });
+    return url.searchParams.get("path") === projects[0].worktrees[0].path
+      ? pendingStatus.promise : response({ branch: "B branch", files: [], stagedCount: 0 });
+  };
+  function Gate() { if (!released) { attempted = true; throw pendingRender.promise; } return null; }
+  const pane = (tree, gate = false) => <Suspense fallback={<div>Pending worktree</div>}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} />{gate && <Gate />}</Suspense>;
+  root.render(pane(projects[0].worktrees[0]));
+  await until(() => host.querySelector(".changes-pane"), "committed A changes pane");
+  startTransition(() => root.render(pane(projects[1].worktrees[0], true)));
+  await until(() => attempted, "B render reached the suspension boundary");
+  assert(host.querySelector(".changes-pane") && !host.textContent.includes("Pending worktree"), "The pending B render replaced committed A");
+  pendingStatus.resolve(response({ branch: "A branch", files: [], stagedCount: 0 }));
+  await until(() => host.querySelector(".pane-toolbar strong")?.textContent === "A branch", "committed A status survived discarded B render");
+  released = true;
+  pendingRender.resolve();
+  await until(() => host.querySelector(".pane-toolbar strong")?.textContent === "B branch", "B status loaded after commit");
+}
+
+async function staleDiffSelectionRegression() {
+  root.render(null);
+  await settle();
+  const older = deferred();
+  const staleStatus = deferred();
+  let holdStatus = false;
+  route = async (url) => {
+    if (url.pathname === "/api/git/status") {
+      if (url.searchParams.get("path") === projects[1].worktrees[0].path) return response({ branch: "B branch", files: [], stagedCount: 0 });
+      if (holdStatus) return staleStatus.promise;
+      return response({ branch: "A branch", files: [{ path: "a.txt", status: " M", index: " ", worktree: "M" }, { path: "b.txt", status: " M", index: " ", worktree: "M" }], stagedCount: 0 });
+    }
+    if (url.pathname === "/api/git/diff") return url.searchParams.get("file") === "a.txt" ? older.promise : response({ diff: "+current B\n" });
+    return response({});
+  };
+  root.render(<ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} />);
+  await until(() => host.querySelectorAll(".change-file-select").length === 2, "two changed files");
+  [...host.querySelectorAll(".change-file-select")].find((button) => button.textContent.includes("b.txt")).click();
+  await until(() => host.querySelector(".diff-view")?.textContent.includes("current B"), "newer selected diff");
+  older.resolve(response({ diff: "+stale A\n" }));
+  await settle();
+  assert(host.querySelector(".diff-view")?.textContent.includes("current B") && !host.querySelector(".diff-view")?.textContent.includes("stale A"), "A late diff response replaced the selected file");
+  holdStatus = true;
+  host.querySelector('[aria-label="Refresh changes"]').click();
+  await settle();
+  root.render(<ChangesPane worktree={projects[1].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} />);
+  await until(() => host.querySelector('.pane-toolbar strong')?.textContent === "B branch", "new worktree status");
+  staleStatus.resolve(response({ branch: "A branch", files: [], stagedCount: 0 }));
+  await settle();
+  assert(host.querySelector('.pane-toolbar strong')?.textContent === "B branch", "A stale worktree status replaced B's status");
+}
+
+async function changesSelectionRefreshRegression() {
+  root.render(null); await settle();
+  const pendingStatus = deferred();
+  const requests = [];
+  let holdStatus = false;
+  const pendingMutation = deferred();
+  const files = ["a.txt", "b.txt"].map((file) => ({ path: file, status: "MM", index: "M", worktree: "M" }));
+  route = async (url) => {
+    requests.push(`${url.pathname}:${url.searchParams.get("file") ?? ""}:${url.searchParams.get("staged") ?? ""}`);
+    if (url.pathname === "/api/git/status") return holdStatus ? pendingStatus.promise : response({ branch: "main", files, stagedCount: 2 });
+    if (url.pathname === "/api/git/diff") return response({ diff: `${url.searchParams.get("file")}:${url.searchParams.get("staged")}` });
+    if (url.pathname === "/api/git/unstage") return pendingMutation.promise;
+    return response({});
+  };
+  const tree = projects[0].worktrees[0];
+  const pane = (event) => <div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>;
+  root.render(pane(null));
+  await until(() => host.querySelectorAll('.change-file-select').length === 2, "change selection ready");
+  holdStatus = true;
+  host.querySelector('[aria-label="Refresh changes"]').click();
+  await settle();
+  [...host.querySelectorAll('.change-file-select')].find((button) => button.textContent.includes("b.txt")).click();
+  host.querySelector('.diff-mode button').click();
+  await until(() => host.querySelector('.diff-view')?.textContent.includes("b.txt:false"), "new file and mode diff");
+  pendingStatus.resolve(response({ branch: "main", files, stagedCount: 2 }));
+  holdStatus = false;
+  await settle();
+  assert(host.querySelector('.change-file.is-active')?.textContent.includes("b.txt") && host.querySelector('.diff-mode button[aria-pressed="true"]')?.textContent === "Unstaged", "Pending status restored an obsolete file or mode");
+  assert(host.querySelector('.diff-view')?.textContent.includes("b.txt:false"), "Pending status restored an obsolete diff");
+  const event = { type: "run.event", payload: { type: "run.completed" } };
+  const beforeCompletion = requests.filter((item) => item.startsWith("/api/git/status")).length;
+  root.render(pane(event));
+  await until(() => requests.filter((item) => item.startsWith("/api/git/status")).length === beforeCompletion + 1,
+    "committed completion event status refresh");
+  await until(() => host.querySelector('.changed-files')?.getAttribute('aria-busy') === 'false'
+    && host.querySelector('.diff-view')?.textContent.includes("b.txt:false"), "completion refresh settled");
+  const statusCount = requests.filter((item) => item.startsWith("/api/git/status")).length;
+  root.render(pane(event)); await settle();
+  assert(requests.filter((item) => item.startsWith("/api/git/status")).length === statusCount, "Retained completion event retriggered status on selection rerender");
+  host.querySelector('[aria-label="Unstage b.txt"]').click();
+  await until(() => requests.some((item) => item.startsWith("/api/git/unstage")), "same-worktree mutation pending");
+  [...host.querySelectorAll('.change-file-select')].find((button) => button.textContent.includes("a.txt")).click();
+  host.querySelector('.diff-mode button').click();
+  const beforeMutationRefresh = requests.filter((item) => item.startsWith("/api/git/status")).length;
+  const beforeMutationDiff = requests.filter((item) => item.startsWith("/api/git/diff")).length;
+  pendingMutation.resolve(response({ ok: true }));
+  await until(() => requests.filter((item) => item.startsWith("/api/git/status")).length > beforeMutationRefresh
+    && requests.filter((item) => item.startsWith("/api/git/diff")).length > beforeMutationDiff
+    && host.querySelector('.change-file.is-active')?.textContent.includes("a.txt")
+    && host.querySelector('.diff-view')?.textContent.includes("a.txt:false"), "mutation follow-up preserved the selected file and mode");
+}
+
+async function changesDiffFailureOwnershipRegression() {
+  root.render(null); await settle();
+  const pendingFile = deferred();
+  const pendingMode = deferred();
+  const errors = [];
+  route = async (url) => {
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: ["a.txt", "b.txt"].map((path) => ({ path, status: "MM", index: "M", worktree: "M" })), stagedCount: 2 });
+    if (url.pathname === "/api/git/diff") {
+      const file = url.searchParams.get("file");
+      const staged = url.searchParams.get("staged") === "true";
+      if (file === "b.txt" && staged) return pendingFile.promise;
+      if (file === "b.txt" && !staged) return pendingMode.promise;
+      return response({ diff: "+A content\n" });
+    }
+    return response({});
+  };
+  root.render(<div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>);
+  await until(() => host.querySelector('.diff-view')?.textContent.includes("A content"), "initial A diff");
+  [...host.querySelectorAll('.change-file-select')].find((button) => button.textContent.includes("b.txt")).click();
+  await settle();
+  assert(host.querySelector('.change-file.is-active')?.textContent.includes("b.txt") && !host.querySelector('.diff-view')?.textContent.includes("A content"), "Previous file diff remained under B while pending");
+  pendingFile.reject(new Error("B staged unavailable"));
+  await until(() => errors.includes("B staged unavailable"), "B diff failure reported");
+  assert(!host.querySelector('.diff-view')?.textContent.includes("A content"), "Previous file diff remained after B failure");
+  host.querySelector('.diff-mode button[aria-pressed="false"]').click();
+  await settle();
+  assert(!host.querySelector('.diff-view')?.textContent.includes("A content"), "Previous mode diff remained during unstaged load");
+  pendingMode.resolve(response({ diff: "+B unstaged\n" }));
+  await until(() => host.querySelector('.diff-view')?.textContent.includes("B unstaged"), "new mode diff loaded");
+}
+
+async function diffRefreshAnchorRegression() {
+  root.render(null); await settle();
+  const original = Array.from({ length: 5_000 }, (_, index) => `+line ${index}\n`).join("");
+  const changed = original.replace("+line 2500", "+LINE 2500");
+  const pending = [];
+  let hold = false;
+  const errors = [];
+  route = async (url) => {
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [{ path: "large.txt", status: "MM", index: "M", worktree: "M" }], stagedCount: 1 });
+    if (url.pathname === "/api/git/diff") {
+      if (hold) { const request = deferred(); pending.push(request); return request.promise; }
+      return response({ diff: original });
+    }
+    return response({});
+  };
+  const tree = projects[0].worktrees[0];
+  const pane = (event) => <div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>;
+  root.render(pane(null));
+  await until(() => host.querySelector(".diff-view")?.textContent.includes("line 0"), "large diff ready");
+  const viewport = host.querySelector(".diff-view");
+  const find = host.querySelector('input[aria-label="Find in diff"]');
+  setControlValue(find, "line 2500");
+  find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  const foundRowIsAligned = () => {
+    const row = viewport.querySelector('[data-find-match="true"]');
+    if (!row?.textContent.includes("2500")) return false;
+    const bounds = row.getBoundingClientRect();
+    const frame = viewport.getBoundingClientRect();
+    return Math.abs(bounds.top - (frame.top + viewport.clientHeight / 3)) < 2;
+  };
+  await until(foundRowIsAligned, "large diff find aligned in viewport");
+  // The mark may mount before the queued Find alignment settles on slower
+  // hosts. Start the refresh comparison from the completed reading position.
+  await settle();
+  assert(foundRowIsAligned(), "Large diff Find lost its aligned row before refresh");
+  const anchor = viewport.scrollTop;
+  hold = true;
+  root.render(pane({ type: "projects.changed" }));
+  await until(() => pending.length === 1, "background diff refresh pending");
+  assert(viewport.textContent.includes("line 2500") && viewport.querySelector('[data-find-match="true"]'), "Background refresh erased the reader's diff or find");
+  assert(Math.abs(viewport.scrollTop - anchor) < 24 && foundRowIsAligned(),
+    `Background refresh moved the diff anchor before its response: ${anchor} -> ${viewport.scrollTop}, row=${viewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top}, viewport=${viewport.getBoundingClientRect().top}`);
+  pending.shift().resolve(response({ diff: original }));
+  await settle();
+  assert(Math.abs(viewport.scrollTop - anchor) < 24 && viewport.querySelector('[data-find-match="true"]'), "Identical diff refresh lost the anchor or find");
+  host.querySelector('[aria-label="Refresh changes"]').click();
+  await until(() => pending.length === 1, "changed diff refresh pending");
+  pending.shift().resolve(response({ diff: changed }));
+  await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("LINE 2500"), "changed diff find retained");
+  assert(Math.abs(viewport.scrollTop - anchor) < 24, "Changed diff refresh moved the reader's line");
+  host.querySelector('[aria-label="Refresh changes"]').click();
+  await until(() => pending.length === 1, "failed same-selection refresh pending");
+  pending.shift().reject(new Error("Diff offline"));
+  await until(() => errors.includes("Diff offline"), "same-selection failure reported");
+  assert(viewport.textContent.includes("LINE 2500") && Math.abs(viewport.scrollTop - anchor) < 24, "Failed same-selection refresh erased the last valid diff");
+}
+
+async function changesMutationOwnerRegression(reject = false, mode = "stage") {
+  root.render(null); await settle();
+  const pending = deferred();
+  const requests = [];
+  const errors = [];
+  route = async (url) => {
+    requests.push(`${url.pathname}:${url.searchParams.get("path") ?? ""}`);
+    if (url.pathname === "/api/git/status") return response({ branch: url.searchParams.get("path") === projects[0].worktrees[0].path ? "A branch" : "B branch", files: [{ path: "file.txt", status: mode === "unstage" ? "M " : " M", index: mode === "unstage" ? "M" : " ", worktree: mode === "unstage" ? " " : "M" }], stagedCount: mode === "unstage" ? 1 : 0 });
+    if (url.pathname === "/api/git/diff") return response({ diff: "+current\n" });
+    if (url.pathname === `/api/git/${mode}`) return pending.promise;
+    return response({});
+  };
+  const pane = (tree) => <div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>;
+  root.render(pane(projects[0].worktrees[0]));
+  await until(() => host.querySelector('.pane-toolbar strong')?.textContent === "A branch", "A changes ready");
+  host.querySelector(`[aria-label="${mode === "unstage" ? "Unstage" : "Stage"} file.txt"]`).click();
+  await until(() => requests.some((item) => item.startsWith(`/api/git/${mode}`)), `A ${mode} pending`);
+  root.render(pane(projects[1].worktrees[0]));
+  await until(() => host.querySelector('.pane-toolbar strong')?.textContent === "B branch", "B changes ready");
+  const bStatusCount = requests.filter((item) => item === `/api/git/status:${projects[1].worktrees[0].path}`).length;
+  if (reject) pending.reject(new Error("old A failure")); else pending.resolve(response({ branch: "A branch", files: [], stagedCount: 0 }));
+  await settle();
+  assert(host.querySelector('.pane-toolbar strong')?.textContent === "B branch", "Late A mutation replaced B status");
+  assert(requests.filter((item) => item === `/api/git/status:${projects[1].worktrees[0].path}`).length === bStatusCount, "Late A mutation refreshed B");
+  assert(!errors.includes("old A failure"), "Late A failure surfaced in B");
+}
+
+async function changesCommitOwnerRegression(reject = false) {
+  root.render(null); await settle();
+  const pending = deferred();
+  const requests = [];
+  const errors = [];
+  const toasts = [];
+  route = async (url) => {
+    requests.push(`${url.pathname}:${url.searchParams.get("path") ?? ""}`);
+    if (url.pathname === "/api/git/status") return response({ branch: url.searchParams.get("path") === projects[0].worktrees[0].path ? "A branch" : "B branch", files: [{ path: "file.txt", status: "M ", index: "M", worktree: " " }], stagedCount: 1 });
+    if (url.pathname === "/api/git/diff") return response({ diff: "+current\n" });
+    if (url.pathname === "/api/git/commit") return pending.promise;
+    return response({});
+  };
+  const pane = (tree) => <div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={(message) => toasts.push(message)} /></div>;
+  root.render(pane(projects[0].worktrees[0]));
+  await until(() => host.querySelector('.pane-toolbar strong')?.textContent === "A branch", "A commit pane ready");
+  setControlValue(host.querySelector('[aria-label="Commit message"]'), "Commit A");
+  await settle();
+  host.querySelector('.commit-bar button').click();
+  await until(() => requests.some((item) => item.startsWith("/api/git/commit")), "A commit pending");
+  root.render(pane(projects[1].worktrees[0]));
+  await until(() => host.querySelector('.pane-toolbar strong')?.textContent === "B branch", "B commit pane ready");
+  const bStatusCount = requests.filter((item) => item === `/api/git/status:${projects[1].worktrees[0].path}`).length;
+  if (reject) pending.reject(new Error("old A commit failed")); else pending.resolve(response({ committed: true }));
+  await settle();
+  assert(host.querySelector('.pane-toolbar strong')?.textContent === "B branch", "Late A commit replaced B status");
+  assert(host.querySelector('[aria-label="Commit message"]').value === "", "A commit draft leaked to B");
+  assert(requests.filter((item) => item === `/api/git/status:${projects[1].worktrees[0].path}`).length === bStatusCount, "Late A commit refreshed B");
+  assert(toasts.length === 0 && errors.length === 0, "Late A commit reported in B");
+}
+
+async function productionDiffViewportRegression() {
+  root.render(null); await settle();
+  const staged = Array.from({ length: 50_000 }, (_, index) => `+staged ${index}\n`).join("");
+  const unstaged = Array.from({ length: 50_000 }, (_, index) => `-unstaged ${index}\n`).join("");
+  route = async (url) => {
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [{ path: "huge.txt", status: "MM", index: "M", worktree: "M" }], stagedCount: 1 });
+    if (url.pathname === "/api/git/diff") return response({ diff: url.searchParams.get("staged") === "true" ? staged : unstaged });
+    return response({});
+  };
+  root.render(<div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>);
+  await until(() => host.querySelector('.diff-view')?.textContent.includes("-unstaged 0"), "initial production diff");
+  host.querySelector('[aria-label="Diff view"] button[aria-pressed="false"]').click();
+  await until(() => host.querySelector('.diff-view')?.textContent.includes("+staged 0"), "staged production diff");
+  let viewport = host.querySelector('.diff-view');
+  assert(viewport.clientHeight > 0 && viewport.clientHeight < 600, `Production diff viewport grew to ${viewport.clientHeight}px`);
+  assert(viewport.querySelectorAll("span").length < 200, "Production diff mounted all staged lines");
+  const ordinaryBeforeZoom = viewport.scrollTop;
+  assert(viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 120, ctrlKey: true, bubbles: true, cancelable: true })),
+    "Ordinary diff intercepted browser zoom");
+  assert(viewport.scrollTop === ordinaryBeforeZoom, "Ordinary diff scrolled during browser zoom");
+  if (window.__fixtureWheel) {
+    viewport.scrollIntoView({ block: "center" });
+    await frame();
+    const initialRemaining = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop;
+    const wheelTrace = [];
+    let attemptBudget = 1;
+    let minimumProgress = Infinity;
+    const wheelBudgetMs = window.__fixtureWheelCap > 0 && window.__fixtureWheelCap <= 1000 ? 300_000 : 120_000;
+    const wheelDeadline = Date.now() + wheelBudgetMs;
+    let exitReason = "budget-or-deadline";
+    for (let step = 0; step < attemptBudget && Date.now() < wheelDeadline; step += 1) {
+      // Virtual rows and the browser's scroll geometry can commit after a
+      // wheel acknowledgement. Only the settled viewport and final row can
+      // establish that native navigation reached the tail.
+      await settle();
+      if (viewport.scrollTop >= viewport.scrollHeight - viewport.clientHeight - 1) {
+        if (viewport.textContent.includes("staged 49999")) { exitReason = "tail-visible"; break; }
+        const atEnd = viewport.scrollHeight - viewport.clientHeight;
+        for (let pendingFrame = 0; pendingFrame < 8 && viewport.scrollTop >= viewport.scrollHeight - viewport.clientHeight - 1
+          && !viewport.textContent.includes("staged 49999"); pendingFrame += 1) await frame();
+        if (viewport.textContent.includes("staged 49999")) { exitReason = "tail-visible-after-commit"; break; }
+        if (viewport.scrollTop >= viewport.scrollHeight - viewport.clientHeight - 1) {
+          exitReason = `physical-end-without-tail:${atEnd}->${viewport.scrollHeight - viewport.clientHeight}`;
+          break;
+        }
+      }
+      const bounds = viewport.getBoundingClientRect();
+      const before = viewport.scrollTop;
+      const delivery = await window.__fixtureWheel(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2, 120_000);
+      assert(delivery.viewport === viewport, `Large wheel missed the diff viewport at step ${step}`);
+      try { await until(() => viewport.scrollTop > before, `large native wheel scroll at step ${step}`); }
+      catch (error) { throw new Error(`${error.message}; trace=${JSON.stringify(wheelTrace)}; delivered=${delivery.deltaY}; canceled=${delivery.defaultPrevented}; physical=${viewport.scrollTop}; logical=${viewport.dataset.firstLine}; mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`, { cause: error }); }
+      await settle();
+      const progress = viewport.scrollTop - before;
+      const frameBounds = viewport.getBoundingClientRect();
+      const mountedRows = viewport.querySelectorAll("span");
+      wheelTrace.push({ requested: 120_000, delivered: delivery.deltaY, canceled: delivery.defaultPrevented,
+        before, after: viewport.scrollTop, max: viewport.scrollHeight - viewport.clientHeight,
+        frame: [frameBounds.top, frameBounds.bottom], logical: viewport.dataset.firstLine,
+        mounted: [viewport.dataset.mountedStart, viewport.dataset.mountedEnd],
+        row: [mountedRows[0]?.getBoundingClientRect().top, mountedRows[0]?.getBoundingClientRect().bottom] });
+      assert(progress > 0 && viewport.querySelectorAll("span").length < 200,
+        `Native wheel lost progress or mounted unbounded rows: ${JSON.stringify(wheelTrace)}`);
+      minimumProgress = Math.min(minimumProgress, progress);
+      const remaining = Math.max(0, viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop);
+      attemptBudget = Math.min(2048, Math.max(attemptBudget, step + 1 + Math.ceil(remaining / minimumProgress) + 8));
+    }
+    await settle();
+    assert(viewport.scrollTop >= viewport.scrollHeight - viewport.clientHeight - 1 && viewport.textContent.includes("staged 49999"),
+      `Native wheels did not reach the staged diff tail: ${JSON.stringify({
+        exitReason, initialRemaining, attempts: wheelTrace.length, attemptBudget, elapsedLimitMs: wheelBudgetMs,
+        remaining: viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop,
+        physical: viewport.scrollTop, logical: viewport.dataset.firstLine,
+        mounted: [viewport.dataset.mountedStart, viewport.dataset.mountedEnd], trace: wheelTrace.slice(-16) })}`);
+  } else { viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); }
+  try { await until(() => viewport.textContent.includes("staged 49999"), "staged final line"); }
+  catch (error) { throw new Error(`${error.message}; scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}`); }
+  if (window.__fixtureWheel) {
+    viewport.scrollTop = 200_000;
+    await settle();
+    const beforeSmallWheel = viewport.scrollTop;
+    const frame = viewport.getBoundingClientRect();
+    const delivery = await window.__fixtureWheel(frame.left + frame.width / 2, frame.top + frame.height / 2, 14);
+    await until(() => viewport.scrollTop > beforeSmallWheel, "ordinary diff small native wheel advanced");
+    assert(delivery.viewport === viewport && delivery.defaultPrevented
+      && Math.abs(viewport.scrollTop - beforeSmallWheel - Math.min(14, delivery.deltaY)) < 2,
+    `Ordinary diff wheel lost its delivered delta: ${JSON.stringify({ beforeSmallWheel, after: viewport.scrollTop, delivered: delivery.deltaY, canceled: delivery.defaultPrevented })}`);
+    viewport.focus();
+    await window.__fixtureSendKey("End");
+    await until(() => viewport.textContent.includes("staged 49999"), "ordinary diff End restores staged tail after wheel");
+  }
+  host.querySelector('[aria-label="Diff view"] button[aria-pressed="false"]').click();
+  await until(() => host.querySelector('.diff-view')?.textContent.includes("-unstaged 0"), "unstaged production diff");
+  viewport = host.querySelector('.diff-view');
+  viewport.focus();
+  if (window.__fixtureSendKey) await window.__fixtureSendKey("End");
+  else { viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); }
+  try { await until(() => viewport.textContent.includes("unstaged 49999"), "unstaged final line"); }
+  catch (error) { throw new Error(`${error.message}; height=${viewport.clientHeight}/${viewport.scrollHeight}; scroll=${viewport.scrollTop}; rows=${viewport.querySelectorAll("span").length}; text=${viewport.textContent.slice(-100)}`); }
+  assert(viewport.querySelectorAll("span").length < 200, "Production diff mounted all unstaged lines");
+  assert(host.querySelectorAll('[aria-label="Diff view"] button').length === 2, "Mode controls were clipped");
+  const find = host.querySelector('input[aria-label="Find in diff"]');
+  setControlValue(find, "unstaged 25000");
+  await settle();
+  find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  // Let the first alignment commit, then deliver a queued native End/scroll.
+  // A one-shot layout correction must not give the older key event ownership.
+  await settle();
+  await settle();
+  viewport.scrollTop = viewport.scrollHeight;
+  viewport.dispatchEvent(new Event("scroll"));
+  await settle();
+  const matchIsVisible = () => {
+    const mark = viewport.querySelector('[data-find-match="true"]');
+    if (!mark?.textContent.includes("unstaged 25000")) return false;
+    const row = mark.getBoundingClientRect();
+    const bounds = viewport.getBoundingClientRect();
+    return row.bottom > bounds.top && row.top < bounds.bottom;
+  };
+  try { await until(matchIsVisible, "offscreen diff match"); }
+  catch (error) { throw new Error(`${error.message}; status=${host.querySelector('.window-find [aria-hidden="true"]')?.textContent}; scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}; rows=${[...viewport.querySelectorAll('[data-find-match], span')].slice(0, 3).map((row) => row.textContent.slice(0, 30)).join('|')}; marked=${viewport.querySelector('[data-find-match="true"]')?.textContent.slice(0, 80)}`); }
+  assert(viewport.querySelector('[data-find-match="true"]')?.textContent.includes("unstaged 25000"), "Found diff line was not marked");
+  assert(viewport.querySelectorAll("span").length < 200, "Finding a diff match mounted all lines");
+  viewport.focus();
+  if (window.__fixtureSendKey) await window.__fixtureSendKey("End");
+  else { viewport.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true, cancelable: true })); viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); }
+  await until(() => viewport.textContent.includes("unstaged 49999"), "real End takes ownership after Find");
+  host.querySelector('[aria-label="Next diff match"]').click();
+  await until(matchIsVisible, "Find realigns after a real End key");
+  root.render(<div className="inspector-body" style={{ width: 320, height: 480 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>);
+  await settle();
+  assert(host.querySelector('.diff-view').clientHeight > 0 && host.querySelector('.diff-view').clientHeight < 480, "Narrow inspector lost its bounded diff viewport");
+  assert(host.querySelector('.diff-view').querySelectorAll("span").length < 200, "Narrow inspector mounted all diff lines");
+}
+
+async function longTranscriptWindowRegression() {
+  root.render(null);
+  await settle();
+  const messages = Array.from({ length: 1_000 }, (_, index) => ({ id: `message-${index}`, body: `Message ${index}` }));
+  const viewport = React.createRef();
+  const started = performance.now();
+  root.render(<div ref={viewport} style={{ height: 420, overflowY: "auto" }} tabIndex={0} aria-label="Long conversation fixture"><WindowedMessages messages={messages} viewportRef={viewport} renderMessage={(message) => <article data-message-id={message.id} style={{ minHeight: 80, marginBottom: 30 }}>{message.body}</article>} /></div>);
+  await until(() => host.querySelectorAll('[role="listitem"]').length > 0 && host.querySelectorAll('[role="listitem"]').length < 40, "bounded initial transcript DOM");
+  const mountedAt = performance.now();
+  const initialCount = host.querySelectorAll('[role="listitem"]').length;
+  viewport.current.scrollTop = viewport.current.scrollHeight;
+  viewport.current.dispatchEvent(new Event("scroll"));
+  try { await until(() => host.querySelector('[data-message-id="message-999"]'), "last message after long scroll"); }
+  catch (error) { throw new Error(`${error.message}; scroll=${viewport.current.scrollTop}/${viewport.current.scrollHeight}, rows=${[...host.querySelectorAll('[data-message-id]')].map((row) => row.dataset.messageId).join(",")}`); }
+  assert(host.querySelectorAll('[role="listitem"]').length < 40, "Long scroll mounted the whole transcript");
+  viewport.current.scrollTop = 0;
+  viewport.current.dispatchEvent(new Event("scroll"));
+  await until(() => host.querySelector('[data-message-id="message-0"]'), "first message after return scroll");
+  const navigatedAt = performance.now();
+  const find = host.querySelector('input[aria-label="Find in conversation"]');
+  setControlValue(find, "Message 999");
+  await settle();
+  find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  try { await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-999"]'), "last offscreen message found"); }
+  catch (error) { throw new Error(`${error.message}; status=${host.querySelector('.history-find .history-find-status')?.textContent}; scroll=${viewport.current.scrollTop}/${viewport.current.scrollHeight}; rows=${[...host.querySelectorAll('[data-message-id]')].map((row) => row.dataset.messageId).join(",")}`); }
+  const firstFoundAt = performance.now();
+  setControlValue(find, "Message 0");
+  await settle();
+  find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-0"]'), "first offscreen message found");
+  assert(host.querySelectorAll('[role="listitem"]').length < 40, "Finding offscreen messages mounted the full transcript");
+  assert(document.activeElement !== viewport.current || viewport.current.tabIndex === 0, "Transcript lost keyboard scroll access");
+  const elapsedMs = Math.round(performance.now() - started);
+  const scrollMs = Math.round(navigatedAt - mountedAt);
+  assert(scrollMs < 1_000, `Scrolling the long transcript to both ends exceeded its 1s budget: ${scrollMs}ms`);
+  window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), transcript: {
+    elapsedMs, mountMs: Math.round(mountedAt - started), scrollMs,
+    findLastMs: Math.round(firstFoundAt - navigatedAt), findFirstMs: Math.round(performance.now() - firstFoundAt),
+    mountedAtStart: initialCount, heapBytes: performance.memory?.usedJSHeapSize ?? null,
+  } };
+}
+
+async function previousFindStartRegression() {
+  root.render(null); await settle();
+  const viewport = React.createRef();
+  const messages = [
+    { id: "first", body: "Other" },
+    { id: "penultimate", body: "Needle" },
+    { id: "last", body: "Needle" },
+  ];
+  root.render(<div ref={viewport} style={{ height: 350, overflowY: "auto" }}><WindowedMessages
+    messages={messages} viewportRef={viewport}
+    renderMessage={(message) => <p data-message-id={message.id}>{message.body}</p>}
+  /></div>);
+  await until(() => host.querySelector('.history-find input'), "local Find ready");
+  setControlValue(host.querySelector('.history-find input'), "Needle");
+  await settle();
+  host.querySelector('[aria-label="Previous conversation match"]').click();
+  await until(() => host.querySelector('[data-find-match="true"]'), "initial Previous found a row");
+  assert(host.querySelector('[data-find-match="true"] [data-message-id]')?.dataset.messageId === "last",
+    "Initial Previous must start at the final matching row");
+  setControlValue(host.querySelector('.history-find input'), "Σ");
+  messages[0].body = "ΟΣ";
+  root.render(<div ref={viewport} style={{ height: 350, overflowY: "auto" }}><WindowedMessages
+    messages={[...messages]} viewportRef={viewport}
+    renderMessage={(message) => <p data-message-id={message.id}>{message.body}</p>}
+  /></div>);
+  await settle();
+  host.querySelector('[aria-label="Next conversation match"]').click();
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="first"]'), "loaded transcript matches final sigma");
+  messages[0].body = "Straße";
+  root.render(<div ref={viewport} style={{ height: 350, overflowY: "auto" }}><WindowedMessages
+    messages={[...messages]} viewportRef={viewport}
+    renderMessage={(message) => <p data-message-id={message.id}>{message.body}</p>}
+  /></div>);
+  setControlValue(host.querySelector('.history-find input'), "STRASSE");
+  await settle();
+  host.querySelector('[aria-label="Next conversation match"]').click();
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="first"]'), "loaded transcript matches full case fold");
+  messages[0].body = "ﬃ";
+  root.render(<div ref={viewport} style={{ height: 350, overflowY: "auto" }}><WindowedMessages
+    messages={[...messages]} viewportRef={viewport}
+    renderMessage={(message) => <p data-message-id={message.id}>{message.body}</p>}
+  /></div>);
+  setControlValue(host.querySelector('.history-find input'), "FFI");
+  await settle();
+  host.querySelector('[aria-label="Next conversation match"]').click();
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="first"]'), "loaded transcript matches a ligature fold");
+}
+
+async function variableHeightFindAnchorRegression() {
+  root.render(null); await settle();
+  const viewport = React.createRef();
+  const messages = Array.from({ length: 200 }, (_, index) => ({ id: `variable-${index}`, body: `Variable ${index}`, height: index % 3 === 0 ? 360 : 54 }));
+  messages[99].body += ` ${"wrapping text ".repeat(150)}`;
+  const render = (rows) => <div><div ref={viewport} style={{ height: 420, overflowY: "auto" }} tabIndex={0}><WindowedMessages messages={rows} viewportRef={viewport} onFind={(query) => `variable-${Number(query)}`} renderMessage={(message) => <article data-message-id={message.id} style={{ minHeight: message.height }}>{message.body}</article>} /></div><div data-slot="scroll-area-scrollbar" /></div>;
+  root.render(render(messages));
+  await until(() => host.querySelector('.history-find input'), "variable-height find ready");
+  const input = host.querySelector('.history-find input');
+  setControlValue(input, "100"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="variable-100"]'), "variable-height target mounted");
+  await settle(); await settle();
+  const visible = () => { const row = host.querySelector('[data-find-match="true"]'); const bounds = row?.getBoundingClientRect(); const area = viewport.current.getBoundingClientRect(); return bounds && bounds.top >= area.top && bounds.top < area.bottom; };
+  assert(visible(), "Measured tall rows displaced the found message");
+  assert(host.querySelectorAll('[role="listitem"]').length < 40, "Variable-height find mounted too many rows");
+  viewport.current.style.width = "180px";
+  await settle(); await settle();
+  assert(visible(), "Width-only wrapping displaced the found message");
+  viewport.current.style.width = "";
+  await settle(); await settle();
+  assert(visible(), "Restoring viewport width lost the found message");
+  viewport.current.style.height = "720px";
+  await settle(); await settle();
+  assert(visible(), "Growing the viewport lost the found message beyond the old overscan");
+  viewport.current.style.height = "300px";
+  await settle(); await settle();
+  assert(visible(), "Viewport resize lost the found message");
+  viewport.current.dispatchEvent(new WheelEvent("wheel", { bubbles: true }));
+  viewport.current.scrollTop = 0; viewport.current.dispatchEvent(new Event("scroll"));
+  await settle();
+  root.render(render([...messages, { id: "variable-200", body: "new", height: 360 }]));
+  await settle();
+  assert(viewport.current.scrollTop < 50, "Live append snapped back to an old find target after user scrolling");
+  for (const index of [0, 200]) {
+    setControlValue(input, String(index)); await settle();
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await until(() => host.querySelector(`[data-find-match="true"] [data-message-id="variable-${index}"]`), `edge match ${index}`);
+    for (let frameIndex = 0; frameIndex < 20; frameIndex += 1) await frame();
+    viewport.current.dispatchEvent(new WheelEvent("wheel", { bubbles: true }));
+    viewport.current.scrollTop = index === 0 ? 700 : 0;
+    viewport.current.dispatchEvent(new Event("scroll"));
+    await settle(); await settle();
+    assert(index === 0 ? viewport.current.scrollTop > 500 : viewport.current.scrollTop < 50, `Edge match ${index} kept snapping the reader back`);
+  }
+  setControlValue(input, "100"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="variable-100"]'), "thumb cancellation target");
+  host.querySelector('[data-slot="scroll-area-scrollbar"]').dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+  viewport.current.scrollTop = 0; viewport.current.dispatchEvent(new Event("scroll"));
+  await settle(); await settle();
+  assert(viewport.current.scrollTop < 50, "Scrollbar thumb interaction lost the reader's scroll position");
+}
+
+async function largeDiffWindowRegression() {
+  root.render(null);
+  await settle();
+  const diff = Array.from({ length: 50_000 }, (_, index) => `+line ${index}\n`).join("");
+  const started = performance.now();
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={diff} label="Large diff fixture" /></div>);
+  await until(() => host.querySelector(".diff-view")?.querySelectorAll("span").length > 0, "large diff initial rows");
+  const viewport = host.querySelector(".diff-view");
+  assert(viewport.querySelectorAll("span").length < 200, "Large diff mounted every line");
+  viewport.scrollTop = viewport.scrollHeight;
+  viewport.dispatchEvent(new Event("scroll"));
+  await until(() => viewport.textContent.includes("+line 49999"), "last diff line after scroll");
+  assert(viewport.querySelectorAll("span").length < 200, "Large diff scroll mounted every line");
+  const elapsedMs = Math.round(performance.now() - started);
+  assert(elapsedMs < 1_000, `Large diff navigation exceeded its 1s fixture budget: ${elapsedMs}ms`);
+  window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), diff: { elapsedMs, mountedAtEnd: viewport.querySelectorAll("span").length, heapBytes: performance.memory?.usedJSHeapSize ?? null } };
+}
+
+async function extremeDiffHeightRegression() {
+  root.render(null); await settle();
+  const diff = "+\n".repeat(600_000) + "+MIDDLE MATCH\n" + "+\n".repeat(650_000) + "+TAIL MATCH\n";
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={diff} label="Tall diff" /></div>);
+  await until(() => host.querySelector(".diff-view"), "tall diff mounted");
+  const viewport = host.querySelector(".diff-view");
+  assert(viewport.scrollHeight < 16_000_000, `Tall diff track was clamped: ${viewport.scrollHeight}px`);
+  const stickyInset = () => viewport.firstElementChild?.firstElementChild?.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
+  assert(Math.abs(stickyInset() - parseFloat(getComputedStyle(viewport).paddingTop)) < 1,
+    `Compressed diff lost its top inset before scrolling: inset=${stickyInset()}`);
+  viewport.scrollTop = viewport.scrollHeight;
+  viewport.dispatchEvent(new Event("scroll"));
+  await until(() => viewport.textContent.includes("TAIL MATCH"), "End reaches final line of tall diff");
+  assert(Math.abs(stickyInset() - parseFloat(getComputedStyle(viewport).paddingTop)) < 1,
+    `Compressed diff lost its top inset after scrolling: inset=${stickyInset()}`);
+  assert(viewport.querySelectorAll("span").length < 200, "Tall diff mounted an unbounded line window");
+  viewport.scrollTop = 0; viewport.dispatchEvent(new Event("scroll")); await settle();
+  // Safari can report a negative physical position during top-edge bounce.
+  // The virtual window must never turn that into a negative line index.
+  Object.defineProperty(viewport, "scrollTop", { configurable: true, get: () => -14, set: () => {} });
+  try {
+    viewport.dispatchEvent(new Event("scroll"));
+    await settle();
+    assert(Number(viewport.dataset.firstLine) === 0 && Number(viewport.dataset.mountedStart) === 0
+      && viewport.textContent.includes("+"), "Top-edge overscroll mounted a negative diff row");
+  } finally { delete viewport.scrollTop; }
+  viewport.dispatchEvent(new Event("scroll")); await settle();
+  const input = host.querySelector('input[aria-label="Find in diff"]');
+  setControlValue(input, "MIDDLE MATCH"); await settle();
+  // Hold the physical scrollbar for one commit, as a browser can do while a
+  // large track relayout settles. The mounted Find row must use the observed
+  // viewport position even when the logical seek is already committed.
+  const nativeScrollTop = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop");
+  let holdPhysicalScroll = true;
+  Object.defineProperty(viewport, "scrollTop", {
+    configurable: true,
+    get: () => nativeScrollTop.get.call(viewport),
+    set: (value) => { if (!holdPhysicalScroll) nativeScrollTop.set.call(viewport, value); },
+  });
+  try {
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("MIDDLE MATCH"), "Find reaches the middle of compressed diff");
+    const mark = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+    const view = viewport.getBoundingClientRect();
+    assert(mark.top < view.bottom && mark.bottom > view.top,
+      `Pending compressed Find placed its row at an unobserved scroll position: mark=${mark.top}/${mark.bottom}, viewport=${view.top}/${view.bottom}, scroll=${viewport.scrollTop}, first=${viewport.dataset.firstLine}, mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}, rowTop=${viewport.firstElementChild?.firstElementChild?.style.top}`);
+  } finally {
+    holdPhysicalScroll = false;
+    delete viewport.scrollTop;
+  }
+  const visibleCompressedMark = (text) => {
+    const mark = viewport.querySelector('[data-find-match="true"]');
+    if (!mark?.textContent.includes(text)) return false;
+    const row = mark.getBoundingClientRect();
+    const view = viewport.getBoundingClientRect();
+    return row.top < view.bottom && row.bottom > view.top;
+  };
+  const awaitCompressedMark = async (text, label) => {
+    try { await until(() => visibleCompressedMark(text), label); }
+    catch (error) {
+      const row = viewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect();
+      const view = viewport.getBoundingClientRect();
+      throw new Error(`${error.message}; mark=${row?.top}/${row?.bottom}, viewport=${view.top}/${view.bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}, first=${viewport.dataset.firstLine}, mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`);
+    }
+  };
+  await awaitCompressedMark("MIDDLE MATCH", "middle compressed diff alignment");
+  let middleBounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+  assert(middleBounds.top < viewport.getBoundingClientRect().bottom && middleBounds.bottom > viewport.getBoundingClientRect().top, "Middle compressed diff match was mounted outside the viewport");
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={"+\n".repeat(10_000) + diff} label="Tall diff" /></div>);
+  await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("MIDDLE MATCH") && host.querySelector('.window-find [role="status"]')?.textContent === "Line 610001", "Refresh realigns a moved middle match");
+  await awaitCompressedMark("MIDDLE MATCH", "refreshed compressed diff alignment");
+  middleBounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+  assert(middleBounds.top < viewport.getBoundingClientRect().bottom && middleBounds.bottom > viewport.getBoundingClientRect().top, "Refreshed compressed diff match was outside the viewport");
+  setControlValue(input, "TAIL MATCH"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("TAIL MATCH"), "Find reaches final line of tall diff");
+  await awaitCompressedMark("TAIL MATCH", "compressed tail Find alignment");
+  const bounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+  assert(bounds.top < viewport.getBoundingClientRect().bottom && bounds.bottom > viewport.getBoundingClientRect().top, `Tall diff find mark is outside the viewport: mark=${bounds.top}/${bounds.bottom}, viewport=${viewport.getBoundingClientRect().top}/${viewport.getBoundingClientRect().bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}`);
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 300 }}><WindowedDiff diff={"+\n".repeat(10_000) + diff} label="Tall diff" /></div>);
+  await until(() => viewport.clientHeight < 400 && viewport.querySelector('[data-find-match="true"]')?.textContent.includes("TAIL MATCH"), "tail Find survives compressed resize");
+  for (let tick = 0; tick < 4; tick += 1) await frame();
+  const resizedTail = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+  const resizedTrack = viewport.getBoundingClientRect();
+  assert(resizedTail.top < resizedTrack.bottom && resizedTail.bottom > resizedTrack.top,
+    `Compressed tail Find lost physical alignment after resize: mark=${resizedTail.top}, viewport=${resizedTrack.top}/${resizedTrack.bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}, first=${viewport.dataset.firstLine}, mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`);
+  viewport.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+  viewport.scrollTop = 0;
+  viewport.dispatchEvent(new Event("scroll"));
+  await until(() => Number(viewport.dataset.firstLine) < 100, "scrollbar takes compressed diff ownership after Find");
+  host.querySelector('[aria-label="Next diff match"]').click();
+  await until(() => {
+    const mark = viewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect();
+    const view = viewport.getBoundingClientRect();
+    return mark && mark.top < view.bottom && mark.bottom > view.top;
+  }, "Find returns to tail after scrollbar movement");
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={null} label="Empty diff" /></div>);
+  await until(() => host.querySelector(".diff-empty"), "nullable diff shows its empty state");
+  const nearLimit = "+\n".repeat(2_900_000) + `+WHEEL A ${"x".repeat(1_000)}\n+WHEEL B\n` + "+\n".repeat(2_899_998) + "+NEAR LIMIT TAIL\n";
+  const heapBefore = performance.memory?.usedJSHeapSize ?? null;
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={nearLimit} label="Near-limit diff" /></div>);
+  await until(() => host.querySelector('.diff-view')?.scrollHeight > 1_000_000, "near-limit diff track mounted");
+  const nearViewport = host.querySelector('.diff-view');
+  assert(nearViewport.scrollHeight < 16_000_000, "near-limit diff exceeded browser scroll geometry");
+  const compressedBeforeZoom = nearViewport.scrollTop;
+  assert(nearViewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 120, ctrlKey: true, bubbles: true, cancelable: true })),
+    "Compressed diff intercepted browser zoom");
+  assert(nearViewport.scrollTop === compressedBeforeZoom, "Compressed diff scrolled during browser zoom");
+  const nearInput = host.querySelector('input[aria-label="Find in diff"]');
+  setControlValue(nearInput, "WHEEL A"); await settle();
+  nearInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => nearViewport.querySelector('[data-find-match="true"]')?.textContent.includes("WHEEL A"), "near-limit middle marker visible");
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 360 }}><WindowedDiff diff={nearLimit} label="Near-limit diff" /></div>);
+  await until(() => nearViewport.clientHeight < 400 && nearViewport.querySelector('[data-find-match="true"]')?.textContent.includes("WHEEL A"), "refreshed diff resized");
+  for (let tick = 0; tick < 4; tick += 1) await frame();
+  const resizedMark = nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+  const resizedViewport = nearViewport.getBoundingClientRect();
+  assert(resizedMark.top < resizedViewport.bottom && resizedMark.bottom > resizedViewport.top, "resizing a refreshed compressed diff lost its matched line");
+  await settle();
+  const beforeWheel = nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top;
+  nearViewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 14, bubbles: true, cancelable: true }));
+  await until(() => nearViewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top < beforeWheel - 5, "compressed wheel advanced one logical line");
+  assert(Math.abs(nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top - beforeWheel + 14) < 5, "Compressed wheel skipped logical lines");
+  const beforeBatch = nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top;
+  const wheelTrace = [];
+  for (let step = 0; step < 3; step += 1) {
+    nearViewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 14, bubbles: true, cancelable: true }));
+    wheelTrace.push({ top: nearViewport.scrollTop, first: nearViewport.dataset.firstLine,
+      mounted: [nearViewport.dataset.mountedStart, nearViewport.dataset.mountedEnd] });
+  }
+  try {
+    await until(() => nearViewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top < beforeBatch - 35, "batched wheels advanced three logical lines");
+  } catch (error) {
+    throw new Error(`Batched diff wheel lost a logical line: ${JSON.stringify({ beforeBatch, after: nearViewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top,
+      physicalTop: nearViewport.scrollTop, first: nearViewport.dataset.firstLine, mounted: [nearViewport.dataset.mountedStart, nearViewport.dataset.mountedEnd], wheelTrace })}`, { cause: error });
+  }
+  assert(Math.abs(nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top - beforeBatch + 42) < 5, "Batched wheels skipped or doubled logical lines");
+  // Model an asynchronous native default queued during capture. Record both
+  // coordinate systems even if cancellation succeeds but row placement drifts.
+  const beforeEarlyDefault = nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top;
+  const beforeEarlyCoordinates = { physical: nearViewport.scrollTop, logical: nearViewport.dataset.firstLine,
+    mounted: [nearViewport.dataset.mountedStart, nearViewport.dataset.mountedEnd], rowTop: nearViewport.firstElementChild?.firstElementChild?.getBoundingClientRect().top };
+  let earlyDefaultQueued = false;
+  const queueEarlyDefault = (event) => { if (!event.defaultPrevented) earlyDefaultQueued = true; };
+  nearViewport.addEventListener("wheel", queueEarlyDefault, { capture: true });
+  nearViewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 14, bubbles: true, cancelable: true }));
+  nearViewport.removeEventListener("wheel", queueEarlyDefault, { capture: true });
+  if (earlyDefaultQueued) nearViewport.scrollTop += 14;
+  await settle();
+  assert(!earlyDefaultQueued && Math.abs(nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top - beforeEarlyDefault + 14) < 5,
+    `Compressed wheel displaced the Find mark: queued=${earlyDefaultQueued}, before=${beforeEarlyDefault}, after=${nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top}, beforeCoordinates=${JSON.stringify(beforeEarlyCoordinates)}, afterCoordinates=${JSON.stringify({ physical: nearViewport.scrollTop, logical: nearViewport.dataset.firstLine, mounted: [nearViewport.dataset.mountedStart, nearViewport.dataset.mountedEnd], rowTop: nearViewport.firstElementChild?.firstElementChild?.getBoundingClientRect().top })}`);
+  if (window.__fixtureWheel) {
+    nearViewport.scrollIntoView({ block: "center" });
+    await frame();
+    const area = nearViewport.getBoundingClientRect();
+    const beforeNative = nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top;
+    const delivery = await window.__fixtureWheel(area.left + area.width / 2, area.top + area.height / 2, 14, 80);
+    assert(delivery.viewport === nearViewport && delivery.defaultPrevented,
+      `Native compressed wheel was not canceled at its target: ${JSON.stringify({ target: delivery.viewport?.className, canceled: delivery.defaultPrevented })}`);
+    await until(() => nearViewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top < beforeNative - 5, "native compressed wheel advanced");
+    await settle();
+    assert(Math.abs(nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect().top - beforeNative + 14) < 5, "Native wheel also performed a passive default scroll");
+    assert(nearViewport.scrollLeft > 0, "Combined horizontal wheel navigation was lost");
+  }
+  nearViewport.scrollTop = nearViewport.scrollHeight;
+  nearViewport.dispatchEvent(new Event("scroll"));
+  await until(() => nearViewport.textContent.includes("NEAR LIMIT TAIL"), "near-limit End reaches the final line");
+  nearViewport.scrollTop = 0; nearViewport.dispatchEvent(new Event("scroll"));
+  setControlValue(nearInput, "NEAR LIMIT TAIL"); await settle();
+  nearInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => nearViewport.querySelector('[data-find-match="true"]')?.textContent.includes("NEAR LIMIT TAIL"), "near-limit Find reaches the final line");
+  assert(nearViewport.querySelectorAll("span").length < 200, "near-limit diff mounted unbounded rows");
+  window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), nearLimitDiff: { bytes: nearLimit.length, lines: 5_800_001, heapBefore, heapAfter: performance.memory?.usedJSHeapSize ?? null, mountedAtEnd: nearViewport.querySelectorAll("span").length } };
+}
+
+async function unicodeDiffFindRegression() {
+  root.render(null); await settle();
+  const diff = "+İstanbul\n" + Array.from({ length: 400 }, (_, index) => `+filler ${index}\n`).join("") + "+CAFÉ target\n+ΟΣ final\n+ΑΣΑ medial\n+I token\n+Straße token\n+ﬃ ligature\n";
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={diff} label="Unicode diff" /></div>);
+  await until(() => host.querySelector('input[aria-label="Find in diff"]'), "Unicode diff find ready");
+  const input = host.querySelector('input[aria-label="Find in diff"]');
+  setControlValue(input, "café"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("CAFÉ target"), "Unicode match on the correct diff line");
+  await until(() => host.querySelector('.window-find [role="status"]')?.textContent === "Line 402", "Unicode find announcement settled");
+  assert(host.querySelector('.window-find [role="status"]')?.textContent === "Line 402", "Unicode case folding shifted the diff line coordinate");
+  setControlValue(input, "Σ"); await settle();
+  host.querySelector('[aria-label="Next diff match"]').click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("ΟΣ final"), "diff Find matches final sigma");
+  host.querySelector('[aria-label="Next diff match"]').click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("ΑΣΑ medial"), "diff Find matches medial sigma");
+  host.querySelector('[aria-label="Next diff match"]').click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("ΟΣ final"), "diff Find wraps sigma forms");
+  setControlValue(input, "STRASSE"); await settle();
+  host.querySelector('[aria-label="Next diff match"]').click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("Straße token"), "diff Find matches expanding case fold");
+  setControlValue(input, "FFI"); await settle();
+  host.querySelector('[aria-label="Next diff match"]').click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("ﬃ ligature"), "diff Find matches a ligature fold");
+  setControlValue(input, "i token"); await settle();
+  host.querySelector('[aria-label="Next diff match"]').click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("I token"), "diff Find ignores host locale");
+}
+
+async function reverseDiffFindWrapRegression() {
+  root.render(null); await settle();
+  root.render(<div style={{ height: 420 }}><WindowedDiff diff={"needle first\nneedle middle\nneedle last\n"} label="Reverse Find diff" /></div>);
+  await until(() => host.querySelector('input[aria-label="Find in diff"]'), "reverse Find ready");
+  const input = host.querySelector('input[aria-label="Find in diff"]');
+  setControlValue(input, "needle"); await settle();
+  const next = host.querySelector('[aria-label="Next diff match"]');
+  const previous = host.querySelector('[aria-label="Previous diff match"]');
+  next.click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("first"), "first diff match");
+  previous.click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("last"), "Previous wraps from offset zero to the final match");
+  previous.click();
+  await until(() => host.querySelector('.diff-view [data-find-match="true"]')?.textContent.includes("middle"), "Previous continues from the wrapped match");
+}
+
+async function manyWorktreeSessionRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-W0" : index === 1 ? "W0" : "A"));
+  const worktrees = Array.from({ length: 200 }, (_, index) => ({ id: `W${index}`, name: `Tree ${index}`, path: `/fixture/A/W${index}`, branch: `branch-${index}`, changedCount: 0 }));
+  const project = { ...projects[0], worktrees };
+  const conversationFor = (id) => ({ id: `chat-${id}`, title: `Chat ${id}`, projectId: "A", worktreeId: id, worktreePath: `/fixture/A/${id}`, provider: "codex", messages: [{ id: `message-${id}`, role: "assistant", kind: "text", body: `Output for ${id}`, createdAt: "2026-09-26T00:00:00Z" }], runs: [] });
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [project], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [conversationFor(url.searchParams.get("worktreeId"))] });
+    const id = url.pathname.match(/^\/api\/conversations\/chat-(W\d+)$/)?.[1];
+    if (id) return response(conversationFor(id));
+    return response({});
+  };
+  const started = performance.now();
+  const heapBefore = performance.memory?.usedJSHeapSize ?? null;
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('#chat-tab-chat-W0[aria-selected="true"]'), "initial many-worktree chat");
+  let heapAtHalf = null;
+  for (let index = 0; index < 16; index += 1) {
+    const id = index % 2 ? "W0" : "W199";
+    const target = [...host.querySelectorAll(".worktree-row")].find((row) => row.textContent.includes(`Tree ${Number(id.slice(1))}`));
+    assert(target, `Missing ${id} in worktree navigation`);
+    target.click();
+    await until(() => host.querySelector(`#chat-tab-chat-${id}[aria-selected="true"]`) && host.querySelector(`[data-message-id="message-${id}"]`), `selected ${id} chat`);
+    assert(host.querySelectorAll(".message-scroll").length === 1 && host.querySelectorAll("[data-message-id]").length === 1, "Worktree navigation accumulated hidden conversations");
+    if (index === 7) heapAtHalf = performance.memory?.usedJSHeapSize ?? null;
+  }
+  const input = host.querySelector('textarea[aria-label="Message the agent"]');
+  const inputStarted = performance.now();
+  setControlValue(input, "Responsive after switching worktrees");
+  await frame();
+  const inputFrameMs = Math.round(performance.now() - inputStarted);
+  assert(host.querySelectorAll(".worktree-row").length === 200, "Fixture did not exercise all worktree rows");
+  const elapsedMs = Math.round(performance.now() - started);
+  const heapAfter = performance.memory?.usedJSHeapSize ?? null;
+  assert(elapsedMs < 6_000 && inputFrameMs < 250, `Many-worktree interaction exceeded its fixture budget: navigation ${elapsedMs}ms, input ${inputFrameMs}ms`);
+  if (heapBefore !== null && heapAfter !== null) assert(heapAfter - heapBefore < 64 * 1024 * 1024, "Repeated worktree switches grew the heap without bound");
+  window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), worktrees: { count: 200, switches: 16, elapsedMs, inputFrameMs, heapBefore, heapAtHalf, heapAfter } };
+}
+
+async function pagedTranscriptAnchorRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (index) => ({ id: `message-${index}`, role: "assistant", kind: "text", body: `Historical message ${index}`, createdAt: new Date(index * 1_000).toISOString() });
+  const initial = Array.from({ length: 1_000 }, (_, index) => message(index + 1_000));
+  const older = Array.from({ length: 200 }, (_, index) => message(index + 800));
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A/messages") return response({ messages: older, messagePage: { hasMore: true, olderCount: 800, beforeId: "message-800", total: 2_000 } });
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: initial, messagePage: { hasMore: true, olderCount: 1_000, beforeId: "message-1000", total: 2_000 } });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.history-loader')?.textContent.includes("1000"), "paged transcript loaded");
+  await settle();
+  const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+  try { await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96, "latest messages on open"); }
+  catch (error) { throw new Error(`${error.message}: scroll=${viewport.scrollTop}, height=${viewport.scrollHeight}, client=${viewport.clientHeight}`); }
+  viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1000 }));
+  viewport.scrollTop = 0;
+  viewport.dispatchEvent(new Event("scroll"));
+  await until(() => host.querySelector('[data-message-id="message-1000"]'), "first anchor visible");
+  await settle();
+  await until(() => host.querySelector('[data-message-id="message-1000"]')?.getBoundingClientRect().top < viewport.getBoundingClientRect().bottom,
+    "first reading row remained visible");
+  const before = host.querySelector('[data-message-id="message-1000"]').getBoundingClientRect().top;
+  host.querySelector('.history-loader').click();
+  try { await until(() => host.querySelector('.history-loader')?.textContent.includes("800") && host.querySelector('[data-message-id="message-1000"]'), "paged anchor restored"); }
+  catch (error) { throw new Error(`${error.message}; loader=${host.querySelector('.history-loader')?.textContent}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}, rows=${[...host.querySelectorAll('[data-message-id]')].map((item) => item.dataset.messageId).join(",")}`); }
+  try { await until(() => Math.abs(host.querySelector('[data-message-id="message-1000"]')?.getBoundingClientRect().top - before) < 10, "paged reading anchor settled"); }
+  catch (error) {
+    const anchor = host.querySelector('[data-message-id="message-1000"]');
+    throw new Error(`${error.message}; delta=${anchor ? Math.round(anchor.getBoundingClientRect().top - before) : "missing"}px`);
+  }
+  assert(host.querySelectorAll('[role="listitem"]').length < 40, "Paged transcript mounted too many messages");
+  viewport.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+  viewport.scrollTop = 1_500;
+  viewport.dispatchEvent(new Event("scroll"));
+  for (let frameIndex = 0; frameIndex < 9; frameIndex += 1) await frame();
+  assert(Math.abs(viewport.scrollTop - 1_500) < 24, "Anchor restoration overrode pointer navigation");
+}
+
+async function pagedTranscriptFindRegression({ endOnly = false, measuredOnly = false } = {}) {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (index) => ({ id: `message-${index}`, role: "assistant", kind: "text", body: index === 10 || index === 900 ? `Needle ${index}` : `Other ${index}`, createdAt: new Date(index * 1_000).toISOString() });
+  const latest = Array.from({ length: 200 }, (_, index) => message(index + 800));
+  const earliest = Array.from({ length: 200 }, (_, index) => message(index));
+  const staleSearch = deferred();
+  const lateSearch = deferred();
+  const olderRequest = deferred();
+  let staleRequested = false;
+  let partialReads = 0;
+  let contextReads = 0;
+  let leftReads = 0;
+  let archived = false;
+  let archiveSignal;
+  const archiveSearch = deferred();
+  const draggedSearch = deferred();
+  let draggedSignal;
+  let lateRequested = false;
+  let olderRequested = false;
+  let olderRequests = 0;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: archived ? [] : [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A" && options?.method === "PATCH") { archived = true; return response({ ...chats.A, archived: true }); }
+    if (url.pathname.endsWith("/messages/find")) {
+      if (url.searchParams.get("q") === "archive") { archiveSignal = options.signal; return archiveSearch.promise; }
+      if (url.searchParams.get("q") === "drag") { draggedSignal = options.signal; return draggedSearch.promise; }
+      if (url.searchParams.get("q") === "partial") {
+        partialReads += 1;
+        if (partialReads > 1) assert(url.searchParams.get("after") === "message-1"
+          && Number(url.searchParams.get("byteOffset")) === (partialReads - 1) * 1024,
+        "A continuation lost its byte offset inside the oversized row");
+        return partialReads <= 8
+          ? response({ partial: true, nextAfterId: "message-1", nextByteOffset: partialReads * 1024, originId: null, wrapped: false })
+          : response({ matchId: "message-10", messages: earliest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } });
+      }
+      if (url.searchParams.get("q") === "context") {
+        contextReads += 1;
+        if (contextReads > 1) assert(url.searchParams.get("after") === "message-1"
+          && Number(url.searchParams.get("contextOffset")) === (contextReads - 1) * 1024,
+        "Unicode context continuation lost its same-row cursor");
+        return contextReads <= 2
+          ? response({ partial: true, nextAfterId: "message-1", nextByteOffset: 0, nextContextOffset: contextReads * 1024, originId: null, wrapped: false })
+          : response({ matchId: "message-10", messages: earliest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } });
+      }
+      if (url.searchParams.get("q") === "left") {
+        leftReads += 1;
+        if (leftReads === 2) assert(url.searchParams.get("after") === "message-1"
+          && Number(url.searchParams.get("leftContextOffset")) === 8192,
+        "left Unicode context cursor did not resume");
+        if (leftReads === 3) assert(Number(url.searchParams.get("leftContextOffset")) === 4096,
+        "left Unicode context cursor did not advance backwards");
+        if (leftReads === 4) assert(Number(url.searchParams.get("contextOffset")) === 1024
+          && url.searchParams.get("leftContextCased") === "1",
+        "right Unicode context lost resolved left state");
+        if (leftReads <= 2) return response({ partial: true, nextAfterId: "message-1", nextByteOffset: 0,
+          nextLeftContextOffset: leftReads === 1 ? 8192 : 4096, originId: null, wrapped: false });
+        if (leftReads === 3) return response({ partial: true, nextAfterId: "message-1", nextByteOffset: 0,
+          nextContextOffset: 1024, nextLeftContextCased: true, originId: null, wrapped: false });
+        return response({ matchId: "message-10", messages: earliest,
+          messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } });
+      }
+      if (url.searchParams.get("q") === "stale") { staleRequested = true; return staleSearch.promise; }
+      if (url.searchParams.get("q") === "late") { lateRequested = true; return lateSearch.promise; }
+      if (url.searchParams.get("q") === "none") return response({ matchId: null, messages: [], messagePage: null });
+      if (url.searchParams.get("q") === "failure") return response({ error: "Search unavailable" }, 503);
+      const older = !url.searchParams.get("after") || url.searchParams.get("after") === "message-900";
+      return response({ matchId: older ? "message-10" : "message-900", messages: older ? earliest : latest, messagePage: { hasMore: !older, olderCount: older ? 0 : 800, hasLater: older, newerCount: older ? 800 : 0, total: 1_000, beforeId: older ? "message-0" : "message-800" } });
+    }
+    if (url.pathname === "/api/conversations/chat-A/messages") { olderRequested = true; olderRequests += 1; return olderRequests === 1 ? olderRequest.promise : response({ error: "Older page unavailable" }, 503); }
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: 800, total: 1_000, beforeId: "message-800" } });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.history-find input'), "paged find ready");
+  const input = host.querySelector('.history-find input');
+  setControlValue(input, "Needle"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  try { await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-10"]'), "old persisted match"); }
+  catch (error) { throw new Error(`${error.message}; status=${host.querySelector('.history-find .history-find-status')?.textContent}, scroll=${host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]')?.scrollTop}, rows=${[...host.querySelectorAll('[data-message-id]')].map((item) => item.dataset.messageId).slice(0, 4).join(',')}`); }
+  const foundViewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+  await until(() => {
+    const row = host.querySelector('[data-find-match="true"]');
+    return row && row.getBoundingClientRect().top < foundViewport.getBoundingClientRect().bottom
+      && row.getBoundingClientRect().bottom > foundViewport.getBoundingClientRect().top;
+  }, "initial found row visible");
+  const foundRow = host.querySelector('[data-find-match="true"]');
+  assert(host.querySelectorAll('[role="listitem"]').length < 40, "Old search match mounted all history");
+  assert(host.querySelector('.history-find .history-find-status')?.textContent === "Message 11 of 1000", "Old match announced its page-local index");
+  await until(() => host.querySelector('.history-find [role="status"]')?.textContent === "Message 11 of 1000", "settled found result announced");
+  assert(foundRow.getAttribute("aria-posinset") === "11" && foundRow.getAttribute("aria-setsize") === "1000", "Old match advertised a page-local list size");
+  assert(host.querySelector('.history-return'), "An older search page lost return-to-latest navigation");
+  for (const type of ["run.completed", "run.failed", "run.stopped"]) {
+    fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: `run-${type}`, payload: { type } }) }));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await settle();
+    assert(host.querySelector('.history-return') && host.querySelector('[data-find-match="true"] [data-message-id="message-10"]'), `${type} replaced the chosen history page or find highlight: return=${Boolean(host.querySelector('.history-return'))}, match=${host.querySelector('[data-find-match="true"] [data-message-id]')?.dataset.messageId}, status=${host.querySelector('.history-find .history-find-status')?.textContent}, scroll=${host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]')?.scrollTop}, rows=${[...host.querySelectorAll('[data-message-id]')].map((item) => item.dataset.messageId).slice(0, 3).join(',')}`);
+  }
+  host.querySelector('[aria-label="Next conversation match"]').click();
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-900"]'), "newer persisted match");
+  assert(host.querySelector('.history-find .history-find-status')?.textContent === "Message 901 of 1000", "New match announced its page-local index");
+  const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+  input.focus();
+  const bounds = input.getBoundingClientRect();
+  const visible = viewport.getBoundingClientRect();
+  assert(document.activeElement === input && bounds.top >= visible.top && bounds.bottom <= visible.bottom, "Focused find control scrolled out of the transcript viewport");
+  viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true }));
+  viewport.scrollTop = Math.max(0, viewport.scrollTop - 350);
+  viewport.dispatchEvent(new Event("scroll"));
+  await settle();
+  // Let the virtual range commit after wheel navigation before recording its
+  // reading anchor. A queued range change can alter scroll geometry by itself.
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const visibleReadingRow = () => [...viewport.querySelectorAll('[data-message-id]')].find((element) => {
+    const row = element.getBoundingClientRect();
+    const frame = viewport.getBoundingClientRect();
+    return row.bottom > frame.top && row.top < frame.bottom;
+  });
+  await until(() => visibleReadingRow(), "visible reading row before live append");
+  const readingId = visibleReadingRow().dataset.messageId;
+  const readingTop = visibleReadingRow().getBoundingClientRect().top;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1_000) }) }));
+  await settle();
+  try { await until(() => {
+    const row = [...viewport.querySelectorAll('[data-message-id]')].find((element) => element.dataset.messageId === readingId);
+    return row && Math.abs(row.getBoundingClientRect().top - readingTop) < 12;
+  }, "live append retained the visible reading anchor"); }
+  catch (error) {
+    const row = [...viewport.querySelectorAll('[data-message-id]')].find((element) => element.dataset.messageId === readingId);
+    throw new Error(`${error.message}; id=${readingId}, before=${readingTop}, after=${row?.getBoundingClientRect().top}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}`);
+  }
+  host.querySelector('[aria-label="Previous conversation match"]').click();
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-10"]'), "previous persisted match");
+  assert(document.activeElement === input && input.getBoundingClientRect().top >= visible.top, "Find control disappeared during previous navigation");
+  host.querySelector('[aria-label="Next conversation match"]').click();
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-900"]'), "next persisted match");
+  setControlValue(input, "stale"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => staleRequested, "stale search request pending");
+  assert(!host.querySelector('.history-find [role="status"]')?.textContent, "pending search announced a transient state");
+  setControlValue(input, "Needle"); await settle();
+  staleSearch.resolve(response({ matchId: "message-10", messages: earliest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } }));
+  await settle();
+  assert(host.querySelector('.history-loader')?.textContent.includes("800") && host.querySelector('.history-return')?.textContent.includes("1 new"), `A cancelled find lost the newer live message affordance: loader=${host.querySelector('.history-loader')?.textContent}, return=${host.querySelector('.history-return')?.textContent}`);
+  host.querySelector('[aria-label="Previous conversation match"]').click();
+  await until(() => host.querySelector('.history-return'), "older page before return race");
+  setControlValue(input, "late"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => lateRequested, "late find started");
+  host.querySelector('.history-return').click();
+  await until(() => host.querySelector('.history-loader')?.textContent.includes("800")
+    && !host.querySelector('.history-return'), "return to latest completed");
+  assert(!host.querySelector('[data-find-match="true"]'), "Return to latest kept a stale match highlight");
+  lateSearch.resolve(response({ matchId: "message-10", messages: earliest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } }));
+  await settle();
+  assert(!host.querySelector('.history-return'), "A late find replaced Return to latest");
+  assert(host.querySelector('.history-find .history-find-status')?.textContent !== "No match", "A cancelled find announced a false miss");
+  host.querySelector('.history-loader').click();
+  await until(() => olderRequested, "older page request pending");
+  setControlValue(input, "none"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('.history-find .history-find-status')?.textContent === "No match", "no-match search completed");
+  await until(() => host.querySelector('.history-find [role="status"]')?.textContent === "No match", "settled no-match announced");
+  olderRequest.resolve(response({ messages: earliest, messagePage: { hasMore: false, olderCount: 0, total: 1_000, beforeId: "message-0" } }));
+  await settle();
+  assert(host.querySelector('.history-loader')?.textContent.includes("800"), "Stale prepend replaced the selected page");
+  setControlValue(input, "failure"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('.history-find .history-find-status')?.textContent === "Search failed; retry", "find failure reported");
+  await until(() => host.querySelector('.history-find [role="status"]')?.textContent === "Search failed; retry", "settled failure announced");
+  assert(host.querySelector('.history-loader')?.textContent.includes("800"), "Failed find replaced the current page");
+  host.querySelector('.history-loader').click();
+  await until(() => host.textContent.includes("Older page unavailable"), "failed prepend reported");
+  if (endOnly) {
+    viewport.focus();
+    await window.__fixtureSendKey("End");
+    await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96, "End reached latest after failed prepend");
+    fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1_001) }) }));
+    await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96, "End kept following a live append");
+    assert(!host.querySelector('.history-return'), "End on the latest page exposed a Return control");
+    return;
+  }
+  if (measuredOnly) {
+    viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -300 }));
+    viewport.scrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight - 300);
+    viewport.dispatchEvent(new Event("scroll"));
+    await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop > 200,
+      "reader moved away before End reestablished latest intent");
+    viewport.focus();
+    await window.__fixtureSendKey("End");
+    await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96,
+      "End established latest-page intent before the row grew");
+    const row = viewport.querySelector('[data-window-id]');
+    assert(row, "Measured-height fixture has no mounted row");
+    const oldEnd = viewport.scrollHeight - viewport.clientHeight;
+    row.style.minHeight = `${row.getBoundingClientRect().height + 900}px`;
+    viewport.scrollTop = oldEnd;
+    viewport.dispatchEvent(new Event("scroll"));
+    try { await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96,
+      "latest page followed the newly measured row before the next message"); }
+    catch (error) { throw new Error(`${error.message}; oldEnd=${oldEnd}, top=${viewport.scrollTop}, max=${viewport.scrollHeight - viewport.clientHeight}, rowHeight=${row.getBoundingClientRect().height}, return=${host.querySelector('.history-return')?.textContent}`); }
+    fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1_001) }) }));
+    try { await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96, "latest page followed a newly measured row and live append"); }
+    catch (error) { throw new Error(`${error.message}; oldEnd=${oldEnd}, top=${viewport.scrollTop}, height=${viewport.scrollHeight}, client=${viewport.clientHeight}, rows=${[...viewport.querySelectorAll('[data-message-id]')].map((item) => item.dataset.messageId).join(',')}`); }
+    assert(!host.querySelector('.history-return'), "A measured latest row exposed a Return control");
+    return;
+  }
+  viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); await settle();
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1_001) }) }));
+  await settle();
+  const bottomDeadline = performance.now() + 250;
+  while (viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop >= 96 && performance.now() < bottomDeadline) await frame();
+  assert(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96, `Stale prepend disabled bottom following: top=${viewport.scrollTop}, height=${viewport.scrollHeight}, client=${viewport.clientHeight}, return=${host.querySelector('.history-return')?.textContent}, loader=${host.querySelector('.history-loader')?.textContent}`);
+  setControlValue(input, "partial"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('.history-find .history-find-status')?.textContent === "Search paused; press Enter to continue", "bounded search offered an explicit continuation");
+  await until(() => host.querySelector('.history-find [role="status"]')?.textContent === "Search paused; press Enter to continue", "settled continuation announced");
+  assert(partialReads === 8, "one Find action exceeded its request budget");
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-10"]'), "continued search found an older message");
+  assert(partialReads === 9, "continuation restarted the search rather than resuming it");
+  setControlValue(input, "context"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-10"]') && contextReads === 3,
+    "bounded Unicode context continued within the same row");
+  setControlValue(input, "left"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="message-10"]') && leftReads === 4,
+    "both bounded Unicode contexts continued within the same row");
+  setControlValue(input, "drag"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => draggedSignal, "drag search entered its server slot");
+  viewport.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+  await until(() => draggedSignal.aborted, "pointer navigation aborted its pending Find request");
+  await until(() => !host.querySelector('.history-find [role="status"]')?.textContent, "canceled search cleared stale live announcement");
+  draggedSearch.resolve(response({ matchId: "message-10", messages: earliest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1_000, beforeId: "message-0" } }));
+  await settle();
+  assert(!host.querySelector('.history-find .history-find-status')?.textContent.includes("Searching") && !host.querySelector('[data-find-match="true"]'), "A dragged Find response restored its stale match");
+  setControlValue(input, "archive"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => archiveSignal, "archive search entered its server slot");
+  host.querySelector(".chat-tab.is-active .tab-close").click();
+  await until(() => archiveSignal.aborted, "archiving aborted its pending Find request");
+  archiveSearch.resolve(response({ matchId: null, messages: [], messagePage: null }));
+  await until(() => !host.querySelector('.chat-tab.is-active'), "archived chat released its visible owner");
+}
+
+async function fullFindMessageReaderRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const full = { id: "large-match", role: "assistant", kind: "text", body: "startneedle-end", createdAt: new Date().toISOString() };
+  const excerpt = { ...full, body: "needle [Later text omitted from Find result]", findExcerpt: true };
+  const later = { ...full, id: "later-message", body: "Later response" };
+  let failedNext = false;
+  let bodyRequests = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname.endsWith("/messages/find")) return response({ matchId: full.id, messages: [excerpt], messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 1, total: 2, beforeId: full.id } });
+    if (url.pathname.endsWith(`/messages/${full.id}/body`)) {
+      bodyRequests += 1;
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      if (offset === 5 && !failedNext) { failedNext = true; return response({ error: "Section unavailable" }, 503); }
+      return response(offset ? { id: full.id, body: "needle-end", offset: 5, nextOffset: 15, totalBytes: 15, hasMore: false }
+        : { id: full.id, body: "start", offset: 0, nextOffset: 5, totalBytes: 15, hasMore: true });
+    }
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: [later], messagePage: { hasMore: true, olderCount: 1, total: 2, beforeId: later.id } });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.history-find input'), "Find reader ready");
+  setControlValue(host.querySelector('.history-find input'), "needle"); await settle();
+  host.querySelector('.history-find input').dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('.message-full-reader button'), "excerpt offers full message");
+  const open = host.querySelector('.message-full-reader button');
+  open.focus();
+  assert(document.activeElement === open, "full message action is keyboard reachable");
+  if (window.__fixtureSendKey) await window.__fixtureSendKey("Enter"); else open.click();
+  try { await until(() => host.querySelector('.message-full-reader pre')?.textContent === "start", "first body section loaded"); }
+  catch (error) { throw new Error(`${error.message}; requests=${bodyRequests}, reader=${host.querySelector('.message-full-reader')?.textContent?.slice(0, 300)}, active=${document.activeElement?.outerHTML?.slice(0, 150)}`); }
+  assert(host.querySelector('.message-full-reader p')?.textContent === "Bytes 1–5 of 15", "first section did not show its byte range");
+  const next = [...host.querySelectorAll('.message-full-reader button')].find((button) => button.textContent === "Next section");
+  next.click();
+  await until(() => host.querySelector('.message-full-reader [role="alert"]')?.textContent.includes("Section unavailable"), "body section failure exposed retry");
+  assert(host.querySelector('.message-full-reader pre')?.textContent === "start", "failed section did not discard the readable section");
+  next.click();
+  await until(() => host.querySelector('.message-full-reader pre')?.textContent === "needle-end", "next body section readable");
+  assert(host.querySelector('.message-full-reader p')?.textContent === "Bytes 6–15 of 15", "next section did not show its byte range");
+  assert(host.querySelector('.message-full-reader pre')?.textContent.length < 20, "reader did not accumulate old sections");
+  const previous = [...host.querySelectorAll('.message-full-reader button')].find((button) => button.textContent === "Previous section");
+  previous.click();
+  await until(() => host.querySelector('.message-full-reader pre')?.textContent === "start", "previous body section readable");
+  assert(host.querySelector('.message-full-reader p')?.textContent === "Bytes 1–5 of 15", "previous section did not restore its byte range");
+  host.querySelector('.history-return')?.click();
+  await until(() => !host.querySelector('.message-full-reader'), "full body reader cleared on return to latest");
+}
+
+async function backgroundLatestRefreshRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const first = { id: "fresh-1", role: "assistant", kind: "text", body: "First persisted output", createdAt: "2026-09-26T00:00:00Z" };
+  let messages = [first];
+  let countTotal = 1;
+  let staleDetail;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A/messages/count") return response({ total: countTotal });
+    if (url.pathname === "/api/conversations/chat-A") return staleDetail?.promise ?? response({ ...chats.A, messages, messagePage: { hasMore: false, olderCount: 0, total: messages.length, beforeId: messages[0].id } });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[data-message-id="fresh-1"]'), "initial latest page");
+  staleDetail = deferred();
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await settle();
+  const buffered = { ...first, id: "fresh-buffered", body: "Output between snapshot and replay", searchOrder: 2 };
+  countTotal = 2;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: buffered }) }));
+  staleDetail.resolve(response({ ...chats.A, messages: [first], messagePage: { hasMore: false, olderCount: 0, total: 1, beforeId: first.id } }));
+  staleDetail = null;
+  await until(() => host.querySelector('[data-message-id="fresh-buffered"]')?.closest('[role="listitem"]')?.getAttribute("aria-setsize") === "2", "replayed insert reconciled a stale snapshot total");
+  messages = [first, buffered];
+  messages = [...messages, { ...first, id: "fresh-2", body: "Recovered missed output" }];
+  countTotal = 3;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await until(() => host.querySelector('[data-message-id="fresh-2"]'), "missed latest output recovered");
+  assert(!host.querySelector('.history-return'), "Latest refresh incorrectly became an older history page");
+}
+
+async function forwardHistoryPagingRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (index) => ({ id: `forward-${index}`, role: "assistant", kind: "text", body: `Read ${index}`, createdAt: new Date(index * 1000).toISOString() });
+  const all = Array.from({ length: 1_001 }, (_, index) => message(index));
+  const requested = [];
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A/messages/count") return response({ total: 1_001 });
+    if (url.pathname === "/api/conversations/chat-A/messages") {
+      const after = Number(url.searchParams.get("after")?.split("-")[1]);
+      requested.push(after);
+      const page = all.slice(after + 1, after + 201);
+      return response({ messages: page, messagePage: { total: 1_001, olderCount: after + 1, newerCount: 1_001 - (after + 1) - page.length, hasMore: true, hasLater: after + 1 + page.length < 1_001, beforeId: page[0]?.id } });
+    }
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: all.slice(0, 200), messagePage: { total: 1_001, olderCount: 0, newerCount: 801, hasMore: false, hasLater: true, beforeId: "forward-0" } });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector(".history-later")?.textContent.includes("801"), "old page has forward affordance");
+  for (const [step, remaining] of [[0, 601], [1, 401], [2, 201], [3, 1]]) {
+    await until(() => !host.querySelector(".history-later")?.disabled, `forward page ${step + 1} enabled`);
+    host.querySelector(".history-later").click();
+    await until(() => host.querySelector(".history-later")?.textContent.includes(`${remaining} remaining`) && !host.querySelector(".history-later")?.disabled, `forward page ${step + 1}`);
+    try { await until(() => host.querySelectorAll('[role="listitem"]').length < 40,
+      `forward page ${step + 1} settled to bounded rows`); }
+    catch (error) {
+      const rows = [...host.querySelectorAll('[role="listitem"]')];
+      const frame = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+      const list = frame?.querySelector('[role="list"]');
+      throw new Error(`${error.message}; count=${rows.length}, first=${rows[0]?.querySelector('[data-message-id]')?.dataset.messageId}, last=${rows.at(-1)?.querySelector('[data-message-id]')?.dataset.messageId}, scroll=${frame?.scrollTop}/${frame?.scrollHeight}, client=${frame?.clientHeight}, listTop=${list?.getBoundingClientRect().top}, frameTop=${frame?.getBoundingClientRect().top}, heights=${rows.slice(0, 5).map((row) => row.getBoundingClientRect().height)}`);
+    }
+  }
+  assert(requested.join(",") === "199,399,599,799", `Forward cursors skipped or repeated a page: ${requested}`);
+  const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+  for (let attempt = 0; attempt < 4 && !host.querySelector('[data-message-id="forward-999"]'); attempt += 1) {
+    viewport.scrollTop = viewport.scrollHeight;
+    viewport.dispatchEvent(new Event("scroll"));
+    await settle();
+  }
+  await until(() => host.querySelector('[data-message-id="forward-999"]'), "forward page committed through 999");
+  host.querySelector(".history-later").click();
+  await until(() => !host.querySelector(".history-later"), "forward read to persisted end");
+  assert(requested.at(-1) === 999, "Final forward cursor did not continue from the loaded page");
+  assert(host.querySelector('[role="listitem"][aria-posinset="1001"]') || host.querySelector('.history-return') === null, "Final forward page lost the persisted end");
+  assert(host.querySelectorAll('[role="listitem"]').length < 40, "Forward paging exceeded bounded mounted rows");
+}
+
+async function forwardPageEvictionAnchorRegression() {
+  for (const evicted of [false, true]) {
+    root.render(null); await settle();
+    keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+    const message = (index) => ({ id: `eviction-${index}`, role: "assistant", kind: "text", body: `Read ${index}`, createdAt: new Date(index * 1000).toISOString() });
+    const initial = Array.from({ length: 1000 }, (_, index) => message(index));
+    const later = Array.from({ length: 200 }, (_, index) => message(index + 1000));
+    route = async (url) => {
+      if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+      if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+      if (url.pathname === "/api/conversations/chat-A/messages/count") return response({ total: 1200 });
+      if (url.pathname === "/api/conversations/chat-A/messages") return response({ messages: later, messagePage: { total: 1200, olderCount: 1000, newerCount: 0, hasMore: true, hasLater: false, beforeId: "eviction-1000" } });
+      if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: initial, messagePage: { total: 1200, olderCount: 0, newerCount: 200, hasMore: false, hasLater: true, beforeId: "eviction-0" } });
+      return response({});
+    };
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector(".history-later"), "full forward page ready");
+    const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+    viewport.scrollTop = 0; viewport.dispatchEvent(new Event("scroll")); await settle();
+    viewport.scrollTop = evicted ? 0 : viewport.scrollHeight / 2;
+    viewport.dispatchEvent(new Event("scroll")); await settle();
+    const visibleRow = () => [...viewport.querySelectorAll("[data-message-id]")].find((element) => {
+      const row = element.getBoundingClientRect();
+      const frame = viewport.getBoundingClientRect();
+      return row.bottom > frame.top + 2 && row.top < frame.bottom - 2;
+    });
+    await until(() => (evicted || viewport.scrollTop > viewport.clientHeight) && visibleRow(),
+      `a genuinely visible ${evicted ? "evicted" : "retained"} reading row; scroll=${viewport.scrollTop}/${viewport.scrollHeight}; frame=${viewport.getBoundingClientRect().top}/${viewport.getBoundingClientRect().bottom}`);
+    const firstVisible = visibleRow();
+    assert(firstVisible, "Forward page fixture has no visible reading row");
+    const anchorId = firstVisible.dataset.messageId;
+    const top = firstVisible.getBoundingClientRect().top;
+    host.querySelector(".history-later").click();
+    await until(() => !host.querySelector(".history-later"), "forward page crossed bounded window");
+    await settle();
+    if (evicted) {
+      assert(!host.querySelector(`[data-message-id="${anchorId}"]`), "Eviction fixture did not evict the old row");
+      assert(host.querySelector('.history-loader'), "Evicted rows cannot be reached through Load earlier");
+      await until(() => host.querySelector('[data-message-id="eviction-200"]'), "first surviving row after forward eviction");
+      assert(host.querySelector('[data-message-id="eviction-200"]').getBoundingClientRect().top < viewport.getBoundingClientRect().bottom,
+        "The first surviving row was mounted outside the reading viewport");
+    } else {
+      await until(() => host.querySelector(`[data-message-id="${anchorId}"]`), `retained forward anchor ${anchorId}; scroll=${viewport.scrollTop}/${viewport.scrollHeight}; rows=${[...viewport.querySelectorAll('[data-message-id]')].map((element) => element.dataset.messageId).join(',')}`);
+      try { await until(() => Math.abs(host.querySelector(`[data-message-id="${anchorId}"]`)?.getBoundingClientRect().top - top) < 12, "retained forward anchor settled"); }
+      catch (error) {
+        const rows = [...viewport.querySelectorAll('[data-message-id]')];
+        const anchor = rows.find((element) => element.dataset.messageId === anchorId);
+        throw new Error(`${error.message}; anchor=${anchorId} top=${top}/${anchor?.getBoundingClientRect().top}; scroll=${viewport.scrollTop}/${viewport.scrollHeight}; mounted=${rows[0]?.dataset.messageId}..${rows.at(-1)?.dataset.messageId}; heights=${rows.map((element) => Math.round(element.getBoundingClientRect().height)).join(',')}`);
+      }
+      const delta = Math.abs(host.querySelector(`[data-message-id="${anchorId}"]`).getBoundingClientRect().top - top);
+      assert(delta < 12, `Forward page moved a retained reading anchor by ${Math.round(delta)}px`);
+    }
+    assert(host.querySelectorAll('[role="listitem"]').length < 40, "Forward page mounted unbounded rows");
+  }
+}
+
+async function backgroundReadingRefreshRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (index) => ({ id: `reading-${index}`, role: "assistant", kind: "text", body: `Persisted ${index}`, createdAt: new Date(index * 1000).toISOString() });
+  let all = Array.from({ length: 200 }, (_, index) => message(index));
+  let reads = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") {
+      reads += 1;
+      return response({ ...chats.A, messages: all, messagePage: { hasMore: false, olderCount: 0, total: all.length, beforeId: all[0].id } });
+    }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  try { await until(() => host.querySelector('[data-message-id="reading-199"]'), "reading page loaded"); }
+  catch (error) {
+    const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+    const rows = [...(viewport?.querySelectorAll('[data-message-id]') ?? [])];
+    throw new Error(`${error.message}; scroll=${viewport?.scrollTop}/${viewport?.scrollHeight}, client=${viewport?.clientHeight}, rows=${rows[0]?.dataset.messageId}..${rows.at(-1)?.dataset.messageId}, count=${rows.length}`);
+  }
+  const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+  const scrollAway = async () => {
+    viewport.scrollTop = viewport.scrollHeight;
+    viewport.dispatchEvent(new Event("scroll"));
+    await settle();
+    viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1000 }));
+    viewport.scrollTop = 0;
+    viewport.dispatchEvent(new Event("scroll"));
+    await settle();
+  };
+  await scrollAway();
+  all = [...all, message(200)];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await until(() => reads === 2 && host.querySelector('.history-return'), "missed output offered return to latest");
+  assert(!host.querySelector('[data-message-id="reading-200"]') && viewport.scrollTop < 50, "Reconnect replaced the reading anchor");
+  const returnButton = host.querySelector('.history-return');
+  const composerTop = host.querySelector('.composer').getBoundingClientRect().top;
+  assert(returnButton.getBoundingClientRect().top >= viewport.getBoundingClientRect().bottom - 1
+    && returnButton.getBoundingClientRect().bottom <= composerTop,
+  `Return control is offscreen while reading history: button=${returnButton.getBoundingClientRect().top}/${returnButton.getBoundingClientRect().bottom}, viewport=${viewport.getBoundingClientRect().bottom}, composer=${composerTop}`);
+  returnButton.click();
+  await until(() => host.querySelector('[data-message-id="reading-200"]') && !host.querySelector('.history-return'), "explicit latest after reconnect");
+  await scrollAway();
+  all = [...all, message(201)];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-reading", payload: { type: "run.completed" } }) }));
+  await until(() => reads === 4 && host.querySelector('.history-return')?.textContent.includes("1 new"), "completed run offered later output");
+  assert(!host.querySelector('[data-message-id="reading-201"]') && viewport.scrollTop < 50, "Completion replaced the reading anchor");
+}
+
+async function fullPageLiveAnchorRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (index) => ({ id: `full-${index}`, role: "assistant", kind: "text", body: `Output ${index}`, createdAt: new Date(index * 1000).toISOString(), searchOrder: index + 1 });
+  let all = Array.from({ length: 1000 }, (_, index) => message(index));
+  let detailReads = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") {
+      detailReads += 1;
+      return response({ ...chats.A, messages: all.slice(-1000), messagePage: { hasMore: all.length > 1000, olderCount: Math.max(0, all.length - 1000), total: all.length, beforeId: all.at(-1000).id } });
+    }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.history-find input'), "full page ready");
+  const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+  viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); await settle();
+  viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1000 }));
+  viewport.scrollTop = 0; viewport.dispatchEvent(new Event("scroll"));
+  await until(() => {
+    const row = host.querySelector('[data-message-id="full-0"]');
+    return row && row.getBoundingClientRect().bottom > viewport.getBoundingClientRect().top
+      && row.getBoundingClientRect().top < viewport.getBoundingClientRect().bottom && viewport.scrollTop < 50;
+  }, "first row visibly read at the top of the full page");
+  const anchorTop = host.querySelector('[data-message-id="full-0"]').getBoundingClientRect().top;
+  all = [...all, message(1000)];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1000) }) }));
+  await until(() => host.querySelector('.history-return')?.textContent.includes("1 new"), "new row offered after full-page append");
+  await until(() => host.querySelector('[data-message-id="full-0"]')
+    && Math.abs(host.querySelector('[data-message-id="full-0"]').getBoundingClientRect().top - anchorTop) < 24,
+  "A full-page live append retained the visible reader anchor");
+  host.querySelector('.history-return').click();
+  await until(() => !host.querySelector('.history-return'), "explicit latest after full-page append");
+  viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll"));
+  await until(() => host.querySelector('[data-message-id="full-1000"]'), "new durable row available at latest");
+  const backdated = { ...message(1001), createdAt: new Date(0).toISOString() };
+  all = [...all, backdated];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: backdated }) }));
+  try { await until(() => host.querySelector('[data-message-id="full-1001"]'), "backdated insertion remains at the durable latest end"); }
+  catch (error) { throw new Error(`${error.message}; return=${host.querySelector('.history-return')?.textContent}; scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}; mounted=${[...viewport.querySelectorAll('[data-message-id]')].map((element) => element.dataset.messageId).slice(-4).join(',')}`); }
+  viewport.scrollTop = viewport.scrollHeight;
+  viewport.dispatchEvent(new Event("scroll"));
+  await until(() => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 2, "latest follow settled before Find key");
+  await settle();
+  const findInput = host.querySelector('.history-find input');
+  findInput.focus();
+  findInput.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true }));
+  all = [...all, message(1002)];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1002) }) }));
+  try { await until(() => host.querySelector('[data-message-id="full-1002"]') && !host.querySelector('.history-return'),
+    "Find control arrow key left latest following with the reader"); }
+  catch (error) { throw new Error(`${error.message}; return=${host.querySelector('.history-return')?.textContent}, scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}, row=${Boolean(host.querySelector('[data-message-id="full-1002"]'))}`); }
+  viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); await settle();
+  const maximum = viewport.scrollHeight - viewport.clientHeight;
+  viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -48 }));
+  // A scroll event can arrive before native wheel movement. It must not
+  // release upward ownership merely because the old position is near bottom.
+  viewport.dispatchEvent(new Event("scroll"));
+  const readerIntentDeadline = Date.now() + 1050;
+  let readerIntentEvaluations = 0;
+  while (Date.now() < readerIntentDeadline) {
+    readerIntentEvaluations += 1;
+    await settle();
+  }
+  assert(readerIntentEvaluations >= 2, "upward reader intent was not observed over multiple updates");
+  viewport.scrollTop = maximum - 48; viewport.dispatchEvent(new Event("scroll")); await settle();
+  const visibleRow = () => {
+    const frame = viewport.getBoundingClientRect();
+    return [...viewport.querySelectorAll('[data-message-id]')].find((element) => {
+      const row = element.getBoundingClientRect();
+      return row.bottom > frame.top && row.top < frame.bottom;
+    });
+  };
+  // Windows may commit the scroll event before React commits the measured
+  // virtual range. Judge the settled viewport, not an intermediate spacer.
+  try { await until(visibleRow, "near-bottom reader has a visible anchor"); }
+  catch (error) {
+    const rows = [...viewport.querySelectorAll('[data-message-id]')].map((element) => {
+      const bounds = element.getBoundingClientRect();
+      return `${element.dataset.messageId}:${Math.round(bounds.top)}..${Math.round(bounds.bottom)}`;
+    });
+    const list = viewport.querySelector('[aria-label="Conversation history"]');
+    throw new Error(`${error.message}; scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}, frame=${Math.round(viewport.getBoundingClientRect().top)}..${Math.round(viewport.getBoundingClientRect().bottom)}, range=${rows.slice(0, 3).join(',')}|${rows.slice(-3).join(',')}, spacers=${[...list.children].filter((element) => element.getAttribute('aria-hidden') === 'true').map((element) => element.style.height).join(',')}`);
+  }
+  const readingRow = visibleRow();
+  const readerTop = viewport.scrollTop;
+  const readingRowId = readingRow.dataset.messageId;
+  const readingRowTop = readingRow.getBoundingClientRect().top;
+  all = [...all, message(1003)];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1003) }) }));
+  try { await until(() => host.querySelector('.history-return')?.textContent.includes("1 new"), "upward reader intent retained a later-message affordance"); }
+  catch (error) { throw new Error(`${error.message}; before=${readerTop}, after=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}, return=${host.querySelector('.history-return')?.textContent}, newRow=${Boolean(host.querySelector('[data-message-id="full-1003"]'))}`); }
+  const retainedRow = viewport.querySelector(`[data-message-id="${readingRowId}"]`);
+  assert(retainedRow && Math.abs(retainedRow.getBoundingClientRect().top - readingRowTop) < 24,
+    `an append moved the upward reader ${readingRowId}: top=${readingRowTop} -> ${retainedRow?.getBoundingClientRect().top}, scroll=${readerTop} -> ${viewport.scrollTop}, max=${viewport.scrollHeight - viewport.clientHeight}`);
+  const readsBeforeReturn = detailReads;
+  host.querySelector('.history-return').click();
+  await until(() => detailReads > readsBeforeReturn, "explicit latest request after upward reading");
+  await until(() => !host.querySelector('.history-return'), "explicit latest page after upward reading");
+  try { await until(() => {
+    const row = host.querySelector('[data-message-id="full-1003"]');
+    const bounds = row?.getBoundingClientRect();
+    const frame = viewport.getBoundingClientRect();
+    return bounds && bounds.bottom > frame.top && bounds.top < frame.bottom;
+  }, "explicit latest row after upward reading"); }
+  catch (error) { throw new Error(`${error.message}; detailReads=${detailReads}, return=${host.querySelector('.history-return')?.textContent}, scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}, mounted=${[...viewport.querySelectorAll('[data-message-id]')].map((row) => row.dataset.messageId).slice(-6).join(',')}`); }
+  viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); await settle();
+  const resumeMaximum = viewport.scrollHeight - viewport.clientHeight;
+  viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -48 }));
+  viewport.scrollTop = resumeMaximum - 48; viewport.dispatchEvent(new Event("scroll")); await settle();
+  viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: 48 }));
+  viewport.scrollTop = viewport.scrollHeight - viewport.clientHeight;
+  viewport.dispatchEvent(new Event("scroll")); await settle();
+  all = [...all, message(1004)];
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1004) }) }));
+  try { await until(() => host.querySelector('[data-message-id="full-1004"]') && !host.querySelector('.history-return'),
+    "downward return inside the bottom zone resumed latest following"); }
+  catch (error) { throw new Error(`${error.message}; return=${host.querySelector('.history-return')?.textContent}, scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}, row=${Boolean(host.querySelector('[data-message-id="full-1004"]'))}`); }
+}
+
+async function largeLiveMessageRetentionRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const initial = [{ id: "bounded-0", role: "assistant", kind: "text", body: "Before large output", createdAt: new Date(0).toISOString() }];
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: initial, messagePage: { hasMore: false, olderCount: 0, total: 1, beforeId: initial[0].id } });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[data-message-id="bounded-0"]'), "initial bounded chat");
+  const body = "🙂".repeat(270_000);
+  const large = { id: "bounded-1", role: "assistant", kind: "text", body, createdAt: new Date(1000).toISOString(),
+    payload: { runId: "large-run", provider: "codex", detail: "x".repeat(1024 * 1024) } };
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: large }) }));
+  await until(() => host.querySelector('[data-message-id="bounded-1"]'), "large live message retained");
+  const row = host.querySelector('[data-message-id="bounded-1"]');
+  assert(row.querySelector('.message-text').textContent.length < 17_000, "live body bypassed the retained-row ceiling");
+  assert(row.querySelector('.message-full-reader button')?.textContent === "Read full message", "large live body lost bounded full-reader access");
+  assert(row.querySelector('.message-run')?.textContent.includes("large-ru"), "bounded payload lost run identity");
+}
+
+async function largePageMessageRetentionRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const middleMatch = "ΩΟΣ\0more";
+  const messages = Array.from({ length: 3 }, (_, index) => ({
+    id: `page-large-${index}`, role: "assistant", kind: "text",
+    body: index === 0 ? "🙂".repeat(125_000) + middleMatch + "🙂".repeat(125_000)
+      : `needle ${index} ` + "🙂".repeat(270_000), createdAt: new Date(index * 1000).toISOString(),
+    payload: { runId: `page-run-${index}`, provider: "codex", detail: "x".repeat(1024 * 1024) },
+  }));
+  let beforeRequests = 0;
+  const page = (rows, olderCount, newerCount) => ({ messages: rows,
+    messagePage: { hasMore: olderCount > 0, olderCount, hasLater: newerCount > 0, newerCount, total: 3, beforeId: rows[0]?.id } });
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname.endsWith("/messages/find")) return response({ matchId: messages[0].id, ...page(messages.slice(0, 1), 0, 2) });
+    if (url.pathname.endsWith("/messages")) {
+      if (url.searchParams.has("before")) beforeRequests += 1;
+      return response(url.searchParams.has("before")
+      ? page(messages.slice(0, 2), 0, 1) : page(messages.slice(1), 1, 0));
+    }
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, ...page(messages.slice(2), 2, 0) });
+    return response({});
+  };
+  const assertBounded = (id) => {
+    const row = host.querySelector(`[data-message-id="${id}"]`);
+    assert(row, `missing ${id}`);
+    assert(row.querySelector('.message-text')?.textContent.length < 17_000, `${id} retained an oversized body`);
+    assert(row.querySelector('.message-full-reader button')?.textContent === "Read full message", `${id} lost full-body access`);
+    assert(row.querySelector('.message-run')?.textContent.includes("page-ru"), `${id} lost run identity`);
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[data-message-id="page-large-2"]'), "latest large page");
+  assertBounded("page-large-2");
+  host.querySelector('.history-loader').click();
+  try { await until(() => host.querySelector('[data-message-id="page-large-0"]'), "older large page"); }
+  catch (error) { throw new Error(`${error.message}; requests=${beforeRequests}, loader=${host.querySelector('.history-loader')?.textContent}, mounted=${[...host.querySelectorAll('[data-message-id]')].map((row) => row.dataset.messageId).join(',')}, alert=${host.querySelector('[role="alert"]')?.textContent}`); }
+  assertBounded("page-large-0");
+  assert(!host.querySelector('.history-loader'), "older page cursor did not reach the start");
+  const input = host.querySelector('.history-find input');
+  setControlValue(input, "Σ"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="page-large-0"]'), "large Find result");
+  assertBounded("page-large-0");
+  assert(host.querySelector('[data-message-id="page-large-0"] .message-text')?.textContent.includes(middleMatch),
+    "a far-middle Unicode and NUL Find match was lost after bounded client retention");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created",
+    conversationId: "chat-A", payload: { ...messages[0], body: messages[0].body + " updated" } }) }));
+  await settle();
+  assertBounded("page-large-0");
+  assert(host.querySelector('[data-message-id="page-large-0"] .message-text')?.textContent.includes(middleMatch),
+    "a live replacement erased the visible Find match context");
+  host.querySelector('.history-later').click();
+  await until(() => host.querySelector('[data-message-id="page-large-2"]'), "later large page");
+  assertBounded("page-large-2");
+  assert(!host.querySelector('.history-later'), "later page cursor did not reach the end");
+}
+
+async function transcriptObserverStabilityRegression() {
+  root.render(null); await settle();
+  const socketCount = fixtureSockets.length;
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const messages = Array.from({ length: 300 }, (_, index) => ({ id: `stable-${index}`, role: "assistant", kind: "text",
+    body: `History ${index}`, createdAt: new Date(index * 1000).toISOString() }));
+  const NativeResizeObserver = window.ResizeObserver;
+  let rowObservations = 0;
+  window.ResizeObserver = class extends NativeResizeObserver {
+    observe(target, options) {
+      if (target.dataset.windowId) rowObservations += 1;
+      return super.observe(target, options);
+    }
+  };
+  try {
+    route = async (url) => {
+      if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+      if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+      if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, runs: [{ id: "run-stable", status: "running" }], messages,
+        messagePage: { hasMore: false, olderCount: 0, total: messages.length, beforeId: messages[0].id } });
+      return response({});
+    };
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('[data-message-id="stable-299"]'), "long transcript ready");
+    await until(() => fixtureSockets.length > socketCount, "long transcript socket ready");
+    await until(() => host.querySelector('[aria-label="Stop active agent run"]'), "long transcript run ready");
+    await settle();
+    const emit = (seq) => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({
+      type: "run.event", conversationId: "chat-A", runId: "run-stable",
+      payload: { type: "assistant.delta", seq, payload: { text: ` fragment ${seq}` } },
+    }) }));
+    emit(1);
+    try { await until(() => host.querySelector('.message.is-streaming')?.textContent.includes("fragment 1"), "first stream paint"); }
+    catch (error) { throw new Error(`${error.message}; sockets=${fixtureSockets.slice(socketCount).map((socket) => socket.readyState).join(',')}, activeRun=${host.querySelector('[aria-label="Stop active agent run"]')?.outerHTML?.slice(0, 120)}, stream=${host.querySelector('.message.is-streaming')?.textContent?.slice(0, 120)}, selected=${localStorage.getItem(keys[2])}`); }
+    await settle();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const baseline = rowObservations;
+    for (let seq = 2; seq <= 8; seq += 1) {
+      emit(seq);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    await until(() => host.querySelector('.message.is-streaming')?.textContent.includes("fragment 8"), "sustained stream paint");
+    assert(rowObservations - baseline <= 40,
+      `unchanged history rows were reobserved ${rowObservations - baseline} times during seven stream paints`);
+    const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+    viewport.scrollTop = viewport.scrollHeight;
+    viewport.dispatchEvent(new Event("scroll"));
+    await settle();
+    const nearBottomBaseline = rowObservations;
+    for (let index = 0; index < 7; index += 1) {
+      // Small reader movements across the old 96px boundary must retain the
+      // same mounted tail and its row observers while output is streaming.
+      viewport.scrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight - (index % 2 ? 120 : 80));
+      viewport.dispatchEvent(new Event("scroll"));
+      await settle();
+    }
+    assert(rowObservations - nearBottomBaseline <= 40,
+      `near-bottom reader movement reobserved ${rowObservations - nearBottomBaseline} unchanged rows`);
+  } finally {
+    root.render(null); await settle();
+    window.ResizeObserver = NativeResizeObserver;
+  }
+}
+
+async function backgroundCompletionKeepsExplicitPageRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const makeMessage = (index) => ({ id: `pending-${index}`, role: "assistant", kind: "text", body: `Message ${index}`, createdAt: new Date(index * 1000).toISOString() });
+  const latest = Array.from({ length: 200 }, (_, index) => makeMessage(index + 800));
+  const older = Array.from({ length: 200 }, (_, index) => makeMessage(index));
+  const pendingLatest = deferred();
+  let holdLatest = false;
+  let detailReads = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname.endsWith("/messages/find")) return response({ matchId: "pending-10", messages: older, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1000, beforeId: "pending-0" } });
+    if (url.pathname === "/api/conversations/chat-A") {
+      detailReads += 1;
+      if (holdLatest) return pendingLatest.promise;
+      return response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: 800, total: 1000, beforeId: "pending-800" } });
+    }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.history-find input'), "explicit page fixture ready");
+  const input = host.querySelector('.history-find input');
+  setControlValue(input, "Message 10"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('.history-return'), "older page selected");
+  holdLatest = true;
+  host.querySelector('.history-return').click();
+  await until(() => detailReads === 2, "explicit latest request pending");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-1", payload: { type: "run.completed" } }) }));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert(detailReads === 2, "Background completion superseded the explicit page request");
+  holdLatest = false;
+  pendingLatest.resolve(response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: 800, total: 1000, beforeId: "pending-800" } }));
+  await until(() => !host.querySelector('.history-return') && host.querySelector('[data-message-id="pending-999"]'), "explicit latest page committed");
+}
+
+async function checkpointReadingPageRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (index, body = `Output ${index}`, seq = 0) => ({ id: `checkpoint-${index}`, role: "assistant", kind: "text", body,
+    payload: index === 999 ? { runId: "run-checkpoint", checkpointEventSeq: seq } : {}, createdAt: new Date(index * 1000).toISOString() });
+  const older = Array.from({ length: 200 }, (_, index) => message(index));
+  let latest = Array.from({ length: 200 }, (_, index) => message(index + 800));
+  let persistedTotal = 1000;
+  let reads = 0;
+  let heldDetail = null;
+  let runStatus = "running";
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A/messages/count") return response({ total: persistedTotal });
+    if (url.pathname.endsWith("/messages/find")) return response({ matchId: "checkpoint-10", messages: older, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1000, beforeId: "checkpoint-0" } });
+    if (url.pathname === "/api/conversations/chat-A") { reads += 1; return heldDetail?.promise ?? response({ ...chats.A, runs: [{ id: "run-checkpoint", status: runStatus }], messages: latest, messagePage: { hasMore: true, olderCount: persistedTotal - latest.length, total: persistedTotal, beforeId: latest[0].id } }); }
+    return response({});
+  };
+  const socketsBefore = fixtureSockets.length;
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => fixtureSockets.length > socketsBefore
+    && host.querySelector('[data-message-id="checkpoint-999"]'), "checkpoint latest and socket loaded");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: { ...message(500), body: "Old checkpoint rewrite", payload: { runId: "run-old", checkpointEventSeq: 1 } } }) }));
+  await settle();
+  const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+  viewport.scrollTop = 0; viewport.dispatchEvent(new Event("scroll")); await settle();
+  latest = latest.map((item) => item.id === "checkpoint-999" ? message(999, "Recovered checkpoint body", 5) : item);
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await until(() => reads >= 2, "checkpoint reconnect read");
+  viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll"));
+  await until(() => host.querySelector('[data-message-id="checkpoint-999"]')?.textContent.includes("Recovered checkpoint body"), "overlapping checkpoint refreshed");
+  const find = host.querySelector('.history-find input');
+  setControlValue(find, "checkpoint 10"); await settle();
+  find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-message-id="checkpoint-10"]'), "older checkpoint page");
+  const loadedCheckpoint = { ...message(10, "Visible checkpoint refreshed"), payload: { runId: "run-loaded", checkpointEventSeq: 1 } };
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: loadedCheckpoint }) }));
+  await until(() => host.querySelector('[data-message-id="checkpoint-10"]')?.textContent.includes("Visible checkpoint refreshed"), "loaded older checkpoint updated in place");
+  const staleRefresh = deferred();
+  heldDetail = staleRefresh;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await until(() => reads >= 3, "stale detail response held after loaded checkpoint");
+  heldDetail = null;
+  staleRefresh.resolve(response({ ...chats.A, runs: [{ id: "run-checkpoint", status: "running" }], messages: latest,
+    messagePage: { hasMore: true, olderCount: 800, total: 1000, beforeId: "checkpoint-800" } }));
+  await settle();
+  assert(host.querySelector('[data-message-id="checkpoint-10"]')?.textContent.includes("Visible checkpoint refreshed"), "stale HTTP detail rolled back a loaded checkpoint");
+  assert(host.querySelector('.history-find .history-find-status')?.textContent === "Message 11 of 1000", "An old off-page checkpoint inflated the persisted count");
+  for (let seq = 6; seq <= 8; seq += 1) {
+    const updated = message(999, `Checkpoint ${seq}`, seq);
+    latest = latest.map((item) => item.id === updated.id ? updated : item);
+    fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: updated }) }));
+  }
+  // Deliver the delta in the same browser task as the checkpoint burst.
+  // Run ownership must be committed before React flushes queued state.
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", runId: "run-checkpoint", conversationId: "chat-A", payload: { type: "assistant.delta", seq: 9, payload: { text: " after eight" } } }) }));
+  try { await until(() => host.querySelector('.history-live-tail')?.textContent.includes("Checkpoint 8 after eight"), "older page shows checkpoint and following delta"); }
+  catch (error) { throw new Error(`${error.message}; tail=${host.querySelector('.history-live-tail')?.textContent}, return=${host.querySelector('.history-return')?.textContent}, reads=${reads}, socket=${fixtureSockets.length - socketsBefore}`); }
+  const nextCheckpoint = message(999, "Checkpoint 9", 9);
+  latest = latest.map((item) => item.id === nextCheckpoint.id ? nextCheckpoint : item);
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: nextCheckpoint }) }));
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", runId: "run-checkpoint", conversationId: "chat-A", payload: { type: "assistant.delta", seq: 10, payload: { text: " after nine" } } }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("Checkpoint 9 after nine"), "older page keeps a coherent second live boundary");
+  assert(host.querySelector('.history-return')?.textContent === "Return to latest · 800 new", `Off-page checkpoint rewrites inflated the new-message count: ${host.querySelector('.history-return')?.textContent}`);
+  runStatus = "completed";
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-checkpoint", payload: { type: "run.completed" } }) }));
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  await until(() => reads >= 4, "checkpoint completion read");
+  assert(host.querySelector('.history-return')?.textContent === "Return to latest · 800 new", "Persisted total failed to reconcile after checkpoint completion");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "conversation.updated", conversationId: "chat-A" }) }));
+  await until(() => reads >= 5, "list update detail read");
+  assert(host.querySelector('[data-message-id="checkpoint-10"]') && host.querySelector('.history-return')?.textContent === "Return to latest · 800 new", "List update replaced the reader's older page");
+  for (let index = 1000; index <= 1002; index += 1) {
+    persistedTotal += 1;
+    latest = [...latest, message(index)].slice(-200);
+    fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(index) }) }));
+  }
+  await until(() => host.querySelector('.history-return')?.textContent === "Return to latest · 803 new", "three durable new ids counted after old page");
+  latest = latest.map((item) => item.id === "checkpoint-999" ? message(999, "Repeated checkpoint", 11) : item);
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(999, "Repeated checkpoint", 11) }) }));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert(host.querySelector('.history-return')?.textContent === "Return to latest · 803 new", "Repeated off-page checkpoint inflated the live count");
+  const oversized = message(999, `${"x".repeat(20_000)}Bounded end`, 12);
+  latest = latest.map((item) => item.id === oversized.id ? oversized : item);
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: oversized }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("Bounded end"), "large checkpoint has a visible tail");
+  assert(host.querySelector('.history-live-tail').textContent.length < 8300, "older page mounted an unbounded live checkpoint");
+  heldDetail = deferred();
+  const staleDetail = heldDetail;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await until(() => reads >= 6, "preserved reading refresh pending before overflow");
+  heldDetail = null;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "noise", payload: { type: "noop", padding: "x".repeat(1_100_000) } }) }));
+  await until(() => reads >= 7, "overflow retried the detail read");
+  staleDetail.resolve(response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: persistedTotal - latest.length, total: persistedTotal, beforeId: latest[0].id } }));
+  await settle();
+  assert(host.querySelector('[data-message-id="checkpoint-10"]') && host.querySelector('.history-return'), "overflow retry replaced the chosen reading page");
+  host.querySelector('.history-return').click();
+  await until(() => !host.querySelector('.history-return') && host.querySelector('[data-message-id="checkpoint-999"]')?.textContent.includes("Bounded end"), "latest page after older live output");
+  assert(!host.querySelector('.history-live-tail'), "Returning to latest retained a duplicate live tail");
+}
+
+async function consecutiveRunLivePreviewRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const older = [{ id: "old-0", role: "assistant", kind: "text", body: "Old reading row", createdAt: new Date(0).toISOString() }];
+  const latest = [{ id: "latest-1", role: "assistant", kind: "text", body: "A checkpoint", payload: { runId: "run-A", checkpointEventSeq: 1 }, createdAt: new Date(1000).toISOString() }];
+  let runBStarted = false;
+  let runCActive = false;
+  const runBResponse = deferred();
+  let detailReads = 0;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A/messages/find") return response({ matchId: "old-0", messages: older, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 1, total: 2, beforeId: "old-0" } });
+    if (url.pathname === "/api/conversations/chat-A/runs" && options?.method === "POST") { runBStarted = true; return runBResponse.promise; }
+    if (url.pathname === "/api/conversations/chat-A") {
+      detailReads += 1;
+      return response({ ...chats.A, runs: runCActive ? [{ id: "run-C", status: "running" }, { id: "run-B", status: "completed" }]
+        : runBStarted ? [{ id: "run-B", status: "running" }, { id: "run-A", status: "completed" }]
+          : [{ id: "run-A", status: detailReads === 1 ? "running" : "completed" }],
+        messages: runCActive ? [{ id: "latest-3", role: "assistant", kind: "text", body: "C checkpoint",
+          payload: { runId: "run-C", checkpointEventSeq: 1 }, createdAt: new Date(3000).toISOString() }] : latest,
+        messagePage: { hasMore: true, olderCount: 1, hasLater: false, newerCount: 0, total: 2,
+          beforeId: runCActive ? "latest-3" : latest[0].id } });
+    }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[data-message-id="latest-1"]'), "first run loaded");
+  const find = host.querySelector('.history-find input');
+  setControlValue(find, "Old reading row"); await settle();
+  find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-message-id="old-0"]') && host.querySelector('.history-return'), "older page selected");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: latest[0] }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("A checkpoint"), "first run preview visible");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-A", payload: { type: "run.completed" } }) }));
+  await until(() => detailReads >= 2, "completed run detail refreshed");
+  await until(() => host.querySelector('.history-live-tail strong')?.textContent === "Recent output", "completed run preview relabeled");
+  const input = host.querySelector('textarea[aria-label="Message the agent"]');
+  setControlValue(input, "Start B");
+  await until(() => host.querySelector('[aria-label="Send message"]')?.disabled === false, "second run send available");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => runBStarted, "second run POST pending");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-B", payload: { type: "assistant.delta", seq: 1, payload: { text: "B first delta" } } }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("B first delta"), "second run early delta visible");
+  assert(!host.querySelector('.history-live-tail').textContent.includes("A checkpoint"), "Previous run checkpoint was mixed with B's first delta");
+  host.querySelector('.history-return').click();
+  await until(() => !host.querySelector('.history-return'), "latest page loaded before B checkpoint");
+  const beforeCheckpointFind = host.querySelector('.history-find input');
+  setControlValue(beforeCheckpointFind, "Old reading row"); await settle();
+  beforeCheckpointFind.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-message-id="old-0"]') && host.querySelector('.history-return'), "older page restored before B checkpoint");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-B", payload: { type: "assistant.delta", seq: 2, payload: { text: " plus next delta" } } }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("B first delta plus next delta"), "reload retained pre-checkpoint run ownership and suffix");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: { id: "latest-2", role: "assistant", kind: "text", body: "B checkpoint", payload: { runId: "run-B", checkpointEventSeq: 2 }, createdAt: new Date(2000).toISOString() } }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("B checkpoint"), "second run checkpoint visible before POST response");
+  runBResponse.resolve(response({ id: "run-B", conversationId: "chat-A", status: "running" }));
+  await until(() => host.querySelector('[aria-label="Stop active agent run"]'), "second run accepted");
+  assert(host.querySelector('.history-live-tail')?.textContent.includes("B checkpoint"), "Accepted run discarded its already visible checkpoint");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-B", payload: { type: "assistant.delta", seq: 3, payload: { text: " after checkpoint" } } }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("B checkpoint after checkpoint"), "accepted run retains its checkpoint and later delta");
+  assert(!host.querySelector('.history-live-tail').textContent.includes("A checkpoint"), "Previous run checkpoint returned after B checkpoint");
+  if (window.__fixtureSetViewport) {
+    await window.__fixtureSetViewport(390);
+    await settle();
+    const previewWidth = host.querySelector('.history-live-tail').getBoundingClientRect().width;
+    const messageWidth = host.querySelector('.message-column').getBoundingClientRect().width;
+    assert(Math.abs(previewWidth - messageWidth) < 2, `Narrow live preview width ${previewWidth} differs from message width ${messageWidth}`);
+    await window.__fixtureSetViewport(1280);
+  }
+  host.querySelector('.history-return').click();
+  await until(() => !host.querySelector('.history-return'), "second run latest page restored");
+  const repeatFind = host.querySelector('.history-find input');
+  setControlValue(repeatFind, "Old reading row"); await settle();
+  repeatFind.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-message-id="old-0"]') && host.querySelector('.history-return'), "second run older page restored");
+  const resumedCheckpoint = { id: "latest-2", role: "assistant", kind: "text", body: "B resumed checkpoint",
+    payload: { runId: "run-B", checkpointEventSeq: 4 }, createdAt: new Date(2000).toISOString() };
+  latest[0] = resumedCheckpoint;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: resumedCheckpoint }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("B resumed checkpoint"), "accepted run checkpoint survives Return and Find");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-B", payload: { type: "assistant.delta", seq: 5, payload: { text: " uncheckpointed" } } }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("B resumed checkpoint uncheckpointed"), "uncheckpointed suffix visible before refresh");
+  const beforeRefresh = detailReads;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await until(() => detailReads > beforeRefresh, "preserved detail refreshed after missed replay");
+  await settle(); await settle();
+  assert(host.querySelector('.history-live-tail')?.textContent.includes("B resumed checkpoint uncheckpointed"),
+    `Preserved refresh lost pre-request deltas after the checkpoint: ${host.querySelector('.history-live-tail')?.textContent}`);
+  host.querySelector('.history-return').click();
+  await until(() => !host.querySelector('.history-return') && host.querySelector('[data-message-id="latest-2"]'), "Return restored B's durable checkpoint");
+  assert(host.querySelector('.message.is-streaming')?.textContent.includes("uncheckpointed"), "Return to latest dropped the active run's suffix");
+  const findAgain = host.querySelector('.history-find input');
+  setControlValue(findAgain, "Old reading row"); await settle();
+  findAgain.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-message-id="old-0"]') && host.querySelector('.history-return'), "older page restored before missed completion");
+  runCActive = true;
+  const beforeRunC = detailReads;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await until(() => detailReads > beforeRunC && host.querySelector('.history-live-tail')?.textContent.includes("C checkpoint"),
+    "missed completion reconciled preview to the newer active run");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-C", payload: { type: "assistant.delta", seq: 2, payload: { text: " C tail" } } }) }));
+  await until(() => host.querySelector('.history-live-tail')?.textContent.includes("C checkpoint C tail"), "newly accepted run retained live deltas");
+  assert(!host.querySelector('.history-live-tail').textContent.includes("B resumed checkpoint"), "completed run leaked into C's preview");
+}
+
+async function replayKeepsLatestPageBoundaryRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (index, seq = 0) => ({ id: `replay-${index}`, role: "assistant", kind: "text", body: `Replay ${index}`,
+    searchOrder: index, createdAt: new Date(index * 1000).toISOString(), payload: { runId: `run-${index}`, checkpointEventSeq: seq } });
+  const latest = Array.from({ length: 200 }, (_, index) => message(index + 800));
+  const heldDetail = deferred();
+  let detailStarted = false;
+  let before = null;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") { detailStarted = true; return heldDetail.promise; }
+    if (url.pathname === "/api/conversations/chat-A/messages") {
+      before = url.searchParams.get("before");
+      return response({ messages: Array.from({ length: 200 }, (_, index) => message(index + 600)), messagePage: { hasMore: true, olderCount: 600, total: 1000, beforeId: "replay-600" } });
+    }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => detailStarted && fixtureSockets.at(-1) && host.querySelector('.message-scroll'), "held latest detail request started");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(10, 2) }) }));
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(1000, 1) }) }));
+  heldDetail.resolve(response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: 800, total: 1000, beforeId: "replay-800" } }));
+  await until(() => host.querySelector('.history-loader')?.textContent.includes("800 remaining"), "latest page after buffered checkpoint");
+  assert(host.querySelector('[role="listitem"]')?.getAttribute("aria-setsize") === "1001", "buffered latest message did not advance persisted total");
+  assert(!host.querySelector('[data-message-id="replay-10"]'), "off-page checkpoint entered the latest page");
+  host.querySelector('.history-loader').click();
+  await until(() => before !== null, "earlier page request after replay");
+  assert(before === "replay-800", `Buffered checkpoint changed the pagination boundary to ${before}`);
+  await until(() => host.querySelector('.history-loader')?.textContent.includes("600 remaining"), "intervening page remains reachable");
+}
+
+async function deferredReloadSelectionOwnershipRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const sibling = { ...chats.B, projectId: "A", worktreeId: "A", worktreePath: projects[0].worktrees[0].path };
+  let aReads = 0;
+  let bReads = 0;
+  let heldASignal;
+  const heldA = deferred();
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A, sibling] });
+    if (url.pathname === "/api/conversations/chat-A") {
+      aReads += 1;
+      if (aReads === 2) heldASignal = options.signal;
+      return aReads === 2 ? heldA.promise : response({ ...chats.A, messages: [], messagePage: { total: 0 } });
+    }
+    if (url.pathname === "/api/conversations/chat-B") { bReads += 1; return response({ ...sibling, messages: [], messagePage: { total: 0 } }); }
+    return response({});
+  };
+  const socketsBefore = fixtureSockets.length;
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => aReads === 1 && fixtureSockets.length > socketsBefore
+    && host.querySelector('#chat-tab-chat-A[aria-selected="true"]')
+    && host.querySelector('.conversation-header h1')?.textContent === chats.A.title
+    && host.querySelector('textarea[aria-label="Message the agent"]:not(:disabled)'), "A detail and socket ready before deferred switch");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.resolved", conversationId: "chat-A", runId: "run-A" }) }));
+  await until(() => aReads === 2, "A refresh held before deferred reload");
+  // Overflow queues A's replacement detail read in a microtask. Switch
+  // selection synchronously before that callback can claim the shared slot.
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "noise", payload: { type: "noop", padding: "x".repeat(1_100_000) } }) }));
+  assert(heldASignal?.aborted, "Overflow did not queue a deferred replacement for A");
+  host.querySelector('#chat-tab-chat-B').click();
+  await until(() => bReads >= 1 && host.querySelector('#chat-tab-chat-B[aria-selected="true"]'), "B detail after queued reload");
+  heldA.resolve(response({ ...chats.A, messages: [], messagePage: { total: 0 } }));
+  await until(() => host.querySelector('.conversation-header h1')?.textContent === sibling.title, "B selected detail committed");
+  assert(aReads === 2, `A stale deferred callback made ${aReads} detail reads after selecting B`);
+}
+
+async function latestBeforeFindOwnershipRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (index) => ({ id: `order-${index}`, role: "assistant", kind: "text", body: `Find ${index}`, createdAt: new Date(index * 1000).toISOString() });
+  const latest = Array.from({ length: 200 }, (_, index) => message(index + 800));
+  const oldest = Array.from({ length: 200 }, (_, index) => message(index));
+  const delayedLatest = deferred();
+  let holdLatest = false;
+  let latestRequested = false;
+  let findRequests = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname.endsWith("/messages/find")) { findRequests += 1; return response({ matchId: "order-10", messages: oldest, messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 800, total: 1000, beforeId: "order-0" } }); }
+    if (url.pathname === "/api/conversations/chat-A") {
+      if (holdLatest) { latestRequested = true; return delayedLatest.promise; }
+      return response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: 800, total: 1000, beforeId: "order-800" } });
+    }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector(".history-find input"), "latest/find ownership ready");
+  const input = host.querySelector(".history-find input");
+  setControlValue(input, "Find 10"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector('[data-find-match="true"] [data-message-id="order-10"]'), "initial old match");
+  holdLatest = true;
+  host.querySelector(".history-return").click();
+  await until(() => latestRequested, "return to latest pending before find");
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => findRequests === 2 && host.querySelector('[data-find-match="true"] [data-message-id="order-10"]') && host.querySelector(".history-return"), "new find owns old page");
+  delayedLatest.resolve(response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: 800, total: 1000, beforeId: "order-800" } }));
+  await settle();
+  assert(host.querySelector('[data-find-match="true"] [data-message-id="order-10"]') && host.querySelector(".history-return"), "Late Return to latest replaced a newer find page");
+}
+
+async function findWhileMetadataRefreshRegression() {
+  for (const kind of ["completion", "reconnect", "list"]) {
+    root.render(null); await settle();
+    keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+    const message = (index) => ({ id: `metadata-${index}`, role: "assistant", kind: "text", body: `Match ${index}`, createdAt: new Date(index * 1000).toISOString() });
+    const older = Array.from({ length: 20 }, (_, index) => message(index));
+    const latest = Array.from({ length: 20 }, (_, index) => message(index + 80));
+    const running = { ...chats.A, runs: [{ id: "run-metadata", status: "running", conversationId: "chat-A" }] };
+    const completed = { ...running, runs: [{ id: "run-metadata", status: "completed", conversationId: "chat-A" }] };
+    const held = deferred();
+    let hold = false;
+    let requested = false;
+    route = async (url) => {
+      if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+      if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+      if (url.pathname.endsWith("/messages/find")) return response({ matchId: "metadata-10", messages: older, messagePage: { total: 100, olderCount: 0, newerCount: 80, hasLater: true, beforeId: "metadata-0" } });
+      if (url.pathname === "/api/conversations/chat-A/messages/count") return response({ total: 100 });
+      if (url.pathname === "/api/conversations/chat-A") {
+        if (hold) { requested = true; return held.promise; }
+        return response({ ...running, messages: latest, messagePage: { total: 100, olderCount: 80, beforeId: "metadata-80" } });
+      }
+      return response({});
+    };
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('[aria-label="Stop active agent run"]'), `${kind} initial active run`);
+    hold = true;
+    const event = kind === "completion" ? { type: "run.event", conversationId: "chat-A", runId: "run-metadata", payload: { type: "run.completed" } }
+      : kind === "reconnect" ? { type: "runtime.connected", payload: { replay: { missed: true } } }
+        : { type: "conversation.updated", conversationId: "chat-A" };
+    fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
+    await until(() => requested, `${kind} metadata refresh pending`);
+    const input = host.querySelector(".history-find input");
+    setControlValue(input, "Match 10"); await settle();
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await until(() => host.querySelector('[data-find-match="true"] [data-message-id="metadata-10"]'), `${kind} found old page`);
+    held.resolve(response({ ...completed, messages: latest, messagePage: { total: 100, olderCount: 80, beforeId: "metadata-80" } }));
+    await until(() => !host.querySelector('[aria-label="Stop active agent run"]') && host.querySelector('[aria-label="Send message"]'), `${kind} terminal metadata after find`);
+    assert(host.querySelector('[data-message-id="metadata-10"]') && host.querySelector(".history-return"), `${kind} metadata refresh replaced the found page`);
+  }
+}
+
+async function metadataBeforeFindResultRegression() {
+  for (const kind of ["completion", "reconnect", "list", "no-match", "error"]) {
+    root.render(null);
+    await until(() => !host.querySelector('.app-shell'), `${kind} previous app unmounted`);
+    keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+    const message = (index) => ({ id: `pending-${index}`, role: "assistant", kind: "text", body: `Match ${index}`, createdAt: new Date(index * 1000).toISOString() });
+    const older = Array.from({ length: 20 }, (_, index) => message(index));
+    const latest = Array.from({ length: 20 }, (_, index) => message(index + 80));
+    const running = { ...chats.A, runs: [{ id: "run-pending", status: "running", conversationId: "chat-A" }] };
+    const completed = { ...running, runs: [{ id: "run-pending", status: "completed", conversationId: "chat-A" }] };
+    const pendingFind = deferred();
+    let findRequested = false;
+    let detailReads = 0;
+    route = async (url) => {
+      if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+      if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+      if (url.pathname.endsWith("/messages/find")) { findRequested = true; return pendingFind.promise; }
+      if (url.pathname === "/api/conversations/chat-A/messages/count") return response({ total: 100 });
+      if (url.pathname === "/api/conversations/chat-A") {
+        detailReads += 1;
+        return response({ ...(detailReads === 1 ? running : completed), messages: latest, messagePage: { total: 100, olderCount: 80, beforeId: "pending-80" } });
+      }
+      return response({});
+    };
+    const socketsBefore = fixtureSockets.length;
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => fixtureSockets.length > socketsBefore
+      && host.querySelector('[aria-label="Stop active agent run"]'), `${kind} initial run and socket`);
+    const input = host.querySelector(".history-find input");
+    setControlValue(input, "Match 10"); await settle();
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await until(() => findRequested, `${kind} find pending`);
+    const event = kind === "completion" ? { type: "run.event", conversationId: "chat-A", runId: "run-pending", payload: { type: "run.completed" } }
+      : kind === "reconnect" ? { type: "runtime.connected", payload: { replay: { missed: true } } }
+        : { type: "conversation.updated", conversationId: "chat-A" };
+    fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
+    await until(() => detailReads > 1 && !host.querySelector('[aria-label="Stop active agent run"]'), `${kind} metadata before find`);
+    assert(host.querySelector('.history-find .history-find-status')?.textContent === "Searching…", `${kind} metadata reset the pending search`);
+    if (kind === "error") pendingFind.resolve(response({ error: "Search unavailable" }, 503));
+    else pendingFind.resolve(response({ matchId: kind === "no-match" ? null : "pending-10", messages: older, messagePage: { total: 100, olderCount: 0, newerCount: 80, hasLater: true, beforeId: "pending-0" } }));
+    if (kind === "no-match" || kind === "error") {
+      await until(() => host.querySelector('.history-find .history-find-status')?.textContent === (kind === "error" ? "Search failed; retry" : "No match"), `${kind} status after metadata`);
+      assert(host.querySelector('[data-message-id="pending-80"]') && !host.querySelector('.history-return') && host.querySelector('[aria-label="Send message"]'), `${kind} replaced the latest page or kept stale run metadata`);
+      continue;
+    }
+    await until(() => host.querySelector('[data-find-match="true"] [data-message-id="pending-10"]'), `${kind} found old page after metadata`);
+    const viewport = host.querySelector('.message-scroll [data-slot="scroll-area-viewport"]');
+    await until(() => {
+      const match = host.querySelector('[data-find-match="true"]');
+      return match && match.getBoundingClientRect().bottom > viewport.getBoundingClientRect().top
+        && match.getBoundingClientRect().top < viewport.getBoundingClientRect().bottom;
+    }, `${kind} aligned the found row`);
+    assert(host.querySelector('.history-return') && host.querySelector('[aria-label="Send message"]'), `${kind} lost the reading page or current run metadata`);
+  }
+}
+
+async function findInFlightEventRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (index) => ({ id: `race-${index}`, role: "assistant", kind: "text", body: `Match ${index}`, createdAt: new Date(index * 1000).toISOString() });
+  const latest = Array.from({ length: 200 }, (_, index) => message(index));
+  const pending = deferred();
+  let requested = false;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname.endsWith("/messages/find")) { requested = true; return pending.promise; }
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: latest, messagePage: { hasMore: false, olderCount: 0, total: 200, beforeId: "race-0" } });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.history-find input'), "find race ready");
+  const input = host.querySelector('.history-find input');
+  setControlValue(input, "Match 10"); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => requested, "find race pending");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "message.created", conversationId: "chat-A", payload: message(200) }) }));
+  pending.resolve(response({ matchId: "race-10", messages: latest, messagePage: { hasMore: false, olderCount: 0, hasLater: false, newerCount: 0, total: 200, beforeId: "race-0" } }));
+  await until(() => host.querySelector('.history-return'), "in-flight event offers return to latest");
+  await until(() => host.querySelector('[data-message-id="race-10"]'), "Find retains its match after a live event");
+}
+
+async function typingDuringPrependRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const message = (index) => ({ id: `prepend-${index}`, role: "assistant", kind: "text", body: `Row ${index}`, createdAt: new Date(index * 1000).toISOString() });
+  const latest = Array.from({ length: 200 }, (_, index) => message(index + 100));
+  const older = Array.from({ length: 100 }, (_, index) => message(index));
+  const pending = deferred();
+  let requested = false;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A/messages") { requested = true; return pending.promise; }
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages: latest, messagePage: { hasMore: true, olderCount: 100, total: 300, beforeId: "prepend-100" } });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.history-loader'), "prepend available");
+  host.querySelector('.history-loader').click();
+  await until(() => requested, "prepend pending");
+  const input = host.querySelector('.history-find input');
+  setControlValue(input, "draft query"); await settle();
+  pending.resolve(response({ messages: older, messagePage: { hasMore: false, olderCount: 0, total: 300, beforeId: "prepend-0" } }));
+  await until(() => !host.querySelector('.history-loader'), "prepend finished after typing");
+  assert(host.querySelector('.history-find input').value === "draft query", "Typing while loading earlier lost the query");
+}
+
+async function providerBootstrapConvergenceRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const bootstrap = deferred();
+  let providerReads = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return bootstrap.promise;
+    if (url.pathname === "/api/providers") { providerReads += 1; return response({ providers: [{ id: "codex", label: "Codex", available: true, checking: false }] }); }
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    return response({});
+  };
+  const socketCount = fixtureSockets.length;
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => fixtureSockets.length > socketCount, "socket before bootstrap");
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "providers.changed", payload: { providers: [{ id: "codex", available: true, checking: false }] } }) }));
+  bootstrap.resolve(response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", label: "Codex", available: false, checking: true }], templates: [], trustedProjects: [] }));
+  await until(() => host.querySelector('[aria-label="Settings"]'), "settings after checking bootstrap");
+  host.querySelector('[aria-label="Settings"]').click();
+  await until(() => document.querySelector('[role="dialog"] option[value="codex"]')?.disabled === false, "provider converged after missed event");
+  assert(providerReads > 0, "Checking bootstrap did not refresh providers");
+  document.querySelector('[role="dialog"] button[aria-label="Close"]')?.click();
+}
+
+async function providerCheckingRateRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  let providerReads = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: false, checking: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/providers") { providerReads += 1; return response({ providers: [{ id: "codex", available: false, checking: true }] }); }
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => providerReads > 0, "checking provider poll started");
+  await new Promise((resolve) => setTimeout(resolve, 1150));
+  assert(providerReads <= 2, `Checking provider polled ${providerReads} times in 1.15s`);
+  root.render(null); await settle();
+}
+
+async function sustainedOutputRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('#chat-tab-chat-A[aria-selected="true"]'), "stream fixture chat");
+  await until(() => host.querySelector('textarea[aria-label="Message the agent"]:not(:disabled)'), "stream fixture ready");
+  await settle();
+  const socket = fixtureSockets.at(-1);
+  const sendDelta = (seq) => socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", runId: "run-stream", conversationId: "chat-A", payload: { type: "assistant.delta", seq, payload: { text: "x".repeat(256) } } }) }));
+  sendDelta(1);
+  await until(() => host.querySelector('.is-streaming .message-text'), "streamed output visible");
+  const text = host.querySelector('.is-streaming .message-text');
+  let paints = 0;
+  const observer = new MutationObserver(() => { paints += 1; });
+  observer.observe(text, { subtree: true, characterData: true, childList: true });
+  const started = performance.now();
+  const priorHidden = Object.getOwnPropertyDescriptor(document, "hidden");
+  try {
+    Object.defineProperty(document, "hidden", { configurable: true, value: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    for (let seq = 2; seq <= 201; seq += 1) {
+      sendDelta(seq);
+      // Exercise hidden-tab posted tasks while stream paints keep their own
+      // 32 ms cadence. Every delta must still reach the eventual flush.
+      if (seq % 2 === 1) await frame();
+    }
+    await until(() => text.textContent.length === 201 * 256, "sustained output complete");
+  } finally {
+    if (priorHidden) Object.defineProperty(document, "hidden", priorHidden);
+    else delete document.hidden;
+    document.dispatchEvent(new Event("visibilitychange"));
+  }
+  observer.disconnect();
+  const input = host.querySelector('textarea[aria-label="Message the agent"]');
+  const inputStarted = performance.now();
+  setControlValue(input, "Type during output");
+  await frame();
+  const inputFrameMs = Math.round(performance.now() - inputStarted);
+  const elapsedMs = Math.round(performance.now() - started);
+  // Timer delivery slows under host load. Bound paints by actual elapsed
+  // stream time, while still requiring substantial coalescing per delta.
+  const paintBudget = Math.min(100, Math.ceil(elapsedMs / 24) + 8);
+  assert(paints <= paintBudget, `Sustained output repainted ${paints} times over ${elapsedMs}ms (budget ${paintBudget})`);
+  assert(inputFrameMs < 250, `Typing after sustained output missed its 250ms fixture budget: ${inputFrameMs}ms`);
+  window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), output: { deltas: 200, elapsedMs, paints, paintBudget, inputFrameMs } };
+}
+
 async function responsiveFocusRegression() {
   root.render(null);
   await settle();
@@ -1434,6 +3718,9 @@ async function responsiveFocusRegression() {
   const setWidth = async (width) => {
     await window.__fixtureSetViewport(width);
     await until(() => window.innerWidth === width && window.matchMedia("(max-width: 760px)").matches === (width <= 760), `real ${width}px layout`);
+    // CDP can acknowledge a hidden tab's new metrics before delivering its
+    // resize event. Exercise the same event a visible window resize emits.
+    window.dispatchEvent(new Event("resize"));
     await settle();
   };
   if (!window.__fixtureSetViewport) return false; // Manual preview still runs width-independent cases.
@@ -1533,6 +3820,7 @@ async function responsiveFocusRegression() {
     await until(() => [...document.querySelectorAll('[role="option"]')].some((option) => option.textContent.includes("Review B")), "narrow project search result");
     [...document.querySelectorAll('[role="option"]')].find((option) => option.textContent.includes("Review B")).click();
     await until(() => host.querySelector('textarea[placeholder*="in B"]'), "project selected while drawer closed");
+    await until(() => !document.querySelector('[role="dialog"][data-open]:not(#project-sidebar)'), "project search dialog dismissed");
     const composerB = host.querySelector('textarea[aria-label="Message the agent"]');
     composerB.focus();
     await setWidth(1280);
@@ -1663,7 +3951,10 @@ async function acceptedFirstPromptOwnerSwitchRegression(sameWorktree = false) {
   if (sameWorktree) setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "");
   setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), newerDraft);
   heldRun.resolve(response({ id: "run-new", conversationId: "chat-new", status: "queued" }, 202));
-  await settle();
+  // The held POST settling and React's state commit are separate turns.
+  await until(() => !host.querySelector('.first-prompt-notice')
+    && host.querySelector('textarea[aria-label="Message the agent"]')?.value === newerDraft,
+  "accepted first prompt visibly settled after owner switch");
   assert(runs.length === 1, "Accepted retry duplicated while settling");
   assert(!host.querySelector(".first-prompt-notice"), "Accepted retry left a false unsent first-prompt marker after owner switch");
   assert(host.querySelector('textarea[aria-label="Message the agent"]')?.value === newerDraft, "Accepted retry erased a newer draft");
@@ -1720,6 +4011,43 @@ async function dialogCreateSuccessorRegression(failSuccessor = false, failPrivat
   }
 }
 
+async function archivePagingLoadingRegression() {
+  for (const direction of ["earlier", "later"]) {
+    for (const failed of [false, true]) {
+      root.render(null); await settle();
+      keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+      const sibling = { ...chats.B, projectId: "A", worktreeId: "A", worktreePath: projects[0].worktrees[0].path };
+      const page = { hasMore: true, olderCount: 50, hasLater: true, newerCount: 50, total: 101, beforeId: "page-50" };
+      const messages = [{ id: "page-50", role: "assistant", kind: "text", body: "Reading page", createdAt: new Date(0).toISOString() }];
+      const held = deferred();
+      let pageStarted = false;
+      let archived = false;
+      route = async (url, options) => {
+        if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+        if (url.pathname === "/api/conversations") return response({ conversations: archived ? [sibling] : [chats.A, sibling] });
+        if (url.pathname === "/api/conversations/chat-A" && options?.method === "PATCH") { archived = true; return response({ ...chats.A, archived: true }); }
+        if (url.pathname === "/api/conversations/chat-A/messages") { pageStarted = true; return held.promise; }
+        if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, messages, messagePage: page });
+        if (url.pathname === "/api/conversations/chat-B") return response({ ...sibling, messages, messagePage: page });
+        return response({});
+      };
+      root.render(<TooltipProvider><App /></TooltipProvider>);
+      await until(() => host.querySelector('.chat-tab.is-active')?.textContent.includes("Conversation A") && host.querySelector('.history-later'), "archive page owner ready");
+      host.querySelector(direction === "earlier" ? '.history-loader' : '.history-later').click();
+      await until(() => pageStarted, "old page request pending");
+      host.querySelector('.chat-tab.is-active .tab-close').click();
+      await until(() => host.querySelector('.chat-tab.is-active')?.textContent.includes("Conversation B") && host.querySelector('.history-later'), "sibling selected after archive");
+      assert(archived && !host.querySelector('#chat-tab-chat-A'), "Archived A reappeared after the post-PATCH list refresh");
+      assert(!host.querySelector('.history-loader').disabled && !host.querySelector('.history-later').disabled,
+        `Archiving during ${direction} left sibling paging disabled`);
+      held.resolve(failed ? response({ error: "Old page failed" }, 503) : response({ messages, messagePage: page }));
+      await settle();
+      assert(!host.querySelector('.history-loader').disabled && !host.querySelector('.history-later').disabled,
+        `Stale ${direction} ${failed ? "failure" : "success"} disabled sibling paging`);
+    }
+  }
+}
+
 async function inlineArchiveFocusRegression(last = false, newerFocus = false, nonselected = false) {
   root.render(null);
   await settle();
@@ -1762,6 +4090,7 @@ try {
     ["current conversation send", () => chatRace(false, false), "sending in the current conversation shows its run"],
     ["delayed send", () => chatRace(false), "delayed send cannot attach A's run to B"],
     ["delayed trust response", () => chatRace(true), "delayed trust response cannot target another conversation"],
+    ["same-worktree chat selection", sameWorktreeChatSelectionRegression, "click, keyboard and created-chat selection load only the selected detail and fence sends"],
     ["chat tab controls", chatTabControlRegression, "chat tab navigation ignores nested archive controls"],
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
     ["archived chat ownership", archivedChatOwnershipRegression, "an archived chat cannot keep a pane or accept runs during held or failed refresh"],
@@ -1780,6 +4109,8 @@ try {
     ["dialog successor failure", () => dialogCreateSuccessorRegression(true), "dialog creation uses list retry after a failed socket successor"],
     ["dialog private list failure", () => dialogCreateSuccessorRegression(false, true), "dialog creation reports a current list failure once and retains retry"],
     ["inline archive sibling focus", () => inlineArchiveFocusRegression(false, false), "inline archive focuses the selected sibling tab"],
+    ["archive paging ownership", archivePagingLoadingRegression, "archiving releases pending earlier and later loading through stale success and failure"],
+    ["consecutive run live preview", consecutiveRunLivePreviewRegression, "a new run owns off-page deltas and checkpoints after completion"],
     ["inline archive nonselected focus", () => inlineArchiveFocusRegression(false, false, true), "inline archive of an inactive tab focuses the still-selected tab"],
     ["inline archive last-tab focus", () => inlineArchiveFocusRegression(true, false), "inline archive focuses New chat after the final tab"],
     ["inline archive newer focus", () => inlineArchiveFocusRegression(false, true), "inline archive preserves a newer focus choice"],
@@ -1800,24 +4131,72 @@ try {
     ["same-pane terminal metadata", terminalSamePaneRestartRegression, "same-pane restart drains reconnect after pending mutation"],
     ["terminal reconnect ownership", terminalReconnectOwnershipRegression, "overlapping reconnects coalesce and unmount discards queued work"],
     ["background terminal activation", terminalBackgroundActivationRegression, "background activation settles and fits when visible"],
-    ["command search", commandPaletteRegression, "command search keeps asynchronous results current and selectable"],
-    ["changes loading", changesLoadingRegression, "changes pane waits for status before announcing a clean tree"],
-    ["responsive focus", responsiveFocusRegression, "narrow drawer and inspector contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["initial terminal failure", terminalInitialFailureRegression, "failed initial terminal activation retains a keyboard-reachable tab"],
     ["terminal mutation failure", terminalMutationFailureRegression, "create, close and reconnect failures preserve terminal tab ownership"],
+    ["command search", commandPaletteRegression, "command search keeps asynchronous results current and selectable"],
+    ["changes loading", changesLoadingRegression, "changes pane waits for status before announcing a clean tree"],
+    ["changes discarded render", changesDiscardedRenderRegression, "a suspended worktree render cannot steal a committed status request"],
+    ["stale diff selection", staleDiffSelectionRegression, "a slow prior diff cannot replace the selected file"],
+    ["changes refresh selection", changesSelectionRefreshRegression, "pending refreshes preserve current file and mode and retained events refresh once"],
+    ["changes diff failure ownership", changesDiffFailureOwnershipRegression, "pending and failed file or mode requests never display a previous diff"],
+    ["diff refresh anchor", diffRefreshAnchorRegression, "same-selection refresh keeps the visible diff line and find through success and failure"],
+    ["changes mutation owner success", () => changesMutationOwnerRegression(false), "late stage completion cannot refresh another worktree"],
+    ["changes mutation owner failure", () => changesMutationOwnerRegression(true), "late stage failure cannot report in another worktree"],
+    ["changes unstage owner failure", () => changesMutationOwnerRegression(true, "unstage"), "late unstage failure cannot report in another worktree"],
+    ["changes commit owner success", () => changesCommitOwnerRegression(false), "late commit completion cannot update another worktree"],
+    ["changes commit owner failure", () => changesCommitOwnerRegression(true), "late commit failure cannot report in another worktree"],
+    ["long transcript window", longTranscriptWindowRegression, "a thousand messages keep a bounded DOM and remain scrollable"],
+    ["sustained output", sustainedOutputRegression, "small deltas coalesce without losing output or input responsiveness"],
+    ["many worktree sessions", manyWorktreeSessionRegression, "two repeated switch cycles across two hundred worktrees keep one conversation mounted"],
+    ["initial Previous find", previousFindStartRegression, "Previous begins at the final matching message"],
+    ["variable-height find anchor", variableHeightFindAnchorRegression, "measured tall messages keep a found row visible through resize and live append"],
+    ["large diff window", largeDiffWindowRegression, "fifty thousand diff lines keep a bounded DOM and preserve the last line"],
+    ["extreme diff height", extremeDiffHeightRegression, "a clamped-height diff still reaches its final line with End and Find"],
+    ["Unicode diff find", unicodeDiffFindRegression, "length-changing case folding keeps the correct diff line"],
+    ["reverse diff Find wrap", reverseDiffFindWrapRegression, "Previous wraps left of offset zero and continues through earlier matches"],
+    ["production diff viewport", productionDiffViewportRegression, "staged and unstaged large diffs stay bounded in the inspector"],
+    ["paged transcript anchor", pagedTranscriptAnchorRegression, "loading earlier history preserves its visible reading anchor"],
+    ["stale page measured follow", () => pagedTranscriptFindRegression({ measuredOnly: true }), "a newly measured row cannot erase latest-page bottom intent before a live append"],
+    ["paged transcript find", pagedTranscriptFindRegression, "find navigates older persisted messages with bounded mounted rows"],
+    ["full Find message reader", fullFindMessageReaderRegression, "an excerpted match opens bounded full-body sections with keyboard, retry and navigation"],
+    ["stale page End follow", () => pagedTranscriptFindRegression({ endOnly: true }), "End reaches the latest row after stale and failed page loads and follows new output"],
+    ["forward history paging", forwardHistoryPagingRegression, "an old page can be read continuously through the persisted end within the 1000-row cap"],
+    ["forward page eviction anchor", forwardPageEvictionAnchorRegression, "a full-window forward page retains surviving reading rows and hands evicted rows to Load earlier"],
+    ["background latest refresh", backgroundLatestRefreshRegression, "a missed event refreshes the latest page without keeping a stale snapshot"],
+    ["background reading refresh", backgroundReadingRefreshRegression, "missed replay and completion expose later output without moving a reader"],
+    ["full-page live anchor", fullPageLiveAnchorRegression, "a new row at the 1000-message cap keeps the reader's oldest visible anchor"],
+    ["large live message retention", largeLiveMessageRetentionRegression, "large live messages retain bounded excerpts and full-reader identity"],
+    ["large page message retention", largePageMessageRetentionRegression, "initial, earlier, Find and later pages retain bounded rows, IDs and full-body access"],
+    ["transcript observer stability", transcriptObserverStabilityRegression, "stream paints do not restart row observation for an unchanged long transcript"],
+    ["background completion page ownership", backgroundCompletionKeepsExplicitPageRegression, "run completion cannot supersede an explicit Return to latest request"],
+    ["replay latest page boundary", replayKeepsLatestPageBoundaryRegression, "a buffered older checkpoint cannot make intervening history unreachable"],
+    ["deferred reload selection", deferredReloadSelectionOwnershipRegression, "a queued old selection reload cannot claim the new chat's detail slot"],
+    ["latest before find ownership", latestBeforeFindOwnershipRegression, "an older Return to latest response cannot supersede a newer find"],
+    ["find during metadata refresh", findWhileMetadataRefreshRegression, "completion, reconnect and list metadata survive a concurrent Find without replacing its page"],
+    ["metadata before find result", metadataBeforeFindResultRegression, "completion, reconnect and list metadata may settle before Find without clearing a match, miss, or error"],
+    ["checkpoint reading page", checkpointReadingPageRegression, "reconnect, completion and list updates retain a reading page and unique checkpoint counts"],
+    ["find in-flight event", findInFlightEventRegression, "an event during find remains reachable when the returned page claims to be latest"],
+    ["typing during prepend", typingDuringPrependRegression, "editing a find query does not silently cancel an earlier-page request"],
+    ["provider bootstrap convergence", providerBootstrapConvergenceRegression, "a checking bootstrap converges after an earlier provider event"],
+    ["provider checking rate", providerCheckingRateRegression, "repeated checking snapshots keep a bounded poll cadence"],
+    ["responsive focus", responsiveFocusRegression, "narrow drawer and inspector contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],
   ];
+  const selectedStep = new URLSearchParams(location.search).get("only");
+  const selectedSteps = selectedStep ? steps.filter(([name]) => selectedStep.split(",").includes(name)) : steps;
+  if (!selectedSteps.length) throw new Error(`Unknown interaction fixture: ${selectedStep}`);
   const startedAt = performance.now();
   window.__fixtureStartedAt = startedAt;
   let passed = 0;
-  for (const [index, [step, run, success, skipped]] of steps.entries()) {
+  for (const [index, [step, run, success, skipped]] of selectedSteps.entries()) {
     const stepStartedAt = performance.now();
-    window.__fixtureProgress = { step, completed: index, total: steps.length, stepStartedAt };
+    window.__fixtureProgress = { step, completed: index, total: selectedSteps.length, stepStartedAt };
     const ran = await run();
     results.textContent += `${ran === false && skipped ? `SKIP: ${skipped}` : `PASS: ${success}`}\n`;
     if (ran !== false) passed += 1;
   }
-  window.__fixtureProgress = { step: "complete", completed: steps.length, total: steps.length, stepStartedAt: performance.now() };
+  window.__fixtureProgress = { step: "complete", completed: selectedSteps.length, total: selectedSteps.length, stepStartedAt: performance.now() };
+  results.textContent += `Performance fixture: ${JSON.stringify(window.__performanceEvidence)}\n`;
   results.textContent += `${passed} interaction regressions passed`;
   document.title = "PASS — Outright interaction regressions";
 } catch (error) {

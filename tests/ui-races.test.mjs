@@ -330,10 +330,13 @@ async function closeDevTools(devtools) {
 async function waitForFixture(send, deadline) {
   let state;
   while (Date.now() < deadline) {
-    const evaluated = await send("Runtime.evaluate", {
-      expression: "({ title: document.title, text: document.getElementById('results')?.textContent ?? '', progress: window.__fixtureProgress && { ...window.__fixtureProgress, elapsedMs: Math.round(performance.now() - window.__fixtureStartedAt), stepElapsedMs: Math.round(performance.now() - window.__fixtureProgress.stepStartedAt) } })",
-      returnByValue: true,
-    });
+    let evaluated;
+    try {
+      evaluated = await send("Runtime.evaluate", {
+        expression: "({ title: document.title, text: document.getElementById('results')?.textContent ?? '', progress: window.__fixtureProgress && { ...window.__fixtureProgress, elapsedMs: Math.round(performance.now() - window.__fixtureStartedAt), stepElapsedMs: Math.round(performance.now() - window.__fixtureProgress.stepStartedAt) } })",
+        returnByValue: true,
+      });
+    } catch (error) { throw new Error(`${error.message}; ${fixtureProgress(state)}`, { cause: error }); }
     const next = evaluated?.exceptionDetails ? null : evaluated?.result?.value;
     if (next && typeof next.title === "string") {
       state = next;
@@ -600,16 +603,20 @@ test("a vanished Windows launcher preserves verified descendants without adoptin
   assert.equal(launcher.ownedWindows.has(4103), false);
 });
 
-// The child has 120 seconds including its 95-second interaction phase and
-// cleanup. The parent must outlive that contract before invoking fallback
-// cleanup, and retain a separate reserve for its own tree/profile cleanup.
-const browserFixtureTimeout = 120_000;
+// The normal child has 180 seconds including its 155-second interaction phase
+// and cleanup. A focused 1000px full-span wheel fixture gets a larger finite
+// phase bound. The parent must outlive either child contract and reserve its
+// own tree/profile cleanup time.
+const smallWheelCap = Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) > 0
+  && Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) <= 1000;
+const browserPhaseTimeout = smallWheelCap ? 330_000 : 155_000;
+const browserFixtureTimeout = browserPhaseTimeout + 25_000;
 const nestedStartupAllowance = 15_000;
 const nestedRunnerBudget = (childBudget, startupAllowance) => childBudget + startupAllowance;
 const nestedExitTimeout = nestedRunnerBudget(browserFixtureTimeout, nestedStartupAllowance);
 test("nested runner deadline exceeds its child's full browser budget", () => {
   assert(nestedExitTimeout > browserFixtureTimeout);
-  assert(nestedExitTimeout > 95_000 + 25_000);
+  assert(nestedExitTimeout > browserPhaseTimeout + 25_000);
 });
 
 test("parent permits a slow child beyond the old shorter watchdog", { timeout: 5_000 }, async () => {
@@ -631,7 +638,10 @@ test("parent permits a slow child beyond the old shorter watchdog", { timeout: 5
 test("fixture assertion failures still clean Chrome, Vite and profile independently", { timeout: nestedExitTimeout + 25_000 }, async (context) => {
   if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE) { context.skip("Nested injected-failure run"); return; }
   const profile = mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
-  const env = { ...process.env, OUTRIGHT_TEST_UI_ASSERTION_FAILURE: "1", OUTRIGHT_TEST_UI_PROFILE: profile };
+  // Cleanup is the contract here; one completed interaction distinguishes a
+  // post-fixture assertion from an early startup failure without coupling this
+  // owner test to the entire long-session interaction sequence.
+  const env = { ...process.env, OUTRIGHT_TEST_UI_ASSERTION_FAILURE: "1", OUTRIGHT_TEST_UI_PROFILE: profile, OUTRIGHT_UI_STEP: "sustained output" };
   delete env.NODE_TEST_CONTEXT;
   const child = spawn(process.execPath, ["--test", "--test-name-pattern=browser interaction regressions", fileURLToPath(import.meta.url)], {
     cwd: root, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true,
@@ -664,7 +674,7 @@ test("fixture assertion failures still clean Chrome, Vite and profile independen
 
 test("browser interaction regressions pass in headless Chrome", { timeout: browserFixtureTimeout }, async () => {
   // Reserve the last part of the test's own bound for independent cleanup.
-  const deadline = Date.now() + 95_000;
+  const deadline = Date.now() + browserPhaseTimeout;
   let phase = "allocate fixture";
   const remaining = () => {
     const duration = deadline - Date.now();
@@ -684,7 +694,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
   let output = "";
   vite.stdout.on("data", (chunk) => { output += chunk; });
   vite.stderr.on("data", (chunk) => { output += chunk; });
-  const url = `http://127.0.0.1:${port}/tests/ui-races.html`;
+  const url = `http://127.0.0.1:${port}/tests/ui-races.html${process.env.OUTRIGHT_UI_STEP ? `?only=${encodeURIComponent(process.env.OUTRIGHT_UI_STEP)}` : ""}`;
   let browser;
   let devtools;
   let failure;
@@ -750,7 +760,9 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     await send("Page.enable");
     await send("Runtime.addBinding", { name: "__requestFixtureViewport" });
     await send("Runtime.addBinding", { name: "__requestFixtureKey" });
+    await send("Runtime.addBinding", { name: "__requestFixtureWheel" });
     await send("Page.addScriptToEvaluateOnNewDocument", { source: `
+      window.__fixtureWheelCap = ${Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) || 0};
       window.__fixtureSetViewport = (width) => new Promise((resolve) => {
         const ready = (event) => {
           if (event.detail !== width) return;
@@ -769,16 +781,60 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
         window.addEventListener("fixture-key-ready", ready);
         window.__requestFixtureKey(key);
       });
+      window.__fixtureWheel = (x, y, deltaY, deltaX = 0) => new Promise((resolve, reject) => {
+        const id = Math.random().toString(36).slice(2);
+        let delivered;
+        let acknowledged = false;
+        const cleanup = () => {
+          clearTimeout(timer);
+          document.removeEventListener("wheel", onWheel);
+          window.removeEventListener("fixture-wheel-ready", ready);
+        };
+        const finish = () => {
+          if (!delivered || !acknowledged) return;
+          cleanup();
+          resolve(delivered);
+        };
+        const onWheel = (event) => {
+          delivered = { viewport: event.target.closest?.(".diff-view") ?? null,
+            defaultPrevented: event.defaultPrevented, deltaY: event.deltaY };
+          finish();
+        };
+        const ready = (event) => {
+          if (event.detail !== id) return;
+          acknowledged = true;
+          finish();
+        };
+        const timer = setTimeout(() => { cleanup(); reject(new Error("Native wheel was acknowledged without a DOM wheel event")); }, 2500);
+        document.addEventListener("wheel", onWheel);
+        window.addEventListener("fixture-wheel-ready", ready);
+        window.__requestFixtureWheel(JSON.stringify({ id, x, y, deltaY, deltaX }));
+      });
     ` });
     let viewportError;
+    const pageErrors = [];
     devtools.onEvent((event) => {
+      if (event.method === "Runtime.exceptionThrown") {
+        const details = event.params.exceptionDetails;
+        pageErrors.push(`${details.text}: ${details.exception?.description ?? details.url ?? "unknown source"}`);
+        return;
+      }
       if (event.method !== "Runtime.bindingCalled") return;
       (async () => {
+        if (event.params.name === "__requestFixtureWheel") {
+          const wheel = JSON.parse(event.params.payload);
+          const configuredCap = Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP);
+          const deliveredDelta = configuredCap > 0
+            ? Math.sign(wheel.deltaY) * Math.min(Math.abs(wheel.deltaY), configuredCap) : wheel.deltaY;
+          await send("Input.dispatchMouseEvent", { type: "mouseWheel", x: wheel.x, y: wheel.y, deltaX: wheel.deltaX ?? 0, deltaY: deliveredDelta });
+          await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-wheel-ready", { detail: ${JSON.stringify(wheel.id)} }))` });
+          return;
+        }
         if (event.params.name === "__requestFixtureKey") {
-          if (!["Escape", "Tab"].includes(event.params.payload)) throw new Error("Unexpected fixture key");
-          const code = event.params.payload === "Tab" ? 9 : 27;
+          if (!["Escape", "Tab", "End", "Enter"].includes(event.params.payload)) throw new Error("Unexpected fixture key");
+          const code = event.params.payload === "Tab" ? 9 : event.params.payload === "End" ? 35 : event.params.payload === "Enter" ? 13 : 27;
           const key = { key: event.params.payload, code: event.params.payload, windowsVirtualKeyCode: code, nativeVirtualKeyCode: code };
-          await send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...key });
+          await send("Input.dispatchKeyEvent", { type: event.params.payload === "Enter" ? "keyDown" : "rawKeyDown", ...(event.params.payload === "Enter" ? { text: "\r" } : {}), ...key });
           await send("Input.dispatchKeyEvent", { type: "keyUp", ...key });
           await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-key-ready", { detail: ${JSON.stringify(event.params.payload)} }))` });
           return;
@@ -795,9 +851,15 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     phase = "run browser interaction fixtures";
     const state = await waitForFixture(async (method, params) => {
       if (viewportError) throw viewportError;
+      if (pageErrors.length) throw new Error(`Uncaught browser error: ${pageErrors.join("; ")}`);
       return send(method, params);
     }, deadline);
-    assert.match(state.text, /47 interaction regressions passed/);
+    assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
+    const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
+    assert.match(state.text, new RegExp(`${selectedCount ?? 94} interaction regressions passed`));
+    const performanceFixture = state.text.match(/Performance fixture: (\{[^\n]+\})/);
+    if (!process.env.OUTRIGHT_UI_STEP) assert.ok(performanceFixture, "large fixture measurements were not recorded");
+    if (performanceFixture) console.log(`UI performance: ${performanceFixture[1]}`);
     if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
   } catch (error) {
     failure = new Error(`UI fixture ${phase}: ${error.message}`, { cause: error });

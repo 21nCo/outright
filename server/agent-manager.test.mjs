@@ -2,18 +2,30 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { AGENT_SUPERVISOR, buildProviderCommand, consumeBoundedLines, createAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_AUTHORIZED_CONTROL, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
+import { AGENT_SUPERVISOR, buildProviderCommand, consumeBoundedLines, createAgentManager as createRuntimeAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_AUTHORIZED_CONTROL, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
 import { streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
 
 const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
 const fakeLaunchDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-agent-test-"));
 const WRAPPER_OWNERSHIP_TOKEN = "00000000-0000-4000-8000-000000000001";
 const platformSupervisor = AGENT_SUPERVISOR;
+// These manager fixtures exercise launch and shutdown ownership. Provider
+// discovery has its own OS-visible tests; spawning two unrelated CLI probes
+// for every fake manager makes shutdown timing depend on CI host process load.
+const createAgentManager = (options) => createRuntimeAgentManager({
+  ...options,
+  providerDiscoveryFactory: () => ({
+    list: () => [],
+    refresh: async () => [],
+    available: async () => false,
+    close: async () => {},
+  }),
+});
 // Direct wrapper probes are trusted leaf-only fixtures, never production
 // launches. Production requires the platform supervisor's owned boundary.
 process.env.OUTRIGHT_TEST_DIRECT_WRAPPER = "1";
@@ -25,6 +37,83 @@ const wrapperArgs = (handshakePath, ...providerArgs) => [
   ...providerArgs,
 ];
 test.after(() => rmSync(fakeLaunchDirectory, { recursive: true, force: true }));
+
+test("macOS capability verification yields the event loop and cleans a failed owner", { skip: process.platform !== "darwin" }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-async-supervisor-"));
+  const executable = path.join(directory, "supervisor");
+  const cleanupLog = path.join(directory, "terminated");
+  const original = process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH;
+  try {
+    writeFileSync(executable, `#!/bin/sh\nif [ "$1" = "--self-test" ]; then sleep 0.25; if [ -f "${directory}/fail" ]; then exit 1; fi; echo supported; exit 0; fi\nif [ "$1" = "--terminate" ]; then echo "$2" > "${cleanupLog}"; fi\n`);
+    chmodSync(executable, 0o700);
+    process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH = executable;
+    const { defaultLaunchCommand: launch } = await import(`./agent-manager.mjs?async-probe=${Date.now()}`);
+    let ticks = 0;
+    const ticker = setInterval(() => { ticks += 1; }, 20);
+    const command = { executable: process.execPath, args: ["-e", ""], display: "test" };
+    try {
+      const prepared = await launch(command, { id: "async-success" }, directory);
+      assert.equal(prepared.ownsDescendants, true);
+      assert.ok(ticks >= 5, `Capability check blocked the event loop; timer ticks: ${ticks}`);
+      writeFileSync(path.join(directory, "fail"), "1");
+      await assert.rejects(launch(command, { id: "async-fail" }, directory), /kernel ownership contract/);
+      assert.match(readFileSync(cleanupLog, "utf8"), /^com\.21n\.outright\./);
+    } finally { clearInterval(ticker); }
+  } finally {
+    if (original === undefined) delete process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH;
+    else process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH = original;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a pending capability check cannot launch after trust revocation, target change or stop", async () => {
+  for (const cancel of ["revoke", "target", "stop"]) {
+    const database = fakeDatabase();
+    const run = database.createRun(codexRun(`capability-${cancel}`));
+    let trusted = true;
+    let spawned = 0;
+    let release;
+    const capability = new Promise((resolve) => { release = resolve; });
+    const manager = createAgentManager({ database, publish: () => {},
+      validateConversation: async () => () => { if (!trusted) throw new Error("Project trust was revoked"); },
+      launchCommand: () => capability,
+      spawnProcess: () => { spawned += 1; return fakeChild(); },
+    });
+    const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (cancel === "revoke") trusted = false;
+    else if (cancel === "target") database.updateConversation("conv-1", { worktreePath: "/tmp/elsewhere" });
+    else await manager.stop(run.id);
+    release({ executable: process.execPath, args: [], display: "test", handshakePath: "", ownsDescendants: true });
+    await scheduled;
+    assert.equal(spawned, 0, `A ${cancel} during the capability probe still spawned a provider`);
+    assert.equal(database.getRun(run.id).status, cancel === "stop" ? "stopped" : "failed");
+    await manager.shutdown();
+  }
+});
+
+test("shutdown waits for an already stopped run's capability cleanup", async () => {
+  const database = fakeDatabase();
+  const run = database.createRun(codexRun("shutdown-capability"));
+  let release;
+  const capability = new Promise((resolve) => { release = resolve; });
+  let spawned = 0;
+  const manager = createAgentManager({ database, publish: () => {},
+    launchCommand: () => capability,
+    spawnProcess: () => { spawned += 1; return fakeChild(); },
+  });
+  const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  await new Promise((resolve) => setImmediate(resolve));
+  await manager.stop(run.id);
+  let settled = false;
+  const shutdown = manager.shutdown().then(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "stop released the active slot while the launch verifier still owned cleanup");
+  release({ executable: process.execPath, args: [], display: "test", handshakePath: "", ownsDescendants: true });
+  await Promise.all([scheduled, shutdown]);
+  assert.equal(spawned, 0);
+  assert.equal(database.getRun(run.id).status, "stopped");
+});
 
 function fakeChild({ autoAcknowledge = true } = {}) {
   const child = new PassThrough();
@@ -53,6 +142,40 @@ async function waitForProcessGone(pid, timeout = 5000) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   assert.fail(`process ${pid} was not reaped within ${timeout}ms`);
+}
+
+function processGroupId(pid) {
+  const result = spawnSync("/bin/ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8", timeout: 1000 });
+  const group = Number(result.stdout.trim());
+  return result.status === 0 && Number.isSafeInteger(group) && group > 0 ? group : null;
+}
+
+function liveProcessGroupMembers(groupId) {
+  const result = spawnSync("/bin/ps", ["-axo", "pgid=,stat="], { encoding: "utf8", timeout: 1000 });
+  assert.equal(result.status, 0, `Could not inspect process group ${groupId}: ${result.error?.message ?? result.stderr}`);
+  return result.stdout.split("\n").filter((line) => {
+    const fields = line.trim().match(/^(\d+)\s+(\S+)/);
+    return fields && Number(fields[1]) === groupId && !fields[2].startsWith("Z");
+  });
+}
+
+if (process.env.CI && process.platform !== "win32") {
+  const signalGroup = process.kill.bind(process);
+  process.kill = (pid, signal) => {
+    if (Number.isSafeInteger(pid) && pid < 0 && signal && signal !== 0) {
+      const ownGroup = processGroupId(process.pid);
+      writeSync(2, `POSIX group signal: sender=${process.pid}/${ownGroup} target=${pid} signal=${signal}\n`);
+      if (-pid === ownGroup) throw new Error("Refusing to signal the test runner process group");
+    }
+    return signalGroup(pid, signal);
+  };
+  test.after(() => { process.kill = signalGroup; });
+  process.once("SIGTERM", () => {
+    writeSync(2, `Agent-manager test received SIGTERM: pid=${process.pid} ppid=${process.ppid} pgid=${processGroupId(process.pid)}\n`);
+    process.exit(143);
+  });
+  process.on("exit", (code) => writeSync(2, `Agent-manager test process exited: pid=${process.pid} code=${code}\n`));
+  process.on("uncaughtExceptionMonitor", (error) => writeSync(2, `Agent-manager test uncaught exception: pid=${process.pid} ${error.stack ?? error}\n`));
 }
 
 function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/project" }) {
@@ -194,7 +317,7 @@ test("serializes runs per conversation even with free global capacity", async ()
   assert.equal(children.length, 1);
 
   children[0].emit("close", 0, null);
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  for (let retry = 0; children.length < 2 && retry < 100; retry += 1) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.deepEqual(manager.activeRuns(), ["run-2"]);
   assert.equal(children.length, 2);
 });
@@ -215,6 +338,7 @@ test("serializes runs across conversations that share a worktree", async () => {
 
   children[0].emit("close", 0, null);
   await second;
+  for (let retry = 0; children.length < 2 && retry < 100; retry += 1) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.deepEqual(manager.activeRuns(), ["run-2"]);
   assert.equal(children.length, 2);
   children[1].emit("close", 0, null);
@@ -607,6 +731,7 @@ for (const action of ["stop", "shutdown"]) {
   test(`${action} waits for a descendant that ignores SIGTERM`, { skip: process.platform === "win32", timeout: 10000 }, async (t) => {
     const database = fakeDatabase();
     let child;
+    let ownsDetachedGroup = false;
     const manager = createAgentManager({
       database, publish: () => {}, terminationGraceMs: 150, terminationTimeoutMs: 5000,
       // This injected process is deliberately not the Linux subreaper launch,
@@ -619,19 +744,29 @@ for (const action of ["stop", "shutdown"]) {
         return child;
       },
     });
-    t.after(() => { try { process.kill(-child.pid, "SIGKILL"); } catch {} });
+    t.after(() => {
+      try {
+        if (ownsDetachedGroup) process.kill(-child.pid, "SIGKILL");
+        else child?.kill("SIGKILL");
+      } catch { /* The owned child already exited. */ }
+    });
     const run = database.createRun(codexRun("tree"));
     await manager.schedule({ conversation: database.getConversation("conv-1"), run });
     await once(child.stdout, "data");
+    const ownGroup = processGroupId(process.pid);
+    const childGroup = processGroupId(child.pid);
+    ownsDetachedGroup = childGroup === child.pid && childGroup !== ownGroup;
+    if (process.env.CI) console.error(`POSIX shutdown ownership: action=${action} test=${process.pid}/${ownGroup} child=${child.pid}/${childGroup} detached=${ownsDetachedGroup}`);
+    assert.equal(ownsDetachedGroup, true, "the fixture must own a detached group distinct from the test runner before signaling it");
     let resolved = false;
     const stopping = (action === "stop" ? manager.stop(run.id) : manager.shutdown()).then(() => { resolved = true; });
     await once(child, "close");
     assert.equal(resolved, false, "provider close is not process-tree completion");
     assert.equal(database.getRun(run.id).status, "running");
-    assert.doesNotThrow(() => process.kill(-child.pid, 0));
+    assert.ok(liveProcessGroupMembers(child.pid).length, "a live descendant keeps the detached group active");
     await stopping;
     assert.equal(database.getRun(run.id).status, "stopped");
-    assert.throws(() => process.kill(-child.pid, 0), { code: "ESRCH" });
+    assert.deepEqual(liveProcessGroupMembers(child.pid), [], "stop waits for every executing group member");
     assert.deepEqual(manager.activeRuns(), []);
   });
 }
@@ -713,7 +848,7 @@ test("schedule waits for the launch owner to acknowledge durable authorization",
     return value;
   });
 
-  await new Promise((resolve) => setImmediate(resolve));
+  for (let retry = 0; database.getRun(run.id).status !== "running" && retry < 100; retry += 1) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(settled, false, "a one-way go write is not proof that the launch owner authorized the provider");
   assert.equal(database.getRun(run.id).status, "running");
 
@@ -732,6 +867,7 @@ test("provider stdout cannot merge with or forge launch authorization", async ()
   let settled = false;
   const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run }).then(() => { settled = true; });
 
+  for (let retry = 0; database.getRun(run.id).status !== "running" && retry < 100; retry += 1) await new Promise((resolve) => setTimeout(resolve, 10));
   child.stdout.write(`provider-prefix${LAUNCH_AUTHORIZED_CONTROL}\n`);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(settled, false, "provider data-plane output is never accepted as launch control");
@@ -782,7 +918,10 @@ test("shutdown between the authorization write and owner acknowledgement still c
     setImmediate(() => child.emit("close", null, signal));
     return true;
   };
-  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child, terminationTimeoutMs: 1000 });
+  // This is an authorization race with a fake child. Keep launch capability
+  // fake too: the Darwin default runs a real launchd self-test and bootout.
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child,
+    launchCommand: (command) => ({ ...command, handshakePath: "", ownsDescendants: true }), terminationTimeoutMs: 1000 });
   const run = database.createRun(codexRun("run-1"));
   const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run });
 
@@ -811,7 +950,8 @@ test("a failed running-state commit reaps the unauthorized wrapper before releas
     setImmediate(() => child.emit("close", null, signal));
     return true;
   };
-  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child, terminationTimeoutMs: 1000 });
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child,
+    launchCommand: (command) => ({ ...command, handshakePath: "", ownsDescendants: true }), terminationTimeoutMs: 1000 });
   const run = database.createRun(codexRun("run-1"));
   await manager.schedule({ conversation: database.getConversation("conv-1"), run });
 
@@ -822,8 +962,12 @@ test("a failed running-state commit reaps the unauthorized wrapper before releas
 });
 
 test("shutdown racing the running-state commit never authorizes the provider", async () => {
+  if (process.env.CI && process.platform !== "win32") {
+    console.error(`POSIX shutdown race begin: test=${process.pid}/${processGroupId(process.pid)} parent=${process.ppid}`);
+  }
   const database = fakeDatabase();
   const child = fakeChild();
+  if (process.env.CI && process.platform !== "win32") console.error(`POSIX shutdown race fake child: pid=${child.pid ?? "none"} group=${child.pid ? processGroupId(child.pid) : "none"}`);
   const writes = [];
   const originalWrite = child.stdin.write.bind(child.stdin);
   child.stdin.write = (chunk) => { writes.push(String(chunk)); return originalWrite(chunk); };
@@ -840,14 +984,18 @@ test("shutdown racing the running-state commit never authorizes the provider", a
     if (patch.status === "running" && !shutdownPromise) shutdownPromise = manager.shutdown();
     return updated;
   };
-  manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child, terminationTimeoutMs: 1000 });
+  manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child,
+    launchCommand: (command) => ({ ...command, handshakePath: "", ownsDescendants: true }), terminationTimeoutMs: 1000 });
   const run = database.createRun(codexRun("run-1"));
+  if (process.env.CI && process.platform !== "win32") console.error(`POSIX shutdown race scheduling: test=${process.pid}`);
   await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  if (process.env.CI && process.platform !== "win32") console.error(`POSIX shutdown race scheduled: test=${process.pid} childSignals=${child.signals.join(",")}`);
   await shutdownPromise;
 
   assert.equal(writes.includes("go\n"), false, "shutdown cannot authorize a provider after cancellation");
   assert.equal(database.getRun(run.id).status, "stopped");
   assert.deepEqual(manager.activeRuns(), []);
+  if (process.env.CI && process.platform !== "win32") console.error("POSIX shutdown race complete: fake child had no process-group identity");
 });
 
 test("shutdown retains ownership when a closed supervisor leaves a stale handshake", async () => {
@@ -855,7 +1003,9 @@ test("shutdown retains ownership when a closed supervisor leaves a stale handsha
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-stale-handshake-"));
   const handshakePath = path.join(root, "run-1.json");
   const child = fakeChild();
-  child.pid = 4242;
+  // This fixture verifies durable handshake ownership. Keep the fake child
+  // pid-less so it cannot signal any external process group. The real wrapper
+  // and descendant tests below verify OS-visible tree termination separately.
   const originalWrite = child.stdin.write.bind(child.stdin);
   child.stdin.write = (chunk) => {
     const written = originalWrite(chunk);
@@ -873,11 +1023,12 @@ test("shutdown retains ownership when a closed supervisor leaves a stale handsha
     });
     const run = database.createRun(codexRun("run-1"));
     await manager.schedule({ conversation: database.getConversation("conv-1"), run });
-    writeFileSync(handshakePath, JSON.stringify({ pid: child.pid, authorized: true, processIdentity: "test:owned" }));
+    writeFileSync(handshakePath, JSON.stringify({ authorized: true, processIdentity: "test:owned" }));
 
     await assert.rejects(manager.shutdown(), /Agent process tree did not terminate/);
 
-    assert.equal(existsSync(handshakePath), true, "an empty process group cannot erase ancestry-based supervisor ownership");
+    assert.deepEqual(child.signals, ["SIGTERM"], "shutdown still requests termination of its owned child");
+    assert.equal(existsSync(handshakePath), true, "a closed child cannot erase the supervisor's durable ownership record");
     assert.equal(database.getRun(run.id).status, "running");
     assert.deepEqual(manager.activeRuns(), [run.id], "the run slot remains owned until the supervisor proves its complete tree is gone");
   } finally {
@@ -1364,7 +1515,7 @@ test("wrapper teardown kills the provider and the wrapper reaps it", { skip: pro
 
     assert.equal(await stopping, true, "stop completes instead of timing out on the tree");
     assert.equal(database.getRun(run.id).status, "stopped");
-    assert.throws(() => process.kill(-child.pid, 0), { code: "ESRCH" }, "the whole owned process group is gone");
+    assert.deepEqual(liveProcessGroupMembers(child.pid), [], "the whole owned process group has stopped executing");
     assert.deepEqual(manager.activeRuns(), []);
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, isUnverifiableLegacyRecovery, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterDurableMessage, streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
+import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, isUnverifiableLegacyRecovery, messagePrecedesPage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterDurableMessage, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "../src/recovery-policy.js";
+
+test("live insertion and replay follow durable order across a backward clock jump", () => {
+  const first = { id: "first", createdAt: "2026-09-26T12:00:00Z", searchOrder: 1 };
+  const second = { id: "second", createdAt: "2026-09-26T11:00:00Z", searchOrder: 2 };
+  assert.equal(messagePrecedesPage(second, first), false);
+  assert.deepEqual(upsertRuntimeMessage([first], second).map((message) => message.id), ["first", "second"]);
+  assert.deepEqual(replayConversationEvents([first], [{ type: "message.created", payload: second }]).messages.map((message) => message.id), ["first", "second"]);
+});
 
 test("worktree recovery metadata gates sibling composers before conversation-local history", () => {
   const local = { id: "local", status: "interrupted" };
@@ -75,6 +83,28 @@ test("conversation loads replay websocket events over a monotonic durable snapsh
   assert.equal(isStaleCheckpointMessage(newerSnapshot.cursors, checkpoint), true);
 });
 
+test("sustained replay keeps the newest bounded transcript without quadratic work", () => {
+  const events = Array.from({ length: 10_000 }, (_, index) => ({
+    type: "message.created",
+    payload: { id: `message-${index}`, role: "assistant", createdAt: new Date(index * 1_000).toISOString(), body: "output" },
+  }));
+  const started = performance.now();
+  const replayed = replayConversationEvents([], events, 1_000);
+  assert.ok(performance.now() - started < 250, "a burst of durable messages must not block input for seconds");
+  assert.equal(replayed.messages.length, 1_000);
+  assert.equal(replayed.dropped, 9_000);
+  assert.equal(replayed.messages[0].id, "message-9000");
+  assert.equal(replayed.messages.at(-1).id, "message-9999");
+});
+
+test("checkpoint cursors stay bounded across thousands of completed runs", () => {
+  const cursors = new Map();
+  for (let index = 0; index < 4_000; index += 1) recordCheckpointCursor(cursors, { payload: { runId: `run-${index}`, checkpointEventSeq: index } });
+  assert.equal(cursors.size, 2_048);
+  assert.equal(cursors.has("run-0"), false);
+  assert.equal(cursors.get("run-3999"), 3_999);
+});
+
 test("checkpoint cursors loaded from older pages only advance", () => {
   const current = new Map([["run-1", 9]]);
   const merged = checkpointCursors([
@@ -83,6 +113,41 @@ test("checkpoint cursors loaded from older pages only advance", () => {
   ], current);
   assert.equal(merged.get("run-1"), 9);
   assert.equal(merged.get("run-2"), 3);
+});
+
+test("older checkpoint replay cannot refresh eviction order or displace a newer high-water mark", () => {
+  const cursors = new Map();
+  for (let index = 0; index < 2_048; index += 1) recordCheckpointCursor(cursors, { payload: { runId: `run-${index}`, checkpointEventSeq: 9 } });
+  recordCheckpointCursor(cursors, { payload: { runId: "run-0", checkpointEventSeq: 4 } });
+  recordCheckpointCursor(cursors, { payload: { runId: "run-new", checkpointEventSeq: 1 } });
+  assert.equal(cursors.has("run-0"), false);
+  assert.equal(cursors.get("run-1"), 9);
+});
+
+test("an active run keeps its checkpoint cursor through more than 2048 other runs", () => {
+  const cursors = new Map();
+  const active = new Set(["long-run"]);
+  recordCheckpointCursor(cursors, { payload: { runId: "long-run", checkpointEventSeq: 100 } }, active);
+  for (let index = 0; index < 2_100; index += 1) recordCheckpointCursor(cursors, { payload: { runId: `short-${index}`, checkpointEventSeq: 1 } }, active);
+  assert.equal(cursors.size, 2_048);
+  assert.equal(cursors.get("long-run"), 100);
+  assert.equal(isStaleCheckpointMessage(cursors, { payload: { runId: "long-run", checkpointEventSeq: 99 } }), true);
+});
+
+test("pending detail replay retains an active high-water mark through checkpoint turnover", () => {
+  const active = new Set(["long-run"]);
+  const checkpoint = { id: "long-message", role: "assistant", createdAt: "2026-09-22T00:00:00Z", payload: { runId: "long-run", checkpointEventSeq: 100 } };
+  const events = Array.from({ length: 2_100 }, (_, index) => ({
+    type: "message.created",
+    payload: { id: `short-${index}`, role: "assistant", createdAt: "2026-09-22T00:00:01Z", payload: { runId: `short-${index}`, checkpointEventSeq: 1 } },
+  }));
+  events.push({ type: "message.created", payload: { ...checkpoint, payload: { runId: "long-run", checkpointEventSeq: 99 }, body: "stale" } });
+  events.push({ type: "run.event", runId: "long-run", payload: { type: "assistant.delta", seq: 100, payload: { text: "duplicate" } } });
+  const replayed = replayConversationEvents([checkpoint], events, 3_000, active);
+  assert.equal(replayed.cursors.size, 2_048);
+  assert.equal(replayed.cursors.get("long-run"), 100);
+  assert.equal(replayed.streamingText, "");
+  assert.equal(replayed.messages.find((message) => message.id === "long-message")?.body, undefined);
 });
 
 test("conversation replay and its in-flight event buffer remain bounded", () => {
@@ -98,6 +163,33 @@ test("conversation replay and its in-flight event buffer remain bounded", () => 
   assert.equal(pending.overflowed, true);
   assert.equal(pending.events.length, 1, "overflow never grows the retained event list");
   assert.equal(bufferConversationRuntimeEvent(pending, { ...event, conversationId: "another" }, 1000), "ignored");
+});
+
+test("replay keeps an unloaded checkpoint outside the latest page boundary", () => {
+  const message = (index, seq = 0) => ({ id: `message-${index}`, role: "assistant", body: `Body ${index}`,
+    searchOrder: index, createdAt: new Date(index * 1000).toISOString(),
+    payload: { runId: `run-${index}`, checkpointEventSeq: seq } });
+  const latest = Array.from({ length: 200 }, (_, index) => message(index + 800));
+  const events = [
+    { type: "message.created", payload: message(10, 2) },
+    { type: "message.created", payload: message(900, 3) },
+    { type: "message.created", payload: message(1000, 1) },
+  ];
+  const replayed = replayConversationEvents(latest, events, 200, new Set(), new Map(),
+    { hasMore: true, olderCount: 800, beforeId: "message-800" });
+  assert.equal(replayed.messages.length, 200);
+  assert.equal(replayed.messages[0].id, "message-801", "only the newest append may evict the oldest page row");
+  assert.equal(replayed.messages.at(-1).id, "message-1000");
+  assert.equal(replayed.messages.find((item) => item.id === "message-900")?.payload.checkpointEventSeq, 3);
+  assert.equal(replayed.messages.some((item) => item.id === "message-10"), false);
+  assert.equal(replayed.cursors.get("run-10"), 2, "off-page replay still owns the checkpoint cursor");
+  assert.equal(replayed.dropped, 1, "page accounting excludes an off-page update");
+  const live = replayConversationEvents(latest, [
+    { type: "run.event", runId: "run-10", payload: { type: "assistant.delta", seq: 1, payload: { text: "prefix" } } },
+    { type: "message.created", payload: message(10, 1) },
+    { type: "run.event", runId: "run-10", payload: { type: "assistant.delta", seq: 2, payload: { text: "suffix" } } },
+  ], 200, new Set(["run-10"]), new Map(), { hasMore: true, olderCount: 800 });
+  assert.equal(live.streamingText, "prefixsuffix", "an unloaded checkpoint cannot erase the visible live prefix");
 });
 
 test("only legacy rows without any process or worktree identity offer manual cleanup", () => {

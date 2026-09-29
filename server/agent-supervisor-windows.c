@@ -36,19 +36,19 @@ static wchar_t *quote_argument(const wchar_t *value) {
   return quoted;
 }
 
-static wchar_t *command_line(int argc, wchar_t **argv) {
+static wchar_t *command_line(int argc, wchar_t **argv, int first_argument) {
   size_t capacity = 1;
   wchar_t **parts = calloc((size_t)argc, sizeof(*parts));
   if (!parts) return NULL;
-  for (int index = 1; index < argc; index++) {
+  for (int index = first_argument; index < argc; index++) {
     parts[index] = quote_argument(argv[index]);
     if (!parts[index]) return NULL;
     capacity += wcslen(parts[index]) + 1;
   }
   wchar_t *line = calloc(capacity, sizeof(*line));
   if (!line) return NULL;
-  for (int index = 1; index < argc; index++) {
-    if (index > 1) wcscat_s(line, capacity, L" ");
+  for (int index = first_argument; index < argc; index++) {
+    if (index > first_argument) wcscat_s(line, capacity, L" ");
     wcscat_s(line, capacity, parts[index]);
     free(parts[index]);
   }
@@ -58,13 +58,15 @@ static wchar_t *command_line(int argc, wchar_t **argv) {
 
 int wmain(int argc, wchar_t **argv) {
   if (argc < 2) return 64;
+  bool test_mode = wcscmp(argv[1], L"--test-runner") == 0;
+  if (test_mode && argc < 4) return 64;
   HANDLE job = CreateJobObjectW(NULL, NULL);
   if (!job) return 70;
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
   limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
   if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return 71;
 
-  wchar_t *line = command_line(argc, argv);
+  wchar_t *line = command_line(argc, argv, test_mode ? 3 : 1);
   if (!line) return 72;
   STARTUPINFOW startup = {0};
   startup.cb = sizeof(startup);
@@ -82,10 +84,27 @@ int wmain(int argc, wchar_t **argv) {
   }
   CloseHandle(process.hThread);
 
-  WaitForSingleObject(process.hProcess, INFINITE);
+  if (test_mode) {
+    for (;;) {
+      DWORD wait = WaitForSingleObject(process.hProcess, 25);
+      if (wait == WAIT_OBJECT_0) break;
+      if (wait == WAIT_FAILED) { TerminateJobObject(job, 1); return 78; }
+      if (GetFileAttributesW(argv[2]) != INVALID_FILE_ATTRIBUTES) {
+        if (!TerminateJobObject(job, 1)) return 77;
+        WaitForSingleObject(process.hProcess, INFINITE);
+        break;
+      }
+    }
+  } else WaitForSingleObject(process.hProcess, INFINITE);
   DWORD exit_code = 1;
   GetExitCodeProcess(process.hProcess, &exit_code);
   CloseHandle(process.hProcess);
+
+  // Test files must not carry helper processes into the next file. Provider
+  // runs retain the normal wait-for-descendants contract below.
+  if (test_mode) {
+    if (!TerminateJobObject(job, exit_code)) return 77;
+  }
 
   // The job owns descendants even when they detach from the provider. Keep
   // this supervisor alive until the kernel reports that the job is empty.

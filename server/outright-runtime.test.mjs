@@ -11,6 +11,14 @@ import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAliv
 import { createOutrightDatabase } from "./database.mjs";
 import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
 
+if (process.env.CI && process.platform !== "win32") {
+  const group = spawnSync("/bin/ps", ["-o", "pgid=", "-p", String(process.pid)], { encoding: "utf8", timeout: 1000 });
+  const pgid = group.status === 0 ? group.stdout.trim() : "unavailable";
+  console.error(`POSIX runtime test module ready: test=${process.pid}/${pgid} parent=${process.ppid} supervisor=${AGENT_SUPERVISOR}`);
+  process.on("exit", (code) => console.error(`POSIX runtime test process exited: test=${process.pid} code=${code}`));
+  process.on("uncaughtExceptionMonitor", (error) => console.error(`POSIX runtime test uncaught exception: test=${process.pid} ${error.stack ?? error}`));
+}
+
 function request(host, origin) {
   return { headers: { host, ...(origin ? { origin } : {}) } };
 }
@@ -29,7 +37,7 @@ function responseCapture() {
   return {
     statusCode: null,
     setHeader(key, value) { (this.headers ??= {})[key] = value; },
-    end(payload) { this.body = payload ? JSON.parse(payload) : null; },
+    end(payload) { this.raw = payload ?? ""; this.body = payload ? JSON.parse(payload) : null; },
   };
 }
 
@@ -129,7 +137,7 @@ function withWorktreeRuntime(fn, options = {}) {
       const worktree = project?.worktrees.find((item) => !item.isLinked);
       if (!project || !worktree) throw new Error("the temp repo was not discovered as a project worktree");
       runtime.database.trustProject(project.id, project.path);
-      await fn(runtime, { project, worktree });
+      await fn(runtime, { project, worktree, bin });
     } finally {
       process.env.PATH = previousPath;
       if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
@@ -170,6 +178,134 @@ test("archived conversations reject new runs before any message or agent schedul
   assert.deepEqual(runtime.database.listRuns(conversation.id), []);
 }));
 
+test("conversation find rejects malformed queries and foreign cursors", withRuntime(async (runtime) => {
+  const chat = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Find", provider: "codex" });
+  const other = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Other", provider: "codex" });
+  const foreign = runtime.database.addMessage({ conversationId: other.id, role: "user", body: "needle" });
+  const own = runtime.database.addMessage({ conversationId: chat.id, role: "user", body: "own" });
+  for (const suffix of ["", "?q=%20", `?q=${"a".repeat(201)}`, "?q=needle&direction=sideways", `?q=needle&after=${foreign.id}`, `?q=needle&after=${foreign.id}&origin=none`, `?q=needle&origin=${foreign.id}`, "?q=needle&wrapped=1", "?q=needle&origin=none&wrapped=1",
+    "?q=needle&byteOffset=1", `?q=needle&after=${own.id}&byteOffset=1`,
+    `?q=needle&after=${own.id}&origin=none&byteOffset=0`, `?q=needle&after=${own.id}&origin=none&byteOffset=99999999999999999999`,
+    "?q=needle&contextOffset=1", `?q=needle&after=${own.id}&contextOffset=1`,
+    `?q=needle&after=${own.id}&origin=none&contextOffset=0`, `?q=needle&after=${own.id}&origin=none&contextOffset=99999999999999999999`,
+    "?q=needle&leftContextOffset=1", `?q=needle&after=${own.id}&leftContextOffset=1`,
+    `?q=needle&after=${own.id}&origin=none&leftContextOffset=0`,
+    `?q=needle&after=${own.id}&origin=none&leftContextOffset=99999999999999999999`,
+    `?q=needle&after=${own.id}&origin=none&leftContextCased=1`]) {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("GET", `/api/conversations/${chat.id}/messages/find${suffix}`), response);
+    assert.equal(response.statusCode, 400, suffix);
+  }
+  const missing = responseCapture();
+  await runtime.handleRequest(requestStream("GET", "/api/conversations/missing/messages/find?q=needle"), missing);
+  assert.equal(missing.statusCode, 404);
+}));
+
+test("conversation Find HTTP carries a bounded Unicode context cursor", withRuntime(async (runtime) => {
+  const chat = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Unicode context", provider: "codex" });
+  const row = runtime.database.addMessage({ conversationId: chat.id, role: "assistant",
+    body: `${"a".repeat(65534)}Σ${"\u0301".repeat(4_300_000)}A` });
+  let cursor = null;
+  let contextOffset = 0;
+  let byteOffset = 0;
+  let result;
+  for (let request = 0; request < 5; request += 1) {
+    const params = new URLSearchParams({ q: "σ" });
+    if (cursor) {
+      params.set("after", cursor);
+      params.set("origin", "none");
+    }
+    if (contextOffset) params.set("contextOffset", String(contextOffset));
+    if (byteOffset) params.set("byteOffset", String(byteOffset));
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("GET", `/api/conversations/${chat.id}/messages/find?${params}`), response);
+    assert.equal(response.statusCode, 200);
+    result = response.body;
+    if (!result.partial) break;
+    assert.equal(result.nextAfterId, row.id);
+    cursor = result.nextAfterId;
+    contextOffset = result.nextContextOffset ?? 0;
+    byteOffset = result.nextByteOffset ?? 0;
+  }
+  assert.equal(result.matchId, row.id);
+}));
+
+test("conversation forward pages and count endpoint remain scoped to one conversation", withRuntime(async (runtime) => {
+  const chat = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Forward", provider: "codex" });
+  const other = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Other", provider: "codex" });
+  const ids = Array.from({ length: 5 }, (_, index) => runtime.database.addMessage({ conversationId: chat.id, role: "user", body: `row ${index}` }).id);
+  const foreign = runtime.database.addMessage({ conversationId: other.id, role: "user", body: "foreign" });
+  const count = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `/api/conversations/${chat.id}/messages/count`), count);
+  assert.equal(count.statusCode, 200);
+  assert.deepEqual(count.body, { total: 5 });
+  const page = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `/api/conversations/${chat.id}/messages?after=${ids[1]}&limit=2`), page);
+  assert.equal(page.statusCode, 200);
+  assert.deepEqual(page.body.messages.map((message) => message.id), ids.slice(2, 4));
+  assert.equal(page.body.messagePage.newerCount, 1);
+  for (const suffix of [`?after=${foreign.id}`, `?before=${ids[0]}&after=${ids[1]}`]) {
+    const invalid = responseCapture();
+    await runtime.handleRequest(requestStream("GET", `/api/conversations/${chat.id}/messages${suffix}`), invalid);
+    assert.equal(invalid.statusCode, 400);
+  }
+  const missing = responseCapture();
+  await runtime.handleRequest(requestStream("GET", "/api/conversations/missing/messages/count"), missing);
+  assert.equal(missing.statusCode, 404);
+}));
+
+test("ordinary conversation HTTP pages bound serialized bytes in both directions", withRuntime(async (runtime) => {
+  const chat = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Large pages", provider: "codex" });
+  const ids = Array.from({ length: 12 }, () => runtime.database.addMessage({ conversationId: chat.id,
+    role: "assistant", body: "x".repeat(1024 * 1024), payload: { detail: "y".repeat(1024 * 1024) } }).id);
+  for (const [suffix, expected] of [
+    ["", ids.slice(9, 12)],
+    [`/messages?before=${ids[9]}&limit=5`, ids.slice(6, 9)],
+    [`/messages?after=${ids[1]}&limit=5`, ids.slice(2, 5)],
+  ]) {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("GET", `/api/conversations/${chat.id}${suffix}`), response);
+    assert.equal(response.statusCode, 200);
+    assert.ok(Buffer.byteLength(response.raw) <= 8 * 1024 * 1024 + 2048, `${suffix || "detail"} exceeded its HTTP byte budget`);
+    assert.equal(response.body.messagePage.total, ids.length);
+    assert.equal(response.body.messagePage.olderCount + response.body.messages.length + response.body.messagePage.newerCount, ids.length);
+    assert.deepEqual(response.body.messages.map((message) => message.id), expected, `${suffix || "detail"} returned the wrong contiguous window`);
+    assert.equal(response.body.messages.every((message) => message.findExcerpt && message.payloadOmitted), true);
+  }
+}));
+
+test("full Find body sections stay bounded and scoped to the selected conversation", withRuntime(async (runtime) => {
+  const chat = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Large", provider: "codex" });
+  const other = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Other", provider: "codex" });
+  const message = runtime.database.addMessage({ conversationId: chat.id, role: "assistant", body: `${"x".repeat(70000)}needle${"y".repeat(70000)}` });
+  const path = `/api/conversations/${chat.id}/messages/${message.id}/body`;
+  const first = responseCapture();
+  await runtime.handleRequest(requestStream("GET", path), first);
+  assert.equal(first.statusCode, 200);
+  assert.equal(first.body.body.length, 65536);
+  assert.equal(first.body.nextOffset, 65536);
+  assert.equal(first.body.hasMore, true);
+  const second = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `${path}?offset=${first.body.nextOffset}`), second);
+  assert.equal(second.statusCode, 200);
+  assert.ok(second.body.body.includes("needle"));
+  const mixed = runtime.database.addMessage({ conversationId: chat.id, role: "assistant", body: `${"x".repeat(65534)}🙂\0tail` });
+  const mixedPath = `/api/conversations/${chat.id}/messages/${mixed.id}/body`;
+  const mixedFirst = responseCapture();
+  await runtime.handleRequest(requestStream("GET", mixedPath), mixedFirst);
+  const mixedNext = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `${mixedPath}?offset=${mixedFirst.body.nextOffset}`), mixedNext);
+  assert.equal(mixedFirst.statusCode, 200);
+  assert.equal(mixedNext.statusCode, 200);
+  assert.equal(mixedFirst.body.body + mixedNext.body.body, `${"x".repeat(65534)}🙂\0tail`);
+  assert.ok(Buffer.byteLength(JSON.stringify(mixedFirst.body)) < 65536 + 1024);
+  for (const invalid of [`/api/conversations/${other.id}/messages/${message.id}/body`, `${path}?offset=-1`, `${path}?offset=1.5`, `${path}?offset=999999`, `/api/conversations/${chat.id}/messages/%ZZ/body`]) {
+    const reply = responseCapture();
+    await runtime.handleRequest(requestStream("GET", invalid), reply);
+    assert.equal(reply.statusCode, invalid.includes(other.id) ? 404 : 400);
+  }
+}));
+
 async function waitForValidation(entered, pending) {
   let timer;
   try {
@@ -203,6 +339,81 @@ test("archiving during asynchronous worktree validation rejects a run without du
   assert.deepEqual(runtime.database.listMessages(conversation.id), []);
   assert.deepEqual(runtime.database.listRuns(conversation.id), []);
 }));
+
+for (const operation of ["send", "recovery"]) {
+  test(`revoking trust during provider discovery rejects ${operation} before a durable commit`, { skip: process.platform === "win32", timeout: 20000 }, (() => {
+    let releaseProbe;
+    let enteredProbe;
+    const waiting = new Promise((resolve) => { enteredProbe = resolve; });
+    const gate = new Promise((resolve) => { releaseProbe = resolve; });
+    return withWorktreeRuntime(async (runtime, { project, worktree }) => {
+      runtime.agents.providerAvailable = async () => { enteredProbe(); await gate; return true; };
+      const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Trust fence", provider: "codex" });
+      let interrupted;
+      if (operation === "recovery") {
+        interrupted = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "codex", approvalPolicy: "read-only", prompt: "unfinished" });
+        runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+      }
+      const response = responseCapture();
+      const endpoint = operation === "send" ? `/api/conversations/${conversation.id}/runs` : `/api/runs/${interrupted.id}/resume`;
+      const body = operation === "send" ? { prompt: "must not persist" } : { policy: "retry" };
+      const pending = runtime.handleRequest(requestStream("POST", endpoint, body), response);
+      try {
+        await waitForValidation(waiting, pending);
+        runtime.database.untrustProject(project.id);
+      } finally { releaseProbe(); }
+      await pending;
+      assert.equal(response.statusCode, 403);
+      assert.equal(response.body.code, "PROJECT_TRUST_REQUIRED");
+      assert.deepEqual(runtime.database.listMessages(conversation.id), []);
+      assert.equal(runtime.database.listRuns(conversation.id).length, operation === "send" ? 0 : 1);
+      if (interrupted) assert.equal(runtime.database.getRun(interrupted.id).recoveryDecision, null);
+    });
+  })());
+}
+
+for (const operation of ["send", "recovery"]) {
+  test(`provider removal denies ${operation} before durable side effects`, { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+    runtime.agents.providerAvailable = async () => false;
+    const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Removed provider", provider: "codex" });
+    let interrupted;
+    if (operation === "recovery") {
+      interrupted = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "codex", approvalPolicy: "read-only", prompt: "unfinished" });
+      runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+    }
+    const result = responseCapture();
+    await runtime.handleRequest(requestStream("POST", operation === "send" ? `/api/conversations/${conversation.id}/runs` : `/api/runs/${interrupted.id}/resume`, operation === "send" ? { prompt: "must not persist" } : { policy: "retry" }), result);
+    assert.equal(result.statusCode, 409);
+    assert.match(result.body.error, /CLI is not available/);
+    assert.deepEqual(runtime.database.listMessages(conversation.id), []);
+    assert.equal(runtime.database.listRuns(conversation.id).length, operation === "send" ? 0 : 1);
+    if (interrupted) assert.equal(runtime.database.getRun(interrupted.id).recoveryDecision, null);
+  }));
+}
+
+for (const operation of ["send", "recovery"]) {
+  test(`slow executable provider probe stays asynchronous and bounded for ${operation}`, { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
+    // Exercise the real execFile --version path through each HTTP endpoint.
+    writeFileSync(path.join(bin, "codex"), "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then sleep 0.25; echo 'codex test'; fi\n");
+    const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Probe latency", provider: "codex" });
+    let interrupted;
+    if (operation === "recovery") {
+      interrupted = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "codex", approvalPolicy: "read-only", prompt: "unfinished" });
+      runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+    }
+    const response = responseCapture();
+    let ticks = 0;
+    const timer = setInterval(() => { ticks += 1; }, 20);
+    const started = performance.now();
+    try {
+      await runtime.handleRequest(requestStream("POST", operation === "send" ? `/api/conversations/${conversation.id}/runs` : `/api/runs/${interrupted.id}/resume`, operation === "send" ? { prompt: "measure probe" } : { policy: "retry" }), response);
+    } finally { clearInterval(timer); }
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed >= 200 && elapsed < 2500, `${operation} took ${elapsed.toFixed(1)} ms with a 250 ms executable probe`);
+    assert.ok(ticks >= 5, `${operation} blocked the event loop during its executable probe`);
+    assert.equal(response.statusCode, 202);
+  }));
+}
 
 test("validation rendezvous fails promptly when an HTTP error settles before the gate", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
   const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Early rejection", provider: "codex" });

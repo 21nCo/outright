@@ -19,18 +19,35 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ChangesPane } from "@/components/ChangesPane";
+import { ESTIMATED_MESSAGE_HEIGHT, WindowedMessages } from "@/components/WindowedMessages";
 import { CommandPalette } from "@/components/CommandPalette";
 import { ContextPane } from "@/components/ContextPane";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { TerminalPane } from "@/components/TerminalPane";
 import { domId, nextTabIndex } from "@/lib/accessibility";
 import { api, connectRuntime, query } from "@/lib/runtime-api";
-import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "@/recovery-policy";
+import { scheduleLayoutTick } from "@/lib/windowing";
+import { foldFindText } from "@/lib/find-text";
+import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, messagePrecedesPage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "@/recovery-policy";
 
 const MAX_RENDERED_MESSAGES = 1000;
+function moveMessageViewport(viewport, top) {
+  if (!viewport) return;
+  const previous = viewport.scrollTop;
+  viewport.scrollTop = top;
+  // Hidden browsers may defer native scroll events. The virtualizer still
+  // needs the new position when an explicit page or anchor move commits.
+  if (Math.abs(viewport.scrollTop - previous) > 0.5) viewport.dispatchEvent(new Event("scroll"));
+}
+const ACTIVE_RUN_STATUSES = new Set(["queued", "launching", "running"]);
+function activeCursorOwners(conversation) {
+  return new Set((conversation?.runs ?? []).filter((run) => ACTIVE_RUN_STATUSES.has(run.status)).map((run) => run.id));
+}
 const MAX_STREAMING_CHARACTERS = 1024 * 1024;
+const MAX_READING_LIVE_PREVIEW_CHARACTERS = 8192;
 const MAX_PENDING_RUNTIME_EVENT_BYTES = 2 * 1024 * 1024;
 const LIVE_TRUNCATION_MARKER = "\n\n[Live output truncated]";
+const LIVE_OMITTED_PREFIX = "[Earlier live output omitted]\n";
 
 export function App() {
   const [bootstrap, setBootstrap] = useState(null);
@@ -49,7 +66,11 @@ export function App() {
   const draftRevisionRef = useRef(0);
   const [unsentCreatedChat, setUnsentCreatedChat] = useState(null);
   const [streamingText, setStreamingText] = useState("");
+  const [liveCheckpoint, setLiveCheckpoint] = useState(null);
+  const streamingTextRef = useRef("");
+  const streamingFlushRef = useRef(null);
   const [runEvents, setRunEvents] = useState([]);
+  const [findResetGeneration, setFindResetGeneration] = useState(0);
   const [runtimeEvent, setRuntimeEvent] = useState(null);
   const [connection, setConnection] = useState("connecting");
   const [isScanning, setIsScanning] = useState(true);
@@ -78,11 +99,38 @@ export function App() {
   const selectedProjectRef = useRef(selectedProjectId);
   const selectedWorktreeRef = useRef(selectedWorktreeId);
   const pendingConversationRef = useRef("");
+  const conversationRef = useRef(null);
   const dragConversationRef = useRef("");
   const runtimeHandlerRef = useRef(null);
   const messageViewportRef = useRef(null);
   const stickToBottomRef = useRef(true);
+  const readerAwayFromBottomRef = useRef(false);
+  const readerScrollInputUntilRef = useRef(0);
   const pendingPrependScrollRef = useRef(null);
+  const pendingEarlierRef = useRef(null);
+  const pendingLiveScrollRef = useRef(null);
+  const pendingLatestScrollRef = useRef(null);
+  const restoreMessageAnchorId = useCallback(() => pendingPrependScrollRef.current?.conversationId === selectedConversationRef.current
+    ? pendingPrependScrollRef.current.messageId
+    : pendingLatestScrollRef.current?.conversationId === selectedConversationRef.current
+      ? pendingLatestScrollRef.current.messageId : null, []);
+  const livePreviewRunRef = useRef(null);
+  const acceptedPreviewRunRef = useRef(null);
+  const liveDeltaEventsRef = useRef(emptyLiveDeltaEvents());
+  const historyGenerationRef = useRef(0);
+  const messageCountRefreshRef = useRef({ generation: 0, timer: null, conversationId: null, inFlight: false });
+  useEffect(() => () => {
+    window.clearTimeout(messageCountRefreshRef.current.timer);
+    messageCountRefreshRef.current = { generation: messageCountRefreshRef.current.generation + 1, timer: null, conversationId: null, inFlight: false };
+  }, []);
+  const pendingFindRef = useRef(null);
+  const activeFindMatchRef = useRef(null);
+  const boundVisibleMessage = useCallback((message) => {
+    const match = activeFindMatchRef.current;
+    return boundPageMessage(message, match?.conversationId === selectedConversationRef.current && match.messageId === message.id
+      ? match.needle : "");
+  }, []);
+  const findProgressRef = useRef(null);
   const sidebarRef = useRef(null);
   const sidebarFocusIntentRef = useRef(null);
   const sidebarFocusOwnerRef = useRef(null);
@@ -96,11 +144,30 @@ export function App() {
   const readyConversationRef = useRef(null);
   const conversationListRequestRef = useRef(0);
   const conversationListPendingRef = useRef(true);
+  const pendingListDetailRefreshRef = useRef(null);
   const trustGrantedRef = useRef(false);
   const conversationOwnerRef = useRef("");
   const conversationsRef = useRef([]);
   const archiveFocusRef = useRef(null);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+
+  const applyStreamingText = useCallback((change, immediate = false) => {
+    streamingTextRef.current = change(streamingTextRef.current);
+    if (immediate) {
+      streamingFlushRef.current?.();
+      streamingFlushRef.current = null;
+      setStreamingText(streamingTextRef.current);
+    } else if (!streamingFlushRef.current) {
+      // Stream paints have their own cadence. Layout ticks can run immediately
+      // through MessageChannel in a hidden tab, turning each delta into a paint.
+      const timer = window.setTimeout(() => {
+        streamingFlushRef.current = null;
+        setStreamingText(streamingTextRef.current);
+      }, 32);
+      streamingFlushRef.current = () => window.clearTimeout(timer);
+    }
+  }, []);
+  useEffect(() => () => streamingFlushRef.current?.(), []);
 
   function stageConversations(next) {
     conversationsRef.current = next;
@@ -110,6 +177,44 @@ export function App() {
   function editDraft(next) {
     draftRevisionRef.current += 1;
     setDraft(next);
+  }
+
+  function selectConversation(nextId) {
+    if (nextId === selectedConversationRef.current) return;
+    // Selection owns the visible detail and submission target.
+    selectedConversationRef.current = nextId;
+    conversationRef.current = null;
+    pendingConversationLoadRef.current?.controller?.abort();
+    pendingConversationLoadRef.current = null;
+    pendingFindRef.current?.abort();
+    pendingFindRef.current = null;
+    activeFindMatchRef.current = null;
+    findProgressRef.current = null;
+    pendingEarlierRef.current = null;
+    pendingPrependScrollRef.current = null;
+    pendingLiveScrollRef.current = null;
+    pendingLatestScrollRef.current = null;
+    pendingListDetailRefreshRef.current = null;
+    window.clearTimeout(messageCountRefreshRef.current.timer);
+    messageCountRefreshRef.current = { generation: messageCountRefreshRef.current.generation + 1, timer: null, conversationId: null, inFlight: false };
+    ++historyGenerationRef.current;
+    readyConversationRef.current = null;
+    stickToBottomRef.current = true;
+    readerAwayFromBottomRef.current = false;
+    readerScrollInputUntilRef.current = 0;
+    checkpointCursorsRef.current.clear();
+    setConversation(null);
+    setConversationDetailReady(false);
+    setConversationLoadFailed(false);
+    setLoadingEarlier(false);
+    setFindResetGeneration((current) => current + 1);
+    applyStreamingText(() => "", true);
+    setLiveCheckpoint(null);
+    livePreviewRunRef.current = null;
+    acceptedPreviewRunRef.current = null;
+    liveDeltaEventsRef.current = emptyLiveDeltaEvents();
+    setRunEvents([]);
+    setSelectedConversationId(nextId);
   }
 
   const loadBootstrap = useCallback(async (manual = false) => {
@@ -124,6 +229,24 @@ export function App() {
   }, []);
 
   useEffect(() => { loadBootstrap(); }, [loadBootstrap]);
+  const providersChecking = Boolean(bootstrap?.providers?.some((provider) => provider.checking));
+  useEffect(() => {
+    if (!providersChecking) return;
+    let active = true;
+    let pending = false;
+    const refreshProviders = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const next = await api("/api/providers");
+        if (active) setBootstrap((current) => current ? { ...current, providers: next.providers } : current);
+      } catch { /* A later poll or runtime event can still resolve discovery. */ }
+      finally { pending = false; }
+    };
+    refreshProviders();
+    const timer = window.setInterval(refreshProviders, 1000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [providersChecking]);
   useEffect(() => {
     if (!bootstrap?.projects.length) return;
     const project = bootstrap.projects.find((item) => item.id === selectedProjectId) ?? bootstrap.projects.find((item) => item.name === "superfunctions") ?? bootstrap.projects[0];
@@ -155,8 +278,6 @@ export function App() {
     setConversationListPending(true);
     pendingConversationLoadRef.current?.controller?.abort();
     pendingConversationLoadRef.current = null;
-    readyConversationRef.current = null;
-    setConversationDetailReady(false);
     setConversationListFailed(false);
     try {
       const result = await api(query("/api/conversations", { projectId: forProjectId, worktreeId: forWorktreeId }));
@@ -170,9 +291,18 @@ export function App() {
       conversationListPendingRef.current = false;
       setConversationListPending(false);
       pendingConversationRef.current = "";
-      selectedConversationRef.current = selected?.id ?? "";
-      setConversation((current) => current?.id === selected?.id ? current : null);
-      setSelectedConversationId(selected?.id ?? "");
+      const changedSelection = selectedConversationRef.current !== (selected?.id ?? "");
+      if (changedSelection) selectConversation(selected?.id ?? "");
+      if (!changedSelection && selected && readyConversationRef.current?.id === selected.id) {
+        readyConversationRef.current = { ...readyConversationRef.current, ...selected };
+        pendingListDetailRefreshRef.current = selected.id;
+        setConversationDetailReady(false);
+      } else if (!changedSelection) {
+        pendingListDetailRefreshRef.current = null;
+        readyConversationRef.current = null;
+        setConversationDetailReady(false);
+      }
+      if (!changedSelection) setConversation((current) => current?.id === selected?.id ? current : null);
       return selected ?? null;
     } catch (nextError) {
       if (request === conversationListRequestRef.current && selectedProjectRef.current === forProjectId && selectedWorktreeRef.current === forWorktreeId) {
@@ -186,20 +316,37 @@ export function App() {
   }, [project?.id, worktree?.id]);
 
   function resetConversationContext() {
+    window.clearTimeout(messageCountRefreshRef.current.timer);
+    messageCountRefreshRef.current = { generation: messageCountRefreshRef.current.generation + 1, timer: null, conversationId: null, inFlight: false };
+    pendingFindRef.current?.abort();
+    pendingFindRef.current = null;
+    activeFindMatchRef.current = null;
+    pendingLiveScrollRef.current = null;
+    pendingLatestScrollRef.current = null;
+    pendingEarlierRef.current = null;
+    pendingPrependScrollRef.current = null;
+    ++historyGenerationRef.current;
+    setLoadingEarlier(false);
     ++conversationListRequestRef.current;
     pendingConversationLoadRef.current?.controller?.abort();
     pendingConversationLoadRef.current = null;
     readyConversationRef.current = null;
+    pendingListDetailRefreshRef.current = null;
     conversationListPendingRef.current = true;
     setConversationListPending(true);
     setConversationDetailReady(false);
     selectedConversationRef.current = "";
     stageConversations([]); setConversation(null); setSelectedConversationId("");
     setConversationListFailed(false); setConversationLoadFailed(false);
-    setStreamingText(""); setRunEvents([]); checkpointCursorsRef.current.clear();
+    applyStreamingText(() => "", true); setRunEvents([]); checkpointCursorsRef.current.clear();
+    setLiveCheckpoint(null);
+    livePreviewRunRef.current = null;
+    acceptedPreviewRunRef.current = null;
+    liveDeltaEventsRef.current = emptyLiveDeltaEvents();
   }
   useEffect(() => { loadConversations(); }, [project?.id, worktree?.id, loadConversations]);
   useLayoutEffect(() => { selectedConversationRef.current = selectedConversationId; }, [selectedConversationId]);
+  useLayoutEffect(() => { conversationRef.current = conversation; }, [conversation]);
   useLayoutEffect(() => { selectedProjectRef.current = selectedProjectId; }, [selectedProjectId]);
   useLayoutEffect(() => { selectedWorktreeRef.current = selectedWorktreeId; }, [selectedWorktreeId]);
   useLayoutEffect(() => {
@@ -211,56 +358,197 @@ export function App() {
   useEffect(() => { if (selectedProjectId) localStorage.setItem("outright.selected-project", selectedProjectId); }, [selectedProjectId]);
   useEffect(() => { if (selectedWorktreeId) localStorage.setItem("outright.selected-worktree", selectedWorktreeId); }, [selectedWorktreeId]);
   useEffect(() => { if (selectedConversationId) localStorage.setItem("outright.selected-conversation", selectedConversationId); }, [selectedConversationId]);
-  const loadConversation = useCallback(async () => {
-    readyConversationRef.current = null;
+  const refreshMessageCount = useCallback(() => {
+    const state = messageCountRefreshRef.current;
+    state.generation += 1;
+    state.conversationId = selectedConversationRef.current;
+    if (state.timer || state.inFlight) return;
+    state.timer = window.setTimeout(async () => {
+      state.timer = null;
+      const requestedId = state.conversationId;
+      const generation = state.generation;
+      state.inFlight = true;
+      try {
+        const result = await api(`/api/conversations/${requestedId}/messages/count`);
+        if (!Number.isSafeInteger(result?.total) || result.total < 0) return;
+        if (selectedConversationRef.current !== requestedId || generation !== state.generation) return;
+        setConversation((current) => {
+          if (current?.id !== requestedId || !current.messagePage) return current;
+          const newerCount = Math.max(0, result.total - (current.messagePage.olderCount ?? 0) - current.messages.length);
+          return { ...current, messagePage: { ...current.messagePage, total: result.total, newerCount, hasLater: newerCount > 0 } };
+        });
+      } catch { /* The next live event or explicit page load will retry. */ }
+      finally {
+        state.inFlight = false;
+        if (messageCountRefreshRef.current === state && generation !== state.generation) refreshMessageCount();
+      }
+    }, 100);
+  }, []);
+  const loadConversation = useCallback(async (options = {}) => {
+    // An old render can dispatch a deferred reload after selection changed but
+    // before React committed the new callback. It must never claim the slot.
+    if (selectedConversationId !== selectedConversationRef.current) return;
+    const preservePage = options.preservePage === true;
+    // A background completion must not cancel an explicit Return to latest or
+    // retry that is already loading the reader's chosen page.
+    if (preservePage && pendingConversationLoadRef.current && !pendingConversationLoadRef.current.preservePage) return;
+    if (!preservePage) {
+      pendingFindRef.current?.abort();
+      pendingFindRef.current = null;
+      activeFindMatchRef.current = null;
+      findProgressRef.current = null;
+      ++historyGenerationRef.current;
+      pendingPrependScrollRef.current = null;
+      pendingEarlierRef.current = null;
+      pendingLiveScrollRef.current = null;
+      pendingLatestScrollRef.current = null;
+      setLoadingEarlier(false);
+    }
+    const startedHistoryGeneration = historyGenerationRef.current;
+    if (readyConversationRef.current?.id !== selectedConversationId) readyConversationRef.current = null;
     setConversationDetailReady(false);
     setConversationLoadFailed(false);
     if (conversationListPendingRef.current || conversationListFailed) return;
-    if (!selectedConversationId || !conversations.some((item) => item.id === selectedConversationId)) {
+    if (!selectedConversationId || !conversationsRef.current.some((item) => item.id === selectedConversationId)) {
       pendingConversationLoadRef.current?.controller?.abort();
       pendingConversationLoadRef.current = null;
       setConversation(null);
       return;
     }
     const requestedId = selectedConversationId;
+    // A metadata read that starts while Find is pending must keep that page
+    // intent even if the search resolves before this detail response does.
+    // The detail still refreshes run/recovery state, but never resets Find.
+    const preservePendingFind = preservePage && pendingFindRef.current?.conversationId === requestedId;
     pendingConversationLoadRef.current?.controller?.abort();
     const controller = new AbortController();
-    const pendingLoad = { conversationId: requestedId, events: [], eventBytes: 0, overflowed: false, controller };
+    // Carry already received, uncheckpointed deltas across a metadata read.
+    // The request buffer alone only sees events that arrive after this point.
+    const retained = conversationRef.current?.id === requestedId ? liveDeltaEventsRef.current : null;
+    const pendingLoad = { conversationId: requestedId, preservePage, acceptedRunId: acceptedPreviewRunRef.current,
+      liveRunId: livePreviewRunRef.current, omittedThroughSeq: retained?.omittedThroughSeq ?? 0,
+      events: retained ? retained.events.slice(retained.start) : [],
+      eventBytes: retained?.bytes ?? 0, overflowed: false, controller };
     pendingConversationLoadRef.current = pendingLoad;
     setConversation((current) => current?.id === requestedId && !current.archived ? current : null);
     try {
       const nextConversation = await api(`/api/conversations/${requestedId}`, { signal: controller.signal });
       // Stale responses from an earlier selection are discarded before they
       // can associate the composer or execution state with the wrong worktree.
-      if (selectedConversationRef.current !== requestedId || !conversations.some((item) => item.id === requestedId)) return;
+      if (selectedConversationRef.current !== requestedId || !conversationsRef.current.some((item) => item.id === requestedId)) return;
       if (nextConversation.projectId !== selectedProjectRef.current || nextConversation.worktreeId !== selectedWorktreeRef.current) return;
       if (pendingConversationLoadRef.current !== pendingLoad || conversationListPendingRef.current || conversationListFailed) return;
+      if (startedHistoryGeneration !== historyGenerationRef.current && !preservePage) {
+        pendingConversationLoadRef.current = null;
+        if (readyConversationRef.current?.id === requestedId) setConversationDetailReady(true);
+        return;
+      }
       if (nextConversation.archived) {
         removeArchivedChat(nextConversation);
         loadConversations();
         return;
       }
       pendingConversationLoadRef.current = null;
-      const replayed = replayConversationEvents(nextConversation.messages, pendingLoad.events, MAX_RENDERED_MESSAGES);
+      const activeRunIds = activeCursorOwners(nextConversation);
+      const acceptedRunId = acceptedPreviewRunRef.current;
+      const serverRunId = [...activeRunIds][0] ?? null;
+      // A server snapshot is authoritative once it has a different active run.
+      // A request started before POST may still return an older snapshot, so
+      // keep the locally accepted run while that submission is in flight.
+      const newlyAcceptedRun = acceptedRunId && acceptedRunId !== pendingLoad.acceptedRunId ? acceptedRunId : null;
+      const pendingSubmissionRun = submissionPendingRef.current && livePreviewRunRef.current !== pendingLoad.liveRunId
+        ? livePreviewRunRef.current : null;
+      const previewRunId = newlyAcceptedRun ?? pendingSubmissionRun ?? serverRunId;
+      if (acceptedRunId && acceptedRunId !== previewRunId) acceptedPreviewRunRef.current = null;
+      const changedPreviewRun = previewRunId && livePreviewRunRef.current !== previewRunId;
+      if (changedPreviewRun) {
+        livePreviewRunRef.current = previewRunId;
+        liveDeltaEventsRef.current = emptyLiveDeltaEvents(previewRunId);
+        setLiveCheckpoint(null);
+        applyStreamingText(() => "", true);
+        setRunEvents([]);
+      }
+      const replayEvents = pendingLoad.events.filter((event) => event.type === "message.created"
+        || (event.type === "run.event" && event.runId === previewRunId));
+      const previewRunIds = previewRunId ? new Set([...activeRunIds, previewRunId]) : activeRunIds;
+      const replayed = replayConversationEvents(nextConversation.messages, replayEvents, MAX_RENDERED_MESSAGES,
+        previewRunIds, conversationRef.current?.id === requestedId ? checkpointCursorsRef.current : new Map(),
+        nextConversation.messagePage);
+      const replayCursor = replayed.cursors.get(previewRunId) ?? 0;
+      const retainedDeltas = replayEvents.filter((event) => event.type === "run.event" && event.payload?.type === "assistant.delta"
+        && (!Number.isSafeInteger(event.payload.seq) || event.payload.seq > replayCursor));
+      const omittedThroughSeq = pendingLoad.omittedThroughSeq > replayCursor ? pendingLoad.omittedThroughSeq : 0;
+      liveDeltaEventsRef.current = boundedLiveDeltaEvents(previewRunId, retainedDeltas, omittedThroughSeq);
+      const latestActiveCheckpoint = [...replayed.messages].reverse().find((message) =>
+        message.role === "assistant" && message.payload?.runId === previewRunId);
+      if (latestActiveCheckpoint) setLiveCheckpoint((current) => {
+        const candidate = readingLiveCheckpoint(latestActiveCheckpoint);
+        if (previewRunId !== candidate.runId) return current;
+        return current?.runId === candidate.runId && current.seq > candidate.seq ? current : candidate;
+      });
+      else if (!preservePage) {
+        setLiveCheckpoint(null);
+        // The active run can have deltas before its first durable checkpoint.
+        // Keep its owner across a latest-page reload so the next delta extends
+        // the replayed suffix instead of starting a new preview.
+        if (!previewRunId) livePreviewRunRef.current = null;
+      }
+      const preserveReading = preservePage && (preservePendingFind || pendingFindRef.current?.conversationId === requestedId
+        || conversationRef.current?.messagePage?.hasLater || readerAwayFromBottomRef.current || !stickToBottomRef.current
+        || startedHistoryGeneration !== historyGenerationRef.current);
       readyConversationRef.current = nextConversation;
       setConversationDetailReady(true);
-      stickToBottomRef.current = true;
-      checkpointCursorsRef.current = replayed.cursors;
-      setConversation({
+      if (!preserveReading) {
+        stickToBottomRef.current = true;
+        readerAwayFromBottomRef.current = false;
+        readerScrollInputUntilRef.current = 0;
+      }
+      checkpointCursorsRef.current = checkpointCursors(replayed.messages, checkpointCursorsRef.current, activeCursorOwners(nextConversation));
+      if (options.returnToLatest && !preserveReading && replayed.messages.length) {
+        pendingLatestScrollRef.current = { conversationId: requestedId, generation: startedHistoryGeneration,
+          messageId: replayed.messages.at(-1).id };
+      }
+      setConversation((current) => preserveReading && current?.id === requestedId ? (() => {
+        const currentTotal = current.messagePage?.total ?? current.messages.length;
+        const latestTotal = Math.max(nextConversation.messagePage?.total ?? nextConversation.messages.length,
+          (nextConversation.messagePage?.olderCount ?? 0) + replayed.messages.length + replayed.dropped);
+        const latestById = new Map(replayed.messages.map((message) => [message.id, message]));
+        const messages = current.messages.map((message) => {
+          const refreshed = latestById.get(message.id);
+          if (!refreshed) return message;
+          const oldSeq = message.payload?.checkpointEventSeq;
+          const newSeq = refreshed.payload?.checkpointEventSeq;
+          return Number.isSafeInteger(oldSeq) && Number.isSafeInteger(newSeq) && oldSeq > newSeq ? message : boundVisibleMessage(refreshed);
+        });
+        const total = Math.max(currentTotal, latestTotal);
+        const newerCount = Math.max(0, total - (current.messagePage?.olderCount ?? 0) - messages.length);
+        const hasLater = newerCount > 0;
+        return {
+          ...nextConversation,
+          messages,
+          messagePage: { ...current.messagePage, total, hasLater, newerCount },
+        };
+      })() : {
         ...nextConversation,
-        messages: replayed.messages,
+        messages: replayed.messages.map((message) => boundVisibleMessage(message)),
         messagePage: {
           ...nextConversation.messagePage,
+          total: Math.max(nextConversation.messagePage?.total ?? nextConversation.messages.length,
+            (nextConversation.messagePage?.olderCount ?? 0) + replayed.messages.length + replayed.dropped),
           hasMore: Boolean(nextConversation.messagePage?.hasMore || replayed.dropped),
           olderCount: (nextConversation.messagePage?.olderCount ?? 0) + replayed.dropped,
           beforeId: replayed.messages[0]?.id ?? null,
         },
       });
-      setStreamingText(boundStreamingText(replayed.streamingText));
+      refreshMessageCount();
+      if (!preserveReading) setFindResetGeneration((current) => current + 1);
+      if (previewRunId) applyStreamingText(() => boundStreamingText(`${liveDeltaEventsRef.current.omittedThroughSeq
+        ? LIVE_OMITTED_PREFIX : ""}${replayed.streamingText}`), true);
+      else if (!preserveReading) applyStreamingText(() => "", true);
       setRunEvents(replayed.runEvents);
-      window.requestAnimationFrame(() => {
+      if (!preserveReading) scheduleLayoutTick(() => {
         const viewport = messageViewportRef.current;
-        if (viewport) viewport.scrollTop = viewport.scrollHeight;
+        if (viewport && selectedConversationRef.current === requestedId && stickToBottomRef.current) moveMessageViewport(viewport, viewport.scrollHeight);
       });
     }
     catch (nextError) {
@@ -269,12 +557,23 @@ export function App() {
         if (nextError.name !== "AbortError") { setConversationLoadFailed(true); setError(nextError.message); }
       }
     }
-  }, [selectedConversationId, conversations, loadConversations, conversationListFailed]);
-  useEffect(() => { loadConversation(); }, [loadConversation]);
+    finally {
+      if (pendingConversationLoadRef.current === pendingLoad) pendingConversationLoadRef.current = null;
+    }
+  }, [selectedConversationId, loadConversations, conversationListFailed, refreshMessageCount]);
+  useEffect(() => {
+    const refreshDetail = pendingListDetailRefreshRef.current === selectedConversationId;
+    if (!conversationListPending && !conversationLoadFailed && selectedConversationId && !conversationDetailReady
+      && (refreshDetail || readyConversationRef.current?.id !== selectedConversationId) && !pendingConversationLoadRef.current) {
+      pendingListDetailRefreshRef.current = null;
+      loadConversation({ preservePage: conversationRef.current?.id === selectedConversationId });
+    }
+  }, [loadConversation, conversationListPending, conversationLoadFailed, conversationDetailReady, selectedConversationId]);
   const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
   const handleRuntimeEvent = useCallback((event) => {
-    setRuntimeEvent(event);
+    if (["projects.changed", "terminal.output", "terminal.exit", "runtime.connected"].includes(event.type)
+      || (event.type === "run.event" && ["run.completed", "run.failed", "run.stopped"].includes(event.payload?.type))) setRuntimeEvent(event);
     const pendingLoad = pendingConversationLoadRef.current;
     if (["message.created", "run.event"].includes(event.type)
       && bufferConversationRuntimeEvent(pendingLoad, event, MAX_PENDING_RUNTIME_EVENT_BYTES) === "overflow") {
@@ -283,31 +582,100 @@ export function App() {
       // overflowing buffer while the microtask schedules its replacement.
       pendingLoad.controller.abort();
       if (pendingConversationLoadRef.current === pendingLoad) pendingConversationLoadRef.current = null;
-      queueMicrotask(loadConversation);
+      queueMicrotask(() => loadConversation({ preservePage: pendingLoad.preservePage }));
+    }
+    const pendingFind = pendingFindRef.current;
+    if (["message.created", "run.event"].includes(event.type)
+      && bufferConversationRuntimeEvent(pendingFind, event, MAX_PENDING_RUNTIME_EVENT_BYTES) === "overflow") {
+      pendingFind.abort();
+      if (pendingFindRef.current === pendingFind) pendingFindRef.current = null;
+      setError("Find interrupted by new output; retry");
     }
     if (event.type === "projects.changed") {
       const payload = event.payload.projects ? event.payload : { projects: event.payload };
       setBootstrap((current) => current ? { ...current, ...payload } : current);
     }
+    if (event.type === "providers.changed") setBootstrap((current) => current ? { ...current, providers: event.payload.providers } : current);
     if (event.type === "runtime.connected" && (event.payload?.replay?.missed || event.payload?.restarted)) {
       loadBootstrap();
-      loadConversation();
+      loadConversation({ preservePage: true });
     }
     if (event.type === "conversation.created" || event.type === "conversation.updated") loadConversations(event.conversationId);
-    if (shouldReloadConversationForResolvedRun(event, selectedConversationRef.current, selectedRecoveryRunId)) loadConversation();
+    if (shouldReloadConversationForResolvedRun(event, selectedConversationRef.current, selectedRecoveryRunId)) loadConversation({ preservePage: true });
     if (event.type === "message.created" && event.conversationId === selectedConversationRef.current) {
       if (isStaleCheckpointMessage(checkpointCursorsRef.current, event.payload)) return;
-      recordCheckpointCursor(checkpointCursorsRef.current, event.payload);
-      setStreamingText((current) => streamingTextAfterRuntimeEvent(current, event));
+      const displayed = conversationRef.current;
+      const olderThanPage = displayed?.messagePage?.hasMore && displayed.messages.length
+        && messagePrecedesPage(event.payload, displayed.messages[0]);
+      const viewport = messageViewportRef.current;
+      const atLatestBottom = !readerAwayFromBottomRef.current && !displayed?.messagePage?.hasLater && viewport
+        && viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96;
+      if (atLatestBottom && !pendingPrependScrollRef.current) {
+        stickToBottomRef.current = true;
+        pendingLiveScrollRef.current = null;
+      } else if (!displayed?.messagePage?.hasLater && !olderThanPage && !stickToBottomRef.current
+        && !pendingPrependScrollRef.current && !pendingLiveScrollRef.current && viewport) {
+        const frame = viewport.getBoundingClientRect();
+        const anchor = [...viewport.querySelectorAll("[data-message-id]")].find((element) => {
+          const row = element.getBoundingClientRect();
+          return row.bottom > frame.top && row.top < frame.bottom;
+        });
+        pendingLiveScrollRef.current = {
+          conversationId: event.conversationId,
+          messageId: anchor?.dataset.messageId,
+          top: anchor?.getBoundingClientRect().top,
+          scrollTop: viewport.scrollTop,
+        };
+      }
+      if (!displayed || olderThanPage || displayed.messagePage?.hasLater
+        || displayed.messages.length >= MAX_RENDERED_MESSAGES) refreshMessageCount();
+      recordCheckpointCursor(checkpointCursorsRef.current, event.payload, activeCursorOwners(displayed));
+      if (event.payload?.payload?.runId === liveDeltaEventsRef.current.runId) {
+        const cursor = checkpointCursorsRef.current.get(liveDeltaEventsRef.current.runId) ?? 0;
+        const events = liveDeltaEventsRef.current.events.slice(liveDeltaEventsRef.current.start).filter((entry) =>
+          !Number.isSafeInteger(entry.payload?.seq) || entry.payload.seq > cursor);
+        liveDeltaEventsRef.current = boundedLiveDeltaEvents(liveDeltaEventsRef.current.runId, events,
+          liveDeltaEventsRef.current.omittedThroughSeq > cursor ? liveDeltaEventsRef.current.omittedThroughSeq : 0);
+      }
+      if (!olderThanPage && event.payload.role === "assistant" && event.payload.payload?.runId) {
+        const candidate = readingLiveCheckpoint(event.payload);
+        if (submissionPendingRef.current && !acceptedPreviewRunRef.current
+          && livePreviewRunRef.current !== candidate.runId) {
+          livePreviewRunRef.current = candidate.runId;
+          applyStreamingText(() => "", true);
+          setRunEvents([]);
+        }
+        if ((!acceptedPreviewRunRef.current || acceptedPreviewRunRef.current === candidate.runId)
+          && (activeCursorOwners(displayed).has(candidate.runId) || livePreviewRunRef.current === candidate.runId
+            || acceptedPreviewRunRef.current === candidate.runId)) {
+          // The following delta can arrive in the same browser task. Claim
+          // the run before React processes the queued checkpoint state.
+          livePreviewRunRef.current = candidate.runId;
+          setLiveCheckpoint((current) => current?.runId === candidate.runId && current.seq > candidate.seq ? current : candidate);
+        }
+      }
+      if (!olderThanPage) applyStreamingText((current) => streamingTextAfterRuntimeEvent(current, event), true);
       setConversation((current) => {
         if (!current) return current;
         const alreadyPresent = current.messages.some((message) => message.id === event.payload.id);
-        const total = (current.messagePage?.total ?? current.messages.length) + (alreadyPresent ? 0 : 1);
-        if (current.messagePage?.hasLater) return {
+        // A checkpoint for an older, unloaded row is an update, not a new
+        // message at the latest end of this bounded page.
+        const olderThanPage = current.messagePage?.hasMore && current.messages.length
+          && messagePrecedesPage(event.payload, current.messages[0]);
+        if (olderThanPage && !alreadyPresent) return current;
+        const total = (current.messagePage?.total ?? current.messages.length) + (alreadyPresent || current.messagePage?.hasLater ? 0 : 1);
+        if (current.messagePage?.hasLater && !alreadyPresent) return {
           ...current,
-          messagePage: { ...current.messagePage, total, newerCount: (current.messagePage.newerCount ?? 0) + (alreadyPresent ? 0 : 1) },
+          messagePage: { ...current.messagePage, total },
         };
-        const merged = upsertRuntimeMessage(current.messages, event.payload);
+        // Reader intent owns the page boundary. A stale bottom-follow bit can
+        // survive a near-bottom upward gesture until the next scroll event.
+        if (!alreadyPresent && current.messages.length >= MAX_RENDERED_MESSAGES
+          && (readerAwayFromBottomRef.current || !stickToBottomRef.current || pendingLiveScrollRef.current)) return {
+          ...current,
+          messagePage: { ...current.messagePage, total, hasLater: true, newerCount: 1 },
+        };
+        const merged = upsertRuntimeMessage(current.messages, boundVisibleMessage(event.payload));
         const dropped = Math.max(0, merged.length - MAX_RENDERED_MESSAGES);
         const messages = merged.slice(-MAX_RENDERED_MESSAGES);
         return {
@@ -325,18 +693,45 @@ export function App() {
     }
     if (event.type === "run.event" && event.conversationId === selectedConversationRef.current) {
       const runEvent = event.payload;
+      const ownsLiveOutput = (!acceptedPreviewRunRef.current || acceptedPreviewRunRef.current === event.runId)
+        && (livePreviewRunRef.current === null || livePreviewRunRef.current === event.runId
+          || activeCursorOwners(conversationRef.current).has(event.runId) || submissionPendingRef.current);
+      if (ownsLiveOutput && (runEvent.type === "assistant.delta" || runEvent.type === "assistant.message")
+        && livePreviewRunRef.current !== event.runId) {
+        livePreviewRunRef.current = event.runId;
+        liveDeltaEventsRef.current = emptyLiveDeltaEvents(event.runId);
+        setLiveCheckpoint(null);
+        applyStreamingText(() => "", true);
+        setRunEvents([]);
+      }
       if (runEvent.type === "assistant.delta") {
         const checkpointEventSeq = checkpointCursorsRef.current.get(event.runId) ?? 0;
-        setStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event, checkpointEventSeq)));
+        if (ownsLiveOutput) {
+          if (!Number.isSafeInteger(runEvent.seq) || runEvent.seq > checkpointEventSeq) {
+            const retained = liveDeltaEventsRef.current.runId === event.runId ? liveDeltaEventsRef.current
+              : emptyLiveDeltaEvents(event.runId);
+            liveDeltaEventsRef.current = appendLiveDeltaEvent(retained, event);
+          }
+          // Browser timer throttling can delay a 32 ms stream flush while the
+          // reader is on an older page. Show the first suffix byte after each
+          // durable checkpoint now; coalesce the following deltas as usual.
+          const firstReadingDelta = Boolean(conversationRef.current?.messagePage?.hasLater) && !streamingTextRef.current;
+          applyStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event, checkpointEventSeq)), firstReadingDelta);
+        }
       }
-      if (runEvent.type === "assistant.message") setStreamingText((current) => streamingTextAfterRuntimeEvent(current, event));
-      if (runEvent.type.startsWith("tool.")) setRunEvents((current) => [...current, runEvent].slice(-20));
+      if (runEvent.type === "assistant.message" && ownsLiveOutput) {
+        liveDeltaEventsRef.current = emptyLiveDeltaEvents(event.runId);
+        applyStreamingText((current) => streamingTextAfterRuntimeEvent(current, event), true);
+      }
+      if (runEvent.type.startsWith("tool.") && ownsLiveOutput) setRunEvents((current) => [...current, runEvent].slice(-20));
       if (["run.completed", "run.failed", "run.stopped"].includes(runEvent.type)) {
-        window.setTimeout(loadConversation, 80);
+        if (acceptedPreviewRunRef.current === event.runId) acceptedPreviewRunRef.current = null;
+        if (liveDeltaEventsRef.current.runId === event.runId) liveDeltaEventsRef.current = emptyLiveDeltaEvents();
+        scheduleLayoutTick(() => loadConversation({ preservePage: true }));
         if (document.hidden && settings.notifications && Notification.permission === "granted") new Notification(`Outright run ${runEvent.type.split(".")[1]}`, { body: conversation?.title ?? "Agent run" });
       }
     }
-  }, [loadConversation, loadConversations, settings.notifications, conversation?.title, selectedRecoveryRunId]);
+  }, [loadConversation, loadConversations, settings.notifications, conversation?.title, selectedRecoveryRunId, applyStreamingText, refreshMessageCount]);
   runtimeHandlerRef.current = handleRuntimeEvent;
 
   useEffect(() => {
@@ -360,7 +755,7 @@ export function App() {
         inspectorInvokerRef.current = document.querySelector('[aria-label="Terminal"]');
         setInspector("terminal");
       }
-      if (event.key === "Escape" && !document.querySelector('[role="dialog"]:not(#project-sidebar)')) {
+      if (event.key === "Escape" && !document.querySelector('[role="dialog"][data-open]:not(#project-sidebar)')) {
         if (isNarrow && sidebarOpen) closeSidebar();
         else if (inspector && !event.target.closest?.(".terminal-host")
           && (inspectorRef.current?.contains(event.target) || event.target.closest?.(".composer") || event.target === inspectorInvokerRef.current)) closeInspector();
@@ -430,8 +825,8 @@ export function App() {
   useLayoutEffect(() => {
     const intent = sidebarFocusIntentRef.current;
     if (!intent || (intent === "opener" && sidebarOpen) || (intent === "sidebar" && !sidebarOpen)) return;
-    let frame;
-    const deadline = performance.now() + 500;
+    let cancelRetry = () => {};
+    const deadline = performance.now() + 3_000;
     const transfer = () => {
       if (sidebarFocusIntentRef.current !== intent) return;
       const target = intent === "opener" ? document.querySelector('[aria-label="Open projects sidebar"]')
@@ -454,10 +849,22 @@ export function App() {
           return;
         }
       }
-      if (performance.now() < deadline) frame = requestAnimationFrame(transfer);
+      if (performance.now() < deadline) {
+        let pending = true;
+        let frame;
+        let timer;
+        const retry = () => {
+          if (!pending) return;
+          cancelRetry();
+          transfer();
+        };
+        frame = requestAnimationFrame(retry);
+        timer = window.setTimeout(retry, 100);
+        cancelRetry = () => { pending = false; cancelAnimationFrame(frame); clearTimeout(timer); };
+      }
     };
     transfer();
-    return () => cancelAnimationFrame(frame);
+    return () => cancelRetry();
   }, [isNarrow, sidebarOpen]);
   useLayoutEffect(() => {
     if (!inspector) return;
@@ -492,38 +899,272 @@ export function App() {
   useEffect(() => {
     const viewport = messageViewportRef.current;
     if (!viewport) return;
-    const updateStickiness = () => { stickToBottomRef.current = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 96; };
+    if (conversation?.messagePage?.hasLater) stickToBottomRef.current = false;
+    let lastScrollTop = viewport.scrollTop;
+    let lastMaximum = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    let growingFrom = null;
+    let growingUntil = 0;
+    let readerTowardBottom = false;
+    let pointerReader = false;
+    const updateStickiness = () => {
+      const top = viewport.scrollTop;
+      const maximum = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+      const now = performance.now();
+      if (maximum > lastMaximum + 1) {
+        growingFrom = now > growingUntil ? lastMaximum : Math.min(growingFrom ?? lastMaximum, lastMaximum);
+        growingUntil = now + 750;
+      }
+      if (!pendingPrependScrollRef.current) {
+        if (conversationRef.current?.messagePage?.hasLater) stickToBottomRef.current = false;
+        else if (readerAwayFromBottomRef.current) {
+          // An upward gesture owns the reader even inside the 96px return
+          // zone. Only later reader input toward the bottom can resume follow;
+          // a new row or measured virtual spacer cannot make that choice.
+          const pointerMovedDown = pointerReader && now < readerScrollInputUntilRef.current
+            && top > lastScrollTop + 1 && maximum <= lastMaximum + 1;
+          if ((readerTowardBottom || pointerMovedDown) && maximum - top < 96) {
+            readerAwayFromBottomRef.current = false;
+            stickToBottomRef.current = true;
+            readerTowardBottom = false;
+            pointerReader = false;
+          } else stickToBottomRef.current = false;
+        }
+        // A virtual row can be measured between a scroll-to-end and this
+        // event. The previous end is still the reader's destination even if
+        // the new spacer makes the current end much farther away.
+        else if (top < lastScrollTop - 1 && maximum - top > 2 && now < readerScrollInputUntilRef.current) {
+          stickToBottomRef.current = false;
+          readerAwayFromBottomRef.current = true;
+        }
+        else if (maximum - top < 96
+          || (now < growingUntil && growingFrom !== null && Math.abs(growingFrom - top) < 96)
+          || (lastMaximum > 0 && Math.abs(lastMaximum - top) < 96)) {
+          stickToBottomRef.current = true;
+          readerAwayFromBottomRef.current = false;
+        }
+      }
+      lastScrollTop = top;
+      lastMaximum = maximum;
+    };
+    const readerWheel = (event) => {
+      readerScrollInputUntilRef.current = performance.now() + 1000;
+      if (event.deltaY < 0) {
+        readerTowardBottom = false;
+        readerAwayFromBottomRef.current = true;
+        stickToBottomRef.current = false;
+      } else if (event.deltaY > 0) readerTowardBottom = true;
+    };
+    const readerKey = (event) => {
+      if (event.target !== viewport) return;
+      if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+        readerTowardBottom = false;
+        readerAwayFromBottomRef.current = true;
+        stickToBottomRef.current = false;
+      } else if (["ArrowDown", "PageDown", "End"].includes(event.key)) readerTowardBottom = true;
+      if (["ArrowUp", "PageUp", "Home", "ArrowDown", "PageDown", "End"].includes(event.key)) {
+        readerScrollInputUntilRef.current = performance.now() + 1000;
+      }
+    };
+    const readerPointer = () => { pointerReader = true; readerTowardBottom = false; readerScrollInputUntilRef.current = performance.now() + 2000; };
+    const scrollOwner = viewport.parentElement;
+    const scrollbarPointer = (event) => {
+      if (event.target.closest?.('[data-slot="scroll-area-scrollbar"]')) readerPointer();
+    };
     viewport.addEventListener("scroll", updateStickiness, { passive: true });
-    return () => viewport.removeEventListener("scroll", updateStickiness);
-  }, [conversation?.id]);
+    viewport.addEventListener("wheel", readerWheel, { passive: true });
+    viewport.addEventListener("keydown", readerKey);
+    viewport.addEventListener("touchstart", readerPointer, { passive: true });
+    scrollOwner?.addEventListener("pointerdown", scrollbarPointer, { passive: true });
+    const followLatest = () => {
+      if (stickToBottomRef.current && !pendingPrependScrollRef.current && !conversationRef.current?.messagePage?.hasLater) {
+        if (readerAwayFromBottomRef.current) { stickToBottomRef.current = false; return; }
+        moveMessageViewport(viewport, viewport.scrollHeight);
+        lastMaximum = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+      }
+    };
+    const resize = new ResizeObserver(followLatest);
+    const column = viewport.querySelector(".message-column");
+    if (column) resize.observe(column);
+    viewport.addEventListener("windowed-range-change", followLatest);
+    followLatest();
+    return () => { viewport.removeEventListener("scroll", updateStickiness); viewport.removeEventListener("wheel", readerWheel); viewport.removeEventListener("keydown", readerKey); viewport.removeEventListener("touchstart", readerPointer); scrollOwner?.removeEventListener("pointerdown", scrollbarPointer); viewport.removeEventListener("windowed-range-change", followLatest); resize.disconnect(); };
+  }, [conversation?.id, conversation?.messagePage?.hasLater]);
+  useLayoutEffect(() => {
+    const pending = pendingLiveScrollRef.current;
+    if (!pending || pending.conversationId !== conversation?.id) return;
+    const viewport = messageViewportRef.current;
+    if (!viewport) return;
+    let cancelTick = () => {};
+    let remaining = 24;
+    let stable = 0;
+    const cancelForReader = (event) => {
+      if (event.type === "keydown" && event.target !== viewport) return;
+      if (pendingLiveScrollRef.current === pending) pendingLiveScrollRef.current = null;
+      cancelTick();
+    };
+    const restore = () => {
+      if (pendingLiveScrollRef.current !== pending) return;
+      const anchor = pending.messageId && [...viewport.querySelectorAll("[data-message-id]")].find((element) => element.dataset.messageId === pending.messageId);
+      if (anchor && pending.top !== undefined) {
+        const delta = anchor.getBoundingClientRect().top - pending.top;
+        if (Math.abs(delta) > 1) moveMessageViewport(viewport, viewport.scrollTop + delta);
+        stable = Math.abs(anchor.getBoundingClientRect().top - pending.top) < 2 ? stable + 1 : 0;
+      } else {
+        // The virtual range may need one tick before the retained row mounts.
+        if (remaining === 24) moveMessageViewport(viewport, pending.scrollTop);
+        stable = 0;
+      }
+      if (--remaining > 0 && stable < 3) cancelTick = scheduleLayoutTick(restore);
+      else if (pendingLiveScrollRef.current === pending) pendingLiveScrollRef.current = null;
+    };
+    const scrollOwner = viewport.parentElement;
+    const cancelForScrollbar = (event) => {
+      if (event.target.closest?.('[data-slot="scroll-area-scrollbar"]')) cancelForReader(event);
+    };
+    viewport.addEventListener("wheel", cancelForReader, { passive: true });
+    viewport.addEventListener("touchstart", cancelForReader, { passive: true });
+    viewport.addEventListener("pointerdown", cancelForReader, { passive: true });
+    viewport.addEventListener("keydown", cancelForReader);
+    scrollOwner?.addEventListener("pointerdown", cancelForScrollbar, { passive: true });
+    restore();
+    return () => {
+      cancelTick();
+      viewport.removeEventListener("wheel", cancelForReader);
+      viewport.removeEventListener("touchstart", cancelForReader);
+      viewport.removeEventListener("pointerdown", cancelForReader);
+      viewport.removeEventListener("keydown", cancelForReader);
+      scrollOwner?.removeEventListener("pointerdown", cancelForScrollbar);
+    };
+  }, [conversation]);
   useLayoutEffect(() => {
     const pending = pendingPrependScrollRef.current;
     const viewport = messageViewportRef.current;
-    if (!pending || !viewport) return;
+    if (!pending || !viewport || pending.conversationId !== conversation?.id || pending.generation !== historyGenerationRef.current) return;
     const restoreAnchor = () => {
       const anchor = [...viewport.querySelectorAll("[data-message-id]")].find((element) => element.dataset.messageId === pending.messageId);
-      if (anchor) viewport.scrollTop += anchor.getBoundingClientRect().top - pending.top;
+      if (anchor && pending.top !== undefined) moveMessageViewport(viewport, viewport.scrollTop + anchor.getBoundingClientRect().top - pending.top);
+      else if (!pending.restoredFallback) {
+        // Recenter the virtualizer on the retained row's new index. Subtracting
+        // estimated heights from the old scroll offset can miss a row when the
+        // removed messages had variable measured heights.
+        if (pending.fallbackIndex !== undefined) moveMessageViewport(viewport, pending.fallbackIndex * ESTIMATED_MESSAGE_HEIGHT);
+        else moveMessageViewport(viewport, viewport.scrollTop + (pending.prependedCount ?? 0) * ESTIMATED_MESSAGE_HEIGHT);
+        pending.restoredFallback = true;
+      }
     };
     restoreAnchor();
-    const firstFrame = window.requestAnimationFrame(() => {
+    let framesRemaining = 32;
+    let framesElapsed = 0;
+    let stableFrames = 0;
+    let previousTop = null;
+    let cancelTick = () => {};
+    const cancelForUserScroll = (event) => {
+      if (event.type === "keydown" && event.target !== viewport) return;
+      if (pendingPrependScrollRef.current === pending) pendingPrependScrollRef.current = null;
+      cancelTick();
+    };
+    const scrollOwner = viewport.parentElement;
+    const cancelForScrollbar = (event) => {
+      if (event.target.closest?.('[data-slot="scroll-area-scrollbar"]')) cancelForUserScroll(event);
+    };
+    viewport.addEventListener("pointerdown", cancelForUserScroll, { passive: true });
+    scrollOwner?.addEventListener("pointerdown", cancelForScrollbar, { passive: true });
+    viewport.addEventListener("wheel", cancelForUserScroll, { passive: true });
+    viewport.addEventListener("touchstart", cancelForUserScroll, { passive: true });
+    viewport.addEventListener("keydown", cancelForUserScroll);
+    const keepAnchor = () => {
+      if (pendingPrependScrollRef.current !== pending) return;
       restoreAnchor();
-      const secondFrame = window.requestAnimationFrame(() => {
-        restoreAnchor();
-        pendingPrependScrollRef.current = null;
-      });
-      pending.cancelSecondFrame = () => window.cancelAnimationFrame(secondFrame);
-    });
-    return () => { window.cancelAnimationFrame(firstFrame); pending.cancelSecondFrame?.(); };
+      const anchor = [...viewport.querySelectorAll("[data-message-id]")].find((element) => element.dataset.messageId === pending.messageId);
+      const top = anchor?.getBoundingClientRect().top;
+      stableFrames = top !== undefined && Math.abs(top - pending.top) < 2 && previousTop !== null && Math.abs(top - previousTop) < 1
+        ? stableFrames + 1 : 0;
+      previousTop = top;
+      framesElapsed += 1;
+      if (--framesRemaining > 0 && (framesElapsed < 12 || stableFrames < 3)) cancelTick = scheduleLayoutTick(keepAnchor);
+      else if (pendingPrependScrollRef.current === pending) pendingPrependScrollRef.current = null;
+    };
+    cancelTick = scheduleLayoutTick(keepAnchor);
+    return () => {
+      cancelTick();
+      viewport.removeEventListener("pointerdown", cancelForUserScroll);
+      scrollOwner?.removeEventListener("pointerdown", cancelForScrollbar);
+      viewport.removeEventListener("wheel", cancelForUserScroll);
+      viewport.removeEventListener("touchstart", cancelForUserScroll);
+      viewport.removeEventListener("keydown", cancelForUserScroll);
+    };
   }, [conversation?.messages[0]?.id]);
   useEffect(() => {
-    if (!stickToBottomRef.current) return;
-    window.requestAnimationFrame(() => {
+    if (!stickToBottomRef.current || readerAwayFromBottomRef.current || pendingPrependScrollRef.current || conversation?.messagePage?.hasLater) return;
+    scheduleLayoutTick(() => {
       const viewport = messageViewportRef.current;
-      if (viewport) viewport.scrollTop = viewport.scrollHeight;
+      if (viewport && stickToBottomRef.current && !readerAwayFromBottomRef.current && !pendingPrependScrollRef.current) moveMessageViewport(viewport, viewport.scrollHeight);
     });
-  }, [conversation?.messages.at(-1)?.id, streamingText]);
+  }, [conversation?.messages.at(-1)?.id, conversation?.messagePage?.hasLater, streamingText]);
+  useLayoutEffect(() => {
+    const pending = pendingLatestScrollRef.current;
+    const viewport = messageViewportRef.current;
+    if (!pending || !viewport || pending.conversationId !== conversation?.id
+      || pending.generation !== historyGenerationRef.current || conversation.messagePage?.hasLater) return;
+    let cancelTick = () => {};
+    let remaining = 32;
+    let stable = 0;
+    const cancelForReader = (event) => {
+      if (event.type === "keydown" && event.target !== viewport) return;
+      if (pendingLatestScrollRef.current === pending) pendingLatestScrollRef.current = null;
+      cancelTick();
+    };
+    const scrollOwner = viewport.parentElement;
+    const cancelForScrollbar = (event) => {
+      if (event.target.closest?.('[data-slot="scroll-area-scrollbar"]')) cancelForReader(event);
+    };
+    const restore = () => {
+      if (pendingLatestScrollRef.current !== pending) return;
+      const row = [...viewport.querySelectorAll("[data-message-id]")].find((element) => element.dataset.messageId === pending.messageId);
+      const frame = viewport.getBoundingClientRect();
+      const bounds = row?.getBoundingClientRect();
+      const visible = bounds && bounds.bottom > frame.top && bounds.top < frame.bottom;
+      const atBottom = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 2;
+      if (visible && atBottom) stable += 1;
+      else {
+        stable = 0;
+        // The virtual range and measured spacers can change after the first
+        // scroll-to-end. Keep the explicit Return destination through them.
+        moveMessageViewport(viewport, viewport.scrollHeight);
+      }
+      if (stable >= 2 || --remaining <= 0) {
+        if (pendingLatestScrollRef.current === pending) pendingLatestScrollRef.current = null;
+      } else cancelTick = scheduleLayoutTick(restore);
+    };
+    viewport.addEventListener("wheel", cancelForReader, { passive: true });
+    viewport.addEventListener("touchstart", cancelForReader, { passive: true });
+    viewport.addEventListener("pointerdown", cancelForReader, { passive: true });
+    viewport.addEventListener("keydown", cancelForReader);
+    scrollOwner?.addEventListener("pointerdown", cancelForScrollbar, { passive: true });
+    restore();
+    return () => {
+      cancelTick();
+      viewport.removeEventListener("wheel", cancelForReader);
+      viewport.removeEventListener("touchstart", cancelForReader);
+      viewport.removeEventListener("pointerdown", cancelForReader);
+      viewport.removeEventListener("keydown", cancelForReader);
+      scrollOwner?.removeEventListener("pointerdown", cancelForScrollbar);
+    };
+  }, [conversation?.id, conversation?.messages.at(-1)?.id, conversation?.messagePage?.hasLater]);
+
+  function handleMessageViewportKeyDown(event) {
+    if (event.target !== event.currentTarget || event.key !== "End" || conversation?.messagePage?.hasLater) return;
+    const viewport = event.currentTarget;
+    stickToBottomRef.current = true;
+    readerAwayFromBottomRef.current = false;
+    readerScrollInputUntilRef.current = 0;
+    pendingLiveScrollRef.current = null;
+    scheduleLayoutTick(() => { if (stickToBottomRef.current && viewport.isConnected) moveMessageViewport(viewport, viewport.scrollHeight); });
+  }
 
   const activeRun = conversation?.runs?.find((run) => ["queued", "launching", "running"].includes(run.status));
+  const readingLiveText = conversation?.messagePage?.hasLater
+    ? readingLivePreview(liveCheckpoint, streamingText) : "";
   const waitingForConversation = Boolean(selectedConversationId && (!conversation || !conversationDetailReady));
   const submissionUnavailable = conversationListPending || conversationListFailed
     || Boolean(selectedConversationId && (!conversationDetailReady || conversationLoadFailed));
@@ -687,7 +1328,13 @@ export function App() {
       setUnsentCreatedChat((current) => current?.id === target.id && current.projectId === target.projectId && current.worktreeId === target.worktreeId ? null : current);
       setDraft((current) => draftRevisionRef.current === submittedDraftRevision ? draftAfterSubmission(current, submittedDraft) : current);
       if (!isSelectedTarget(target)) return true;
-      setStreamingText(""); setRunEvents([]);
+      const previewAlreadyOwnedByRun = livePreviewRunRef.current === run.id;
+      livePreviewRunRef.current = run.id;
+      acceptedPreviewRunRef.current = run.id;
+      if (!previewAlreadyOwnedByRun) {
+        liveDeltaEventsRef.current = emptyLiveDeltaEvents(run.id);
+        setLiveCheckpoint(null); applyStreamingText(() => "", true); setRunEvents([]);
+      }
       setConversation((current) => {
         if (current && current.id !== target.id) return current;
         const next = current ?? { ...target, messages: [], runs: [] };
@@ -725,30 +1372,200 @@ export function App() {
   async function stopRun() { try { await api(`/api/runs/${activeRun.id}/stop`, { method: "POST" }); } catch (nextError) { setError(nextError.message); } }
   async function loadEarlierMessages() {
     if (!conversation?.messagePage?.hasMore || loadingEarlier || !conversation.messages[0]) return;
+    pendingLatestScrollRef.current = null;
+    activeFindMatchRef.current = null;
+    pendingFindRef.current?.abort();
+    pendingFindRef.current = null;
+    const historyGeneration = ++historyGenerationRef.current;
     const viewport = messageViewportRef.current;
     const anchor = viewport?.querySelector(`[data-message-id="${CSS.escape(conversation.messages[0].id)}"]`);
-    pendingPrependScrollRef.current = anchor ? { messageId: conversation.messages[0].id, top: anchor.getBoundingClientRect().top } : null;
+    const pendingPrepend = { conversationId: conversation.id, generation: historyGeneration, messageId: conversation.messages[0].id, top: anchor?.getBoundingClientRect().top };
+    pendingPrependScrollRef.current = pendingPrepend;
+    pendingEarlierRef.current = pendingPrepend;
     stickToBottomRef.current = false;
     setLoadingEarlier(true);
     try {
       const result = await api(query(`/api/conversations/${conversation.id}/messages`, { before: conversation.messages[0].id, limit: 200 }));
-      checkpointCursorsRef.current = checkpointCursors(result.messages, checkpointCursorsRef.current);
+      if (historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversation.id) return;
+      if (pendingPrependScrollRef.current === pendingPrepend) pendingPrepend.prependedCount = result.messages.length;
+      const pageMessages = result.messages.map((message) => boundPageMessage(message));
+      checkpointCursorsRef.current = checkpointCursors(pageMessages, checkpointCursorsRef.current, activeCursorOwners(conversation));
       setConversation((current) => {
         if (current?.id !== conversation.id) return current;
-        const merged = [...result.messages, ...current.messages];
-        const dropped = Math.max(0, merged.length - MAX_RENDERED_MESSAGES);
+        const merged = [...pageMessages, ...current.messages];
+        const messages = merged.slice(0, MAX_RENDERED_MESSAGES);
+        const total = Math.max(result.messagePage.total, current.messagePage?.total ?? 0);
+        const olderCount = result.messagePage.olderCount;
+        const newerCount = Math.max(0, total - olderCount - messages.length);
         return {
           ...current,
-          messages: merged.slice(0, MAX_RENDERED_MESSAGES),
+          messages,
           messagePage: {
             ...result.messagePage,
-            hasLater: Boolean(current.messagePage?.hasLater || dropped),
-            newerCount: current.messagePage?.newerCount ?? 0,
+            total, olderCount, hasLater: newerCount > 0, newerCount,
           },
         };
       });
-    } catch (nextError) { pendingPrependScrollRef.current = null; setError(nextError.message); }
-    finally { setLoadingEarlier(false); }
+      refreshMessageCount();
+    } catch (nextError) {
+      if (pendingPrependScrollRef.current === pendingPrepend) pendingPrependScrollRef.current = null;
+      if (historyGeneration === historyGenerationRef.current && selectedConversationRef.current === conversation.id) setError(nextError.message);
+    } finally {
+      if (pendingPrependScrollRef.current === pendingPrepend && (historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversation.id)) pendingPrependScrollRef.current = null;
+      if (pendingEarlierRef.current === pendingPrepend) { pendingEarlierRef.current = null; setLoadingEarlier(false); }
+    }
+  }
+
+  async function loadLaterMessages() {
+    if (!conversation?.messagePage?.hasLater || loadingEarlier || !conversation.messages.at(-1)) return;
+    pendingLatestScrollRef.current = null;
+    activeFindMatchRef.current = null;
+    pendingFindRef.current?.abort();
+    pendingFindRef.current = null;
+    const historyGeneration = ++historyGenerationRef.current;
+    const viewport = messageViewportRef.current;
+    const firstVisible = [...(viewport?.querySelectorAll("[data-message-id]") ?? [])].find((element) => element.getBoundingClientRect().bottom > viewport.getBoundingClientRect().top);
+    const pendingPage = { conversationId: conversation.id, generation: historyGeneration, messageId: firstVisible?.dataset.messageId ?? conversation.messages.at(-1).id, top: firstVisible?.getBoundingClientRect().top };
+    pendingPrependScrollRef.current = pendingPage;
+    pendingEarlierRef.current = pendingPage;
+    stickToBottomRef.current = false;
+    setLoadingEarlier(true);
+    try {
+      const result = await api(query(`/api/conversations/${conversation.id}/messages`, { after: conversation.messages.at(-1).id, limit: 200 }));
+      if (historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversation.id) return;
+      const pageMessages = result.messages.map((message) => boundPageMessage(message));
+      checkpointCursorsRef.current = checkpointCursors(pageMessages, checkpointCursorsRef.current, activeCursorOwners(conversation));
+      setConversation((current) => {
+        if (current?.id !== conversation.id) return current;
+        const merged = [...current.messages, ...pageMessages.filter((message) => !current.messages.some((entry) => entry.id === message.id))];
+        const dropped = Math.max(0, merged.length - MAX_RENDERED_MESSAGES);
+        const messages = merged.slice(dropped);
+        if (dropped) pendingPage.fallbackIndex = Math.max(0, current.messages.findIndex((message) => message.id === pendingPage.messageId) - dropped);
+        // A forward page may evict the visible row. Move the anchor to the
+        // first surviving row explicitly; its predecessor remains reachable
+        // through Load earlier. Never run the prepend-only pixel fallback.
+        if (dropped && !messages.some((message) => message.id === pendingPage.messageId)) {
+          pendingPage.messageId = messages[0].id;
+          pendingPage.top = viewport?.getBoundingClientRect().top;
+        }
+        const olderCount = (current.messagePage?.olderCount ?? 0) + dropped;
+        const total = Math.max(result.messagePage.total, current.messagePage?.total ?? 0);
+        const newerCount = Math.max(0, total - olderCount - messages.length);
+        return { ...current, messages, messagePage: {
+          ...current.messagePage, total, olderCount, hasMore: olderCount > 0,
+          hasLater: newerCount > 0, newerCount, beforeId: messages[0]?.id ?? null,
+        } };
+      });
+      refreshMessageCount();
+      if (conversation.messages.length + result.messages.length <= MAX_RENDERED_MESSAGES && pendingPrependScrollRef.current === pendingPage) pendingPrependScrollRef.current = null;
+    } catch (nextError) {
+      if (pendingPrependScrollRef.current === pendingPage) pendingPrependScrollRef.current = null;
+      if (historyGeneration === historyGenerationRef.current && selectedConversationRef.current === conversation.id) setError(nextError.message);
+    } finally {
+      if (pendingPrependScrollRef.current === pendingPage && (historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversation.id)) pendingPrependScrollRef.current = null;
+      if (pendingEarlierRef.current === pendingPage) { pendingEarlierRef.current = null; setLoadingEarlier(false); }
+    }
+  }
+
+  async function findConversationMessage(needle, direction, afterId) {
+    pendingLatestScrollRef.current = null;
+    const conversationId = selectedConversationRef.current;
+    if (!conversationId) return null;
+    const priorProgress = findProgressRef.current;
+    const continuation = priorProgress?.conversationId === conversationId
+      && priorProgress.needle === needle && priorProgress.direction === direction
+      && priorProgress.afterId === afterId && priorProgress.generation === historyGenerationRef.current;
+    findProgressRef.current = null;
+    pendingFindRef.current?.abort();
+    // Find owns only the message page. A completion, reconnect, or list read
+    // still owns fresh run and recovery metadata, even while Find is pending.
+    // Explicit page loads are superseded by this new navigation request.
+    if (pendingConversationLoadRef.current && !pendingConversationLoadRef.current.preservePage) {
+      pendingConversationLoadRef.current.controller.abort();
+      pendingConversationLoadRef.current = null;
+    }
+    const controller = new AbortController();
+    const pendingFind = { conversationId, controller, abort: () => controller.abort(), events: [], eventBytes: 0, overflowed: false };
+    pendingFindRef.current = pendingFind;
+    const historyGeneration = ++historyGenerationRef.current;
+    pendingPrependScrollRef.current = null;
+    pendingEarlierRef.current = null;
+    setLoadingEarlier(false);
+    try {
+      let cursor = continuation ? priorProgress.nextAfterId : afterId;
+      let byteOffset = continuation ? priorProgress.nextByteOffset ?? 0 : 0;
+      let contextOffset = continuation ? priorProgress.nextContextOffset ?? 0 : 0;
+      let leftContextOffset = continuation ? priorProgress.nextLeftContextOffset ?? 0 : 0;
+      let leftContextCased = continuation ? priorProgress.nextLeftContextCased ?? null : null;
+      let originId = continuation ? priorProgress.originId : afterId;
+      let wrapped = continuation ? priorProgress.wrapped : false;
+      let result;
+      for (let page = 0; page < 8; page += 1) {
+        result = await api(query(`/api/conversations/${conversationId}/messages/find`, {
+          q: needle, after: cursor || undefined, direction: direction < 0 ? "previous" : "next",
+          origin: page || continuation ? originId ?? "none" : undefined,
+          wrapped: wrapped ? "1" : undefined,
+          byteOffset: byteOffset || undefined,
+          contextOffset: contextOffset || undefined,
+          leftContextOffset: leftContextOffset || undefined,
+          leftContextCased: leftContextCased === null ? undefined : leftContextCased ? "1" : "0",
+        }), { signal: controller.signal });
+        if (!result.partial) break;
+        if (!result.nextAfterId || (result.nextAfterId === cursor
+          && !(result.nextByteOffset > byteOffset || (byteOffset > 0 && !result.nextByteOffset)
+            || (result.nextByteOffset === byteOffset && result.nextContextOffset > contextOffset)
+            || (result.nextByteOffset === byteOffset && result.nextLeftContextOffset > 0
+              && (!leftContextOffset || result.nextLeftContextOffset < leftContextOffset))))) throw new Error("Search continuation did not advance");
+        cursor = result.nextAfterId;
+        byteOffset = result.nextByteOffset ?? 0;
+        contextOffset = result.nextContextOffset ?? 0;
+        leftContextOffset = result.nextLeftContextOffset ?? 0;
+        leftContextCased = result.nextLeftContextCased ?? null;
+        originId = result.originId;
+        wrapped = result.wrapped;
+        if (page === 7) {
+          if (controller.signal.aborted || historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversationId) return undefined;
+          findProgressRef.current = { conversationId, needle, direction, afterId, nextAfterId: cursor,
+            nextByteOffset: byteOffset, nextContextOffset: contextOffset,
+            nextLeftContextOffset: leftContextOffset, nextLeftContextCased: leftContextCased,
+            originId, wrapped, generation: historyGeneration };
+          return { partial: true };
+        }
+      }
+      if (controller.signal.aborted || historyGeneration !== historyGenerationRef.current || selectedConversationRef.current !== conversationId) return undefined;
+      if (!result.matchId) { activeFindMatchRef.current = null; return null; }
+      activeFindMatchRef.current = { conversationId, messageId: result.matchId, needle };
+      stickToBottomRef.current = false;
+      const pageById = new Map(result.messages.map((message) => [message.id,
+        boundPageMessage(message, message.id === result.matchId ? needle : "")]));
+      let unseenEvent = false;
+      for (const event of pendingFind.events) {
+        if (event.type !== "message.created") continue;
+        const previous = pageById.get(event.payload.id);
+        if (!previous) { unseenEvent = true; continue; }
+        const oldSeq = previous.payload?.checkpointEventSeq;
+        const newSeq = event.payload?.payload?.checkpointEventSeq;
+        if (!Number.isSafeInteger(oldSeq) || !Number.isSafeInteger(newSeq) || newSeq > oldSeq) pageById.set(event.payload.id,
+          boundPageMessage(event.payload, event.payload.id === result.matchId ? needle : ""));
+      }
+      const messages = result.messages.map((message) => pageById.get(message.id));
+      checkpointCursorsRef.current = checkpointCursors(messages, checkpointCursorsRef.current, activeCursorOwners(conversationRef.current));
+      setConversation((current) => {
+        if (current?.id !== conversationId) return current;
+        const total = Math.max(result.messagePage.total ?? messages.length, current.messagePage?.total ?? 0);
+        const newerCount = Math.max(0, total - (result.messagePage.olderCount ?? 0) - messages.length);
+        return { ...current, messages, messagePage: {
+          ...result.messagePage, total,
+          hasLater: Boolean(result.messagePage.hasLater || unseenEvent || newerCount),
+          newerCount,
+        } };
+      });
+      refreshMessageCount();
+      return result.matchId;
+    } catch (error) {
+      if (error.name === "AbortError") return undefined;
+      throw error;
+    } finally { if (pendingFindRef.current === pendingFind) pendingFindRef.current = null; }
   }
 
   async function createGroup(event) { event.preventDefault(); try { await api("/api/groups", { method: "POST", body: { name: newGroupName } }); setNewGroupName(""); setNewGroupOpen(false); await refreshGroups(); setToast("Project group created"); } catch (nextError) { setError(nextError.message); } }
@@ -768,9 +1585,23 @@ export function App() {
     setConversationDetailReady(false);
     pendingConversationLoadRef.current?.controller?.abort();
     pendingConversationLoadRef.current = null;
+    pendingFindRef.current?.abort();
+    pendingFindRef.current = null;
+    activeFindMatchRef.current = null;
+    findProgressRef.current = null;
+    pendingEarlierRef.current = null;
+    pendingPrependScrollRef.current = null;
+    pendingLiveScrollRef.current = null;
+    pendingLatestScrollRef.current = null;
+    ++historyGenerationRef.current;
+    stickToBottomRef.current = true;
+    setLoadingEarlier(false);
+    setLiveCheckpoint(null);
+    livePreviewRunRef.current = null;
+    acceptedPreviewRunRef.current = null;
     selectedConversationRef.current = nextId;
     setSelectedConversationId(nextId);
-    setConversation(null); setConversationLoadFailed(false); setStreamingText(""); setRunEvents([]); checkpointCursorsRef.current.clear();
+    setConversation(null); setConversationLoadFailed(false); applyStreamingText(() => "", true); setRunEvents([]); checkpointCursorsRef.current.clear();
   }
   async function archiveChat(item, focusSource) {
     try {
@@ -833,7 +1664,7 @@ export function App() {
   async function refreshAll(includeTemplates = false) {
     try { const next = await api("/api/bootstrap"); setBootstrap(next); if (includeTemplates) setToast("Templates updated"); } catch (nextError) { setError(nextError.message); }
   }
-  function openManageChat() { if (!conversation) return; setChatDraft({ title: conversation.title, providerSessionId: conversation.providerSessionId ?? "", provider: conversation.provider, model: conversation.model ?? "", destination: `${conversation.projectId}::${conversation.worktreeId}` }); setManageChatOpen(true); }
+  function openManageChat() { if (!conversation || !conversationDetailReady || !isSelectedTarget(conversation)) return; setChatDraft({ title: conversation.title, providerSessionId: conversation.providerSessionId ?? "", provider: conversation.provider, model: conversation.model ?? "", destination: `${conversation.projectId}::${conversation.worktreeId}` }); setManageChatOpen(true); }
 
   if (!bootstrap || !project || !worktree) return <LoadingScreen isScanning={isScanning} />;
 
@@ -849,13 +1680,15 @@ export function App() {
 
     <main id="main-workspace" className={`workspace ${inspector ? "has-inspector" : ""}`} inert={isNarrow && sidebarOpen ? true : undefined} aria-hidden={isNarrow && sidebarOpen ? true : undefined}>
       <header className="workspace-bar">{!sidebarOpen && <Button variant="ghost" size="icon-sm" onClick={openSidebar} aria-label="Open projects sidebar" aria-controls="project-sidebar" aria-expanded={sidebarOpen}><SidebarSimple /></Button>}<div className="workspace-context"><span>{project.name}</span><CaretRight /><GitBranch /><strong>{worktree.name}</strong></div><div className="workspace-tools"><RunState run={activeRun ?? latestRun} /><WorktreeState worktree={worktree} /><Tooltip><TooltipTrigger render={<Button variant={inspector === "changes" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("changes", event.currentTarget)} aria-label="Changes" aria-controls="workspace-inspector" aria-expanded={inspector === "changes"} />}><GitDiff /></TooltipTrigger><TooltipContent>Changes</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "terminal" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("terminal", event.currentTarget)} aria-label="Terminal" aria-controls="workspace-inspector" aria-expanded={inspector === "terminal"} />}><TerminalWindow /></TooltipTrigger><TooltipContent>Terminal ⌘⇧T</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "context" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("context", event.currentTarget)} aria-label="Project context" aria-controls="workspace-inspector" aria-expanded={inspector === "context"} />}><Info /></TooltipTrigger><TooltipContent>Project context</TooltipContent></Tooltip><ThemeMenu theme={theme} onThemeChange={setTheme} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Worktree options" />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, editor: settings.editor } }).then(() => setToast(`Opened in ${settings.editor}`)).catch((nextError) => setError(nextError.message))}><PencilSimple />Open in {settings.editor}</DropdownMenuItem><DropdownMenuItem onClick={() => setWorktreeDialog(project)}><GitBranch />New worktree</DropdownMenuItem>{worktree.isLinked && <><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onClick={() => setRemoveWorktreeOpen(true)}><Trash />Remove worktree</DropdownMenuItem></>}</DropdownMenuContent></DropdownMenu></div></header>
-      <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll" role="tablist" aria-label="Open agent chats" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', setSelectedConversationId)}>{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={() => { dragConversationRef.current = item.id; }} onDragOver={(event) => event.preventDefault()} onDrop={() => reorderConversation(item.id)}><button className="tab-select" id={domId("chat-tab", item.id)} data-tab-id={item.id} role="tab" aria-selected={item.id === selectedConversationId} aria-controls="conversation-panel" tabIndex={item.id === selectedConversationId ? 0 : -1} onClick={() => setSelectedConversationId(item.id)} onDoubleClick={() => { setSelectedConversationId(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); archiveChat(item, event.currentTarget); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
+      <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll" role="tablist" aria-label="Open agent chats" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', selectConversation)}>{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={() => { dragConversationRef.current = item.id; }} onDragOver={(event) => event.preventDefault()} onDrop={() => reorderConversation(item.id)}><button className="tab-select" id={domId("chat-tab", item.id)} data-tab-id={item.id} role="tab" aria-selected={item.id === selectedConversationId} aria-controls="conversation-panel" tabIndex={item.id === selectedConversationId ? 0 : -1} onClick={() => selectConversation(item.id)} onDoubleClick={() => { selectConversation(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); archiveChat(item, event.currentTarget); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
       <div className="work-area">
         <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
           <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} onManage={openManageChat} />
-          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages" }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? conversation.messages.map((message) => <Message key={message.id} message={message} />) : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}{conversation?.messagePage?.hasLater && <button className="history-return" onClick={loadConversation}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button>}</div></ScrollArea>
+          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? <WindowedMessages key={conversation.id} messages={conversation.messages} messagePage={conversation.messagePage} viewportRef={messageViewportRef} restoreAnchorId={restoreMessageAnchorId} renderMessage={(message) => <Message message={message} conversationId={conversation.id} />} onFind={findConversationMessage} onCancelFind={() => { pendingFindRef.current?.abort(); pendingFindRef.current = null; activeFindMatchRef.current = null; findProgressRef.current = null; }} resetFindGeneration={findResetGeneration} /> : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{!conversation?.messagePage?.hasLater && activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}</div></ScrollArea>
+          {readingLiveText && <section className="history-live-tail" aria-label={activeRun ? "Live output while reading history" : "Recent output while reading history"} tabIndex={0}><strong>{activeRun ? "Live output" : "Recent output"}</strong><p>{readingLiveText}</p></section>}
+          {conversation?.messagePage?.hasLater && <div className="history-forward"><button className="history-later" onClick={loadLaterMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading later messages…" : `Load later messages · ${conversation.messagePage.newerCount} remaining`}</button><button className="history-return" onClick={() => loadConversation({ returnToLatest: true })}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button></div>}
           {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}
-          <form className="composer" onSubmit={sendPrompt}>{unsentCreatedChat && <div className="first-prompt-notice" role="status" aria-live="polite">Chat created, but your message was not sent. {unsentForOwner ? firstPromptAwaitingSelection ? "Open the created chat before sending again." : "Send again when the chat is ready." : "Return to its worktree before sending again."}{unsentForOwner && firstPromptAwaitingSelection && conversations.some((item) => item.id === unsentForOwner.id) && <Button type="button" variant="outline" size="sm" onClick={() => setSelectedConversationId(unsentForOwner.id)}>Open created chat</Button>}{!unsentForOwner && unsentProject && unsentWorktree && <Button type="button" variant="outline" size="sm" onClick={() => { pendingConversationRef.current = unsentCreatedChat.id; chooseProject(unsentProject, unsentWorktree); }}>Return to created chat</Button>}<Button type="button" variant="ghost" size="sm" onClick={() => { setUnsentCreatedChat(null); editDraft(""); }}>Discard unsent message</Button></div>}<textarea aria-label="Message the agent" disabled={Boolean(interruptedRun) || submissionUnavailable} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversationLoadFailed ? "Chat unavailable; retry loading…" : waitingForConversation ? "Loading selected chat…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={editDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running" role="status" aria-live="polite"><span className="status-dot demo" aria-hidden="true" />Agent is {activeRun.status}</span> : interruptedRun ? <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Recovery decision required</span> : waitingForConversation ? <span className="send-hint" role="status" aria-live="polite">{conversationLoadFailed ? "Chat unavailable; retry loading" : "Loading selected chat"}</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun) || submissionUnavailable || firstPromptAwaitingSelection} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
+          <form className="composer" onSubmit={sendPrompt}>{unsentCreatedChat && <div className="first-prompt-notice" role="status" aria-live="polite">Chat created, but your message was not sent. {unsentForOwner ? firstPromptAwaitingSelection ? "Open the created chat before sending again." : "Send again when the chat is ready." : "Return to its worktree before sending again."}{unsentForOwner && firstPromptAwaitingSelection && conversations.some((item) => item.id === unsentForOwner.id) && <Button type="button" variant="outline" size="sm" onClick={() => selectConversation(unsentForOwner.id)}>Open created chat</Button>}{!unsentForOwner && unsentProject && unsentWorktree && <Button type="button" variant="outline" size="sm" onClick={() => { pendingConversationRef.current = unsentCreatedChat.id; chooseProject(unsentProject, unsentWorktree); }}>Return to created chat</Button>}<Button type="button" variant="ghost" size="sm" onClick={() => { setUnsentCreatedChat(null); editDraft(""); }}>Discard unsent message</Button></div>}<textarea aria-label="Message the agent" disabled={Boolean(interruptedRun) || submissionUnavailable} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversationLoadFailed ? "Chat unavailable; retry loading…" : waitingForConversation ? "Loading selected chat…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={editDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running" role="status" aria-live="polite"><span className="status-dot demo" aria-hidden="true" />Agent is {activeRun.status}</span> : interruptedRun ? <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Recovery decision required</span> : waitingForConversation ? <span className="send-hint" role="status" aria-live="polite">{conversationLoadFailed ? "Chat unavailable; retry loading" : "Loading selected chat"}</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun) || submissionUnavailable || firstPromptAwaitingSelection} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
         </section>
         {inspector && <aside className="inspector" id="workspace-inspector" aria-label="Workspace inspector" tabIndex={-1} ref={inspectorRef}><header><nav role="tablist" aria-label="Inspector panels" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', setInspector)}><button id="inspector-tab-changes" data-tab-id="changes" role="tab" className={inspector === "changes" ? "is-active" : ""} aria-selected={inspector === "changes"} aria-controls="inspector-content" tabIndex={inspector === "changes" ? 0 : -1} onClick={() => setInspector("changes")}><GitDiff />Changes</button><button id="inspector-tab-terminal" data-tab-id="terminal" role="tab" className={inspector === "terminal" ? "is-active" : ""} aria-selected={inspector === "terminal"} aria-controls="inspector-content" tabIndex={inspector === "terminal" ? 0 : -1} onClick={() => setInspector("terminal")}><TerminalWindow />Terminal</button><button id="inspector-tab-context" data-tab-id="context" role="tab" className={inspector === "context" ? "is-active" : ""} aria-selected={inspector === "context"} aria-controls="inspector-content" tabIndex={inspector === "context" ? 0 : -1} onClick={() => setInspector("context")}><TreeStructure />Context</button></nav><Button variant="ghost" size="icon-xs" onClick={closeInspector} aria-label="Close inspector"><X /></Button></header><div className="inspector-body" id="inspector-content" role="tabpanel" aria-labelledby={`inspector-tab-${inspector}`}>{inspector === "changes" && <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />}{inspector === "terminal" && <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} sendRuntime={sendRuntime} onError={handleError} />}{inspector === "context" && <ContextPane worktree={worktree} settings={settings} onError={handleError} />}</div></aside>}
       </div>
@@ -878,7 +1711,32 @@ function ProjectTree({ project, activeProjectId, activeWorktreeId, expanded, gro
   return <div className={`project-tree ${project.id === activeProjectId ? "is-active" : ""}`}><div className="project-row"><button className="tree-caret" onClick={onToggle} aria-label={`${expanded ? "Collapse" : "Expand"} ${project.name}`} aria-expanded={expanded}>{expanded ? <CaretDown /> : <CaretRight />}</button><button className="project-select" onClick={onSelectProject}><FolderOpen weight={project.id === activeProjectId ? "fill" : "duotone"} /><span><strong>{project.name}</strong><small>{compactPath(project.path)}</small></span></button><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-xs" className="project-menu" aria-label={`Project options for ${project.name}`} />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={onCreateWorktree}><GitBranch />New worktree</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuGroup><DropdownMenuLabel>Move to group</DropdownMenuLabel>{groups.map((group) => <DropdownMenuItem key={group.id} onClick={() => onMove(group.id)}><Folders />{group.name}</DropdownMenuItem>)}</DropdownMenuGroup><DropdownMenuItem onClick={() => onMove(null)}>Ungrouped</DropdownMenuItem></DropdownMenuContent></DropdownMenu></div>{expanded && <div className="worktree-list">{project.worktrees.map((item) => <button className={`worktree-row ${project.id === activeProjectId && item.id === activeWorktreeId ? "is-active" : ""}`} aria-current={project.id === activeProjectId && item.id === activeWorktreeId ? "page" : undefined} key={item.id} onClick={() => onSelectWorktree(item)}><span /><GitBranch /><span className="worktree-copy"><strong>{item.name}</strong><small>{item.branch}</small></span><GitHealth worktree={item} /></button>)}</div>}</div>;
 }
 function ConversationHeader({ conversation, worktree, latestRun, onManage }) { return <section className="conversation-header"><div className="conversation-symbol"><ChatCircle weight="duotone" /></div><div><h1>{conversation?.title ?? "No conversation selected"}</h1><p><GitBranch />{worktree.branch}<span>·</span>{compactPath(worktree.path)}</p></div><div className="conversation-meta">{conversation && <button onClick={onManage}><span>{conversation.provider}</span><PencilSimple /></button>}{latestRun && <small>{runSummary(latestRun)}</small>}</div></section>; }
-function Message({ message }) { const user = message.role === "user"; if (message.kind === "tool") return <article className="message is-agent is-tool" data-message-id={message.id}><div className="avatar"><CheckCircle weight="fill" /></div><div className="message-body"><p className="message-text">{message.body}</p></div></article>; return <article className={`message ${user ? "is-user" : "is-agent"}`} data-message-id={message.id}><div className="avatar">{user ? "Y" : <Sparkle weight="fill" />}</div><div className="message-body"><div className="message-meta"><strong>{user ? "You" : "Outright"}</strong><time>{formatTime(message.createdAt)}</time></div><p className="message-text">{message.body}</p>{message.payload?.runId && <small className="message-run">{message.payload.provider} · {message.payload.runId.slice(0, 8)}</small>}</div></article>; }
+function Message({ message, conversationId }) {
+  const [bodyPage, setBodyPage] = useState(null);
+  const [bodyError, setBodyError] = useState("");
+  const [bodyLoading, setBodyLoading] = useState(false);
+  const bodyRequestRef = useRef(null);
+  useEffect(() => () => bodyRequestRef.current?.abort(), []);
+  async function readBody(offset) {
+    bodyRequestRef.current?.abort();
+    const controller = new AbortController();
+    bodyRequestRef.current = controller;
+    setBodyLoading(true);
+    setBodyError("");
+    try {
+      const page = await api(query(`/api/conversations/${conversationId}/messages/${encodeURIComponent(message.id)}/body`, { offset }), { signal: controller.signal });
+      if (!controller.signal.aborted) setBodyPage(page);
+    } catch (error) {
+      if (!controller.signal.aborted) setBodyError(error.message);
+    } finally {
+      if (bodyRequestRef.current === controller) { bodyRequestRef.current = null; setBodyLoading(false); }
+    }
+  }
+  const user = message.role === "user";
+  const bodyReader = message.findExcerpt && <div className="message-full-reader"><button type="button" onClick={() => readBody(bodyPage?.offset ?? 0)} disabled={bodyLoading}>{bodyPage ? "Reload this section" : "Read full message"}</button>{bodyPage && <><p>Bytes {bodyPage.offset + 1}–{bodyPage.nextOffset} of {bodyPage.totalBytes}</p><pre tabIndex={0} aria-label="Full message section">{bodyPage.body}</pre><div><button type="button" disabled={bodyLoading || bodyPage.offset === 0} onClick={() => readBody(Math.max(0, bodyPage.offset - 65536))}>Previous section</button><button type="button" disabled={bodyLoading || !bodyPage.hasMore} onClick={() => readBody(bodyPage.nextOffset)}>Next section</button></div></>}{bodyLoading && <span role="status">Loading message section…</span>}{bodyError && <span role="alert">{bodyError}</span>}</div>;
+  if (message.kind === "tool") return <article className="message is-agent is-tool" data-message-id={message.id}><div className="avatar"><CheckCircle weight="fill" /></div><div className="message-body"><p className="message-text">{message.body}</p>{bodyReader}</div></article>;
+  return <article className={`message ${user ? "is-user" : "is-agent"}`} data-message-id={message.id}><div className="avatar">{user ? "Y" : <Sparkle weight="fill" />}</div><div className="message-body"><div className="message-meta"><strong>{user ? "You" : "Outright"}</strong><time>{formatTime(message.createdAt)}</time></div><p className="message-text">{message.body}</p>{bodyReader}{message.payload?.runId && <small className="message-run">{message.payload.provider} · {message.payload.runId.slice(0, 8)}</small>}</div></article>;
+}
 function StreamingMessage({ text, events }) { return <article className="message is-agent is-streaming" aria-busy="true"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="message-text">{text}</p><ToolActivity events={events} /></div></article>; }
 function RunningMessage({ run, events }) { return <article className="message is-agent is-streaming" role="status" aria-live="polite"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="thinking-copy">{run.status === "queued" ? "Waiting for an execution slot…" : "Working in this worktree…"}</p><ToolActivity events={events} /></div></article>; }
 // Interrupted runs surface here until the operator picks a continuation
@@ -921,6 +1779,81 @@ function compactPath(value = "") { return value.replace(/^\/Users\/[^/]+/, "~");
 function defaultSettings() { return { provider: "codex", model: "", reasoningEffort: "medium", approvalPolicy: "workspace-write", editor: "zed", notifications: true, maxConcurrentRuns: 3 }; }
 function focusableElements(container) { return container ? [...container.querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')].filter((element) => element.getClientRects().length && element.getAttribute("aria-hidden") !== "true") : []; }
 function boundStreamingText(value) { return value.length > MAX_STREAMING_CHARACTERS ? `${value.slice(0, MAX_STREAMING_CHARACTERS)}${LIVE_TRUNCATION_MARKER}` : value; }
+
+function boundPageMessage(message, matchNeedle = "") {
+  const body = String(message.body ?? "");
+  let bounded = message;
+  // HTTP pages apply the same ceiling before hydration. Live events and
+  // buffered replay must not bypass the retained 1000-row memory bound.
+  if (body.length > 16_000) {
+    const foldedIndex = matchNeedle ? foldFindText(body).indexOf(foldFindText(matchNeedle)) : -1;
+    if (foldedIndex >= 0) {
+      // Find may return a server excerpt centered on a match far from both
+      // ends. Keep that context when applying the smaller client heap cap.
+      let originalIndex = 0;
+      let foldedPosition = 0;
+      for (const point of body) {
+        if (foldedPosition >= foldedIndex) break;
+        foldedPosition += foldFindText(point).length;
+        originalIndex += point.length;
+      }
+      let start = Math.max(0, originalIndex - 7_500);
+      if (start && /[\uDC00-\uDFFF]/.test(body[start])) start -= 1;
+      let end = Math.min(body.length, start + 15_000);
+      if (end < body.length && /[\uD800-\uDBFF]/.test(body[end - 1])) end -= 1;
+      bounded = { ...bounded, body: `${start ? "[Earlier text omitted from this page]\n" : ""}${body.slice(start, end)}${end < body.length ? "\n[Later text omitted from this page]" : ""}`, findExcerpt: true };
+    } else {
+      const prefix = body.slice(0, 8_000).replace(/[\uD800-\uDBFF]$/, "");
+      const suffix = body.slice(-8_000).replace(/^[\uDC00-\uDFFF]/, "");
+      bounded = { ...bounded, body: `${prefix}\n[Middle text omitted from this page]\n${suffix}`, findExcerpt: true };
+    }
+  }
+  if (message.payload && JSON.stringify(message.payload).length > 32_000) {
+    bounded = { ...bounded, payload: { runId: message.payload.runId, provider: message.payload.provider,
+      checkpointEventSeq: message.payload.checkpointEventSeq }, payloadOmitted: true };
+  }
+  return bounded;
+}
+
+function emptyLiveDeltaEvents(runId = null) { return { runId, events: [], start: 0, bytes: 0, omittedThroughSeq: 0 }; }
+
+function appendLiveDeltaEvent(state, event) {
+  state.events.push(event);
+  state.bytes += JSON.stringify(event).length * 2;
+  while (state.bytes > MAX_PENDING_RUNTIME_EVENT_BYTES / 2 && state.events.length - state.start > 1) {
+    const removed = state.events[state.start++];
+    state.bytes -= JSON.stringify(removed).length * 2;
+    state.omittedThroughSeq = Number.isSafeInteger(removed.payload?.seq)
+      ? Math.max(state.omittedThroughSeq, removed.payload.seq) : Number.POSITIVE_INFINITY;
+  }
+  if (state.start > 128 && state.start * 2 > state.events.length) {
+    state.events = state.events.slice(state.start);
+    state.start = 0;
+  }
+  return state;
+}
+
+function boundedLiveDeltaEvents(runId, events, omittedThroughSeq = 0) {
+  const state = emptyLiveDeltaEvents(runId);
+  state.omittedThroughSeq = omittedThroughSeq;
+  for (const event of events) appendLiveDeltaEvent(state, event);
+  return state;
+}
+
+function readingLiveCheckpoint(message) {
+  const body = String(message.body ?? "");
+  return { runId: message.payload.runId, seq: message.payload.checkpointEventSeq ?? 0,
+    text: body.slice(-MAX_READING_LIVE_PREVIEW_CHARACTERS), truncated: body.length > MAX_READING_LIVE_PREVIEW_CHARACTERS };
+}
+
+function readingLivePreview(checkpoint, suffix) {
+  if (!checkpoint?.text && !suffix) return "";
+  const text = `${checkpoint?.text ?? ""}${suffix.slice(-MAX_READING_LIVE_PREVIEW_CHARACTERS)}`;
+  const truncated = Boolean(checkpoint?.truncated) || text.length > MAX_READING_LIVE_PREVIEW_CHARACTERS
+    || suffix.length > MAX_READING_LIVE_PREVIEW_CHARACTERS;
+  const visible = text.slice(-MAX_READING_LIVE_PREVIEW_CHARACTERS);
+  return truncated ? `[Earlier live output omitted]\n${visible}` : visible;
+}
 function formatTime(value) { return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(value)); }
 function runSummary(run) { const tokens = Number(run.inputTokens ?? 0) + Number(run.outputTokens ?? 0); return `${run.status}${tokens ? ` · ${tokens.toLocaleString()} tokens` : ""}${run.costUsd != null ? ` · $${Number(run.costUsd).toFixed(3)}` : ""}`; }
 function toolLabel(event) { const item = event.payload?.item ?? {}; return item.command || item.name || item.type || (event.type === "tool.started" ? "Tool started" : "Tool completed"); }
