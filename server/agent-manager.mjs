@@ -4,11 +4,15 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync,
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
+import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
 
 const MAX_PROVIDER_LINE_BYTES = 1024 * 1024;
 const MAX_ASSISTANT_BYTES = 1024 * 1024;
 const MAX_PROCESS_EVENT_BYTES = 64 * 1024;
 const MAX_ASSISTANT_EVENT_BYTES = 255 * 1024;
+const MAX_RUN_TRANSCRIPT_ITEMS = RESOURCE_BUDGETS.maxRunTranscriptItems;
+const MAX_RUN_TRANSCRIPT_BYTES = RESOURCE_BUDGETS.maxRunTranscriptBytes;
+const MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES = 16 * 1024;
 const ASSISTANT_TRUNCATION_MARKER = "\n\n[Output truncated by Outright at 1 MiB]";
 // Assistant checkpoints are coalesced: a new durable checkpoint is written
 // only after this many new stream bytes (or this much time) accumulate, so a
@@ -518,7 +522,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     const status = state.stopped ? "stopped" : successful ? "completed" : "failed";
     const message = error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : "");
     const finishedAt = new Date().toISOString();
-    const transcriptMessage = pendingAssistantMessage(state);
+    const transcriptMessage = budgetTranscript(state, pendingAssistantMessage(state));
     // The last transcript checkpoint and terminal run state commit together.
     // A crash can therefore leave the run recoverable, but never terminal with
     // its final assistant segment missing.
@@ -626,7 +630,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       }));
       if (index < 0) return;
       const entry = queue.splice(index, 1)[0];
-      const state = { ...entry, assistantSegments: [], assistantBytes: 0, assistantTruncated: false, assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, stderr: "", stopped: false, checkpointPendingBytes: 0, lastCheckpointAt: 0, checkpointTimer: null, checkpointHalted: false };
+      const state = { ...entry, assistantSegments: [], assistantBytes: 0, assistantTruncated: false, assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, transcriptSizes: new Map(), transcriptBytes: 0, transcriptOmitted: false, stderr: "", stopped: false, checkpointPendingBytes: 0, lastCheckpointAt: 0, checkpointTimer: null, checkpointHalted: false };
       active.set(entry.run.id, state);
       state.launch = entry.launch = (async () => {
         try {
@@ -664,10 +668,15 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   // one message rather than duplicating partial content.
   function persistTranscriptItem(state, item) {
     state.transcriptSeq = (state.transcriptSeq ?? 0) + 1;
+    const toolItem = item.payload?.item ?? null;
+    const boundedItem = toolItem && Buffer.byteLength(JSON.stringify(toolItem)) > MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES
+      ? { truncated: true, preview: truncateUtf8(JSON.stringify(toolItem), MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES - 256) } : toolItem;
     const payload = item.kind === "text"
       ? { runId: state.run.id, provider: state.run.provider, truncated: Boolean(item.payload?.truncated) }
-      : { runId: state.run.id, item: item.payload?.item ?? null };
-    const message = database.addMessage({ id: `${state.run.id}:${state.transcriptSeq}`, conversationId: state.conversation.id, role: "assistant", kind: item.kind, body: item.body, payload });
+      : { runId: state.run.id, item: boundedItem };
+    const input = budgetTranscript(state, { id: `${state.run.id}:${state.transcriptSeq}`, conversationId: state.conversation.id, role: "assistant", kind: item.kind, body: item.body, payload });
+    if (!input) return;
+    const message = database.addMessage(input);
     publish({ type: "message.created", conversationId: state.conversation.id, payload: message });
   }
 
@@ -716,7 +725,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     clearCheckpointTimer(state);
     state.checkpointPendingBytes = 0;
     state.lastCheckpointAt = Date.now();
-    const message = pendingAssistantMessage(state);
+    const message = budgetTranscript(state, pendingAssistantMessage(state));
     if (!message) return null;
     // The capped body plus truncation marker is now durable; discarded deltas
     // beyond the cap must not schedule further rewrites of the same body.
@@ -730,7 +739,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     clearCheckpointTimer(state);
     state.checkpointPendingBytes = 0;
     state.lastCheckpointAt = Date.now();
-    const message = pendingAssistantMessage(state);
+    const message = budgetTranscript(state, pendingAssistantMessage(state));
     if (!message) return emit(state.run.id, "assistant.delta", payload);
     if (state.assistantTruncated) state.checkpointHalted = true;
     // The delta event and the transcript prefix that already contains it are
@@ -747,6 +756,38 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     const run = database.getRun(runId);
     publish({ type: "run.event", conversationId: run?.conversationId, runId, payload: event });
     return event;
+  }
+
+  function budgetTranscript(state, message) {
+    if (!message) return null;
+    const prior = state.transcriptSizes.get(message.id) ?? 0;
+    if (!prior && state.transcriptSizes.size >= MAX_RUN_TRANSCRIPT_ITEMS) {
+      markTranscriptOmitted(state);
+      return null;
+    }
+    const payloadBytes = Buffer.byteLength(JSON.stringify(message.payload ?? null));
+    const allowance = MAX_RUN_TRANSCRIPT_BYTES - 512 - state.transcriptBytes + prior - payloadBytes;
+    if (allowance <= 0) { markTranscriptOmitted(state); return null; }
+    const originalBytes = Buffer.byteLength(message.body ?? "");
+    const body = originalBytes > allowance ? truncateUtf8(message.body, Math.max(0, allowance - 64)) : message.body;
+    const bounded = originalBytes > allowance
+      ? { ...message, body: `${body}\n[Further output omitted: transcript budget reached]`, payload: { ...message.payload, truncated: true } }
+      : message;
+    const size = Buffer.byteLength(bounded.body ?? "") + Buffer.byteLength(JSON.stringify(bounded.payload ?? null));
+    if (state.transcriptBytes - prior + size > MAX_RUN_TRANSCRIPT_BYTES - 256) { markTranscriptOmitted(state); return null; }
+    state.transcriptSizes.set(message.id, size);
+    state.transcriptBytes += size - prior;
+    if (originalBytes > allowance) markTranscriptOmitted(state);
+    return bounded;
+  }
+
+  function markTranscriptOmitted(state) {
+    if (state.transcriptOmitted) return;
+    state.transcriptOmitted = true;
+    const message = database.addMessage({ id: `${state.run.id}:budget`, conversationId: state.conversation.id,
+      role: "assistant", kind: "text", body: "Further run transcript items omitted because the retention budget was reached.",
+      payload: { runId: state.run.id, provider: state.run.provider, truncated: true } });
+    publish({ type: "message.created", conversationId: state.conversation.id, payload: message });
   }
 
   return {

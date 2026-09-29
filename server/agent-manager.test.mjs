@@ -361,6 +361,37 @@ test("persists ordered transcript items instead of one accumulated answer", asyn
   assert.deepEqual(database.messages.map((message) => message.kind), ["text", "tool", "text"]);
 });
 
+test("sustained tool output stops growing the durable run transcript", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  database.createRun(codexRun("budget-run"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun("budget-run") });
+  for (let index = 0; index < 2100; index += 1) {
+    child.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: `command-${index}` } }) + "\n");
+  }
+  child.emit("close", 0, null);
+  assert.equal(database.messages.length, 2001);
+  assert.match(database.messages.at(-1).body, /retention budget/);
+  assert.equal(database.getRun("budget-run").status, "completed");
+});
+
+test("many assistant segments share one durable transcript byte budget", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  database.createRun(codexRun("byte-budget-run"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun("byte-budget-run") });
+  for (let index = 0; index < 40; index += 1) {
+    child.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: `${index}:${"x".repeat(512 * 1024)}` } }) + "\n");
+  }
+  child.emit("close", 0, null);
+  const bytes = database.messages.reduce((sum, message) => sum + Buffer.byteLength(message.body) + Buffer.byteLength(JSON.stringify(message.payload)), 0);
+  assert.ok(bytes <= 16 * 1024 * 1024);
+  assert.equal(database.messages.some((message) => /retention budget/.test(message.body)), true);
+  assert.equal(database.getRun("byte-budget-run").status, "completed");
+});
+
 test("persists partial transcript output before the provider exits", async () => {
   const database = fakeDatabase();
   const child = fakeChild();

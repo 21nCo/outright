@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { foldFindText } from "../src/lib/find-text.js";
+import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
 
 const DEFAULT_SETTINGS = {
   provider: "codex",
@@ -12,15 +13,32 @@ const DEFAULT_SETTINGS = {
   approvalPolicy: "workspace-write",
   editor: "zed",
   maxConcurrentRuns: 3,
+  maxQueuedRuns: RESOURCE_BUDGETS.maxQueuedRuns,
+  maxRetainedMiB: RESOURCE_BUDGETS.maxRetainedMiB,
+  retentionDays: RESOURCE_BUDGETS.retentionDays,
   notifications: true,
   theme: "system",
 };
 
 const MAX_RUN_EVENT_PAYLOAD_BYTES = 256 * 1024;
+const MAX_RUN_EVENT_RETAINED_BYTES = RESOURCE_BUDGETS.maxRunEventBytes;
 const MAX_MESSAGE_PAGE_BYTES = 8 * 1024 * 1024;
 const MAX_INLINE_MESSAGE_BYTES = 64 * 1024;
 const FIND_SCAN_BYTES = 8 * 1024 * 1024;
 const FIND_CHUNK_BYTES = 64 * 1024;
+const RETAINED_COLUMNS = [
+  ["settings", "key, value"],
+  ["project_groups", "id, name, created_at"],
+  ["project_memberships", "project_id, group_id"],
+  ["conversations", "id, project_id, worktree_id, worktree_path, title, provider, model, provider_session_id, created_at, updated_at"],
+  ["messages", "id, conversation_id, role, kind, body, payload, created_at"],
+  ["runs", "id, conversation_id, worktree_path, provider, model, reasoning_effort, approval_policy, prompt, status, provider_session_id, created_at, started_at, finished_at, error, recovery_class, recovery_decision"],
+  ["run_events", "run_id, type, payload, created_at"],
+  ["run_event_usage", "run_id"],
+  ["trusted_projects", "project_id, project_path, trusted_at"],
+  ["audit_log", "action, target, details, created_at"],
+  ["prompt_templates", "id, title, prompt, created_at"],
+];
 
 const SETTING_RULES = {
   provider: (value) => typeof value === "string" && ["codex", "claude"].includes(value),
@@ -29,6 +47,9 @@ const SETTING_RULES = {
   approvalPolicy: (value) => ["read-only", "workspace-write", "danger-full-access"].includes(value),
   editor: (value) => ["zed", "code", "cursor", "finder"].includes(value),
   maxConcurrentRuns: (value) => Number.isInteger(value) && value >= 1 && value <= 8,
+  maxQueuedRuns: (value) => Number.isInteger(value) && value >= 1 && value <= 256,
+  maxRetainedMiB: (value) => Number.isInteger(value) && value >= 64 && value <= 4096,
+  retentionDays: (value) => Number.isInteger(value) && value >= 1 && value <= 3650,
   notifications: (value) => typeof value === "boolean",
   theme: (value) => ["system", "light", "dark"].includes(value),
 };
@@ -99,12 +120,45 @@ export function createOutrightDatabase(options = {}) {
       update.immediate(Object.entries(patch));
       return this.getSettings();
     },
+    capacity() {
+      const settings = this.getSettings();
+      const queued = db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status = 'queued'").get().count;
+      const active = db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status IN ('launching', 'running')").get().count;
+      const recoverable = db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status = 'interrupted' AND recovery_decision IS NULL").get().count;
+      const bytes = retainedBytes(db);
+      return { queued, active, recoverable, retainedBytes: bytes, limits: {
+        maxQueuedRuns: settings.maxQueuedRuns, maxConcurrentRuns: settings.maxConcurrentRuns,
+        maxRetainedBytes: settings.maxRetainedMiB * 1024 * 1024, retentionDays: settings.retentionDays,
+        maxRunTranscriptItems: RESOURCE_BUDGETS.maxRunTranscriptItems, maxRunTranscriptBytes: RESOURCE_BUDGETS.maxRunTranscriptBytes,
+        maxRunEventBytes: MAX_RUN_EVENT_RETAINED_BYTES,
+      }, cpuUsage: null, memoryUsage: null, diskAllocatedBytes: null };
+    },
+    // Only archived conversations without pending or recoverable work may be
+    // removed. This is one transaction so a failed deletion cannot leave
+    // messages, run events, or recovery ownership half-pruned.
+    pruneHistory({ before, limit = 100 } = {}) {
+      if (typeof before !== "string" || !Number.isFinite(Date.parse(before))) throw databaseError(400, "Retention cutoff is invalid");
+      if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw databaseError(400, "Retention limit must be 1 to 1000");
+      const prune = db.transaction(() => {
+        const ids = db.prepare(`SELECT id FROM conversations WHERE archived = 1 AND updated_at < ?
+          AND NOT EXISTS (SELECT 1 FROM runs WHERE conversation_id = conversations.id
+            AND (status IN ('queued', 'launching', 'running') OR (status = 'interrupted' AND recovery_decision IS NULL)))
+          ORDER BY updated_at, id LIMIT ?`).all(before, limit).map((row) => row.id);
+        const remove = db.prepare("DELETE FROM conversations WHERE id = ?");
+        for (const id of ids) remove.run(id);
+        return { deleted: ids.length, ids };
+      });
+      return prune.immediate();
+    },
     listGroups() {
       const groups = db.prepare("SELECT id, name, position, created_at AS createdAt FROM project_groups ORDER BY position, created_at").all();
       const memberships = Object.fromEntries(db.prepare("SELECT project_id, group_id FROM project_memberships").all().map((row) => [row.project_id, row.group_id]));
       return { groups, memberships };
     },
     createGroup(name) {
+      if (retainedBytes(db) >= this.getSettings().maxRetainedMiB * 1024 * 1024) {
+        throw databaseError(507, "Retained history is full; archive old conversations and clean up history");
+      }
       const id = randomUUID();
       const position = db.prepare("SELECT COALESCE(MAX(position), -1) + 1 AS position FROM project_groups").get().position;
       db.prepare("INSERT INTO project_groups (id, name, position, created_at) VALUES (?, ?, ?, ?)").run(id, name.trim(), position, now());
@@ -133,6 +187,9 @@ export function createOutrightDatabase(options = {}) {
       return db.prepare(`SELECT ${conversationColumns()} FROM conversations WHERE id = ?`).get(id);
     },
     createConversation(input) {
+      if (retainedBytes(db) >= this.getSettings().maxRetainedMiB * 1024 * 1024) {
+        throw databaseError(507, "Retained history is full; archive old conversations and clean up history");
+      }
       const id = randomUUID();
       const timestamp = now();
       const position = db.prepare("SELECT COALESCE(MAX(tab_position), -1) + 1 AS position FROM conversations WHERE project_id = ? AND worktree_id = ?").get(input.projectId, input.worktreeId).position;
@@ -574,13 +631,31 @@ export function createOutrightDatabase(options = {}) {
         FROM messages WHERE id = ?`).get(message.id));
     },
     createRun(input) {
-      const run = { id: randomUUID(), status: "queued", createdAt: now(), ...input };
-      const worktreePath = run.worktreePath ?? this.getConversation(run.conversationId)?.worktreePath;
-      if (!worktreePath) throw databaseError(400, "Run worktree path is required");
-      db.prepare(`INSERT INTO runs (id, conversation_id, worktree_path, provider, model, reasoning_effort, approval_policy, prompt, status, provider_session_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(run.id, run.conversationId, worktreePath, run.provider, run.model ?? "", run.reasoningEffort ?? "medium", run.approvalPolicy, run.prompt, run.status, run.providerSessionId ?? null, run.createdAt);
-      return this.getRun(run.id);
+      const insert = db.transaction(() => {
+        const settings = this.getSettings();
+        if (db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status = 'queued'").get().count >= settings.maxQueuedRuns) {
+          throw databaseError(429, "Run queue is full; stop a queued run or wait for capacity");
+        }
+        if (retainedBytes(db) >= settings.maxRetainedMiB * 1024 * 1024) {
+          throw databaseError(507, "Retained history is full; archive old conversations and clean up history");
+        }
+        const run = { id: randomUUID(), status: "queued", createdAt: now(), ...input };
+        const worktreePath = run.worktreePath ?? this.getConversation(run.conversationId)?.worktreePath;
+        if (!worktreePath) throw databaseError(400, "Run worktree path is required");
+        db.prepare(`INSERT INTO runs (id, conversation_id, worktree_path, provider, model, reasoning_effort, approval_policy, prompt, status, provider_session_id, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          .run(run.id, run.conversationId, worktreePath, run.provider, run.model ?? "", run.reasoningEffort ?? "medium", run.approvalPolicy, run.prompt, run.status, run.providerSessionId ?? null, run.createdAt);
+        return this.getRun(run.id);
+      });
+      return insert.immediate();
+    },
+    submitRun(input, prompt) {
+      const submit = db.transaction(() => {
+        const run = this.createRun(input);
+        const message = this.addMessage({ conversationId: input.conversationId, role: "user", kind: "text", body: prompt });
+        return { run, message };
+      });
+      return submit.immediate();
     },
     getRun(id) {
       return db.prepare(`SELECT id, conversation_id AS conversationId, worktree_path AS worktreePath, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
@@ -774,12 +849,28 @@ export function createOutrightDatabase(options = {}) {
       return finish.immediate();
     },
     appendRunEvent(runId, type, payload) {
-      const seq = db.prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM run_events WHERE run_id = ?").get(runId).seq;
-      const createdAt = now();
-      const serialized = serializePayload(payload);
-      const result = db.prepare("INSERT INTO run_events (run_id, seq, type, payload, created_at) VALUES (?, ?, ?, ?, ?)").run(runId, seq, type, serialized, createdAt);
-      db.prepare("DELETE FROM run_events WHERE run_id = ? AND seq <= ?").run(runId, seq - 2_000);
-      return { id: Number(result.lastInsertRowid), runId, seq, type, payload: parseJson(serialized, null), createdAt };
+      const commit = db.transaction(() => {
+        const seq = db.prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM run_events WHERE run_id = ?").get(runId).seq;
+        const createdAt = now();
+        const serialized = serializePayload(payload);
+        const result = db.prepare("INSERT INTO run_events (run_id, seq, type, payload, created_at) VALUES (?, ?, ?, ?, ?)").run(runId, seq, type, serialized, createdAt);
+        db.prepare(`INSERT INTO run_event_usage (run_id, bytes) VALUES (?, ?)
+          ON CONFLICT(run_id) DO UPDATE SET bytes = bytes + excluded.bytes`).run(runId, Buffer.byteLength(serialized) + 128);
+        // Replay is a bounded tail. Durable transcript checkpoints and run
+        // rows remain separate, so pruning does not erase recovery evidence.
+        let bytes = db.prepare("SELECT bytes FROM run_event_usage WHERE run_id = ?").get(runId).bytes;
+        const old = db.prepare("SELECT id, seq, COALESCE(LENGTH(CAST(payload AS BLOB)), 0) + 128 AS bytes FROM run_events WHERE run_id = ? ORDER BY seq LIMIT 1");
+        const remove = db.prepare("DELETE FROM run_events WHERE id = ?");
+        while (bytes > MAX_RUN_EVENT_RETAINED_BYTES || old.get(runId)?.seq <= seq - 2_000) {
+          const row = old.get(runId);
+          if (!row) break;
+          remove.run(row.id);
+          bytes -= row.bytes;
+        }
+        db.prepare("UPDATE run_event_usage SET bytes = ? WHERE run_id = ?").run(bytes, runId);
+        return { id: Number(result.lastInsertRowid), runId, seq, type, payload: parseJson(serialized, null), createdAt };
+      });
+      return commit.immediate();
     },
     appendRunEventWithMessage(runId, type, payload, transcriptMessage) {
       const commit = db.transaction(() => {
@@ -808,13 +899,20 @@ export function createOutrightDatabase(options = {}) {
     },
     listTrustedProjects() { return db.prepare("SELECT project_id AS projectId, project_path AS projectPath, trusted_at AS trustedAt FROM trusted_projects ORDER BY trusted_at DESC").all(); },
     audit(action, details = {}) {
-      db.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)").run(action, details.target ?? "", JSON.stringify(details), now());
+      db.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)").run(action, String(details.target ?? "").slice(0, 512), serializePayload(details, 4 * 1024), now());
+      db.prepare(`DELETE FROM audit_log WHERE id <= (SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET 9999)
+        AND target NOT IN (SELECT id FROM runs WHERE status IN ('queued', 'launching', 'running')
+          OR (status = 'interrupted' AND recovery_decision IS NULL))`).run();
     },
     listAudit(limit = 100) {
-      return db.prepare("SELECT id, action, target, details, created_at AS createdAt FROM audit_log ORDER BY id DESC LIMIT ?").all(limit).map(hydrateDetails);
+      const bounded = Math.max(1, Math.min(500, Number(limit) || 100));
+      return db.prepare("SELECT id, action, target, details, created_at AS createdAt FROM audit_log ORDER BY id DESC LIMIT ?").all(bounded).map(hydrateDetails);
     },
     listTemplates() { return db.prepare("SELECT id, title, prompt, created_at AS createdAt FROM prompt_templates ORDER BY title").all(); },
     saveTemplate(input) {
+      if (retainedBytes(db) >= this.getSettings().maxRetainedMiB * 1024 * 1024) {
+        throw databaseError(507, "Retained history is full; archive old conversations and clean up history");
+      }
       const id = input.id ?? randomUUID();
       db.prepare("INSERT INTO prompt_templates (id, title, prompt, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title = excluded.title, prompt = excluded.prompt")
         .run(id, input.title.trim(), input.prompt.trim(), now());
@@ -859,10 +957,13 @@ function migrate(db) {
       id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
       seq INTEGER NOT NULL, type TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL, UNIQUE(run_id, seq)
     );
+    CREATE TABLE IF NOT EXISTS run_event_usage (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, bytes INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS trusted_projects (project_id TEXT PRIMARY KEY, project_path TEXT NOT NULL, trusted_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, target TEXT, details TEXT, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS prompt_templates (id TEXT PRIMARY KEY, title TEXT NOT NULL, prompt TEXT NOT NULL, created_at TEXT NOT NULL);
   `);
+  db.exec(`INSERT OR IGNORE INTO run_event_usage (run_id, bytes)
+    SELECT run_id, SUM(COALESCE(LENGTH(CAST(payload AS BLOB)), 0) + 128) FROM run_events GROUP BY run_id`);
   if (!db.pragma("table_info(messages)").some((column) => column.name === "search_order")) {
     db.exec("BEGIN IMMEDIATE");
     try {
@@ -888,6 +989,21 @@ function migrate(db) {
   db.exec(`UPDATE runs SET worktree_path = (SELECT worktree_path FROM conversations WHERE conversations.id = runs.conversation_id)
     WHERE worktree_path IS NULL AND status IN ('completed', 'failed', 'stopped')`);
   db.exec("CREATE INDEX IF NOT EXISTS runs_worktree_recovery ON runs(worktree_path, status, recovery_decision, created_at)");
+  // Rebuild once at startup for legacy databases, then maintain in the same
+  // SQLite transaction as every write and cascade. Admission stays O(1) as
+  // transcript history grows over long sessions.
+  db.exec("CREATE TABLE IF NOT EXISTS retained_usage (id INTEGER PRIMARY KEY CHECK(id = 1), bytes INTEGER NOT NULL)");
+  db.exec("INSERT OR IGNORE INTO retained_usage (id, bytes) VALUES (1, 0)");
+  for (const [table, fields] of RETAINED_COLUMNS) {
+    const size = (alias) => `128 + ${fields.split(", ").map((field) => `COALESCE(LENGTH(CAST(${alias}.${field} AS BLOB)), 0)`).join(" + ")}`;
+    db.exec(`CREATE TRIGGER IF NOT EXISTS retained_${table}_insert AFTER INSERT ON ${table}
+      BEGIN UPDATE retained_usage SET bytes = bytes + (${size("NEW")}) WHERE id = 1; END`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS retained_${table}_update AFTER UPDATE ON ${table}
+      BEGIN UPDATE retained_usage SET bytes = bytes + (${size("NEW")}) - (${size("OLD")}) WHERE id = 1; END`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS retained_${table}_delete AFTER DELETE ON ${table}
+      BEGIN UPDATE retained_usage SET bytes = bytes - (${size("OLD")}) WHERE id = 1; END`);
+  }
+  db.prepare("UPDATE retained_usage SET bytes = ? WHERE id = 1").run(calculateRetainedBytes(db));
 }
 
 function conversationColumns() {
@@ -926,6 +1042,12 @@ function decodeMessageWindow(bytes) {
 function hydrateDetails(row) { return { ...row, details: parseJson(row.details, {}) }; }
 function parseJson(value, fallback) { try { return JSON.parse(value); } catch { return fallback; } }
 function now() { return new Date().toISOString(); }
+function retainedBytes(db) {
+  return db.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes;
+}
+function calculateRetainedBytes(db) {
+  return RETAINED_COLUMNS.reduce((total, [table, fields]) => total + db.prepare(`SELECT COALESCE(SUM(128 + ${fields.split(", ").map((field) => `COALESCE(LENGTH(CAST(${field} AS BLOB)), 0)`).join(" + ")}), 0) AS bytes FROM ${table}`).get().bytes, 0);
+}
 function preparePrivateLaunchDirectory(directory) {
   if (!directory || !path.isAbsolute(directory)) throw new Error("A private absolute launch directory is required");
   try { mkdirSync(directory, { mode: 0o700 }); }

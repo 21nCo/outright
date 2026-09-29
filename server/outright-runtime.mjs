@@ -132,12 +132,21 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           templates: database.listTemplates(),
           terminals: terminals.list(),
           activeRuns: agents.activeRuns(),
+          capacity: database.capacity(),
         });
       }
       if (url.pathname === "/api/projects" && ["GET", "POST"].includes(request.method)) return json(response, 200, await projects(request.method === "POST"));
       if (url.pathname === "/api/providers" && request.method === "GET") return json(response, 200, { providers: agents.providers() });
       if (url.pathname === "/api/settings" && request.method === "GET") return json(response, 200, database.getSettings());
       if (url.pathname === "/api/settings" && request.method === "PATCH") return json(response, 200, database.updateSettings(await readJson(request)));
+      if (url.pathname === "/api/capacity" && request.method === "GET") return json(response, 200, database.capacity());
+      if (url.pathname === "/api/retention/cleanup" && request.method === "POST") {
+        const body = await readJson(request);
+        const cutoff = body.before ?? new Date(Date.now() - database.getSettings().retentionDays * 86_400_000).toISOString();
+        const result = database.pruneHistory({ before: cutoff, limit: 100 });
+        database.audit("retention.cleaned", { deleted: result.deleted, before: cutoff });
+        return json(response, 200, { deleted: result.deleted, capacity: database.capacity() });
+      }
 
       if (url.pathname === "/api/groups" && request.method === "GET") return json(response, 200, database.listGroups());
       if (url.pathname === "/api/groups" && request.method === "POST") {
@@ -304,9 +313,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         }
         const currentInterrupted = database.findUnresolvedInterruptedRunForWorktree(conversation.worktreePath);
         if (currentInterrupted) throw apiError(409, "Resolve the interrupted run before starting more agent work", { code: "RUN_RECOVERY_REQUIRED", runId: currentInterrupted.id });
-        const userMessage = database.addMessage({ conversationId: conversation.id, role: "user", kind: "text", body: prompt });
+        const { run, message: userMessage } = database.submitRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, provider, model: body.model ?? conversation.model ?? settings.model, reasoningEffort: body.reasoningEffort || settings.reasoningEffort, approvalPolicy: body.approvalPolicy || settings.approvalPolicy, prompt }, prompt);
         publish({ type: "message.created", conversationId: conversation.id, payload: userMessage });
-        const run = database.createRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, provider, model: body.model ?? conversation.model ?? settings.model, reasoningEffort: body.reasoningEffort || settings.reasoningEffort, approvalPolicy: body.approvalPolicy || settings.approvalPolicy, prompt });
         return json(response, 202, await agents.schedule({ conversation: database.getConversation(conversation.id), run }));
       }
       const runMatch = url.pathname.match(/^\/api\/runs\/([^/]+)$/);
