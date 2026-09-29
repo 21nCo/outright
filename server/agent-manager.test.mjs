@@ -371,9 +371,37 @@ test("sustained tool output stops growing the durable run transcript", async () 
     child.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: `command-${index}` } }) + "\n");
   }
   child.emit("close", 0, null);
-  assert.equal(database.messages.length, 2001);
+  assert.equal(database.messages.length, 1999);
   assert.match(database.messages.at(-1).body, /retention budget/);
   assert.equal(database.getRun("budget-run").status, "completed");
+});
+
+test("reserves a final assistant segment after the item cap is reached", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  database.createRun({ ...codexRun("final-budget-run"), provider: "claude" });
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun("final-budget-run") });
+  for (let index = 0; index < 2000; index += 1) {
+    child.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: `tool-${index}` }] } }) + "\n");
+  }
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "Final segment" } } }) + "\n");
+  child.emit("close", 0, null);
+  assert.equal(database.getRun("final-budget-run").status, "completed");
+  assert.ok(database.messages.length <= 2000);
+  assert.ok(database.messages.some((message) => message.body === "Final segment"));
+});
+
+test("aggregate event refusal does not crash a streaming run", async () => {
+  const database = fakeDatabase();
+  database.appendRunEvent = () => null;
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child, checkpointIntervalMs: Date.now() + 60_000 });
+  database.createRun({ ...codexRun("aggregate-stream-run"), provider: "claude" });
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun("aggregate-stream-run") });
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "hello" } } }) + "\n");
+  child.emit("close", 0, null);
+  assert.equal(database.getRun("aggregate-stream-run").status, "completed");
 });
 
 test("many assistant segments share one durable transcript byte budget", async () => {

@@ -142,9 +142,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/capacity" && request.method === "GET") return json(response, 200, database.capacity());
       if (url.pathname === "/api/retention/cleanup" && request.method === "POST") {
         const body = await readJson(request);
-        const cutoff = body.before ?? new Date(Date.now() - database.getSettings().retentionDays * 86_400_000).toISOString();
-        const result = database.pruneHistory({ before: cutoff, limit: 100 });
-        database.audit("retention.cleaned", { deleted: result.deleted, before: cutoff });
+        const result = database.pruneHistory({ before: body.before, limit: 100 });
+        database.audit("retention.cleaned", { deleted: result.deleted, before: body.before ?? "saved retention window" });
         return json(response, 200, { deleted: result.deleted, capacity: database.capacity() });
       }
 
@@ -535,6 +534,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       throw apiError(404, "API route not found");
     } catch (error) {
       if (response.destroyed) return true;
+      if (error?.message?.includes("OUTRIGHT_RETAINED_LIMIT")) return json(response, 507, { error: "Retained history is full; archive old conversations and clean up history" });
       return json(response, error.statusCode ?? 500, { error: error.message || "Internal server error", ...(error.details ?? {}) });
     }
   }

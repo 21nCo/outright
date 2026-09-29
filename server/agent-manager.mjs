@@ -473,6 +473,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     for (const event of events) {
       let checkpointDelta = null;
       if (event.type === "session") {
+        if (typeof event.payload.sessionId !== "string" || Buffer.byteLength(event.payload.sessionId) > 4096) continue;
         state.run.providerSessionId = event.payload.sessionId;
         database.updateRun(state.run.id, { providerSessionId: event.payload.sessionId });
         // A recovered run keeps its immutable provider, while the conversation
@@ -510,7 +511,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         continue;
       }
       const emitted = emit(state.run.id, event.type, emittedPayload);
-      if (event.type === "assistant.delta") state.lastAssistantDeltaSeq = emitted.seq;
+      if (event.type === "assistant.delta" && emitted) state.lastAssistantDeltaSeq = emitted.seq;
     }
   }
 
@@ -522,11 +523,12 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     const status = state.stopped ? "stopped" : successful ? "completed" : "failed";
     const message = error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : "");
     const finishedAt = new Date().toISOString();
-    const transcriptMessage = budgetTranscript(state, pendingAssistantMessage(state));
+    const transcriptMessage = budgetTranscript(state, pendingAssistantMessage(state), { terminal: true });
     // The last transcript checkpoint and terminal run state commit together.
-    // A crash can therefore leave the run recoverable, but never terminal with
-    // its final assistant segment missing.
+    // A crash can leave the run recoverable. At aggregate capacity the final
+    // segment is explicitly omitted while the terminal run state still commits.
     const finished = database.finishRun(state.run.id, { status, finishedAt, exitCode, error: message || null, pid: null }, transcriptMessage);
+    if (transcriptMessage && !finished.message) markTranscriptOmitted(state);
     // A Windows wrapper leaves a completed Job Object proof until this
     // terminal transaction succeeds. Other platforms may leave a record only
     // after a hard kill; both are safe to remove after the durable commit.
@@ -676,7 +678,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       : { runId: state.run.id, item: boundedItem };
     const input = budgetTranscript(state, { id: `${state.run.id}:${state.transcriptSeq}`, conversationId: state.conversation.id, role: "assistant", kind: item.kind, body: item.body, payload });
     if (!input) return;
-    const message = database.addMessage(input);
+    let message;
+    try { message = database.addMessage(input); }
+    catch (error) { if (error.statusCode !== 507) throw error; markTranscriptOmitted(state); return; }
     publish({ type: "message.created", conversationId: state.conversation.id, payload: message });
   }
 
@@ -730,8 +734,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // The capped body plus truncation marker is now durable; discarded deltas
     // beyond the cap must not schedule further rewrites of the same body.
     if (state.assistantTruncated) state.checkpointHalted = true;
-    const stored = database.upsertMessage(message);
-    if (publishEvent) publish({ type: "message.created", conversationId: state.conversation.id, payload: stored });
+    let stored;
+    try { stored = database.upsertMessage(message); }
+    catch (error) { if (error.statusCode !== 507) throw error; markTranscriptOmitted(state); state.checkpointHalted = true; return null; }
+    if (publishEvent && stored) publish({ type: "message.created", conversationId: state.conversation.id, payload: stored });
     return stored;
   }
 
@@ -746,27 +752,30 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // one SQLite commit. The message records the event cursor, so a page load
     // racing publication can discard that already-durable delta exactly once.
     const committed = database.appendRunEventWithMessage(state.run.id, "assistant.delta", payload, message);
-    state.lastAssistantDeltaSeq = committed.event.seq;
-    publish({ type: "run.event", conversationId: state.conversation.id, runId: state.run.id, payload: committed.event });
+    if (!committed.message) { markTranscriptOmitted(state); state.checkpointHalted = true; }
+    if (committed.event) state.lastAssistantDeltaSeq = committed.event.seq;
+    if (committed.event) publish({ type: "run.event", conversationId: state.conversation.id, runId: state.run.id, payload: committed.event });
     return committed.event;
   }
 
   function emit(runId, type, payload) {
     const event = database.appendRunEvent(runId, type, payload);
     const run = database.getRun(runId);
-    publish({ type: "run.event", conversationId: run?.conversationId, runId, payload: event });
+    if (event) publish({ type: "run.event", conversationId: run?.conversationId, runId, payload: event });
     return event;
   }
 
-  function budgetTranscript(state, message) {
+  function budgetTranscript(state, message, { terminal = false } = {}) {
     if (!message) return null;
     const prior = state.transcriptSizes.get(message.id) ?? 0;
-    if (!prior && state.transcriptSizes.size >= MAX_RUN_TRANSCRIPT_ITEMS) {
+    // Leave room for both the omission notice and a final assistant segment.
+    if (!prior && state.transcriptSizes.size >= MAX_RUN_TRANSCRIPT_ITEMS - (terminal ? 0 : 2)) {
       markTranscriptOmitted(state);
       return null;
     }
     const payloadBytes = Buffer.byteLength(JSON.stringify(message.payload ?? null));
-    const allowance = MAX_RUN_TRANSCRIPT_BYTES - 512 - state.transcriptBytes + prior - payloadBytes;
+    const ceiling = MAX_RUN_TRANSCRIPT_BYTES - (terminal ? 512 : 4096);
+    const allowance = ceiling - state.transcriptBytes + prior - payloadBytes;
     if (allowance <= 0) { markTranscriptOmitted(state); return null; }
     const originalBytes = Buffer.byteLength(message.body ?? "");
     const body = originalBytes > allowance ? truncateUtf8(message.body, Math.max(0, allowance - 64)) : message.body;
@@ -774,7 +783,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       ? { ...message, body: `${body}\n[Further output omitted: transcript budget reached]`, payload: { ...message.payload, truncated: true } }
       : message;
     const size = Buffer.byteLength(bounded.body ?? "") + Buffer.byteLength(JSON.stringify(bounded.payload ?? null));
-    if (state.transcriptBytes - prior + size > MAX_RUN_TRANSCRIPT_BYTES - 256) { markTranscriptOmitted(state); return null; }
+    if (state.transcriptBytes - prior + size > ceiling) { markTranscriptOmitted(state); return null; }
     state.transcriptSizes.set(message.id, size);
     state.transcriptBytes += size - prior;
     if (originalBytes > allowance) markTranscriptOmitted(state);
@@ -784,10 +793,12 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   function markTranscriptOmitted(state) {
     if (state.transcriptOmitted) return;
     state.transcriptOmitted = true;
-    const message = database.addMessage({ id: `${state.run.id}:budget`, conversationId: state.conversation.id,
-      role: "assistant", kind: "text", body: "Further run transcript items omitted because the retention budget was reached.",
-      payload: { runId: state.run.id, provider: state.run.provider, truncated: true } });
-    publish({ type: "message.created", conversationId: state.conversation.id, payload: message });
+    try {
+      const message = database.addMessage({ id: `${state.run.id}:budget`, conversationId: state.conversation.id,
+        role: "assistant", kind: "text", body: "Further run transcript items omitted because the retention budget was reached.",
+        payload: { runId: state.run.id, provider: state.run.provider, truncated: true } });
+      publish({ type: "message.created", conversationId: state.conversation.id, payload: message });
+    } catch (error) { if (error.statusCode !== 507) throw error; }
   }
 
   return {

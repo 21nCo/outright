@@ -14,6 +14,13 @@ function runInput(conversationId) {
   return { conversationId, provider: "codex", approvalPolicy: "read-only", prompt: "work" };
 }
 
+function ageArchived(filename, ids) {
+  const admin = new Database(filename);
+  const old = new Date(Date.now() - 100 * 86_400_000).toISOString();
+  for (const id of ids) admin.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?").run(old, id);
+  admin.close();
+}
+
 test("burst admission is bounded and a refused run leaves no user message", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
@@ -45,7 +52,9 @@ test("a full queue cannot consume an interrupted run's retry decision", () => {
 });
 
 test("retention removes only archived history with settled recovery and cascades its events", () => {
-  const database = createOutrightDatabase({ filename: ":memory:" });
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-retention-"));
+  const filename = path.join(directory, "outright.db");
+  const database = createOutrightDatabase({ filename });
   try {
     const visible = chat(database, "visible");
     const queued = chat(database, "queued");
@@ -58,8 +67,8 @@ test("retention removes only archived history with settled recovery and cascades
     database.updateRun(interruptedRun.id, { status: "interrupted" });
     database.updateRun(finishedRun.id, { status: "completed" });
     database.appendRunEvent(finishedRun.id, "done", { value: "retained until cleanup" });
-    const before = new Date(Date.now() + 60_000).toISOString();
-    const first = database.pruneHistory({ before });
+    ageArchived(filename, [queued.id, interrupted.id, finished.id]);
+    const first = database.pruneHistory();
     assert.deepEqual(first.ids, [finished.id]);
     assert.equal(database.getRun(finishedRun.id), undefined);
     assert.ok(database.getConversation(visible.id));
@@ -67,26 +76,84 @@ test("retention removes only archived history with settled recovery and cascades
     assert.ok(database.getRun(interruptedRun.id));
     database.updateRun(queuedRun.id, { status: "stopped" });
     database.resolveInterruptedRun(interruptedRun.id, "discard");
-    assert.equal(database.pruneHistory({ before }).deleted, 2);
-  } finally { database.close(); }
+    assert.equal(database.pruneHistory().deleted, 2);
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("aggregate retained history denies new work until eligible history is cleaned", () => {
-  const database = createOutrightDatabase({ filename: ":memory:" });
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-aggregate-"));
+  const filename = path.join(directory, "outright.db");
+  const database = createOutrightDatabase({ filename });
   try {
     database.updateSettings({ maxRetainedMiB: 64 });
     const old = chat(database, "old");
     const current = chat(database, "current");
-    database.addMessage({ conversationId: old.id, role: "assistant", body: "x".repeat(64 * 1024 * 1024) });
-    assert.ok(database.capacity().retainedBytes >= 64 * 1024 * 1024);
+    const admitted = database.createRun(runInput(current.id));
+    const interrupted = database.createRun(runInput(current.id));
+    database.updateRun(interrupted.id, { status: "interrupted" });
+    const template = database.saveTemplate({ title: "saved", prompt: "original" });
+    database.addMessage({ conversationId: old.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+    assert.throws(() => database.addMessage({ conversationId: old.id, role: "assistant", body: "y".repeat(2 * 1024 * 1024) }), (error) => error.statusCode === 507);
+    assert.ok(database.capacity().retainedBytes < 64 * 1024 * 1024);
+    // Fill the remaining ordinary budget without consuming the recovery reserve.
+    const room = 63 * 1024 * 1024 - database.capacity().retainedBytes - 512;
+    const filler = database.addMessage({ conversationId: old.id, role: "assistant", body: "z".repeat(room) });
+    const remaining = 63 * 1024 * 1024 - database.capacity().retainedBytes;
+    database.upsertMessage({ ...filler, body: `${filler.body}${"z".repeat(remaining - 8)}` });
+    assert.ok(database.capacity().availableForNewWorkBytes < 64);
+    assert.equal(database.capacity().limits.reservedRetainedBytes, 1024 * 1024);
     assert.throws(() => database.submitRun(runInput(current.id), "refused"), (error) => error.statusCode === 507);
+    assert.equal(database.appendRunEvent(admitted.id, "tool.output", { text: "not retained" }), null);
+    assert.throws(() => database.beginInterruptedRunRecovery(interrupted.id, "retry"), (error) => error.statusCode === 507);
+    assert.equal(database.getRun(interrupted.id).recoveryDecision, null);
+    assert.throws(() => database.updateConversation(current.id, { title: "large".repeat(100) }), (error) => error.statusCode === 507);
+    assert.equal(database.getConversation(current.id).title, "current");
+    assert.throws(() => database.saveTemplate({ id: template.id, title: "saved", prompt: "x".repeat(1024) }), (error) => error.statusCode === 507);
+    assert.equal(database.listTemplates()[0].prompt, "original");
     assert.throws(() => database.createGroup("too much"), (error) => error.statusCode === 507);
     assert.throws(() => database.saveTemplate({ title: "too much", prompt: "work" }), (error) => error.statusCode === 507);
     assert.equal(database.messageCount(current.id), 0);
+    const finished = database.finishRun(admitted.id, { status: "completed", finishedAt: new Date().toISOString() },
+      { id: `${admitted.id}:final`, conversationId: current.id, role: "assistant", kind: "text", body: "final".repeat(1024) });
+    assert.equal(finished.run.status, "completed");
+    assert.equal(finished.message, null, "terminal state commits when the aggregate budget omits its last output");
+    assert.ok(database.capacity().retainedBytes <= 64 * 1024 * 1024);
+    const admin = new Database(filename);
+    try {
+      assert.throws(() => admin.prepare("UPDATE conversations SET title = ? WHERE id = ?").run("x".repeat(2 * 1024 * 1024), current.id), /OUTRIGHT_RETAINED_LIMIT/);
+    } finally { admin.close(); }
     database.updateConversation(old.id, { archived: true });
-    database.pruneHistory({ before: new Date(Date.now() + 60_000).toISOString() });
+    ageArchived(filename, [old.id]);
+    database.pruneHistory();
     assert.equal(database.submitRun(runInput(current.id), "accepted").run.status, "queued");
-  } finally { database.close(); }
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("migration preserves recovery transitions for legacy data already over quota", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-legacy-quota-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    database.updateSettings({ maxRetainedMiB: 64 });
+    const old = chat(database, "old");
+    const live = chat(database, "live");
+    const run = database.createRun(runInput(live.id));
+    database.close();
+    const legacy = new Database(filename);
+    legacy.exec("DROP TRIGGER retained_hard_limit");
+    legacy.prepare("INSERT INTO messages (id, conversation_id, role, kind, body, payload, created_at) VALUES (?, ?, 'assistant', 'text', ?, 'null', ?)")
+      .run("legacy-output", old.id, "x".repeat(65 * 1024 * 1024), new Date().toISOString());
+    legacy.prepare("UPDATE conversations SET archived = 1, updated_at = ? WHERE id = ?")
+      .run(new Date(Date.now() - 100 * 86_400_000).toISOString(), old.id);
+    legacy.close();
+    database = createOutrightDatabase({ filename });
+    assert.ok(database.capacity().retainedBytes > 64 * 1024 * 1024);
+    database.updateRun(run.id, { status: "interrupted", recoveryClass: "unknown" });
+    assert.equal(database.getRun(run.id).status, "interrupted");
+    assert.throws(() => database.submitRun(runInput(live.id), "blocked"), (error) => error.statusCode === 507);
+    assert.equal(database.pruneHistory().deleted, 1);
+    assert.equal(database.submitRun(runInput(live.id), "accepted").run.status, "queued");
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("sustained event output retains a byte-bounded replay tail with monotonic cursors", () => {

@@ -67,6 +67,22 @@ function withRuntime(fn, options = {}) {
   };
 }
 
+test("retention HTTP rejects invalid and future cutoffs without deleting fresh archived history", withRuntime(async (runtime) => {
+  const chat = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Fresh archive", provider: "codex" });
+  runtime.database.updateConversation(chat.id, { archived: true });
+  for (const before of ["nonsense", "9999-01-01T00:00:00.000Z", new Date(Date.now() + 60_000).toISOString()]) {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", { before }), response);
+    assert.equal(response.statusCode, 400);
+    assert.ok(runtime.database.getConversation(chat.id));
+  }
+  const normal = responseCapture();
+  await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", {}), normal);
+  assert.equal(normal.statusCode, 200);
+  assert.equal(normal.body.deleted, 0);
+  assert.ok(runtime.database.getConversation(chat.id));
+}));
+
 function seedLegacyUnknownTargetDatabase(filename) {
   const legacy = new Database(filename);
   legacy.exec(`
