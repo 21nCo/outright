@@ -150,12 +150,27 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       setExitNotice(exited ? `${terminal.name} process exited ${exited.exitCode ?? "unknown"}` : "");
       activeIdRef.current = terminal.id;
       displayedCursorRef.current = displayedCursor;
-      if (!exited && !document.hidden) {
-        try { fitRef.current?.fit(); } catch { /* The host may be transitioning. */ }
-        if (xterm) sendRuntime({ type: "terminal.resize", terminalId: terminal.id, cols: xterm.cols, rows: xterm.rows });
-        inputReadyRef.current = true;
-      } else if (!exited) awaitingVisibleFitRef.current = true;
       setActiveId(terminal.id);
+      if (!exited && !document.hidden) {
+        // The selected tab changes the pane layout. Fit only after React has
+        // committed that selection and the browser has laid out its host;
+        // otherwise a fast retry can publish the preceding narrow grid.
+        await new Promise((resolve) => {
+          let frame;
+          const timer = setTimeout(() => { cancelAnimationFrame(frame); resolve(); }, 100);
+          frame = requestAnimationFrame(() => { clearTimeout(timer); resolve(); });
+        });
+        if (token !== reconcileTokenRef.current || exitedIdsRef.current.has(terminal.id)) return;
+        if (document.hidden) { awaitingVisibleFitRef.current = true; return; }
+        try {
+          const dimensions = fitRef.current?.proposeDimensions();
+          if (dimensions) {
+            fitRef.current.fit();
+            sendRuntime({ type: "terminal.resize", terminalId: terminal.id, cols: xterm.cols, rows: xterm.rows });
+            inputReadyRef.current = true;
+          } else awaitingVisibleFitRef.current = true;
+        } catch { awaitingVisibleFitRef.current = true; }
+      } else if (!exited) awaitingVisibleFitRef.current = true;
     } finally {
       if (pendingOutputRef.current === pending) pendingOutputRef.current = null;
     }

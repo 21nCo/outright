@@ -256,6 +256,48 @@ test("oversized archived HTTP deletion defers without blocking live output or ca
   assert.equal(database.canLaunchRun(), true);
 }));
 
+test("oversized archive writer returns retryable HTTP writes while capacity remains readable", (() => {
+  const lockGate = new Int32Array(new SharedArrayBuffer(4));
+  return withRuntime(async (runtime) => {
+    const database = runtime.database;
+    const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Old", provider: "codex" });
+    const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    const legacy = new Database(database.filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
+    legacy.close();
+    database.updateConversation(archived.id, { archived: true });
+    const deletionResponse = responseCapture();
+    const deletion = runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived",
+      { id: archived.id, confirmation: archived.id }), deletionResponse);
+    try {
+      const deadline = Date.now() + 5000;
+      while (Atomics.load(lockGate, 0) !== 1) {
+        assert.ok(Date.now() < deadline, "archive writer did not acquire its lock");
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      const began = performance.now();
+      const capacity = responseCapture();
+      await runtime.handleRequest(requestStream("GET", "/api/capacity"), capacity);
+      assert.equal(capacity.statusCode, 200);
+      assert.equal(capacity.body.cleanupPending, true);
+      const denied = responseCapture();
+      await runtime.handleRequest(requestStream("POST", "/api/groups", { name: "Retry after cleanup" }), denied);
+      assert.equal(denied.statusCode, 503);
+      assert.match(denied.body.error, /retry shortly/);
+      assert.ok(performance.now() - began < 250, "HTTP waited on the archive writer lock");
+    } finally {
+      Atomics.store(lockGate, 0, 2);
+      Atomics.notify(lockGate, 0);
+    }
+    await deletion;
+    assert.equal(deletionResponse.statusCode, 200);
+    const retry = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/groups", { name: "Retry after cleanup" }), retry);
+    assert.equal(retry.statusCode, 201);
+    assert.equal(database.getConversation(archived.id), undefined);
+  }, { deletionWorkerGate: lockGate.buffer });
+})());
+
 test("archived HTTP cursor reaches an older selection and rejects malformed pages", withRuntime(async (runtime) => {
   const database = runtime.database;
   const firstCreated = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "First", provider: "codex" });

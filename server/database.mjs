@@ -87,11 +87,13 @@ export function createOutrightDatabase(options = {}) {
   const deletionsInFlight = new Set();
   const deletionWorkers = new Set();
   const releaseLeaseIfIdle = () => {
+    if (!closing && !deletionWorkers.size) db.pragma("busy_timeout = 5000");
     if (closing && !deletionWorkers.size && leaseDb) { leaseDb.close(); leaseDb = undefined; }
     else if (!closing) options.onDeletionWorkerExit?.();
   };
   const deletionContext = { isClosing: () => closing, filename: storageFilename,
-    workers: deletionWorkers, onWorkerExit: releaseLeaseIfIdle };
+    workers: deletionWorkers, lockGate: options.deletionWorkerGate,
+    onWorkerStart: () => db.pragma("busy_timeout = 0"), onWorkerExit: releaseLeaseIfIdle };
   try {
     // Hold the process lease on a companion SQLite file. The data database
     // stays in WAL mode so an oversized archive row can be deleted on a
@@ -1172,7 +1174,12 @@ export function createOutrightDatabase(options = {}) {
           reserveRecoveryHeadroom(db);
         }).immediate();
         else withinRetainedBudget(writeAudit);
-      } catch (error) { if (error.statusCode !== 507) throw error; }
+      } catch (error) {
+        // Audit telemetry must not turn a terminal exit or completed Git
+        // operation into an uncaught callback error while archive cleanup
+        // holds the writer. The deletion audit itself runs after that worker.
+        if (error.statusCode !== 507 && !(deletionWorkers.size && ["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code))) throw error;
+      }
     },
     listAudit(limit = 100) {
       const bounded = Math.max(1, Math.min(500, Number(limit) || 100));
@@ -1220,7 +1227,7 @@ function runPatchAssignments(patch) {
 // to HTTP, sockets, and active agents. A larger legacy row is deleted on a
 // separate SQLite worker connection. The marker survives a crash and is
 // resumed on the next open.
-function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosing, filename, workers, onWorkerExit }) {
+function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosing, filename, workers, lockGate, onWorkerStart, onWorkerExit }) {
   if (inFlight.has(id)) throw databaseError(409, "Archived conversation deletion is in progress");
   inFlight.add(id);
   const run = async () => {
@@ -1237,7 +1244,7 @@ function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosin
           if (workers.size || db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
             return { deleted: 0, deferred: true, id };
           }
-          try { await deleteOversizedArchivedRow(filename, id, step.oversized, workers, onWorkerExit); }
+          try { await deleteOversizedArchivedRow(filename, id, step.oversized, workers, lockGate, onWorkerStart, onWorkerExit); }
           catch (error) {
             if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
             throw error;
@@ -1298,10 +1305,18 @@ function deleteArchivedBatch(db, id, filename) {
   return { done: true };
 }
 
-function deleteOversizedArchivedRow(filename, conversationId, oversized, workers, onWorkerExit) {
+function deleteOversizedArchivedRow(filename, conversationId, oversized, workers, lockGate, onWorkerStart, onWorkerExit) {
   return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL("./archive-delete-worker.mjs", import.meta.url),
-      { workerData: { filename, conversationId, ...oversized } });
+    // Once the worker can own SQLite's sole writer lock, synchronous runtime
+    // writes must fail promptly rather than sleep on the event-loop thread.
+    // The HTTP boundary reports a retryable 503; active runs were excluded
+    // before this point and queued launches remain paused until worker exit.
+    let worker;
+    try {
+      onWorkerStart();
+      worker = new Worker(new URL("./archive-delete-worker.mjs", import.meta.url),
+        { workerData: { filename, conversationId, ...oversized, lockGate } });
+    } catch (error) { onWorkerExit(); reject(error); return; }
     workers.add(worker);
     let reply;
     let failure;

@@ -1395,6 +1395,20 @@ async function terminalRejectedSwitchRegression() {
   const retrySize = sent.findLast((message) => message.type === "terminal.resize");
   assert(retrySize?.terminalId === "term-A2" && retrySize.cols > narrowSize.cols,
     `Retried terminal did not fit the current pane: narrow=${JSON.stringify(narrowSize)}, retry=${JSON.stringify(retrySize)}`);
+  for (const width of [320, 540, 320, 540]) {
+    host.style.width = `${width}px`;
+    await until(() => Math.abs(host.querySelector('.terminal-host')?.getBoundingClientRect().width - width) < 2,
+      `terminal host width ${width}`);
+    host.querySelector('[data-tab-id="term-A"]').click();
+    await until(() => terminalReady("Terminal A"), `terminal A at ${width}`);
+    const before = sent.length;
+    host.querySelector('[data-tab-id="term-A2"]').click();
+    await until(() => terminalReady("Terminal A2") && sent.slice(before).some((message) => message.type === "terminal.resize" && message.terminalId === "term-A2"),
+      `terminal A2 fitted at ${width}`);
+    const fitted = sent.findLast((message) => message.type === "terminal.resize" && message.terminalId === "term-A2");
+    assert(width === 540 ? fitted.cols > narrowSize.cols : fitted.cols <= narrowSize.cols,
+      `Terminal published a stale grid after ${width}px layout: ${JSON.stringify(fitted)}`);
+  }
   host.style.width = "";
 }
 

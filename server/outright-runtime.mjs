@@ -12,10 +12,10 @@ import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000 }) {
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate } = {}) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
-  const database = createOutrightDatabase({ runtimeLease: true, onMigrationComplete: () => {
+  const database = createOutrightDatabase({ runtimeLease: true, deletionWorkerGate, onMigrationComplete: () => {
     agents.resumeQueued();
     publish({ type: "capacity.changed", payload: database.capacity() });
   }, onDeletionWorkerExit: () => {
@@ -591,6 +591,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       throw apiError(404, "API route not found");
     } catch (error) {
       if (response.destroyed) return true;
+      if (["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error?.code)) {
+        return json(response, 503, { error: "Storage cleanup is writing; retry shortly" });
+      }
       if (error?.message?.includes("OUTRIGHT_RETAINED_LIMIT")) return json(response, 507, { error: "Retained history is full; archive conversations, then delete selected archived chats or clean up older history" });
       return json(response, error.statusCode ?? 500, { error: error.message || "Internal server error", ...(error.details ?? {}) });
     }

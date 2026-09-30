@@ -885,6 +885,48 @@ test("oversized legacy archive cleanup defers while active runs write, then resu
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("oversized cleanup keeps the runtime reader responsive and fails competing writes promptly", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-writer-"));
+  const filename = path.join(directory, "outright.db");
+  const lockGate = new Int32Array(new SharedArrayBuffer(4));
+  const database = createOutrightDatabase({ filename, runtimeLease: true, deletionWorkerGate: lockGate.buffer });
+  try {
+    for (const mode of ["explicit", "automatic"]) {
+      Atomics.store(lockGate, 0, 0);
+      const archived = chat(database, mode);
+      const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+      const legacy = new Database(filename);
+      legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
+      legacy.close();
+      database.updateConversation(archived.id, { archived: true });
+      if (mode === "automatic") ageArchived(filename, [archived.id]);
+      const deletion = mode === "explicit" ? database.deleteArchivedConversation(archived.id, archived.id) : database.pruneHistory();
+      const deadline = Date.now() + 5000;
+      while (Atomics.load(lockGate, 0) !== 1) {
+        assert.ok(Date.now() < deadline, "cleanup did not acquire the oversized writer lock");
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      const began = performance.now();
+      assert.equal(database.capacity().cleanupPending, true);
+      assert.throws(() => chat(database, `competing ${mode}`),
+        (error) => error.code === "SQLITE_BUSY");
+      assert.doesNotThrow(() => database.audit("terminal.exited", { target: mode }),
+        "optional terminal audit must not crash its event callback");
+      assert.ok(performance.now() - began < 250, "a competing write slept behind the cleanup writer lock");
+      Atomics.store(lockGate, 0, 2);
+      Atomics.notify(lockGate, 0);
+      assert.equal((await deletion).deleted, 1);
+      assert.equal(database.getConversation(archived.id), undefined);
+      assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id));
+    }
+  } finally {
+    Atomics.store(lockGate, 0, 2);
+    Atomics.notify(lockGate, 0);
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("closing during an oversized archive delete keeps its lease until the worker exits and resumes cleanup", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-oversized-restart-"));
   const filename = path.join(directory, "outright.db");
