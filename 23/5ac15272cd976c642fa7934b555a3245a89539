@@ -1,0 +1,24 @@
+server/archive-delete-worker.mjs
+  h_a39f9495f9ec1d 1-33
+server/database.mjs
+  h_a39f9495f9ec1d 2,6,78-79,87-90,92-95,97-102,111,147,185,187,275,298,400-402,408-412,1183-1184,1186-1187,1204-1212,1220,1235-1237,1255-1272,1349-1350,1353-1369
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 805-808,828-947
+src/App.jsx
+  h_a39f9495f9ec1d 831-834,837,860,862,867,878,1724
+src/components/SettingsDialog.jsx
+  h_a39f9495f9ec1d 28,31,92-102
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 292,342-344,351-352,4006-4014
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "235ac15272cd976c642fa7934b555a3245a89539",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
