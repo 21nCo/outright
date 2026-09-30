@@ -831,6 +831,7 @@ export function App() {
     const intent = sidebarFocusIntentRef.current;
     if (!intent || (intent === "opener" && sidebarOpen) || (intent === "sidebar" && !sidebarOpen)) return;
     let cancelRetry = () => {};
+    let active = true;
     let attempts = 0;
     const maxAttempts = 30;
     let watchChecks = 0;
@@ -889,16 +890,27 @@ export function App() {
     // Some browser viewports omit focusout, so the bounded watch also checks
     // ownership after delayed layout tasks.
     const restoreAfterBlur = (event) => {
-      const ownedControl = intent === "opener" ? event.target.matches?.('[aria-label="Open projects sidebar"]')
-        : sidebarRef.current?.contains(event.target);
+      const ownedControl = event.target === sidebarFocusSourceRef.current || (intent === "opener"
+        ? event.target.matches?.('[aria-label="Open projects sidebar"]')
+        : sidebarRef.current?.contains(event.target));
       if (!ownedControl || sidebarFocusIntentRef.current !== intent) return;
       queueMicrotask(() => {
         if (sidebarFocusIntentRef.current === intent && document.activeElement === document.body) transfer();
       });
+      // Some engines dispatch focusout while the old control is still active
+      // and clear activeElement only after this microtask. A committed layout
+      // task gets another chance without overriding a newer focus owner.
+      window.setTimeout(() => {
+        if (active && sidebarFocusIntentRef.current === intent && document.activeElement === document.body) transfer();
+      }, 0);
     };
     document.addEventListener("focusout", restoreAfterBlur, true);
+    const observer = new ResizeObserver(() => {
+      if (active && sidebarFocusIntentRef.current === intent && document.activeElement === document.body) transfer();
+    });
+    if (sidebarRef.current) observer.observe(sidebarRef.current);
     transfer();
-    return () => { cancelRetry(); document.removeEventListener("focusout", restoreAfterBlur, true); };
+    return () => { active = false; cancelRetry(); observer.disconnect(); document.removeEventListener("focusout", restoreAfterBlur, true); };
   }, [isNarrow, sidebarOpen]);
   useLayoutEffect(() => {
     if (!inspector) return;

@@ -270,6 +270,26 @@ async function waitForJson(url, child, logs, diagnostic, deadline = Date.now() +
   throw new Error(`Timed out waiting for ${url}: ${diagnostic()}; output: ${logs()}`);
 }
 
+async function waitForDevToolsPort(profile, child, logs, diagnostic, deadline) {
+  const marker = path.join(profile, "DevToolsActivePort");
+  let lastMarker = "missing";
+  while (Date.now() < deadline) {
+    if (hasExited(child)) throw new Error(`Chrome exited before DevTools selected a port: ${diagnostic()}; output: ${logs()}`);
+    if (existsSync(marker)) {
+      try {
+        lastMarker = readFileSync(marker, "utf8").split(/\r?\n/, 1)[0];
+        const port = Number(lastMarker);
+        if (Number.isInteger(port) && port > 0 && port <= 65535) return port;
+      } catch (error) {
+        if (!["EPERM", "EACCES", "ENOENT"].includes(error?.code)) throw error;
+        lastMarker = error.code;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Timed out waiting for Chrome's DevTools port (marker=${lastMarker}): ${diagnostic()}; output: ${logs()}`);
+}
+
 function connectDevTools(url, handshakeTimeout = 10_000) {
   return new Promise((resolve, reject) => {
     // A responsive DevTools HTTP endpoint does not guarantee its WebSocket
@@ -682,7 +702,6 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     return duration;
   };
   const port = await unusedPort();
-  const debugPort = await unusedPort();
   const profile = process.env.OUTRIGHT_TEST_UI_PROFILE ?? mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
   const vite = spawn(process.execPath, [viteCli, "--config", "tests/vite.ui-races.config.mjs", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
     cwd: root,
@@ -716,7 +735,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       "--disable-gpu",
       "--no-default-browser-check",
       "--no-first-run",
-      `--remote-debugging-port=${debugPort}`,
+      "--remote-debugging-port=0",
       `--user-data-dir=${profile}`,
       "about:blank",
     ], {
@@ -746,7 +765,11 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       if (!browser.ownedWindows?.has(browser.pid)) throw new Error(`Cannot capture Chrome launch identity: ${diagnostic()}; output: ${logs()}`);
     }
     phase = "wait for Chrome DevTools HTTP";
-    await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, logs, diagnostic, Math.min(Date.now() + 45_000, deadline));
+    // A port released by unusedPort() can be claimed by another process before
+    // Chrome binds it, especially in the nested Windows cleanup fixture.
+    const devToolsDeadline = Math.min(Date.now() + 45_000, deadline);
+    const debugPort = await waitForDevToolsPort(profile, browser, logs, diagnostic, devToolsDeadline);
+    await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, logs, diagnostic, devToolsDeadline);
     snapshotWindowsTree(browser);
     phase = "create DevTools target";
     const targetResponse = await fetch(`http://127.0.0.1:${debugPort}/json/new?${encodeURIComponent("about:blank")}`, { method: "PUT", signal: AbortSignal.timeout(Math.min(10_000, remaining())) });
