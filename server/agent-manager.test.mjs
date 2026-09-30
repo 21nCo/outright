@@ -419,6 +419,52 @@ test("aggregate event refusal does not crash a streaming run", async () => {
   assert.equal(database.getRun("aggregate-stream-run").status, "completed");
 });
 
+for (const provider of ["codex", "claude"]) {
+  test(`${provider} quota-refused usage cannot interrupt provider output or terminal state`, async () => {
+    const database = fakeDatabase();
+    const originalUpdate = database.updateRun.bind(database);
+    let refused = 0;
+    database.updateRun = (id, patch) => {
+      if (patch.inputTokens !== undefined || patch.costUsd !== undefined) {
+        refused += 1;
+        throw Object.assign(new Error("retained quota"), { statusCode: 507 });
+      }
+      return originalUpdate(id, patch);
+    };
+    const child = fakeChild();
+    const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+    const run = database.createRun({ ...codexRun(`usage-${provider}`), provider });
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+    const usage = provider === "codex"
+      ? { type: "turn.completed", usage: { input_tokens: 12, output_tokens: 7 } }
+      : { type: "result", usage: { input_tokens: 12, output_tokens: 7 }, total_cost_usd: 0.02 };
+    assert.doesNotThrow(() => child.stdout.write(`${JSON.stringify(usage)}\n`));
+    child.stdout.write(`${JSON.stringify(provider === "codex"
+      ? { type: "item.completed", item: { type: "agent_message", text: "after usage" } }
+      : { type: "stream_event", event: { delta: { type: "text_delta", text: "after usage" } } })}\n`);
+    child.emit("close", 0, null);
+    assert.equal(refused, 1);
+    assert.equal(database.getRun(run.id).status, "completed");
+    assert.ok(database.messages.some((message) => message.body.includes("after usage")));
+  });
+}
+
+test("unexpected usage persistence errors remain visible to the provider stream owner", async () => {
+  const database = fakeDatabase();
+  const originalUpdate = database.updateRun.bind(database);
+  database.updateRun = (id, patch) => {
+    if (patch.inputTokens !== undefined) throw Object.assign(new Error("usage I/O failed"), { statusCode: 500 });
+    return originalUpdate(id, patch);
+  };
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  const run = database.createRun(codexRun("usage-io-error"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  assert.throws(() => child.stdout.write(`${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } })}\n`),
+    /usage I\/O failed/);
+  child.emit("close", 0, null);
+});
+
 test("quota-refused stdout, tool and assistant checkpoints leave run-level omission evidence", async () => {
   for (const scenario of ["stdout", "tool", "tool-cancel", "assistant-message", "assistant-delta"]) {
     const database = fakeDatabase();

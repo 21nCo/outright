@@ -353,7 +353,7 @@ async function archivedSettingsPagingFocusRegression() {
   const settings = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
     editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
   const entries = Array.from({ length: 101 }, (_, index) => ({ id: `archive-${index}`, title: index === 1 ? "Archived 0" : `Archived ${index}`,
-    worktreePath: "/tmp/worktree", updatedAt: new Date(Date.now() - index * 1000).toISOString() }));
+    worktreePath: "/worktree", updatedAt: new Date(Date.now() - index * 1000).toISOString() }));
   let deleted = false;
   route = async (url, options) => {
     if (url.pathname === "/api/capacity") return response({});
@@ -407,6 +407,75 @@ async function archivedSettingsPagingFocusRegression() {
   const cleanup = [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Clean old archived history");
   await until(() => document.activeElement === cleanup, "focus restored after deleting the originating row");
   assert(document.querySelector('[role="dialog"]'), "Settings closed after deletion");
+}
+
+async function archivedSettingsSessionFenceRegression() {
+  root.render(null);
+  await settle();
+  const settings = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
+    editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
+  const entries = ["Old", "Current"].map((title) => ({ id: title.toLowerCase(), title,
+    worktreePath: "/worktree", updatedAt: "2026-09-01T00:00:00.000Z" }));
+  const cleanup = deferred();
+  const deletion = deferred();
+  const reportError = (error) => { throw error; };
+  let cleanupStarted = false;
+  let deletionStarted = false;
+  let historyRefreshes = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/capacity") return response({});
+    if (url.pathname === "/api/retention/archived") return response({ conversations: entries, nextCursor: null });
+    if (url.pathname === "/api/retention/cleanup") { cleanupStarted = true; return cleanup.promise; }
+    if (url.pathname === "/api/retention/delete-archived") { deletionStarted = true; return deletion.promise; }
+    return response({});
+  };
+  function Fixture() {
+    const [open, setOpen] = React.useState(false);
+    return <><button onClick={() => setOpen(true)}>Open archive session fixture</button><SettingsDialog open={open}
+      onOpenChange={setOpen} settings={settings} providers={[{ id: "codex", label: "Codex", available: true }]}
+      templates={[]} onSaved={(_, reason) => { if (reason === "history") historyRefreshes += 1; }}
+      onError={reportError} /></>;
+  }
+  root.render(<TooltipProvider><Fixture /></TooltipProvider>);
+  const open = () => host.querySelector("button").click();
+  const close = () => [...document.querySelectorAll('[role="dialog"] button')].filter((button) => button.textContent.trim() === "Cancel").at(-1).click();
+  const choose = (id) => document.querySelector(`.archived-history-list button[aria-label*="(${id})"]`).click();
+  await until(() => host.querySelector("button")?.textContent === "Open archive session fixture", "archive session fixture mounted");
+  open();
+  await until(() => document.querySelectorAll(".archived-history-list button").length === 2, "archive session first page");
+  [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Clean old archived history").click();
+  await until(() => cleanupStarted, "held cleanup started");
+  close();
+  await until(() => !document.querySelector('[role="dialog"]'), "closed during cleanup");
+  open();
+  await until(() => document.querySelectorAll(".archived-history-list button").length === 2, "reopened during cleanup");
+  choose("current");
+  await until(() => document.querySelector(".archive-delete-confirm")?.textContent.includes("Current"), "new selection during cleanup");
+  cleanup.resolve(response({ deleted: 1, capacity: { retainedBytes: 1 } }));
+  await until(() => historyRefreshes === 1, "stale cleanup refreshed app history");
+  assert(document.querySelector(".archive-delete-confirm")?.textContent.includes("Current"), "stale cleanup replaced the new selection");
+  assert(!document.querySelector(".capacity-status")?.textContent.includes("Deleted"), "stale cleanup changed the new status");
+
+  close();
+  await until(() => !document.querySelector('[role="dialog"]'), "closed before deletion");
+  open();
+  await until(() => document.querySelectorAll(".archived-history-list button").length === 2, "reopened for deletion");
+  choose("old");
+  await until(() => document.querySelector(".archive-delete-confirm")?.textContent.includes("Old"), "old selection confirmed");
+  document.querySelectorAll(".archive-delete-confirm button")[1].click();
+  await until(() => deletionStarted, "held deletion started");
+  close();
+  await until(() => !document.querySelector('[role="dialog"]'), "closed during deletion");
+  open();
+  await until(() => document.querySelectorAll(".archived-history-list button").length === 2, "reopened during deletion");
+  choose("current");
+  await until(() => document.querySelector(".archive-delete-confirm")?.textContent.includes("Current"), "new selection during deletion");
+  const focused = document.activeElement;
+  deletion.resolve(response({ deleted: 1, capacity: { retainedBytes: 2 } }));
+  await until(() => historyRefreshes === 2, "stale deletion refreshed app history");
+  assert(document.querySelector(".archive-delete-confirm")?.textContent.includes("Current"), "stale deletion cleared the new selection");
+  assert(document.activeElement === focused, "stale deletion moved focus in the reopened Settings dialog");
+  assert(!document.querySelector(".capacity-status")?.textContent.includes("Deleted"), "stale deletion changed the new status");
 }
 
 async function archivedChatOwnershipRegression() {
@@ -4219,6 +4288,7 @@ try {
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
     ["settings retention draft", settingsRetentionDraftRegression, "missing archived data stays safe and cancel, cleanup and save use the persisted retention age"],
     ["archived settings paging focus", archivedSettingsPagingFocusRegression, "the oldest archive can be paged to and cancel and delete keep keyboard focus in Settings"],
+    ["archived settings session fence", archivedSettingsSessionFenceRegression, "delayed cleanup and deletion cannot change a reopened Settings selection, status or focus"],
     ["archived chat ownership", archivedChatOwnershipRegression, "an archived chat cannot keep a pane or accept runs during held or failed refresh"],
     ["same-owner archive refresh", sameOwnerArchiveRefreshRegression, "a held archive cannot overwrite a newer same-worktree list after refresh failure"],
     ["chat detail refresh ownership", chatDetailRefreshOwnershipRegression, "failed and pending same-chat detail blocks submission and trust until fresh detail loads"],

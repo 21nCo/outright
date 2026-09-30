@@ -504,6 +504,7 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
 .archive-delete-confirm { margin-top: 9px; padding: 10px; border: 1px solid var(--destructive); border-radius: 6px; font-size: 11px; }
 .archive-delete-confirm p { margin: 0 0 8px; }
 .archive-delete-confirm > div { display: flex; flex-wrap: wrap; gap: 8px; }
+.capacity-status { display: block; }
 .template-list { margin: 9px 0; display: grid; gap: 4px; }
 .template-list > div { min-height: 38px; padding: 4px 5px 4px 9px; display: flex; align-items: center; border: 1px solid var(--line-soft); border-radius: 6px; }
 .template-list > div > span { min-width: 0; display: flex; flex: 1; flex-direction: column; }

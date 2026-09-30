@@ -219,7 +219,7 @@ export function createOutrightDatabase(options = {}) {
     pruneHistory({ before, limit = 100 } = {}) {
       const maximum = Date.now() - this.getSettings().retentionDays * 86_400_000;
       const requested = before ?? new Date(maximum).toISOString();
-      const cutoffTime = typeof requested === "string" ? Date.parse(requested) : NaN;
+      const cutoffTime = typeof requested === "string" ? Date.parse(requested) : Number.NaN;
       if (!Number.isFinite(cutoffTime) || cutoffTime > maximum) {
         throw databaseError(400, "Retention cutoff must be a valid date within the saved retention window");
       }
@@ -228,7 +228,7 @@ export function createOutrightDatabase(options = {}) {
       const cutoff = new Date(cutoffTime).toISOString();
       if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw databaseError(400, "Retention limit must be 1 to 1000");
       const prune = db.transaction(() => {
-        const ids = db.prepare(`SELECT id FROM conversations WHERE archived = 1 AND updated_at < ?
+        const ids = db.prepare(`SELECT id FROM conversations WHERE archived = 1 AND pinned = 0 AND updated_at < ?
           AND NOT EXISTS (SELECT 1 FROM runs WHERE conversation_id = conversations.id
             AND (status IN ('queued', 'launching', 'running') OR (status = 'interrupted' AND recovery_decision IS NULL)))
           ORDER BY updated_at, id LIMIT ?`).all(cutoff, limit).map((row) => row.id);
@@ -947,28 +947,21 @@ export function createOutrightDatabase(options = {}) {
       return recover.immediate();
     },
     updateRun(id, patch) {
-      const criticalFields = [];
-      const criticalValues = [];
-      const optionalFields = [];
-      const optionalValues = [];
-      if (patch.providerSessionId != null && (typeof patch.providerSessionId !== "string" || Buffer.byteLength(patch.providerSessionId) > 4096)) {
-        throw databaseError(400, "Provider session id is invalid");
-      }
-      for (const [key, column] of Object.entries({ status: "status", pid: "pid", providerSessionId: "provider_session_id", startedAt: "started_at", finishedAt: "finished_at", exitCode: "exit_code", error: "error", costUsd: "cost_usd", inputTokens: "input_tokens", outputTokens: "output_tokens", recoveryClass: "recovery_class", recoveryDecision: "recovery_decision", transcriptOmitted: "transcript_omitted" })) {
-        if (patch[key] === undefined) continue;
-        const optional = ["costUsd", "inputTokens", "outputTokens"].includes(key);
-        (optional ? optionalFields : criticalFields).push(key === "transcriptOmitted" ? `${column} = MAX(${column}, ?)` : `${column} = ?`);
-        (optional ? optionalValues : criticalValues).push(key === "transcriptOmitted" ? Number(Boolean(patch[key])) : patch[key]);
-      }
+      const { criticalFields, criticalValues, optionalFields, optionalValues } = runPatchAssignments(patch);
       const criticalUpdate = () => { if (criticalFields.length) db.prepare(`UPDATE runs SET ${criticalFields.join(", ")} WHERE id = ?`).run(...criticalValues, id); };
       const optionalUpdate = () => { if (optionalFields.length) withinRetainedBudget(() => db.prepare(`UPDATE runs SET ${optionalFields.join(", ")} WHERE id = ?`).run(...optionalValues, id)); };
       // A mixed update commits its state even if optional usage telemetry is
-      // refused. Usage alone still reports the quota error to its caller.
-      if (criticalFields.length && optionalFields.length) db.transaction(() => {
+      // refused. Usage alone reports the quota error to its caller.
+      if (criticalFields.length && optionalFields.length) {
+        db.transaction(() => {
+          criticalUpdate();
+          try { optionalUpdate(); }
+          catch (error) { if (error.statusCode !== 507) throw error; }
+        }).immediate();
+      } else {
         criticalUpdate();
-        try { optionalUpdate(); } catch (error) { if (error.statusCode !== 507) throw error; }
-      }).immediate();
-      else { criticalUpdate(); optionalUpdate(); }
+        optionalUpdate();
+      }
       return this.getRun(id);
     },
     finishRun(id, patch, transcriptMessage = null) {
@@ -1008,7 +1001,10 @@ export function createOutrightDatabase(options = {}) {
         return { id: Number(result.lastInsertRowid), runId, seq, type, payload: parseJson(serialized, null), createdAt };
       });
       try { return withinRetainedBudget(() => commit.immediate()); }
-      catch (error) { if (error.statusCode !== 507) throw error; return null; }
+      catch (error) {
+        if (error.statusCode !== 507) { throw error; }
+        return null;
+      }
     },
     appendRunEventWithMessage(runId, type, payload, transcriptMessage) {
       const commit = db.transaction(() => {
@@ -1068,6 +1064,23 @@ export function createOutrightDatabase(options = {}) {
       return { conversations, messages };
     },
   };
+}
+
+function runPatchAssignments(patch) {
+  if (patch.providerSessionId != null && (typeof patch.providerSessionId !== "string" || Buffer.byteLength(patch.providerSessionId) > 4096)) {
+    throw databaseError(400, "Provider session id is invalid");
+  }
+  const criticalFields = [];
+  const criticalValues = [];
+  const optionalFields = [];
+  const optionalValues = [];
+  for (const [key, column] of Object.entries({ status: "status", pid: "pid", providerSessionId: "provider_session_id", startedAt: "started_at", finishedAt: "finished_at", exitCode: "exit_code", error: "error", costUsd: "cost_usd", inputTokens: "input_tokens", outputTokens: "output_tokens", recoveryClass: "recovery_class", recoveryDecision: "recovery_decision", transcriptOmitted: "transcript_omitted" })) {
+    if (patch[key] === undefined) continue;
+    const optional = ["costUsd", "inputTokens", "outputTokens"].includes(key);
+    (optional ? optionalFields : criticalFields).push(key === "transcriptOmitted" ? `${column} = MAX(${column}, ?)` : `${column} = ?`);
+    (optional ? optionalValues : criticalValues).push(key === "transcriptOmitted" ? Number(Boolean(patch[key])) : patch[key]);
+  }
+  return { criticalFields, criticalValues, optionalFields, optionalValues };
 }
 
 function migrate(db) {
@@ -1161,11 +1174,15 @@ function migrate(db) {
   if (!db.pragma("table_info(retained_usage)").some((column) => column.name === "legacy_ceiling")) {
     db.exec("ALTER TABLE retained_usage ADD COLUMN legacy_ceiling INTEGER NOT NULL DEFAULT 0");
   }
-  db.exec("INSERT OR IGNORE INTO retained_usage (id, bytes) VALUES (1, 0)");
+  const counterCreated = db.prepare("INSERT OR IGNORE INTO retained_usage (id, bytes) VALUES (1, 0)").run().changes > 0;
+  // Version 2 records the retained column set and trigger formula. Existing
+  // counters from older versions need one reconciliation after schema changes;
+  // subsequent opens trust transactionally maintained usage.
+  const needsRetainedMeasure = counterCreated || db.pragma("user_version", { simple: true }) < 2;
   // Existing triggers were compiled against the older runs column set.
   db.exec("DROP TRIGGER IF EXISTS retained_runs_insert; DROP TRIGGER IF EXISTS retained_runs_update; DROP TRIGGER IF EXISTS retained_runs_delete");
   for (const [table, fields] of RETAINED_COLUMNS) {
-    const size = (alias) => `128 + ${fields.split(", ").map((field) => `COALESCE(LENGTH(CAST(${alias}.${field} AS BLOB)), 0)`).join(" + ")}`;
+    const size = (alias) => retainedSizeExpression(fields, `${alias}.`);
     db.exec(`CREATE TRIGGER IF NOT EXISTS retained_${table}_insert AFTER INSERT ON ${table}
       BEGIN UPDATE retained_usage SET bytes = bytes + (${size("NEW")}) WHERE id = 1; END`);
     db.exec(`CREATE TRIGGER IF NOT EXISTS retained_${table}_update AFTER UPDATE ON ${table}
@@ -1177,14 +1194,13 @@ function migrate(db) {
   // headroom scales with the existing unsettled rows; optional writes still
   // use the ordinary configured limit and cleanup clears this allowance.
   db.exec("DROP TRIGGER IF EXISTS retained_hard_limit");
-  const measured = calculateRetainedBytes(db);
   const configured = Number(db.prepare("SELECT value FROM settings WHERE key = 'maxRetainedMiB'").get()?.value ?? DEFAULT_SETTINGS.maxRetainedMiB) * 1024 * 1024;
-  db.prepare("UPDATE retained_usage SET bytes = ? WHERE id = 1").run(measured);
+  if (needsRetainedMeasure) db.prepare("UPDATE retained_usage SET bytes = ? WHERE id = 1").run(calculateRetainedBytes(db));
   reserveRecoveryHeadroom(db, configured);
   db.exec(`CREATE TRIGGER retained_hard_limit BEFORE UPDATE ON retained_usage
     WHEN NEW.bytes > MAX(COALESCE((SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'maxRetainedMiB'), ${DEFAULT_SETTINGS.maxRetainedMiB}) * 1048576, OLD.legacy_ceiling)
     BEGIN SELECT RAISE(ABORT, 'OUTRIGHT_RETAINED_LIMIT'); END`);
-  if (needsLegacyEventMigration) db.pragma("user_version = 1");
+  if (needsRetainedMeasure) db.pragma("user_version = 2");
 }
 
 function reserveRecoveryHeadroom(db, configured = Number(db.prepare("SELECT value FROM settings WHERE key = 'maxRetainedMiB'").get()?.value ?? DEFAULT_SETTINGS.maxRetainedMiB) * 1024 * 1024) {
@@ -1240,7 +1256,10 @@ function retainedBytes(db) {
   return db.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes;
 }
 function calculateRetainedBytes(db) {
-  return RETAINED_COLUMNS.reduce((total, [table, fields]) => total + db.prepare(`SELECT COALESCE(SUM(128 + ${fields.split(", ").map((field) => `COALESCE(LENGTH(CAST(${field} AS BLOB)), 0)`).join(" + ")}), 0) AS bytes FROM ${table}`).get().bytes, 0);
+  return RETAINED_COLUMNS.reduce((total, [table, fields]) => total + db.prepare(`SELECT COALESCE(SUM(${retainedSizeExpression(fields)}), 0) AS bytes FROM ${table}`).get().bytes, 0);
+}
+function retainedSizeExpression(fields, prefix = "") {
+  return `128 + ${fields.split(", ").map((field) => "COALESCE(LENGTH(CAST(" + prefix + field + " AS BLOB)), 0)").join(" + ")}`;
 }
 function preparePrivateLaunchDirectory(directory) {
   if (!directory || !path.isAbsolute(directory)) throw new Error("A private absolute launch directory is required");

@@ -101,6 +101,48 @@ test("retention removes only archived history with settled recovery and cascades
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("automatic retention preserves pinned archives while confirmed deletion remains available", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-pinned-retention-"));
+  const filename = path.join(directory, "outright.db");
+  const database = createOutrightDatabase({ filename });
+  try {
+    const pinned = chat(database, "pinned archive");
+    const ordinary = chat(database, "ordinary archive");
+    for (const item of [pinned, ordinary]) database.updateConversation(item.id, { archived: true });
+    database.updateConversation(pinned.id, { pinned: true });
+    ageArchived(filename, [pinned.id, ordinary.id]);
+    assert.deepEqual(database.pruneHistory().ids, [ordinary.id]);
+    assert.ok(database.getConversation(pinned.id));
+    assert.equal(database.deleteArchivedConversation(pinned.id, pinned.id).deleted, 1);
+    assert.equal(database.getConversation(pinned.id), undefined);
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("retained counter is measured on upgrade and trusted on populated restart", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-retained-restart-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const conversation = chat(database);
+    database.addMessage({ conversationId: conversation.id, role: "assistant", body: "retained output" });
+    const measured = database.capacity().retainedBytes;
+    database.close();
+    const legacy = new Database(filename);
+    legacy.pragma("user_version = 1");
+    legacy.prepare("UPDATE retained_usage SET bytes = 1 WHERE id = 1").run();
+    legacy.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.capacity().retainedBytes, measured, "legacy counter is reconciled once");
+    database.close();
+    const admin = new Database(filename);
+    assert.equal(admin.pragma("user_version", { simple: true }), 2);
+    admin.prepare("UPDATE retained_usage SET bytes = bytes + 17 WHERE id = 1").run();
+    admin.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.capacity().retainedBytes, measured + 17, "versioned startup does not rescan populated history");
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("retention compares parsed cutoff instants and protects unsettled run transitions", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-retention-cutoff-"));
   const filename = path.join(directory, "outright.db");

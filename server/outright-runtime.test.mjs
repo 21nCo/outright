@@ -722,7 +722,7 @@ for (const operation of ["send", "recovery"]) {
 for (const operation of ["send", "recovery"]) {
   test(`slow executable provider probe stays asynchronous and bounded for ${operation}`, { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
     // Exercise the real execFile --version path through each HTTP endpoint.
-    writeFileSync(path.join(bin, "codex"), "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then sleep 0.25; echo 'codex test'; fi\n");
+    writeFileSync(path.join(bin, "codex"), "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then sleep 0.4; echo 'codex test'; fi\n");
     const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Probe latency", provider: "codex" });
     let interrupted;
     if (operation === "recovery") {
@@ -737,7 +737,7 @@ for (const operation of ["send", "recovery"]) {
       await runtime.handleRequest(requestStream("POST", operation === "send" ? `/api/conversations/${conversation.id}/runs` : `/api/runs/${interrupted.id}/resume`, operation === "send" ? { prompt: "measure probe" } : { policy: "retry" }), response);
     } finally { clearInterval(timer); }
     const elapsed = performance.now() - started;
-    assert.ok(elapsed >= 200 && elapsed < 2500, `${operation} took ${elapsed.toFixed(1)} ms with a 250 ms executable probe`);
+    assert.ok(elapsed >= 200 && elapsed < 2500, `${operation} took ${elapsed.toFixed(1)} ms with a 400 ms executable probe`);
     assert.ok(ticks >= 5, `${operation} blocked the event loop during its executable probe`);
     assert.equal(response.statusCode, 202);
   }));

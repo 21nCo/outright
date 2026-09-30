@@ -506,7 +506,12 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         archiveAssistant(state, (current) => persistAssistantCheckpoint(current, { publishEvent: true }));
         persistTranscriptItem(state, { kind: "tool", body: toolTranscriptLabel(event), payload: { item: event.payload.item ?? null } });
       }
-      if (event.type === "usage") database.updateRun(state.run.id, event.payload);
+      if (event.type === "usage") {
+        // Provider usage is optional telemetry. A quota refusal must not
+        // escape the stdout listener and terminate supervision of every run.
+        try { database.updateRun(state.run.id, event.payload); }
+        catch (error) { if (error.statusCode !== 507) throw error; }
+      }
       const emittedPayload = ["assistant.delta", "assistant.message"].includes(event.type)
         ? { ...event.payload, text: truncateUtf8(event.payload.text ?? "", MAX_ASSISTANT_EVENT_BYTES), truncated: Buffer.byteLength(event.payload.text ?? "") > MAX_ASSISTANT_EVENT_BYTES }
         : event.payload;
@@ -688,7 +693,11 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if (!input) return;
     let message;
     try { message = database.addMessage(input); }
-    catch (error) { if (error.statusCode !== 507) throw error; markTranscriptOmitted(state); return; }
+    catch (error) {
+      if (error.statusCode !== 507) { throw error; }
+      markTranscriptOmitted(state);
+      return;
+    }
     publish({ type: "message.created", conversationId: state.conversation.id, payload: message });
   }
 
@@ -744,7 +753,12 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if (state.assistantTruncated) state.checkpointHalted = true;
     let stored;
     try { stored = database.upsertMessage(message); }
-    catch (error) { if (error.statusCode !== 507) throw error; markTranscriptOmitted(state); state.checkpointHalted = true; return null; }
+    catch (error) {
+      if (error.statusCode !== 507) { throw error; }
+      markTranscriptOmitted(state);
+      state.checkpointHalted = true;
+      return null;
+    }
     if (publishEvent && stored) publish({ type: "message.created", conversationId: state.conversation.id, payload: stored });
     return stored;
   }
