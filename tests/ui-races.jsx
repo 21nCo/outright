@@ -1370,13 +1370,20 @@ async function terminalRejectedSwitchRegression() {
   const pending = deferred();
   const errors = [];
   const sent = [];
+  const resizeSnapshots = [];
   let retry = false;
   route = async (url) => {
     if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("A2")] });
     if (url.pathname === "/api/terminals/term-A2") return retry ? response({ buffer: "Retry output\r\n" }) : pending.promise;
     return response({ buffer: "Terminal A output\r\n" });
   };
-  root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => errors.push(error)} sendRuntime={(message) => sent.push(message)} />);
+  root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => errors.push(error)} sendRuntime={(message) => {
+    sent.push(message);
+    if (message.type === "terminal.resize") resizeSnapshots.push({ message,
+      busy: host.querySelector(".terminal-tabs")?.getAttribute("aria-busy"),
+      selected: host.querySelector('.terminal-tabs [aria-selected="true"]')?.dataset.tabId,
+      hostWidth: host.querySelector(".terminal-host")?.getBoundingClientRect().width });
+  }} />);
   await until(() => terminalReady("Terminal A"), "rejection fixture terminal A ready");
   const narrowSize = sent.findLast((message) => message.type === "terminal.resize");
   const first = [...host.querySelectorAll('[role="tab"]')].find((tab) => tab.textContent === "Terminal A");
@@ -1393,8 +1400,11 @@ async function terminalRejectedSwitchRegression() {
   host.querySelector('[data-tab-id="term-A2"]').click();
   await until(() => terminalReady("Terminal A2"), "rejected activation retry");
   const retrySize = sent.findLast((message) => message.type === "terminal.resize");
+  const retrySnapshot = resizeSnapshots.findLast((snapshot) => snapshot.message === retrySize);
+  assert(retrySnapshot?.busy === "false" && retrySnapshot.selected === "term-A2",
+    `Retried terminal published a PTY size before the selected pane committed: ${JSON.stringify(retrySnapshot)}`);
   assert(retrySize?.terminalId === "term-A2" && retrySize.cols > narrowSize.cols,
-    `Retried terminal did not fit the current pane: narrow=${JSON.stringify(narrowSize)}, retry=${JSON.stringify(retrySize)}`);
+    `Retried terminal did not fit the current pane: narrow=${JSON.stringify(narrowSize)}, retry=${JSON.stringify(retrySnapshot)}`);
   for (const width of [320, 540, 320, 540]) {
     host.style.width = `${width}px`;
     await until(() => Math.abs(host.querySelector('.terminal-host')?.getBoundingClientRect().width - width) < 2,
@@ -4132,38 +4142,54 @@ async function expectResponsiveFocus(label, target) {
 }
 
 async function responsiveSidebarBreakpointCycles(setWidth) {
-  for (let round = 0; round < 3; round += 1) {
-    const desktopSidebarControl = host.querySelector('[aria-label="Close projects sidebar"]');
-    desktopSidebarControl.focus();
-    await setWidth(640);
-    await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), `sidebar closed from focused desktop control ${round + 1}`);
-    await expectResponsiveFocus(`visible focus restored after hiding desktop sidebar ${round + 1}`,
-      () => host.querySelector('[aria-label="Open projects sidebar"]'));
-    if (round === 0) {
-      // A busy main thread can deliver a blur timer after the old three-second
-      // wall-clock retry window. The visible opener must regain ownership.
-      document.activeElement.blur();
-      const pauseUntil = performance.now() + 3_100;
-      while (performance.now() < pauseUntil) { /* Hold browser task delivery. */ }
-      await expectResponsiveFocus("sidebar opener focus after a delayed browser task",
+  const trace = [];
+  const describe = (element) => element?.getAttribute?.("aria-label") ?? element?.id ?? element?.tagName;
+  const record = (event) => trace.push({ type: event.type, target: describe(event.target),
+    active: describe(document.activeElement), width: window.innerWidth,
+    sidebarHidden: host.querySelector("#project-sidebar")?.getAttribute("aria-hidden") });
+  document.addEventListener("focusin", record, true);
+  document.addEventListener("focusout", record, true);
+  window.addEventListener("resize", record);
+  try {
+    for (let round = 0; round < 3; round += 1) {
+      const desktopSidebarControl = host.querySelector('[aria-label="Close projects sidebar"]');
+      desktopSidebarControl.focus();
+      await setWidth(640);
+      await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), `sidebar closed from focused desktop control ${round + 1}`);
+      await expectResponsiveFocus(`visible focus restored after hiding desktop sidebar ${round + 1}`,
         () => host.querySelector('[aria-label="Open projects sidebar"]'));
+      if (round === 0) {
+        // A busy main thread can deliver a blur timer after the old three-second
+        // wall-clock retry window. The visible opener must regain ownership.
+        document.activeElement.blur();
+        const pauseUntil = performance.now() + 3_100;
+        while (performance.now() < pauseUntil) { /* Hold browser task delivery. */ }
+        await expectResponsiveFocus("sidebar opener focus after a delayed browser task",
+          () => host.querySelector('[aria-label="Open projects sidebar"]'));
+      }
+      if (round === 1) {
+        // Some engines blur a disappearing control before dispatching the media
+        // change. Preserve the last owner even if activeElement is now BODY.
+        document.activeElement.blur();
+        assert(document.activeElement === document.body, "Blur did not simulate focus loss before breakpoint change");
+      }
+      await setWidth(1280);
+      await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", `sidebar reopened after wide transition ${round + 1}`);
+      if (round === 0) {
+        // Chromium can remove focus after focus() succeeds during the sidebar
+        // layout transition. The owner must restore it without a new resize.
+        const focused = document.activeElement;
+        if (host.querySelector("#project-sidebar").contains(focused)) focused.blur();
+      }
+      await expectResponsiveFocus(`visible sidebar focus after wide transition ${round + 1}`,
+        () => host.querySelector("#project-sidebar").contains(document.activeElement) ? document.activeElement : null);
     }
-    if (round === 1) {
-      // Some engines blur a disappearing control before dispatching the media
-      // change. Preserve the last owner even if activeElement is now BODY.
-      document.activeElement.blur();
-      assert(document.activeElement === document.body, "Blur did not simulate focus loss before breakpoint change");
-    }
-    await setWidth(1280);
-    await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", `sidebar reopened after wide transition ${round + 1}`);
-    if (round === 0) {
-      // Chromium can remove focus after focus() succeeds during the sidebar
-      // layout transition. The owner must restore it without a new resize.
-      const focused = document.activeElement;
-      if (host.querySelector("#project-sidebar").contains(focused)) focused.blur();
-    }
-    await expectResponsiveFocus(`visible sidebar focus after wide transition ${round + 1}`,
-      () => host.querySelector("#project-sidebar").contains(document.activeElement) ? document.activeElement : null);
+  } catch (error) {
+    throw new Error(`${error.message}; focusTrace=${JSON.stringify(trace.slice(-35))}`);
+  } finally {
+    document.removeEventListener("focusin", record, true);
+    document.removeEventListener("focusout", record, true);
+    window.removeEventListener("resize", record);
   }
 }
 

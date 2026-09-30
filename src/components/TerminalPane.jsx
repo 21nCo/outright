@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { ArrowsClockwise, Plus, TerminalWindow, X } from "@phosphor-icons/react";
@@ -15,7 +15,7 @@ export function TerminalPane(props) {
 function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) {
   const hostRef = useRef(null);
   const xtermRef = useRef(null);
-  const fitRef = useRef(null);
+  const fitSelectedRef = useRef(null);
   const activeIdRef = useRef("");
   const displayedCursorRef = useRef(0);
   const inputReadyRef = useRef(false);
@@ -54,10 +54,11 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     xterm.loadAddon(fit);
     xterm.open(hostRef.current);
     xtermRef.current = xterm;
-    fitRef.current = fit;
     const resizeTerminal = () => {
       try {
         if (document.hidden) return;
+        const dimensions = fit.proposeDimensions();
+        if (!dimensions) return;
         fit.fit();
         if (!loadingRef.current && activeIdRef.current && !exitedIdsRef.current.has(activeIdRef.current)
           && (inputReadyRef.current || awaitingVisibleFitRef.current)) {
@@ -67,14 +68,22 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
         }
       } catch { /* The terminal may be transitioning out of the DOM. */ }
     };
+    fitSelectedRef.current = resizeTerminal;
     const resize = new ResizeObserver(resizeTerminal);
     resize.observe(hostRef.current);
     document.addEventListener("visibilitychange", resizeTerminal);
     const disposable = xterm.onData((data) => {
       if (inputReadyRef.current && !loadingRef.current && activeIdRef.current) sendRuntime({ type: "terminal.input", terminalId: activeIdRef.current, data });
     });
-    return () => { disposable.dispose(); document.removeEventListener("visibilitychange", resizeTerminal); resize.disconnect(); xterm.dispose(); xtermRef.current = null; };
+    return () => { disposable.dispose(); document.removeEventListener("visibilitychange", resizeTerminal); resize.disconnect(); fitSelectedRef.current = null; xterm.dispose(); xtermRef.current = null; };
   }, [sendRuntime]);
+
+  // The selected terminal and the busy state both change the committed pane.
+  // Publish its PTY size only after that React commit, using the same fit path
+  // as ResizeObserver and visibility restoration.
+  useLayoutEffect(() => {
+    if (!loading && activeId) fitSelectedRef.current?.();
+  }, [activeId, loading]);
 
   function beginSelection() {
     const token = ++reconcileTokenRef.current;
@@ -151,26 +160,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       activeIdRef.current = terminal.id;
       displayedCursorRef.current = displayedCursor;
       setActiveId(terminal.id);
-      if (!exited && !document.hidden) {
-        // The selected tab changes the pane layout. Fit only after React has
-        // committed that selection and the browser has laid out its host;
-        // otherwise a fast retry can publish the preceding narrow grid.
-        await new Promise((resolve) => {
-          let frame;
-          const timer = setTimeout(() => { cancelAnimationFrame(frame); resolve(); }, 100);
-          frame = requestAnimationFrame(() => { clearTimeout(timer); resolve(); });
-        });
-        if (token !== reconcileTokenRef.current || exitedIdsRef.current.has(terminal.id)) return;
-        if (document.hidden) { awaitingVisibleFitRef.current = true; return; }
-        try {
-          const dimensions = fitRef.current?.proposeDimensions();
-          if (dimensions) {
-            fitRef.current.fit();
-            sendRuntime({ type: "terminal.resize", terminalId: terminal.id, cols: xterm.cols, rows: xterm.rows });
-            inputReadyRef.current = true;
-          } else awaitingVisibleFitRef.current = true;
-        } catch { awaitingVisibleFitRef.current = true; }
-      } else if (!exited) awaitingVisibleFitRef.current = true;
+      if (!exited) awaitingVisibleFitRef.current = true;
     } finally {
       if (pendingOutputRef.current === pending) pendingOutputRef.current = null;
     }
