@@ -352,7 +352,7 @@ async function archivedSettingsPagingFocusRegression() {
   await settle();
   const settings = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
     editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
-  const entries = Array.from({ length: 101 }, (_, index) => ({ id: `archive-${index}`, title: `Archived ${index}`,
+  const entries = Array.from({ length: 101 }, (_, index) => ({ id: `archive-${index}`, title: index === 1 ? "Archived 0" : `Archived ${index}`,
     worktreePath: "/tmp/worktree", updatedAt: new Date(Date.now() - index * 1000).toISOString() }));
   let deleted = false;
   route = async (url, options) => {
@@ -379,6 +379,11 @@ async function archivedSettingsPagingFocusRegression() {
   await until(() => host.querySelector("button"), "archive fixture mounted");
   host.querySelector("button").click();
   await until(() => document.querySelectorAll(".archived-history-list button").length === 100, "first archived page");
+  const archiveActions = [...document.querySelectorAll(".archived-history-list button")];
+  const actionNames = archiveActions.map((button) => button.getAttribute("aria-label"));
+  assert(new Set(actionNames).size === 100, "Each archived delete action needs a distinct accessible name");
+  assert(actionNames[0]?.includes(entries[0].title) && actionNames[0]?.includes(entries[0].id),
+    "An archived delete action must identify its chat even when titles repeat");
   const load = [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Next archived page");
   assert(load, "Older archived history has no keyboard-reachable page action");
   load.focus();
@@ -386,6 +391,7 @@ async function archivedSettingsPagingFocusRegression() {
   load.click();
   await until(() => document.querySelectorAll(".archived-history-list button").length === 1, "oldest archived row loaded in a bounded page");
   const oldestTrigger = [...document.querySelectorAll(".archived-history-list button")].at(-1);
+  assert(oldestTrigger.getAttribute("aria-label")?.includes(entries[100].title), "The older page action must identify its chat");
   await until(() => document.activeElement === oldestTrigger, "focus moved into the new archived page");
   oldestTrigger.click();
   await until(() => document.querySelector(".archive-delete-confirm button"), "archive confirmation");

@@ -138,12 +138,10 @@ export function createOutrightDatabase(options = {}) {
         // saved quota; only already retained state gets transition headroom.
         if (patch.maxRetainedMiB !== undefined) {
           const target = patch.maxRetainedMiB * 1024 * 1024;
-          if (retainedBytes(db) > target) reserveRecoveryHeadroom(db);
+          reserveRecoveryHeadroom(db, target);
         }
         for (const [key, value] of entries) statement.run(key, JSON.stringify(value));
-        if (patch.maxRetainedMiB !== undefined && retainedBytes(db) <= patch.maxRetainedMiB * 1024 * 1024) {
-          db.prepare("UPDATE retained_usage SET legacy_ceiling = 0 WHERE id = 1").run();
-        }
+        if (patch.maxRetainedMiB !== undefined) reserveRecoveryHeadroom(db);
       });
       update.immediate(Object.entries(patch));
       return this.getSettings();
@@ -201,9 +199,7 @@ export function createOutrightDatabase(options = {}) {
           if (!db.prepare("SELECT 1 FROM conversations WHERE id = ?").get(id)) throw databaseError(404, "Conversation not found");
           throw databaseError(409, "Only archived conversations without active or unresolved recovery work can be deleted");
         }
-        if (retainedBytes(db) <= this.getSettings().maxRetainedMiB * 1024 * 1024) {
-          db.prepare("UPDATE retained_usage SET legacy_ceiling = 0 WHERE id = 1").run();
-        }
+        reserveRecoveryHeadroom(db);
         return { deleted: 1, id };
       });
       return remove.immediate();
@@ -229,9 +225,7 @@ export function createOutrightDatabase(options = {}) {
           ORDER BY updated_at, id LIMIT ?`).all(cutoff, limit).map((row) => row.id);
         const remove = db.prepare("DELETE FROM conversations WHERE id = ?");
         for (const id of ids) remove.run(id);
-        if (retainedBytes(db) <= this.getSettings().maxRetainedMiB * 1024 * 1024) {
-          db.prepare("UPDATE retained_usage SET legacy_ceiling = 0 WHERE id = 1").run();
-        }
+        reserveRecoveryHeadroom(db);
         return { deleted: ids.length, ids };
       });
       return prune.immediate();
@@ -1135,22 +1129,24 @@ function migrate(db) {
   db.exec("DROP TRIGGER IF EXISTS retained_hard_limit");
   const measured = calculateRetainedBytes(db);
   const configured = Number(db.prepare("SELECT value FROM settings WHERE key = 'maxRetainedMiB'").get()?.value ?? DEFAULT_SETTINGS.maxRetainedMiB) * 1024 * 1024;
-  const priorCeiling = db.prepare("SELECT legacy_ceiling FROM retained_usage WHERE id = 1").get().legacy_ceiling;
-  db.prepare("UPDATE retained_usage SET bytes = ?, legacy_ceiling = ? WHERE id = 1").run(measured, measured > configured ? priorCeiling : 0);
-  if (measured > configured) reserveRecoveryHeadroom(db);
+  db.prepare("UPDATE retained_usage SET bytes = ? WHERE id = 1").run(measured);
+  reserveRecoveryHeadroom(db, configured);
   db.exec(`CREATE TRIGGER retained_hard_limit BEFORE UPDATE ON retained_usage
     WHEN NEW.bytes > MAX(COALESCE((SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'maxRetainedMiB'), ${DEFAULT_SETTINGS.maxRetainedMiB}) * 1048576, OLD.legacy_ceiling)
     BEGIN SELECT RAISE(ABORT, 'OUTRIGHT_RETAINED_LIMIT'); END`);
 }
 
-function reserveRecoveryHeadroom(db) {
+function reserveRecoveryHeadroom(db, configured = Number(db.prepare("SELECT value FROM settings WHERE key = 'maxRetainedMiB'").get()?.value ?? DEFAULT_SETTINGS.maxRetainedMiB) * 1024 * 1024) {
   const unsettled = db.prepare(`SELECT COUNT(*) AS count FROM runs WHERE status IN ('queued', 'launching', 'running')
     OR (status = 'interrupted' AND recovery_decision IS NULL)`).get().count;
-  // Covers classification, timestamps, explicit recovery decisions and
-  // terminal outcomes for each already admitted row. No new run is admitted
-  // above the configured cap.
-  const headroom = Math.max(1024 * 1024, unsettled * 256);
-  db.prepare("UPDATE retained_usage SET legacy_ceiling = MAX(legacy_ceiling, bytes + ?) WHERE id = 1").run(headroom);
+  // Reserve transitions before they start even when legacy usage is just
+  // below the cap. Each restart recalculates from the remaining unsettled
+  // rows, so a crash partway through bounded reconciliation cannot strand
+  // the backlog. Ordinary new-work admission still uses the configured cap.
+  const bytes = retainedBytes(db);
+  const headroom = unsettled || bytes > configured ? Math.max(1024 * 1024, unsettled * 256) : 0;
+  const ceiling = bytes + headroom > configured ? bytes + headroom : 0;
+  db.prepare("UPDATE retained_usage SET legacy_ceiling = ? WHERE id = 1").run(ceiling);
 }
 
 function conversationColumns() {

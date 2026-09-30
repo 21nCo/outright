@@ -304,6 +304,62 @@ test("startup reconciles a legacy backlog larger than fixed recovery headroom", 
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("near-cap legacy backlog reserves recovery space through interrupted restarts and cleanup", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-near-cap-recovery-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    database.updateSettings({ maxRetainedMiB: 64 });
+    const archived = chat(database, "old archive");
+    const live = chat(database, "live");
+    database.updateConversation(archived.id, { archived: true });
+    database.close();
+    const legacy = new Database(filename);
+    legacy.exec("DROP TRIGGER retained_hard_limit");
+    legacy.prepare(`WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 9000)
+      INSERT INTO runs (id, conversation_id, worktree_path, provider, approval_policy, prompt, status, pid, created_at)
+      SELECT 'legacy-' || n, ?, '/tmp/w', 'codex', 'read-only', 'work',
+        CASE n % 3 WHEN 0 THEN 'running' WHEN 1 THEN 'queued' ELSE 'launching' END,
+        CASE WHEN n % 3 = 0 THEN 12345 ELSE NULL END,
+        '2026-01-01T00:00:00.000Z' FROM seq`).run(live.id);
+    legacy.prepare("INSERT INTO messages (id, conversation_id, role, kind, body, payload, created_at) VALUES ('legacy-output', ?, 'assistant', 'text', 'x', 'null', '2026-01-01T00:00:00.000Z')")
+      .run(archived.id);
+    const target = 64 * 1024 * 1024 - 199_989;
+    const current = legacy.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes;
+    assert.ok(current < target);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = 'legacy-output'").run("x".repeat(1 + target - current));
+    legacy.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?")
+      .run(new Date(Date.now() - 100 * 86_400_000).toISOString(), archived.id);
+    legacy.close();
+
+    database = createOutrightDatabase({ filename });
+    assert.ok(database.capacity().retainedBytes < 64 * 1024 * 1024);
+    assert.equal(database.capacity().availableForNewWorkBytes, 0);
+    assert.throws(() => database.addMessage({ conversationId: live.id, role: "user", body: "refused" }),
+      (error) => error.statusCode === 507);
+    let probes = 0;
+    assert.throws(() => database.reconcileInterruptedRuns({ probeAlive: () => {
+      if (++probes === 200) throw new Error("probe interrupted");
+      return false;
+    } }), /probe interrupted/);
+    assert.equal(database.capacity().recoverable, 500, "one bounded batch survived the interruption");
+    database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.reconcileInterruptedRuns({ probeAlive: () => false }).count, 8500);
+    assert.equal(database.capacity().queued, 0);
+    assert.equal(database.capacity().active, 0);
+    assert.equal(database.capacity().recoverable, 9000);
+    assert.equal(database.resolveInterruptedRun("legacy-1", "discard").status, "failed");
+    assert.equal(database.resolveInterruptedRun("legacy-2", "retry").recoveryDecision, "retry");
+    assert.equal(database.pruneHistory().deleted, 1);
+    assert.equal(database.resolveInterruptedRun("legacy-3", "discard-unverifiable").status, "failed");
+    database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.reconcileInterruptedRuns({ probeAlive: () => false }).count, 0);
+    assert.equal(database.capacity().recoverable, 8997);
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("startup recovery commits bounded batches before an interrupted probe", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-reconcile-batches-"));
   const filename = path.join(directory, "outright.db");
