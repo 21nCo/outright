@@ -151,7 +151,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       }
       if (url.pathname === "/api/capacity" && request.method === "GET") return json(response, 200, database.capacity());
       if (url.pathname === "/api/retention/archived" && request.method === "GET") {
-        return json(response, 200, { conversations: database.listDeletableArchivedConversations() });
+        const limitText = url.searchParams.get("limit");
+        const limit = limitText === null ? 100 : Number(limitText);
+        return json(response, 200, database.listDeletableArchivedConversations({ limit, cursor: url.searchParams.get("cursor") }));
       }
       if (url.pathname === "/api/retention/delete-archived" && request.method === "POST") {
         const body = await readJson(request);

@@ -182,20 +182,50 @@ test("selected cleanup rechecks archived and run state at deletion, including ca
     database.updateRun(activeRun.id, { status: "running" });
     const interruptedRun = database.createRun(runInput(interrupted.id));
     database.updateRun(interruptedRun.id, { status: "interrupted" });
-    assert.deepEqual(database.listDeletableArchivedConversations(), []);
+    assert.deepEqual(database.listDeletableArchivedConversations().conversations, []);
     for (const item of [visible, queued, active, interrupted]) {
       assert.throws(() => database.deleteArchivedConversation(item.id, item.id), (error) => error.statusCode === 409);
     }
     database.updateRun(queuedRun.id, { status: "stopped" });
     database.updateRun(activeRun.id, { status: "completed" });
     database.resolveInterruptedRun(interruptedRun.id, "discard");
-    assert.equal(database.listDeletableArchivedConversations().length, 3);
+    assert.equal(database.listDeletableArchivedConversations().conversations.length, 3);
     for (const item of [queued, active, interrupted]) assert.equal(database.deleteArchivedConversation(item.id, item.id).deleted, 1);
     assert.ok(database.getConversation(visible.id));
     assert.equal(database.getRun(queuedRun.id), undefined);
     assert.equal(database.getRun(activeRun.id), undefined);
     assert.equal(database.getRun(interruptedRun.id), undefined);
   } finally { database.close(); }
+});
+
+test("archived selection pages past 100 without deleting newer chats or exposing active evidence", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archived-pages-"));
+  const filename = path.join(directory, "outright.db");
+  const database = createOutrightDatabase({ filename });
+  try {
+    const oldest = chat(database, "oldest selected");
+    database.updateConversation(oldest.id, { archived: true });
+    const protectedChat = chat(database, "running protected");
+    database.updateConversation(protectedChat.id, { archived: true });
+    const active = database.createRun(runInput(protectedChat.id));
+    database.updateRun(active.id, { status: "running" });
+    for (let index = 0; index < 101; index++) database.updateConversation(chat(database, `newer ${index}`).id, { archived: true });
+    ageArchived(filename, [oldest.id]);
+    const first = database.listDeletableArchivedConversations();
+    assert.equal(first.conversations.length, 100);
+    assert.ok(first.nextCursor);
+    assert.equal(first.conversations.some((item) => item.id === oldest.id), false);
+    const second = database.listDeletableArchivedConversations({ cursor: first.nextCursor });
+    assert.equal(second.conversations.some((item) => item.id === oldest.id), true);
+    assert.equal(second.conversations.some((item) => item.id === protectedChat.id), false);
+    assert.equal(second.nextCursor, null);
+    assert.equal(database.deleteArchivedConversation(oldest.id, oldest.id).deleted, 1);
+    assert.ok(database.getConversation(first.conversations[0].id), "newer history is retained");
+    assert.ok(database.getRun(active.id), "active evidence is retained");
+    for (const cursor of ["", "!", "a".repeat(2049), Buffer.from(JSON.stringify(["date"])).toString("base64url")]) {
+      assert.throws(() => database.listDeletableArchivedConversations({ cursor }), (error) => error.statusCode === 400);
+    }
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("migration preserves recovery transitions for legacy data already over quota", () => {

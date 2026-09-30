@@ -173,6 +173,53 @@ test("explicit archived deletion at the HTTP boundary restores admission without
   assert.ok(database.getRun(recovery.id));
 }));
 
+test("archived HTTP cursor reaches an older selection and rejects malformed pages", withRuntime(async (runtime) => {
+  const database = runtime.database;
+  const firstCreated = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "First", provider: "codex" });
+  database.updateConversation(firstCreated.id, { archived: true });
+  for (let index = 0; index < 3; index++) {
+    const row = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: `Newer ${index}`, provider: "codex" });
+    database.updateConversation(row.id, { archived: true });
+  }
+  const oldestSelectable = database.listDeletableArchivedConversations().conversations.at(-1);
+  const first = responseCapture();
+  await runtime.handleRequest(requestStream("GET", "/api/retention/archived?limit=2"), first);
+  assert.equal(first.statusCode, 200);
+  assert.equal(first.body.conversations.length, 2);
+  assert.equal(first.body.conversations.some((row) => row.id === oldestSelectable.id), false);
+  const second = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `/api/retention/archived?limit=2&cursor=${first.body.nextCursor}`), second);
+  assert.equal(second.statusCode, 200);
+  assert.equal(second.body.conversations.some((row) => row.id === oldestSelectable.id), true);
+  assert.equal(second.body.nextCursor, null);
+  const deleted = responseCapture();
+  await runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived", { id: oldestSelectable.id, confirmation: oldestSelectable.id }), deleted);
+  assert.equal(deleted.statusCode, 200);
+  assert.ok(database.getConversation(first.body.conversations[0].id));
+  for (const query of ["limit=101", "limit=0", "cursor=%21", "cursor="]) {
+    const invalid = responseCapture();
+    await runtime.handleRequest(requestStream("GET", `/api/retention/archived?${query}`), invalid);
+    assert.equal(invalid.statusCode, 400);
+  }
+}));
+
+test("concurrent HTTP submissions admit only the configured queue budget", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  runtime.database.updateSettings({ maxQueuedRuns: 3 });
+  runtime.agents.providerAvailable = async () => true;
+  // Hold scheduling so admission, rather than a provider's completion speed,
+  // decides the burst outcome at the HTTP boundary.
+  runtime.agents.schedule = async ({ run }) => ({ id: run.id, status: run.status });
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id,
+    worktreePath: worktree.path, title: "Burst", provider: "codex" });
+  const replies = Array.from({ length: 20 }, () => responseCapture());
+  await Promise.all(replies.map((reply, index) => runtime.handleRequest(
+    requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: `burst ${index}` }), reply)));
+  assert.equal(replies.filter((reply) => reply.statusCode === 202).length, 3);
+  assert.equal(replies.filter((reply) => reply.statusCode === 429).length, 17);
+  assert.equal(runtime.database.capacity().queued, 3);
+  assert.equal(runtime.database.messageCount(conversation.id), 3, "rejected submissions leave no message");
+}));
+
 test("bootstrap and retention remain reachable when default groups cannot fit the retained budget", async () => {
   const configDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-budget-config-"));
   const configFile = path.join(configDirectory, "outright.config.json");

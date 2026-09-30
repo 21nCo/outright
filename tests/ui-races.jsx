@@ -344,6 +344,62 @@ async function settingsRetentionDraftRegression() {
   assert(patchCalls === 1 && saved.retentionDays === 60, "Settings save did not persist the new age once");
 }
 
+async function archivedSettingsPagingFocusRegression() {
+  root.render(null);
+  await settle();
+  const settings = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
+    editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
+  const entries = Array.from({ length: 101 }, (_, index) => ({ id: `archive-${index}`, title: `Archived ${index}`,
+    worktreePath: "/tmp/worktree", updatedAt: new Date(Date.now() - index * 1000).toISOString() }));
+  let deleted = false;
+  route = async (url, options) => {
+    if (url.pathname === "/api/capacity") return response({});
+    if (url.pathname === "/api/retention/archived") {
+      if (url.searchParams.get("cursor") === "older") return response({ conversations: deleted ? [] : entries.slice(100), nextCursor: null });
+      return response({ conversations: entries.slice(0, 100), nextCursor: "older" });
+    }
+    if (url.pathname === "/api/retention/delete-archived") {
+      const body = JSON.parse(options.body);
+      assert(body.id === entries[100].id && body.confirmation === body.id, "The oldest selected archive was not confirmed");
+      deleted = true;
+      return response({ deleted: 1, capacity: {} });
+    }
+    return response({});
+  };
+  function Fixture() {
+    const [open, setOpen] = React.useState(false);
+    return <><button onClick={() => setOpen(true)}>Open archive fixture</button><SettingsDialog open={open}
+      onOpenChange={setOpen} settings={settings} providers={[{ id: "codex", label: "Codex", available: true }]}
+      templates={[]} onSaved={() => {}} onError={(error) => { throw error; }} /></>;
+  }
+  root.render(<TooltipProvider><Fixture /></TooltipProvider>);
+  await until(() => host.querySelector("button"), "archive fixture mounted");
+  host.querySelector("button").click();
+  await until(() => document.querySelectorAll(".archived-history-list button").length === 100, "first archived page");
+  const load = [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Next archived page");
+  assert(load, "Older archived history has no keyboard-reachable page action");
+  load.focus();
+  assert(document.activeElement === load, "Archived page action cannot receive keyboard focus");
+  load.click();
+  await until(() => document.querySelectorAll(".archived-history-list button").length === 1, "oldest archived row loaded in a bounded page");
+  const oldestTrigger = [...document.querySelectorAll(".archived-history-list button")].at(-1);
+  await until(() => document.activeElement === oldestTrigger, "focus moved into the new archived page");
+  oldestTrigger.click();
+  await until(() => document.querySelector(".archive-delete-confirm button"), "archive confirmation");
+  const cancel = document.querySelector(".archive-delete-confirm button");
+  await until(() => document.activeElement === cancel, "confirmation focus");
+  cancel.click();
+  await until(() => !document.querySelector(".archive-delete-confirm"), "archive confirmation cancelled");
+  assert(document.activeElement === oldestTrigger, "Cancel did not restore focus to the originating delete action");
+  oldestTrigger.click();
+  await until(() => document.querySelectorAll(".archive-delete-confirm button").length === 2, "archive confirmation reopened");
+  document.querySelectorAll(".archive-delete-confirm button")[1].click();
+  await until(() => deleted && !document.querySelector(".archive-delete-confirm"), "oldest archive deleted");
+  const cleanup = [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Clean old archived history");
+  await until(() => document.activeElement === cleanup, "focus restored after deleting the originating row");
+  assert(document.querySelector('[role="dialog"]'), "Settings closed after deletion");
+}
+
 async function archivedChatOwnershipRegression() {
   root.render(null);
   await settle();
@@ -4153,6 +4209,7 @@ try {
     ["chat tab controls", chatTabControlRegression, "chat tab navigation ignores nested archive controls"],
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
     ["settings retention draft", settingsRetentionDraftRegression, "missing archived data stays safe and cancel, cleanup and save use the persisted retention age"],
+    ["archived settings paging focus", archivedSettingsPagingFocusRegression, "the oldest archive can be paged to and cancel and delete keep keyboard focus in Settings"],
     ["archived chat ownership", archivedChatOwnershipRegression, "an archived chat cannot keep a pane or accept runs during held or failed refresh"],
     ["same-owner archive refresh", sameOwnerArchiveRefreshRegression, "a held archive cannot overwrite a newer same-worktree list after refresh failure"],
     ["chat detail refresh ownership", chatDetailRefreshOwnershipRegression, "failed and pending same-chat detail blocks submission and trust until fresh detail loads"],

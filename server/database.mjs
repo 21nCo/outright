@@ -159,12 +159,25 @@ export function createOutrightDatabase(options = {}) {
       // and terminal transitions.
       return this.capacity().availableForNewWorkBytes >= 64 * 1024;
     },
-    listDeletableArchivedConversations(limit = 100) {
+    listDeletableArchivedConversations({ limit = 100, cursor = null } = {}) {
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw databaseError(400, "Archived history page size must be 1 to 100");
-      return db.prepare(`SELECT id, title, worktree_path AS worktreePath, updated_at AS updatedAt FROM conversations
+      let after = null;
+      if (cursor !== null) {
+        if (typeof cursor !== "string" || cursor.length > 2048 || !/^[A-Za-z0-9_-]+$/.test(cursor)) throw databaseError(400, "Archived history cursor is invalid");
+        try {
+          after = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+          if (Buffer.from(JSON.stringify(after)).toString("base64url") !== cursor || !Array.isArray(after) || after.length !== 2
+            || after.some((part) => typeof part !== "string" || !part || part.length > 512)) throw new Error("invalid cursor");
+        } catch { throw databaseError(400, "Archived history cursor is invalid"); }
+      }
+      const rows = db.prepare(`SELECT id, title, worktree_path AS worktreePath, updated_at AS updatedAt FROM conversations
         WHERE archived = 1 AND NOT EXISTS (SELECT 1 FROM runs WHERE conversation_id = conversations.id
           AND (status IN ('queued', 'launching', 'running') OR (status = 'interrupted' AND recovery_decision IS NULL)))
-        ORDER BY updated_at DESC, id LIMIT ?`).all(limit);
+        AND (? IS NULL OR updated_at < ? OR (updated_at = ? AND id < ?))
+        ORDER BY updated_at DESC, id DESC LIMIT ?`).all(after?.[0] ?? null, after?.[0] ?? null, after?.[0] ?? null, after?.[1] ?? null, limit + 1);
+      const conversations = rows.slice(0, limit);
+      const last = conversations.at(-1);
+      return { conversations, nextCursor: rows.length > limit ? Buffer.from(JSON.stringify([last.updatedAt, last.id])).toString("base64url") : null };
     },
     deleteArchivedConversation(id, confirmation) {
       if (typeof id !== "string" || !id || id.length > 200 || confirmation !== id) {
