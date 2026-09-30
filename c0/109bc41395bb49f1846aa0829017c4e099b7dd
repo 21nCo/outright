@@ -1,0 +1,24 @@
+server/database.mjs
+  h_a39f9495f9ec1d 264-268,295-302,331-336,1228,1237,1253-1265
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 242
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 121,135-139,865
+src/App.jsx
+  h_a39f9495f9ec1d 1738
+src/components/SettingsDialog.jsx
+  h_a39f9495f9ec1d 129,131-132,187
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 2066-2067
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c0109bc41395bb49f1846aa0829017c4e099b7dd",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
