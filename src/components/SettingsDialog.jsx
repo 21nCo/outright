@@ -126,9 +126,10 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
       const result = await api("/api/retention/cleanup", { method: "POST", body: {} });
       if (session !== archiveSessionRef.current) { onSaved(settings, "history"); return; }
       setCapacity(result.capacity);
+      const deletedLabel = result.deleted === 1 ? "chat" : "chats";
       setCleanupResult(result.deferred
-        ? `Deleted ${result.deleted} old archived ${result.deleted === 1 ? "chat" : "chats"}; ${result.deferred} queued for cleanup after active runs finish.`
-        : `Deleted ${result.deleted} old archived ${result.deleted === 1 ? "chat" : "chats"}.`);
+        ? `Deleted ${result.deleted} old archived ${deletedLabel}; ${result.deferred} queued for cleanup after active runs finish.`
+        : `Deleted ${result.deleted} old archived ${deletedLabel}.`);
       await refreshArchived();
       onSaved(settings, "history");
     } catch (error) { if (session === archiveSessionRef.current) onError(error); }
@@ -183,6 +184,6 @@ function capacityUsageText(capacity) {
   if (typeof capacity.retainedBytes !== "number") return "Measuring retained history · new work paused";
   if (capacity.migrationStatus === "migrating") return "Indexing retained history · new work paused";
   const usage = `${(capacity.retainedBytes / 1048576).toFixed(1)} of ${(capacity.limits.maxRetainedBytes / 1048576).toFixed(0)} MiB retained`;
-  if (capacity.cleanupPending) return `${usage} · archived cleanup in progress; new launches paused`;
+  if (capacity.cleanupPending) return `${usage} · archived cleanup pending; launches may pause briefly during deletion`;
   return `${usage} · ${(capacity.availableForNewWorkBytes / 1048576).toFixed(1)} MiB available for new work`;
 }

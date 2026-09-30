@@ -261,7 +261,11 @@ export function createOutrightDatabase(options = {}) {
       // record its first output. The separate reserve remains for recovery
       // and terminal transitions.
       const capacity = this.capacity();
-      return !capacity.cleanupPending && capacity.availableForNewWorkBytes >= 64 * 1024;
+      // A durable deletion marker protects its own conversation, but does
+      // not reserve every free agent slot. Only the short-lived SQLite writer
+      // worker pauses launches; a long unrelated run may keep an oversized
+      // delete deferred without starving the queue.
+      return !deletionWorkers.size && capacity.availableForNewWorkBytes >= 64 * 1024;
     },
     listDeletableArchivedConversations({ limit = 100, cursor = null } = {}) {
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw databaseError(400, "Archived history page size must be 1 to 100");
@@ -288,7 +292,14 @@ export function createOutrightDatabase(options = {}) {
         throw databaseError(400, "Confirm the exact archived conversation id before deleting it");
       }
       return deleteArchivedInBatches(db, id, deletionsInFlight, deletionContext)
-        .then((result) => { if (result.deferred) scheduleDeletionResume(250); return result; });
+        .then((result) => {
+          if (result.deferred) { scheduleDeletionResume(250); }
+          return result;
+        })
+        .catch((error) => {
+          if (!closing) { scheduleDeletionResume(1000); }
+          throw error;
+        });
     },
     // Each eligible conversation is fenced before bounded child-row batches.
     // The fence survives restart, so interruption cannot expose a partly
@@ -317,7 +328,12 @@ export function createOutrightDatabase(options = {}) {
             if (result.deleted) deleted.push(id);
             else if (result.deferred) { deferred += 1; scheduleDeletionResume(250); }
           }
-          catch (error) { if (error.statusCode !== 404 && error.statusCode !== 409) throw error; }
+          catch (error) {
+            if (error.statusCode !== 404 && error.statusCode !== 409) {
+              if (!closing) { scheduleDeletionResume(1000); }
+              throw error;
+            }
+          }
         }
         return { deleted: deleted.length, deferred, ids: deleted };
       })();
@@ -1209,16 +1225,7 @@ function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosin
   inFlight.add(id);
   const run = async () => {
     try {
-      db.transaction(() => {
-        const row = db.prepare("SELECT archived, pinned, deleting FROM conversations WHERE id = ?").get(id);
-        if (!row) throw databaseError(404, "Conversation not found");
-        if (!row.archived || (automatic && !row.deleting && row.pinned)
-          || db.prepare(`SELECT 1 FROM runs WHERE conversation_id = ? AND (status IN ('queued', 'launching', 'running')
-            OR (status = 'interrupted' AND recovery_decision IS NULL)) LIMIT 1`).get(id)) {
-          throw databaseError(409, "Only archived conversations without active or unresolved recovery work can be deleted");
-        }
-        db.prepare("UPDATE conversations SET deleting = 1 WHERE id = ?").run(id);
-      }).immediate();
+      markArchivedForDeletion(db, id, automatic);
       while (true) {
         if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
         const step = db.transaction(() => deleteArchivedBatch(db, id, filename)).immediate();
@@ -1227,7 +1234,7 @@ function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosin
           // SQLite has one writer even in WAL mode. Never let a legacy giant
           // row delete contend with output or terminal writes from a live run.
           // The durable marker lets restart or the retry timer finish later.
-          if (db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
+          if (workers.size || db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
             return { deleted: 0, deferred: true, id };
           }
           try { await deleteOversizedArchivedRow(filename, id, step.oversized, workers, onWorkerExit); }
@@ -1241,6 +1248,19 @@ function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosin
     } finally { inFlight.delete(id); }
   };
   return run();
+}
+
+function markArchivedForDeletion(db, id, automatic) {
+  db.transaction(() => {
+    const row = db.prepare("SELECT archived, pinned, deleting FROM conversations WHERE id = ?").get(id);
+    if (!row) throw databaseError(404, "Conversation not found");
+    if (!row.archived || (automatic && !row.deleting && row.pinned)
+      || db.prepare(`SELECT 1 FROM runs WHERE conversation_id = ? AND (status IN ('queued', 'launching', 'running')
+        OR (status = 'interrupted' AND recovery_decision IS NULL)) LIMIT 1`).get(id)) {
+      throw databaseError(409, "Only archived conversations without active or unresolved recovery work can be deleted");
+    }
+    db.prepare("UPDATE conversations SET deleting = 1 WHERE id = ?").run(id);
+  }).immediate();
 }
 
 function deleteArchivedBatch(db, id, filename) {

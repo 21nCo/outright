@@ -2063,7 +2063,8 @@ async function diffRefreshAnchorRegression() {
     const frame = viewport.getBoundingClientRect();
     return Math.abs(bounds.top - (frame.top + viewport.clientHeight / 3)) < 2;
   };
-  await until(foundRowIsAligned, "large diff find aligned in viewport");
+  await until(() => foundRowIsAligned() && viewport.scrollTop > 20_000,
+    "large diff find aligned at its committed reading position");
   // The mark may mount before the queued Find alignment settles on slower
   // hosts. Start the refresh comparison from the completed reading position.
   await settle();

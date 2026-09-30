@@ -118,7 +118,7 @@ test("automatic retention preserves pinned archives while confirmed deletion rem
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("retained counter is measured on upgrade and trusted on populated restart", () => {
+test("retained counter is measured on upgrade and trusted on populated restart", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-retained-restart-"));
   const filename = path.join(directory, "outright.db");
   let database = createOutrightDatabase({ filename });
@@ -132,6 +132,11 @@ test("retained counter is measured on upgrade and trusted on populated restart",
     legacy.prepare("UPDATE retained_usage SET bytes = 1 WHERE id = 1").run();
     legacy.close();
     database = createOutrightDatabase({ filename });
+    const deadline = Date.now() + 5_000;
+    while (database.capacity().migrationStatus === "migrating") {
+      assert.ok(Date.now() < deadline, "legacy counter did not finish bounded measurement");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
     assert.equal(database.capacity().retainedBytes, measured, "legacy counter is reconciled once");
     database.close();
     const admin = new Database(filename);
@@ -857,7 +862,7 @@ test("oversized legacy archive cleanup defers while active runs write, then resu
       assert.equal(result.deleted, 0, "giant row deleted while an active run still owned the writer budget");
       assert.ok(result.deferred, "cleanup did not report the durable deferred marker");
       assert.equal(database.capacity().cleanupPending, true);
-      assert.equal(database.canLaunchRun(), false, "new launches overtook a marked giant archive delete");
+      assert.equal(database.canLaunchRun(), true, "an unrelated run cannot wait for a marked giant archive delete");
       const began = performance.now();
       database.appendRunEvent(running.id, "progress", { during: archived.title });
       assert.ok(performance.now() - began < 100, "active-run output waited for a giant archive writer");

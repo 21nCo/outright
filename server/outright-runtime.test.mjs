@@ -239,7 +239,7 @@ test("oversized archived HTTP deletion defers without blocking live output or ca
   assert.equal(deleteResponse.body.deleted, 0);
   assert.equal(deleteResponse.body.deferred, true);
   assert.equal(deleteResponse.body.capacity.cleanupPending, true);
-  assert.equal(database.canLaunchRun(), false);
+  assert.equal(database.canLaunchRun(), true, "deferred cleanup must leave unrelated run slots available");
   const started = performance.now();
   database.appendRunEvent(running.id, "progress", { text: "still writable" });
   const capacityResponse = responseCapture();
