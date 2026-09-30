@@ -771,6 +771,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // Terminal state is already durable even if the event log is full. Send a
     // bounded runtime notification so connected clients refresh that state.
     const terminal = ["run.completed", "run.failed", "run.stopped"].includes(type);
+    if (!event && !terminal) {
+      const state = active.get(runId);
+      if (state) markTranscriptOmitted(state);
+    }
     if (event || terminal) publish({ type: "run.event", conversationId: run?.conversationId, runId,
       payload: event ?? { runId, type, payload, seq: null, transient: true, createdAt: new Date().toISOString() } });
     return event;
@@ -803,6 +807,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
 
   function markTranscriptOmitted(state) {
     if (state.transcriptOmitted) return;
+    // The optional message can itself be refused at the aggregate cap. The
+    // run row uses reserved transition space, so it remains a durable marker
+    // through cancellation, finalization and restart.
+    database.updateRun(state.run.id, { transcriptOmitted: true });
     state.transcriptOmitted = true;
     try {
       const message = database.addMessage({ id: `${state.run.id}:budget`, conversationId: state.conversation.id,

@@ -32,7 +32,7 @@ const RETAINED_COLUMNS = [
   ["project_memberships", "project_id, group_id"],
   ["conversations", "id, project_id, worktree_id, worktree_path, title, provider, model, provider_session_id, created_at, updated_at"],
   ["messages", "id, conversation_id, role, kind, body, payload, created_at"],
-  ["runs", "id, conversation_id, worktree_path, provider, model, reasoning_effort, approval_policy, prompt, status, provider_session_id, created_at, started_at, finished_at, error, recovery_class, recovery_decision"],
+  ["runs", "id, conversation_id, worktree_path, provider, model, reasoning_effort, approval_policy, prompt, status, provider_session_id, created_at, started_at, finished_at, error, recovery_class, recovery_decision, transcript_omitted"],
   ["run_events", "run_id, type, payload, created_at"],
   ["run_event_usage", "run_id"],
   ["trusted_projects", "project_id, project_path, trusted_at"],
@@ -772,14 +772,14 @@ export function createOutrightDatabase(options = {}) {
       return db.prepare(`SELECT id, conversation_id AS conversationId, worktree_path AS worktreePath, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
         prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
         finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
-        output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision FROM runs WHERE id = ?`).get(id);
+        output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision, transcript_omitted AS transcriptOmitted FROM runs WHERE id = ?`).get(id);
     },
     listRuns(conversationId, limit = 200) {
       const boundedLimit = Math.max(1, Math.min(500, Number(limit) || 200));
       return db.prepare(`SELECT id, conversation_id AS conversationId, worktree_path AS worktreePath, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
         prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
         finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
-        output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision FROM runs WHERE conversation_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(conversationId, boundedLimit);
+        output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision, transcript_omitted AS transcriptOmitted FROM runs WHERE conversation_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(conversationId, boundedLimit);
     },
     listUnresolvedInterruptedRuns(conversationId) {
       return db.prepare(`SELECT id, conversation_id AS conversationId, worktree_path AS worktreePath, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
@@ -941,9 +941,10 @@ export function createOutrightDatabase(options = {}) {
     updateRun(id, patch) {
       const fields = [];
       const values = [];
-      for (const [key, column] of Object.entries({ status: "status", pid: "pid", providerSessionId: "provider_session_id", startedAt: "started_at", finishedAt: "finished_at", exitCode: "exit_code", error: "error", costUsd: "cost_usd", inputTokens: "input_tokens", outputTokens: "output_tokens", recoveryClass: "recovery_class", recoveryDecision: "recovery_decision" })) {
+      for (const [key, column] of Object.entries({ status: "status", pid: "pid", providerSessionId: "provider_session_id", startedAt: "started_at", finishedAt: "finished_at", exitCode: "exit_code", error: "error", costUsd: "cost_usd", inputTokens: "input_tokens", outputTokens: "output_tokens", recoveryClass: "recovery_class", recoveryDecision: "recovery_decision", transcriptOmitted: "transcript_omitted" })) {
         if (patch[key] === undefined) continue;
-        fields.push(`${column} = ?`); values.push(patch[key]);
+        fields.push(key === "transcriptOmitted" ? `${column} = MAX(${column}, ?)` : `${column} = ?`);
+        values.push(key === "transcriptOmitted" ? Number(Boolean(patch[key])) : patch[key]);
       }
       if (fields.length) db.prepare(`UPDATE runs SET ${fields.join(", ")} WHERE id = ?`).run(...values, id);
       return this.getRun(id);
@@ -955,19 +956,21 @@ export function createOutrightDatabase(options = {}) {
           try { message = this.upsertMessage(transcriptMessage); }
           catch (error) { if (error.statusCode !== 507) throw error; }
         }
-        const run = this.updateRun(id, patch);
+        // The terminal state and the evidence of its omitted final checkpoint
+        // must survive the same commit, including a crash immediately after it.
+        const run = this.updateRun(id, message || !transcriptMessage ? patch : { ...patch, transcriptOmitted: true });
         return { run, message };
       });
       return finish.immediate();
     },
     appendRunEvent(runId, type, payload) {
       const commit = db.transaction(() => {
-        const seq = db.prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM run_events WHERE run_id = ?").get(runId).seq;
+        const seq = db.prepare("SELECT COALESCE((SELECT last_seq FROM run_event_usage WHERE run_id = ?), 0) + 1 AS seq").get(runId).seq;
         const createdAt = now();
         const serialized = serializePayload(payload);
         const result = db.prepare("INSERT INTO run_events (run_id, seq, type, payload, created_at) VALUES (?, ?, ?, ?, ?)").run(runId, seq, type, serialized, createdAt);
-        db.prepare(`INSERT INTO run_event_usage (run_id, bytes) VALUES (?, ?)
-          ON CONFLICT(run_id) DO UPDATE SET bytes = bytes + excluded.bytes`).run(runId, Buffer.byteLength(serialized) + 128);
+        db.prepare(`INSERT INTO run_event_usage (run_id, bytes, last_seq) VALUES (?, ?, ?)
+          ON CONFLICT(run_id) DO UPDATE SET bytes = bytes + excluded.bytes, last_seq = excluded.last_seq`).run(runId, Buffer.byteLength(serialized) + 128, seq);
         // Replay is a bounded tail. Durable transcript checkpoints and run
         // rows remain separate, so pruning does not erase recovery evidence.
         let bytes = db.prepare("SELECT bytes FROM run_event_usage WHERE run_id = ?").get(runId).bytes;
@@ -1067,20 +1070,42 @@ function migrate(db) {
       worktree_path TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT 'medium', approval_policy TEXT NOT NULL, prompt TEXT NOT NULL,
       status TEXT NOT NULL, pid INTEGER, provider_session_id TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
       exit_code INTEGER, error TEXT, cost_usd REAL, input_tokens INTEGER, output_tokens INTEGER,
-      recovery_class TEXT, recovery_decision TEXT
+      recovery_class TEXT, recovery_decision TEXT, transcript_omitted INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS runs_conversation ON runs(conversation_id, created_at);
     CREATE TABLE IF NOT EXISTS run_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
       seq INTEGER NOT NULL, type TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL, UNIQUE(run_id, seq)
     );
-    CREATE TABLE IF NOT EXISTS run_event_usage (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, bytes INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS run_event_usage (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, bytes INTEGER NOT NULL, last_seq INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS trusted_projects (project_id TEXT PRIMARY KEY, project_path TEXT NOT NULL, trusted_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, target TEXT, details TEXT, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS prompt_templates (id TEXT PRIMARY KEY, title TEXT NOT NULL, prompt TEXT NOT NULL, created_at TEXT NOT NULL);
   `);
-  db.exec(`INSERT OR IGNORE INTO run_event_usage (run_id, bytes)
-    SELECT run_id, SUM(COALESCE(LENGTH(CAST(payload AS BLOB)), 0) + 128) FROM run_events GROUP BY run_id`);
+  // Old replay logs predate the tail limit. Trim them once before any read;
+  // later starts use counters maintained in the append transaction instead
+  // of scanning all retained events in a long-running installation.
+  db.exec("DROP TRIGGER IF EXISTS retained_hard_limit");
+  try { db.exec("ALTER TABLE run_event_usage ADD COLUMN last_seq INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
+  const needsLegacyEventMigration = db.pragma("user_version", { simple: true }) < 1;
+  if (needsLegacyEventMigration) db.transaction(() => {
+    db.exec(`INSERT INTO run_event_usage (run_id, bytes, last_seq)
+      SELECT run_id, SUM(COALESCE(LENGTH(CAST(payload AS BLOB)), 0) + 128), MAX(seq) FROM run_events GROUP BY run_id
+      ON CONFLICT(run_id) DO UPDATE SET bytes = excluded.bytes, last_seq = MAX(run_event_usage.last_seq, excluded.last_seq)`);
+    db.exec(`DELETE FROM run_events WHERE id IN (
+      SELECT id FROM (
+        SELECT id,
+          SUM(COALESCE(LENGTH(CAST(payload AS BLOB)), 0) + 128) OVER
+            (PARTITION BY run_id ORDER BY seq DESC ROWS UNBOUNDED PRECEDING) AS tail_bytes,
+          ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY seq DESC) AS tail_items
+        FROM run_events
+      ) WHERE tail_bytes > ${MAX_RUN_EVENT_RETAINED_BYTES} OR tail_items > 2000
+    )`);
+    db.exec(`UPDATE run_event_usage SET bytes = COALESCE((
+      SELECT SUM(COALESCE(LENGTH(CAST(payload AS BLOB)), 0) + 128)
+      FROM run_events WHERE run_id = run_event_usage.run_id
+    ), 0)`);
+  }).immediate();
   if (!db.pragma("table_info(messages)").some((column) => column.name === "search_order")) {
     db.exec("BEGIN IMMEDIATE");
     try {
@@ -1098,6 +1123,7 @@ function migrate(db) {
   try { db.exec("ALTER TABLE runs ADD COLUMN recovery_class TEXT"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN recovery_decision TEXT"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN worktree_path TEXT"); } catch { /* Already migrated. */ }
+  try { db.exec("ALTER TABLE runs ADD COLUMN transcript_omitted INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   // Terminal legacy rows no longer own execution and can use the
   // conversation's current target for history display. A pending or
   // interrupted legacy row may have started before its conversation moved;
@@ -1114,6 +1140,8 @@ function migrate(db) {
     db.exec("ALTER TABLE retained_usage ADD COLUMN legacy_ceiling INTEGER NOT NULL DEFAULT 0");
   }
   db.exec("INSERT OR IGNORE INTO retained_usage (id, bytes) VALUES (1, 0)");
+  // Existing triggers were compiled against the older runs column set.
+  db.exec("DROP TRIGGER IF EXISTS retained_runs_insert; DROP TRIGGER IF EXISTS retained_runs_update; DROP TRIGGER IF EXISTS retained_runs_delete");
   for (const [table, fields] of RETAINED_COLUMNS) {
     const size = (alias) => `128 + ${fields.split(", ").map((field) => `COALESCE(LENGTH(CAST(${alias}.${field} AS BLOB)), 0)`).join(" + ")}`;
     db.exec(`CREATE TRIGGER IF NOT EXISTS retained_${table}_insert AFTER INSERT ON ${table}
@@ -1134,6 +1162,7 @@ function migrate(db) {
   db.exec(`CREATE TRIGGER retained_hard_limit BEFORE UPDATE ON retained_usage
     WHEN NEW.bytes > MAX(COALESCE((SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'maxRetainedMiB'), ${DEFAULT_SETTINGS.maxRetainedMiB}) * 1048576, OLD.legacy_ceiling)
     BEGIN SELECT RAISE(ABORT, 'OUTRIGHT_RETAINED_LIMIT'); END`);
+  if (needsLegacyEventMigration) db.pragma("user_version = 1");
 }
 
 function reserveRecoveryHeadroom(db, configured = Number(db.prepare("SELECT value FROM settings WHERE key = 'maxRetainedMiB'").get()?.value ?? DEFAULT_SETTINGS.maxRetainedMiB) * 1024 * 1024) {

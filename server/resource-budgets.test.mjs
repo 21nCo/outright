@@ -174,6 +174,7 @@ test("aggregate retained history denies new work until eligible history is clean
       { id: `${admitted.id}:final`, conversationId: current.id, role: "assistant", kind: "text", body: "final".repeat(1024) });
     assert.equal(finished.run.status, "completed");
     assert.equal(finished.message, null, "terminal state commits when the aggregate budget omits its last output");
+    assert.equal(finished.run.transcriptOmitted, 1, "terminal refusal leaves durable omission evidence");
     assert.ok(database.capacity().retainedBytes <= 64 * 1024 * 1024);
     const admin = new Database(filename);
     try {
@@ -418,6 +419,31 @@ test("truncated output cannot spend terminal transition reserve at the quota edg
   } finally { database.close(); }
 });
 
+test("omission metadata survives terminal outcomes and restart at the retained quota edge", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-omission-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    database.updateSettings({ maxRetainedMiB: 64 });
+    const conversation = chat(database);
+    const runs = ["completed", "failed", "stopped"].map(() => database.createRun(runInput(conversation.id)));
+    database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+    for (const [index, status] of ["completed", "failed", "stopped"].entries()) {
+      const run = runs[index];
+      const result = database.finishRun(run.id, { status, finishedAt: new Date().toISOString() },
+        { id: `${run.id}:final`, conversationId: conversation.id, role: "assistant", body: "y".repeat(2 * 1024 * 1024) });
+      assert.equal(result.message, null);
+      assert.equal(result.run.transcriptOmitted, 1);
+    }
+    database.close();
+    database = createOutrightDatabase({ filename });
+    assert.deepEqual(runs.map((run) => database.getRun(run.id).transcriptOmitted), [1, 1, 1]);
+    assert.deepEqual(database.listRuns(conversation.id).map((run) => run.transcriptOmitted), [1, 1, 1]);
+    database.updateRun(runs[0].id, { transcriptOmitted: false });
+    assert.equal(database.getRun(runs[0].id).transcriptOmitted, 1, "later updates cannot clear omission evidence");
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("sustained event output retains a byte-bounded replay tail with monotonic cursors", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
@@ -442,11 +468,46 @@ test("legacy null event payloads migrate into the byte counter without blocking 
     const run = database.createRun(runInput(conversation.id));
     database.close();
     const legacy = new Database(filename);
+    legacy.pragma("user_version = 0");
     legacy.prepare("INSERT INTO run_events (run_id, seq, type, payload, created_at) VALUES (?, 1, 'legacy', NULL, ?)").run(run.id, new Date().toISOString());
     legacy.close();
     database = createOutrightDatabase({ filename });
     assert.equal(database.appendRunEvent(run.id, "new", { healthy: true }).seq, 2);
     assert.equal(database.listRunEvents(run.id).length, 2);
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("legacy oversized replay tails are pruned on reopen with monotonic run-detail cursors", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-legacy-events-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const conversation = chat(database);
+    const run = database.createRun(runInput(conversation.id));
+    const giant = database.createRun(runInput(conversation.id));
+    database.close();
+    const legacy = new Database(filename);
+    legacy.pragma("user_version = 0");
+    const insert = legacy.prepare("INSERT INTO run_events (run_id, seq, type, payload, created_at) VALUES (?, ?, 'legacy', ?, ?)");
+    const payload = JSON.stringify({ text: "x".repeat(256 * 1024) });
+    legacy.transaction(() => {
+      for (let seq = 1; seq <= 40; seq++) insert.run(run.id, seq, payload, new Date().toISOString());
+      insert.run(giant.id, 73, JSON.stringify({ text: "z".repeat(9 * 1024 * 1024) }), new Date().toISOString());
+    })();
+    legacy.close();
+    database = createOutrightDatabase({ filename });
+    const events = database.listRunEvents(run.id);
+    assert.equal(events.at(-1).seq, 40);
+    assert.ok(events[0].seq > 1, "pre-upgrade head was removed");
+    assert.ok(events.reduce((sum, event) => sum + Buffer.byteLength(JSON.stringify(event.payload)) + 128, 0) <= 8 * 1024 * 1024);
+    assert.deepEqual(database.listRunEvents(run.id, events[5].seq).map((event) => event.seq), events.slice(6).map((event) => event.seq));
+    assert.equal(database.appendRunEvent(run.id, "new", { value: 41 }).seq, 41);
+    assert.deepEqual(database.listRunEvents(giant.id), [], "one oversized legacy event cannot escape the tail cap");
+    assert.equal(database.appendRunEvent(giant.id, "new", { value: 74 }).seq, 74);
+    assert.deepEqual(database.listRunEvents(giant.id, 73).map((event) => event.seq), [74]);
+    database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.listRunEvents(run.id).at(-1).seq, 41);
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 

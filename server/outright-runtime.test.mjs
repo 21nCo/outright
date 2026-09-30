@@ -69,6 +69,37 @@ function withRuntime(fn, options = {}) {
   };
 }
 
+test("run detail pages a migrated oversized replay tail without returning pruned output", (() => {
+  let runId;
+  return withRuntime(async (runtime) => {
+    const first = responseCapture();
+    await runtime.handleRequest(requestStream("GET", `/api/runs/${runId}?after=0`), first);
+    assert.equal(first.statusCode, 200);
+    assert.ok(first.body.events[0].seq > 1);
+    assert.equal(first.body.events.at(-1).seq, 40);
+    assert.ok(Buffer.byteLength(first.raw) <= 8 * 1024 * 1024);
+    const cursor = first.body.events[5].seq;
+    const later = responseCapture();
+    await runtime.handleRequest(requestStream("GET", `/api/runs/${runId}?after=${cursor}`), later);
+    assert.equal(later.statusCode, 200);
+    assert.deepEqual(later.body.events.map((event) => event.seq), first.body.events.slice(6).map((event) => event.seq));
+  }, { seed(dataDirectory) {
+    const filename = path.join(dataDirectory, "outright.db");
+    const database = createOutrightDatabase({ filename });
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Legacy replay", provider: "codex" });
+    runId = database.createRun({ conversationId: chat.id, provider: "codex", approvalPolicy: "read-only", prompt: "work" }).id;
+    database.close();
+    const legacy = new Database(filename);
+    legacy.pragma("user_version = 0");
+    const insert = legacy.prepare("INSERT INTO run_events (run_id, seq, type, payload, created_at) VALUES (?, ?, 'legacy', ?, ?)");
+    const payload = JSON.stringify({ text: "x".repeat(256 * 1024) });
+    legacy.transaction(() => {
+      for (let seq = 1; seq <= 40; seq++) insert.run(runId, seq, payload, new Date().toISOString());
+    })();
+    legacy.close();
+  } });
+})());
+
 test("retention HTTP rejects invalid and future cutoffs without deleting fresh archived history", withRuntime(async (runtime) => {
   const chat = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Fresh archive", provider: "codex" });
   runtime.database.updateConversation(chat.id, { archived: true });

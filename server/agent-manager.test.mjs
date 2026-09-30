@@ -404,6 +404,42 @@ test("aggregate event refusal does not crash a streaming run", async () => {
   assert.equal(database.getRun("aggregate-stream-run").status, "completed");
 });
 
+test("quota-refused stdout, tool and assistant checkpoints leave run-level omission evidence", async () => {
+  for (const scenario of ["stdout", "tool", "tool-cancel", "assistant-message", "assistant-delta"]) {
+    const database = fakeDatabase();
+    const child = fakeChild();
+    const provider = scenario === "assistant-delta" ? "claude" : "codex";
+    const run = { ...codexRun(`quota-${scenario}`), provider };
+    database.createRun(run);
+    const full = Object.assign(new Error("Retained history is full"), { statusCode: 507 });
+    database.addMessage = () => { throw full; };
+    database.upsertMessage = () => { throw full; };
+    database.appendRunEventWithMessage = () => ({ event: null, message: null });
+    database.finishRun = (id, patch, transcriptMessage) => {
+      const next = { ...database.getRun(id), ...patch, transcriptOmitted: transcriptMessage ? true : database.getRun(id).transcriptOmitted };
+      database.runs.set(id, next);
+      return { run: next, message: null };
+    };
+    const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun(run.id) });
+    database.appendRunEvent = () => null;
+    const line = scenario === "stdout" ? null : scenario.startsWith("tool")
+      ? { type: "item.completed", item: { type: "command_execution", command: "echo hello" } }
+      : scenario === "assistant-message"
+        ? { type: "item.completed", item: { type: "agent_message", text: "answer" } }
+        : { type: "stream_event", event: { delta: { type: "text_delta", text: "answer" } } };
+    child.stdout.write(scenario === "stdout" ? "malformed output\n" : `${JSON.stringify(line)}\n`);
+    assert.equal(database.getRun(run.id).transcriptOmitted, true, `${scenario} omission is durable before process exit`);
+    if (scenario === "tool-cancel") {
+      const stopped = manager.stop(run.id);
+      child.emit("close", null, "SIGTERM");
+      await stopped;
+    } else child.emit("close", 0, null);
+    assert.equal(database.getRun(run.id).status, scenario === "tool-cancel" ? "stopped" : "completed");
+    assert.equal(database.getRun(run.id).transcriptOmitted, true);
+  }
+});
+
 test("a terminal run still notifies connected clients when its event cannot be retained", async () => {
   const database = fakeDatabase();
   const published = [];
