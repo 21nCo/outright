@@ -438,7 +438,7 @@ async function archivedSettingsSessionFenceRegression() {
   }
   root.render(<TooltipProvider><Fixture /></TooltipProvider>);
   const open = () => host.querySelector("button").click();
-  const close = () => [...document.querySelectorAll('[role="dialog"] button')].filter((button) => button.textContent.trim() === "Cancel").at(-1).click();
+  const close = () => [...document.querySelectorAll('[role="dialog"] button')].findLast((button) => button.textContent.trim() === "Cancel").click();
   const choose = (id) => document.querySelector(`.archived-history-list button[aria-label*="(${id})"]`).click();
   await until(() => host.querySelector("button")?.textContent === "Open archive session fixture", "archive session fixture mounted");
   open();
@@ -3959,6 +3959,12 @@ async function responsiveFocusRegression() {
       }
       await setWidth(1280);
       await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", `sidebar reopened after wide transition ${round + 1}`);
+      if (round === 0) {
+        // Chromium can remove focus after focus() succeeds during the sidebar
+        // layout transition. The owner must restore it without a new resize.
+        const focused = document.activeElement;
+        if (host.querySelector("#project-sidebar").contains(focused)) focused.blur();
+      }
       try {
         await until(() => host.querySelector("#project-sidebar").contains(document.activeElement) && visibleFocus(document.activeElement), `visible sidebar focus after wide transition ${round + 1}`);
       } catch (error) {

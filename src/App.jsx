@@ -844,8 +844,17 @@ export function App() {
         target.focus({ preventScroll: true });
         if (document.activeElement === target && target.getBoundingClientRect().width > 0) {
           sidebarFocusOwnerRef.current = intent;
-          sidebarFocusIntentRef.current = null;
-          sidebarFocusSourceRef.current = null;
+          // A breakpoint transition can blur this control after focus() has
+          // succeeded (notably while the sidebar finishes changing layout on
+          // macOS). Keep ownership until it survives the transition.
+          const timer = window.setTimeout(() => {
+            if (sidebarFocusIntentRef.current !== intent) return;
+            if (document.activeElement === target) {
+              sidebarFocusIntentRef.current = null;
+              sidebarFocusSourceRef.current = null;
+            } else if (document.activeElement === document.body) transfer();
+          }, 220);
+          cancelRetry = () => clearTimeout(timer);
           return;
         }
       }

@@ -15,7 +15,10 @@ import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.m
 export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000 }) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
-  const database = createOutrightDatabase({ runtimeLease: true });
+  const database = createOutrightDatabase({ runtimeLease: true, onMigrationComplete: () => {
+    agents.resumeQueued();
+    publish({ type: "capacity.changed", payload: database.capacity() });
+  } });
   // Completion markers are trusted recovery evidence. Secure their directory
   // before reconciliation reads any record, rather than waiting for the agent
   // manager to initialize after recovery has already classified pending rows.

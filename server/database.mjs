@@ -25,7 +25,9 @@ const MAX_RUN_EVENT_RETAINED_BYTES = RESOURCE_BUDGETS.maxRunEventBytes;
 const MAX_MESSAGE_PAGE_BYTES = 8 * 1024 * 1024;
 const MAX_INLINE_MESSAGE_BYTES = 64 * 1024;
 const FIND_SCAN_BYTES = 8 * 1024 * 1024;
-const FIND_CHUNK_BYTES = 64 * 1024;
+// Keep one synchronous fold small enough for responsive event delivery even
+// after earlier searches have increased heap pressure in a long session.
+const FIND_CHUNK_BYTES = 32 * 1024;
 const RETAINED_COLUMNS = [
   ["settings", "key, value"],
   ["project_groups", "id, name, created_at"],
@@ -74,6 +76,9 @@ export function createOutrightDatabase(options = {}) {
   const db = new Database(filename);
   let activeMessageFinds = 0;
   let closing = false;
+  let migrationTick;
+  let migrationRetry;
+  let migrationError = null;
   try {
     // A runtime keeps SQLite in exclusive locking mode for its whole lifetime.
     // The kernel releases this lease if the process crashes, so a second
@@ -89,6 +94,7 @@ export function createOutrightDatabase(options = {}) {
     db.pragma("foreign_keys = ON");
     db.pragma("busy_timeout = 5000");
     migrate(db);
+    advanceMigrations(db);
   } catch (error) {
     db.close();
     if (options.runtimeLease && ["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error?.code)) {
@@ -100,11 +106,30 @@ export function createOutrightDatabase(options = {}) {
     throw error;
   }
 
+  const continueMigrations = () => {
+    if (closing || !migrationPending(db)) return;
+    migrationTick = setImmediate(() => {
+      migrationTick = undefined;
+      if (closing) return;
+      try { advanceMigrations(db); migrationError = null; }
+      catch (error) {
+        migrationError = error;
+        options.onMigrationError?.(error);
+        migrationRetry = setTimeout(() => { migrationRetry = undefined; continueMigrations(); }, 1000);
+        return;
+      }
+      if (!migrationPending(db)) options.onMigrationComplete?.();
+      continueMigrations();
+    });
+  };
+  continueMigrations();
+
   // Optional retained-data writes use the shared SQLite byte counter. The
   // database trigger below is the final guard for every tracked table. Keep a
   // reserve for run state, recovery decisions and omission markers.
   const retainedReserveBytes = 1024 * 1024;
   function withinRetainedBudget(write, reserve = retainedReserveBytes) {
+    if (migrationPending(db)) throw databaseError(507, "Retained history is being migrated; retry when capacity is available");
     try { return db.transaction(() => {
       const before = retainedBytes(db);
       const result = write();
@@ -124,7 +149,7 @@ export function createOutrightDatabase(options = {}) {
   return {
     filename,
     launchDirectory,
-    close: () => { closing = true; db.close(); },
+    close: () => { closing = true; if (migrationTick) clearImmediate(migrationTick); if (migrationRetry) clearTimeout(migrationRetry); db.close(); },
     getSettings() {
       const rows = db.prepare("SELECT key, value FROM settings").all();
       return rows.reduce((settings, row) => {
@@ -135,6 +160,7 @@ export function createOutrightDatabase(options = {}) {
     },
     updateSettings(patch) {
       validateSettingsPatch(patch);
+      if (migrationPending(db)) throw databaseError(507, "Retained history is being migrated; retry when capacity is available");
       const statement = db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
       const update = db.transaction((entries) => {
         const before = retainedBytes(db);
@@ -160,10 +186,14 @@ export function createOutrightDatabase(options = {}) {
       const queued = db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status = 'queued'").get().count;
       const active = db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status IN ('launching', 'running')").get().count;
       const recoverable = db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status = 'interrupted' AND recovery_decision IS NULL").get().count;
-      const bytes = retainedBytes(db);
+      const measured = retainedMeasured(db);
+      const migrating = migrationPending(db);
+      const bytes = measured ? retainedBytes(db) : null;
       const maxRetainedBytes = settings.maxRetainedMiB * 1024 * 1024;
       return { queued, active, recoverable, retainedBytes: bytes,
-        availableForNewWorkBytes: Math.max(0, maxRetainedBytes - retainedReserveBytes - bytes), limits: {
+        retainedUsageStatus: measured ? "measured" : migrationError ? "error" : "measuring",
+        migrationStatus: migrationError ? "error" : migrating ? "migrating" : "ready",
+        availableForNewWorkBytes: measured && !migrating ? Math.max(0, maxRetainedBytes - retainedReserveBytes - bytes) : 0, limits: {
         maxQueuedRuns: settings.maxQueuedRuns, maxConcurrentRuns: settings.maxConcurrentRuns,
         maxRetainedBytes, reservedRetainedBytes: retainedReserveBytes, retentionDays: settings.retentionDays,
         maxRunTranscriptItems: RESOURCE_BUDGETS.maxRunTranscriptItems, maxRunTranscriptBytes: RESOURCE_BUDGETS.maxRunTranscriptBytes,
@@ -342,13 +372,15 @@ export function createOutrightDatabase(options = {}) {
       return this.getConversation(id);
     },
     listMessages(conversationId) {
+      assertMessageOrderReady(db);
       return db.prepare(`SELECT search_order AS searchOrder, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
-        FROM messages WHERE conversation_id = ? ORDER BY search_order`).all(conversationId).map(hydratePayload);
+        FROM messages WHERE conversation_id = ? AND search_order IS NOT NULL ORDER BY search_order`).all(conversationId).map(hydratePayload);
     },
     messageCount(conversationId) {
       return db.prepare("SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?").get(conversationId).count;
     },
     listMessagePage(conversationId, options = {}) {
+      assertMessageOrderReady(db);
       const limit = Math.max(1, Math.min(500, Number(options.limit) || 200));
       if (options.beforeId && options.afterId) throw databaseError(400, "Choose one message cursor");
       // Select a contiguous cursor window by stored byte lengths before any
@@ -362,15 +394,15 @@ export function createOutrightDatabase(options = {}) {
         const cursor = db.prepare("SELECT search_order AS rowid FROM messages WHERE conversation_id = ? AND id = ?").get(conversationId, options.beforeId);
         if (!cursor) throw databaseError(400, "Message cursor was not found");
         candidates = db.prepare(`SELECT ${candidateColumns}
-          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order < ? ORDER BY search_order DESC LIMIT ?`).all(conversationId, cursor.rowid, limit);
+          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order < ? ORDER BY search_order DESC LIMIT ?`).all(conversationId, cursor.rowid, limit);
       } else if (options.afterId) {
         const cursor = db.prepare("SELECT search_order AS rowid FROM messages WHERE conversation_id = ? AND id = ?").get(conversationId, options.afterId);
         if (!cursor) throw databaseError(400, "Message cursor was not found");
         candidates = db.prepare(`SELECT ${candidateColumns}
-          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order > ? ORDER BY search_order ASC LIMIT ?`).all(conversationId, cursor.rowid, limit);
+          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order > ? ORDER BY search_order ASC LIMIT ?`).all(conversationId, cursor.rowid, limit);
       } else {
         candidates = db.prepare(`SELECT ${candidateColumns}
-          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? ORDER BY search_order DESC LIMIT ?`).all(conversationId, limit);
+          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL ORDER BY search_order DESC LIMIT ?`).all(conversationId, limit);
       }
       let selectedBytes = 2048;
       const selected = [];
@@ -394,7 +426,7 @@ export function createOutrightDatabase(options = {}) {
           CASE WHEN COALESCE(LENGTH(CAST(payload AS BLOB)), 0) BETWEEN ? AND ? THEN CASE WHEN json_valid(payload) THEN json_extract(payload, '$.provider') END END AS provider,
           CASE WHEN COALESCE(LENGTH(CAST(payload AS BLOB)), 0) BETWEEN ? AND ? THEN CASE WHEN json_valid(payload) THEN json_extract(payload, '$.checkpointEventSeq') END END AS checkpointEventSeq,
           created_at AS createdAt
-          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order BETWEEN ? AND ? ORDER BY search_order`)
+          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order BETWEEN ? AND ? ORDER BY search_order`)
           .all(MAX_INLINE_MESSAGE_BYTES, MAX_INLINE_MESSAGE_BYTES / 2,
             MAX_INLINE_MESSAGE_BYTES, MAX_INLINE_MESSAGE_BYTES / 2, MAX_INLINE_MESSAGE_BYTES,
             MAX_INLINE_MESSAGE_BYTES + 1, MAX_MESSAGE_PAGE_BYTES,
@@ -421,7 +453,7 @@ export function createOutrightDatabase(options = {}) {
       }
       const total = db.prepare("SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?").get(conversationId).count;
       const oldestRowId = messages[0]?.searchOrder;
-      const olderCount = oldestRowId ? db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order < ?").get(conversationId, oldestRowId).count : options.afterId ? total : 0;
+      const olderCount = oldestRowId ? db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order < ?").get(conversationId, oldestRowId).count : options.afterId ? total : 0;
       const hasMore = olderCount > 0;
       const newerCount = Math.max(0, total - olderCount - messages.length);
       return {
@@ -431,6 +463,7 @@ export function createOutrightDatabase(options = {}) {
     },
     async findMessagePage(conversationId, query, afterId, direction = 1, signal,
       { originId = afterId, wrapped = false, byteOffset = 0, contextOffset = 0, leftContextOffset = 0, leftContextCased = null } = {}) {
+      assertMessageOrderReady(db);
       if (activeMessageFinds >= 8) throw databaseError(429, "Too many conversation searches; retry");
       activeMessageFinds += 1;
       try {
@@ -449,8 +482,8 @@ export function createOutrightDatabase(options = {}) {
         // Select identities and byte lengths first. Legacy bodies can exceed
         // the request budget, so each body is read in bounded BLOB sections.
         const columns = "search_order AS rowid, id, COALESCE(LENGTH(CAST(body AS BLOB)), 0) AS bodyBytes";
-        const batch = db.prepare(`SELECT ${columns} FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order ${comparison} ? ORDER BY search_order ${order} LIMIT 8`);
-        const wrappedBatch = origin && db.prepare(`SELECT ${columns} FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order ${comparison} ? AND search_order ${forward ? "<=" : ">="} ? ORDER BY search_order ${order} LIMIT 8`);
+        const batch = db.prepare(`SELECT ${columns} FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order ${comparison} ? ORDER BY search_order ${order} LIMIT 8`);
+        const wrappedBatch = origin && db.prepare(`SELECT ${columns} FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order ${comparison} ? AND search_order ${forward ? "<=" : ">="} ? ORDER BY search_order ${order} LIMIT 8`);
         const resumeRow = db.prepare(`SELECT ${columns} FROM messages WHERE conversation_id = ? AND id = ?`);
         const bodyChunk = db.prepare("SELECT SUBSTR(CAST(COALESCE(body, '') AS BLOB), ?, ?) AS bytes FROM messages WHERE conversation_id = ? AND id = ?");
         const foldedQuery = foldFindText(query);
@@ -619,7 +652,7 @@ export function createOutrightDatabase(options = {}) {
         // 200-row Find window can otherwise serialize hundreds of MiB even
         // though the search scan itself has an 8 MiB work limit.
         const sizes = `SELECT search_order AS rowid, id, COALESCE(LENGTH(CAST(body AS BLOB)), 0) + COALESCE(LENGTH(CAST(payload AS BLOB)), 0) + 512 AS bytes
-          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order`;
+          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order`;
         const olderCandidates = db.prepare(`${sizes} <= ? ORDER BY search_order DESC LIMIT 100`).all(conversationId, match.rowid);
         const newerCandidates = db.prepare(`${sizes} > ? ORDER BY search_order ASC LIMIT 100`).all(conversationId, match.rowid);
         if (olderCandidates[0]?.id !== match.id) return { matchId: null, messages: [], messagePage: null };
@@ -654,7 +687,7 @@ export function createOutrightDatabase(options = {}) {
           CASE WHEN COALESCE(LENGTH(CAST(payload AS BLOB)), 0) BETWEEN ? AND ? THEN CASE WHEN json_valid(payload) THEN json_extract(payload, '$.provider') END END AS provider,
           CASE WHEN COALESCE(LENGTH(CAST(payload AS BLOB)), 0) BETWEEN ? AND ? THEN CASE WHEN json_valid(payload) THEN json_extract(payload, '$.checkpointEventSeq') END END AS checkpointEventSeq,
           created_at AS createdAt
-          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order BETWEEN ? AND ? ORDER BY search_order`)
+          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order BETWEEN ? AND ? ORDER BY search_order`)
           .all(MAX_INLINE_MESSAGE_BYTES, MAX_INLINE_MESSAGE_BYTES / 2, MAX_INLINE_MESSAGE_BYTES, MAX_INLINE_MESSAGE_BYTES / 2,
             MAX_INLINE_MESSAGE_BYTES, MAX_INLINE_MESSAGE_BYTES + 1, MAX_MESSAGE_PAGE_BYTES,
             MAX_INLINE_MESSAGE_BYTES + 1, MAX_MESSAGE_PAGE_BYTES,
@@ -687,8 +720,8 @@ export function createOutrightDatabase(options = {}) {
             ? messages.shift() : messages.pop();
           serializedBytes -= Buffer.byteLength(JSON.stringify(removed)) + 1;
         }
-        const olderCount = db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order < ?").get(conversationId, messages[0].searchOrder).count;
-        const newerCount = db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order > ?").get(conversationId, messages.at(-1).searchOrder).count;
+        const olderCount = db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order < ?").get(conversationId, messages[0].searchOrder).count;
+        const newerCount = db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order > ?").get(conversationId, messages.at(-1).searchOrder).count;
         return { matchId: match.id, messages, messagePage: {
           hasMore: olderCount > 0, olderCount, hasLater: newerCount > 0, newerCount,
           total: olderCount + messages.length + newerCount, beforeId: messages[0].id, limit: 200,
@@ -748,6 +781,7 @@ export function createOutrightDatabase(options = {}) {
     },
     createRun(input) {
       const insert = db.transaction(() => {
+        if (migrationPending(db)) throw databaseError(507, "Retained history is being migrated; retry when capacity is available");
         const settings = this.getSettings();
         if (db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status = 'queued'").get().count >= settings.maxQueuedRuns) {
           throw databaseError(429, "Run queue is full; stop a queued run or wait for capacity");
@@ -979,6 +1013,7 @@ export function createOutrightDatabase(options = {}) {
       return finish.immediate();
     },
     appendRunEvent(runId, type, payload) {
+      if (migrationJob(db, "events")) return null;
       const commit = db.transaction(() => {
         const seq = db.prepare("SELECT COALESCE((SELECT last_seq FROM run_event_usage WHERE run_id = ?), 0) + 1 AS seq").get(runId).seq;
         const createdAt = now();
@@ -1020,6 +1055,7 @@ export function createOutrightDatabase(options = {}) {
       return commit.immediate();
     },
     listRunEvents(runId, after = 0) {
+      if (migrationJob(db, "events")) return [];
       const cursor = Number.isSafeInteger(Number(after)) && Number(after) >= 0 ? Number(after) : 0;
       return db.prepare("SELECT id, run_id AS runId, seq, type, payload, created_at AS createdAt FROM run_events WHERE run_id = ? AND seq > ? ORDER BY seq LIMIT 2000")
         .all(runId, cursor).map(hydratePayload);
@@ -1117,41 +1153,16 @@ function migrate(db) {
     CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, target TEXT, details TEXT, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS prompt_templates (id TEXT PRIMARY KEY, title TEXT NOT NULL, prompt TEXT NOT NULL, created_at TEXT NOT NULL);
   `);
-  // Old replay logs predate the tail limit. Trim them once before any read;
-  // later starts use counters maintained in the append transaction instead
-  // of scanning all retained events in a long-running installation.
   db.exec("DROP TRIGGER IF EXISTS retained_hard_limit");
   try { db.exec("ALTER TABLE run_event_usage ADD COLUMN last_seq INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
-  const needsLegacyEventMigration = db.pragma("user_version", { simple: true }) < 1;
-  if (needsLegacyEventMigration) db.transaction(() => {
-    db.exec(`INSERT INTO run_event_usage (run_id, bytes, last_seq)
-      SELECT run_id, SUM(COALESCE(LENGTH(CAST(payload AS BLOB)), 0) + 128), MAX(seq) FROM run_events GROUP BY run_id
-      ON CONFLICT(run_id) DO UPDATE SET bytes = excluded.bytes, last_seq = MAX(run_event_usage.last_seq, excluded.last_seq)`);
-    db.exec(`DELETE FROM run_events WHERE id IN (
-      SELECT id FROM (
-        SELECT id,
-          SUM(COALESCE(LENGTH(CAST(payload AS BLOB)), 0) + 128) OVER
-            (PARTITION BY run_id ORDER BY seq DESC ROWS UNBOUNDED PRECEDING) AS tail_bytes,
-          ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY seq DESC) AS tail_items
-        FROM run_events
-      ) WHERE tail_bytes > ${MAX_RUN_EVENT_RETAINED_BYTES} OR tail_items > 2000
-    )`);
-    db.exec(`UPDATE run_event_usage SET bytes = COALESCE((
-      SELECT SUM(COALESCE(LENGTH(CAST(payload AS BLOB)), 0) + 128)
-      FROM run_events WHERE run_id = run_event_usage.run_id
-    ), 0)`);
-  }).immediate();
-  if (!db.pragma("table_info(messages)").some((column) => column.name === "search_order")) {
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      db.exec("ALTER TABLE messages ADD COLUMN search_order INTEGER");
-      db.exec("UPDATE messages SET search_order = rowid");
-      db.exec("COMMIT");
-    } catch (error) { db.exec("ROLLBACK"); throw error; }
-  }
-  db.exec(`CREATE TRIGGER IF NOT EXISTS messages_search_order_insert AFTER INSERT ON messages
-    BEGIN UPDATE messages SET search_order = NEW.rowid WHERE rowid = NEW.rowid; END`);
-  db.exec("CREATE INDEX IF NOT EXISTS messages_search_order ON messages(conversation_id, search_order)");
+  const version = db.pragma("user_version", { simple: true });
+  db.exec(`CREATE TABLE IF NOT EXISTS migration_progress (
+    kind TEXT PRIMARY KEY, cursor_text TEXT, cursor_number INTEGER NOT NULL DEFAULT 0,
+    retained_bytes INTEGER NOT NULL DEFAULT 0, retained_items INTEGER NOT NULL DEFAULT 0,
+    max_seq INTEGER NOT NULL DEFAULT 0
+  )`);
+  if (version < 1) db.prepare("INSERT OR IGNORE INTO migration_progress (kind) VALUES ('events')").run();
+  prepareMessageOrderMigration(db);
   try { db.exec("ALTER TABLE conversations ADD COLUMN tab_position INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'medium'"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN pid INTEGER"); } catch { /* Already migrated. */ }
@@ -1159,48 +1170,169 @@ function migrate(db) {
   try { db.exec("ALTER TABLE runs ADD COLUMN recovery_decision TEXT"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN worktree_path TEXT"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN transcript_omitted INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
-  // Terminal legacy rows no longer own execution and can use the
-  // conversation's current target for history display. A pending or
-  // interrupted legacy row may have started before its conversation moved;
-  // leave that target unknown so it gates every worktree until recovery is
-  // resolved instead of guessing a path that could release the real checkout.
-  db.exec(`UPDATE runs SET worktree_path = (SELECT worktree_path FROM conversations WHERE conversations.id = runs.conversation_id)
+  // Unresolved legacy runs retain unknown launch targets so they gate every
+  // worktree until recovery resolves their ownership.
+  if (version < 2) db.exec(`UPDATE runs SET worktree_path = (SELECT worktree_path FROM conversations WHERE conversations.id = runs.conversation_id)
     WHERE worktree_path IS NULL AND status IN ('completed', 'failed', 'stopped')`);
   db.exec("CREATE INDEX IF NOT EXISTS runs_worktree_recovery ON runs(worktree_path, status, recovery_decision, created_at)");
-  // Rebuild once at startup for legacy databases, then maintain in the same
-  // SQLite transaction as every write and cascade. Admission stays O(1) as
-  // transcript history grows over long sessions.
-  db.exec("CREATE TABLE IF NOT EXISTS retained_usage (id INTEGER PRIMARY KEY CHECK(id = 1), bytes INTEGER NOT NULL, legacy_ceiling INTEGER NOT NULL DEFAULT 0)");
+  prepareRetainedMeasurement(db, version);
+  reserveRecoveryHeadroom(db);
+  db.exec(`CREATE TRIGGER retained_hard_limit BEFORE UPDATE ON retained_usage
+    WHEN OLD.measured = 1 AND NEW.bytes > MAX(COALESCE((SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'maxRetainedMiB'), ${DEFAULT_SETTINGS.maxRetainedMiB}) * 1048576, OLD.legacy_ceiling)
+    BEGIN SELECT RAISE(ABORT, 'OUTRIGHT_RETAINED_LIMIT'); END`);
+  if (!migrationPending(db)) db.pragma("user_version = 3");
+}
+
+function prepareMessageOrderMigration(db) {
+  if (!db.pragma("table_info(messages)").some((column) => column.name === "search_order")) {
+    db.transaction(() => {
+      db.exec("ALTER TABLE messages ADD COLUMN search_order INTEGER");
+      db.prepare("INSERT OR IGNORE INTO migration_progress (kind) VALUES ('messages')").run();
+    }).immediate();
+  }
+  db.exec(`CREATE TRIGGER IF NOT EXISTS messages_search_order_insert AFTER INSERT ON messages
+    BEGIN UPDATE messages SET search_order = NEW.rowid WHERE rowid = NEW.rowid; END`);
+  // A partial index starts empty for legacy rows and fills with each bounded
+  // backfill batch. Building a full index on the old table would block startup.
+  db.exec("CREATE INDEX IF NOT EXISTS messages_search_order ON messages(conversation_id, search_order) WHERE search_order IS NOT NULL");
+}
+
+function prepareRetainedMeasurement(db, version) {
+  db.exec("CREATE TABLE IF NOT EXISTS retained_usage (id INTEGER PRIMARY KEY CHECK(id = 1), bytes INTEGER NOT NULL, legacy_ceiling INTEGER NOT NULL DEFAULT 0, measured INTEGER NOT NULL DEFAULT 0)");
   if (!db.pragma("table_info(retained_usage)").some((column) => column.name === "legacy_ceiling")) {
     db.exec("ALTER TABLE retained_usage ADD COLUMN legacy_ceiling INTEGER NOT NULL DEFAULT 0");
   }
-  const counterCreated = db.prepare("INSERT OR IGNORE INTO retained_usage (id, bytes) VALUES (1, 0)").run().changes > 0;
-  // Version 2 records the retained column set and trigger formula. Existing
-  // counters from older versions need one reconciliation after schema changes;
-  // subsequent opens trust transactionally maintained usage.
-  const needsRetainedMeasure = counterCreated || db.pragma("user_version", { simple: true }) < 2;
-  // Existing triggers were compiled against the older runs column set.
-  db.exec("DROP TRIGGER IF EXISTS retained_runs_insert; DROP TRIGGER IF EXISTS retained_runs_update; DROP TRIGGER IF EXISTS retained_runs_delete");
-  for (const [table, fields] of RETAINED_COLUMNS) {
-    const size = (alias) => retainedSizeExpression(fields, `${alias}.`);
-    db.exec(`CREATE TRIGGER IF NOT EXISTS retained_${table}_insert AFTER INSERT ON ${table}
-      BEGIN UPDATE retained_usage SET bytes = bytes + (${size("NEW")}) WHERE id = 1; END`);
-    db.exec(`CREATE TRIGGER IF NOT EXISTS retained_${table}_update AFTER UPDATE ON ${table}
-      BEGIN UPDATE retained_usage SET bytes = bytes + (${size("NEW")}) - (${size("OLD")}) WHERE id = 1; END`);
-    db.exec(`CREATE TRIGGER IF NOT EXISTS retained_${table}_delete AFTER DELETE ON ${table}
-      BEGIN UPDATE retained_usage SET bytes = bytes - (${size("OLD")}) WHERE id = 1; END`);
+  if (!db.pragma("table_info(retained_usage)").some((column) => column.name === "measured")) {
+    db.exec("ALTER TABLE retained_usage ADD COLUMN measured INTEGER NOT NULL DEFAULT 0");
   }
-  // A pre-budget database may already exceed the saved limit. Recovery
-  // headroom scales with the existing unsettled rows; optional writes still
-  // use the ordinary configured limit and cleanup clears this allowance.
-  db.exec("DROP TRIGGER IF EXISTS retained_hard_limit");
-  const configured = Number(db.prepare("SELECT value FROM settings WHERE key = 'maxRetainedMiB'").get()?.value ?? DEFAULT_SETTINGS.maxRetainedMiB) * 1024 * 1024;
-  if (needsRetainedMeasure) db.prepare("UPDATE retained_usage SET bytes = ? WHERE id = 1").run(calculateRetainedBytes(db));
-  reserveRecoveryHeadroom(db, configured);
-  db.exec(`CREATE TRIGGER retained_hard_limit BEFORE UPDATE ON retained_usage
-    WHEN NEW.bytes > MAX(COALESCE((SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'maxRetainedMiB'), ${DEFAULT_SETTINGS.maxRetainedMiB}) * 1048576, OLD.legacy_ceiling)
-    BEGIN SELECT RAISE(ABORT, 'OUTRIGHT_RETAINED_LIMIT'); END`);
-  if (needsRetainedMeasure) db.pragma("user_version = 2");
+  const counterCreated = db.prepare("INSERT OR IGNORE INTO retained_usage (id, bytes) VALUES (1, 0)").run().changes > 0;
+  db.exec("CREATE TABLE IF NOT EXISTS retained_scans (table_name TEXT PRIMARY KEY, cursor INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0)");
+  if (version >= 2 && !counterCreated && !db.prepare("SELECT 1 FROM retained_scans LIMIT 1").get()) {
+    db.prepare("UPDATE retained_usage SET measured = 1 WHERE id = 1").run();
+  } else if (!db.prepare("SELECT 1 FROM retained_scans LIMIT 1").get()) {
+    db.transaction(() => {
+      db.prepare("UPDATE retained_usage SET bytes = 0, measured = 0 WHERE id = 1").run();
+      const insert = db.prepare("INSERT INTO retained_scans (table_name) VALUES (?)");
+      for (const [table] of RETAINED_COLUMNS) insert.run(table);
+    }).immediate();
+  }
+  installRetainedTriggers(db);
+}
+
+function installRetainedTriggers(db) {
+  for (const [table, fields] of RETAINED_COLUMNS) {
+    for (const action of ["insert", "update", "delete"]) db.exec(`DROP TRIGGER IF EXISTS retained_${table}_${action}`);
+    const counted = (alias) => `(measured = 1 OR COALESCE((SELECT done FROM retained_scans WHERE table_name = '${table}'), 0) = 1
+      OR ${alias}.rowid <= COALESCE((SELECT cursor FROM retained_scans WHERE table_name = '${table}'), 0))`;
+    const size = (alias) => retainedSizeExpression(fields, `${alias}.`);
+    db.exec(`CREATE TRIGGER retained_${table}_insert AFTER INSERT ON ${table}
+      BEGIN UPDATE retained_usage SET bytes = bytes + (${size("NEW")}) WHERE id = 1 AND ${counted("NEW")}; END`);
+    db.exec(`CREATE TRIGGER retained_${table}_update AFTER UPDATE ON ${table}
+      BEGIN UPDATE retained_usage SET bytes = bytes + (${size("NEW")}) - (${size("OLD")}) WHERE id = 1 AND ${counted("OLD")}; END`);
+    db.exec(`CREATE TRIGGER retained_${table}_delete AFTER DELETE ON ${table}
+      BEGIN UPDATE retained_usage SET bytes = bytes - (${size("OLD")}) WHERE id = 1 AND ${counted("OLD")}; END`);
+  }
+}
+
+function migrationJob(db, kind) {
+  return db.prepare("SELECT * FROM migration_progress WHERE kind = ?").get(kind);
+}
+
+function migrationPending(db) {
+  return Boolean(db.prepare("SELECT 1 FROM migration_progress LIMIT 1").get()
+    || db.prepare("SELECT 1 FROM retained_scans WHERE done = 0 LIMIT 1").get());
+}
+
+function retainedMeasured(db) {
+  return db.prepare("SELECT measured FROM retained_usage WHERE id = 1").get().measured === 1;
+}
+
+function assertMessageOrderReady(db) {
+  if (migrationJob(db, "messages")) throw databaseError(503, "Conversation history is being indexed; retry shortly");
+}
+
+// One tick visits at most 64 rows in each migration family and retained
+// table. Cursors and byte adjustments commit together, so an interrupted
+// upgrade resumes without recounting old rows or dropping live writes.
+function advanceMigrations(db) {
+  if (!migrationPending(db)) return;
+  for (let step = 0; step < 4 && migrationJob(db, "events"); step += 1) advanceEventMigration(db);
+  advanceMessageMigration(db);
+  advanceRetainedMigration(db);
+  if (!migrationPending(db)) db.pragma("user_version = 3");
+}
+
+function advanceEventMigration(db) {
+  const job = migrationJob(db, "events");
+  if (!job) return;
+  db.transaction(() => {
+    let runId = job.cursor_text;
+    let cursor = job.cursor_number;
+    let bytes = job.retained_bytes;
+    let items = job.retained_items;
+    let maxSeq = job.max_seq;
+    if (!cursor) {
+      const next = db.prepare("SELECT run_id FROM run_events WHERE run_id > ? GROUP BY run_id ORDER BY run_id LIMIT 1").get(runId ?? "");
+      if (!next) { db.prepare("DELETE FROM migration_progress WHERE kind = 'events'").run(); return; }
+      runId = next.run_id;
+      maxSeq = db.prepare("SELECT MAX(seq) AS seq FROM run_events WHERE run_id = ?").get(runId).seq;
+      cursor = maxSeq + 1;
+      bytes = 0;
+      items = 0;
+    }
+    const rows = db.prepare(`SELECT id, seq, COALESCE(octet_length(payload), 0) + 128 AS size
+      FROM run_events WHERE run_id = ? AND seq < ? ORDER BY seq DESC LIMIT 64`).all(runId, cursor);
+    const remove = db.prepare("DELETE FROM run_events WHERE id = ?");
+    for (const row of rows) {
+      if (bytes + row.size > MAX_RUN_EVENT_RETAINED_BYTES || items >= 2000) remove.run(row.id);
+      else { bytes += row.size; items += 1; }
+    }
+    if (rows.length < 64) {
+      if (db.prepare("SELECT 1 FROM runs WHERE id = ?").get(runId)) {
+        db.prepare(`INSERT INTO run_event_usage (run_id, bytes, last_seq) VALUES (?, ?, ?)
+          ON CONFLICT(run_id) DO UPDATE SET bytes = excluded.bytes, last_seq = MAX(run_event_usage.last_seq, excluded.last_seq)`)
+          .run(runId, bytes, maxSeq);
+      }
+      db.prepare(`UPDATE migration_progress SET cursor_text = ?, cursor_number = 0,
+        retained_bytes = 0, retained_items = 0, max_seq = 0 WHERE kind = 'events'`).run(runId);
+    } else {
+      db.prepare(`UPDATE migration_progress SET cursor_text = ?, cursor_number = ?,
+        retained_bytes = ?, retained_items = ?, max_seq = ? WHERE kind = 'events'`)
+        .run(runId, rows.at(-1).seq, bytes, items, maxSeq);
+    }
+  }).immediate();
+}
+
+function advanceMessageMigration(db) {
+  const job = migrationJob(db, "messages");
+  if (!job) return;
+  db.transaction(() => {
+    const rows = db.prepare("SELECT rowid AS scanRowId FROM messages WHERE rowid > ? ORDER BY rowid LIMIT 64").all(job.cursor_number);
+    const update = db.prepare("UPDATE messages SET search_order = rowid WHERE rowid = ? AND search_order IS NULL");
+    for (const row of rows) update.run(row.scanRowId);
+    if (rows.length < 64) db.prepare("DELETE FROM migration_progress WHERE kind = 'messages'").run();
+    else db.prepare("UPDATE migration_progress SET cursor_number = ? WHERE kind = 'messages'").run(rows.at(-1).scanRowId);
+  }).immediate();
+}
+
+function advanceRetainedMigration(db) {
+  if (retainedMeasured(db)) return;
+  db.transaction(() => {
+    for (const [table, fields] of RETAINED_COLUMNS) {
+      const scan = db.prepare("SELECT cursor, done FROM retained_scans WHERE table_name = ?").get(table);
+      if (!scan || scan.done) continue;
+      const rows = db.prepare(`SELECT rowid AS scanRowId, ${retainedSizeExpression(fields)} AS bytes FROM ${table} WHERE rowid > ? ORDER BY rowid LIMIT 64`).all(scan.cursor);
+      const bytes = rows.reduce((total, row) => total + row.bytes, 0);
+      db.prepare("UPDATE retained_usage SET bytes = bytes + ? WHERE id = 1").run(bytes);
+      db.prepare("UPDATE retained_scans SET cursor = ?, done = ? WHERE table_name = ?")
+        .run(rows.at(-1)?.scanRowId ?? scan.cursor, Number(rows.length < 64), table);
+    }
+    if (!db.prepare("SELECT 1 FROM retained_scans WHERE done = 0 LIMIT 1").get()) {
+      reserveRecoveryHeadroom(db);
+      db.prepare("UPDATE retained_usage SET measured = 1 WHERE id = 1").run();
+      db.prepare("DELETE FROM retained_scans").run();
+    }
+  }).immediate();
 }
 
 function reserveRecoveryHeadroom(db, configured = Number(db.prepare("SELECT value FROM settings WHERE key = 'maxRetainedMiB'").get()?.value ?? DEFAULT_SETTINGS.maxRetainedMiB) * 1024 * 1024) {
@@ -1255,11 +1387,8 @@ function now() { return new Date().toISOString(); }
 function retainedBytes(db) {
   return db.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes;
 }
-function calculateRetainedBytes(db) {
-  return RETAINED_COLUMNS.reduce((total, [table, fields]) => total + db.prepare(`SELECT COALESCE(SUM(${retainedSizeExpression(fields)}), 0) AS bytes FROM ${table}`).get().bytes, 0);
-}
 function retainedSizeExpression(fields, prefix = "") {
-  return `128 + ${fields.split(", ").map((field) => "COALESCE(LENGTH(CAST(" + prefix + field + " AS BLOB)), 0)").join(" + ")}`;
+  return `128 + ${fields.split(", ").map((field) => "COALESCE(octet_length(" + prefix + field + "), 0)").join(" + ")}`;
 }
 function preparePrivateLaunchDirectory(directory) {
   if (!directory || !path.isAbsolute(directory)) throw new Error("A private absolute launch directory is required");

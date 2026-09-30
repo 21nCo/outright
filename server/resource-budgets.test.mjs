@@ -135,11 +135,146 @@ test("retained counter is measured on upgrade and trusted on populated restart",
     assert.equal(database.capacity().retainedBytes, measured, "legacy counter is reconciled once");
     database.close();
     const admin = new Database(filename);
-    assert.equal(admin.pragma("user_version", { simple: true }), 2);
+    assert.equal(admin.pragma("user_version", { simple: true }), 3);
     admin.prepare("UPDATE retained_usage SET bytes = bytes + 17 WHERE id = 1").run();
     admin.close();
     database = createOutrightDatabase({ filename });
     assert.equal(database.capacity().retainedBytes, measured + 17, "versioned startup does not rescan populated history");
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("large legacy backfills resume after interruption without admitting new work or losing recovery", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-bounded-upgrade-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const conversation = chat(database);
+    const run = database.createRun(runInput(conversation.id));
+    database.close();
+    const legacy = new Database(filename);
+    legacy.exec("DROP TRIGGER messages_search_order_insert; DROP INDEX messages_search_order; ALTER TABLE messages DROP COLUMN search_order");
+    const insertMessage = legacy.prepare("INSERT INTO messages (id, conversation_id, role, kind, body, created_at) VALUES (?, ?, 'assistant', 'text', ?, ?)");
+    const insertEvent = legacy.prepare("INSERT INTO run_events (run_id, seq, type, payload, created_at) VALUES (?, ?, 'tool.output', ?, ?)");
+    legacy.transaction(() => {
+      for (let index = 1; index <= 600; index += 1) insertMessage.run(`legacy-${index}`, conversation.id, `message ${index} ` + "m".repeat(4096), "2026-01-01T00:00:00.000Z");
+      for (let seq = 1; seq <= 500; seq += 1) insertEvent.run(run.id, seq, JSON.stringify({ text: "e".repeat(20 * 1024) }), "2026-01-01T00:00:00.000Z");
+      legacy.pragma("user_version = 0");
+      legacy.prepare("UPDATE retained_usage SET bytes = 1, measured = 0 WHERE id = 1").run();
+    })();
+    legacy.close();
+
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.capacity().retainedUsageStatus, "measuring", "startup exposes unknown usage before a full scan");
+    assert.equal(database.capacity().migrationStatus, "migrating");
+    assert.equal(database.capacity().retainedBytes, null);
+    assert.equal(database.capacity().availableForNewWorkBytes, 0);
+    assert.throws(() => database.createRun(runInput(conversation.id)), (error) => error.statusCode === 507);
+    assert.throws(() => database.listMessagePage(conversation.id), (error) => error.statusCode === 503);
+    assert.equal(database.appendRunEvent(run.id, "new", { text: "deferred" }), null);
+    database.updateRun(run.id, { status: "failed", error: "Recovered while history was measured" });
+    assert.equal(database.getRun(run.id).status, "failed");
+    database.close();
+
+    const interrupted = new Database(filename);
+    assert.ok(interrupted.prepare("SELECT cursor FROM retained_scans WHERE table_name = 'messages'").get().cursor > 0);
+    assert.ok(interrupted.prepare("SELECT cursor_number FROM migration_progress WHERE kind = 'messages'").get().cursor_number > 0);
+    interrupted.close();
+    let migrationCompletions = 0;
+    database = createOutrightDatabase({ filename, onMigrationComplete: () => { migrationCompletions += 1; } });
+    const deadline = Date.now() + 10_000;
+    while (database.capacity().retainedUsageStatus !== "measured" || database.listRunEvents(run.id).length === 0) {
+      if (Date.now() >= deadline) {
+        const probe = new Database(filename);
+        const state = { jobs: probe.prepare("SELECT * FROM migration_progress").all(), scans: probe.prepare("SELECT * FROM retained_scans").all(), capacity: database.capacity() };
+        probe.close();
+        assert.fail(`bounded migration did not finish: ${JSON.stringify(state)}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(database.messageCount(conversation.id), 600);
+    assert.equal(database.capacity().migrationStatus, "ready");
+    assert.equal(database.listMessagePage(conversation.id, { limit: 2 }).messages.at(-1).id, "legacy-600");
+    const events = database.listRunEvents(run.id);
+    assert.equal(events.at(-1).seq, 500);
+    assert.ok(events[0].seq > 1 && events.reduce((sum, event) => sum + Buffer.byteLength(JSON.stringify(event.payload)) + 128, 0) <= 8 * 1024 * 1024);
+    assert.equal(database.appendRunEvent(run.id, "new", { text: "resumed" }).seq, 501);
+    assert.equal(database.getRun(run.id).status, "failed");
+    assert.equal(migrationCompletions, 1, "queued work gets one completion wakeup");
+    const measured = database.capacity().retainedBytes;
+    const sizeProbe = new Database(filename);
+    const payloadBytes = sizeProbe.prepare("SELECT COALESCE(SUM(octet_length(payload)), 0) AS bytes FROM run_events").get().bytes;
+    const bodyBytes = sizeProbe.prepare("SELECT COALESCE(SUM(octet_length(body)), 0) AS bytes FROM messages").get().bytes;
+    sizeProbe.close();
+    assert.ok(measured >= payloadBytes + bodyBytes && measured < payloadBytes + bodyBytes + 1024 * 1024,
+      "completed counter matches retained payloads without recounting interrupted batches");
+    database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.capacity().retainedBytes, measured, "completed accounting persists across restart");
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("legacy event migration survives deletion of its current archived run", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-event-cleanup-upgrade-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const conversation = chat(database);
+    const run = database.createRun(runInput(conversation.id));
+    database.updateRun(run.id, { status: "completed" });
+    database.updateConversation(conversation.id, { archived: true });
+    database.close();
+    const legacy = new Database(filename);
+    const insert = legacy.prepare("INSERT INTO run_events (run_id, seq, type, payload, created_at) VALUES (?, ?, 'tool.output', ?, ?)");
+    legacy.transaction(() => {
+      for (let seq = 1; seq <= 400; seq += 1) insert.run(run.id, seq, JSON.stringify({ text: "x".repeat(1024) }), "2026-01-01T00:00:00.000Z");
+      legacy.pragma("user_version = 0");
+    })();
+    legacy.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.capacity().retainedUsageStatus, "measuring");
+    assert.equal(database.deleteArchivedConversation(conversation.id, conversation.id).deleted, 1);
+    const deadline = Date.now() + 10_000;
+    while (true) {
+      const probe = new Database(filename);
+      const pending = Boolean(probe.prepare("SELECT 1 FROM migration_progress LIMIT 1").get());
+      probe.close();
+      if (database.capacity().retainedUsageStatus === "measured" && !pending) break;
+      assert.ok(Date.now() < deadline, "cleanup left migration pending");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(database.getRun(run.id), undefined);
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("measured bytes do not reopen admission before legacy event cursors finish", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-event-admission-upgrade-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const conversation = chat(database);
+    database.close();
+    const legacy = new Database(filename);
+    legacy.prepare(`WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 200)
+      INSERT INTO runs (id, conversation_id, worktree_path, provider, approval_policy, prompt, status, created_at)
+      SELECT printf('legacy-%04d', n), ?, '/tmp/w', 'codex', 'read-only', 'work', 'completed', '2026-01-01T00:00:00.000Z' FROM seq`).run(conversation.id);
+    legacy.exec(`INSERT INTO run_events (run_id, seq, type, payload, created_at)
+      SELECT id, 1, 'legacy', '{}', '2026-01-01T00:00:00.000Z' FROM runs WHERE id LIKE 'legacy-%'`);
+    legacy.pragma("user_version = 0");
+    legacy.close();
+    database = createOutrightDatabase({ filename });
+    const deadline = Date.now() + 10_000;
+    while (database.capacity().retainedUsageStatus !== "measured") {
+      assert.ok(Date.now() < deadline, "retained scan did not complete");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(database.capacity().migrationStatus, "migrating", "event cursors outlast the byte scan");
+    assert.equal(database.capacity().availableForNewWorkBytes, 0);
+    assert.throws(() => database.createRun(runInput(conversation.id)), (error) => error.statusCode === 507);
+    while (database.capacity().migrationStatus !== "ready") {
+      assert.ok(Date.now() < deadline, "event migration did not complete");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(database.createRun(runInput(conversation.id)).status, "queued");
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
