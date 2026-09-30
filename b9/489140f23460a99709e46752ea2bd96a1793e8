@@ -1,0 +1,16 @@
+src/components/TerminalPane.jsx
+  h_a39f9495f9ec1d 1,18,60-61,71,78,81-87,163
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 1373,1380-1386,1403-1405,1407,4145-4159,4161-4185,4187-4192
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b9489140f23460a99709e46752ea2bd96a1793e8",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
