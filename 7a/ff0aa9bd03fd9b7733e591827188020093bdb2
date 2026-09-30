@@ -1,0 +1,26 @@
+server/archive-delete-worker.mjs
+  h_a39f9495f9ec1d 4,18-21,30-36
+server/database.mjs
+  h_a39f9495f9ec1d 90,95-96,1177-1182,1230,1247,1308,1310-1319
+server/outright-runtime.mjs
+  h_a39f9495f9ec1d 15,18,594-596
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 259-300
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 888-929
+src/components/TerminalPane.jsx
+  h_a39f9495f9ec1d 153,155-172
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 1398-1411
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7aff0aa9bd03fd9b7733e591827188020093bdb2",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
