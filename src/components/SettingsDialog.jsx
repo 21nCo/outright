@@ -25,9 +25,10 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
   const restorePageFocusRef = useRef(false);
   const archivedRequestRef = useRef(0);
   const archiveSessionRef = useRef(0);
+  const openedSettingsRef = useRef(settings);
   // A bootstrap refresh can replace settings while the dialog is open.
   // Only opening the dialog starts a new editing session.
-  useEffect(() => { if (open) setDraft(settings); }, [open]);
+  useEffect(() => { if (open) { openedSettingsRef.current = settings; setDraft(settings); } }, [open]);
   useLayoutEffect(() => { archiveSessionRef.current += 1; }, [open]);
   useEffect(() => { if (open) { setCleanupResult(null); setPendingDelete(null); setDeleting(false); setLoadingArchived(false); } }, [open]);
   useLayoutEffect(() => {
@@ -88,7 +89,17 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
     } finally { if (session === archiveSessionRef.current) setLoadingArchived(false); }
   }
   async function save() {
-    try { onSaved(await api("/api/settings", { method: "PATCH", body: draft })); onOpenChange(false); }
+    // PATCH only fields this session edited. Another Settings session may have
+    // tightened a quota or execution policy since this draft was opened.
+    const patch = Object.fromEntries(Object.entries(draft).filter(([key, value]) =>
+      value !== openedSettingsRef.current[key]));
+    try {
+      const updated = Object.keys(patch).length
+        ? await api("/api/settings", { method: "PATCH", body: patch })
+        : await api("/api/settings");
+      onSaved(updated);
+      onOpenChange(false);
+    }
     catch (error) { onError(error); }
   }
   async function saveTemplate() {

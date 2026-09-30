@@ -828,9 +828,13 @@ export function App() {
     const intent = sidebarFocusIntentRef.current;
     if (!intent || (intent === "opener" && sidebarOpen) || (intent === "sidebar" && !sidebarOpen)) return;
     let cancelRetry = () => {};
-    const deadline = performance.now() + 3_000;
+    // A loaded browser can delay the first animation frame beyond a wall-clock
+    // deadline. Count delivered opportunities instead of elapsed time.
+    let attempts = 0;
+    const maxAttempts = 30;
     const transfer = () => {
       if (sidebarFocusIntentRef.current !== intent) return;
+      attempts += 1;
       const target = intent === "opener" ? document.querySelector('[aria-label="Open projects sidebar"]')
         : sidebarRef.current?.querySelector('button:not(:disabled)');
       const active = document.activeElement;
@@ -853,13 +857,14 @@ export function App() {
           let timer;
           const checkFocus = () => {
             if (sidebarFocusIntentRef.current !== intent) return;
+            attempts += 1;
             if (document.activeElement === target) {
-              if (performance.now() < deadline) timer = window.setTimeout(checkFocus, 100);
+              if (attempts < maxAttempts) timer = window.setTimeout(checkFocus, 100);
               else {
                 sidebarFocusIntentRef.current = null;
                 sidebarFocusSourceRef.current = null;
               }
-            } else if (document.activeElement === document.body && performance.now() < deadline) transfer();
+            } else if (document.activeElement === document.body && attempts < maxAttempts) transfer();
             else {
               sidebarFocusIntentRef.current = null;
               sidebarFocusSourceRef.current = null;
@@ -870,7 +875,7 @@ export function App() {
           return;
         }
       }
-      if (performance.now() < deadline) {
+      if (attempts < maxAttempts) {
         let pending = true;
         let frame;
         let timer;
@@ -1716,7 +1721,7 @@ export function App() {
     </main>
 
     <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} projects={bootstrap.projects} onSelectProject={chooseProject} onSelectConversation={(item) => { const nextProject = bootstrap.projects.find((entry) => entry.id === item.projectId); const nextWorktree = nextProject?.worktrees.find((entry) => entry.id === item.worktreeId); if (nextProject && nextWorktree) { pendingConversationRef.current = item.id; chooseProject(nextProject, nextWorktree); } }} />
-    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} runtimeEvent={runtimeEvent} onSaved={(nextSettings, refresh) => { if (refresh !== "history") { setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") { Promise.resolve(Notification.requestPermission()).catch(() => {}); } } if (refresh) refreshAll(refresh === true); }} onError={handleError} />
+    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} runtimeEvent={runtimeEvent} onSaved={(nextSettings, refresh) => { if (refresh !== "history") { setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") { try { void Notification.requestPermission().catch(() => {}); } catch { /* Older browsers may reject the call synchronously. */ } } } if (refresh) refreshAll(refresh === true); }} onError={handleError} />
 
     <SimpleDialog open={newChatOpen} onOpenChange={setNewChatOpen} title="New agent chat" description={`${project.name} / ${worktree.name}`} onSubmit={(event) => { event.preventDefault(); createConversation(); }} submit="Create chat"><label htmlFor="chat-title">What should the agent work on?</label><Input id="chat-title" autoFocus value={newChatTitle} onChange={(event) => setNewChatTitle(event.target.value)} placeholder="Review the worktree scanner" /></SimpleDialog>
     <SimpleDialog open={newGroupOpen} onOpenChange={setNewGroupOpen} title="Create project group" description="Organize related projects together in the sidebar." onSubmit={createGroup} submit="Create group" disabled={!newGroupName.trim()}><label htmlFor="group-name">Group name</label><Input id="group-name" autoFocus value={newGroupName} onChange={(event) => setNewGroupName(event.target.value)} placeholder="Client work" /></SimpleDialog>

@@ -289,7 +289,7 @@ async function chatSettingsArchiveRegression() {
 async function settingsRetentionDraftRegression() {
   root.render(null);
   await settle();
-  const initial = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
+  const initial = { provider: "codex", model: "", approvalPolicy: "workspace-write", reasoningEffort: "medium",
     editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
   let saved = initial;
   let cleanupCalls = 0;
@@ -339,12 +339,17 @@ async function settingsRetentionDraftRegression() {
   assert(age()?.value === "45", "History refresh discarded an unsaved Settings draft");
   assert(!document.querySelector(".archived-history-list"), "Missing archived array crashed or rendered a list");
   setControlValue(age(), "60");
+  // A second authorized session tightens execution limits after this dialog
+  // opened. Saving the age must leave those shared limits intact.
+  saved = { ...saved, maxConcurrentRuns: 1, maxQueuedRuns: 1, approvalPolicy: "read-only" };
   [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent.includes("Save settings")).click();
   await until(() => !document.querySelector('[role="dialog"]'), "saved settings closed");
   open();
   try { await until(() => age()?.value === "60", "saved retention age reloaded"); }
   catch (error) { throw new Error(`${error.message}; patchCalls=${patchCalls}, saved=${saved.retentionDays}, visible=${age()?.value}, dialog=${Boolean(document.querySelector('[role="dialog"]'))}`); }
   assert(patchCalls === 1 && saved.retentionDays === 60, "Settings save did not persist the new age once");
+  assert(saved.maxConcurrentRuns === 1 && saved.maxQueuedRuns === 1 && saved.approvalPolicy === "read-only",
+    "An older Settings draft overwrote another session's resource or execution policy");
 }
 
 async function settingsMigrationCompletionRegression() {
@@ -3997,6 +4002,15 @@ async function responsiveSidebarBreakpointCycles(setWidth) {
       const active = document.activeElement;
       const opener = host.querySelector('[aria-label="Open projects sidebar"]');
       throw new Error(`${error.message}; active=${active?.outerHTML?.slice(0, 250)}; openerRect=${JSON.stringify(opener?.getBoundingClientRect().toJSON())}; openerVisibility=${opener && getComputedStyle(opener).visibility}`);
+    }
+    if (round === 0) {
+      // A busy main thread can deliver a blur timer after the old three-second
+      // wall-clock retry window. The visible opener must regain ownership.
+      document.activeElement.blur();
+      const pauseUntil = performance.now() + 3_100;
+      while (performance.now() < pauseUntil) { /* Hold browser task delivery. */ }
+      await until(() => visibleFocus(host.querySelector('[aria-label="Open projects sidebar"]')),
+        "sidebar opener focus after a delayed browser task");
     }
     if (round === 1) {
       // Some engines blur a disappearing control before dispatching the media

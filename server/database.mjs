@@ -1,8 +1,9 @@
 import Database from "better-sqlite3";
-import { chmodSync, lstatSync, mkdirSync, opendirSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, opendirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { Worker } from "node:worker_threads";
 import { foldFindText } from "../src/lib/find-text.js";
 import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
 
@@ -74,6 +75,8 @@ export function createOutrightDatabase(options = {}) {
   if (filename && path.isAbsolute(filename)) mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
   if (filename !== ":memory:" || options.launchDirectory) preparePrivateLaunchDirectory(launchDirectory);
   const db = new Database(filename);
+  const storageFilename = filename === ":memory:" ? filename : realpathSync(filename);
+  let leaseDb;
   let activeMessageFinds = 0;
   let closing = false;
   let migrationTick;
@@ -81,16 +84,22 @@ export function createOutrightDatabase(options = {}) {
   let deletionTick;
   let migrationError = null;
   const deletionsInFlight = new Set();
+  const deletionWorkers = new Set();
+  const releaseLeaseIfIdle = () => {
+    if (closing && !deletionWorkers.size && leaseDb) { leaseDb.close(); leaseDb = undefined; }
+  };
   try {
-    // A runtime keeps SQLite in exclusive locking mode for its whole lifetime.
-    // The kernel releases this lease if the process crashes, so a second
-    // runtime cannot reconcile or schedule rows owned by the first and there
-    // is no stale lock file to recover. Administrative/test database handles
-    // opt out by default.
+    // Hold the process lease on a companion SQLite file. The data database
+    // stays in WAL mode so an oversized archive row can be deleted on a
+    // worker connection without blocking the runtime's JavaScript thread.
+    // SQLite releases the companion lock on process death.
     if (options.runtimeLease) {
-      db.pragma("busy_timeout = 250");
-      db.pragma("locking_mode = EXCLUSIVE");
-      db.exec("BEGIN EXCLUSIVE; COMMIT;");
+      if (filename === ":memory:") throw new Error("A runtime lease requires a database file");
+      if (lstatSync(storageFilename).nlink !== 1) throw new Error("A runtime database cannot be hard-linked");
+      leaseDb = new Database(`${storageFilename}.runtime-lease`);
+      leaseDb.pragma("busy_timeout = 250");
+      leaseDb.pragma("locking_mode = EXCLUSIVE");
+      leaseDb.exec("BEGIN EXCLUSIVE; COMMIT;");
     }
     db.pragma("journal_mode = WAL");
     db.pragma("foreign_keys = ON");
@@ -99,6 +108,7 @@ export function createOutrightDatabase(options = {}) {
     advanceMigrations(db);
   } catch (error) {
     db.close();
+    leaseDb?.close();
     if (options.runtimeLease && ["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error?.code)) {
       const leaseError = new Error("Another Outright runtime already owns this database");
       leaseError.code = "OUTRIGHT_RUNTIME_LEASE_HELD";
@@ -134,7 +144,7 @@ export function createOutrightDatabase(options = {}) {
       return;
     }
     let failed = false;
-    deleteArchivedInBatches(db, pending.id, deletionsInFlight, true, () => closing)
+    deleteArchivedInBatches(db, pending.id, deletionsInFlight, true, () => closing, storageFilename, deletionWorkers, releaseLeaseIfIdle)
       .catch((error) => { failed = true; options.onDeletionError?.(error); })
       .finally(() => { if (!closing) deletionTick = failed ? setTimeout(resumeDeletions, 1000) : setImmediate(resumeDeletions); });
   };
@@ -172,7 +182,9 @@ export function createOutrightDatabase(options = {}) {
       if (migrationTick) clearImmediate(migrationTick);
       if (migrationRetry) clearTimeout(migrationRetry);
       if (deletionTick) { clearImmediate(deletionTick); clearTimeout(deletionTick); }
+      for (const worker of deletionWorkers) void worker.terminate().catch(() => {});
       db.close();
+      releaseLeaseIfIdle();
     },
     getSettings() {
       const rows = db.prepare("SELECT key, value FROM settings").all();
@@ -260,7 +272,7 @@ export function createOutrightDatabase(options = {}) {
       if (typeof id !== "string" || !id || id.length > 200 || confirmation !== id) {
         throw databaseError(400, "Confirm the exact archived conversation id before deleting it");
       }
-      return deleteArchivedInBatches(db, id, deletionsInFlight, false, () => closing);
+      return deleteArchivedInBatches(db, id, deletionsInFlight, false, () => closing, storageFilename, deletionWorkers, releaseLeaseIfIdle);
     },
     // Each eligible conversation is fenced before bounded child-row batches.
     // The fence survives restart, so interruption cannot expose a partly
@@ -283,7 +295,7 @@ export function createOutrightDatabase(options = {}) {
       return (async () => {
         const deleted = [];
         for (const id of ids) {
-          try { await deleteArchivedInBatches(db, id, deletionsInFlight, true, () => closing); deleted.push(id); }
+          try { await deleteArchivedInBatches(db, id, deletionsInFlight, true, () => closing, storageFilename, deletionWorkers, releaseLeaseIfIdle); deleted.push(id); }
           catch (error) { if (error.statusCode !== 404 && error.statusCode !== 409) throw error; }
         }
         return { deleted: deleted.length, ids: deleted };
@@ -385,13 +397,19 @@ export function createOutrightDatabase(options = {}) {
       return this.getConversation(id);
     },
     moveConversation(id, destination) {
+      if (db.prepare("SELECT deleting FROM conversations WHERE id = ?").get(id)?.deleting) {
+        throw databaseError(409, "Archived conversation deletion is in progress");
+      }
       const unresolved = this.listUnresolvedInterruptedRuns(id);
       if (unresolved.some((run) => !run.worktreePath || run.worktreePath !== destination.worktreePath)) {
         throw databaseError(409, "Resolve the interrupted run before moving this conversation away from its recovery worktree");
       }
       const position = db.prepare("SELECT COALESCE(MAX(tab_position), -1) + 1 AS position FROM conversations WHERE project_id = ? AND worktree_id = ?").get(destination.projectId, destination.worktreeId).position;
-      withinRetainedBudget(() => db.prepare("UPDATE conversations SET project_id = ?, worktree_id = ?, worktree_path = ?, tab_position = ?, updated_at = ? WHERE id = ?")
-        .run(destination.projectId, destination.worktreeId, destination.worktreePath, position, now(), id));
+      withinRetainedBudget(() => {
+        const changed = db.prepare("UPDATE conversations SET project_id = ?, worktree_id = ?, worktree_path = ?, tab_position = ?, updated_at = ? WHERE id = ? AND deleting = 0")
+          .run(destination.projectId, destination.worktreeId, destination.worktreePath, position, now(), id).changes;
+        if (!changed) throw databaseError(409, "Conversation is unavailable for moving");
+      });
       return this.getConversation(id);
     },
     listMessages(conversationId) {
@@ -1162,9 +1180,11 @@ function runPatchAssignments(patch) {
 
 // A marked archive is intentionally hidden from new work. Each transaction
 // removes at most 64 child rows or 256 KiB of retained payload, then yields
-// to HTTP, sockets, and active agents. The marker survives a crash and is
+// to HTTP, sockets, and active agents. A larger legacy row is deleted on a
+// separate SQLite worker connection. The marker survives a crash and is
 // resumed on the next open.
-function deleteArchivedInBatches(db, id, inFlight, automatic = false, isClosing = () => false) {
+function deleteArchivedInBatches(db, id, inFlight, automatic = false, isClosing = () => false,
+  filename = ":memory:", workers = new Set(), onWorkerExit = () => {}) {
   if (inFlight.has(id)) throw databaseError(409, "Archived conversation deletion is in progress");
   inFlight.add(id);
   const run = async () => {
@@ -1181,8 +1201,15 @@ function deleteArchivedInBatches(db, id, inFlight, automatic = false, isClosing 
       }).immediate();
       while (true) {
         if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
-        const done = db.transaction(() => deleteArchivedBatch(db, id)).immediate();
-        if (done) return { deleted: 1, id };
+        const step = db.transaction(() => deleteArchivedBatch(db, id, filename)).immediate();
+        if (step === true) return { deleted: 1, id };
+        if (step?.oversized) {
+          try { await deleteOversizedArchivedRow(filename, id, step.oversized, workers, onWorkerExit); }
+          catch (error) {
+            if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
+            throw error;
+          }
+        }
         await new Promise((resolve) => setImmediate(resolve));
       }
     } finally { inFlight.delete(id); }
@@ -1190,7 +1217,7 @@ function deleteArchivedInBatches(db, id, inFlight, automatic = false, isClosing 
   return run();
 }
 
-function deleteArchivedBatch(db, id) {
+function deleteArchivedBatch(db, id, filename) {
   const sources = [
     [`SELECT events.id, COALESCE(octet_length(events.payload), 0) + 128 AS bytes FROM run_events AS events
       JOIN runs ON runs.id = events.run_id WHERE runs.conversation_id = ? LIMIT 64`, "run_events"],
@@ -1205,6 +1232,9 @@ function deleteArchivedBatch(db, id) {
     const remove = db.prepare(`DELETE FROM ${table} WHERE id = ?`);
     let bytes = 0;
     for (const row of rows) {
+      if (!bytes && row.bytes > 256 * 1024 && filename !== ":memory:") {
+        return { oversized: { table, rowId: row.id } };
+      }
       if (bytes && bytes + row.bytes > 256 * 1024) break;
       remove.run(row.id);
       bytes += row.bytes;
@@ -1220,6 +1250,24 @@ function deleteArchivedBatch(db, id) {
     reserveRecoveryHeadroom(db);
   }
   return true;
+}
+
+function deleteOversizedArchivedRow(filename, conversationId, oversized, workers, onWorkerExit) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./archive-delete-worker.mjs", import.meta.url),
+      { workerData: { filename, conversationId, ...oversized } });
+    workers.add(worker);
+    let reply;
+    let failure;
+    worker.on("message", (message) => { reply = message; });
+    worker.on("error", (error) => { failure = error; });
+    worker.on("exit", (code) => {
+      workers.delete(worker);
+      onWorkerExit();
+      if (failure || code !== 0 || !reply?.ok) reject(failure ?? new Error(reply?.error ?? `Archive deletion worker exited ${code}`));
+      else resolve();
+    });
+  });
 }
 
 function trimAudit(db) {
@@ -1298,19 +1346,27 @@ function migrate(db) {
 
 function prepareRecoveryLookup(db, hadRuns, version) {
   const hadLookup = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recovery_scope'").get());
-  db.exec("CREATE TABLE IF NOT EXISTS recovery_scope (run_id TEXT PRIMARY KEY, worktree_path TEXT)");
-  db.exec("CREATE INDEX IF NOT EXISTS recovery_scope_path ON recovery_scope(worktree_path, run_id)");
-  if (hadRuns && !hadLookup) db.prepare("INSERT OR IGNORE INTO migration_progress (kind, cursor_text) VALUES ('recovery', ?)")
-    .run(version < 2 ? "backfill-terminal" : null);
+  const hadAllTriggers = ["runs_recovery_insert", "runs_recovery_update", "runs_recovery_delete"].every((name) =>
+    Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?").get(name)));
   const path = (alias) => `CASE WHEN octet_length(${alias}.worktree_path) <= 4096 THEN ${alias}.worktree_path ELSE NULL END`;
   const unsettled = (alias) => `(${alias}.status IN ('queued', 'launching', 'running') OR (${alias}.status = 'interrupted' AND ${alias}.recovery_decision IS NULL))`;
-  db.exec(`CREATE TRIGGER IF NOT EXISTS runs_recovery_insert AFTER INSERT ON runs BEGIN
-    INSERT INTO recovery_scope (run_id, worktree_path) SELECT NEW.id, ${path("NEW")} WHERE ${unsettled("NEW")}; END`);
-  db.exec(`CREATE TRIGGER IF NOT EXISTS runs_recovery_update AFTER UPDATE ON runs BEGIN
-    DELETE FROM recovery_scope WHERE run_id = OLD.id;
-    INSERT INTO recovery_scope (run_id, worktree_path) SELECT NEW.id, ${path("NEW")} WHERE ${unsettled("NEW")}; END`);
-  db.exec(`CREATE TRIGGER IF NOT EXISTS runs_recovery_delete AFTER DELETE ON runs BEGIN
-    DELETE FROM recovery_scope WHERE run_id = OLD.id; END`);
+  // DDL and the backfill marker must commit together. A pre-fix crash could
+  // leave the table without its marker; missing triggers identify that state.
+  db.transaction(() => {
+    db.exec("CREATE TABLE IF NOT EXISTS recovery_scope (run_id TEXT PRIMARY KEY, worktree_path TEXT)");
+    db.exec("CREATE INDEX IF NOT EXISTS recovery_scope_path ON recovery_scope(worktree_path, run_id)");
+    if (hadRuns && (!hadLookup || !hadAllTriggers)) {
+      db.prepare("INSERT OR IGNORE INTO migration_progress (kind, cursor_text) VALUES ('recovery', ?)")
+        .run(version < 2 ? "backfill-terminal" : null);
+    }
+    db.exec(`CREATE TRIGGER IF NOT EXISTS runs_recovery_insert AFTER INSERT ON runs BEGIN
+      INSERT INTO recovery_scope (run_id, worktree_path) SELECT NEW.id, ${path("NEW")} WHERE ${unsettled("NEW")}; END`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS runs_recovery_update AFTER UPDATE ON runs BEGIN
+      DELETE FROM recovery_scope WHERE run_id = OLD.id;
+      INSERT INTO recovery_scope (run_id, worktree_path) SELECT NEW.id, ${path("NEW")} WHERE ${unsettled("NEW")}; END`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS runs_recovery_delete AFTER DELETE ON runs BEGIN
+      DELETE FROM recovery_scope WHERE run_id = OLD.id; END`);
+  }).immediate();
 }
 
 function prepareMessageOrderMigration(db) {
