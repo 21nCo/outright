@@ -1,0 +1,45 @@
+server/database.mjs
+  s_2f44717380cda3::t_8488dda7ab99c2 81,83,128-143,170-176,217-222,224-225,251,263,265-267,279,283-290,360-362,479-483,811-813,871,878-880,883,890-892,1106,1108-1120,1163-1230,1232,1240-1241,1278-1279,1286-1290,1296-1313,1389-1390,1393-1415,1472,1475-1476,1481-1491,1494-1496,1506-1508,1514
+server/outright-runtime.test.mjs
+  s_55d0a6ad53816d::t_a58222f892badb 88-92
+server/resource-budgets.test.mjs
+  s_2f44717380cda3::t_222afd643767f3 75,92,100,104,114,116,138,235,281,299,305,311,316,361,364,371,386,392,400,421,430,452,485,532,564,576,685,698-702,708,727-731,756-863
+src/App.jsx
+  s_d572a2e2a0ff20::t_31bd2f4e13efdd 575,718-721,851-854,857-863,866-868,1719,1791-1799,1887-1893
+tests/ui-races.jsx
+  s_2f44717380cda3::t_82b6317400dc34 350-427,3353-3360,3988-4024,4062,4383-4384
+tests/ui-races.test.mjs
+  s_2f44717380cda3::t_386d5764a21571 859
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "98be1938638fb7052068a78118473f816e70728d",
+  "prompts": {},
+  "sessions": {
+    "s_2f44717380cda3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "eda6820d-8303-4b09-8310-4b0dc7c73079",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_55d0a6ad53816d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "302221c7-1aff-43cf-9332-56a7c4a0d50e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_d572a2e2a0ff20": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0f22f-afe9-7798-87e2-790fa94afbe4",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
