@@ -419,6 +419,52 @@ test("truncated output cannot spend terminal transition reserve at the quota edg
   } finally { database.close(); }
 });
 
+test("optional metadata cannot exhaust terminal and restart recovery space", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-metadata-reserve-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    database.updateSettings({ maxRetainedMiB: 64 });
+    const conversations = Array.from({ length: 300 }, (_, index) => chat(database, `chat ${index}`));
+    const [completed, failed, stopped, cancelled, interrupted] = Array.from({ length: 5 }, () => database.createRun(runInput(conversations[0].id)));
+    database.updateRun(interrupted.id, { status: "running", pid: 424242 });
+    const filler = database.addMessage({ conversationId: conversations[0].id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+    const room = 63 * 1024 * 1024 - database.capacity().retainedBytes;
+    assert.ok(room > 0);
+    database.upsertMessage({ ...filler, body: `${filler.body}${"x".repeat(room - 1)}` });
+    const atEdge = database.capacity().retainedBytes;
+    assert.ok(database.capacity().availableForNewWorkBytes <= 1);
+
+    for (const conversation of conversations.slice(0, 256)) {
+      assert.throws(() => database.updateConversation(conversation.id, { providerSessionId: "s".repeat(4096) }),
+        (error) => error.statusCode === 507);
+      assert.equal(database.getConversation(conversation.id).providerSessionId, null);
+    }
+    assert.throws(() => database.moveConversation(conversations[0].id,
+      { projectId: "p", worktreeId: "w2", worktreePath: `/tmp/${"w".repeat(4096)}` }), (error) => error.statusCode === 507);
+    assert.throws(() => database.updateSettings({ model: "m".repeat(200) }), (error) => error.statusCode === 507);
+    assert.throws(() => database.updateRun(completed.id, { inputTokens: 123456789012345 }), (error) => error.statusCode === 507);
+    assert.equal(database.capacity().retainedBytes, atEdge);
+    const mixed = database.updateRun(completed.id, { status: "running", inputTokens: 123456789012345 });
+    assert.equal(mixed.status, "running");
+    assert.equal(mixed.inputTokens, null, "optional usage is dropped without losing the required state transition");
+    assert.equal(database.getSettings().model, "");
+
+    for (const [run, status] of [[completed, "completed"], [failed, "failed"], [stopped, "stopped"]]) {
+      assert.equal(database.finishRun(run.id, { status, finishedAt: new Date().toISOString(), error: status === "failed" ? "x".repeat(64 * 1024) : null }).run.status, status);
+    }
+    assert.equal(database.updateRun(cancelled.id, { status: "stopped", finishedAt: new Date().toISOString() }).status, "stopped");
+    database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.reconcileInterruptedRuns({ probeAlive: () => false }).count, 1);
+    assert.equal(database.getRun(interrupted.id).status, "interrupted");
+    assert.equal(database.resolveInterruptedRun(interrupted.id, "discard").status, "failed");
+    assert.deepEqual([completed, failed, stopped, cancelled].map((run) => database.getRun(run.id).status),
+      ["completed", "failed", "stopped", "stopped"]);
+    assert.ok(database.capacity().retainedBytes <= 64 * 1024 * 1024);
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("omission metadata survives terminal outcomes and restart at the retained quota edge", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-omission-"));
   const filename = path.join(directory, "outright.db");

@@ -158,6 +158,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       }
       if (url.pathname === "/api/retention/delete-archived" && request.method === "POST") {
         const body = await readJson(request);
+        if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Retention request must be a JSON object");
         const result = database.deleteArchivedConversation(body.id, body.confirmation);
         database.audit("retention.archived.deleted", { conversationId: result.id });
         agents.resumeQueued();
@@ -165,6 +166,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       }
       if (url.pathname === "/api/retention/cleanup" && request.method === "POST") {
         const body = await readJson(request);
+        if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Retention request must be a JSON object");
         const result = database.pruneHistory({ before: body.before, limit: 100 });
         database.audit("retention.cleaned", { deleted: result.deleted, before: body.before ?? "saved retention window" });
         agents.resumeQueued();
@@ -314,7 +316,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           throw apiError(409, "Resolve the interrupted run before moving this conversation away from its recovery worktree", { code: "RUN_RECOVERY_REQUIRED" });
         }
         const { worktreePath: destinationPath } = await resolveWorktreeTarget(body);
-        const conversation = database.moveConversation(conversationMoveMatch[1], { projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath });
+        const conversation = editRetainedData(() => database.moveConversation(conversationMoveMatch[1],
+          { projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath }));
         database.audit("conversation.moved", { target: conversation.id, projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath });
         publish({ type: "conversation.updated", conversationId: conversation.id, payload: conversation });
         return json(response, 200, conversation);

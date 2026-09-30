@@ -277,6 +277,21 @@ test("keeps recovered session ids run-local when the conversation switched provi
   child.emit("close", 0, null);
 });
 
+test("a full conversation metadata budget does not fail a provider session event", async () => {
+  const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex", providerSessionId: null });
+  database.updateConversation = () => { const error = new Error("Retained history is full"); error.statusCode = 507; throw error; };
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  const run = database.createRun(codexRun("quota-session"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  child.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "session-at-quota" }) + "\n");
+  assert.equal(database.getRun(run.id).providerSessionId, "session-at-quota");
+  assert.equal(database.getConversation("conv-1").providerSessionId, null);
+  child.emit("close", 0, null);
+  await manager.shutdown();
+  assert.equal(database.getRun(run.id).status, "completed");
+});
+
 test("handles asynchronous authorization-pipe errors without an uncaught stream error", async () => {
   const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex" });
   const child = fakeChild();

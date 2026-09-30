@@ -32,7 +32,7 @@ const RETAINED_COLUMNS = [
   ["project_memberships", "project_id, group_id"],
   ["conversations", "id, project_id, worktree_id, worktree_path, title, provider, model, provider_session_id, created_at, updated_at"],
   ["messages", "id, conversation_id, role, kind, body, payload, created_at"],
-  ["runs", "id, conversation_id, worktree_path, provider, model, reasoning_effort, approval_policy, prompt, status, provider_session_id, created_at, started_at, finished_at, error, recovery_class, recovery_decision, transcript_omitted"],
+  ["runs", "id, conversation_id, worktree_path, provider, model, reasoning_effort, approval_policy, prompt, status, pid, provider_session_id, created_at, started_at, finished_at, exit_code, error, cost_usd, input_tokens, output_tokens, recovery_class, recovery_decision, transcript_omitted"],
   ["run_events", "run_id, type, payload, created_at"],
   ["run_event_usage", "run_id"],
   ["trusted_projects", "project_id, project_path, trusted_at"],
@@ -106,9 +106,13 @@ export function createOutrightDatabase(options = {}) {
   const retainedReserveBytes = 1024 * 1024;
   function withinRetainedBudget(write, reserve = retainedReserveBytes) {
     try { return db.transaction(() => {
+      const before = retainedBytes(db);
       const result = write();
       const limit = Math.max(0, Number(db.prepare("SELECT value FROM settings WHERE key = 'maxRetainedMiB'").get()?.value ?? DEFAULT_SETTINGS.maxRetainedMiB) * 1024 * 1024 - reserve);
-      if (retainedBytes(db) > limit) throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
+      const after = retainedBytes(db);
+      // Archiving, clearing metadata, and shrinking retained text must remain
+      // possible when a lowered quota already puts history over the limit.
+      if (after > limit && after > before) throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
       return result;
     }).immediate(); }
     catch (error) {
@@ -133,15 +137,20 @@ export function createOutrightDatabase(options = {}) {
       validateSettingsPatch(patch);
       const statement = db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
       const update = db.transaction((entries) => {
+        const before = retainedBytes(db);
+        const optionalLimit = Math.max(this.getSettings().maxRetainedMiB, patch.maxRetainedMiB ?? 0) * 1024 * 1024 - retainedReserveBytes;
         // Lowering a quota must not make the existing database unopenable or
-        // prevent recovery decisions. Optional writes still check the newly
-        // saved quota; only already retained state gets transition headroom.
+        // prevent recovery decisions. Other settings in this patch may not
+        // consume the reserve that existed before the quota change.
         if (patch.maxRetainedMiB !== undefined) {
           const target = patch.maxRetainedMiB * 1024 * 1024;
           reserveRecoveryHeadroom(db, target);
         }
         for (const [key, value] of entries) statement.run(key, JSON.stringify(value));
         if (patch.maxRetainedMiB !== undefined) reserveRecoveryHeadroom(db);
+        if (retainedBytes(db) > before && retainedBytes(db) > optionalLimit) {
+          throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
+        }
       });
       update.immediate(Object.entries(patch));
       return this.getSettings();
@@ -318,8 +327,7 @@ export function createOutrightDatabase(options = {}) {
         fields.push("updated_at = ?");
         values.push(now(), id);
         const update = () => db.prepare(`UPDATE conversations SET ${fields.join(", ")} WHERE id = ?`).run(...values);
-        if (["title", "model", "provider"].some((key) => patch[key] !== undefined)) withinRetainedBudget(update);
-        else update();
+        withinRetainedBudget(update);
       }
       return this.getConversation(id);
     },
@@ -329,8 +337,8 @@ export function createOutrightDatabase(options = {}) {
         throw databaseError(409, "Resolve the interrupted run before moving this conversation away from its recovery worktree");
       }
       const position = db.prepare("SELECT COALESCE(MAX(tab_position), -1) + 1 AS position FROM conversations WHERE project_id = ? AND worktree_id = ?").get(destination.projectId, destination.worktreeId).position;
-      db.prepare("UPDATE conversations SET project_id = ?, worktree_id = ?, worktree_path = ?, tab_position = ?, updated_at = ? WHERE id = ?")
-        .run(destination.projectId, destination.worktreeId, destination.worktreePath, position, now(), id);
+      withinRetainedBudget(() => db.prepare("UPDATE conversations SET project_id = ?, worktree_id = ?, worktree_path = ?, tab_position = ?, updated_at = ? WHERE id = ?")
+        .run(destination.projectId, destination.worktreeId, destination.worktreePath, position, now(), id));
       return this.getConversation(id);
     },
     listMessages(conversationId) {
@@ -939,14 +947,28 @@ export function createOutrightDatabase(options = {}) {
       return recover.immediate();
     },
     updateRun(id, patch) {
-      const fields = [];
-      const values = [];
+      const criticalFields = [];
+      const criticalValues = [];
+      const optionalFields = [];
+      const optionalValues = [];
+      if (patch.providerSessionId != null && (typeof patch.providerSessionId !== "string" || Buffer.byteLength(patch.providerSessionId) > 4096)) {
+        throw databaseError(400, "Provider session id is invalid");
+      }
       for (const [key, column] of Object.entries({ status: "status", pid: "pid", providerSessionId: "provider_session_id", startedAt: "started_at", finishedAt: "finished_at", exitCode: "exit_code", error: "error", costUsd: "cost_usd", inputTokens: "input_tokens", outputTokens: "output_tokens", recoveryClass: "recovery_class", recoveryDecision: "recovery_decision", transcriptOmitted: "transcript_omitted" })) {
         if (patch[key] === undefined) continue;
-        fields.push(key === "transcriptOmitted" ? `${column} = MAX(${column}, ?)` : `${column} = ?`);
-        values.push(key === "transcriptOmitted" ? Number(Boolean(patch[key])) : patch[key]);
+        const optional = ["costUsd", "inputTokens", "outputTokens"].includes(key);
+        (optional ? optionalFields : criticalFields).push(key === "transcriptOmitted" ? `${column} = MAX(${column}, ?)` : `${column} = ?`);
+        (optional ? optionalValues : criticalValues).push(key === "transcriptOmitted" ? Number(Boolean(patch[key])) : patch[key]);
       }
-      if (fields.length) db.prepare(`UPDATE runs SET ${fields.join(", ")} WHERE id = ?`).run(...values, id);
+      const criticalUpdate = () => { if (criticalFields.length) db.prepare(`UPDATE runs SET ${criticalFields.join(", ")} WHERE id = ?`).run(...criticalValues, id); };
+      const optionalUpdate = () => { if (optionalFields.length) withinRetainedBudget(() => db.prepare(`UPDATE runs SET ${optionalFields.join(", ")} WHERE id = ?`).run(...optionalValues, id)); };
+      // A mixed update commits its state even if optional usage telemetry is
+      // refused. Usage alone still reports the quota error to its caller.
+      if (criticalFields.length && optionalFields.length) db.transaction(() => {
+        criticalUpdate();
+        try { optionalUpdate(); } catch (error) { if (error.statusCode !== 507) throw error; }
+      }).immediate();
+      else { criticalUpdate(); optionalUpdate(); }
       return this.getRun(id);
     },
     finishRun(id, patch, transcriptMessage = null) {

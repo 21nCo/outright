@@ -484,7 +484,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         // never replace another provider's conversation-level resume token.
         const currentConversation = database.getConversation(state.conversation.id);
         if (currentConversation?.provider === state.run.provider) {
-          database.updateConversation(state.conversation.id, { providerSessionId: event.payload.sessionId });
+          try { database.updateConversation(state.conversation.id, { providerSessionId: event.payload.sessionId }); }
+          catch (error) { if (error.statusCode !== 507) throw error; }
         }
       }
       if (event.type === "assistant.delta") {

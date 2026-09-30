@@ -28,10 +28,23 @@ function requestStream(method, url, body) {
   stream.method = method;
   stream.url = url;
   stream.headers = { host: "localhost:4173" };
-  if (body != null) stream.push(JSON.stringify(body));
+  if (body !== undefined) stream.push(JSON.stringify(body));
   stream.push(null);
   return stream;
 }
+
+test("retention POST bodies reject null and arrays without deleting archived history", withRuntime(async (runtime) => {
+  const archived = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Keep", provider: "codex" });
+  runtime.database.updateConversation(archived.id, { archived: true });
+  for (const route of ["/api/retention/cleanup", "/api/retention/delete-archived"]) {
+    for (const body of [null, [], "wrong shape"]) {
+      const response = responseCapture();
+      await runtime.handleRequest(requestStream("POST", route, body), response);
+      assert.equal(response.statusCode, 400);
+      assert.ok(runtime.database.getConversation(archived.id));
+    }
+  }
+}));
 
 function responseCapture() {
   return {
@@ -322,6 +335,28 @@ test("capacity-restoring edits wake deferred runs at the launch boundary", withR
     assert.equal(wakeups, 1 + ["/api/templates", `/api/groups/${group.id}`, `/api/conversations/${conversation.id}`].indexOf(url));
     assert.equal(database.getRun(queued.id).status, "queued");
   }
+}));
+
+test("moving a conversation to a shorter worktree path wakes deferred work", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const database = runtime.database;
+  database.updateSettings({ maxRetainedMiB: 64 });
+  const conversation = database.createConversation({ projectId: project.id, worktreeId: "old", worktreePath: `/tmp/${"old".repeat(1400)}`,
+    title: "Movable", provider: "codex" });
+  const queued = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "waiting" });
+  const filler = database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+  const increase = database.capacity().availableForNewWorkBytes - (64 * 1024 - 50);
+  assert.ok(increase > 0);
+  database.upsertMessage({ ...filler, body: `${filler.body}${"x".repeat(increase)}` });
+  assert.equal(database.canLaunchRun(), false);
+  let wakeups = 0;
+  runtime.agents.resumeQueued = () => { wakeups += 1; };
+  const response = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/move`,
+    { projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path }), response);
+  assert.equal(response.statusCode, 200, response.raw);
+  assert.equal(database.canLaunchRun(), true);
+  assert.equal(wakeups, 1);
+  assert.equal(database.getRun(queued.id).status, "queued");
 }));
 
 test("bootstrap and retention remain reachable when default groups cannot fit the retained budget", async () => {
