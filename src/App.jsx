@@ -149,6 +149,7 @@ export function App() {
   const conversationOwnerRef = useRef("");
   const conversationsRef = useRef([]);
   const archiveFocusRef = useRef(null);
+  const settingsRefreshRef = useRef(0);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
 
   const applyStreamingText = useCallback((change, immediate = false) => {
@@ -769,9 +770,11 @@ export function App() {
     const narrow = window.matchMedia("(max-width: 760px)");
     let wasNarrow = narrow.matches;
     const trackFocus = (event) => {
+      const target = sidebarFocusIntentRef.current === "opener"
+        ? document.querySelector('[aria-label="Open projects sidebar"]')
+        : sidebarRef.current?.querySelector('button:not(:disabled)');
       if (sidebarFocusIntentRef.current && event.target !== sidebarFocusSourceRef.current
-        && event.target !== sidebarRef.current && !sidebarRef.current?.contains(event.target)
-        && !event.target.matches?.('[aria-label="Open projects sidebar"]')) {
+        && event.target !== target) {
         sidebarFocusIntentRef.current = null;
         sidebarFocusSourceRef.current = null;
       }
@@ -828,19 +831,31 @@ export function App() {
     const intent = sidebarFocusIntentRef.current;
     if (!intent || (intent === "opener" && sidebarOpen) || (intent === "sidebar" && !sidebarOpen)) return;
     let cancelRetry = () => {};
-    // A loaded browser can delay the first animation frame beyond a wall-clock
-    // deadline. Count delivered opportunities instead of elapsed time.
     let attempts = 0;
     const maxAttempts = 30;
+    let watchChecks = 0;
+    let target;
+    const watchFocus = () => {
+      if (sidebarFocusIntentRef.current !== intent || watchChecks++ >= 60) return;
+      const active = document.activeElement;
+      if (active === document.body) { transfer(); return; }
+      if (active !== target) {
+        sidebarFocusIntentRef.current = null;
+        sidebarFocusSourceRef.current = null;
+        return;
+      }
+      const timer = window.setTimeout(watchFocus, 250);
+      cancelRetry = () => clearTimeout(timer);
+    };
     const transfer = () => {
       if (sidebarFocusIntentRef.current !== intent) return;
+      cancelRetry();
+      cancelRetry = () => {};
       attempts += 1;
-      const target = intent === "opener" ? document.querySelector('[aria-label="Open projects sidebar"]')
+      target = intent === "opener" ? document.querySelector('[aria-label="Open projects sidebar"]')
         : sidebarRef.current?.querySelector('button:not(:disabled)');
       const active = document.activeElement;
-      const fromPriorControl = active === sidebarFocusSourceRef.current || (intent === "opener"
-        ? sidebarRef.current?.contains(active)
-        : active?.matches?.('[aria-label="Open projects sidebar"]') || active === sidebarRef.current);
+      const fromPriorControl = active === sidebarFocusSourceRef.current;
       if (active !== document.body && active !== target && !fromPriorControl) {
         sidebarFocusIntentRef.current = null; // Do not override a newer user focus choice.
         sidebarFocusSourceRef.current = null;
@@ -850,27 +865,8 @@ export function App() {
         target.focus({ preventScroll: true });
         if (document.activeElement === target && target.getBoundingClientRect().width > 0) {
           sidebarFocusOwnerRef.current = intent;
-          // A breakpoint transition can blur this control after focus() has
-          // succeeded (notably while the sidebar finishes changing layout on
-          // macOS). Keep ownership through the transition unless the user
-          // focuses another control; a single successful focus is not final.
-          let timer;
-          const checkFocus = () => {
-            if (sidebarFocusIntentRef.current !== intent) return;
-            attempts += 1;
-            if (document.activeElement === target) {
-              if (attempts < maxAttempts) timer = window.setTimeout(checkFocus, 100);
-              else {
-                sidebarFocusIntentRef.current = null;
-                sidebarFocusSourceRef.current = null;
-              }
-            } else if (document.activeElement === document.body && attempts < maxAttempts) transfer();
-            else {
-              sidebarFocusIntentRef.current = null;
-              sidebarFocusSourceRef.current = null;
-            }
-          };
-          timer = window.setTimeout(checkFocus, 100);
+          attempts = 0;
+          const timer = window.setTimeout(watchFocus, 250);
           cancelRetry = () => clearTimeout(timer);
           return;
         }
@@ -889,8 +885,20 @@ export function App() {
         cancelRetry = () => { pending = false; cancelAnimationFrame(frame); clearTimeout(timer); };
       }
     };
+    // A breakpoint can detach or blur a control after focus() succeeds.
+    // Some browser viewports omit focusout, so the bounded watch also checks
+    // ownership after delayed layout tasks.
+    const restoreAfterBlur = (event) => {
+      const ownedControl = intent === "opener" ? event.target.matches?.('[aria-label="Open projects sidebar"]')
+        : sidebarRef.current?.contains(event.target);
+      if (!ownedControl || sidebarFocusIntentRef.current !== intent) return;
+      queueMicrotask(() => {
+        if (sidebarFocusIntentRef.current === intent && document.activeElement === document.body) transfer();
+      });
+    };
+    document.addEventListener("focusout", restoreAfterBlur, true);
     transfer();
-    return () => cancelRetry();
+    return () => { cancelRetry(); document.removeEventListener("focusout", restoreAfterBlur, true); };
   }, [isNarrow, sidebarOpen]);
   useLayoutEffect(() => {
     if (!inspector) return;
@@ -1688,7 +1696,13 @@ export function App() {
     catch (nextError) { setError(nextError.message); }
   }
   async function refreshAll(includeTemplates = false) {
-    try { const next = await api("/api/bootstrap"); setBootstrap(next); if (includeTemplates) setToast("Templates updated"); } catch (nextError) { setError(nextError.message); }
+    const request = ++settingsRefreshRef.current;
+    try {
+      const next = await api("/api/bootstrap");
+      if (request !== settingsRefreshRef.current) return;
+      setBootstrap(next);
+      if (includeTemplates) setToast("Templates updated");
+    } catch (nextError) { if (request === settingsRefreshRef.current) setError(nextError.message); }
   }
   function openManageChat() { if (!conversation || !conversationDetailReady || !isSelectedTarget(conversation)) return; setChatDraft({ title: conversation.title, providerSessionId: conversation.providerSessionId ?? "", provider: conversation.provider, model: conversation.model ?? "", destination: `${conversation.projectId}::${conversation.worktreeId}` }); setManageChatOpen(true); }
 
@@ -1721,7 +1735,7 @@ export function App() {
     </main>
 
     <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} projects={bootstrap.projects} onSelectProject={chooseProject} onSelectConversation={(item) => { const nextProject = bootstrap.projects.find((entry) => entry.id === item.projectId); const nextWorktree = nextProject?.worktrees.find((entry) => entry.id === item.worktreeId); if (nextProject && nextWorktree) { pendingConversationRef.current = item.id; chooseProject(nextProject, nextWorktree); } }} />
-    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} runtimeEvent={runtimeEvent} onSaved={(nextSettings, refresh) => { if (refresh !== "history") { setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") { try { void Notification.requestPermission().catch(() => {}); } catch { /* Older browsers may reject the call synchronously. */ } } } if (refresh) refreshAll(refresh === true); }} onError={handleError} />
+    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} runtimeEvent={runtimeEvent} onSaved={(nextSettings, refresh) => { if (refresh !== "history" && refresh !== "settings" && refresh !== "templates") { ++settingsRefreshRef.current; setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") requestNotificationPermission(); } if (refresh) refreshAll(refresh === "templates"); }} onError={handleError} />
 
     <SimpleDialog open={newChatOpen} onOpenChange={setNewChatOpen} title="New agent chat" description={`${project.name} / ${worktree.name}`} onSubmit={(event) => { event.preventDefault(); createConversation(); }} submit="Create chat"><label htmlFor="chat-title">What should the agent work on?</label><Input id="chat-title" autoFocus value={newChatTitle} onChange={(event) => setNewChatTitle(event.target.value)} placeholder="Review the worktree scanner" /></SimpleDialog>
     <SimpleDialog open={newGroupOpen} onOpenChange={setNewGroupOpen} title="Create project group" description="Organize related projects together in the sidebar." onSubmit={createGroup} submit="Create group" disabled={!newGroupName.trim()}><label htmlFor="group-name">Group name</label><Input id="group-name" autoFocus value={newGroupName} onChange={(event) => setNewGroupName(event.target.value)} placeholder="Client work" /></SimpleDialog>
@@ -1812,6 +1826,12 @@ function preferredWorktree(project) { return project.worktrees.find((item) => it
 function compactPath(value = "") { return value.replace(/^\/Users\/[^/]+/, "~"); }
 function defaultSettings() { return { provider: "codex", model: "", reasoningEffort: "medium", approvalPolicy: "workspace-write", editor: "zed", notifications: true, maxConcurrentRuns: 3 }; }
 function focusableElements(container) { return container ? [...container.querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')].filter((element) => element.getClientRects().length && element.getAttribute("aria-hidden") !== "true") : []; }
+
+function requestNotificationPermission() {
+  // The microtask also turns older browsers' synchronous throws into a
+  // rejection, so both failure paths are handled by the same promise chain.
+  void Promise.resolve().then(() => Notification.requestPermission()).catch(() => {});
+}
 function boundStreamingText(value) { return value.length > MAX_STREAMING_CHARACTERS ? `${value.slice(0, MAX_STREAMING_CHARACTERS)}${LIVE_TRUNCATION_MARKER}` : value; }
 
 function boundPageMessage(message, matchNeedle = "") {

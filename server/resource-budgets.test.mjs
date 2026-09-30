@@ -825,7 +825,7 @@ test("large archived cleanup yields to active work and resumes after interruptio
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("oversized legacy archive rows delete off-thread through explicit and automatic cleanup", async () => {
+test("oversized legacy archive cleanup defers while active runs write, then resumes", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-oversized-retention-"));
   const filename = path.join(directory, "outright.db");
   const database = createOutrightDatabase({ filename, runtimeLease: true });
@@ -851,27 +851,32 @@ test("oversized legacy archive rows delete off-thread through explicit and autom
     }
     ageArchived(filename, archives.map((item) => item.id));
     for (const [index, archived] of archives.entries()) {
-      let ticks = 0;
-      const timer = setInterval(() => { ticks += 1; }, 1);
-      try {
-        const deletion = index === 0
-          ? database.deleteArchivedConversation(archived.id, archived.id)
-          : database.pruneHistory();
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        const began = performance.now();
-        database.appendRunEvent(running.id, "progress", { during: archived.title });
-        assert.ok(performance.now() - began < 500, "active-run output was blocked by giant archive cleanup");
-        const result = await deletion;
-        assert.equal(result.deleted, 1);
-        assert.ok(ticks > 0, "archive cleanup blocked browser and runtime task delivery");
-      } finally { clearInterval(timer); }
-      assert.equal(database.getConversation(archived.id), undefined);
-      assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id));
+      const result = await (index === 0
+        ? database.deleteArchivedConversation(archived.id, archived.id)
+        : database.pruneHistory());
+      assert.equal(result.deleted, 0, "giant row deleted while an active run still owned the writer budget");
+      assert.ok(result.deferred, "cleanup did not report the durable deferred marker");
+      assert.equal(database.capacity().cleanupPending, true);
+      assert.equal(database.canLaunchRun(), false, "new launches overtook a marked giant archive delete");
+      const began = performance.now();
+      database.appendRunEvent(running.id, "progress", { during: archived.title });
+      assert.ok(performance.now() - began < 100, "active-run output waited for a giant archive writer");
+      assert.ok(database.getConversation(archived.id), "deferred row was removed before the active run finished");
       assert.equal(database.getRun(running.id).status, "running");
+    }
+    database.updateRun(running.id, { status: "completed" });
+    const deadline = Date.now() + 8_000;
+    for (const archived of archives) {
+      while (database.getConversation(archived.id)) {
+        assert.ok(Date.now() < deadline, "deferred giant archive cleanup did not resume");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id));
     }
     const probe = new Database(filename);
     assert.ok(probe.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes < 1024 * 1024);
     probe.close();
+    assert.equal(database.canLaunchRun(), true, "cleanup did not reopen run admission");
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 

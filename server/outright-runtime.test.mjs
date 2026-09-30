@@ -222,6 +222,40 @@ test("explicit archived deletion at the HTTP boundary restores admission without
   assert.ok(database.getRun(recovery.id));
 }));
 
+test("oversized archived HTTP deletion defers without blocking live output or capacity reads", withRuntime(async (runtime) => {
+  const database = runtime.database;
+  const active = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Active", provider: "codex" });
+  const running = database.createRun({ conversationId: active.id, provider: "codex", approvalPolicy: "read-only", prompt: "work" });
+  database.updateRun(running.id, { status: "running" });
+  const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Old", provider: "codex" });
+  const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "short" });
+  const legacy = new Database(database.filename);
+  legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(8 * 1024 * 1024), message.id);
+  legacy.close();
+  database.updateConversation(archived.id, { archived: true });
+  const deleteResponse = responseCapture();
+  await runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived", { id: archived.id, confirmation: archived.id }), deleteResponse);
+  assert.equal(deleteResponse.statusCode, 202);
+  assert.equal(deleteResponse.body.deleted, 0);
+  assert.equal(deleteResponse.body.deferred, true);
+  assert.equal(deleteResponse.body.capacity.cleanupPending, true);
+  assert.equal(database.canLaunchRun(), false);
+  const started = performance.now();
+  database.appendRunEvent(running.id, "progress", { text: "still writable" });
+  const capacityResponse = responseCapture();
+  await runtime.handleRequest(requestStream("GET", "/api/capacity"), capacityResponse);
+  assert.equal(capacityResponse.statusCode, 200);
+  assert.ok(performance.now() - started < 100, "deferred cleanup delayed active output and HTTP capacity");
+  database.updateRun(running.id, { status: "completed" });
+  const deadline = Date.now() + 5_000;
+  while (database.getConversation(archived.id)) {
+    assert.ok(Date.now() < deadline, "marked HTTP deletion did not resume");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id));
+  assert.equal(database.canLaunchRun(), true);
+}));
+
 test("archived HTTP cursor reaches an older selection and rejects malformed pages", withRuntime(async (runtime) => {
   const database = runtime.database;
   const firstCreated = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "First", provider: "codex" });

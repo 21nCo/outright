@@ -18,6 +18,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   const database = createOutrightDatabase({ runtimeLease: true, onMigrationComplete: () => {
     agents.resumeQueued();
     publish({ type: "capacity.changed", payload: database.capacity() });
+  }, onDeletionWorkerExit: () => {
+    agents.resumeQueued();
+    publish({ type: "capacity.changed", payload: database.capacity() });
   } });
   // Completion markers are trusted recovery evidence. Secure their directory
   // before reconciliation reads any record, rather than waiting for the agent
@@ -164,15 +167,15 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Retention request must be a JSON object");
         const result = await database.deleteArchivedConversation(body.id, body.confirmation);
         agents.resumeQueued();
-        return json(response, 200, { deleted: result.deleted, capacity: database.capacity() });
+        return json(response, result.deferred ? 202 : 200, { deleted: result.deleted, deferred: Boolean(result.deferred), capacity: database.capacity() });
       }
       if (url.pathname === "/api/retention/cleanup" && request.method === "POST") {
         const body = await readJson(request);
         if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Retention request must be a JSON object");
         const result = await database.pruneHistory({ before: body.before, limit: 100 });
-        database.audit("retention.cleaned", { deleted: result.deleted, before: body.before ?? "saved retention window" });
+        database.audit("retention.cleaned", { deleted: result.deleted, deferred: result.deferred, before: body.before ?? "saved retention window" });
         agents.resumeQueued();
-        return json(response, 200, { deleted: result.deleted, capacity: database.capacity() });
+        return json(response, 200, { deleted: result.deleted, deferred: result.deferred, capacity: database.capacity() });
       }
 
       if (url.pathname === "/api/groups" && request.method === "GET") return json(response, 200, database.listGroups());

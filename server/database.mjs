@@ -82,12 +82,16 @@ export function createOutrightDatabase(options = {}) {
   let migrationTick;
   let migrationRetry;
   let deletionTick;
+  let deletionTickKind;
   let migrationError = null;
   const deletionsInFlight = new Set();
   const deletionWorkers = new Set();
   const releaseLeaseIfIdle = () => {
     if (closing && !deletionWorkers.size && leaseDb) { leaseDb.close(); leaseDb = undefined; }
+    else if (!closing) options.onDeletionWorkerExit?.();
   };
+  const deletionContext = { isClosing: () => closing, filename: storageFilename,
+    workers: deletionWorkers, onWorkerExit: releaseLeaseIfIdle };
   try {
     // Hold the process lease on a companion SQLite file. The data database
     // stays in WAL mode so an oversized archive row can be deleted on a
@@ -135,21 +139,29 @@ export function createOutrightDatabase(options = {}) {
     });
   };
   continueMigrations();
+  const scheduleDeletionResume = (delayMs = 0) => {
+    if (closing) return;
+    // Cancel only the matching handle type. Clearing an Immediate as a Timer
+    // can cancel an unrelated request timer on Node's shared handle table.
+    if (deletionTickKind === "timeout") clearTimeout(deletionTick);
+    else if (deletionTickKind === "immediate") clearImmediate(deletionTick);
+    deletionTickKind = delayMs ? "timeout" : "immediate";
+    deletionTick = delayMs ? setTimeout(resumeDeletions, delayMs) : setImmediate(resumeDeletions);
+  };
   const resumeDeletions = () => {
     if (closing) return;
     const pending = db.prepare("SELECT id FROM conversations WHERE deleting = 1 ORDER BY rowid LIMIT 1").get();
     if (!pending) return;
     if (deletionsInFlight.has(pending.id)) {
-      deletionTick = setTimeout(resumeDeletions, 100);
+      scheduleDeletionResume(100);
       return;
     }
-    let failed = false;
-    deleteArchivedInBatches(db, pending.id, deletionsInFlight, true, () => closing, storageFilename, deletionWorkers, releaseLeaseIfIdle)
-      .catch((error) => { failed = true; options.onDeletionError?.(error); })
-      .finally(() => { if (!closing) deletionTick = failed ? setTimeout(resumeDeletions, 1000) : setImmediate(resumeDeletions); });
+    deleteArchivedInBatches(db, pending.id, deletionsInFlight, { ...deletionContext, automatic: true })
+      .then((result) => scheduleDeletionResume(result.deferred ? 250 : 0))
+      .catch((error) => { options.onDeletionError?.(error); scheduleDeletionResume(1000); });
   };
   if (db.prepare("SELECT 1 FROM conversations WHERE deleting = 1 LIMIT 1").get()) {
-    deletionTick = setImmediate(resumeDeletions);
+    scheduleDeletionResume();
   }
 
   // Optional retained-data writes use the shared SQLite byte counter. The
@@ -181,7 +193,8 @@ export function createOutrightDatabase(options = {}) {
       closing = true;
       if (migrationTick) clearImmediate(migrationTick);
       if (migrationRetry) clearTimeout(migrationRetry);
-      if (deletionTick) { clearImmediate(deletionTick); clearTimeout(deletionTick); }
+      if (deletionTickKind === "timeout") clearTimeout(deletionTick);
+      else if (deletionTickKind === "immediate") clearImmediate(deletionTick);
       for (const worker of deletionWorkers) void worker.terminate().catch(() => {});
       db.close();
       releaseLeaseIfIdle();
@@ -222,6 +235,7 @@ export function createOutrightDatabase(options = {}) {
       const queued = db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status = 'queued'").get().count;
       const active = db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status IN ('launching', 'running')").get().count;
       const recoverable = db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status = 'interrupted' AND recovery_decision IS NULL").get().count;
+      const cleanupPending = Boolean(db.prepare("SELECT 1 FROM conversations WHERE deleting = 1 LIMIT 1").get());
       const measured = retainedMeasured(db);
       const migrating = migrationPending(db);
       const bytes = measured ? retainedBytes(db) : null;
@@ -232,7 +246,7 @@ export function createOutrightDatabase(options = {}) {
       let retainedUsageStatus = "measuring";
       if (measured) retainedUsageStatus = "measured";
       else if (migrationError) retainedUsageStatus = "error";
-      return { queued, active, recoverable, retainedBytes: bytes,
+      return { queued, active, recoverable, cleanupPending, retainedBytes: bytes,
         retainedUsageStatus,
         migrationStatus,
         availableForNewWorkBytes: measured && !migrating ? Math.max(0, maxRetainedBytes - retainedReserveBytes - bytes) : 0, limits: {
@@ -246,7 +260,8 @@ export function createOutrightDatabase(options = {}) {
       // Keep enough ordinary retained space for a newly launched run to
       // record its first output. The separate reserve remains for recovery
       // and terminal transitions.
-      return this.capacity().availableForNewWorkBytes >= 64 * 1024;
+      const capacity = this.capacity();
+      return !capacity.cleanupPending && capacity.availableForNewWorkBytes >= 64 * 1024;
     },
     listDeletableArchivedConversations({ limit = 100, cursor = null } = {}) {
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw databaseError(400, "Archived history page size must be 1 to 100");
@@ -272,7 +287,8 @@ export function createOutrightDatabase(options = {}) {
       if (typeof id !== "string" || !id || id.length > 200 || confirmation !== id) {
         throw databaseError(400, "Confirm the exact archived conversation id before deleting it");
       }
-      return deleteArchivedInBatches(db, id, deletionsInFlight, false, () => closing, storageFilename, deletionWorkers, releaseLeaseIfIdle);
+      return deleteArchivedInBatches(db, id, deletionsInFlight, deletionContext)
+        .then((result) => { if (result.deferred) scheduleDeletionResume(250); return result; });
     },
     // Each eligible conversation is fenced before bounded child-row batches.
     // The fence survives restart, so interruption cannot expose a partly
@@ -294,11 +310,16 @@ export function createOutrightDatabase(options = {}) {
           ORDER BY updated_at, id LIMIT ?`).all(cutoff, limit).map((row) => row.id);
       return (async () => {
         const deleted = [];
+        let deferred = 0;
         for (const id of ids) {
-          try { await deleteArchivedInBatches(db, id, deletionsInFlight, true, () => closing, storageFilename, deletionWorkers, releaseLeaseIfIdle); deleted.push(id); }
+          try {
+            const result = await deleteArchivedInBatches(db, id, deletionsInFlight, { ...deletionContext, automatic: true });
+            if (result.deleted) deleted.push(id);
+            else if (result.deferred) { deferred += 1; scheduleDeletionResume(250); }
+          }
           catch (error) { if (error.statusCode !== 404 && error.statusCode !== 409) throw error; }
         }
-        return { deleted: deleted.length, ids: deleted };
+        return { deleted: deleted.length, deferred, ids: deleted };
       })();
     },
     listGroups() {
@@ -1183,8 +1204,7 @@ function runPatchAssignments(patch) {
 // to HTTP, sockets, and active agents. A larger legacy row is deleted on a
 // separate SQLite worker connection. The marker survives a crash and is
 // resumed on the next open.
-function deleteArchivedInBatches(db, id, inFlight, automatic = false, isClosing = () => false,
-  filename = ":memory:", workers = new Set(), onWorkerExit = () => {}) {
+function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosing, filename, workers, onWorkerExit }) {
   if (inFlight.has(id)) throw databaseError(409, "Archived conversation deletion is in progress");
   inFlight.add(id);
   const run = async () => {
@@ -1202,8 +1222,14 @@ function deleteArchivedInBatches(db, id, inFlight, automatic = false, isClosing 
       while (true) {
         if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
         const step = db.transaction(() => deleteArchivedBatch(db, id, filename)).immediate();
-        if (step === true) return { deleted: 1, id };
+        if (step.done) { onWorkerExit(); return { deleted: 1, id }; }
         if (step?.oversized) {
+          // SQLite has one writer even in WAL mode. Never let a legacy giant
+          // row delete contend with output or terminal writes from a live run.
+          // The durable marker lets restart or the retry timer finish later.
+          if (db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
+            return { deleted: 0, deferred: true, id };
+          }
           try { await deleteOversizedArchivedRow(filename, id, step.oversized, workers, onWorkerExit); }
           catch (error) {
             if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
@@ -1239,7 +1265,7 @@ function deleteArchivedBatch(db, id, filename) {
       remove.run(row.id);
       bytes += row.bytes;
     }
-    return false;
+    return { done: false };
   }
   const deleted = db.prepare("DELETE FROM conversations WHERE id = ? AND deleting = 1").run(id).changes;
   if (deleted) {
@@ -1249,7 +1275,7 @@ function deleteArchivedBatch(db, id, filename) {
     trimAudit(db);
     reserveRecoveryHeadroom(db);
   }
-  return true;
+  return { done: true };
 }
 
 function deleteOversizedArchivedRow(filename, conversationId, oversized, workers, onWorkerExit) {

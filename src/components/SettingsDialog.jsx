@@ -89,6 +89,7 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
     } finally { if (session === archiveSessionRef.current) setLoadingArchived(false); }
   }
   async function save() {
+    const session = archiveSessionRef.current;
     // PATCH only fields this session edited. Another Settings session may have
     // tightened a quota or execution policy since this draft was opened.
     const patch = Object.fromEntries(Object.entries(draft).filter(([key, value]) =>
@@ -97,14 +98,27 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
       const updated = Object.keys(patch).length
         ? await api("/api/settings", { method: "PATCH", body: patch })
         : await api("/api/settings");
+      if (session !== archiveSessionRef.current) {
+        if (Object.keys(patch).length) onSaved(null, "settings");
+        return;
+      }
       onSaved(updated);
       onOpenChange(false);
     }
-    catch (error) { onError(error); }
+    catch (error) { if (session === archiveSessionRef.current) onError(error); }
   }
   async function saveTemplate() {
-    try { await api("/api/templates", { method: "POST", body: templateDraft }); setTemplateDraft({ title: "", prompt: "" }); onSaved(await api("/api/settings"), true); }
-    catch (error) { onError(error); }
+    const session = archiveSessionRef.current;
+    try {
+      await api("/api/templates", { method: "POST", body: templateDraft });
+      if (session === archiveSessionRef.current) setTemplateDraft({ title: "", prompt: "" });
+      onSaved(null, "templates");
+    } catch (error) { if (session === archiveSessionRef.current) onError(error); }
+  }
+  async function deleteTemplate(id) {
+    const session = archiveSessionRef.current;
+    try { await api(`/api/templates/${id}`, { method: "DELETE" }); onSaved(null, "templates"); }
+    catch (error) { if (session === archiveSessionRef.current) onError(error); }
   }
   async function cleanHistory() {
     const session = archiveSessionRef.current;
@@ -112,7 +126,9 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
       const result = await api("/api/retention/cleanup", { method: "POST", body: {} });
       if (session !== archiveSessionRef.current) { onSaved(settings, "history"); return; }
       setCapacity(result.capacity);
-      setCleanupResult(`Deleted ${result.deleted} old archived ${result.deleted === 1 ? "chat" : "chats"}.`);
+      setCleanupResult(result.deferred
+        ? `Deleted ${result.deleted} old archived ${result.deleted === 1 ? "chat" : "chats"}; ${result.deferred} queued for cleanup after active runs finish.`
+        : `Deleted ${result.deleted} old archived ${result.deleted === 1 ? "chat" : "chats"}.`);
       await refreshArchived();
       onSaved(settings, "history");
     } catch (error) { if (session === archiveSessionRef.current) onError(error); }
@@ -126,7 +142,8 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
       const result = await api("/api/retention/delete-archived", { method: "POST", body: { id: selected.id, confirmation: selected.id } });
       if (session !== archiveSessionRef.current) { onSaved(settings, "history"); return; }
       setCapacity(result.capacity);
-      setCleanupResult(`Deleted archived chat “${selected.title}”.`);
+      setCleanupResult(result.deferred ? `Archived chat “${selected.title}” is queued for cleanup after active runs finish.`
+        : `Deleted archived chat “${selected.title}”.`);
       let refreshError;
       try { await refreshArchived(); }
       catch (error) {
@@ -156,7 +173,7 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
     <Setting icon={Brain} label="Queued runs"><Input type="number" min="1" max="256" value={draft.maxQueuedRuns} onChange={(event) => setDraft({ ...draft, maxQueuedRuns: Number(event.target.value) })} /></Setting>
     <Setting icon={Brain} label="Retained history (MiB)"><Input type="number" min="64" max="4096" value={draft.maxRetainedMiB} onChange={(event) => setDraft({ ...draft, maxRetainedMiB: Number(event.target.value) })} /></Setting>
     <Setting icon={Brain} label="Archived history age (days)"><Input type="number" min="1" max="3650" value={draft.retentionDays} onChange={(event) => setDraft({ ...draft, retentionDays: Number(event.target.value) })} /></Setting>
-  </div><section className="template-settings"><header><div><strong>Capacity and retention</strong><small>Cleanup removes unpinned archived chats older than the saved age. You can also select a recent archived chat to delete now. Active and recoverable runs stay protected.</small></div></header>{capacity?.limits && <output className="capacity-status">{capacity.queued} of {capacity.limits.maxQueuedRuns} queued · {capacity.active} active · {capacity.recoverable} awaiting recovery · {capacityUsageText(capacity)} ({(capacity.limits.reservedRetainedBytes / 1048576).toFixed(0)} MiB reserved for active runs). CPU, memory and allocated disk use are unknown.</output>}<Button ref={cleanupButtonRef} variant="outline" onClick={cleanHistory}>Clean old archived history</Button>{cleanupResult && <output className="capacity-status">{cleanupResult}</output>}{archived.length > 0 && <div ref={archivedListRef} className="template-list archived-history-list" aria-label="Archived chats available to delete">{archived.map((item) => <div key={item.id}><span><strong>{item.title}</strong><small title={item.worktreePath}>{item.worktreePath} · Archived {new Date(item.updatedAt).toLocaleDateString()}</small></span><Button variant="outline" size="sm" aria-label={`Delete archived chat “${item.title}” in ${item.worktreePath} (${item.id})`} onClick={(event) => { deleteTriggerRef.current = event.currentTarget; setPendingDelete(item); }}>Delete now</Button></div>)}</div>}{showingOlderArchived && <Button ref={backToNewestRef} variant="outline" onClick={() => { restorePageFocusRef.current = true; refreshArchived().catch((error) => { restorePageFocusRef.current = false; onError(error); }); }}>Back to newest archived chats</Button>}{archivedCursor && <Button variant="outline" onClick={loadMoreArchived} disabled={loadingArchived}>{loadingArchived ? "Loading archived chats…" : "Next archived page"}</Button>}{pendingDelete && <fieldset className="archive-delete-confirm"><legend className="sr-only">Confirm archived chat deletion</legend><p>Delete “{pendingDelete.title}” in {pendingDelete.worktreePath} and its messages and run history permanently?</p><div><Button ref={cancelDeleteRef} variant="outline" onClick={() => { restoreDeleteFocusRef.current = true; setPendingDelete(null); }} disabled={deleting}>Cancel</Button><Button variant="destructive" onClick={deleteSelectedArchive} disabled={deleting}>Delete archived chat</Button></div></fieldset>}</section><section className="template-settings"><header><div><strong>Prompt templates</strong><small>Reusable instructions available from the composer.</small></div></header><div className="template-list">{templates.map((template) => <div key={template.id}><span><strong>{template.title}</strong><small>{template.prompt}</small></span><Button variant="ghost" size="icon-xs" aria-label={`Delete template ${template.title}`} onClick={() => api(`/api/templates/${template.id}`, { method: "DELETE" }).then(() => onSaved(settings, true)).catch(onError)}><Trash /></Button></div>)}</div><div className="new-template"><Input aria-label="Template name" value={templateDraft.title} onChange={(event) => setTemplateDraft({ ...templateDraft, title: event.target.value })} placeholder="Template name" /><Input aria-label="Template prompt" value={templateDraft.prompt} onChange={(event) => setTemplateDraft({ ...templateDraft, prompt: event.target.value })} placeholder="Prompt" /><Button variant="outline" onClick={saveTemplate} disabled={!templateDraft.title.trim() || !templateDraft.prompt.trim()}>Add template</Button></div></section><DialogFooter><Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button><Button onClick={save}>Save settings</Button></DialogFooter></DialogContent></Dialog>;
+  </div><section className="template-settings"><header><div><strong>Capacity and retention</strong><small>Cleanup removes unpinned archived chats older than the saved age. You can also select a recent archived chat to delete now. Active and recoverable runs stay protected.</small></div></header>{capacity?.limits && <output className="capacity-status">{capacity.queued} of {capacity.limits.maxQueuedRuns} queued · {capacity.active} active · {capacity.recoverable} awaiting recovery · {capacityUsageText(capacity)} ({(capacity.limits.reservedRetainedBytes / 1048576).toFixed(0)} MiB reserved for active runs). CPU, memory and allocated disk use are unknown.</output>}<Button ref={cleanupButtonRef} variant="outline" onClick={cleanHistory}>Clean old archived history</Button>{cleanupResult && <output className="capacity-status">{cleanupResult}</output>}{archived.length > 0 && <div ref={archivedListRef} className="template-list archived-history-list" aria-label="Archived chats available to delete">{archived.map((item) => <div key={item.id}><span><strong>{item.title}</strong><small title={item.worktreePath}>{item.worktreePath} · Archived {new Date(item.updatedAt).toLocaleDateString()}</small></span><Button variant="outline" size="sm" aria-label={`Delete archived chat “${item.title}” in ${item.worktreePath} (${item.id})`} onClick={(event) => { deleteTriggerRef.current = event.currentTarget; setPendingDelete(item); }}>Delete now</Button></div>)}</div>}{showingOlderArchived && <Button ref={backToNewestRef} variant="outline" onClick={() => { restorePageFocusRef.current = true; refreshArchived().catch((error) => { restorePageFocusRef.current = false; onError(error); }); }}>Back to newest archived chats</Button>}{archivedCursor && <Button variant="outline" onClick={loadMoreArchived} disabled={loadingArchived}>{loadingArchived ? "Loading archived chats…" : "Next archived page"}</Button>}{pendingDelete && <fieldset className="archive-delete-confirm"><legend className="sr-only">Confirm archived chat deletion</legend><p>Delete “{pendingDelete.title}” in {pendingDelete.worktreePath} and its messages and run history permanently?</p><div><Button ref={cancelDeleteRef} variant="outline" onClick={() => { restoreDeleteFocusRef.current = true; setPendingDelete(null); }} disabled={deleting}>Cancel</Button><Button variant="destructive" onClick={deleteSelectedArchive} disabled={deleting}>Delete archived chat</Button></div></fieldset>}</section><section className="template-settings"><header><div><strong>Prompt templates</strong><small>Reusable instructions available from the composer.</small></div></header><div className="template-list">{templates.map((template) => <div key={template.id}><span><strong>{template.title}</strong><small>{template.prompt}</small></span><Button variant="ghost" size="icon-xs" aria-label={`Delete template ${template.title}`} onClick={() => deleteTemplate(template.id)}><Trash /></Button></div>)}</div><div className="new-template"><Input aria-label="Template name" value={templateDraft.title} onChange={(event) => setTemplateDraft({ ...templateDraft, title: event.target.value })} placeholder="Template name" /><Input aria-label="Template prompt" value={templateDraft.prompt} onChange={(event) => setTemplateDraft({ ...templateDraft, prompt: event.target.value })} placeholder="Prompt" /><Button variant="outline" onClick={saveTemplate} disabled={!templateDraft.title.trim() || !templateDraft.prompt.trim()}>Add template</Button></div></section><DialogFooter><Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button><Button onClick={save}>Save settings</Button></DialogFooter></DialogContent></Dialog>;
 }
 
 function Setting({ icon: Icon, label, children }) { return <label className="setting-row"><span><Icon />{label}</span>{children}</label>; }
@@ -165,5 +182,7 @@ function capacityUsageText(capacity) {
   if (capacity.migrationStatus === "error") return "Retained history migration paused; retrying · new work paused";
   if (typeof capacity.retainedBytes !== "number") return "Measuring retained history · new work paused";
   if (capacity.migrationStatus === "migrating") return "Indexing retained history · new work paused";
-  return `${(capacity.retainedBytes / 1048576).toFixed(1)} of ${(capacity.limits.maxRetainedBytes / 1048576).toFixed(0)} MiB retained · ${(capacity.availableForNewWorkBytes / 1048576).toFixed(1)} MiB available for new work`;
+  const usage = `${(capacity.retainedBytes / 1048576).toFixed(1)} of ${(capacity.limits.maxRetainedBytes / 1048576).toFixed(0)} MiB retained`;
+  if (capacity.cleanupPending) return `${usage} · archived cleanup in progress; new launches paused`;
+  return `${usage} · ${(capacity.availableForNewWorkBytes / 1048576).toFixed(1)} MiB available for new work`;
 }

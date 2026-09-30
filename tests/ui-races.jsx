@@ -352,6 +352,123 @@ async function settingsRetentionDraftRegression() {
     "An older Settings draft overwrote another session's resource or execution policy");
 }
 
+async function settingsSaveSessionFenceRegression() {
+  const settings = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
+    editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
+  for (const method of ["GET", "PATCH"]) {
+    for (const outcome of ["success", "failure"]) {
+      root.render(null);
+      await settle();
+      const held = deferred();
+      let started = false;
+      let saved = 0;
+      let errors = 0;
+      let requests = 0;
+      route = async (url, options) => {
+        if (url.pathname === "/api/capacity") return response({});
+        if (url.pathname === "/api/retention/archived") return response({ conversations: [] });
+        if (url.pathname === "/api/settings") {
+          requests += 1;
+          if (requests === 1) { started = true; return held.promise; }
+          return response({ ...settings, retentionDays: 70 });
+        }
+        return response({});
+      };
+      function Fixture() {
+        const [open, setOpen] = React.useState(false);
+        return <><button onClick={() => setOpen(true)}>Open save fixture</button><SettingsDialog open={open}
+          onOpenChange={setOpen} settings={settings} providers={[{ id: "codex", label: "Codex", available: true }]}
+          templates={[]} onSaved={(_, refresh) => { if (!refresh) saved += 1; }} onError={() => { errors += 1; }} /></>;
+      }
+      root.render(<TooltipProvider><Fixture /></TooltipProvider>);
+      await until(() => host.querySelector("button"), "save fixture mounted");
+      const open = () => host.querySelector("button").click();
+      const age = () => document.querySelector('[role="dialog"] label:last-of-type input');
+      const action = (label) => [...document.querySelectorAll('[role="dialog"] button')]
+        .find((button) => button.textContent.includes(label)).click();
+      open();
+      await until(() => age()?.value === "90", "save fixture opened");
+      if (method === "PATCH") setControlValue(age(), "60");
+      action("Save settings");
+      await until(() => started, "old Settings save held");
+      action("Cancel");
+      await until(() => !document.querySelector('[role="dialog"]'), "old Settings closed");
+      open();
+      await until(() => age()?.value === "90", "new Settings session opened");
+      setControlValue(age(), "70");
+      age().focus();
+      if (outcome === "success") held.resolve(response({ ...settings, retentionDays: 60 }));
+      else held.reject(new Error("old Settings request failed"));
+      await settle();
+      assert(age()?.value === "70" && document.activeElement === age(), `${method} ${outcome} changed new Settings draft or focus`);
+      assert(saved === 0 && errors === 0, `${method} ${outcome} published an old Settings completion`);
+      action("Save settings");
+      await until(() => !document.querySelector('[role="dialog"]') && saved === 1,
+        `current Settings save after stale ${method} ${outcome}`);
+    }
+  }
+  await settingsAppRefreshFenceRegression();
+}
+
+async function settingsAppRefreshFenceRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const initial = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
+    editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
+  const oldPatch = deferred();
+  const oldBootstrap = deferred();
+  let saved = initial;
+  let patches = 0;
+  let holdBootstrap = false;
+  let heldBootstrapStarted = false;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") {
+      if (holdBootstrap) { holdBootstrap = false; heldBootstrapStarted = true; return oldBootstrap.promise; }
+      return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: saved,
+        providers: [{ id: "codex", label: "Codex", available: true }], templates: [], trustedProjects: [] });
+    }
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/capacity") return response({});
+    if (url.pathname === "/api/retention/archived") return response({ conversations: [] });
+    if (url.pathname === "/api/settings" && options.method === "PATCH") {
+      patches += 1;
+      saved = { ...saved, ...JSON.parse(options.body) };
+      return patches === 1 ? oldPatch.promise : response(saved);
+    }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[aria-label="Settings"]'), "app settings refresh fixture");
+  const open = () => host.querySelector('[aria-label="Settings"]').click();
+  const age = () => document.querySelector('[role="dialog"] label:last-of-type input');
+  const action = (label) => [...document.querySelectorAll('[role="dialog"] button')]
+    .find((button) => button.textContent.includes(label)).click();
+  open();
+  await until(() => age()?.value === "90", "old app Settings opened");
+  setControlValue(age(), "60");
+  action("Save settings");
+  await until(() => patches === 1, "old app Settings PATCH held");
+  action("Cancel");
+  await until(() => !document.querySelector('[role="dialog"]'), "old app Settings closed");
+  open();
+  await until(() => age()?.value === "90", "new app Settings opened");
+  setControlValue(age(), "70");
+  holdBootstrap = true;
+  oldPatch.resolve(response({ ...initial, retentionDays: 60 }));
+  await until(() => heldBootstrapStarted, "stale PATCH requested authoritative refresh");
+  assert(age()?.value === "70", "stale PATCH replaced the new App Settings draft");
+  action("Save settings");
+  await until(() => patches === 2 && !document.querySelector('[role="dialog"]'), "current app Settings saved");
+  oldBootstrap.resolve(response({ projects, projectGroups: { groups: [], memberships: {} },
+    settings: { ...initial, retentionDays: 60 }, providers: [{ id: "codex", label: "Codex", available: true }],
+    templates: [], trustedProjects: [] }));
+  await settle();
+  open();
+  await until(() => age()?.value === "70", "stale bootstrap did not undo current Settings save");
+}
+
 async function settingsMigrationCompletionRegression() {
   root.render(null);
   await settle();
@@ -3990,27 +4107,31 @@ async function sustainedOutputRegression() {
   window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), output: { deltas: 200, elapsedMs, paints, paintBudget, inputFrameMs } };
 }
 
+async function expectResponsiveFocus(label, target) {
+  try {
+    await until(() => visibleFocus(target()), label);
+  } catch (error) {
+    const active = document.activeElement;
+    throw new Error(`${error.message}; active=${active?.outerHTML?.slice(0, 250)}; target=${target()?.outerHTML?.slice(0, 250)}`);
+  }
+}
+
 async function responsiveSidebarBreakpointCycles(setWidth) {
   for (let round = 0; round < 3; round += 1) {
     const desktopSidebarControl = host.querySelector('[aria-label="Close projects sidebar"]');
     desktopSidebarControl.focus();
     await setWidth(640);
     await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), `sidebar closed from focused desktop control ${round + 1}`);
-    try {
-      await until(() => visibleFocus(host.querySelector('[aria-label="Open projects sidebar"]')), `visible focus restored after hiding desktop sidebar ${round + 1}`);
-    } catch (error) {
-      const active = document.activeElement;
-      const opener = host.querySelector('[aria-label="Open projects sidebar"]');
-      throw new Error(`${error.message}; active=${active?.outerHTML?.slice(0, 250)}; openerRect=${JSON.stringify(opener?.getBoundingClientRect().toJSON())}; openerVisibility=${opener && getComputedStyle(opener).visibility}`);
-    }
+    await expectResponsiveFocus(`visible focus restored after hiding desktop sidebar ${round + 1}`,
+      () => host.querySelector('[aria-label="Open projects sidebar"]'));
     if (round === 0) {
       // A busy main thread can deliver a blur timer after the old three-second
       // wall-clock retry window. The visible opener must regain ownership.
       document.activeElement.blur();
       const pauseUntil = performance.now() + 3_100;
       while (performance.now() < pauseUntil) { /* Hold browser task delivery. */ }
-      await until(() => visibleFocus(host.querySelector('[aria-label="Open projects sidebar"]')),
-        "sidebar opener focus after a delayed browser task");
+      await expectResponsiveFocus("sidebar opener focus after a delayed browser task",
+        () => host.querySelector('[aria-label="Open projects sidebar"]'));
     }
     if (round === 1) {
       // Some engines blur a disappearing control before dispatching the media
@@ -4026,13 +4147,8 @@ async function responsiveSidebarBreakpointCycles(setWidth) {
       const focused = document.activeElement;
       if (host.querySelector("#project-sidebar").contains(focused)) focused.blur();
     }
-    try {
-      await until(() => host.querySelector("#project-sidebar").contains(document.activeElement) && visibleFocus(document.activeElement), `visible sidebar focus after wide transition ${round + 1}`);
-    } catch (error) {
-      const active = document.activeElement;
-      const rect = active?.getBoundingClientRect();
-      throw new Error(`${error.message}; active=${active?.outerHTML?.slice(0, 250)}; sidebar=${host.querySelector("#project-sidebar")?.getAttribute("aria-hidden")}; activeRect=${rect && JSON.stringify({ x: rect.x, width: rect.width })}`);
-    }
+    await expectResponsiveFocus(`visible sidebar focus after wide transition ${round + 1}`,
+      () => host.querySelector("#project-sidebar").contains(document.activeElement) ? document.activeElement : null);
   }
 }
 
@@ -4394,6 +4510,7 @@ try {
     ["chat tab controls", chatTabControlRegression, "chat tab navigation ignores nested archive controls"],
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
     ["settings retention draft", settingsRetentionDraftRegression, "missing archived data stays safe and cancel, cleanup and save use the persisted retention age"],
+    ["settings save session fence", settingsSaveSessionFenceRegression, "delayed GET and PATCH save completions cannot change a reopened Settings dialog"],
     ["settings migration completion", settingsMigrationCompletionRegression, "an open Settings dialog refreshes capacity when migration finishes"],
     ["notification permission rejection", rejectedNotificationPermissionRegression, "a rejected permission request does not disrupt Settings save or escape as an unhandled rejection"],
     ["archived settings paging focus", archivedSettingsPagingFocusRegression, "the oldest archive can be paged to and cancel and delete keep keyboard focus in Settings"],

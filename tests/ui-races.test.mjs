@@ -856,7 +856,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     }, deadline);
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
     const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
-    assert.match(state.text, new RegExp(`${selectedCount ?? 99} interaction regressions passed`));
+    assert.match(state.text, new RegExp(`${selectedCount ?? 100} interaction regressions passed`));
     const performanceFixture = state.text.match(/Performance fixture: (\{[^\n]+\})/);
     if (!process.env.OUTRIGHT_UI_STEP) assert.ok(performanceFixture, "large fixture measurements were not recorded");
     if (performanceFixture) console.log(`UI performance: ${performanceFixture[1]}`);
