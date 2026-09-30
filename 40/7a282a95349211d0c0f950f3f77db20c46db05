@@ -1,0 +1,20 @@
+server/database.mjs
+  h_a39f9495f9ec1d 141,144,202,228,1132-1133,1139,1142-1149
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 307-362
+src/components/SettingsDialog.jsx
+  h_a39f9495f9ec1d 127
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 355,382-386,394
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "407a282a95349211d0c0f950f3f77db20c46db05",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
