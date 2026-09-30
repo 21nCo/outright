@@ -85,6 +85,11 @@ function withRuntime(fn, options = {}) {
 test("run detail pages a migrated oversized replay tail without returning pruned output", (() => {
   let runId;
   return withRuntime(async (runtime) => {
+    const deadline = Date.now() + 5_000;
+    while (runtime.database.capacity().migrationStatus === "migrating" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(runtime.database.capacity().migrationStatus, "ready", "Legacy replay migration did not finish");
     const first = responseCapture();
     await runtime.handleRequest(requestStream("GET", `/api/runs/${runId}?after=0`), first);
     assert.equal(first.statusCode, 200);

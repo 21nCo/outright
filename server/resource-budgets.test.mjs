@@ -72,7 +72,7 @@ test("a full queue cannot consume an interrupted run's retry decision", () => {
   } finally { database.close(); }
 });
 
-test("retention removes only archived history with settled recovery and cascades its events", () => {
+test("retention removes only archived history with settled recovery and cascades its events", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-retention-"));
   const filename = path.join(directory, "outright.db");
   const database = createOutrightDatabase({ filename });
@@ -89,7 +89,7 @@ test("retention removes only archived history with settled recovery and cascades
     database.updateRun(finishedRun.id, { status: "completed" });
     database.appendRunEvent(finishedRun.id, "done", { value: "retained until cleanup" });
     ageArchived(filename, [queued.id, interrupted.id, finished.id]);
-    const first = database.pruneHistory();
+    const first = await database.pruneHistory();
     assert.deepEqual(first.ids, [finished.id]);
     assert.equal(database.getRun(finishedRun.id), undefined);
     assert.ok(database.getConversation(visible.id));
@@ -97,11 +97,11 @@ test("retention removes only archived history with settled recovery and cascades
     assert.ok(database.getRun(interruptedRun.id));
     database.updateRun(queuedRun.id, { status: "stopped" });
     database.resolveInterruptedRun(interruptedRun.id, "discard");
-    assert.equal(database.pruneHistory().deleted, 2);
+    assert.equal((await database.pruneHistory()).deleted, 2);
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("automatic retention preserves pinned archives while confirmed deletion remains available", () => {
+test("automatic retention preserves pinned archives while confirmed deletion remains available", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-pinned-retention-"));
   const filename = path.join(directory, "outright.db");
   const database = createOutrightDatabase({ filename });
@@ -111,9 +111,9 @@ test("automatic retention preserves pinned archives while confirmed deletion rem
     for (const item of [pinned, ordinary]) database.updateConversation(item.id, { archived: true });
     database.updateConversation(pinned.id, { pinned: true });
     ageArchived(filename, [pinned.id, ordinary.id]);
-    assert.deepEqual(database.pruneHistory().ids, [ordinary.id]);
+    assert.deepEqual((await database.pruneHistory()).ids, [ordinary.id]);
     assert.ok(database.getConversation(pinned.id));
-    assert.equal(database.deleteArchivedConversation(pinned.id, pinned.id).deleted, 1);
+    assert.equal((await database.deleteArchivedConversation(pinned.id, pinned.id)).deleted, 1);
     assert.equal(database.getConversation(pinned.id), undefined);
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
@@ -135,7 +135,7 @@ test("retained counter is measured on upgrade and trusted on populated restart",
     assert.equal(database.capacity().retainedBytes, measured, "legacy counter is reconciled once");
     database.close();
     const admin = new Database(filename);
-    assert.equal(admin.pragma("user_version", { simple: true }), 3);
+    assert.equal(admin.pragma("user_version", { simple: true }), 4);
     admin.prepare("UPDATE retained_usage SET bytes = bytes + 17 WHERE id = 1").run();
     admin.close();
     database = createOutrightDatabase({ filename });
@@ -232,7 +232,7 @@ test("legacy event migration survives deletion of its current archived run", asy
     legacy.close();
     database = createOutrightDatabase({ filename });
     assert.equal(database.capacity().retainedUsageStatus, "measuring");
-    assert.equal(database.deleteArchivedConversation(conversation.id, conversation.id).deleted, 1);
+    assert.equal((await database.deleteArchivedConversation(conversation.id, conversation.id)).deleted, 1);
     const deadline = Date.now() + 10_000;
     while (true) {
       const probe = new Database(filename);
@@ -278,7 +278,7 @@ test("measured bytes do not reopen admission before legacy event cursors finish"
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("retention compares parsed cutoff instants and protects unsettled run transitions", () => {
+test("retention compares parsed cutoff instants and protects unsettled run transitions", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-retention-cutoff-"));
   const filename = path.join(directory, "outright.db");
   const database = createOutrightDatabase({ filename });
@@ -296,24 +296,24 @@ test("retention compares parsed cutoff instants and protects unsettled run trans
     database.updateRun(interruptedRun.id, { status: "interrupted" });
     ageArchived(filename, [settled.id, queued.id, active.id, interrupted.id]);
 
-    assert.deepEqual(database.pruneHistory({ before: "Jan 1 2000" }).ids, [], "locale date cannot compare lexically after fresh ISO rows");
+    assert.deepEqual((await database.pruneHistory({ before: "Jan 1 2000" })).ids, [], "locale date cannot compare lexically after fresh ISO rows");
     for (const before of ["nonsense", "9999-01-01", new Date(Date.now() + 86_400_000).toISOString()]) {
       assert.throws(() => database.pruneHistory({ before }), (error) => error.statusCode === 400);
     }
     const cutoff = new Date(Date.now() - 95 * 86_400_000);
     const offsetCutoff = `${new Date(cutoff.getTime() + 5.5 * 3_600_000).toISOString().slice(0, 19)}+05:30`;
-    assert.deepEqual(database.pruneHistory({ before: offsetCutoff }).ids, [settled.id]);
+    assert.deepEqual((await database.pruneHistory({ before: offsetCutoff })).ids, [settled.id]);
     for (const item of [fresh, queued, active, interrupted]) assert.ok(database.getConversation(item.id));
 
     database.updateRun(queuedRun.id, { status: "stopped" });
     database.updateRun(activeRun.id, { status: "completed" });
     database.resolveInterruptedRun(interruptedRun.id, "discard");
-    assert.deepEqual(new Set(database.pruneHistory({ before: offsetCutoff }).ids), new Set([queued.id, active.id, interrupted.id]));
+    assert.deepEqual(new Set((await database.pruneHistory({ before: offsetCutoff })).ids), new Set([queued.id, active.id, interrupted.id]));
     assert.ok(database.getConversation(fresh.id));
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("aggregate retained history denies new work until eligible history is cleaned", () => {
+test("aggregate retained history denies new work until eligible history is cleaned", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-aggregate-"));
   const filename = path.join(directory, "outright.db");
   const database = createOutrightDatabase({ filename });
@@ -358,17 +358,17 @@ test("aggregate retained history denies new work until eligible history is clean
       assert.throws(() => admin.prepare("UPDATE conversations SET title = ? WHERE id = ?").run("x".repeat(2 * 1024 * 1024), current.id), /OUTRIGHT_RETAINED_LIMIT/);
     } finally { admin.close(); }
     database.updateConversation(old.id, { archived: true });
-    assert.equal(database.pruneHistory().deleted, 0, "ordinary cleanup respects the saved age");
+    assert.equal((await database.pruneHistory()).deleted, 0, "ordinary cleanup respects the saved age");
     assert.throws(() => database.submitRun(runInput(current.id), "still refused"), (error) => error.statusCode === 507);
     assert.throws(() => database.deleteArchivedConversation(old.id, "wrong id"), (error) => error.statusCode === 400);
-    assert.equal(database.deleteArchivedConversation(old.id, old.id).deleted, 1);
+    assert.equal((await database.deleteArchivedConversation(old.id, old.id)).deleted, 1);
     assert.equal(database.canLaunchRun(), true, "selected cleanup reopens the launch gate");
     assert.ok(database.getRun(interrupted.id), "a sibling's recovery evidence survives selected cleanup");
     assert.equal(database.submitRun(runInput(current.id), "accepted").run.status, "queued");
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("selected cleanup rechecks archived and run state at deletion, including cancellation and recovery", () => {
+test("selected cleanup rechecks archived and run state at deletion, including cancellation and recovery", async () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
     const visible = chat(database, "visible");
@@ -383,13 +383,13 @@ test("selected cleanup rechecks archived and run state at deletion, including ca
     database.updateRun(interruptedRun.id, { status: "interrupted" });
     assert.deepEqual(database.listDeletableArchivedConversations().conversations, []);
     for (const item of [visible, queued, active, interrupted]) {
-      assert.throws(() => database.deleteArchivedConversation(item.id, item.id), (error) => error.statusCode === 409);
+      await assert.rejects(database.deleteArchivedConversation(item.id, item.id), (error) => error.statusCode === 409);
     }
     database.updateRun(queuedRun.id, { status: "stopped" });
     database.updateRun(activeRun.id, { status: "completed" });
     database.resolveInterruptedRun(interruptedRun.id, "discard");
     assert.equal(database.listDeletableArchivedConversations().conversations.length, 3);
-    for (const item of [queued, active, interrupted]) assert.equal(database.deleteArchivedConversation(item.id, item.id).deleted, 1);
+    for (const item of [queued, active, interrupted]) assert.equal((await database.deleteArchivedConversation(item.id, item.id)).deleted, 1);
     assert.ok(database.getConversation(visible.id));
     assert.equal(database.getRun(queuedRun.id), undefined);
     assert.equal(database.getRun(activeRun.id), undefined);
@@ -397,7 +397,7 @@ test("selected cleanup rechecks archived and run state at deletion, including ca
   } finally { database.close(); }
 });
 
-test("archived selection pages past 100 without deleting newer chats or exposing active evidence", () => {
+test("archived selection pages past 100 without deleting newer chats or exposing active evidence", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archived-pages-"));
   const filename = path.join(directory, "outright.db");
   const database = createOutrightDatabase({ filename });
@@ -418,7 +418,7 @@ test("archived selection pages past 100 without deleting newer chats or exposing
     assert.equal(second.conversations.some((item) => item.id === oldest.id), true);
     assert.equal(second.conversations.some((item) => item.id === protectedChat.id), false);
     assert.equal(second.nextCursor, null);
-    assert.equal(database.deleteArchivedConversation(oldest.id, oldest.id).deleted, 1);
+    assert.equal((await database.deleteArchivedConversation(oldest.id, oldest.id)).deleted, 1);
     assert.ok(database.getConversation(first.conversations[0].id), "newer history is retained");
     assert.ok(database.getRun(active.id), "active evidence is retained");
     for (const cursor of ["", "!", "a".repeat(2049), Buffer.from(JSON.stringify(["date"])).toString("base64url")]) {
@@ -427,7 +427,7 @@ test("archived selection pages past 100 without deleting newer chats or exposing
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("migration preserves recovery transitions for legacy data already over quota", () => {
+test("migration preserves recovery transitions for legacy data already over quota", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-legacy-quota-"));
   const filename = path.join(directory, "outright.db");
   let database = createOutrightDatabase({ filename });
@@ -449,7 +449,7 @@ test("migration preserves recovery transitions for legacy data already over quot
     database.updateRun(run.id, { status: "interrupted", recoveryClass: "unknown" });
     assert.equal(database.getRun(run.id).status, "interrupted");
     assert.throws(() => database.submitRun(runInput(live.id), "blocked"), (error) => error.statusCode === 507);
-    assert.equal(database.pruneHistory().deleted, 1);
+    assert.equal((await database.pruneHistory()).deleted, 1);
     assert.equal(database.submitRun(runInput(live.id), "accepted").run.status, "queued");
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
@@ -482,7 +482,7 @@ test("startup reconciles a legacy backlog larger than fixed recovery headroom", 
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("near-cap legacy backlog reserves recovery space through interrupted restarts and cleanup", () => {
+test("near-cap legacy backlog reserves recovery space through interrupted restarts and cleanup", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-near-cap-recovery-"));
   const filename = path.join(directory, "outright.db");
   let database = createOutrightDatabase({ filename });
@@ -529,7 +529,7 @@ test("near-cap legacy backlog reserves recovery space through interrupted restar
     assert.equal(database.capacity().recoverable, 9000);
     assert.equal(database.resolveInterruptedRun("legacy-1", "discard").status, "failed");
     assert.equal(database.resolveInterruptedRun("legacy-2", "retry").recoveryDecision, "retry");
-    assert.equal(database.pruneHistory().deleted, 1);
+    assert.equal((await database.pruneHistory()).deleted, 1);
     assert.equal(database.resolveInterruptedRun("legacy-3", "discard-unverifiable").status, "failed");
     database.close();
     database = createOutrightDatabase({ filename });
@@ -561,7 +561,7 @@ test("startup recovery commits bounded batches before an interrupted probe", () 
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("lowering the retained cap preserves cleanup and refuses new retained work", () => {
+test("lowering the retained cap preserves cleanup and refuses new retained work", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-lower-cap-"));
   const filename = path.join(directory, "outright.db");
   const database = createOutrightDatabase({ filename });
@@ -573,7 +573,7 @@ test("lowering the retained cap preserves cleanup and refuses new retained work"
     assert.equal(database.updateSettings({ maxRetainedMiB: 64 }).maxRetainedMiB, 64);
     assert.equal(database.capacity().availableForNewWorkBytes, 0);
     assert.throws(() => database.submitRun(runInput(live.id), "blocked"), (error) => error.statusCode === 507);
-    assert.equal(database.deleteArchivedConversation(archived.id, archived.id).deleted, 1);
+    assert.equal((await database.deleteArchivedConversation(archived.id, archived.id)).deleted, 1);
     assert.equal(database.submitRun(runInput(live.id), "ready").run.status, "queued");
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
@@ -682,7 +682,7 @@ test("sustained event output retains a byte-bounded replay tail with monotonic c
   } finally { database.close(); }
 });
 
-test("legacy null event payloads migrate into the byte counter without blocking new events", () => {
+test("legacy null event payloads migrate into the byte counter without blocking new events", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-event-budget-"));
   const filename = path.join(directory, "outright.db");
   let database = createOutrightDatabase({ filename });
@@ -695,12 +695,17 @@ test("legacy null event payloads migrate into the byte counter without blocking 
     legacy.prepare("INSERT INTO run_events (run_id, seq, type, payload, created_at) VALUES (?, 1, 'legacy', NULL, ?)").run(run.id, new Date().toISOString());
     legacy.close();
     database = createOutrightDatabase({ filename });
+    const deadline = Date.now() + 10_000;
+    while (database.capacity().migrationStatus !== "ready") {
+      assert.ok(Date.now() < deadline, "legacy null event migration did not finish");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
     assert.equal(database.appendRunEvent(run.id, "new", { healthy: true }).seq, 2);
     assert.equal(database.listRunEvents(run.id).length, 2);
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("legacy oversized replay tails are pruned on reopen with monotonic run-detail cursors", () => {
+test("legacy oversized replay tails are pruned on reopen with monotonic run-detail cursors", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-legacy-events-"));
   const filename = path.join(directory, "outright.db");
   let database = createOutrightDatabase({ filename });
@@ -719,6 +724,11 @@ test("legacy oversized replay tails are pruned on reopen with monotonic run-deta
     })();
     legacy.close();
     database = createOutrightDatabase({ filename });
+    const deadline = Date.now() + 10_000;
+    while (database.capacity().migrationStatus !== "ready") {
+      assert.ok(Date.now() < deadline, "legacy replay migration did not finish");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
     const events = database.listRunEvents(run.id);
     assert.equal(events.at(-1).seq, 40);
     assert.ok(events[0].seq > 1, "pre-upgrade head was removed");
@@ -742,4 +752,112 @@ test("audit history bounds both an entry and the requested page", () => {
     for (let index = 0; index < 501; index += 1) database.audit("small", { index });
     assert.equal(database.listAudit(100000).length, 500);
   } finally { database.close(); }
+});
+
+test("legacy pinned schema and migration audit survive cleanup and restart", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-legacy-retention-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const archived = chat(database, "legacy archive");
+    for (let index = 0; index < 200; index += 1) database.addMessage({ conversationId: archived.id, role: "assistant", body: `legacy ${index}` });
+    database.updateConversation(archived.id, { archived: true });
+    database.close();
+    const legacy = new Database(filename);
+    legacy.exec("ALTER TABLE conversations DROP COLUMN pinned");
+    legacy.pragma("user_version = 0");
+    legacy.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.capacity().migrationStatus, "migrating");
+    database.audit("runtime.runs.reconciled", { target: "runtime", count: 1 });
+    assert.equal(database.listAudit().find((entry) => entry.action === "runtime.runs.reconciled")?.target, "runtime");
+    assert.equal(database.listConversations({ archived: true }).find((item) => item.id === archived.id)?.pinned, 0);
+    assert.equal((await database.deleteArchivedConversation(archived.id, archived.id)).deleted, 1);
+    assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id));
+    database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.getConversation(archived.id), undefined);
+    assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id));
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("large archived cleanup yields to active work and resumes after interruption", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-batched-retention-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const archived = chat(database, "large archive");
+    const active = chat(database, "active work");
+    const running = database.createRun(runInput(active.id));
+    database.updateRun(running.id, { status: "running" });
+    for (let index = 0; index < 400; index += 1) {
+      database.addMessage({ conversationId: archived.id, role: "assistant", body: "x".repeat(16 * 1024) });
+    }
+    database.updateConversation(archived.id, { archived: true });
+    const deletion = database.deleteArchivedConversation(archived.id, archived.id);
+    await new Promise((resolve) => setImmediate(resolve));
+    const probe = new Database(filename);
+    assert.equal(probe.prepare("SELECT deleting FROM conversations WHERE id = ?").get(archived.id)?.deleting, 1);
+    assert.ok(probe.prepare("SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?").get(archived.id).count > 0);
+    probe.close();
+    assert.equal(database.getRun(running.id).status, "running", "active work remains queryable during cleanup");
+    assert.throws(() => database.createRun(runInput(archived.id)), (error) => error.statusCode === 409);
+    await deletion;
+    assert.equal(database.getConversation(archived.id), undefined);
+    assert.equal(database.getRun(running.id).status, "running");
+    const interrupted = chat(database, "interrupted cleanup");
+    for (let index = 0; index < 80; index += 1) database.addMessage({ conversationId: interrupted.id, role: "assistant", body: "partial" });
+    database.updateConversation(interrupted.id, { archived: true });
+    const interruptedDeletion = database.deleteArchivedConversation(interrupted.id, interrupted.id);
+    database.close();
+    await assert.rejects(interruptedDeletion, (error) => error.statusCode === 503);
+    database = createOutrightDatabase({ filename });
+    const deadline = Date.now() + 5_000;
+    while (database.getConversation(interrupted.id)) {
+      assert.ok(Date.now() < deadline, "interrupted deletion did not resume");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === interrupted.id));
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("legacy run ownership and retained bytes advance without a whole-table startup pass", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-legacy-ownership-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const conversation = chat(database);
+    database.close();
+    const legacy = new Database(filename);
+    legacy.exec(`DROP TRIGGER runs_recovery_insert; DROP TRIGGER runs_recovery_update;
+      DROP TRIGGER runs_recovery_delete; DROP TABLE recovery_scope; DROP INDEX runs_worktree_recovery`);
+    legacy.prepare(`WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 2000)
+      INSERT INTO runs (id, conversation_id, worktree_path, provider, approval_policy, prompt, status, created_at)
+      SELECT printf('legacy-%04d', n), ?, '/tmp/w', 'codex', 'read-only', 'old prompt', 'completed', '2026-01-01T00:00:00.000Z' FROM seq`)
+      .run(conversation.id);
+    legacy.prepare("UPDATE runs SET prompt = ? WHERE id = 'legacy-2000'").run("x".repeat(8 * 1024 * 1024));
+    legacy.prepare("UPDATE retained_usage SET bytes = 0, measured = 0 WHERE id = 1").run();
+    legacy.pragma("user_version = 1");
+    legacy.close();
+
+    database = createOutrightDatabase({ filename });
+    const probe = new Database(filename);
+    const cursor = probe.prepare("SELECT cursor_number FROM migration_progress WHERE kind = 'recovery'").get()?.cursor_number;
+    assert.ok(cursor > 0 && cursor < 2000, "startup did not defer the legacy ownership pass");
+    assert.equal(probe.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'runs_worktree_recovery'").get(), undefined,
+      "startup rebuilt a full legacy runs index");
+    probe.close();
+    assert.equal(database.capacity().migrationStatus, "migrating");
+    assert.throws(() => database.createRun(runInput(conversation.id)), (error) => error.statusCode === 507);
+    const deadline = Date.now() + 10_000;
+    while (database.capacity().migrationStatus !== "ready") {
+      assert.ok(Date.now() < deadline, "legacy ownership migration did not converge");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(database.getRun("legacy-2000").worktreePath, conversation.worktreePath);
+    assert.ok(database.capacity().retainedBytes > 8 * 1024 * 1024);
+    database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.capacity().migrationStatus, "ready", "completed upgrade rescanned on restart");
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });

@@ -5,7 +5,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Input } from "@/components/ui/input";
 import { api } from "@/lib/runtime-api";
 
-export function SettingsDialog({ open, onOpenChange, settings, providers, templates, onSaved, onError }) {
+export function SettingsDialog({ open, onOpenChange, settings, providers, templates, runtimeEvent, onSaved, onError }) {
   const [draft, setDraft] = useState(settings);
   const [templateDraft, setTemplateDraft] = useState({ title: "", prompt: "" });
   const [capacity, setCapacity] = useState(null);
@@ -56,6 +56,13 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
     } }).catch((error) => { if (current) onError(error); });
     return () => { current = false; archivedRequestRef.current++; };
   }, [open, onError]);
+  useEffect(() => {
+    if (!open || runtimeEvent?.type !== "capacity.changed") return;
+    const session = archiveSessionRef.current;
+    api("/api/capacity").then((value) => {
+      if (session === archiveSessionRef.current) setCapacity(value);
+    }).catch((error) => { if (session === archiveSessionRef.current) onError(error); });
+  }, [open, runtimeEvent, onError]);
   async function refreshArchived() {
     const request = ++archivedRequestRef.current;
     const value = await api("/api/retention/archived");

@@ -78,7 +78,9 @@ export function createOutrightDatabase(options = {}) {
   let closing = false;
   let migrationTick;
   let migrationRetry;
+  let deletionTick;
   let migrationError = null;
+  const deletionsInFlight = new Set();
   try {
     // A runtime keeps SQLite in exclusive locking mode for its whole lifetime.
     // The kernel releases this lease if the process crashes, so a second
@@ -123,6 +125,22 @@ export function createOutrightDatabase(options = {}) {
     });
   };
   continueMigrations();
+  const resumeDeletions = () => {
+    if (closing) return;
+    const pending = db.prepare("SELECT id FROM conversations WHERE deleting = 1 ORDER BY rowid LIMIT 1").get();
+    if (!pending) return;
+    if (deletionsInFlight.has(pending.id)) {
+      deletionTick = setTimeout(resumeDeletions, 100);
+      return;
+    }
+    let failed = false;
+    deleteArchivedInBatches(db, pending.id, deletionsInFlight, true, () => closing)
+      .catch((error) => { failed = true; options.onDeletionError?.(error); })
+      .finally(() => { if (!closing) deletionTick = failed ? setTimeout(resumeDeletions, 1000) : setImmediate(resumeDeletions); });
+  };
+  if (db.prepare("SELECT 1 FROM conversations WHERE deleting = 1 LIMIT 1").get()) {
+    deletionTick = setImmediate(resumeDeletions);
+  }
 
   // Optional retained-data writes use the shared SQLite byte counter. The
   // database trigger below is the final guard for every tracked table. Keep a
@@ -149,7 +167,13 @@ export function createOutrightDatabase(options = {}) {
   return {
     filename,
     launchDirectory,
-    close: () => { closing = true; if (migrationTick) clearImmediate(migrationTick); if (migrationRetry) clearTimeout(migrationRetry); db.close(); },
+    close: () => {
+      closing = true;
+      if (migrationTick) clearImmediate(migrationTick);
+      if (migrationRetry) clearTimeout(migrationRetry);
+      if (deletionTick) { clearImmediate(deletionTick); clearTimeout(deletionTick); }
+      db.close();
+    },
     getSettings() {
       const rows = db.prepare("SELECT key, value FROM settings").all();
       return rows.reduce((settings, row) => {
@@ -190,9 +214,15 @@ export function createOutrightDatabase(options = {}) {
       const migrating = migrationPending(db);
       const bytes = measured ? retainedBytes(db) : null;
       const maxRetainedBytes = settings.maxRetainedMiB * 1024 * 1024;
+      let migrationStatus = "ready";
+      if (migrationError) migrationStatus = "error";
+      else if (migrating) migrationStatus = "migrating";
+      let retainedUsageStatus = "measuring";
+      if (measured) retainedUsageStatus = "measured";
+      else if (migrationError) retainedUsageStatus = "error";
       return { queued, active, recoverable, retainedBytes: bytes,
-        retainedUsageStatus: measured ? "measured" : migrationError ? "error" : "measuring",
-        migrationStatus: migrationError ? "error" : migrating ? "migrating" : "ready",
+        retainedUsageStatus,
+        migrationStatus,
         availableForNewWorkBytes: measured && !migrating ? Math.max(0, maxRetainedBytes - retainedReserveBytes - bytes) : 0, limits: {
         maxQueuedRuns: settings.maxQueuedRuns, maxConcurrentRuns: settings.maxConcurrentRuns,
         maxRetainedBytes, reservedRetainedBytes: retainedReserveBytes, retentionDays: settings.retentionDays,
@@ -218,7 +248,7 @@ export function createOutrightDatabase(options = {}) {
         } catch { throw databaseError(400, "Archived history cursor is invalid"); }
       }
       const rows = db.prepare(`SELECT id, title, worktree_path AS worktreePath, updated_at AS updatedAt FROM conversations
-        WHERE archived = 1 AND NOT EXISTS (SELECT 1 FROM runs WHERE conversation_id = conversations.id
+        WHERE archived = 1 AND deleting = 0 AND NOT EXISTS (SELECT 1 FROM runs WHERE conversation_id = conversations.id
           AND (status IN ('queued', 'launching', 'running') OR (status = 'interrupted' AND recovery_decision IS NULL)))
         AND (? IS NULL OR updated_at < ? OR (updated_at = ? AND id < ?))
         ORDER BY updated_at DESC, id DESC LIMIT ?`).all(after?.[0] ?? null, after?.[0] ?? null, after?.[0] ?? null, after?.[1] ?? null, limit + 1);
@@ -230,22 +260,11 @@ export function createOutrightDatabase(options = {}) {
       if (typeof id !== "string" || !id || id.length > 200 || confirmation !== id) {
         throw databaseError(400, "Confirm the exact archived conversation id before deleting it");
       }
-      const remove = db.transaction(() => {
-        const deleted = db.prepare(`DELETE FROM conversations WHERE id = ? AND archived = 1
-          AND NOT EXISTS (SELECT 1 FROM runs WHERE conversation_id = conversations.id
-            AND (status IN ('queued', 'launching', 'running') OR (status = 'interrupted' AND recovery_decision IS NULL)))`).run(id).changes;
-        if (!deleted) {
-          if (!db.prepare("SELECT 1 FROM conversations WHERE id = ?").get(id)) throw databaseError(404, "Conversation not found");
-          throw databaseError(409, "Only archived conversations without active or unresolved recovery work can be deleted");
-        }
-        reserveRecoveryHeadroom(db);
-        return { deleted: 1, id };
-      });
-      return remove.immediate();
+      return deleteArchivedInBatches(db, id, deletionsInFlight, false, () => closing);
     },
-    // Only archived conversations without pending or recoverable work may be
-    // removed. This is one transaction so a failed deletion cannot leave
-    // messages, run events, or recovery ownership half-pruned.
+    // Each eligible conversation is fenced before bounded child-row batches.
+    // The fence survives restart, so interruption cannot expose a partly
+    // deleted conversation to a new run or unarchive operation.
     pruneHistory({ before, limit = 100 } = {}) {
       const maximum = Date.now() - this.getSettings().retentionDays * 86_400_000;
       const requested = before ?? new Date(maximum).toISOString();
@@ -257,17 +276,18 @@ export function createOutrightDatabase(options = {}) {
       // the same format rather than a caller's locale or timezone spelling.
       const cutoff = new Date(cutoffTime).toISOString();
       if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw databaseError(400, "Retention limit must be 1 to 1000");
-      const prune = db.transaction(() => {
-        const ids = db.prepare(`SELECT id FROM conversations WHERE archived = 1 AND pinned = 0 AND updated_at < ?
+      const ids = db.prepare(`SELECT id FROM conversations WHERE archived = 1 AND (deleting = 1 OR (pinned = 0 AND updated_at < ?))
           AND NOT EXISTS (SELECT 1 FROM runs WHERE conversation_id = conversations.id
             AND (status IN ('queued', 'launching', 'running') OR (status = 'interrupted' AND recovery_decision IS NULL)))
           ORDER BY updated_at, id LIMIT ?`).all(cutoff, limit).map((row) => row.id);
-        const remove = db.prepare("DELETE FROM conversations WHERE id = ?");
-        for (const id of ids) remove.run(id);
-        reserveRecoveryHeadroom(db);
-        return { deleted: ids.length, ids };
-      });
-      return prune.immediate();
+      return (async () => {
+        const deleted = [];
+        for (const id of ids) {
+          try { await deleteArchivedInBatches(db, id, deletionsInFlight, true, () => closing); deleted.push(id); }
+          catch (error) { if (error.statusCode !== 404 && error.statusCode !== 409) throw error; }
+        }
+        return { deleted: deleted.length, ids: deleted };
+      })();
     },
     listGroups() {
       const groups = db.prepare("SELECT id, name, position, created_at AS createdAt FROM project_groups ORDER BY position, created_at").all();
@@ -337,6 +357,9 @@ export function createOutrightDatabase(options = {}) {
       return this.getConversation(id);
     },
     updateConversation(id, patch) {
+      if (db.prepare("SELECT deleting FROM conversations WHERE id = ?").get(id)?.deleting) {
+        throw databaseError(409, "Archived conversation deletion is in progress");
+      }
       if (patch.archived !== undefined && typeof patch.archived !== "boolean") {
         throw databaseError(400, "Conversation archived state must be a boolean");
       }
@@ -453,7 +476,11 @@ export function createOutrightDatabase(options = {}) {
       }
       const total = db.prepare("SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?").get(conversationId).count;
       const oldestRowId = messages[0]?.searchOrder;
-      const olderCount = oldestRowId ? db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order < ?").get(conversationId, oldestRowId).count : options.afterId ? total : 0;
+      let olderCount = 0;
+      if (oldestRowId) {
+        olderCount = db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order < ?")
+          .get(conversationId, oldestRowId).count;
+      } else if (options.afterId) olderCount = total;
       const hasMore = olderCount > 0;
       const newerCount = Math.max(0, total - olderCount - messages.length);
       return {
@@ -781,6 +808,9 @@ export function createOutrightDatabase(options = {}) {
     },
     createRun(input) {
       const insert = db.transaction(() => {
+        if (db.prepare("SELECT deleting FROM conversations WHERE id = ?").get(input.conversationId)?.deleting) {
+          throw databaseError(409, "Archived conversation deletion is in progress");
+        }
         if (migrationPending(db)) throw databaseError(507, "Retained history is being migrated; retry when capacity is available");
         const settings = this.getSettings();
         if (db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status = 'queued'").get().count >= settings.maxQueuedRuns) {
@@ -838,26 +868,28 @@ export function createOutrightDatabase(options = {}) {
         FROM runs WHERE conversation_id = ? AND status = 'interrupted' AND recovery_decision IS NULL ORDER BY created_at, rowid LIMIT 1`).get(conversationId);
     },
     listUnresolvedInterruptedRunsForWorktree(worktreePath) {
+      if (migrationJob(db, "recovery")) throw databaseError(503, "Recovery ownership is being indexed; retry shortly");
       return db.prepare(`SELECT runs.id, runs.conversation_id AS conversationId, runs.worktree_path AS worktreePath, runs.provider, runs.model,
         runs.reasoning_effort AS reasoningEffort, runs.approval_policy AS approvalPolicy, runs.prompt, runs.status, runs.pid,
         runs.provider_session_id AS providerSessionId, runs.created_at AS createdAt, runs.started_at AS startedAt,
         runs.finished_at AS finishedAt, runs.exit_code AS exitCode, runs.error, runs.cost_usd AS costUsd,
         runs.input_tokens AS inputTokens, runs.output_tokens AS outputTokens, runs.recovery_class AS recoveryClass,
         runs.recovery_decision AS recoveryDecision
-        FROM runs
-        WHERE (runs.worktree_path = ? OR runs.worktree_path IS NULL) AND runs.status = 'interrupted' AND runs.recovery_decision IS NULL
-        ORDER BY CASE WHEN runs.worktree_path IS NULL THEN 0 ELSE 1 END, runs.created_at, runs.rowid`).all(worktreePath);
+        FROM recovery_scope AS scope JOIN runs ON runs.id = scope.run_id
+        WHERE (scope.worktree_path = ? OR scope.worktree_path IS NULL) AND runs.status = 'interrupted' AND runs.recovery_decision IS NULL
+        ORDER BY CASE WHEN scope.worktree_path IS NULL THEN 0 ELSE 1 END, runs.created_at, runs.rowid`).all(worktreePath);
     },
     findUnresolvedInterruptedRunForWorktree(worktreePath) {
+      if (migrationJob(db, "recovery")) throw databaseError(503, "Recovery ownership is being indexed; retry shortly");
       return db.prepare(`SELECT runs.id, runs.conversation_id AS conversationId, runs.worktree_path AS worktreePath, runs.provider, runs.model,
         runs.reasoning_effort AS reasoningEffort, runs.approval_policy AS approvalPolicy, runs.prompt, runs.status, runs.pid,
         runs.provider_session_id AS providerSessionId, runs.created_at AS createdAt, runs.started_at AS startedAt,
         runs.finished_at AS finishedAt, runs.exit_code AS exitCode, runs.error, runs.cost_usd AS costUsd,
         runs.input_tokens AS inputTokens, runs.output_tokens AS outputTokens, runs.recovery_class AS recoveryClass,
         runs.recovery_decision AS recoveryDecision
-        FROM runs
-        WHERE (runs.worktree_path = ? OR runs.worktree_path IS NULL) AND runs.status = 'interrupted' AND runs.recovery_decision IS NULL
-        ORDER BY CASE WHEN runs.worktree_path IS NULL THEN 0 ELSE 1 END, runs.created_at, runs.rowid LIMIT 1`).get(worktreePath);
+        FROM recovery_scope AS scope JOIN runs ON runs.id = scope.run_id
+        WHERE (scope.worktree_path = ? OR scope.worktree_path IS NULL) AND runs.status = 'interrupted' AND runs.recovery_decision IS NULL
+        ORDER BY CASE WHEN scope.worktree_path IS NULL THEN 0 ELSE 1 END, runs.created_at, runs.rowid LIMIT 1`).get(worktreePath);
     },
     getLaunchHandshake(runId) {
       return readLaunchHandshake(launchDirectory, runId);
@@ -1071,12 +1103,21 @@ export function createOutrightDatabase(options = {}) {
     },
     listTrustedProjects() { return db.prepare("SELECT project_id AS projectId, project_path AS projectPath, trusted_at AS trustedAt FROM trusted_projects ORDER BY trusted_at DESC").all(); },
     audit(action, details = {}) {
-      try { withinRetainedBudget(() => {
+      const writeAudit = () => {
         db.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)").run(action, String(details.target ?? "").slice(0, 512), serializePayload(details, 4 * 1024), now());
-        db.prepare(`DELETE FROM audit_log WHERE id <= (SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET 9999)
-        AND target NOT IN (SELECT id FROM runs WHERE status IN ('queued', 'launching', 'running')
-          OR (status = 'interrupted' AND recovery_decision IS NULL))`).run();
-      }); } catch (error) { if (error.statusCode !== 507) throw error; }
+        trimAudit(db);
+      };
+      try {
+        // Migration pauses optional history, but reconciliation and deletion
+        // still need audit evidence. Triggers account for writes before or
+        // after each retained scan cursor without double counting.
+        if (migrationPending(db)) db.transaction(() => {
+          reserveRecoveryHeadroom(db, undefined, true);
+          writeAudit();
+          reserveRecoveryHeadroom(db);
+        }).immediate();
+        else withinRetainedBudget(writeAudit);
+      } catch (error) { if (error.statusCode !== 507) throw error; }
     },
     listAudit(limit = 100) {
       const bounded = Math.max(1, Math.min(500, Number(limit) || 100));
@@ -1119,7 +1160,76 @@ function runPatchAssignments(patch) {
   return { criticalFields, criticalValues, optionalFields, optionalValues };
 }
 
+// A marked archive is intentionally hidden from new work. Each transaction
+// removes at most 64 child rows or 256 KiB of retained payload, then yields
+// to HTTP, sockets, and active agents. The marker survives a crash and is
+// resumed on the next open.
+function deleteArchivedInBatches(db, id, inFlight, automatic = false, isClosing = () => false) {
+  if (inFlight.has(id)) throw databaseError(409, "Archived conversation deletion is in progress");
+  inFlight.add(id);
+  const run = async () => {
+    try {
+      db.transaction(() => {
+        const row = db.prepare("SELECT archived, pinned, deleting FROM conversations WHERE id = ?").get(id);
+        if (!row) throw databaseError(404, "Conversation not found");
+        if (!row.archived || (automatic && !row.deleting && row.pinned)
+          || db.prepare(`SELECT 1 FROM runs WHERE conversation_id = ? AND (status IN ('queued', 'launching', 'running')
+            OR (status = 'interrupted' AND recovery_decision IS NULL)) LIMIT 1`).get(id)) {
+          throw databaseError(409, "Only archived conversations without active or unresolved recovery work can be deleted");
+        }
+        db.prepare("UPDATE conversations SET deleting = 1 WHERE id = ?").run(id);
+      }).immediate();
+      while (true) {
+        if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
+        const done = db.transaction(() => deleteArchivedBatch(db, id)).immediate();
+        if (done) return { deleted: 1, id };
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    } finally { inFlight.delete(id); }
+  };
+  return run();
+}
+
+function deleteArchivedBatch(db, id) {
+  const sources = [
+    [`SELECT events.id, COALESCE(octet_length(events.payload), 0) + 128 AS bytes FROM run_events AS events
+      JOIN runs ON runs.id = events.run_id WHERE runs.conversation_id = ? LIMIT 64`, "run_events"],
+    [`SELECT id, COALESCE(octet_length(body), 0) + COALESCE(octet_length(payload), 0) + 128 AS bytes
+      FROM messages WHERE conversation_id = ? LIMIT 64`, "messages"],
+    [`SELECT id, COALESCE(octet_length(prompt), 0) + 128 AS bytes
+      FROM runs WHERE conversation_id = ? LIMIT 64`, "runs"],
+  ];
+  for (const [query, table] of sources) {
+    const rows = db.prepare(query).all(id);
+    if (!rows.length) continue;
+    const remove = db.prepare(`DELETE FROM ${table} WHERE id = ?`);
+    let bytes = 0;
+    for (const row of rows) {
+      if (bytes && bytes + row.bytes > 256 * 1024) break;
+      remove.run(row.id);
+      bytes += row.bytes;
+    }
+    return false;
+  }
+  const deleted = db.prepare("DELETE FROM conversations WHERE id = ? AND deleting = 1").run(id).changes;
+  if (deleted) {
+    reserveRecoveryHeadroom(db, undefined, true);
+    db.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
+      .run("retention.archived.deleted", id, "{}", now());
+    trimAudit(db);
+    reserveRecoveryHeadroom(db);
+  }
+  return true;
+}
+
+function trimAudit(db) {
+  db.prepare(`DELETE FROM audit_log WHERE id <= (SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET 9999)
+    AND target NOT IN (SELECT id FROM runs WHERE status IN ('queued', 'launching', 'running')
+      OR (status = 'interrupted' AND recovery_decision IS NULL))`).run();
+}
+
 function migrate(db) {
+  const hadRuns = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").get());
   db.exec(`
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS project_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
@@ -1127,7 +1237,8 @@ function migrate(db) {
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, worktree_path TEXT NOT NULL,
       title TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', provider_session_id TEXT, tab_position INTEGER NOT NULL DEFAULT 0,
-      archived INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      archived INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, deleting INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS conversations_scope ON conversations(project_id, worktree_id, archived, updated_at);
     CREATE TABLE IF NOT EXISTS messages (
@@ -1164,23 +1275,42 @@ function migrate(db) {
   if (version < 1) db.prepare("INSERT OR IGNORE INTO migration_progress (kind) VALUES ('events')").run();
   prepareMessageOrderMigration(db);
   try { db.exec("ALTER TABLE conversations ADD COLUMN tab_position INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
+  try { db.exec("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
+  try { db.exec("ALTER TABLE conversations ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'medium'"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN pid INTEGER"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN recovery_class TEXT"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN recovery_decision TEXT"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN worktree_path TEXT"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN transcript_omitted INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
-  // Unresolved legacy runs retain unknown launch targets so they gate every
-  // worktree until recovery resolves their ownership.
-  if (version < 2) db.exec(`UPDATE runs SET worktree_path = (SELECT worktree_path FROM conversations WHERE conversations.id = runs.conversation_id)
-    WHERE worktree_path IS NULL AND status IN ('completed', 'failed', 'stopped')`);
-  db.exec("CREATE INDEX IF NOT EXISTS runs_worktree_recovery ON runs(worktree_path, status, recovery_decision, created_at)");
+  // Building an index over a populated legacy runs table holds the startup
+  // thread for an unbounded interval. A new database gets the direct index;
+  // legacy databases build a small recovery-only lookup by durable cursor.
+  if (!hadRuns) db.exec("CREATE INDEX IF NOT EXISTS runs_worktree_recovery ON runs(worktree_path, status, recovery_decision, created_at)");
+  prepareRecoveryLookup(db, hadRuns, version);
   prepareRetainedMeasurement(db, version);
   reserveRecoveryHeadroom(db);
   db.exec(`CREATE TRIGGER retained_hard_limit BEFORE UPDATE ON retained_usage
     WHEN OLD.measured = 1 AND NEW.bytes > MAX(COALESCE((SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'maxRetainedMiB'), ${DEFAULT_SETTINGS.maxRetainedMiB}) * 1048576, OLD.legacy_ceiling)
     BEGIN SELECT RAISE(ABORT, 'OUTRIGHT_RETAINED_LIMIT'); END`);
-  if (!migrationPending(db)) db.pragma("user_version = 3");
+  if (!migrationPending(db)) db.pragma("user_version = 4");
+}
+
+function prepareRecoveryLookup(db, hadRuns, version) {
+  const hadLookup = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recovery_scope'").get());
+  db.exec("CREATE TABLE IF NOT EXISTS recovery_scope (run_id TEXT PRIMARY KEY, worktree_path TEXT)");
+  db.exec("CREATE INDEX IF NOT EXISTS recovery_scope_path ON recovery_scope(worktree_path, run_id)");
+  if (hadRuns && !hadLookup) db.prepare("INSERT OR IGNORE INTO migration_progress (kind, cursor_text) VALUES ('recovery', ?)")
+    .run(version < 2 ? "backfill-terminal" : null);
+  const path = (alias) => `CASE WHEN octet_length(${alias}.worktree_path) <= 4096 THEN ${alias}.worktree_path ELSE NULL END`;
+  const unsettled = (alias) => `(${alias}.status IN ('queued', 'launching', 'running') OR (${alias}.status = 'interrupted' AND ${alias}.recovery_decision IS NULL))`;
+  db.exec(`CREATE TRIGGER IF NOT EXISTS runs_recovery_insert AFTER INSERT ON runs BEGIN
+    INSERT INTO recovery_scope (run_id, worktree_path) SELECT NEW.id, ${path("NEW")} WHERE ${unsettled("NEW")}; END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS runs_recovery_update AFTER UPDATE ON runs BEGIN
+    DELETE FROM recovery_scope WHERE run_id = OLD.id;
+    INSERT INTO recovery_scope (run_id, worktree_path) SELECT NEW.id, ${path("NEW")} WHERE ${unsettled("NEW")}; END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS runs_recovery_delete AFTER DELETE ON runs BEGIN
+    DELETE FROM recovery_scope WHERE run_id = OLD.id; END`);
 }
 
 function prepareMessageOrderMigration(db) {
@@ -1256,10 +1386,33 @@ function assertMessageOrderReady(db) {
 // upgrade resumes without recounting old rows or dropping live writes.
 function advanceMigrations(db) {
   if (!migrationPending(db)) return;
-  for (let step = 0; step < 4 && migrationJob(db, "events"); step += 1) advanceEventMigration(db);
+  advanceRecoveryMigration(db);
+  advanceEventMigration(db);
   advanceMessageMigration(db);
   advanceRetainedMigration(db);
-  if (!migrationPending(db)) db.pragma("user_version = 3");
+  if (!migrationPending(db)) db.pragma("user_version = 4");
+}
+
+function advanceRecoveryMigration(db) {
+  const job = migrationJob(db, "recovery");
+  if (!job) return;
+  db.transaction(() => {
+    const rows = db.prepare(`SELECT rowid AS scanRowId, id, status, recovery_decision AS recoveryDecision,
+      CASE WHEN octet_length(worktree_path) <= 4096 THEN worktree_path ELSE NULL END AS worktreePath
+      FROM runs WHERE rowid > ? ORDER BY rowid LIMIT 64`).all(job.cursor_number);
+    const insert = db.prepare("INSERT OR IGNORE INTO recovery_scope (run_id, worktree_path) VALUES (?, ?)");
+    const backfill = db.prepare(`UPDATE runs SET worktree_path = (SELECT worktree_path FROM conversations WHERE id = runs.conversation_id)
+      WHERE rowid = ? AND worktree_path IS NULL AND status IN ('completed', 'failed', 'stopped')
+      AND (SELECT octet_length(worktree_path) FROM conversations WHERE id = runs.conversation_id) <= 4096`);
+    for (const row of rows) {
+      if (job.cursor_text === "backfill-terminal") backfill.run(row.scanRowId);
+      if (["queued", "launching", "running"].includes(row.status) || (row.status === "interrupted" && row.recoveryDecision == null)) {
+        insert.run(row.id, row.worktreePath);
+      }
+    }
+    if (rows.length < 64) db.prepare("DELETE FROM migration_progress WHERE kind = 'recovery'").run();
+    else db.prepare("UPDATE migration_progress SET cursor_number = ? WHERE kind = 'recovery'").run(rows.at(-1).scanRowId);
+  }).immediate();
 }
 
 function advanceEventMigration(db) {
@@ -1316,16 +1469,31 @@ function advanceMessageMigration(db) {
 }
 
 function advanceRetainedMigration(db) {
+  if (migrationJob(db, "recovery")) return;
   if (retainedMeasured(db)) return;
   db.transaction(() => {
+    let remainingBytes = 256 * 1024;
+    const started = performance.now();
     for (const [table, fields] of RETAINED_COLUMNS) {
       const scan = db.prepare("SELECT cursor, done FROM retained_scans WHERE table_name = ?").get(table);
       if (!scan || scan.done) continue;
       const rows = db.prepare(`SELECT rowid AS scanRowId, ${retainedSizeExpression(fields)} AS bytes FROM ${table} WHERE rowid > ? ORDER BY rowid LIMIT 64`).all(scan.cursor);
-      const bytes = rows.reduce((total, row) => total + row.bytes, 0);
+      // octet_length(column) reads SQLite's stored length metadata; it does
+      // not hydrate giant legacy bodies into JavaScript. Still debit each row
+      // against this tick's byte budget so one tick cannot reconcile dozens
+      // of oversized rows. A single old row is the indivisible minimum.
+      let bytes = 0;
+      let processed = 0;
+      for (const row of rows) {
+        if (processed && (bytes + row.bytes > remainingBytes || performance.now() - started > 8)) break;
+        bytes += row.bytes;
+        processed += 1;
+      }
       db.prepare("UPDATE retained_usage SET bytes = bytes + ? WHERE id = 1").run(bytes);
       db.prepare("UPDATE retained_scans SET cursor = ?, done = ? WHERE table_name = ?")
-        .run(rows.at(-1)?.scanRowId ?? scan.cursor, Number(rows.length < 64), table);
+        .run(rows[processed - 1]?.scanRowId ?? scan.cursor, Number(rows.length < 64 && processed === rows.length), table);
+      remainingBytes = Math.max(0, remainingBytes - bytes);
+      if (remainingBytes === 0 || performance.now() - started > 8) break;
     }
     if (!db.prepare("SELECT 1 FROM retained_scans WHERE done = 0 LIMIT 1").get()) {
       reserveRecoveryHeadroom(db);
@@ -1335,15 +1503,15 @@ function advanceRetainedMigration(db) {
   }).immediate();
 }
 
-function reserveRecoveryHeadroom(db, configured = Number(db.prepare("SELECT value FROM settings WHERE key = 'maxRetainedMiB'").get()?.value ?? DEFAULT_SETTINGS.maxRetainedMiB) * 1024 * 1024) {
-  const unsettled = db.prepare(`SELECT COUNT(*) AS count FROM runs WHERE status IN ('queued', 'launching', 'running')
-    OR (status = 'interrupted' AND recovery_decision IS NULL)`).get().count;
+function reserveRecoveryHeadroom(db, configured = Number(db.prepare("SELECT value FROM settings WHERE key = 'maxRetainedMiB'").get()?.value ?? DEFAULT_SETTINGS.maxRetainedMiB) * 1024 * 1024, criticalAudit = false) {
+  const recoveryPending = Boolean(migrationJob(db, "recovery"));
+  const unsettled = recoveryPending ? 0 : db.prepare("SELECT COUNT(*) AS count FROM recovery_scope").get().count;
   // Reserve transitions before they start even when legacy usage is just
   // below the cap. Each restart recalculates from the remaining unsettled
   // rows, so a crash partway through bounded reconciliation cannot strand
   // the backlog. Ordinary new-work admission still uses the configured cap.
   const bytes = retainedBytes(db);
-  const headroom = unsettled || bytes > configured ? Math.max(1024 * 1024, unsettled * 256) : 0;
+  const headroom = criticalAudit || recoveryPending || unsettled || bytes > configured ? Math.max(1024 * 1024, unsettled * 256) : 0;
   const ceiling = bytes + headroom > configured ? bytes + headroom : 0;
   db.prepare("UPDATE retained_usage SET legacy_ceiling = ? WHERE id = 1").run(ceiling);
 }

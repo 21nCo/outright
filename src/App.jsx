@@ -572,7 +572,7 @@ export function App() {
   const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
   const handleRuntimeEvent = useCallback((event) => {
-    if (["projects.changed", "terminal.output", "terminal.exit", "runtime.connected"].includes(event.type)
+    if (["projects.changed", "terminal.output", "terminal.exit", "runtime.connected", "capacity.changed"].includes(event.type)
       || (event.type === "run.event" && ["run.completed", "run.failed", "run.stopped"].includes(event.payload?.type))) setRuntimeEvent(event);
     const pendingLoad = pendingConversationLoadRef.current;
     if (["message.created", "run.event"].includes(event.type)
@@ -715,8 +715,10 @@ export function App() {
           // Browser timer throttling can delay a 32 ms stream flush while the
           // reader is on an older page. Show the first suffix byte after each
           // durable checkpoint now; coalesce the following deltas as usual.
-          const firstReadingDelta = Boolean(conversationRef.current?.messagePage?.hasLater) && !streamingTextRef.current;
-          applyStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event, checkpointEventSeq)), firstReadingDelta);
+          // The first byte must be visible without waiting for a throttled
+          // timer, including when the tab has been hidden during a long run.
+          const firstDelta = !streamingTextRef.current;
+          applyStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event, checkpointEventSeq)), firstDelta);
         }
       }
       if (runEvent.type === "assistant.message" && ownsLiveOutput) {
@@ -846,14 +848,24 @@ export function App() {
           sidebarFocusOwnerRef.current = intent;
           // A breakpoint transition can blur this control after focus() has
           // succeeded (notably while the sidebar finishes changing layout on
-          // macOS). Keep ownership until it survives the transition.
-          const timer = window.setTimeout(() => {
+          // macOS). Keep ownership through the transition unless the user
+          // focuses another control; a single successful focus is not final.
+          let timer;
+          const checkFocus = () => {
             if (sidebarFocusIntentRef.current !== intent) return;
             if (document.activeElement === target) {
+              if (performance.now() < deadline) timer = window.setTimeout(checkFocus, 100);
+              else {
+                sidebarFocusIntentRef.current = null;
+                sidebarFocusSourceRef.current = null;
+              }
+            } else if (document.activeElement === document.body && performance.now() < deadline) transfer();
+            else {
               sidebarFocusIntentRef.current = null;
               sidebarFocusSourceRef.current = null;
-            } else if (document.activeElement === document.body) transfer();
-          }, 220);
+            }
+          };
+          timer = window.setTimeout(checkFocus, 100);
           cancelRetry = () => clearTimeout(timer);
           return;
         }
@@ -1704,7 +1716,7 @@ export function App() {
     </main>
 
     <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} projects={bootstrap.projects} onSelectProject={chooseProject} onSelectConversation={(item) => { const nextProject = bootstrap.projects.find((entry) => entry.id === item.projectId); const nextWorktree = nextProject?.worktrees.find((entry) => entry.id === item.worktreeId); if (nextProject && nextWorktree) { pendingConversationRef.current = item.id; chooseProject(nextProject, nextWorktree); } }} />
-    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} onSaved={(nextSettings, refresh) => { if (refresh !== "history") { setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") Notification.requestPermission(); } if (refresh) refreshAll(refresh === true); }} onError={handleError} />
+    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} runtimeEvent={runtimeEvent} onSaved={(nextSettings, refresh) => { if (refresh !== "history") { setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") { Promise.resolve(Notification.requestPermission()).catch(() => {}); } } if (refresh) refreshAll(refresh === true); }} onError={handleError} />
 
     <SimpleDialog open={newChatOpen} onOpenChange={setNewChatOpen} title="New agent chat" description={`${project.name} / ${worktree.name}`} onSubmit={(event) => { event.preventDefault(); createConversation(); }} submit="Create chat"><label htmlFor="chat-title">What should the agent work on?</label><Input id="chat-title" autoFocus value={newChatTitle} onChange={(event) => setNewChatTitle(event.target.value)} placeholder="Review the worktree scanner" /></SimpleDialog>
     <SimpleDialog open={newGroupOpen} onOpenChange={setNewGroupOpen} title="Create project group" description="Organize related projects together in the sidebar." onSubmit={createGroup} submit="Create group" disabled={!newGroupName.trim()}><label htmlFor="group-name">Group name</label><Input id="group-name" autoFocus value={newGroupName} onChange={(event) => setNewGroupName(event.target.value)} placeholder="Client work" /></SimpleDialog>
@@ -1776,7 +1788,15 @@ function RecoveryNotice({ run, conversation, recoveryConversation, onOpenRecover
 function ToolActivity({ events }) { if (!events.length) return null; return <div className="tool-activity">{events.slice(-4).map((event) => <div key={event.id}><CheckCircle /><span>{toolLabel(event)}</span></div>)}</div>; }
 function EmptyChat({ worktree, onCreate }) { return <div className="empty-chat"><ChatCircle size={29} /><h2>Start in {worktree.name}</h2><p>Create a durable conversation, then run Codex or Claude directly in this worktree.</p><Button onClick={onCreate}><Plus />New chat</Button></div>; }
 function WorktreeState({ worktree }) { if (worktree.isPrunable) return <span className="worktree-state warning"><WarningCircle />stale</span>; if (worktree.changedCount) return <span className="worktree-state warning"><GitDiff />{worktree.changedCount} changed</span>; return <span className="worktree-state clean"><Check />clean</span>; }
-function RunState({ run }) { if (!run) return null; const running = ["queued", "launching", "running"].includes(run.status); const pendingDecision = run.status === "interrupted" && !run.recoveryDecision; return <span className={`run-state ${run.status}`} role="status" aria-live="polite" title={pendingDecision ? "Restart interrupted this run; choose a continuation below" : undefined}><span className={`status-dot ${running || pendingDecision ? "demo" : run.status === "completed" ? "live" : "error"}`} aria-hidden="true" />{run.status}{run.transcriptOmitted ? " · output omitted" : ""}{run.costUsd != null && <small>${Number(run.costUsd).toFixed(3)}</small>}</span>; }
+function RunState({ run }) {
+  if (!run) return null;
+  const running = ["queued", "launching", "running"].includes(run.status);
+  const pendingDecision = run.status === "interrupted" && !run.recoveryDecision;
+  let dotState = "error";
+  if (running || pendingDecision) dotState = "demo";
+  else if (run.status === "completed") dotState = "live";
+  return <span className={`run-state ${run.status}`} role="status" aria-live="polite" title={pendingDecision ? "Restart interrupted this run; choose a continuation below" : undefined}><span className={`status-dot ${dotState}`} aria-hidden="true" />{run.status}{run.transcriptOmitted ? " · output omitted" : ""}{run.costUsd != null && <small>${Number(run.costUsd).toFixed(3)}</small>}</span>;
+}
 function GitHealth({ worktree }) { if (worktree.isPrunable) return <span className="git-health warning"><WarningCircle /></span>; if (worktree.changedCount) return <span className="git-health warning"><span className="status-dot demo" />{worktree.changedCount}</span>; return <span className="git-health clean"><Check /></span>; }
 function TemplateMenu({ templates, onSelect }) { if (!templates.length) return null; return <DropdownMenu><DropdownMenuTrigger render={<Button type="button" variant="ghost" size="icon-sm" aria-label="Prompt templates" />}><ClockCounterClockwise /></DropdownMenuTrigger><DropdownMenuContent align="start"><DropdownMenuGroup><DropdownMenuLabel>Prompt templates</DropdownMenuLabel>{templates.map((template) => <DropdownMenuItem key={template.id} onClick={() => onSelect(template.prompt)}>{template.title}</DropdownMenuItem>)}</DropdownMenuGroup></DropdownMenuContent></DropdownMenu>; }
 function ThemeMenu({ theme, onThemeChange }) { const Icon = theme === "light" ? Sun : theme === "dark" ? Moon : Desktop; return <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Change theme" />}><Icon /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup><DropdownMenuLabel>Appearance</DropdownMenuLabel></DropdownMenuGroup><DropdownMenuRadioGroup value={theme} onValueChange={onThemeChange}><DropdownMenuRadioItem value="system"><Desktop />System</DropdownMenuRadioItem><DropdownMenuRadioItem value="light"><Sun />Light</DropdownMenuRadioItem><DropdownMenuRadioItem value="dark"><Moon />Dark</DropdownMenuRadioItem></DropdownMenuRadioGroup></DropdownMenuContent></DropdownMenu>; }
@@ -1864,5 +1884,11 @@ function readingLivePreview(checkpoint, suffix) {
   return truncated ? `[Earlier live output omitted]\n${visible}` : visible;
 }
 function formatTime(value) { return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(value)); }
-function runSummary(run) { const tokens = Number(run.inputTokens ?? 0) + Number(run.outputTokens ?? 0); return `${run.status}${run.transcriptOmitted ? " · output omitted" : ""}${tokens ? ` · ${tokens.toLocaleString()} tokens` : ""}${run.costUsd != null ? ` · $${Number(run.costUsd).toFixed(3)}` : ""}`; }
+function runSummary(run) {
+  const tokens = Number(run.inputTokens ?? 0) + Number(run.outputTokens ?? 0);
+  const omission = run.transcriptOmitted ? " · output omitted" : "";
+  const tokenSummary = tokens ? ` · ${tokens.toLocaleString()} tokens` : "";
+  const costSummary = run.costUsd == null ? "" : ` · $${Number(run.costUsd).toFixed(3)}`;
+  return `${run.status}${omission}${tokenSummary}${costSummary}`;
+}
 function toolLabel(event) { const item = event.payload?.item ?? {}; return item.command || item.name || item.type || (event.type === "tool.started" ? "Tool started" : "Tool completed"); }

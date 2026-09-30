@@ -347,6 +347,84 @@ async function settingsRetentionDraftRegression() {
   assert(patchCalls === 1 && saved.retentionDays === 60, "Settings save did not persist the new age once");
 }
 
+async function settingsMigrationCompletionRegression() {
+  root.render(null);
+  await settle();
+  const settings = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
+    editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
+  let measured = false;
+  let signalCompletion;
+  let reads = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/capacity") {
+      reads += 1;
+      return response({ queued: 0, active: 0, recoverable: 0,
+        retainedBytes: measured ? 1024 : null, migrationStatus: measured ? "ready" : "migrating",
+        availableForNewWorkBytes: measured ? 63 * 1048576 : 0,
+        limits: { maxQueuedRuns: 32, maxConcurrentRuns: 2, maxRetainedBytes: 64 * 1048576, reservedRetainedBytes: 1048576 } });
+    }
+    if (url.pathname === "/api/retention/archived") return response({ conversations: [] });
+    return response({});
+  };
+  function Fixture() {
+    const [open, setOpen] = React.useState(false);
+    const [event, setEvent] = React.useState(null);
+    signalCompletion = () => { measured = true; setEvent({ type: "capacity.changed" }); };
+    return <><button onClick={() => setOpen(true)}>Open migration fixture</button><SettingsDialog open={open}
+      onOpenChange={setOpen} settings={settings} providers={[{ id: "codex", label: "Codex", available: true }]}
+      templates={[]} runtimeEvent={event} onSaved={() => {}} onError={(error) => { throw error; }} /></>;
+  }
+  root.render(<TooltipProvider><Fixture /></TooltipProvider>);
+  await until(() => host.querySelector("button")?.textContent === "Open migration fixture", "migration settings fixture");
+  host.querySelector("button").click();
+  await until(() => document.querySelector(".capacity-status")?.textContent.includes("new work paused"), "migration warning shown");
+  signalCompletion();
+  await until(() => document.querySelector(".capacity-status")?.textContent.includes("available for new work"), "migration warning cleared while Settings stayed open");
+  assert(reads >= 2, "capacity completion did not read authoritative state");
+}
+
+async function rejectedNotificationPermissionRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const settings = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
+    editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
+  let requested = 0;
+  let unhandled = 0;
+  const originalNotification = Object.getOwnPropertyDescriptor(window, "Notification");
+  const onUnhandled = () => { unhandled += 1; };
+  Object.defineProperty(window, "Notification", { configurable: true, value: class {
+    static permission = "default";
+    static requestPermission() { requested += 1; return Promise.reject(new Error("permission refused")); }
+  } });
+  window.addEventListener("unhandledrejection", onUnhandled);
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings,
+      providers: [{ id: "codex", label: "Codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/capacity") return response({});
+    if (url.pathname === "/api/retention/archived") return response({ conversations: [] });
+    if (url.pathname === "/api/settings" && options.method === "PATCH") return response({ ...settings, ...JSON.parse(options.body) });
+    return response({});
+  };
+  try {
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('[aria-label="Agent provider and model settings"]'), "notification settings control");
+    host.querySelector('[aria-label="Agent provider and model settings"]').click();
+    await until(() => document.querySelector('[aria-label="Notify when runs finish"]'), "notification setting");
+    document.querySelector('[aria-label="Notify when runs finish"]').click();
+    [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent.includes("Save settings")).click();
+    await until(() => !document.querySelector('[role="dialog"]'), "settings saved after permission denial");
+    await settle();
+    assert(requested === 1 && unhandled === 0, "permission rejection escaped Settings save");
+  } finally {
+    window.removeEventListener("unhandledrejection", onUnhandled);
+    if (originalNotification) Object.defineProperty(window, "Notification", originalNotification);
+    else delete window.Notification;
+  }
+}
+
 async function archivedSettingsPagingFocusRegression() {
   root.render(null);
   await settle();
@@ -3272,9 +3350,14 @@ async function transcriptObserverStabilityRegression() {
       type: "run.event", conversationId: "chat-A", runId: "run-stable",
       payload: { type: "assistant.delta", seq, payload: { text: ` fragment ${seq}` } },
     }) }));
-    emit(1);
-    try { await until(() => host.querySelector('.message.is-streaming')?.textContent.includes("fragment 1"), "first stream paint"); }
-    catch (error) { throw new Error(`${error.message}; sockets=${fixtureSockets.slice(socketCount).map((socket) => socket.readyState).join(',')}, activeRun=${host.querySelector('[aria-label="Stop active agent run"]')?.outerHTML?.slice(0, 120)}, stream=${host.querySelector('.message.is-streaming')?.textContent?.slice(0, 120)}, selected=${localStorage.getItem(keys[2])}`); }
+    const nativeSetTimeout = window.setTimeout;
+    window.setTimeout = (callback, delay, ...args) => nativeSetTimeout(callback, delay === 32 ? 6_000 : delay, ...args);
+    try {
+      emit(1);
+      await until(() => host.querySelector('.message.is-streaming')?.textContent.includes("fragment 1"), "first stream paint without a stream timer");
+    } catch (error) {
+      throw new Error(`${error.message}; sockets=${fixtureSockets.slice(socketCount).map((socket) => socket.readyState).join(',')}, activeRun=${host.querySelector('[aria-label="Stop active agent run"]')?.outerHTML?.slice(0, 120)}, stream=${host.querySelector('.message.is-streaming')?.textContent?.slice(0, 120)}, selected=${localStorage.getItem(keys[2])}`);
+    } finally { window.setTimeout = nativeSetTimeout; }
     await settle();
     await new Promise((resolve) => setTimeout(resolve, 150));
     const baseline = rowObservations;
@@ -3902,6 +3985,43 @@ async function sustainedOutputRegression() {
   window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), output: { deltas: 200, elapsedMs, paints, paintBudget, inputFrameMs } };
 }
 
+async function responsiveSidebarBreakpointCycles(setWidth) {
+  for (let round = 0; round < 3; round += 1) {
+    const desktopSidebarControl = host.querySelector('[aria-label="Close projects sidebar"]');
+    desktopSidebarControl.focus();
+    await setWidth(640);
+    await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), `sidebar closed from focused desktop control ${round + 1}`);
+    try {
+      await until(() => visibleFocus(host.querySelector('[aria-label="Open projects sidebar"]')), `visible focus restored after hiding desktop sidebar ${round + 1}`);
+    } catch (error) {
+      const active = document.activeElement;
+      const opener = host.querySelector('[aria-label="Open projects sidebar"]');
+      throw new Error(`${error.message}; active=${active?.outerHTML?.slice(0, 250)}; openerRect=${JSON.stringify(opener?.getBoundingClientRect().toJSON())}; openerVisibility=${opener && getComputedStyle(opener).visibility}`);
+    }
+    if (round === 1) {
+      // Some engines blur a disappearing control before dispatching the media
+      // change. Preserve the last owner even if activeElement is now BODY.
+      document.activeElement.blur();
+      assert(document.activeElement === document.body, "Blur did not simulate focus loss before breakpoint change");
+    }
+    await setWidth(1280);
+    await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", `sidebar reopened after wide transition ${round + 1}`);
+    if (round === 0) {
+      // Chromium can remove focus after focus() succeeds during the sidebar
+      // layout transition. The owner must restore it without a new resize.
+      const focused = document.activeElement;
+      if (host.querySelector("#project-sidebar").contains(focused)) focused.blur();
+    }
+    try {
+      await until(() => host.querySelector("#project-sidebar").contains(document.activeElement) && visibleFocus(document.activeElement), `visible sidebar focus after wide transition ${round + 1}`);
+    } catch (error) {
+      const active = document.activeElement;
+      const rect = active?.getBoundingClientRect();
+      throw new Error(`${error.message}; active=${active?.outerHTML?.slice(0, 250)}; sidebar=${host.querySelector("#project-sidebar")?.getAttribute("aria-hidden")}; activeRect=${rect && JSON.stringify({ x: rect.x, width: rect.width })}`);
+    }
+  }
+}
+
 async function responsiveFocusRegression() {
   root.render(null);
   await settle();
@@ -3939,40 +4059,7 @@ async function responsiveFocusRegression() {
     await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", "reopened desktop sidebar");
     await setWidth(1280);
 
-    for (let round = 0; round < 3; round += 1) {
-      const desktopSidebarControl = host.querySelector('[aria-label="Close projects sidebar"]');
-      desktopSidebarControl.focus();
-      await setWidth(640);
-      await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), `sidebar closed from focused desktop control ${round + 1}`);
-      try {
-        await until(() => visibleFocus(host.querySelector('[aria-label="Open projects sidebar"]')), `visible focus restored after hiding desktop sidebar ${round + 1}`);
-      } catch (error) {
-        const active = document.activeElement;
-        const opener = host.querySelector('[aria-label="Open projects sidebar"]');
-        throw new Error(`${error.message}; active=${active?.outerHTML?.slice(0, 250)}; openerRect=${JSON.stringify(opener?.getBoundingClientRect().toJSON())}; openerVisibility=${opener && getComputedStyle(opener).visibility}`);
-      }
-      if (round === 1) {
-        // Some engines blur a disappearing control before dispatching the media
-        // change. Preserve the last owner even if activeElement is now BODY.
-        document.activeElement.blur();
-        assert(document.activeElement === document.body, "Blur did not simulate focus loss before breakpoint change");
-      }
-      await setWidth(1280);
-      await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", `sidebar reopened after wide transition ${round + 1}`);
-      if (round === 0) {
-        // Chromium can remove focus after focus() succeeds during the sidebar
-        // layout transition. The owner must restore it without a new resize.
-        const focused = document.activeElement;
-        if (host.querySelector("#project-sidebar").contains(focused)) focused.blur();
-      }
-      try {
-        await until(() => host.querySelector("#project-sidebar").contains(document.activeElement) && visibleFocus(document.activeElement), `visible sidebar focus after wide transition ${round + 1}`);
-      } catch (error) {
-        const active = document.activeElement;
-        const rect = active?.getBoundingClientRect();
-        throw new Error(`${error.message}; active=${active?.outerHTML?.slice(0, 250)}; sidebar=${host.querySelector("#project-sidebar")?.getAttribute("aria-hidden")}; activeRect=${rect && JSON.stringify({ x: rect.x, width: rect.width })}`);
-      }
-    }
+    await responsiveSidebarBreakpointCycles(setWidth);
 
     const composer = host.querySelector('textarea[aria-label="Message the agent"]');
     composer.focus();
@@ -4293,6 +4380,8 @@ try {
     ["chat tab controls", chatTabControlRegression, "chat tab navigation ignores nested archive controls"],
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
     ["settings retention draft", settingsRetentionDraftRegression, "missing archived data stays safe and cancel, cleanup and save use the persisted retention age"],
+    ["settings migration completion", settingsMigrationCompletionRegression, "an open Settings dialog refreshes capacity when migration finishes"],
+    ["notification permission rejection", rejectedNotificationPermissionRegression, "a rejected permission request does not disrupt Settings save or escape as an unhandled rejection"],
     ["archived settings paging focus", archivedSettingsPagingFocusRegression, "the oldest archive can be paged to and cancel and delete keep keyboard focus in Settings"],
     ["archived settings session fence", archivedSettingsSessionFenceRegression, "delayed cleanup and deletion cannot change a reopened Settings selection, status or focus"],
     ["archived chat ownership", archivedChatOwnershipRegression, "an archived chat cannot keep a pane or accept runs during held or failed refresh"],
