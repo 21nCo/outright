@@ -1,0 +1,29 @@
+server/database.mjs
+  s_22ab84176cadba::t_9e4e6efb44e3cf 28-30,79-81,97,109-126,132,152,163,189-191,194-196,375,377,383,397,402,405,429,456,466,485-486,655,690,723-724,784,1016,1058,1158-1165,1173-1175,1178-1201,1205-1207,1209-1222,1224-1226,1228-1233,1235-1335,1391
+server/resource-budgets.test.mjs
+  s_a6e100393f44fe::t_a70b78558bd5a1 138,146-280
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ac0765157405129dee5c52dee640fb945dc6191e",
+  "prompts": {},
+  "sessions": {
+    "s_22ab84176cadba": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f0e439f7effexh4cObhrBqfRtc",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_a6e100393f44fe": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f1cb-a9f5-7320-b26d-2ef6f087268c",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
