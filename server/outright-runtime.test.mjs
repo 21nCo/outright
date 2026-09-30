@@ -262,6 +262,37 @@ test("capacity-reclaim deletion routes wake queued work after restoring launch r
   }
 });
 
+test("capacity-restoring edits wake deferred runs at the launch boundary", withRuntime(async (runtime) => {
+  const database = runtime.database;
+  database.updateSettings({ maxRetainedMiB: 64 });
+  const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w",
+    title: "Conversation ".repeat(150), provider: "codex" });
+  const queued = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "waiting" });
+  const group = database.createGroup("Group ".repeat(350));
+  const template = database.saveTemplate({ title: "Spare", prompt: "Template ".repeat(300) });
+  const filler = database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+  let fillerBody = filler.body;
+  let wakeups = 0;
+  runtime.agents.resumeQueued = () => { wakeups += 1; };
+  for (const [url, method, body] of [
+    ["/api/templates", "POST", { id: template.id, title: template.title, prompt: "short" }],
+    [`/api/groups/${group.id}`, "PATCH", { name: "Short group" }],
+    [`/api/conversations/${conversation.id}`, "PATCH", { title: "Short conversation" }],
+  ]) {
+    const increase = database.capacity().availableForNewWorkBytes - (64 * 1024 - 50);
+    assert.ok(increase > 0);
+    fillerBody += "x".repeat(increase);
+    database.upsertMessage({ ...filler, body: fillerBody });
+    assert.equal(database.canLaunchRun(), false);
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream(method, url, body), response);
+    assert.ok([200, 201].includes(response.statusCode), `${url} edit succeeded: ${response.raw}`);
+    assert.equal(database.canLaunchRun(), true, `${url} edit restored launch room`);
+    assert.equal(wakeups, 1 + ["/api/templates", `/api/groups/${group.id}`, `/api/conversations/${conversation.id}`].indexOf(url));
+    assert.equal(database.getRun(queued.id).status, "queued");
+  }
+}));
+
 test("bootstrap and retention remain reachable when default groups cannot fit the retained budget", async () => {
   const configDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-budget-config-"));
   const configFile = path.join(configDirectory, "outright.config.json");
@@ -273,12 +304,15 @@ test("bootstrap and retention remain reachable when default groups cannot fit th
   const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Reclaimable", provider: "codex" });
   const filler = database.addMessage({ conversationId: archived.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
   const remaining = 63 * 1024 * 1024 - database.capacity().retainedBytes;
-  database.upsertMessage({ ...filler, body: `${filler.body}${"x".repeat(remaining - 8)}` });
+  database.upsertMessage({ ...filler, body: `${filler.body}${"x".repeat(remaining - 300)}` });
   database.updateConversation(archived.id, { archived: true });
-  assert.throws(() => database.createGroup("Core systems"), (error) => error.statusCode === 507);
+  const firstGroup = database.createGroup("Core systems");
+  assert.throws(() => database.createGroup("Experiments"), (error) => error.statusCode === 507);
+  database.deleteGroup(firstGroup.id);
   const bootstrap = responseCapture();
   await runtime.handleRequest(requestStream("GET", "/api/bootstrap"), bootstrap);
   assert.equal(bootstrap.statusCode, 200);
+  assert.deepEqual(bootstrap.body.projectGroups.groups, [], "failed setup leaves no partial default group");
   assert.equal(bootstrap.body.capacity.availableForNewWorkBytes < 64 * 1024, true);
   const listing = responseCapture();
   await runtime.handleRequest(requestStream("GET", "/api/retention/archived"), listing);
@@ -287,6 +321,10 @@ test("bootstrap and retention remain reachable when default groups cannot fit th
   await runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived", { id: archived.id, confirmation: archived.id }), deleted);
   assert.equal(deleted.statusCode, 200);
   assert.equal(database.canLaunchRun(), true);
+  const rescan = responseCapture();
+  await runtime.handleRequest(requestStream("POST", "/api/projects"), rescan);
+  assert.equal(rescan.statusCode, 200);
+  assert.deepEqual(database.listGroups().groups.map((group) => group.name), ["Core systems", "Experiments"]);
     }, { configUrl: pathToFileURL(configFile) })();
   } finally { rmSync(configDirectory, { recursive: true, force: true }); }
 });

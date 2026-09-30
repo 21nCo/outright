@@ -37,6 +37,27 @@ test("burst admission is bounded and a refused run leaves no user message", () =
   } finally { database.close(); }
 });
 
+test("legacy partial default setup resumes memberships once and preserves later user edits", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const core = database.createGroup("Core systems");
+    database.setProjectGroup("already-set", core.id);
+    database.ensureDefaultGroups([
+      { id: "already-set", name: "Existing", path: "/work/existing" },
+      { id: "new-core", name: "Application", path: "/work/application" },
+      { id: "new-experiment", name: "Prototype", path: "/work/prototype" },
+    ]);
+    const { groups, memberships } = database.listGroups();
+    assert.deepEqual(groups.map((group) => group.name), ["Core systems", "Experiments"]);
+    assert.equal(memberships["already-set"], core.id);
+    assert.equal(memberships["new-core"], core.id);
+    assert.equal(memberships["new-experiment"], groups[1].id);
+    database.deleteGroup(groups[1].id);
+    database.ensureDefaultGroups([{ id: "new-experiment", name: "Prototype", path: "/work/prototype" }]);
+    assert.deepEqual(database.listGroups().groups.map((group) => group.name), ["Core systems"], "later user deletion is not undone by scanning");
+  } finally { database.close(); }
+});
+
 test("a full queue cannot consume an interrupted run's retry decision", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

@@ -124,6 +124,7 @@ export function createOutrightDatabase(options = {}) {
     getSettings() {
       const rows = db.prepare("SELECT key, value FROM settings").all();
       return rows.reduce((settings, row) => {
+        if (row.key === "_defaultGroupsInitialized") return settings;
         settings[row.key] = parseJson(row.value, row.value);
         return settings;
       }, { ...DEFAULT_SETTINGS });
@@ -239,6 +240,25 @@ export function createOutrightDatabase(options = {}) {
       const groups = db.prepare("SELECT id, name, position, created_at AS createdAt FROM project_groups ORDER BY position, created_at").all();
       const memberships = Object.fromEntries(db.prepare("SELECT project_id, group_id FROM project_memberships").all().map((row) => [row.project_id, row.group_id]));
       return { groups, memberships };
+    },
+    ensureDefaultGroups(projects) {
+      if (db.prepare("SELECT 1 FROM settings WHERE key = '_defaultGroupsInitialized'").get()) return;
+      const existing = this.listGroups().groups;
+      if (existing.length && !existing.some((group) => ["Core systems", "Experiments"].includes(group.name))) return;
+      // Keep both groups, every discovered membership, and the completion
+      // marker in one quota-checked transaction. A failed first scan can be
+      // retried after cleanup without leaving a partial default hierarchy.
+      withinRetainedBudget(() => {
+        const groups = this.listGroups().groups;
+        const core = groups.find((group) => group.name === "Core systems") ?? this.createGroup("Core systems");
+        const experiments = groups.find((group) => group.name === "Experiments") ?? this.createGroup("Experiments");
+        const memberships = this.listGroups().memberships;
+        for (const project of projects) {
+          if (memberships[project.id]) continue;
+          this.setProjectGroup(project.id, /experiment|prototype|playground/i.test(`${project.name} ${project.path}`) ? experiments.id : core.id);
+        }
+        db.prepare("INSERT INTO settings (key, value) VALUES ('_defaultGroupsInitialized', 'true')").run();
+      });
     },
     createGroup(name) {
       if (retainedBytes(db) >= this.getSettings().maxRetainedMiB * 1024 * 1024) {

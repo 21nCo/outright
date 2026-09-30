@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Bell, Brain, Code, ShieldCheck, Trash } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -24,9 +24,11 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
   const restoreDeleteFocusRef = useRef(false);
   const restorePageFocusRef = useRef(false);
   const archivedRequestRef = useRef(0);
-  useEffect(() => { if (open) setDraft(settings); }, [open, settings]);
+  // A bootstrap refresh can replace settings while the dialog is open.
+  // Only opening the dialog starts a new editing session.
+  useEffect(() => { if (open) setDraft(settings); }, [open]);
   useEffect(() => { if (open) { setCleanupResult(null); setPendingDelete(null); } }, [open]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) { restoreDeleteFocusRef.current = false; return; }
     if (pendingDelete) cancelDeleteRef.current?.focus();
     else if (restoreDeleteFocusRef.current) {
@@ -35,7 +37,7 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
       (trigger?.isConnected ? trigger : cleanupButtonRef.current)?.focus();
     }
   }, [open, pendingDelete]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open || !restorePageFocusRef.current) return;
     restorePageFocusRef.current = false;
     (archivedListRef.current?.querySelector("button") ?? backToNewestRef.current ?? cleanupButtonRef.current)?.focus();

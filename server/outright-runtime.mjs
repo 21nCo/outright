@@ -106,19 +106,20 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   }
 
   function ensureDefaultGroups(projectList) {
-    const current = database.listGroups();
-    if (current.groups.length) return;
     try {
-      const core = database.createGroup("Core systems");
-      const experiments = database.createGroup("Experiments");
-      for (const project of projectList) {
-        database.setProjectGroup(project.id, /experiment|prototype|playground/i.test(`${project.name} ${project.path}`) ? experiments.id : core.id);
-      }
+      database.ensureDefaultGroups(projectList);
     } catch (error) {
       // An over-quota legacy database still needs bootstrap and retention UI.
       // The next scan can finish creating defaults once space is reclaimed.
       if (error.statusCode !== 507) throw error;
     }
+  }
+
+  function editRetainedData(edit) {
+    const launchable = database.canLaunchRun();
+    const result = edit();
+    if (!launchable && database.canLaunchRun()) agents.resumeQueued();
+    return result;
   }
 
   async function handleRequest(request, response) {
@@ -177,7 +178,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         return json(response, 201, database.createGroup(body.name));
       }
       const groupMatch = url.pathname.match(/^\/api\/groups\/([^/]+)$/);
-      if (groupMatch && request.method === "PATCH") return json(response, 200, database.updateGroup(groupMatch[1], await readJson(request)));
+      if (groupMatch && request.method === "PATCH") {
+        const patch = await readJson(request);
+        const group = editRetainedData(() => database.updateGroup(groupMatch[1], patch));
+        return json(response, 200, group);
+      }
       if (groupMatch && request.method === "DELETE") {
         const deleted = database.deleteGroup(groupMatch[1]);
         if (deleted) agents.resumeQueued();
@@ -226,7 +231,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         });
       }
       if (conversationMatch && request.method === "PATCH") {
-        const conversation = database.updateConversation(conversationMatch[1], await readJson(request));
+        const patch = await readJson(request);
+        const conversation = editRetainedData(() => database.updateConversation(conversationMatch[1], patch));
         publish({ type: "conversation.updated", conversationId: conversationMatch[1], payload: conversation });
         return json(response, conversation ? 200 : 404, conversation);
       }
@@ -561,7 +567,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/worktrees" && request.method === "DELETE") { const result = await git.removeWorktree(await readJson(request)); await projects(true); publish({ type: "projects.changed", payload: latestScan }); return json(response, 200, result); }
 
       if (url.pathname === "/api/templates" && request.method === "GET") return json(response, 200, { templates: database.listTemplates() });
-      if (url.pathname === "/api/templates" && request.method === "POST") return json(response, 201, database.saveTemplate(await readJson(request)));
+      if (url.pathname === "/api/templates" && request.method === "POST") {
+        const input = await readJson(request);
+        const template = editRetainedData(() => database.saveTemplate(input));
+        return json(response, 201, template);
+      }
       const templateMatch = url.pathname.match(/^\/api\/templates\/([^/]+)$/);
       if (templateMatch && request.method === "DELETE") {
         const deleted = database.deleteTemplate(templateMatch[1]);

@@ -317,7 +317,7 @@ async function settingsRetentionDraftRegression() {
     const [settings, setSettings] = React.useState(initial);
     return <><button onClick={() => setOpen(true)}>Open settings fixture</button><SettingsDialog open={open}
       onOpenChange={setOpen} settings={settings} providers={[{ id: "codex", label: "Codex", available: true }]}
-      templates={[]} onSaved={(nextSettings, refresh) => { if (refresh !== "history") setSettings(nextSettings); }}
+      templates={[]} onSaved={(nextSettings, refresh) => { setSettings(refresh === "history" ? { ...saved } : nextSettings); }}
       onError={(error) => { throw error; }} /></>;
   }
   root.render(<TooltipProvider><Fixture /></TooltipProvider>);
@@ -332,8 +332,11 @@ async function settingsRetentionDraftRegression() {
   await until(() => !document.querySelector('[role="dialog"]'), "settings cancelled");
   open();
   await until(() => age()?.value === "90", "cancelled draft reset to saved age");
+  setControlValue(age(), "45");
+  await until(() => age()?.value === "45", "unsaved retention edit before cleanup");
   [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent.includes("Clean old archived history")).click();
   await until(() => cleanupCalls === 1 && document.querySelector('[role="dialog"]')?.textContent.includes("Deleted 0 old archived chats"), "cleanup used saved age");
+  assert(age()?.value === "45", "History refresh discarded an unsaved Settings draft");
   assert(!document.querySelector(".archived-history-list"), "Missing archived array crashed or rendered a list");
   setControlValue(age(), "60");
   [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent.includes("Save settings")).click();
