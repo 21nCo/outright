@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, unlinkSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, opendirSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -132,10 +132,19 @@ export function createOutrightDatabase(options = {}) {
       validateSettingsPatch(patch);
       const statement = db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
       const update = db.transaction((entries) => {
+        // Lowering a quota must not make the existing database unopenable or
+        // prevent recovery decisions. Optional writes still check the newly
+        // saved quota; only already retained state gets transition headroom.
+        if (patch.maxRetainedMiB !== undefined) {
+          const target = patch.maxRetainedMiB * 1024 * 1024;
+          if (retainedBytes(db) > target) reserveRecoveryHeadroom(db);
+        }
         for (const [key, value] of entries) statement.run(key, JSON.stringify(value));
+        if (patch.maxRetainedMiB !== undefined && retainedBytes(db) <= patch.maxRetainedMiB * 1024 * 1024) {
+          db.prepare("UPDATE retained_usage SET legacy_ceiling = 0 WHERE id = 1").run();
+        }
       });
-      if (patch.maxRetainedMiB !== undefined) withinRetainedBudget(() => update.immediate(Object.entries(patch)));
-      else update.immediate(Object.entries(patch));
+      update.immediate(Object.entries(patch));
       return this.getSettings();
     },
     capacity() {
@@ -699,7 +708,7 @@ export function createOutrightDatabase(options = {}) {
       // conversation's updated_at backwards in sidebar and search ordering.
       db.prepare("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?").run(message.createdAt, message.conversationId);
         return { ...message, searchOrder: Number(inserted.lastInsertRowid) };
-      }, message.payload?.truncated ? 0 : retainedReserveBytes);
+      }, retainedReserveBytes);
     },
     upsertMessage(input) {
       const message = { id: input.id ?? randomUUID(), createdAt: input.createdAt ?? now(), ...input };
@@ -813,10 +822,11 @@ export function createOutrightDatabase(options = {}) {
       // transaction would upgrade from a read snapshot to a write while
       // another runtime commits, failing with SQLITE_BUSY_SNAPSHOT and
       // aborting startup.
-      const adopted = [];
-      const keepHandshakeIds = new Set();
       const reconcile = db.transaction(() => {
-        const pending = db.prepare("SELECT id, status, pid FROM runs WHERE status IN ('queued', 'running', 'launching')").all();
+        // A legacy database may contain far more pending rows than the current
+        // queue limit. Commit bounded batches so a crash preserves progress
+        // and startup never materializes the entire backlog in JavaScript.
+        const pending = db.prepare("SELECT id, status, pid FROM runs WHERE status IN ('queued', 'running', 'launching') ORDER BY rowid LIMIT 500").all();
         for (const run of pending) {
           let classification = "unknown";
           let pid = run.pid ?? null;
@@ -833,9 +843,8 @@ export function createOutrightDatabase(options = {}) {
             const handshake = readLaunchHandshake(launchDirectory, run.id);
             if (handshake) {
               pid = handshake.pid;
-              // The identity is now durably adopted into the row; the record
-              // itself must not linger.
-              adopted.push(run.id);
+              // The identity is now durably adopted into the row. The sweep
+              // below removes its no-longer-needed marker after commit.
             }
           }
           else if (run.pid != null) {
@@ -850,20 +859,14 @@ export function createOutrightDatabase(options = {}) {
             .run(pid, finishedAt, classification, run.id);
           if (!result.changes) continue;
           counts[classification] = (counts[classification] ?? 0) + 1;
-          // A row whose tree may still be live (alive/unknown) may still own
-          // a wrapper that removes its own record on exit; keep those. An
-          // 'exited' tree is proven gone, so a hard-killed wrapper can no
-          // longer unlink its record — keeping it would leak one stale file
-          // per hard-killed run.
-          if (run.status === "running" && (classification === "alive" || classification === "unknown")) keepHandshakeIds.add(run.id);
         }
+        return pending.length;
       });
-      reconcile.immediate();
-      // Handshake hygiene: adopted records are deleted, and records belonging
-      // to runs that are not pending (terminal, resolved, or unknown ids) are
-      // swept so a hard-killed runtime cannot leak one file per crash.
-      for (const runId of adopted) removeLaunchHandshake(launchDirectory, runId);
-      sweepLaunchHandshakes(launchDirectory, keepHandshakeIds);
+      while (reconcile.immediate()) { /* Each committed batch is recoverable after interruption. */ }
+      // Preserve unresolved live/unknown ownership evidence across repeated
+      // restarts; sweep adopted and stale records without retaining every run
+      // ID or directory entry in memory.
+      sweepLaunchHandshakes(launchDirectory, db);
       const count = Object.values(counts).reduce((sum, classified) => sum + classified, 0);
       return { count, counts };
     },
@@ -1106,19 +1109,28 @@ function migrate(db) {
     db.exec(`CREATE TRIGGER IF NOT EXISTS retained_${table}_delete AFTER DELETE ON ${table}
       BEGIN UPDATE retained_usage SET bytes = bytes - (${size("OLD")}) WHERE id = 1; END`);
   }
-  // A pre-budget database may already exceed the saved limit. Preserve its
-  // active recovery rows with at most one MiB of transition headroom; optional
-  // writes still use the ordinary configured limit and cleanup clears this
-  // migration allowance once retained usage falls below quota.
+  // A pre-budget database may already exceed the saved limit. Recovery
+  // headroom scales with the existing unsettled rows; optional writes still
+  // use the ordinary configured limit and cleanup clears this allowance.
   db.exec("DROP TRIGGER IF EXISTS retained_hard_limit");
   const measured = calculateRetainedBytes(db);
   const configured = Number(db.prepare("SELECT value FROM settings WHERE key = 'maxRetainedMiB'").get()?.value ?? DEFAULT_SETTINGS.maxRetainedMiB) * 1024 * 1024;
   const priorCeiling = db.prepare("SELECT legacy_ceiling FROM retained_usage WHERE id = 1").get().legacy_ceiling;
-  db.prepare("UPDATE retained_usage SET bytes = ?, legacy_ceiling = ? WHERE id = 1")
-    .run(measured, measured > configured ? (measured > priorCeiling ? measured + 1024 * 1024 : priorCeiling) : 0);
+  db.prepare("UPDATE retained_usage SET bytes = ?, legacy_ceiling = ? WHERE id = 1").run(measured, measured > configured ? priorCeiling : 0);
+  if (measured > configured) reserveRecoveryHeadroom(db);
   db.exec(`CREATE TRIGGER retained_hard_limit BEFORE UPDATE ON retained_usage
     WHEN NEW.bytes > MAX(COALESCE((SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'maxRetainedMiB'), ${DEFAULT_SETTINGS.maxRetainedMiB}) * 1048576, OLD.legacy_ceiling)
     BEGIN SELECT RAISE(ABORT, 'OUTRIGHT_RETAINED_LIMIT'); END`);
+}
+
+function reserveRecoveryHeadroom(db) {
+  const unsettled = db.prepare(`SELECT COUNT(*) AS count FROM runs WHERE status IN ('queued', 'launching', 'running')
+    OR (status = 'interrupted' AND recovery_decision IS NULL)`).get().count;
+  // Covers classification, timestamps, explicit recovery decisions and
+  // terminal outcomes for each already admitted row. No new run is admitted
+  // above the configured cap.
+  const headroom = Math.max(1024 * 1024, unsettled * 256);
+  db.prepare("UPDATE retained_usage SET legacy_ceiling = MAX(legacy_ceiling, bytes + ?) WHERE id = 1").run(headroom);
 }
 
 function conversationColumns() {
@@ -1189,23 +1201,25 @@ function readLaunchHandshake(launchDirectory, runId) {
   } catch { /* No handshake record exists (or it is unreadable). */ }
   return null;
 }
-function removeLaunchHandshake(launchDirectory, runId) {
-  try { unlinkSync(path.join(launchDirectory, `${runId}.json`)); } catch { /* Already gone. */ }
-}
 // Deletes handshake records that no longer belong to a pending run, so a
 // runtime hard-killed after authorization cannot leak one stale file per
 // crash. Records for rows that were actually running are kept: their wrapper
 // may still be alive and removes its own record when it exits.
-function sweepLaunchHandshakes(launchDirectory, keepRunIds) {
-  let entries;
-  try { entries = readdirSync(launchDirectory); }
+function sweepLaunchHandshakes(launchDirectory, db) {
+  let directory;
+  try { directory = opendirSync(launchDirectory); }
   catch { return; }
-  for (const entry of entries) {
-    if (!entry.endsWith(".json")) continue;
-    const runId = entry.slice(0, -".json".length);
-    if (keepRunIds.has(runId)) continue;
-    try { rmSync(path.join(launchDirectory, entry), { force: true }); } catch { /* Already gone. */ }
-  }
+  const keep = db.prepare(`SELECT 1 FROM runs WHERE id = ? AND status = 'interrupted'
+    AND recovery_decision IS NULL AND recovery_class IN ('alive', 'unknown')`);
+  try {
+    let entry;
+    while ((entry = directory.readSync())) {
+      if (!entry.name.endsWith(".json")) continue;
+      const runId = entry.name.slice(0, -".json".length);
+      if (keep.get(runId)) continue;
+      try { rmSync(path.join(launchDirectory, entry.name), { force: true }); } catch { /* Already gone. */ }
+    }
+  } finally { directory.closeSync(); }
 }
 // Probes the run's whole process group, not just the detached leader PID: an
 // exited leader can leave live provider descendants in process group `pid` that

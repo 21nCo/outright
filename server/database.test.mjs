@@ -998,6 +998,11 @@ test("reconciliation sweeps stale handshake records but keeps live-wrapper recor
     assert.equal(existsSync(path.join(launchDirectory, `${exited.id}.json`)), false, "an exited tree is proven gone, so its hard-killed wrapper's record is swept instead of leaking");
     assert.equal(existsSync(path.join(launchDirectory, `${finished.id}.json`)), false, "a terminal run's stale record is swept");
     assert.equal(existsSync(path.join(launchDirectory, "run-that-never-existed.json")), false, "a record for an unknown run is swept");
+    database.reconcileInterruptedRuns();
+    assert.equal(existsSync(path.join(launchDirectory, `${running.id}.json`)), true, "a second restart preserves unresolved ownership evidence");
+    database.resolveInterruptedRun(running.id, "discard");
+    database.reconcileInterruptedRuns();
+    assert.equal(existsSync(path.join(launchDirectory, `${running.id}.json`)), false, "resolved ownership evidence is swept");
   } finally {
     database.close();
     rmSync(launchDirectory, { recursive: true, force: true });

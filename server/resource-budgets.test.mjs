@@ -255,6 +255,92 @@ test("migration preserves recovery transitions for legacy data already over quot
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("startup reconciles a legacy backlog larger than fixed recovery headroom", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-legacy-burst-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    database.updateSettings({ maxRetainedMiB: 64 });
+    const conversation = chat(database);
+    database.close();
+    const legacy = new Database(filename);
+    legacy.exec("DROP TRIGGER retained_hard_limit");
+    legacy.prepare(`WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 30000)
+      INSERT INTO runs (id, conversation_id, worktree_path, provider, approval_policy, prompt, status, created_at)
+      SELECT 'legacy-' || n, ?, '/tmp/w', 'codex', 'read-only', 'work', 'queued', '2026-01-01T00:00:00.000Z' FROM seq`).run(conversation.id);
+    legacy.prepare("INSERT INTO messages (id, conversation_id, role, kind, body, payload, created_at) VALUES ('legacy-output', ?, 'assistant', 'text', ?, 'null', '2026-01-01T00:00:00.000Z')")
+      .run(conversation.id, "x".repeat(68 * 1024 * 1024));
+    legacy.close();
+    database = createOutrightDatabase({ filename });
+    assert.ok(database.capacity().retainedBytes > 64 * 1024 * 1024);
+    assert.equal(database.reconcileInterruptedRuns({ probeAlive: () => false }).count, 30000);
+    assert.equal(database.capacity().queued, 0);
+    assert.equal(database.capacity().recoverable, 30000);
+    database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.reconcileInterruptedRuns({ probeAlive: () => false }).count, 0);
+    assert.equal(database.capacity().recoverable, 30000);
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("startup recovery commits bounded batches before an interrupted probe", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-reconcile-batches-"));
+  const filename = path.join(directory, "outright.db");
+  const database = createOutrightDatabase({ filename });
+  try {
+    const conversation = chat(database);
+    const admin = new Database(filename);
+    admin.prepare(`WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 501)
+      INSERT INTO runs (id, conversation_id, worktree_path, provider, approval_policy, prompt, status, pid, created_at)
+      SELECT 'pending-' || n, ?, '/tmp/w', 'codex', 'read-only', 'work', 'running', 12345, '2026-01-01T00:00:00.000Z' FROM seq`).run(conversation.id);
+    admin.close();
+    let probed = 0;
+    assert.throws(() => database.reconcileInterruptedRuns({ probeAlive: () => {
+      if (++probed === 501) throw new Error("probe interrupted");
+      return false;
+    } }), /probe interrupted/);
+    assert.equal(database.capacity().recoverable, 500);
+    assert.equal(database.capacity().active, 1);
+    assert.equal(database.reconcileInterruptedRuns({ probeAlive: () => false }).count, 1);
+    assert.equal(database.capacity().recoverable, 501);
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("lowering the retained cap preserves cleanup and refuses new retained work", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-lower-cap-"));
+  const filename = path.join(directory, "outright.db");
+  const database = createOutrightDatabase({ filename });
+  try {
+    const archived = chat(database, "large archive");
+    const live = chat(database, "live");
+    database.addMessage({ conversationId: archived.id, role: "assistant", body: "x".repeat(65 * 1024 * 1024) });
+    database.updateConversation(archived.id, { archived: true });
+    assert.equal(database.updateSettings({ maxRetainedMiB: 64 }).maxRetainedMiB, 64);
+    assert.equal(database.capacity().availableForNewWorkBytes, 0);
+    assert.throws(() => database.submitRun(runInput(live.id), "blocked"), (error) => error.statusCode === 507);
+    assert.equal(database.deleteArchivedConversation(archived.id, archived.id).deleted, 1);
+    assert.equal(database.submitRun(runInput(live.id), "ready").run.status, "queued");
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("truncated output cannot spend terminal transition reserve at the quota edge", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    database.updateSettings({ maxRetainedMiB: 64 });
+    const conversation = chat(database);
+    const runs = ["completed", "failed", "stopped"].map(() => database.createRun(runInput(conversation.id)));
+    database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+    const room = 64 * 1024 * 1024 - database.capacity().retainedBytes;
+    assert.ok(room > 1024 * 1024);
+    assert.throws(() => database.addMessage({ conversationId: conversation.id, role: "assistant",
+      body: "x".repeat(room - 1024), payload: { truncated: true } }), (error) => error.statusCode === 507);
+    for (const [index, status] of ["completed", "failed", "stopped"].entries()) {
+      const result = database.finishRun(runs[index].id, { status, finishedAt: new Date().toISOString(), error: status === "failed" ? "provider exited" : null });
+      assert.equal(result.run.status, status);
+    }
+  } finally { database.close(); }
+});
+
 test("sustained event output retains a byte-bounded replay tail with monotonic cursors", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

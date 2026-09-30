@@ -220,6 +220,48 @@ test("concurrent HTTP submissions admit only the configured queue budget", { ski
   assert.equal(runtime.database.messageCount(conversation.id), 3, "rejected submissions leave no message");
 }));
 
+test("capacity-reclaim deletion routes wake queued work after restoring launch room", async () => {
+  for (const kind of ["group", "membership", "template", "trust"]) {
+    await withRuntime(async (runtime) => {
+      const database = runtime.database;
+      database.updateSettings({ maxRetainedMiB: 64 });
+      const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: kind, provider: "codex" });
+      const queued = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "waiting" });
+      let url;
+      let body;
+      let method = "DELETE";
+      if (kind === "group") url = `/api/groups/${database.createGroup("Spare group").id}`;
+      else if (kind === "membership") {
+        const group = database.createGroup("Membership group");
+        database.setProjectGroup("spare-project", group.id);
+        url = "/api/project-memberships";
+        method = "PUT";
+        body = { projectId: "spare-project", groupId: null };
+      }
+      else if (kind === "template") url = `/api/templates/${database.saveTemplate({ title: "Spare", prompt: "safe" }).id}`;
+      else {
+        database.trustProject("spare-project", "/tmp/spare");
+        url = "/api/trust";
+        body = { projectId: "spare-project" };
+      }
+      const filler = database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+      const desiredAvailable = 64 * 1024 - 50;
+      const increase = database.capacity().availableForNewWorkBytes - desiredAvailable;
+      assert.ok(increase > 0);
+      database.upsertMessage({ ...filler, body: `${filler.body}${"x".repeat(increase)}` });
+      assert.equal(database.canLaunchRun(), false);
+      let wakeups = 0;
+      runtime.agents.resumeQueued = () => { wakeups += 1; };
+      const response = responseCapture();
+      await runtime.handleRequest(requestStream(method, url, body), response);
+      assert.ok([200, 204].includes(response.statusCode), `${kind} deletion succeeded`);
+      assert.equal(database.canLaunchRun(), true, `${kind} deletion restored launch room`);
+      assert.equal(wakeups, 1, `${kind} deletion woke deferred work`);
+      assert.equal(database.getRun(queued.id).status, "queued");
+    })();
+  }
+});
+
 test("bootstrap and retention remain reachable when default groups cannot fit the retained budget", async () => {
   const configDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-budget-config-"));
   const configFile = path.join(configDirectory, "outright.config.json");

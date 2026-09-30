@@ -178,9 +178,16 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       }
       const groupMatch = url.pathname.match(/^\/api\/groups\/([^/]+)$/);
       if (groupMatch && request.method === "PATCH") return json(response, 200, database.updateGroup(groupMatch[1], await readJson(request)));
-      if (groupMatch && request.method === "DELETE") return json(response, database.deleteGroup(groupMatch[1]) ? 204 : 404, null);
+      if (groupMatch && request.method === "DELETE") {
+        const deleted = database.deleteGroup(groupMatch[1]);
+        if (deleted) agents.resumeQueued();
+        return json(response, deleted ? 204 : 404, null);
+      }
       if (url.pathname === "/api/project-memberships" && request.method === "PUT") {
-        const body = await readJson(request); database.setProjectGroup(body.projectId, body.groupId); return json(response, 200, database.listGroups());
+        const body = await readJson(request);
+        database.setProjectGroup(body.projectId, body.groupId);
+        if (!body.groupId) agents.resumeQueued();
+        return json(response, 200, database.listGroups());
       }
 
       if (url.pathname === "/api/conversations" && request.method === "GET") return json(response, 200, { conversations: database.listConversations({ projectId: url.searchParams.get("projectId"), worktreeId: url.searchParams.get("worktreeId"), archived: url.searchParams.get("archived") === "true" }) });
@@ -529,7 +536,12 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         database.trustProject(project.id, project.path); database.audit("project.trusted", { target: project.id, path: project.path });
         return json(response, 200, { trusted: true, projectId: project.id });
       }
-      if (url.pathname === "/api/trust" && request.method === "DELETE") { const body = await readJson(request); database.untrustProject(body.projectId); return json(response, 200, { trusted: false }); }
+      if (url.pathname === "/api/trust" && request.method === "DELETE") {
+        const body = await readJson(request);
+        database.untrustProject(body.projectId);
+        agents.resumeQueued();
+        return json(response, 200, { trusted: false });
+      }
 
       if (url.pathname === "/api/terminals" && request.method === "GET") return json(response, 200, { terminals: terminals.list() });
       if (url.pathname === "/api/terminals" && request.method === "POST") { const body = await readJson(request); await projects(); const cwd = await git.requireWorktree(body.cwd); return json(response, 201, terminals.create({ ...body, cwd })); }
@@ -551,7 +563,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/templates" && request.method === "GET") return json(response, 200, { templates: database.listTemplates() });
       if (url.pathname === "/api/templates" && request.method === "POST") return json(response, 201, database.saveTemplate(await readJson(request)));
       const templateMatch = url.pathname.match(/^\/api\/templates\/([^/]+)$/);
-      if (templateMatch && request.method === "DELETE") return json(response, database.deleteTemplate(templateMatch[1]) ? 204 : 404, null);
+      if (templateMatch && request.method === "DELETE") {
+        const deleted = database.deleteTemplate(templateMatch[1]);
+        if (deleted) agents.resumeQueued();
+        return json(response, deleted ? 204 : 404, null);
+      }
       if (url.pathname === "/api/search" && request.method === "GET") return json(response, 200, database.search(requiredQuery(url, "q")));
       if (url.pathname === "/api/audit" && request.method === "GET") return json(response, 200, { entries: database.listAudit(Number(url.searchParams.get("limit") ?? 100)) });
       throw apiError(404, "API route not found");
