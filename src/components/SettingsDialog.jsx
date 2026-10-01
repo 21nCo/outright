@@ -34,7 +34,7 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
   function refreshCapacity() {
     const request = ++capacityRequestRef.current;
     const session = archiveSessionRef.current;
-    api("/api/capacity").then((value) => {
+    return api("/api/capacity").then((value) => {
       if (session === archiveSessionRef.current && request === capacityRequestRef.current) setCapacity(value);
     }).catch((error) => {
       if (session === archiveSessionRef.current && request === capacityRequestRef.current) onError(error);
@@ -71,6 +71,28 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
     if (!open || runtimeEvent?.type !== "capacity.changed") return;
     refreshCapacity();
   }, [open, runtimeEvent, onError]);
+  useEffect(() => {
+    if (!open) return;
+    let stopped = false;
+    let inFlight = false;
+    let timer;
+    const schedule = () => { timer = window.setTimeout(poll, 2000); };
+    const poll = async () => {
+      if (stopped) return;
+      if (document.hidden) { schedule(); return; }
+      inFlight = true;
+      try { await refreshCapacity(); }
+      finally { inFlight = false; if (!stopped) schedule(); }
+    };
+    const onVisible = () => {
+      if (document.hidden || inFlight) return;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(poll, 0);
+    };
+    schedule();
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { stopped = true; window.clearTimeout(timer); document.removeEventListener("visibilitychange", onVisible); };
+  }, [open, onError]);
   async function refreshArchived() {
     const request = ++archivedRequestRef.current;
     const value = await api("/api/retention/archived");

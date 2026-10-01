@@ -551,6 +551,41 @@ async function settingsMigrationCompletionRegression() {
   assert(reads >= 2, "capacity completion did not read authoritative state");
 }
 
+async function settingsCapacityWithoutEventRegression() {
+  root.render(null); await settle();
+  const settings = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
+    editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
+  let reads = 0;
+  let otherClientCapacity = { queued: 0, active: 0, recoverable: 0, retainedBytes: 0 };
+  route = async (url) => {
+    if (url.pathname === "/api/capacity") {
+      reads += 1;
+      return response({ ...otherClientCapacity, migrationStatus: "ready", availableForNewWorkBytes: 63 * 1048576 - otherClientCapacity.retainedBytes,
+        limits: { maxQueuedRuns: 32, maxConcurrentRuns: 2, maxRetainedBytes: 64 * 1048576, reservedRetainedBytes: 1048576 } });
+    }
+    if (url.pathname === "/api/retention/archived") return response({ conversations: [] });
+    return response({});
+  };
+  function Fixture() {
+    const [open, setOpen] = React.useState(false);
+    return <><button onClick={() => setOpen(true)}>Open live capacity</button><SettingsDialog open={open}
+      onOpenChange={setOpen} settings={settings} providers={[{ id: "codex", label: "Codex", available: true }]}
+      templates={[]} runtimeEvent={null} onSaved={() => {}} onError={(error) => { throw error; }} /></>;
+  }
+  root.render(<TooltipProvider><Fixture /></TooltipProvider>);
+  await until(() => host.querySelector("button")?.textContent === "Open live capacity", "live capacity fixture");
+  host.querySelector("button").click();
+  await until(() => document.querySelector(".capacity-status")?.textContent.includes("0 of 32 queued"), "initial capacity read");
+  otherClientCapacity = { queued: 2, active: 1, recoverable: 0, retainedBytes: 4 * 1048576 };
+  await until(() => document.querySelector(".capacity-status")?.textContent.includes("2 of 32 queued")
+    && document.querySelector(".capacity-status")?.textContent.includes("4.0 of 64 MiB retained"),
+  "capacity converges without an event after another client writes");
+  [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Cancel").click();
+  const readsAtClose = reads;
+  await new Promise((resolve) => setTimeout(resolve, 2200));
+  assert(reads === readsAtClose, "closed Settings kept polling capacity");
+}
+
 async function settingsCapacityAndDeletionOrderRegression() {
   root.render(null);
   await settle();
@@ -4765,6 +4800,7 @@ try {
     ["settings save session fence", settingsSaveSessionFenceRegression, "delayed GET and PATCH save completions cannot change a reopened Settings dialog"],
     ["settings shared refresh order", settingsSharedRefreshOrderRegression, "a settings save preserves an in-flight template refresh without reverting the new quota"],
     ["settings migration completion", settingsMigrationCompletionRegression, "an open Settings dialog refreshes capacity when migration finishes"],
+    ["settings live capacity", settingsCapacityWithoutEventRegression, "an open Settings dialog reads another client's quota changes without a capacity event"],
     ["settings capacity and deletion order", settingsCapacityAndDeletionOrderRegression, "new capacity wins reordered responses and deletion owns its confirmation"],
     ["settings template completion", settingsTemplateCompletionRegression, "a successful template POST clears its submitted draft after reopening"],
     ["notification permission rejection", rejectedNotificationPermissionRegression, "a rejected permission request does not disrupt Settings save or escape as an unhandled rejection"],
