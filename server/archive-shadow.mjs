@@ -17,8 +17,8 @@ function fileInfo(filename) {
 
 function privateRegularFile(filename) {
   const info = fileInfo(filename);
-  if (!info) return false;
-  if (!info.isFile() || info.nlink !== 1) throw new Error(`Unsafe archive maintenance file: ${filename}`);
+  if (!info) { return false; }
+  if (!info.isFile() || info.nlink !== 1) { throw new Error(`Unsafe archive maintenance file: ${filename}`); }
   return true;
 }
 
@@ -75,6 +75,14 @@ function matchesCandidate(filename, candidate, hash = false, renamed = false) {
     && (!hash || current.digest === candidate.digest);
 }
 
+function authenticatedCandidate(filename, marker, renamed = false) {
+  // Preparation verified SQLite before recording the digest. Matching that
+  // digest also detects corruption, so recovery need not run a second full
+  // SQLite integrity scan on the same bytes during startup.
+  return marker.version === 2 && !hasNonemptyWal(filename)
+    && matchesCandidate(filename, marker.candidate, true, renamed);
+}
+
 function validDatabase(filename) {
   if (!privateRegularFile(filename)) return false;
   // SQLite treats an empty file as a valid empty database. A reserved but
@@ -102,13 +110,13 @@ function hasNonemptyWal(filename) {
 function removeCheckpointedSidecars(filename) {
   if (hasNonemptyWal(filename)) throw new Error(`Uncheckpointed archive database WAL: ${filename}`);
   for (const suffix of ["-wal", "-shm"]) {
-    if (privateRegularFile(`${filename}${suffix}`)) rmSync(`${filename}${suffix}`);
+    if (privateRegularFile(`${filename}${suffix}`)) { rmSync(`${filename}${suffix}`); }
   }
 }
 
 function discardShadowCandidate(filename) {
   for (const suffix of ["", "-wal", "-shm", "-journal"]) {
-    if (privateRegularFile(`${filename}${suffix}`)) rmSync(`${filename}${suffix}`);
+    if (privateRegularFile(`${filename}${suffix}`)) { rmSync(`${filename}${suffix}`); }
   }
 }
 
@@ -120,6 +128,33 @@ function markerOwnsDatabase(marker, filename) {
   // through its canonical parent still owns the same maintenance files.
   try { return realpathSync(path.dirname(marker.source)) === path.dirname(filename); }
   catch (error) { if (error.code === "ENOENT") return false; throw error; }
+}
+
+function recoverInterruptedCutover(filename, next, old, marker) {
+  // Legacy version-1 markers did not pin a candidate. Roll those back to
+  // the original rather than trusting a database that could be substituted.
+  let candidateVerified = false;
+  if (!fileInfo(filename)) {
+    candidateVerified = authenticatedCandidate(next, marker);
+    if (candidateVerified) renameSync(next, filename);
+    else {
+      // Keep the marker and both names intact if the only fallback is
+      // corrupt. Renaming first would erase the evidence of that failure.
+      if (!validDatabase(old)) throw new Error("Neither archive maintenance database is valid");
+      renameSync(old, filename);
+    }
+    durableDirectory(filename);
+  }
+  if (fileInfo(old) && !candidateVerified && !authenticatedCandidate(filename, marker, true)) {
+    if (!validDatabase(old)) throw new Error("Neither archive maintenance database is valid");
+    rmSync(filename);
+    durableDirectory(filename);
+    renameSync(old, filename);
+    durableDirectory(filename);
+  }
+  durableFile(filename);
+  durableDirectory(filename);
+  if (privateRegularFile(old)) { rmSync(old); durableDirectory(filename); }
 }
 
 export function recoverArchiveShadow(filename, { sourceUnmoved = false } = {}) {
@@ -146,25 +181,7 @@ export function recoverArchiveShadow(filename, { sourceUnmoved = false } = {}) {
     return;
   }
   if (fileInfo(old)) {
-    // Legacy version-1 markers did not pin a candidate. Roll those back to
-    // the original rather than trusting a database that could be substituted.
-    const promoted = (name, renamed = false) => marker.version === 2 && !hasNonemptyWal(name)
-      && validDatabase(name) && matchesCandidate(name, marker.candidate, true, renamed);
-    if (!fileInfo(filename)) {
-      if (promoted(next)) renameSync(next, filename);
-      else renameSync(old, filename);
-      durableDirectory(filename);
-    }
-    if (fileInfo(old) && !promoted(filename, true)) {
-      if (!validDatabase(old)) throw new Error("Neither archive maintenance database is valid");
-      rmSync(filename);
-      durableDirectory(filename);
-      renameSync(old, filename);
-      durableDirectory(filename);
-    }
-    durableFile(filename);
-    durableDirectory(filename);
-    if (privateRegularFile(old)) { rmSync(old); durableDirectory(filename); }
+    recoverInterruptedCutover(filename, next, old, marker);
   } else if (!validDatabase(filename)) {
     throw new Error("Archive maintenance source is missing or invalid");
   }
@@ -209,23 +226,11 @@ export function cutoverArchiveShadow(filename) {
   removeCheckpointedSidecars(next);
   renameSync(filename, old);
   durableDirectory(filename);
-  try {
-    renameSync(next, filename);
-    durableDirectory(filename);
-    if (!matchesCandidate(filename, marker.candidate, false, true)) throw new Error("Archive cutover candidate changed during promotion");
-  }
-  catch (error) {
-    // Both names remain owned by the durable marker until the original is
-    // restored. A crash before this rollback is handled by startup recovery.
-    if (fileInfo(filename)) rmSync(filename);
-    renameSync(old, filename);
-    durableDirectory(filename);
-    discardShadowCandidate(next);
-    durableDirectory(filename);
-    rmSync(state);
-    durableDirectory(filename);
-    throw error;
-  }
+  // An interrupted promotion keeps both names and the durable marker. The
+  // parent recovers it on a worker while HTTP can return bounded 503s.
+  renameSync(next, filename);
+  durableDirectory(filename);
+  if (!matchesCandidate(filename, marker.candidate, false, true)) throw new Error("Archive cutover candidate changed during promotion");
   // The worker validated and flushed this same inode before the fence. A
   // full integrity scan here would make the service outage size-dependent.
   rmSync(old);
@@ -245,6 +250,9 @@ export function allocatedDatabaseBytes(filename) {
         if (!info.isFile()) throw new Error(`Unsafe database storage file: ${part}`);
         const allocated = typeof info.blocks === "number" ? info.blocks * 512 : 0;
         return total + (allocated > 0 ? allocated : info.size);
-      } catch (error) { if (error.code === "ENOENT") return total; throw error; }
+      } catch (error) {
+        if (error.code === "ENOENT") { return total; }
+        throw error;
+      }
     }, 0);
 }

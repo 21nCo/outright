@@ -207,7 +207,7 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
     {Object.entries(BUDGET_RANGES).map(([name, [label, min, max]]) =>
       <BudgetSetting key={name} name={name} label={label} min={min} max={max} value={draft[name]} setDraft={setDraft} />)}
   </div>
-  {!validBudgetSettings(draft) && <p id="budget-settings-error">Enter whole numbers within the shown ranges before saving.</p>}
+  {!validBudgetSettings(draft) && <p id="budget-settings-error" role="alert">Enter whole numbers within the shown ranges before saving.</p>}
   <section className="template-settings">
     <header><div><strong>Capacity and retention</strong><small>Cleanup removes unpinned archived chats older than the saved age. You can also select a recent archived chat to delete now. Active and recoverable runs stay protected.</small></div></header>
     {capacity?.limits && <output className="capacity-status">{capacity.queued} of {capacity.limits.maxQueuedRuns} queued · {capacity.active} active · {capacity.recoverable} awaiting recovery · {capacityUsageText(capacity)} ({(capacity.limits.reservedRetainedBytes / 1048576).toFixed(0)} MiB reserved for active runs). CPU and memory use are unknown. {allocatedDiskUsageText(capacity)}</output>}

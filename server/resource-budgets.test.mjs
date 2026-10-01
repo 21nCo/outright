@@ -915,7 +915,7 @@ test("oversized legacy archive cleanup defers while active runs write, then resu
     const probe = new Database(filename);
     assert.ok(probe.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes < 1024 * 1024);
     probe.close();
-    assert.equal(shadowCopies, archives.length, "one archive made repeated whole-database copies for sibling giant rows");
+    assert.equal(shadowCopies, archives.length, `expected ${archives.length} shadow copies for sibling giant rows; observed ${shadowCopies}`);
     assert.equal(database.canLaunchRun(), true, "cleanup did not reopen run admission");
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
@@ -1005,7 +1005,7 @@ test("shadow copy serves unrelated work and retries after a concurrent source wr
     Atomics.store(copyGate, 0, 2);
     Atomics.notify(copyGate, 0);
     const first = await deletion;
-    assert.equal(first.deferred, true, "a stale shadow replaced concurrent source changes");
+    assert.equal(first.deferred, true, "a stale shadow should defer after concurrent source changes");
     assert.ok(database.getConversation(sibling.id));
     const completed = Date.now() + 8000;
     while (archivePresentOrMaintaining(database, archived.id)) {

@@ -51,6 +51,7 @@ const LIVE_OMITTED_PREFIX = "[Earlier live output omitted]\n";
 
 export function App() {
   const [bootstrap, setBootstrap] = useState(null);
+  const [bootstrapError, setBootstrapError] = useState("");
   const bootstrapLoadRef = useRef(null);
   const [selectedProjectId, setSelectedProjectId] = useState(() => localStorage.getItem("outright.selected-project") || "");
   const [selectedWorktreeId, setSelectedWorktreeId] = useState(() => localStorage.getItem("outright.selected-worktree") || "");
@@ -226,11 +227,12 @@ export function App() {
       const next = await api(manual ? "/api/projects" : "/api/bootstrap", manual ? { method: "POST" } : undefined);
       if (manual) setBootstrap((current) => ({ ...current, ...next }));
       else setBootstrap(next);
-      if (!manual) setError("");
+      if (!manual) setBootstrapError("");
       if (manual) setToast(`Found ${next.projects.length} Git projects`);
       return true;
     } catch (nextError) {
-      if (manual || nextError.status !== 503) setError(nextError.message);
+      if (manual) setError(nextError.message);
+      else if (nextError.status !== 503) setBootstrapError(nextError.message);
       return !manual && nextError.status === 503 ? "retry" : "error";
     }
     finally { setIsScanning(false); }
@@ -787,6 +789,9 @@ export function App() {
     const narrow = window.matchMedia("(max-width: 760px)");
     let wasNarrow = narrow.matches;
     const trackFocus = (event) => {
+      // A layout transition can briefly focus BODY before the replacement
+      // control commits. Pointer and keyboard input cancel the intent below.
+      if (event.target === document.body) return;
       const target = sidebarFocusIntentRef.current === "opener"
         ? document.querySelector('[aria-label="Open projects sidebar"]')
         : sidebarRef.current?.querySelector('button:not(:disabled)');
@@ -851,10 +856,9 @@ export function App() {
     let active = true;
     let attempts = 0;
     const maxAttempts = 30;
-    let watchChecks = 0;
     let target;
     const watchFocus = () => {
-      if (!active || sidebarFocusIntentRef.current !== intent || watchChecks++ >= 12) return;
+      if (!active || sidebarFocusIntentRef.current !== intent) return;
       const focused = document.activeElement;
       if (focused === document.body) { transfer(); return; }
       if (focused !== target) {
@@ -862,7 +866,7 @@ export function App() {
         sidebarFocusSourceRef.current = null;
         return;
       }
-      const timer = window.setTimeout(watchFocus, 250);
+      const timer = window.setTimeout(watchFocus, 500);
       cancelRetry = () => clearTimeout(timer);
     };
     const transfer = () => {
@@ -884,7 +888,7 @@ export function App() {
         if (document.activeElement === target && target.getBoundingClientRect().width > 0) {
           sidebarFocusOwnerRef.current = intent;
           attempts = 0;
-          const timer = window.setTimeout(watchFocus, 250);
+          const timer = window.setTimeout(watchFocus, 500);
           cancelRetry = () => clearTimeout(timer);
           return;
         }
@@ -967,6 +971,11 @@ export function App() {
   }, [conversations, selectedConversationId]);
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 2800); return () => clearTimeout(timer); }, [toast]);
   useEffect(() => { if (!error) return; const timer = setTimeout(() => setError(""), 6000); return () => clearTimeout(timer); }, [error]);
+  useEffect(() => {
+    if (!bootstrap || !bootstrapError) return;
+    const timer = setTimeout(() => setBootstrapError(""), 6000);
+    return () => clearTimeout(timer);
+  }, [bootstrap, bootstrapError]);
   useEffect(() => {
     const viewport = messageViewportRef.current;
     if (!viewport) return;
@@ -1744,7 +1753,7 @@ export function App() {
   }
   function openManageChat() { if (!conversation || !conversationDetailReady || !isSelectedTarget(conversation)) return; setChatDraft({ title: conversation.title, providerSessionId: conversation.providerSessionId ?? "", provider: conversation.provider, model: conversation.model ?? "", destination: `${conversation.projectId}::${conversation.worktreeId}` }); setManageChatOpen(true); }
 
-  if (!bootstrap || !project || !worktree) return <LoadingScreen isScanning={isScanning} error={error} onRetry={() => { setError(""); void bootstrapLoadRef.current?.(); }} />;
+  if (!bootstrap || !project || !worktree) return <LoadingScreen isScanning={isScanning} error={bootstrapError} onRetry={() => { setBootstrapError(""); void bootstrapLoadRef.current?.(); }} />;
 
   return <div className={`app-shell ${sidebarOpen ? "sidebar-is-open" : "sidebar-is-closed"}`}>
     <aside className="sidebar" id="project-sidebar" role={isNarrow && sidebarOpen ? "dialog" : undefined} aria-modal={isNarrow && sidebarOpen ? true : undefined} aria-label="Projects and worktrees" aria-hidden={!sidebarOpen} tabIndex={isNarrow ? -1 : undefined} ref={sidebarRef}>
@@ -1781,7 +1790,7 @@ export function App() {
     <Dialog open={manageChatOpen} onOpenChange={setManageChatOpen}><DialogContent><form className="dialog-form" onSubmit={saveChatSettings}><DialogHeader><DialogTitle>Conversation settings</DialogTitle><DialogDescription>Rename, move, pin, or attach an existing provider session.</DialogDescription></DialogHeader><label htmlFor="chat-settings-title">Title</label><Input id="chat-settings-title" value={chatDraft.title} onChange={(event) => setChatDraft({ ...chatDraft, title: event.target.value })} /><label htmlFor="chat-settings-destination">Move to worktree</label><select id="chat-settings-destination" value={chatDraft.destination} onChange={(event) => setChatDraft({ ...chatDraft, destination: event.target.value })}>{bootstrap.projects.map((item) => <optgroup key={item.id} label={item.name}>{item.worktrees.filter((entry) => !entry.isPrunable && !entry.isBare).map((entry) => <option key={entry.id} value={`${item.id}::${entry.id}`}>{entry.name} · {entry.branch}</option>)}</optgroup>)}</select><label htmlFor="chat-settings-provider">Provider</label><select id="chat-settings-provider" value={chatDraft.provider} onChange={(event) => setChatDraft({ ...chatDraft, provider: event.target.value })}>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.label}</option>)}</select><label htmlFor="chat-settings-model">Model</label><Input id="chat-settings-model" value={chatDraft.model} onChange={(event) => setChatDraft({ ...chatDraft, model: event.target.value })} placeholder="Provider default" /><label htmlFor="chat-settings-session">Provider session ID</label><Input id="chat-settings-session" value={chatDraft.providerSessionId} onChange={(event) => setChatDraft({ ...chatDraft, providerSessionId: event.target.value })} placeholder="Attach or resume an existing session" /><div className="manage-actions"><Button type="button" variant="outline" onClick={() => updateConversation({ pinned: !conversation.pinned })}><PushPin />{conversation?.pinned ? "Unpin" : "Pin"}</Button><Button type="button" variant="destructive" onClick={archiveConversation}><Archive />Archive conversation</Button></div><DialogFooter><Button variant="outline" type="button" onClick={() => setManageChatOpen(false)}>Cancel</Button><Button type="submit">Save</Button></DialogFooter></form></DialogContent></Dialog>
     <SimpleDialog open={Boolean(worktreeDialog)} onOpenChange={(open) => !open && setWorktreeDialog(null)} title="Create worktree" description={worktreeDialog?.name ?? ""} onSubmit={createWorktree} submit="Create worktree" disabled={!worktreeDraft.branch.trim()}><label htmlFor="worktree-branch">Branch name</label><Input id="worktree-branch" value={worktreeDraft.branch} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, branch: event.target.value })} placeholder="feature/my-change" /><label htmlFor="worktree-directory">Directory name <small>optional</small></label><Input id="worktree-directory" value={worktreeDraft.name} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, name: event.target.value })} placeholder="project-my-change" /><label htmlFor="worktree-base">Base revision</label><Input id="worktree-base" value={worktreeDraft.baseBranch} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, baseBranch: event.target.value })} /></SimpleDialog>
     <Dialog open={removeWorktreeOpen} onOpenChange={setRemoveWorktreeOpen}><DialogContent><DialogHeader><DialogTitle>Remove worktree?</DialogTitle><DialogDescription>This is allowed only when the linked worktree has no uncommitted changes. Type its exact path to confirm.</DialogDescription></DialogHeader><code className="confirm-path">{worktree.path}</code><label htmlFor="remove-worktree-confirmation">Confirmation path</label><Input id="remove-worktree-confirmation" value={removeConfirmation} onChange={(event) => setRemoveConfirmation(event.target.value)} placeholder="Exact worktree path" /><DialogFooter><Button variant="outline" onClick={() => setRemoveWorktreeOpen(false)}>Cancel</Button><Button variant="destructive" disabled={removeConfirmation !== worktree.path} onClick={removeWorktree}>Remove worktree</Button></DialogFooter></DialogContent></Dialog>
-    {toast && <div className="toast" role="status" aria-live="polite"><CheckCircle weight="fill" />{toast}</div>}{error && <div className="error-toast" role="alert" aria-live="assertive"><WarningCircle weight="fill" /><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error"><X /></button></div>}
+    {toast && <div className="toast" role="status" aria-live="polite"><CheckCircle weight="fill" />{toast}</div>}{error && <div className="error-toast" role="alert" aria-live="assertive"><WarningCircle weight="fill" /><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error"><X /></button></div>}{bootstrapError && <div className={`error-toast ${error ? "error-toast-stacked" : ""}`} role="alert" aria-live="assertive"><WarningCircle weight="fill" /><span>{bootstrapError}</span><button onClick={() => setBootstrapError("")} aria-label="Dismiss loading error"><X /></button></div>}
   </div>;
 }
 

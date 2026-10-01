@@ -515,6 +515,43 @@ async function settingsSharedRefreshOrderRegression() {
   await until(() => document.querySelector(".template-list")?.textContent.includes("Review diff"), "earlier template refresh still committed");
 }
 
+async function bootstrapRefreshErrorOwnershipRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const linkedProjects = projects.map((item) => item.id === "A"
+    ? { ...item, worktrees: [{ ...item.worktrees[0], isLinked: true }] } : item);
+  const heldBootstrap = deferred();
+  let bootstrapCalls = 0;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") {
+      bootstrapCalls += 1;
+      return bootstrapCalls === 1 ? response({ projects: linkedProjects, projectGroups: { groups: [], memberships: {} },
+        settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] })
+        : heldBootstrap.promise;
+    }
+    if (url.pathname === "/api/worktrees" && options.method === "DELETE") return response({});
+    if (url.pathname === "/api/projects" && options.method === "POST") return response({ error: "Scan failed" }, 500);
+    if (url.pathname === "/api/conversations") return response({ conversations: [] });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[aria-label="Worktree options"]'), "linked worktree options");
+  host.querySelector('[aria-label="Worktree options"]').click();
+  await until(() => [...document.querySelectorAll('[role="menuitem"]')].some((item) => item.textContent.includes("Remove worktree")), "remove worktree menu item");
+  [...document.querySelectorAll('[role="menuitem"]')].find((item) => item.textContent.includes("Remove worktree")).click();
+  await until(() => document.querySelector("#remove-worktree-confirmation"), "remove worktree confirmation");
+  setControlValue(document.querySelector("#remove-worktree-confirmation"), "/fixture/A");
+  [...document.querySelectorAll('[role="dialog"] button')].find((item) => item.textContent === "Remove worktree").click();
+  await until(() => bootstrapCalls === 2, "background bootstrap held after worktree removal");
+  [...host.querySelectorAll("button")].find((item) => item.textContent.includes("Scan projects")).click();
+  await until(() => host.querySelector('.error-toast')?.textContent.includes("Scan failed"), "manual scan error displayed");
+  heldBootstrap.resolve(response({ projects: [projects[1]], projectGroups: { groups: [], memberships: {} },
+    settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] }));
+  await until(() => host.querySelector('.workspace-context')?.textContent.includes("Review B"), "background bootstrap finished");
+  assert(host.querySelector('.error-toast')?.textContent.includes("Scan failed"), "background bootstrap dismissed an unrelated operation error");
+}
+
 async function settingsMigrationCompletionRegression() {
   root.render(null);
   await settle();
@@ -645,8 +682,8 @@ async function settingsCapacityAndDeletionOrderRegression() {
     "fractional quota disables save");
   assert(queuedInput.getAttribute("aria-invalid") === "true", "fractional quota did not mark its input invalid");
   const error = document.getElementById(queuedInput.getAttribute("aria-describedby"));
-  assert(error?.textContent.includes("whole numbers") && !error.hasAttribute("role"),
-    "invalid quota lacks a stable, non-live error description");
+  assert(error?.textContent.includes("whole numbers") && error.getAttribute("role") === "alert",
+    "invalid quota lacks a live error announcement");
   setControlValue(queuedInput, "32");
   await until(() => !queuedInput.hasAttribute("aria-invalid") && !queuedInput.hasAttribute("aria-describedby"),
     "corrected quota clears input error semantics");
@@ -2649,6 +2686,13 @@ async function variableHeightFindAnchorRegression() {
   assert(viewport.current.scrollTop < 50, "Scrollbar thumb interaction lost the reader's scroll position");
 }
 
+function physicallyVisibleWithin(element, viewport) {
+  if (!element) return false;
+  const mark = element.getBoundingClientRect();
+  const bounds = viewport.getBoundingClientRect();
+  return mark.bottom > bounds.top && mark.top < bounds.bottom;
+}
+
 async function largeDiffWindowRegression() {
   root.render(null);
   await settle();
@@ -2672,11 +2716,8 @@ async function largeDiffWindowRegression() {
   const ordinaryHeight = viewport.clientHeight;
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 300 }}><WindowedDiff diff={diff} label="Large diff fixture" /></div>);
   await until(() => viewport.clientHeight < ordinaryHeight - 40, "ordinary diff resized after Find settled");
-  await until(() => {
-    const mark = viewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect();
-    const bounds = viewport.getBoundingClientRect();
-    return mark && mark.bottom > bounds.top && mark.top < bounds.bottom;
-  }, "ordinary diff Find remains physically visible after resize");
+  await until(() => physicallyVisibleWithin(viewport.querySelector('[data-find-match="true"]'), viewport),
+    "ordinary diff Find remains physically visible after resize");
   window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), diff: { elapsedMs, mountedAtEnd: viewport.querySelectorAll("span").length, heapBytes: performance.memory?.usedJSHeapSize ?? null } };
 }
 
@@ -4835,6 +4876,7 @@ try {
     ["settings retention draft", settingsRetentionDraftRegression, "missing archived data stays safe and cancel, cleanup and save use the persisted retention age"],
     ["settings save session fence", settingsSaveSessionFenceRegression, "delayed GET and PATCH save completions cannot change a reopened Settings dialog"],
     ["settings shared refresh order", settingsSharedRefreshOrderRegression, "a settings save preserves an in-flight template refresh without reverting the new quota"],
+    ["bootstrap error ownership", bootstrapRefreshErrorOwnershipRegression, "a background bootstrap cannot dismiss an unrelated operation error"],
     ["settings migration completion", settingsMigrationCompletionRegression, "an open Settings dialog refreshes capacity when migration finishes"],
     ["settings live capacity", settingsCapacityWithoutEventRegression, "an open Settings dialog reads another client's quota changes without a capacity event"],
     ["settings capacity and deletion order", settingsCapacityAndDeletionOrderRegression, "new capacity wins reordered responses and deletion owns its confirmation"],

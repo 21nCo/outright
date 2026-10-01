@@ -3,7 +3,7 @@ import { closeSync, openSync } from "node:fs";
 import { parentPort, workerData } from "node:worker_threads";
 import { archiveShadowPaths, cutoverArchiveShadow, prepareArchiveShadowCutover } from "./archive-shadow.mjs";
 
-const { filename, conversationId, table, rowId, lockGate, copyGate } = workerData;
+const { filename, conversationId, table, rowId, lockGate, copyGate, copyPhase } = workerData;
 const ownership = {
   run_events: `SELECT 1 FROM run_events AS item JOIN runs ON runs.id = item.run_id
     WHERE item.id = ? AND runs.conversation_id = ?`,
@@ -35,7 +35,15 @@ try {
   // Reserve the fixed sibling name without following a symlink created by a
   // local process between the parent preflight and VACUUM INTO.
   closeSync(openSync(next, "wx", 0o600));
+  if (copyPhase instanceof SharedArrayBuffer) {
+    Atomics.store(new Int32Array(copyPhase), 0, 1);
+    Atomics.notify(new Int32Array(copyPhase), 0);
+  }
   source.prepare("VACUUM INTO ?").run(next);
+  if (copyPhase instanceof SharedArrayBuffer) {
+    Atomics.store(new Int32Array(copyPhase), 0, 2);
+    Atomics.notify(new Int32Array(copyPhase), 0);
+  }
   if (copyGate instanceof SharedArrayBuffer) {
     const signal = new Int32Array(copyGate);
     if (Atomics.compareExchange(signal, 0, 0, 1) === 0) {

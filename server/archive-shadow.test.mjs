@@ -69,6 +69,20 @@ test("archive shadow recovery restores the source when the replacement is invali
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
 });
 
+test("recovery preserves an invalid fallback and marker when no database is usable", () => {
+  const item = fixture();
+  try {
+    beginArchiveShadow(item.filename);
+    writeFileSync(item.next, "invalid replacement");
+    renameSync(item.filename, item.old);
+    writeFileSync(item.old, "invalid fallback");
+    assert.throws(() => recoverArchiveShadow(item.filename), /Neither archive maintenance database is valid/);
+    assert.equal(existsSync(item.filename), false, "an invalid fallback became the active database");
+    assert.equal(existsSync(item.old), true, "invalid backup was removed before inspection");
+    assert.equal(existsSync(item.state), true, "recovery marker was removed before inspection");
+  } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
 test("an empty reserved shadow never replaces the recoverable source", () => {
   const item = fixture();
   try {
@@ -192,11 +206,16 @@ test("an unpinned legacy marker rolls back a valid but unauthenticated candidate
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
 });
 
-test("dangling maintenance links are rejected before recovery can discard its marker", () => {
+test("dangling maintenance links are rejected before recovery can discard its marker", (t) => {
   const item = fixture();
   try {
     beginArchiveShadow(item.filename);
-    symlinkSync(path.join(item.directory, "missing-candidate"), item.next);
+    try { symlinkSync(path.join(item.directory, "missing-candidate"), item.next); }
+    catch (error) {
+      if (process.platform !== "win32" || !["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) throw error;
+      t.skip(`Windows account cannot create file symlinks: ${error.code}`);
+      return;
+    }
     assert.throws(() => recoverArchiveShadow(item.filename), /Unsafe archive maintenance file/);
     assert.equal(existsSync(item.state), true, "recovery erased the only ownership marker");
     assert.equal(body(item.filename), "recoverable payload");

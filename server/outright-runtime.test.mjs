@@ -3,7 +3,7 @@ import test from "node:test";
 import Database from "better-sqlite3";
 import { Readable } from "node:stream";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -259,18 +259,31 @@ test("HTTP bootstrap stays available during shadow copy and preserves a concurre
   const configFile = path.join(configDirectory, "outright.config.json");
   writeFileSync(configFile, JSON.stringify({ scanRoots: [], maxDepth: 1, maxProjects: 1 }));
   const copyGate = new Int32Array(new SharedArrayBuffer(4));
+  const copyPhase = new Int32Array(new SharedArrayBuffer(4));
   try { await withRuntime(async (runtime) => {
     const database = runtime.database;
     const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Old", provider: "codex" });
     const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "short" });
     const legacy = new Database(database.filename);
-    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(8 * 1024 * 1024), message.id);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(96 * 1024 * 1024), message.id);
     legacy.close();
     database.updateConversation(archived.id, { archived: true });
     const deletion = responseCapture();
     const request = runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived",
       { id: archived.id, confirmation: archived.id }), deletion);
     try {
+      const copyingDeadline = Date.now() + 10_000;
+      while (Atomics.load(copyPhase, 0) === 0 || statSync(`${database.filename}.archive-next`, { throwIfNoEntry: false })?.size === 0) {
+        assert.ok(Date.now() < copyingDeadline, "shadow copy never wrote candidate bytes");
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      assert.equal(Atomics.load(copyPhase, 0), 1, "HTTP probe started after VACUUM INTO completed");
+      const inCopyBootstrap = responseCapture();
+      const inCopyRequest = runtime.handleRequest(requestStream("GET", "/api/bootstrap"), inCopyBootstrap);
+      const inCopySurvivor = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "During copy", provider: "codex" });
+      await inCopyRequest;
+      assert.equal(inCopyBootstrap.statusCode, 200, `in-copy bootstrap was unavailable: ${inCopyBootstrap.raw}`);
+      assert.ok(database.getConversation(inCopySurvivor.id), "in-copy write was unavailable");
       const deadline = Date.now() + 5_000;
       while (Atomics.load(copyGate, 0) !== 1) {
         assert.ok(Date.now() < deadline, "HTTP cleanup did not enter shadow copy");
@@ -285,7 +298,7 @@ test("HTTP bootstrap stays available during shadow copy and preserves a concurre
       Atomics.store(copyGate, 0, 2);
       Atomics.notify(copyGate, 0);
       await request;
-      assert.equal(deletion.statusCode, 202, "a stale shadow replaced the concurrent HTTP-visible write");
+      assert.equal(deletion.statusCode, 202, "a stale shadow should defer after a concurrent HTTP-visible write");
       assert.ok(database.getConversation(survivor.id));
       const completed = Date.now() + 8_000;
       while (true) {
@@ -301,7 +314,7 @@ test("HTTP bootstrap stays available during shadow copy and preserves a concurre
       Atomics.store(copyGate, 0, 2);
       Atomics.notify(copyGate, 0);
     }
-  }, { deletionCopyGate: copyGate.buffer, configUrl: pathToFileURL(configFile) })(); }
+  }, { deletionCopyGate: copyGate.buffer, deletionCopyPhase: copyPhase.buffer, configUrl: pathToFileURL(configFile) })(); }
   finally { rmSync(configDirectory, { recursive: true, force: true }); }
 });
 
