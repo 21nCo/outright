@@ -689,7 +689,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     const payload = item.kind === "text"
       ? { runId: state.run.id, provider: state.run.provider, truncated: Boolean(item.payload?.truncated) }
       : { runId: state.run.id, item: boundedItem };
-    const input = budgetTranscript(state, { id: `${state.run.id}:${state.transcriptSeq}`, conversationId: state.conversation.id, role: "assistant", kind: item.kind, body: item.body, payload });
+    const body = item.kind === "tool" ? truncateUtf8(item.body, MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES) : item.body;
+    const input = budgetTranscript(state, { id: `${state.run.id}:${state.transcriptSeq}`, conversationId: state.conversation.id, role: "assistant", kind: item.kind, body, payload });
     if (!input) return;
     let message;
     try { message = database.addMessage(input); }
@@ -786,10 +787,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // Terminal state is already durable even if the event log is full. Send a
     // bounded runtime notification so connected clients refresh that state.
     const terminal = ["run.completed", "run.failed", "run.stopped"].includes(type);
-    if (!event && !terminal) {
-      const state = active.get(runId);
-      if (state) markTranscriptOmitted(state);
-    }
+    // Event replay and transcript persistence have separate quotas. A dropped
+    // replay event does not imply that the visible transcript lost a message.
     if (event || terminal) publish({ type: "run.event", conversationId: run?.conversationId, runId,
       payload: event ?? { runId, type, payload, seq: null, transient: true, createdAt: new Date().toISOString() } });
     return event;

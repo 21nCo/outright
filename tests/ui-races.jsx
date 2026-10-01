@@ -469,6 +469,52 @@ async function settingsAppRefreshFenceRegression() {
   await until(() => age()?.value === "70", "stale bootstrap did not undo current Settings save");
 }
 
+async function settingsSharedRefreshOrderRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const settings = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
+    editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
+  const heldBootstrap = deferred();
+  let holdRefresh = false;
+  let refreshStarted = false;
+  let saved = settings;
+  const bootstrap = (currentSettings, templates = []) => ({ projects, projectGroups: { groups: [], memberships: {} },
+    settings: currentSettings, providers: [{ id: "codex", label: "Codex", available: true }], templates, trustedProjects: [] });
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") {
+      if (holdRefresh) { refreshStarted = true; holdRefresh = false; return heldBootstrap.promise; }
+      return response(bootstrap(saved));
+    }
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/capacity") return response({});
+    if (url.pathname === "/api/retention/archived") return response({ conversations: [] });
+    if (url.pathname === "/api/templates") { holdRefresh = true; return response({ id: "template-1" }); }
+    if (url.pathname === "/api/settings" && options.method === "PATCH") {
+      saved = { ...saved, ...JSON.parse(options.body) };
+      return response(saved);
+    }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[aria-label="Settings"]'), "shared refresh app loaded");
+  host.querySelector('[aria-label="Settings"]').click();
+  await until(() => document.querySelector('[aria-label="Template name"]'), "shared refresh settings opened");
+  setControlValue(document.querySelector('[aria-label="Template name"]'), "Review");
+  setControlValue(document.querySelector('[aria-label="Template prompt"]'), "Review diff");
+  [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Add template").click();
+  await until(() => refreshStarted, "template bootstrap held");
+  const age = document.querySelector('[role="dialog"] label:last-of-type input');
+  setControlValue(age, "30");
+  [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Save settings").click();
+  await until(() => !document.querySelector('[role="dialog"]'), "settings saved while template refresh pending");
+  heldBootstrap.resolve(response(bootstrap(settings, [{ id: "template-1", title: "Review", prompt: "Review diff" }])));
+  host.querySelector('[aria-label="Settings"]').click();
+  await until(() => document.querySelector('[role="dialog"] label:last-of-type input')?.value === "30", "newer saved quota preserved");
+  await until(() => document.querySelector(".template-list")?.textContent.includes("Review diff"), "earlier template refresh still committed");
+}
+
 async function settingsMigrationCompletionRegression() {
   root.render(null);
   await settle();
@@ -503,6 +549,98 @@ async function settingsMigrationCompletionRegression() {
   signalCompletion();
   await until(() => document.querySelector(".capacity-status")?.textContent.includes("available for new work"), "migration warning cleared while Settings stayed open");
   assert(reads >= 2, "capacity completion did not read authoritative state");
+}
+
+async function settingsCapacityAndDeletionOrderRegression() {
+  root.render(null);
+  await settle();
+  const settings = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
+    editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
+  const entries = ["first", "second"].map((id) => ({ id, title: id, worktreePath: "/worktree", updatedAt: "2026-09-01T00:00:00.000Z" }));
+  const initial = deferred();
+  const changed = deferred();
+  const deletion = deferred();
+  const reportError = (error) => { throw error; };
+  let reads = 0;
+  let deleting = false;
+  let signalChange;
+  route = async (url) => {
+    if (url.pathname === "/api/capacity") return (++reads === 1 ? initial.promise : changed.promise).then((value) => response(value));
+    if (url.pathname === "/api/retention/archived") return response({ conversations: entries });
+    if (url.pathname === "/api/retention/delete-archived") { deleting = true; return deletion.promise; }
+    return response({});
+  };
+  function Fixture() {
+    const [open, setOpen] = React.useState(false);
+    const [event, setEvent] = React.useState(null);
+    signalChange = () => setEvent({ type: "capacity.changed", stamp: Date.now() });
+    return <><button onClick={() => setOpen(true)}>Open ordered settings</button><SettingsDialog open={open}
+      onOpenChange={setOpen} settings={settings} providers={[{ id: "codex", label: "Codex", available: true }]}
+      templates={[]} runtimeEvent={event} onSaved={() => {}} onError={reportError} /></>;
+  }
+  root.render(<TooltipProvider><Fixture /></TooltipProvider>);
+  await until(() => host.querySelector("button")?.textContent === "Open ordered settings", "ordered settings mounted");
+  host.querySelector("button").click();
+  await until(() => reads === 1 && document.querySelectorAll(".archived-history-list button").length === 2, "initial settings reads");
+  signalChange();
+  await until(() => reads >= 2, "capacity event requested authoritative data");
+  const capacity = (retainedBytes) => ({ queued: 0, active: 0, recoverable: 0,
+    retainedBytes, migrationStatus: "ready", availableForNewWorkBytes: 64 * 1048576 - retainedBytes,
+    limits: { maxQueuedRuns: 32, maxRetainedBytes: 64 * 1048576, reservedRetainedBytes: 1048576 } });
+  changed.resolve(capacity(2 * 1048576));
+  await until(() => document.querySelector(".capacity-status")?.textContent.includes("2.0 of 64 MiB"), "new capacity committed");
+  initial.resolve(capacity(60 * 1048576));
+  await settle();
+  assert(document.querySelector(".capacity-status")?.textContent.includes("2.0 of 64 MiB"), "stale capacity replaced event refresh");
+  document.querySelector('.archived-history-list button[aria-label*="(first)"]').click();
+  await until(() => document.querySelector(".archive-delete-confirm")?.textContent.includes("first"), "first archive selected");
+  document.querySelectorAll(".archive-delete-confirm button")[1].click();
+  await until(() => deleting, "first deletion in flight");
+  const second = document.querySelector('.archived-history-list button[aria-label*="(second)"]');
+  assert(second.disabled, "second archive action stayed enabled during deletion");
+  second.click();
+  assert(document.querySelector(".archive-delete-confirm")?.textContent.includes("first"), "second click changed pending confirmation");
+  deletion.resolve(response({ deleted: 1, capacity: { retainedBytes: 1048576 } }));
+  await until(() => !document.querySelector(".archive-delete-confirm"), "first deletion completed");
+  const queuedInput = [...document.querySelectorAll('[role="dialog"] label')].find((label) => label.textContent.includes("Queued runs"))?.querySelector("input");
+  setControlValue(queuedInput, "2.5");
+  await until(() => [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Save settings")?.disabled,
+    "fractional quota disables save");
+}
+
+async function settingsTemplateCompletionRegression() {
+  root.render(null);
+  await settle();
+  const settings = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
+    editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
+  const post = deferred();
+  let posted = false;
+  route = async (url) => {
+    if (url.pathname === "/api/capacity") return response({});
+    if (url.pathname === "/api/retention/archived") return response({ conversations: [] });
+    if (url.pathname === "/api/templates") { posted = true; return post.promise; }
+    return response({});
+  };
+  function Fixture() {
+    const [open, setOpen] = React.useState(false);
+    return <><button onClick={() => setOpen(true)}>Open template settings</button><SettingsDialog open={open}
+      onOpenChange={setOpen} settings={settings} providers={[{ id: "codex", label: "Codex", available: true }]}
+      templates={[]} onSaved={() => {}} onError={(error) => { throw error; }} /></>;
+  }
+  root.render(<TooltipProvider><Fixture /></TooltipProvider>);
+  await until(() => host.querySelector("button")?.textContent === "Open template settings", "template settings mounted");
+  host.querySelector("button").click();
+  await until(() => document.querySelector('[aria-label="Template name"]'), "template editor visible");
+  setControlValue(document.querySelector('[aria-label="Template name"]'), "Review");
+  setControlValue(document.querySelector('[aria-label="Template prompt"]'), "Review the current diff");
+  [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Add template").click();
+  await until(() => posted, "template POST started");
+  [...document.querySelectorAll('[role="dialog"] button')].findLast((button) => button.textContent === "Cancel").click();
+  await until(() => !document.querySelector('[role="dialog"]'), "template dialog closed during POST");
+  host.querySelector("button").click();
+  await until(() => document.querySelector('[aria-label="Template name"]')?.value === "Review", "submitted draft visible after reopen");
+  post.resolve(response({ id: "created" }));
+  await until(() => document.querySelector('[aria-label="Template name"]')?.value === "", "successful submitted draft cleared");
 }
 
 async function rejectedNotificationPermissionRegression() {
@@ -4199,6 +4337,13 @@ async function responsiveSidebarBreakpointCycles(setWidth) {
       await expectResponsiveFocus(`visible sidebar focus after wide transition ${round + 1}`,
         () => host.querySelector("#project-sidebar").contains(document.activeElement) ? document.activeElement : null);
     }
+    await setWidth(640);
+    const opener = host.querySelector('[aria-label="Open projects sidebar"]');
+    await expectResponsiveFocus("opener before intentional blank click", () => opener);
+    host.querySelector("#main-workspace").dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    opener.blur();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert(document.activeElement === document.body, "sidebar watcher reclaimed focus after an intentional blank click");
   } catch (error) {
     throw new Error(`${error.message}; focusTrace=${JSON.stringify(trace.slice(-35))}`);
   } finally {
@@ -4567,7 +4712,10 @@ try {
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
     ["settings retention draft", settingsRetentionDraftRegression, "missing archived data stays safe and cancel, cleanup and save use the persisted retention age"],
     ["settings save session fence", settingsSaveSessionFenceRegression, "delayed GET and PATCH save completions cannot change a reopened Settings dialog"],
+    ["settings shared refresh order", settingsSharedRefreshOrderRegression, "a settings save preserves an in-flight template refresh without reverting the new quota"],
     ["settings migration completion", settingsMigrationCompletionRegression, "an open Settings dialog refreshes capacity when migration finishes"],
+    ["settings capacity and deletion order", settingsCapacityAndDeletionOrderRegression, "new capacity wins reordered responses and deletion owns its confirmation"],
+    ["settings template completion", settingsTemplateCompletionRegression, "a successful template POST clears its submitted draft after reopening"],
     ["notification permission rejection", rejectedNotificationPermissionRegression, "a rejected permission request does not disrupt Settings save or escape as an unhandled rejection"],
     ["archived settings paging focus", archivedSettingsPagingFocusRegression, "the oldest archive can be paged to and cancel and delete keep keyboard focus in Settings"],
     ["archived settings session fence", archivedSettingsSessionFenceRegression, "delayed cleanup and deletion cannot change a reopened Settings selection, status or focus"],

@@ -154,6 +154,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/settings" && request.method === "PATCH") {
         const settings = database.updateSettings(await readJson(request));
         agents.resumeQueued();
+        publish({ type: "capacity.changed", payload: database.capacity() });
         return json(response, 200, settings);
       }
       if (url.pathname === "/api/capacity" && request.method === "GET") return json(response, 200, database.capacity());
@@ -172,8 +173,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/retention/cleanup" && request.method === "POST") {
         const body = await readJson(request);
         if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Retention request must be a JSON object");
+        const operationId = randomUUID();
+        await database.auditRequired("retention.cleanup.requested", { operationId, before: body.before ?? "saved retention window" });
         const result = await database.pruneHistory({ before: body.before, limit: 100 });
-        database.audit("retention.cleaned", { deleted: result.deleted, deferred: result.deferred, before: body.before ?? "saved retention window" });
+        await database.auditRequired("retention.cleaned", { operationId, deleted: result.deleted, deferred: result.deferred, before: body.before ?? "saved retention window" });
         agents.resumeQueued();
         return json(response, 200, { deleted: result.deleted, deferred: result.deferred, capacity: database.capacity() });
       }

@@ -376,6 +376,21 @@ test("persists ordered transcript items instead of one accumulated answer", asyn
   assert.deepEqual(database.messages.map((message) => message.kind), ["text", "tool", "text"]);
 });
 
+test("provider command labels and payloads each stay bounded in a tool transcript", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  database.createRun(codexRun("large-command"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun("large-command") });
+  child.stdout.write(JSON.stringify({ type: "item.completed", item: {
+    type: "command_execution", command: "x".repeat(512 * 1024),
+  } }) + "\n");
+  child.emit("close", 0, null);
+  assert.equal(database.messages.length, 1);
+  assert.ok(Buffer.byteLength(database.messages[0].body) <= 16 * 1024);
+  assert.ok(Buffer.byteLength(JSON.stringify(database.messages[0].payload)) <= 17 * 1024);
+});
+
 test("sustained tool output stops growing the durable run transcript", async () => {
   const database = fakeDatabase();
   const child = fakeChild();
@@ -465,7 +480,7 @@ test("unexpected usage persistence errors remain visible to the provider stream 
   child.emit("close", 0, null);
 });
 
-test("quota-refused stdout, tool and assistant checkpoints leave run-level omission evidence", async () => {
+test("quota-refused transcript writes mark omission while replay-only stdout loss does not", async () => {
   for (const scenario of ["stdout", "tool", "tool-cancel", "assistant-message", "assistant-delta"]) {
     const database = fakeDatabase();
     const child = fakeChild();
@@ -490,14 +505,15 @@ test("quota-refused stdout, tool and assistant checkpoints leave run-level omiss
         ? { type: "item.completed", item: { type: "agent_message", text: "answer" } }
         : { type: "stream_event", event: { delta: { type: "text_delta", text: "answer" } } };
     child.stdout.write(scenario === "stdout" ? "malformed output\n" : `${JSON.stringify(line)}\n`);
-    assert.equal(database.getRun(run.id).transcriptOmitted, true, `${scenario} omission is durable before process exit`);
+    assert.equal(Boolean(database.getRun(run.id).transcriptOmitted), scenario !== "stdout",
+      `${scenario} must distinguish replay loss from transcript loss before process exit`);
     if (scenario === "tool-cancel") {
       const stopped = manager.stop(run.id);
       child.emit("close", null, "SIGTERM");
       await stopped;
     } else child.emit("close", 0, null);
     assert.equal(database.getRun(run.id).status, scenario === "tool-cancel" ? "stopped" : "completed");
-    assert.equal(database.getRun(run.id).transcriptOmitted, true);
+    assert.equal(Boolean(database.getRun(run.id).transcriptOmitted), scenario !== "stdout");
   }
 });
 

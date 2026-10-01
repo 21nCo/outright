@@ -150,6 +150,7 @@ export function App() {
   const conversationsRef = useRef([]);
   const archiveFocusRef = useRef(null);
   const settingsRefreshRef = useRef(0);
+  const settingsVersionRef = useRef(0);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
 
   const applyStreamingText = useCallback((change, immediate = false) => {
@@ -837,10 +838,10 @@ export function App() {
     let watchChecks = 0;
     let target;
     const watchFocus = () => {
-      if (sidebarFocusIntentRef.current !== intent || watchChecks++ >= 60) return;
-      const active = document.activeElement;
-      if (active === document.body) { transfer(); return; }
-      if (active !== target) {
+      if (!active || sidebarFocusIntentRef.current !== intent || watchChecks++ >= 12) return;
+      const focused = document.activeElement;
+      if (focused === document.body) { transfer(); return; }
+      if (focused !== target) {
         sidebarFocusIntentRef.current = null;
         sidebarFocusSourceRef.current = null;
         return;
@@ -849,15 +850,15 @@ export function App() {
       cancelRetry = () => clearTimeout(timer);
     };
     const transfer = () => {
-      if (sidebarFocusIntentRef.current !== intent) return;
+      if (!active || sidebarFocusIntentRef.current !== intent) return;
       cancelRetry();
       cancelRetry = () => {};
       attempts += 1;
       target = intent === "opener" ? document.querySelector('[aria-label="Open projects sidebar"]')
         : sidebarRef.current?.querySelector('button:not(:disabled)');
-      const active = document.activeElement;
-      const fromPriorControl = active === sidebarFocusSourceRef.current;
-      if (active !== document.body && active !== target && !fromPriorControl) {
+      const focused = document.activeElement;
+      const fromPriorControl = focused === sidebarFocusSourceRef.current;
+      if (focused !== document.body && focused !== target && !fromPriorControl) {
         sidebarFocusIntentRef.current = null; // Do not override a newer user focus choice.
         sidebarFocusSourceRef.current = null;
         return;
@@ -895,7 +896,7 @@ export function App() {
         : sidebarRef.current?.contains(event.target));
       if (!ownedControl || sidebarFocusIntentRef.current !== intent) return;
       queueMicrotask(() => {
-        if (sidebarFocusIntentRef.current === intent && document.activeElement === document.body) transfer();
+        if (active && sidebarFocusIntentRef.current === intent && document.activeElement === document.body) transfer();
       });
       // Some engines dispatch focusout while the old control is still active
       // and clear activeElement only after this microtask. A committed layout
@@ -905,12 +906,20 @@ export function App() {
       }, 0);
     };
     document.addEventListener("focusout", restoreAfterBlur, true);
+    const releaseOnUserInput = (event) => {
+      if (event.type === "pointerdown" && event.target === target) return;
+      sidebarFocusIntentRef.current = null;
+      sidebarFocusSourceRef.current = null;
+      cancelRetry();
+    };
+    document.addEventListener("pointerdown", releaseOnUserInput, true);
+    document.addEventListener("keydown", releaseOnUserInput, true);
     const observer = new ResizeObserver(() => {
       if (active && sidebarFocusIntentRef.current === intent && document.activeElement === document.body) transfer();
     });
     if (sidebarRef.current) observer.observe(sidebarRef.current);
     transfer();
-    return () => { active = false; cancelRetry(); observer.disconnect(); document.removeEventListener("focusout", restoreAfterBlur, true); };
+    return () => { active = false; cancelRetry(); observer.disconnect(); document.removeEventListener("focusout", restoreAfterBlur, true); document.removeEventListener("pointerdown", releaseOnUserInput, true); document.removeEventListener("keydown", releaseOnUserInput, true); };
   }, [isNarrow, sidebarOpen]);
   useLayoutEffect(() => {
     if (!inspector) return;
@@ -1709,10 +1718,11 @@ export function App() {
   }
   async function refreshAll(includeTemplates = false) {
     const request = ++settingsRefreshRef.current;
+    const settingsVersion = settingsVersionRef.current;
     try {
       const next = await api("/api/bootstrap");
       if (request !== settingsRefreshRef.current) return;
-      setBootstrap(next);
+      setBootstrap((current) => ({ ...next, settings: settingsVersion === settingsVersionRef.current ? next.settings : current.settings }));
       if (includeTemplates) setToast("Templates updated");
     } catch (nextError) { if (request === settingsRefreshRef.current) setError(nextError.message); }
   }
@@ -1747,7 +1757,7 @@ export function App() {
     </main>
 
     <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} projects={bootstrap.projects} onSelectProject={chooseProject} onSelectConversation={(item) => { const nextProject = bootstrap.projects.find((entry) => entry.id === item.projectId); const nextWorktree = nextProject?.worktrees.find((entry) => entry.id === item.worktreeId); if (nextProject && nextWorktree) { pendingConversationRef.current = item.id; chooseProject(nextProject, nextWorktree); } }} />
-    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} runtimeEvent={runtimeEvent} onSaved={(nextSettings, refresh) => { if (refresh !== "history" && refresh !== "settings" && refresh !== "templates") { ++settingsRefreshRef.current; setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") requestNotificationPermission(); } if (refresh) void refreshAll(refresh === "templates"); }} onError={handleError} />
+    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} runtimeEvent={runtimeEvent} onSaved={(nextSettings, refresh) => { if (refresh !== "history" && refresh !== "settings" && refresh !== "templates") { ++settingsVersionRef.current; setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") requestNotificationPermission(); } if (refresh) void refreshAll(refresh === "templates"); }} onError={handleError} />
 
     <SimpleDialog open={newChatOpen} onOpenChange={setNewChatOpen} title="New agent chat" description={`${project.name} / ${worktree.name}`} onSubmit={(event) => { event.preventDefault(); createConversation(); }} submit="Create chat"><label htmlFor="chat-title">What should the agent work on?</label><Input id="chat-title" autoFocus value={newChatTitle} onChange={(event) => setNewChatTitle(event.target.value)} placeholder="Review the worktree scanner" /></SimpleDialog>
     <SimpleDialog open={newGroupOpen} onOpenChange={setNewGroupOpen} title="Create project group" description="Organize related projects together in the sidebar." onSubmit={createGroup} submit="Create group" disabled={!newGroupName.trim()}><label htmlFor="group-name">Group name</label><Input id="group-name" autoFocus value={newGroupName} onChange={(event) => setNewGroupName(event.target.value)} placeholder="Client work" /></SimpleDialog>

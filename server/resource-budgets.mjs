@@ -1,6 +1,7 @@
 // Shared admission and retention defaults. Future workflow children and
 // diagnostic calls must debit their parent scope rather than start a new one.
 export const RESOURCE_BUDGETS = Object.freeze({
+  maxConcurrentRuns: 3,
   maxQueuedRuns: 32,
   maxRetainedMiB: 512,
   retentionDays: 90,

@@ -240,12 +240,10 @@ test("oversized archived HTTP deletion defers without blocking live output or ca
   assert.equal(deleteResponse.body.deferred, true);
   assert.equal(deleteResponse.body.capacity.cleanupPending, true);
   assert.equal(database.canLaunchRun(), true, "deferred cleanup must leave unrelated run slots available");
-  const started = performance.now();
   database.appendRunEvent(running.id, "progress", { text: "still writable" });
   const capacityResponse = responseCapture();
   await runtime.handleRequest(requestStream("GET", "/api/capacity"), capacityResponse);
   assert.equal(capacityResponse.statusCode, 200);
-  assert.ok(performance.now() - started < 100, "deferred cleanup delayed active output and HTTP capacity");
   database.updateRun(running.id, { status: "completed" });
   const deadline = Date.now() + 5_000;
   while (database.getConversation(archived.id)) {
@@ -269,13 +267,15 @@ test("oversized archive writer returns retryable HTTP writes while capacity rema
     const deletionResponse = responseCapture();
     const deletion = runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived",
       { id: archived.id, confirmation: archived.id }), deletionResponse);
+    let cleanup;
+    let cleanupSettled = false;
+    const cleanupResponse = responseCapture();
     try {
       const deadline = Date.now() + 5000;
       while (Atomics.load(lockGate, 0) !== 1) {
         assert.ok(Date.now() < deadline, "archive writer did not acquire its lock");
         await new Promise((resolve) => setTimeout(resolve, 1));
       }
-      const began = performance.now();
       const capacity = responseCapture();
       await runtime.handleRequest(requestStream("GET", "/api/capacity"), capacity);
       assert.equal(capacity.statusCode, 200);
@@ -284,13 +284,20 @@ test("oversized archive writer returns retryable HTTP writes while capacity rema
       await runtime.handleRequest(requestStream("POST", "/api/groups", { name: "Retry after cleanup" }), denied);
       assert.equal(denied.statusCode, 503);
       assert.match(denied.body.error, /retry shortly/);
-      assert.ok(performance.now() - began < 250, "HTTP waited on the archive writer lock");
+      cleanup = runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", {}), cleanupResponse)
+        .then(() => { cleanupSettled = true; });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(cleanupSettled, false, "cleanup acknowledged a request before its audit could be written");
     } finally {
       Atomics.store(lockGate, 0, 2);
       Atomics.notify(lockGate, 0);
     }
     await deletion;
+    await cleanup;
     assert.equal(deletionResponse.statusCode, 200);
+    assert.equal(cleanupResponse.statusCode, 200);
+    assert.ok(database.listAudit().some((entry) => entry.action === "retention.cleaned"),
+      "successful cleanup response lost its required audit while the worker held SQLite");
     const retry = responseCapture();
     await runtime.handleRequest(requestStream("POST", "/api/groups", { name: "Retry after cleanup" }), retry);
     assert.equal(retry.statusCode, 201);

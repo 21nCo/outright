@@ -725,6 +725,9 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     const executable = chromeExecutable();
     const launchedAt = new Date().toISOString();
     const browserLog = path.join(profile, "chrome.log");
+    // A caller-supplied profile can retain the previous launch's port. Only
+    // this launch may provide the marker consumed below.
+    rmSync(path.join(profile, "DevToolsActivePort"), { force: true });
     const logFd = openSync(browserLog, "w");
     try {
       browser = spawn(executable, [
@@ -879,7 +882,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     }, deadline);
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
     const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
-    assert.match(state.text, new RegExp(`${selectedCount ?? 100} interaction regressions passed`));
+    assert.match(state.text, new RegExp(`${selectedCount ?? 103} interaction regressions passed`));
     const performanceFixture = state.text.match(/Performance fixture: (\{[^\n]+\})/);
     if (!process.env.OUTRIGHT_UI_STEP) assert.ok(performanceFixture, "large fixture measurements were not recorded");
     if (performanceFixture) console.log(`UI performance: ${performanceFixture[1]}`);
