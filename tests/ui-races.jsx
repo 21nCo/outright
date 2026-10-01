@@ -1302,7 +1302,10 @@ async function terminalSelectionReconnectRegression() {
 async function terminalActivationOwnershipRegression() {
   root.render(null);
   await settle();
-  host.style.width = "320px";
+  host.style.width = "";
+  // Earlier full-suite layouts may leave the fixture root wider than the
+  // terminal. Exercise a real narrow pane without assuming root width.
+  host.style.minWidth = "1280px";
   const pending = deferred();
   let holdSecond = true;
   const sent = [];
@@ -1317,11 +1320,19 @@ async function terminalActivationOwnershipRegression() {
     if (url.pathname === "/api/terminals/term-A3") return response({ buffer: "A3 ready\r\n", outputCursor: 0 });
     return response({ buffer: "Old A output\r\n", outputCursor: 0 });
   };
-  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} onError={onError} sendRuntime={sendRuntime} />);
+  let frameWidth = 320;
+  const show = (event = null) => root.render(<div className="fixture-terminal-frame" style={{ width: frameWidth, height: "100%" }}>
+    <TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} onError={onError} sendRuntime={sendRuntime} />
+  </div>);
   show();
   await until(() => terminalReady("Terminal A"), "ownership fixture initial terminal ready");
+  const paneFrame = host.querySelector(".fixture-terminal-frame");
+  await until(() => Math.abs(paneFrame.getBoundingClientRect().width - 320) < 2
+    && Math.abs(host.querySelector(".terminal-host").getBoundingClientRect().width - 320) < 2,
+  "actual narrow terminal baseline");
+  assert(host.getBoundingClientRect().width > 1000, "fixture did not exercise a wide outer root");
   const initialSize = sent.findLast((message) => message.type === "terminal.resize");
-  const initialRootWidth = host.getBoundingClientRect().width;
+  const initialRootWidth = paneFrame.getBoundingClientRect().width;
   const initialHostWidth = host.querySelector(".terminal-host").getBoundingClientRect().width;
   assert(initialSize?.terminalId === "term-A", "Initial activation did not synchronize the selected PTY size");
   assert(Math.abs(initialHostWidth - initialRootWidth) < 2, `Terminal host exceeded its narrow pane: root=${initialRootWidth}, host=${initialHostWidth}`);
@@ -1329,10 +1340,11 @@ async function terminalActivationOwnershipRegression() {
   await until(() => host.querySelector('.terminal-tabs[aria-busy="true"]'), "pending terminal activation");
   assert(host.querySelector('[role="tab"][aria-selected="true"]')?.dataset.tabId === "term-A", "Pending candidate was selected before its buffer was installed");
   await until(() => host.querySelector(".xterm-rows")?.textContent.includes("Old A output"), "committed terminal output");
-  host.style.width = "540px";
+  frameWidth = 540;
+  paneFrame.style.width = "540px";
   try { await until(() => host.querySelector(".terminal-host")?.getBoundingClientRect().width > initialHostWidth + 100, "terminal host expanded during activation"); }
   catch (error) {
-    throw new Error(`${error.message}: root=${host.getBoundingClientRect().width}, pane=${host.querySelector('.terminal-pane')?.getBoundingClientRect().width}, tabs=${host.querySelector('.terminal-tabs')?.getBoundingClientRect().width}, host=${host.querySelector('.terminal-host')?.getBoundingClientRect().width}, initial=${initialHostWidth}, loading=${host.querySelector('.terminal-tabs')?.getAttribute('aria-busy')}`, { cause: error });
+    throw new Error(`${error.message}: frame=${paneFrame.getBoundingClientRect().width}, pane=${host.querySelector('.terminal-pane')?.getBoundingClientRect().width}, tabs=${host.querySelector('.terminal-tabs')?.getBoundingClientRect().width}, host=${host.querySelector('.terminal-host')?.getBoundingClientRect().width}, initial=${initialHostWidth}, loading=${host.querySelector('.terminal-tabs')?.getAttribute('aria-busy')}`, { cause: error });
   }
   await settle();
   show({ type: "terminal.output", terminalId: "term-A2", payload: { data: "Included snapshot\r\n", cursor: 1 } });
@@ -1348,7 +1360,7 @@ async function terminalActivationOwnershipRegression() {
   const sizes = sent.filter((message) => message.type === "terminal.resize" && message.terminalId === "term-A2");
   const currentHostWidth = host.querySelector(".terminal-host").getBoundingClientRect().width;
   const currentGridWidth = host.querySelector(".xterm-screen").getBoundingClientRect().width;
-  assert(Math.abs(currentHostWidth - host.getBoundingClientRect().width) < 2, `Activated terminal host did not track its pane: host=${currentHostWidth}, root=${host.getBoundingClientRect().width}`);
+  assert(Math.abs(currentHostWidth - paneFrame.getBoundingClientRect().width) < 2, `Activated terminal host did not track its pane: host=${currentHostWidth}, frame=${paneFrame.getBoundingClientRect().width}`);
   assert(sizes.length && sizes.at(-1).cols > initialSize.cols && sizes.at(-1).rows > 0,
     `Activation lost fitted PTY size: initial=${JSON.stringify(initialSize)}, next=${JSON.stringify(sizes)}, host=${initialHostWidth}->${currentHostWidth}, grid=${currentGridWidth}`);
   host.querySelector('[aria-label="New terminal"]').click();
@@ -1360,13 +1372,13 @@ async function terminalActivationOwnershipRegression() {
   show({ type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [terminal("A"), terminal("A2")] } });
   await until(() => terminalReady("Terminal A2") && sent.length > beforeReconnect, "reconnected terminal ready");
   assert(sent.slice(beforeReconnect).some((message) => message.type === "terminal.resize" && message.terminalId === "term-A2"), "Reconnection did not synchronize PTY size");
-  host.style.width = "";
+  host.style.minWidth = "";
 }
 
 async function terminalRejectedSwitchRegression() {
   root.render(null);
   await settle();
-  host.style.width = "320px";
+  host.style.width = "";
   const pending = deferred();
   const errors = [];
   const sent = [];
@@ -1377,20 +1389,24 @@ async function terminalRejectedSwitchRegression() {
     if (url.pathname === "/api/terminals/term-A2") return retry ? response({ buffer: "Retry output\r\n" }) : pending.promise;
     return response({ buffer: "Terminal A output\r\n" });
   };
-  root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => errors.push(error)} sendRuntime={(message) => {
+  root.render(<div className="fixture-terminal-frame" style={{ width: 320, height: "100%" }}><TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => errors.push(error)} sendRuntime={(message) => {
     sent.push(message);
     if (message.type === "terminal.resize") resizeSnapshots.push({ message,
       busy: host.querySelector(".terminal-tabs")?.getAttribute("aria-busy"),
       selected: host.querySelector('.terminal-tabs [aria-selected="true"]')?.dataset.tabId,
       hostWidth: host.querySelector(".terminal-host")?.getBoundingClientRect().width });
-  }} />);
+  }} /></div>);
   await until(() => terminalReady("Terminal A"), "rejection fixture terminal A ready");
+  const paneFrame = host.querySelector(".fixture-terminal-frame");
+  await until(() => Math.abs(paneFrame.getBoundingClientRect().width - 320) < 2
+    && Math.abs(host.querySelector(".terminal-host").getBoundingClientRect().width - 320) < 2,
+  "rejection fixture actual narrow terminal baseline");
   const narrowSize = sent.findLast((message) => message.type === "terminal.resize");
   const first = [...host.querySelectorAll('[role="tab"]')].find((tab) => tab.textContent === "Terminal A");
   first.focus();
   first.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
   await until(() => document.activeElement?.textContent === "Terminal A2", "pending rejected terminal");
-  host.style.width = "540px";
+  paneFrame.style.width = "540px";
   await until(() => host.querySelector('.terminal-host')?.getBoundingClientRect().width > 500, "terminal host widens during rejected activation");
   pending.reject(new Error("Buffer failed"));
   await until(() => errors.length === 1 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "rejected terminal response");
@@ -1406,7 +1422,7 @@ async function terminalRejectedSwitchRegression() {
   assert(retrySize?.terminalId === "term-A2" && retrySize.cols > narrowSize.cols,
     `Retried terminal did not fit the current pane: narrow=${JSON.stringify(narrowSize)}, retry=${JSON.stringify(retrySnapshot)}`);
   for (const width of [320, 540, 320, 540]) {
-    host.style.width = `${width}px`;
+    paneFrame.style.width = `${width}px`;
     await until(() => Math.abs(host.querySelector('.terminal-host')?.getBoundingClientRect().width - width) < 2,
       `terminal host width ${width}`);
     host.querySelector('[data-tab-id="term-A"]').click();
@@ -1419,7 +1435,6 @@ async function terminalRejectedSwitchRegression() {
     assert(width === 540 ? fitted.cols > narrowSize.cols : fitted.cols <= narrowSize.cols,
       `Terminal published a stale grid after ${width}px layout: ${JSON.stringify(fitted)}`);
   }
-  host.style.width = "";
 }
 
 async function terminalExitDuringActivationRegression() {
