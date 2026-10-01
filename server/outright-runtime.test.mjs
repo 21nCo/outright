@@ -246,7 +246,7 @@ test("oversized archived HTTP deletion defers without blocking live output or ca
   assert.equal(capacityResponse.statusCode, 200);
   database.updateRun(running.id, { status: "completed" });
   const deadline = Date.now() + 5_000;
-  while (database.getConversation(archived.id)) {
+  while (database.maintenanceActive || database.getConversation(archived.id)) {
     assert.ok(Date.now() < deadline, "marked HTTP deletion did not resume");
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -267,18 +267,6 @@ test("oversized archive writer returns retryable HTTP writes while capacity rema
     const deletionResponse = responseCapture();
     const deletion = runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived",
       { id: archived.id, confirmation: archived.id }), deletionResponse);
-    let cleanup;
-    let cleanupSettled = false;
-    let signalAuditAttempt;
-    const auditAttempted = new Promise((resolve) => { signalAuditAttempt = resolve; });
-    const auditRequired = database.auditRequired.bind(database);
-    database.auditRequired = (action, details) => {
-      const result = auditRequired(action, details);
-      // The required audit makes its first synchronous SQLite write attempt
-      // before returning a promise that waits for the worker lock.
-      if (action === "retention.cleanup.requested") signalAuditAttempt();
-      return result;
-    };
     const cleanupResponse = responseCapture();
     try {
       const deadline = Date.now() + 5000;
@@ -294,24 +282,17 @@ test("oversized archive writer returns retryable HTTP writes while capacity rema
       await runtime.handleRequest(requestStream("POST", "/api/groups", { name: "Retry after cleanup" }), denied);
       assert.equal(denied.statusCode, 503);
       assert.match(denied.body.error, /retry shortly/);
-      cleanup = runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", {}), cleanupResponse)
-        .then(() => { cleanupSettled = true; });
-      let auditTimer;
-      try {
-        await Promise.race([auditAttempted, new Promise((_, reject) => {
-          auditTimer = setTimeout(() => reject(new Error("cleanup did not attempt its required audit")), 5000);
-        })]);
-      } finally { clearTimeout(auditTimer); }
-      await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(cleanupSettled, false, "cleanup acknowledged a request before its audit could be written");
+      await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", {}), cleanupResponse);
+      assert.equal(cleanupResponse.statusCode, 503, "offline maintenance must reject another cleanup before auditing it");
     } finally {
       Atomics.store(lockGate, 0, 2);
       Atomics.notify(lockGate, 0);
     }
     await deletion;
-    await cleanup;
     assert.equal(deletionResponse.statusCode, 200);
-    assert.equal(cleanupResponse.statusCode, 200);
+    const retryCleanup = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", {}), retryCleanup);
+    assert.equal(retryCleanup.statusCode, 200);
     assert.ok(database.listAudit().some((entry) => entry.action === "retention.cleaned"),
       "successful cleanup response lost its required audit while the worker held SQLite");
     const reopened = new Database(database.filename);
@@ -354,6 +335,31 @@ test("archived HTTP cursor reaches an older selection and rejects malformed page
     await runtime.handleRequest(requestStream("GET", `/api/retention/archived?${query}`), invalid);
     assert.equal(invalid.statusCode, 400);
   }
+}));
+
+test("archived HTTP pages bound serialized metadata while cursors reach long-title chats", withRuntime(async (runtime) => {
+  const title = '"\n📦'.repeat(32 * 1024);
+  const worktreePath = `/tmp/${"x".repeat(128 * 1024)}`;
+  const ids = [];
+  for (let index = 0; index < 3; index += 1) {
+    const row = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath,
+      title: `${index}${title}`, provider: "codex" });
+    runtime.database.updateConversation(row.id, { archived: true });
+    ids.push(row.id);
+  }
+  const seen = [];
+  let cursor = null;
+  do {
+    const response = responseCapture();
+    const query = cursor ? `?limit=2&cursor=${encodeURIComponent(cursor)}` : "?limit=2";
+    await runtime.handleRequest(requestStream("GET", `/api/retention/archived${query}`), response);
+    assert.equal(response.statusCode, 200);
+    assert.ok(Buffer.byteLength(response.raw) < 16 * 1024, "archived response copied full legacy metadata");
+    assert.ok(response.body.conversations.every((row) => row.title.endsWith("…") && row.worktreePath.endsWith("…")));
+    seen.push(...response.body.conversations.map((row) => row.id));
+    cursor = response.body.nextCursor;
+  } while (cursor);
+  assert.deepEqual(new Set(seen), new Set(ids), "paging skipped an eligible oversized chat");
 }));
 
 test("concurrent HTTP submissions admit only the configured queue budget", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {

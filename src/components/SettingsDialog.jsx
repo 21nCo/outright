@@ -188,7 +188,7 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
   {!validBudgetSettings(draft) && <p id="budget-settings-error">Enter whole numbers within the shown ranges before saving.</p>}
   <section className="template-settings">
     <header><div><strong>Capacity and retention</strong><small>Cleanup removes unpinned archived chats older than the saved age. You can also select a recent archived chat to delete now. Active and recoverable runs stay protected.</small></div></header>
-    {capacity?.limits && <output className="capacity-status">{capacity.queued} of {capacity.limits.maxQueuedRuns} queued · {capacity.active} active · {capacity.recoverable} awaiting recovery · {capacityUsageText(capacity)} ({(capacity.limits.reservedRetainedBytes / 1048576).toFixed(0)} MiB reserved for active runs). CPU, memory and allocated disk use are unknown.</output>}
+    {capacity?.limits && <output className="capacity-status">{capacity.queued} of {capacity.limits.maxQueuedRuns} queued · {capacity.active} active · {capacity.recoverable} awaiting recovery · {capacityUsageText(capacity)} ({(capacity.limits.reservedRetainedBytes / 1048576).toFixed(0)} MiB reserved for active runs). CPU and memory use are unknown. {allocatedDiskUsageText(capacity)}</output>}
     <Button ref={cleanupButtonRef} variant="outline" onClick={cleanHistory}>Clean old archived history</Button>
     {cleanupResult && <output className="capacity-status">{cleanupResult}</output>}
     {archived.length > 0 && <div ref={archivedListRef} className="template-list archived-history-list" aria-label="Archived chats available to delete">{archived.map((item) => <div key={item.id}><span><strong>{item.title}</strong><small title={item.worktreePath}>{item.worktreePath} · Archived {new Date(item.updatedAt).toLocaleDateString()}</small></span><Button variant="outline" size="sm" disabled={deleting} aria-label={`Delete archived chat “${item.title}” in ${item.worktreePath} (${item.id})`} onClick={(event) => {
@@ -232,10 +232,17 @@ function Setting({ icon: Icon, label, children }) { return <label className="set
 
 function capacityUsageText(capacity) {
   if (capacity.migrationStatus === "error") return "Retained history migration paused; retrying · new work paused";
+  if (capacity.maintenanceError) return "Archived storage recovery needs a restart · new work paused";
+  if (capacity.migrationStatus === "maintenance") return "Reclaiming archived storage · new work paused; requests can be retried shortly";
   if (typeof capacity.retainedBytes !== "number") return "Measuring retained history · new work paused";
   if (capacity.migrationStatus === "migrating") return "Indexing retained history · new work paused";
   const usage = `${(capacity.retainedBytes / 1048576).toFixed(1)} of ${(capacity.limits.maxRetainedBytes / 1048576).toFixed(0)} MiB retained`;
   if (capacity.cleanupPaused) return `${usage} · ${capacity.cleanupPaused} archived cleanup ${capacity.cleanupPaused === 1 ? "item is" : "items are"} paused after repeated storage errors; restart Outright to retry`;
   if (capacity.cleanupPending) return `${usage} · archived cleanup pending; launches may pause briefly during deletion`;
   return `${usage} · ${(capacity.availableForNewWorkBytes / 1048576).toFixed(1)} MiB available for new work`;
+}
+
+function allocatedDiskUsageText(capacity) {
+  if (typeof capacity.diskAllocatedBytes !== "number") return "Allocated disk use is unknown.";
+  return `Allocated disk: ${(capacity.diskAllocatedBytes / 1048576).toFixed(1)} MiB (${capacity.diskUsageStatus ?? "estimated"}).`;
 }

@@ -1,13 +1,47 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createOutrightDatabase } from "./database.mjs";
 
 function chat(database, title = "Budget test") {
   return database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title, provider: "codex" });
+}
+
+function archivePresentOrMaintaining(database, id) {
+  try { return Boolean(database.getConversation(id)); }
+  catch (error) {
+    if (error.statusCode === 503 && database.capacity().migrationStatus === "maintenance") return true;
+    throw error;
+  }
+}
+
+function retainedReadback(db) {
+  // Recount actual stored values after cutover, independently of the live
+  // trigger counter. The 128-byte row allowance is part of the quota policy.
+  const retained = {
+    settings: "key value",
+    project_groups: "id name created_at",
+    project_memberships: "project_id group_id",
+    conversations: "id project_id worktree_id worktree_path title provider model provider_session_id created_at updated_at",
+    messages: "id conversation_id role kind body payload created_at",
+    runs: "id conversation_id worktree_path provider model reasoning_effort approval_policy prompt status pid provider_session_id created_at started_at finished_at exit_code error cost_usd input_tokens output_tokens recovery_class recovery_decision transcript_omitted",
+    run_events: "run_id type payload created_at",
+    run_event_usage: "run_id",
+    trusted_projects: "project_id project_path trusted_at",
+    audit_log: "action target details created_at",
+    prompt_templates: "id title prompt created_at",
+  };
+  let total = 0;
+  for (const [table, fields] of Object.entries(retained)) {
+    for (const row of db.prepare(`SELECT ${fields.split(" ").join(", ")} FROM ${table}`).all()) {
+      total += 128 + Object.values(row).reduce((bytes, value) => bytes + (value == null ? 0
+        : Buffer.isBuffer(value) ? value.byteLength : Buffer.byteLength(String(value))), 0);
+    }
+  }
+  return total;
 }
 
 function runInput(conversationId) {
@@ -833,7 +867,8 @@ test("large archived cleanup yields to active work and resumes after interruptio
 test("oversized legacy archive cleanup defers while active runs write, then resumes", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-oversized-retention-"));
   const filename = path.join(directory, "outright.db");
-  const database = createOutrightDatabase({ filename, runtimeLease: true });
+  let shadowCopies = 0;
+  const database = createOutrightDatabase({ filename, runtimeLease: true, onDeletionWorkerStart: () => { shadowCopies += 1; } });
   try {
     const active = chat(database, "active");
     const running = database.createRun(runInput(active.id));
@@ -870,7 +905,7 @@ test("oversized legacy archive cleanup defers while active runs write, then resu
     database.updateRun(running.id, { status: "completed" });
     const deadline = Date.now() + 8_000;
     for (const archived of archives) {
-      while (database.getConversation(archived.id)) {
+      while (archivePresentOrMaintaining(database, archived.id)) {
         assert.ok(Date.now() < deadline, "deferred giant archive cleanup did not resume");
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
@@ -879,16 +914,21 @@ test("oversized legacy archive cleanup defers while active runs write, then resu
     const probe = new Database(filename);
     assert.ok(probe.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes < 1024 * 1024);
     probe.close();
+    assert.equal(shadowCopies, archives.length, "one archive made repeated whole-database copies for sibling giant rows");
     assert.equal(database.canLaunchRun(), true, "cleanup did not reopen run admission");
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("oversized cleanup keeps the runtime reader responsive and fails competing writes promptly", async () => {
+test("oversized cleanup fences the live database and reclaims a shadow before resuming writes", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-writer-"));
   const filename = path.join(directory, "outright.db");
   const lockGate = new Int32Array(new SharedArrayBuffer(4));
   const database = createOutrightDatabase({ filename, runtimeLease: true, deletionWorkerGate: lockGate.buffer });
   try {
+    const survivor = chat(database, "retained sibling");
+    const survivorBody = "evidence-\u03c3-".repeat(400);
+    const retainedMessage = database.addMessage({ conversationId: survivor.id, role: "assistant", body: survivorBody });
+    const queued = database.createRun(runInput(survivor.id));
     for (const mode of ["explicit", "automatic"]) {
       Atomics.store(lockGate, 0, 0);
       const archived = chat(database, mode);
@@ -896,23 +936,38 @@ test("oversized cleanup keeps the runtime reader responsive and fails competing 
       const legacy = new Database(filename);
       legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
       legacy.close();
+      const oldPhysicalBytes = statSync(filename).size;
       database.updateConversation(archived.id, { archived: true });
       if (mode === "automatic") ageArchived(filename, [archived.id]);
       const deletion = mode === "explicit" ? database.deleteArchivedConversation(archived.id, archived.id) : database.pruneHistory();
       const deadline = Date.now() + 5000;
       while (Atomics.load(lockGate, 0) !== 1) {
-        assert.ok(Date.now() < deadline, "cleanup did not acquire the oversized writer lock");
+        assert.ok(Date.now() < deadline, "cleanup did not reach shadow maintenance");
         await new Promise((resolve) => setTimeout(resolve, 1));
       }
       assert.equal(database.capacity().cleanupPending, true);
+      assert.equal(database.capacity().migrationStatus, "maintenance");
+      assert.equal(database.capacity().diskUsageStatus, "partial");
+      const started = performance.now();
       assert.throws(() => chat(database, `competing ${mode}`),
-        (error) => error.code === "SQLITE_BUSY");
+        (error) => error.statusCode === 503 && /maintenance/.test(error.message));
+      assert.ok(performance.now() - started < 25, "a competing write waited on a giant SQLite row");
+      assert.equal(database.canLaunchRun(), false);
       assert.doesNotThrow(() => database.audit("terminal.exited", { target: mode }),
         "optional terminal audit must not crash its event callback");
       Atomics.store(lockGate, 0, 2);
       Atomics.notify(lockGate, 0);
       assert.equal((await deletion).deleted, 1);
       assert.equal(database.getConversation(archived.id), undefined);
+      assert.notEqual(database.capacity().diskUsageStatus, "partial");
+      assert.ok(statSync(filename).size < oldPhysicalBytes, "shadow cutover did not reclaim legacy overflow pages");
+      const proof = new Database(filename, { readonly: true });
+      try {
+        assert.equal(proof.prepare("SELECT body FROM messages WHERE id = ?").get(retainedMessage.id).body, survivorBody);
+        assert.equal(proof.prepare("SELECT status FROM runs WHERE id = ?").get(queued.id).status, "queued");
+        assert.equal(proof.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes,
+          retainedReadback(proof), "shadow cutover lost exact retained-byte accounting");
+      } finally { proof.close(); }
       assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id));
     }
   } finally {
@@ -948,8 +1003,8 @@ test("automatic deletion wraps to an archive marked behind its in-flight cursor"
       markedEarlier = true;
     } });
     const deadline = Date.now() + 8_000;
-    while (database.getConversation(earlier.id) || database.getConversation(later.id)) {
-      assert.ok(Date.now() < deadline, `archive behind deletion cursor was stranded: earlier=${Boolean(database.getConversation(earlier.id))}, later=${Boolean(database.getConversation(later.id))}, pending=${database.capacity().cleanupPending}`);
+    while (archivePresentOrMaintaining(database, earlier.id) || archivePresentOrMaintaining(database, later.id)) {
+      assert.ok(Date.now() < deadline, `archive behind deletion cursor was stranded: pending=${database.capacity().cleanupPending}`);
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     assert.equal(markedEarlier, true);
@@ -1055,7 +1110,8 @@ test("persistent cleanup failure pauses retries and automatic cleanup clears pau
 test("closing during an oversized archive delete keeps its lease until the worker exits and resumes cleanup", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-oversized-restart-"));
   const filename = path.join(directory, "outright.db");
-  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  const lockGate = new Int32Array(new SharedArrayBuffer(4));
+  let database = createOutrightDatabase({ filename, runtimeLease: true, deletionWorkerGate: lockGate.buffer });
   try {
     const archived = chat(database);
     const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
@@ -1064,10 +1120,21 @@ test("closing during an oversized archive delete keeps its lease until the worke
     legacy.close();
     database.updateConversation(archived.id, { archived: true });
     const deletion = database.deleteArchivedConversation(archived.id, archived.id);
-    await new Promise((resolve) => setImmediate(resolve));
-    database.close();
+    const gateDeadline = Date.now() + 5_000;
+    while (Atomics.load(lockGate, 0) !== 1) {
+      assert.ok(Date.now() < gateDeadline, "shadow maintenance did not reach the interruption gate");
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.throws(() => createOutrightDatabase({ filename, runtimeLease: true }),
+      (error) => error.code === "OUTRIGHT_RUNTIME_LEASE_HELD");
+    const closed = database.close();
     database = null;
+    await closed;
     await assert.rejects(deletion, (error) => error.statusCode === 503);
+    assert.equal(existsSync(`${filename}.archive-state`), false, "shutdown left an unrecoverable shadow marker");
+    const retained = new Database(filename);
+    assert.equal(retained.prepare("SELECT COUNT(*) AS count FROM messages WHERE id = ?").get(message.id).count, 1);
+    retained.close();
     const deadline = Date.now() + 5_000;
     while (!database) {
       assert.ok(Date.now() < deadline, "oversized deletion worker kept the runtime lease after exit");
@@ -1077,12 +1144,17 @@ test("closing during an oversized archive delete keeps its lease until the worke
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
     }
-    while (database.getConversation(archived.id)) {
+    while (archivePresentOrMaintaining(database, archived.id)) {
       assert.ok(Date.now() < deadline, "oversized archived cleanup did not resume");
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id));
-  } finally { database?.close(); rmSync(directory, { recursive: true, force: true }); }
+  } finally {
+    Atomics.store(lockGate, 0, 2);
+    Atomics.notify(lockGate, 0);
+    await database?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("a partially created recovery lookup restarts its bounded backfill before ownership queries", async () => {

@@ -586,9 +586,11 @@ async function settingsCapacityAndDeletionOrderRegression() {
   await until(() => reads >= 2, "capacity event requested authoritative data");
   const capacity = (retainedBytes) => ({ queued: 0, active: 0, recoverable: 0,
     retainedBytes, migrationStatus: "ready", availableForNewWorkBytes: 64 * 1048576 - retainedBytes,
+    diskAllocatedBytes: 3 * 1048576, diskUsageStatus: "measured",
     limits: { maxQueuedRuns: 32, maxRetainedBytes: 64 * 1048576, reservedRetainedBytes: 1048576 } });
   changed.resolve(capacity(2 * 1048576));
   await until(() => document.querySelector(".capacity-status")?.textContent.includes("2.0 of 64 MiB"), "new capacity committed");
+  assert(document.querySelector(".capacity-status")?.textContent.includes("Allocated disk: 3.0 MiB (measured)"), "Settings hid measured allocated disk use");
   initial.resolve(capacity(60 * 1048576));
   await settle();
   assert(document.querySelector(".capacity-status")?.textContent.includes("2.0 of 64 MiB"), "stale capacity replaced event refresh");
@@ -2627,6 +2629,18 @@ async function largeDiffWindowRegression() {
   assert(viewport.querySelectorAll("span").length < 200, "Large diff scroll mounted every line");
   const elapsedMs = Math.round(performance.now() - started);
   assert(elapsedMs < 1_000, `Large diff navigation exceeded its 1s fixture budget: ${elapsedMs}ms`);
+  const find = host.querySelector('input[aria-label="Find in diff"]');
+  setControlValue(find, "line 35000"); await settle();
+  find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("line 35000"), "ordinary diff Find match");
+  for (let tick = 0; tick < 16; tick += 1) await frame();
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 300 }}><WindowedDiff diff={diff} label="Large diff fixture" /></div>);
+  await until(() => viewport.clientHeight < 400, "ordinary diff resized after Find settled");
+  await until(() => {
+    const mark = viewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect();
+    const bounds = viewport.getBoundingClientRect();
+    return mark && mark.bottom > bounds.top && mark.top < bounds.bottom;
+  }, "ordinary diff Find remains physically visible after resize");
   window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), diff: { elapsedMs, mountedAtEnd: viewport.querySelectorAll("span").length, heapBytes: performance.memory?.usedJSHeapSize ?? null } };
 }
 
@@ -2709,6 +2723,7 @@ async function extremeDiffHeightRegression() {
   await awaitCompressedMark("TAIL MATCH", "compressed tail Find alignment");
   const bounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
   assert(bounds.top < viewport.getBoundingClientRect().bottom && bounds.bottom > viewport.getBoundingClientRect().top, `Tall diff find mark is outside the viewport: mark=${bounds.top}/${bounds.bottom}, viewport=${viewport.getBoundingClientRect().top}/${viewport.getBoundingClientRect().bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}`);
+  for (let tick = 0; tick < 16; tick += 1) await frame();
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 300 }}><WindowedDiff diff={"+\n".repeat(10_000) + diff} label="Tall diff" /></div>);
   await until(() => viewport.clientHeight < 400 && viewport.querySelector('[data-find-match="true"]')?.textContent.includes("TAIL MATCH"), "tail Find survives compressed resize");
   for (let tick = 0; tick < 4; tick += 1) await frame();
@@ -2726,6 +2741,11 @@ async function extremeDiffHeightRegression() {
     const view = viewport.getBoundingClientRect();
     return mark && mark.top < view.bottom && mark.bottom > view.top;
   }, "Find returns to tail after scrollbar movement");
+  root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 300 }}><WindowedDiff diff={"+\n".repeat(1_250_000)} label="Tall diff" /></div>);
+  await until(() => host.querySelector('.window-find [role="status"]')?.textContent === "No match", "removed match clears Find state");
+  viewport.scrollTop = 0;
+  viewport.dispatchEvent(new Event("scroll"));
+  await until(() => Number(viewport.dataset.firstLine) < 100, "removed match releases the old virtual window");
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={null} label="Empty diff" /></div>);
   await until(() => host.querySelector(".diff-empty"), "nullable diff shows its empty state");
   const nearLimit = "+\n".repeat(2_900_000) + `+WHEEL A ${"x".repeat(1_000)}\n+WHEEL B\n` + "+\n".repeat(2_899_998) + "+NEAR LIMIT TAIL\n";

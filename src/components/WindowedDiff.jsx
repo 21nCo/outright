@@ -128,14 +128,14 @@ export function WindowedDiff({ diff, label }) {
   }
   function find(direction = 1, value = needle) {
     const query = foldFindText(value.trim());
-    if (!query) { setFoundLine(-1); setSearched(false); foundOffsetRef.current = -1; return; }
+    if (!query) { setFoundLine(-1); setSearched(false); foundOffsetRef.current = -1; pendingFindAlignmentRef.current = null; return; }
     const offset = foundOffsetRef.current < 0 ? (direction > 0 ? 0 : searchable.length - 1) : foundOffsetRef.current + direction;
     // lastIndexOf treats a negative fromIndex as zero, so wrap explicitly
     // when Previous moves left of a match at the start of the diff.
     const searchOffset = direction < 0 && offset < 0 ? searchable.length - 1 : offset;
     let match = direction > 0 ? searchable.indexOf(query, searchOffset) : searchable.lastIndexOf(query, searchOffset);
     if (match < 0) match = direction > 0 ? searchable.indexOf(query) : searchable.lastIndexOf(query);
-    if (match < 0) { setFoundLine(-1); setSearched(true); foundOffsetRef.current = -1; return; }
+    if (match < 0) { setFoundLine(-1); setSearched(true); foundOffsetRef.current = -1; pendingFindAlignmentRef.current = null; return; }
     foundOffsetRef.current = match;
     setSearched(true);
     let low = 0; let high = searchableStarts.length;
@@ -169,7 +169,7 @@ export function WindowedDiff({ diff, label }) {
     const query = foldFindText(needle.trim());
     let match = searchable.indexOf(query, Math.min(foundOffsetRef.current, searchable.length));
     if (match < 0) match = searchable.indexOf(query);
-    if (match < 0) { foundOffsetRef.current = -1; setFoundLine(-1); setSearched(true); return; }
+    if (match < 0) { foundOffsetRef.current = -1; pendingFindAlignmentRef.current = null; setFoundLine(-1); setSearched(true); return; }
     foundOffsetRef.current = match;
     let low = 0; let high = searchableStarts.length;
     while (low < high) { const middle = (low + high) >>> 1; if (searchableStarts[middle] <= match) low = middle + 1; else high = middle; }
@@ -201,6 +201,11 @@ export function WindowedDiff({ diff, label }) {
     const pending = pendingFindAlignmentRef.current;
     const viewport = viewportRef.current;
     if (!pending || pending.line !== foundLine || !viewport) return;
+    if (pending.height !== position.height || pending.compressed !== compressed) {
+      pending.height = position.height;
+      pending.compressed = compressed;
+      pending.attempts = 0;
+    }
     let frame;
     const align = () => {
       if (pendingFindAlignmentRef.current !== pending) return;

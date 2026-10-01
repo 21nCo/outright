@@ -18,6 +18,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   const database = createOutrightDatabase({ runtimeLease: true, deletionWorkerGate, onMigrationComplete: () => {
     agents.resumeQueued();
     publish({ type: "capacity.changed", payload: database.capacity() });
+  }, onDeletionWorkerStart: () => {
+    publish({ type: "capacity.changed", payload: database.capacity() });
   }, onDeletionWorkerExit: () => {
     agents.resumeQueued();
     publish({ type: "capacity.changed", payload: database.capacity() });
@@ -134,6 +136,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     try {
       assertRuntimeRequest(request, allowedHosts);
       if (shuttingDown) throw apiError(503, "Runtime is shutting down");
+      if (database.maintenanceActive && url.pathname !== "/api/capacity") {
+        throw apiError(503, "Archive maintenance is running; retry shortly");
+      }
       if (url.pathname === "/api/bootstrap" && request.method === "GET") {
         const scan = await projects();
         return json(response, 200, {
@@ -652,7 +657,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       terminals.shutdown();
       eventHub.shutdown();
       wss.close();
-      database.close();
+      await database.close();
     })();
     return shutdownPromise;
   }
