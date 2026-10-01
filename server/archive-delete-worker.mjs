@@ -20,8 +20,13 @@ try {
   // short final fence and cutover; a changed snapshot is discarded on retry.
   source = new Database(filename);
   source.pragma("busy_timeout = 250");
-  const checkpoint = source.pragma("wal_checkpoint(TRUNCATE)")[0];
-  if (checkpoint?.busy) throw new Error("Archive source WAL is busy");
+  let checkpoint;
+  try { checkpoint = source.pragma("wal_checkpoint(TRUNCATE)")[0]; }
+  catch (error) {
+    if (!["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code)) throw error;
+    throw Object.assign(new Error("Archive source WAL is busy"), { code: "ARCHIVE_SOURCE_BUSY" });
+  }
+  if (checkpoint?.busy) throw Object.assign(new Error("Archive source WAL is busy"), { code: "ARCHIVE_SOURCE_BUSY" });
   parentPort.postMessage({ ready: "copy" });
   await new Promise((resolve, reject) => {
     parentPort.once("message", (message) => message === "proceed" ? resolve() : reject(new Error("Invalid archive maintenance command")));
@@ -102,14 +107,19 @@ try {
     Atomics.notify(signal, 0);
     if (Atomics.wait(signal, 0, 1, 5000) === "timed-out") throw new Error("Archive lock probe timed out");
   }
-  const finalCheckpoint = source.pragma("wal_checkpoint(TRUNCATE)")[0];
-  if (finalCheckpoint?.busy) throw new Error("Archive source WAL is busy at cutover");
+  let finalCheckpoint;
+  try { finalCheckpoint = source.pragma("wal_checkpoint(TRUNCATE)")[0]; }
+  catch (error) {
+    if (!["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code)) throw error;
+    throw Object.assign(new Error("Archive source WAL is busy at cutover"), { code: "ARCHIVE_SOURCE_BUSY" });
+  }
+  if (finalCheckpoint?.busy) throw Object.assign(new Error("Archive source WAL is busy at cutover"), { code: "ARCHIVE_SOURCE_BUSY" });
   source.close();
   source = undefined;
   cutoverArchiveShadow(filename);
   parentPort.postMessage({ ok: true });
 } catch (error) {
-  parentPort.postMessage({ ok: false, error: error.message });
+  parentPort.postMessage({ ok: false, error: error.message, code: error.code });
 } finally {
   shadow?.close();
   source?.close();

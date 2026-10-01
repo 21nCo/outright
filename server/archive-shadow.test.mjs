@@ -4,7 +4,7 @@ import Database from "better-sqlite3";
 import { existsSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { allocatedDatabaseBytes, archiveShadowPaths, beginArchiveShadow, recoverArchiveShadow } from "./archive-shadow.mjs";
+import { allocatedDatabaseBytes, archiveShadowPaths, beginArchiveShadow, cutoverArchiveShadow, prepareArchiveShadowCutover, recoverArchiveShadow } from "./archive-shadow.mjs";
 
 function fixture() {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-shadow-recover-"));
@@ -45,6 +45,7 @@ test("archive shadow recovery finishes a cutover gap and retains the verified re
     const next = new Database(item.next);
     next.prepare("INSERT INTO evidence (body) VALUES (?)").run("committed shadow payload");
     next.close();
+    prepareArchiveShadowCutover(item.filename);
     renameSync(item.filename, item.old);
     recoverArchiveShadow(item.filename);
     assert.equal(body(item.filename), "recoverable payload");
@@ -121,6 +122,7 @@ test("archive shadow recovery keeps the promoted database and releases its old p
     const replacement = new Database(item.next);
     replacement.prepare("UPDATE evidence SET body = ? WHERE id = 1").run("promoted payload");
     replacement.close();
+    prepareArchiveShadowCutover(item.filename);
     renameSync(item.filename, item.old);
     renameSync(item.next, item.filename);
     const withOld = allocatedDatabaseBytes(item.filename);
@@ -128,6 +130,65 @@ test("archive shadow recovery keeps the promoted database and releases its old p
     assert.equal(body(item.filename), "promoted payload");
     assert.equal(existsSync(item.old), false);
     assert.ok(allocatedDatabaseBytes(item.filename) < withOld, "retained old file was omitted from disk accounting");
+  } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
+test("a valid replacement after preparation cannot displace the recoverable source", () => {
+  const item = fixture();
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    const substitute = `${item.filename}.substitute`;
+    const other = new Database(substitute);
+    other.exec("CREATE TABLE evidence (id INTEGER PRIMARY KEY, body TEXT NOT NULL)");
+    other.prepare("INSERT INTO evidence (body) VALUES (?)").run("unvalidated payload");
+    other.close();
+    rmSync(item.next);
+    renameSync(substitute, item.next);
+    assert.throws(() => cutoverArchiveShadow(item.filename), /candidate changed/);
+    recoverArchiveShadow(item.filename);
+    assert.equal(body(item.filename), "recoverable payload");
+    assert.equal(existsSync(item.old), false);
+    assert.equal(existsSync(item.state), false);
+  } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
+test("recovery rejects a substituted candidate after the original is renamed", () => {
+  const item = fixture();
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    renameSync(item.filename, item.old);
+    const next = new Database(item.next);
+    next.prepare("UPDATE evidence SET body = ? WHERE id = 1").run("changed after prepare");
+    next.close();
+    recoverArchiveShadow(item.filename);
+    assert.equal(body(item.filename), "recoverable payload");
+    assert.equal(existsSync(item.old), false);
+    assert.equal(existsSync(item.next), false);
+  } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
+test("an unpinned legacy marker rolls back a valid but unauthenticated candidate", () => {
+  const item = fixture();
+  try {
+    beginArchiveShadow(item.filename);
+    writeFileSync(item.state, JSON.stringify({ version: 1, source: item.filename }));
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    const candidate = new Database(item.next);
+    candidate.prepare("UPDATE evidence SET body = ? WHERE id = 1").run("unauthenticated payload");
+    candidate.close();
+    renameSync(item.filename, item.old);
+    recoverArchiveShadow(item.filename);
+    assert.equal(body(item.filename), "recoverable payload");
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
 });
 

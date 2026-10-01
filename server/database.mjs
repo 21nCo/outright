@@ -129,7 +129,9 @@ export function createOutrightDatabase(options = {}) {
     onWorkerReady: (snapshot) => {
       if (activeMessageFinds || deletionsInFlight.size !== 1
         || db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
-        throw databaseError(503, "Archive maintenance must wait for other work");
+        const error = databaseError(503, "Archive maintenance must wait for other work");
+        error.code = "ARCHIVE_DEFERRED";
+        throw error;
       }
       const currentSnapshot = { changes: db.prepare("SELECT total_changes() AS count").get().count,
         dataVersion: db.pragma("data_version", { simple: true }) };
@@ -1440,7 +1442,9 @@ async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, cop
   try { await deleteOversizedArchivedRow(filename, id, step.oversized, { workers, lockGate, copyGate, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure }); }
   catch (error) {
     if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
-    if (error.code === "ARCHIVE_SNAPSHOT_CHANGED") return { deleted: 0, deferred: true, id };
+    if (["ARCHIVE_SNAPSHOT_CHANGED", "ARCHIVE_DEFERRED", "ARCHIVE_SOURCE_BUSY"].includes(error.code)) {
+      return { deleted: 0, deferred: true, id };
+    }
     throw error;
   }
   return { deleted: 1, id };
@@ -1518,11 +1522,13 @@ function deleteOversizedArchivedRow(filename, conversationId, oversized, lifecyc
     });
     worker.on("error", (error) => { failure = error; });
     worker.on("exit", async (code) => {
-      const problem = failure ?? (code !== 0 || !reply?.ok ? new Error(reply?.error ?? `Archive deletion worker exited ${code}`) : null);
+      const problem = failure ?? (code !== 0 || !reply?.ok
+        ? Object.assign(new Error(reply?.error ?? `Archive deletion worker exited ${code}`), { code: reply?.code }) : null);
       try {
         // Integrity scans and interrupted-cutover recovery belong to a
         // worker. Keep the process lease while this worker is still tracked.
-        if (problem) await recoverArchiveOnWorker(filename);
+        if (problem) await recoverArchiveOnWorker(filename,
+          ["ARCHIVE_SNAPSHOT_CHANGED", "ARCHIVE_DEFERRED", "ARCHIVE_SOURCE_BUSY"].includes(problem.code));
         workers.delete(worker);
         onWorkerExit();
         if (problem) reject(problem);
@@ -1536,9 +1542,9 @@ function deleteOversizedArchivedRow(filename, conversationId, oversized, lifecyc
   });
 }
 
-function recoverArchiveOnWorker(filename) {
+function recoverArchiveOnWorker(filename, sourceUnmoved = false) {
   return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL("./archive-recover-worker.mjs", import.meta.url), { workerData: { filename } });
+    const worker = new Worker(new URL("./archive-recover-worker.mjs", import.meta.url), { workerData: { filename, sourceUnmoved } });
     let reply;
     let failure;
     worker.on("message", (message) => { reply = message; });

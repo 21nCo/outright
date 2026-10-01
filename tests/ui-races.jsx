@@ -4299,6 +4299,42 @@ async function bootstrapMaintenanceRetryRegression() {
   assert(!host.querySelector('[role="alert"]'), "a transient maintenance response left a persistent error");
 }
 
+async function bootstrapHardFailureRegression() {
+  for (const failure of [
+    { status: 401, message: "Sign in required" },
+    { status: 500, message: "Runtime failed" },
+    { message: "Network unavailable" },
+  ]) {
+    root.render(null); await settle();
+    let bootstrapReads = 0;
+    let fail = true;
+    route = async (url) => {
+      if (url.pathname === "/api/bootstrap") {
+        bootstrapReads += 1;
+        if (fail) {
+          if (failure.status) return response({ error: failure.message }, failure.status);
+          throw new Error(failure.message);
+        }
+        return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} },
+          settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+      }
+      return response({});
+    };
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('.loading-screen [role="alert"]')?.textContent === failure.message,
+      `bootstrap ${failure.status ?? "network"} failure is surfaced`);
+    await new Promise((resolve) => setTimeout(resolve, 1150));
+    assert(bootstrapReads === 1, `bootstrap ${failure.status ?? "network"} failure was polled indefinitely`);
+    assert(host.querySelector('.loading-screen button')?.textContent.includes("Retry"), "hard failure has no explicit retry");
+    if (failure.status === 401) {
+      fail = false;
+      host.querySelector('.loading-screen button').click();
+      await until(() => host.querySelector('[aria-label="Settings"]'), "explicit retry loads after authorization recovers");
+      assert(bootstrapReads === 2, "explicit retry made an unexpected number of bootstrap requests");
+    }
+  }
+}
+
 async function providerCheckingRateRegression() {
   root.render(null); await settle();
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
@@ -4892,6 +4928,7 @@ try {
     ["typing during prepend", typingDuringPrependRegression, "editing a find query does not silently cancel an earlier-page request"],
     ["provider bootstrap convergence", providerBootstrapConvergenceRegression, "a checking bootstrap converges after an earlier provider event"],
     ["bootstrap maintenance retry", bootstrapMaintenanceRetryRegression, "a transient archive cutover resumes initial loading"],
+    ["bootstrap hard failures", bootstrapHardFailureRegression, "authorization, server, and network failures surface once"],
     ["provider checking rate", providerCheckingRateRegression, "repeated checking snapshots keep a bounded poll cadence"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and inspector contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],

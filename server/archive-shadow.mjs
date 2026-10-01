@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
-import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { closeSync, constants, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 // The runtime lease is held by the caller for every transition. The source
@@ -39,11 +40,39 @@ export function beginArchiveShadow(filename) {
   if (fileInfo(state) || fileInfo(archiveShadowPaths(filename).next)
     || fileInfo(archiveShadowPaths(filename).old)) throw new Error("Archive maintenance state already exists");
   if (privateRegularFile(temporary)) rmSync(temporary);
-  writeFileSync(temporary, JSON.stringify({ version: 1, source: filename }), { mode: 0o600, flag: "wx" });
+  writeFileSync(temporary, JSON.stringify({ version: 2, source: filename }), { mode: 0o600, flag: "wx" });
   durableFile(temporary);
   renameSync(temporary, state);
   durableFile(state);
   durableDirectory(state);
+}
+
+function candidateIdentity(filename, hash = false) {
+  if (!privateRegularFile(filename)) return null;
+  const fd = openSync(filename, constants.O_RDONLY | (process.platform === "win32" ? 0 : constants.O_NOFOLLOW));
+  try {
+    const info = fstatSync(fd, { bigint: true });
+    const identity = [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].map(String);
+    if (!hash) return { identity };
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let bytes;
+    while ((bytes = readSync(fd, buffer, 0, buffer.length, null)) > 0) digest.update(buffer.subarray(0, bytes));
+    const after = fstatSync(fd, { bigint: true });
+    const currentPath = statSync(filename, { bigint: true });
+    if ([after, currentPath].some((item) => identity.some((value, index) => value !== [item.dev, item.ino, item.size, item.mtimeNs, item.ctimeNs][index].toString()))) {
+      throw new Error("Archive candidate changed during validation");
+    }
+    return { identity, digest: digest.digest("hex") };
+  } finally { closeSync(fd); }
+}
+
+function matchesCandidate(filename, candidate, hash = false, renamed = false) {
+  if (!candidate) return false;
+  const current = candidateIdentity(filename, hash);
+  const identityLength = renamed ? 4 : 5; // rename can change ctime without changing file contents.
+  return current && JSON.stringify(current.identity.slice(0, identityLength)) === JSON.stringify(candidate.identity.slice(0, identityLength))
+    && (!hash || current.digest === candidate.digest);
 }
 
 function validDatabase(filename) {
@@ -84,7 +113,7 @@ function discardShadowCandidate(filename) {
 }
 
 function markerOwnsDatabase(marker, filename) {
-  if (marker?.version !== 1 || typeof marker.source !== "string" || !path.isAbsolute(marker.source)) return false;
+  if (![1, 2].includes(marker?.version) || typeof marker.source !== "string" || !path.isAbsolute(marker.source)) return false;
   if (marker.source === filename) return true;
   if (path.basename(marker.source) !== path.basename(filename)) return false;
   // Older runtimes wrote a lexical parent path into the marker. A restart
@@ -93,7 +122,7 @@ function markerOwnsDatabase(marker, filename) {
   catch (error) { if (error.code === "ENOENT") return false; throw error; }
 }
 
-export function recoverArchiveShadow(filename) {
+export function recoverArchiveShadow(filename, { sourceUnmoved = false } = {}) {
   const { next, old, state } = archiveShadowPaths(filename);
   const temporary = `${state}.tmp`;
   if (privateRegularFile(temporary)) rmSync(temporary);
@@ -105,13 +134,28 @@ export function recoverArchiveShadow(filename) {
   if (!markerOwnsDatabase(marker, filename)) throw new Error("Archive maintenance marker does not match the database");
   privateRegularFile(next);
   privateRegularFile(old);
+  // An expected live conflict is reported only before either rename. The
+  // runtime still has its original connection, so discarding this candidate
+  // does not need a whole-database integrity scan on every normal deferral.
+  if (sourceUnmoved && !fileInfo(old)) {
+    if (!privateRegularFile(filename)) throw new Error("Archive maintenance source is missing or invalid");
+    discardShadowCandidate(next);
+    durableDirectory(filename);
+    rmSync(state);
+    durableDirectory(filename);
+    return;
+  }
   if (fileInfo(old)) {
+    // Legacy version-1 markers did not pin a candidate. Roll those back to
+    // the original rather than trusting a database that could be substituted.
+    const promoted = (name, renamed = false) => marker.version === 2 && !hasNonemptyWal(name)
+      && validDatabase(name) && matchesCandidate(name, marker.candidate, true, renamed);
     if (!fileInfo(filename)) {
-      if (!hasNonemptyWal(next) && validDatabase(next)) renameSync(next, filename);
+      if (promoted(next)) renameSync(next, filename);
       else renameSync(old, filename);
       durableDirectory(filename);
     }
-    if (!validDatabase(filename)) {
+    if (fileInfo(old) && !promoted(filename, true)) {
       if (!validDatabase(old)) throw new Error("Neither archive maintenance database is valid");
       rmSync(filename);
       durableDirectory(filename);
@@ -139,6 +183,14 @@ export function prepareArchiveShadowCutover(filename) {
   }
   durableFile(next);
   durableDirectory(next);
+  const marker = JSON.parse(readFileSync(state, "utf8"));
+  if (marker.version !== 2 || !markerOwnsDatabase(marker, filename)) throw new Error("Archive marker is not owned by this database");
+  const candidate = candidateIdentity(next, true);
+  const temporary = `${state}.tmp`;
+  writeFileSync(temporary, JSON.stringify({ ...marker, candidate }), { mode: 0o600, flag: "wx" });
+  durableFile(temporary);
+  renameSync(temporary, state);
+  durableDirectory(state);
 }
 
 export function cutoverArchiveShadow(filename) {
@@ -146,7 +198,9 @@ export function cutoverArchiveShadow(filename) {
   if (!privateRegularFile(next)) throw new Error("Archive shadow is missing");
   if (fileInfo(old) || !privateRegularFile(state)) throw new Error("Archive cutover state is missing or conflicting");
   const marker = JSON.parse(readFileSync(state, "utf8"));
-  if (!markerOwnsDatabase(marker, filename)) throw new Error("Archive cutover marker does not match the database");
+  if (!markerOwnsDatabase(marker, filename) || marker.version !== 2 || !matchesCandidate(next, marker.candidate)) {
+    throw new Error("Archive cutover candidate changed after validation");
+  }
   // The worker checkpoints and closes the source before publishing `ready`.
   // A nonempty WAL would be left behind by a file rename and is unsafe.
   if (hasNonemptyWal(filename)) throw new Error("Archive source WAL was not checkpointed");
@@ -155,8 +209,15 @@ export function cutoverArchiveShadow(filename) {
   removeCheckpointedSidecars(next);
   renameSync(filename, old);
   durableDirectory(filename);
-  try { renameSync(next, filename); durableDirectory(filename); }
+  try {
+    renameSync(next, filename);
+    durableDirectory(filename);
+    if (!matchesCandidate(filename, marker.candidate, false, true)) throw new Error("Archive cutover candidate changed during promotion");
+  }
   catch (error) {
+    // Both names remain owned by the durable marker until the original is
+    // restored. A crash before this rollback is handled by startup recovery.
+    if (fileInfo(filename)) rmSync(filename);
     renameSync(old, filename);
     durableDirectory(filename);
     discardShadowCandidate(next);

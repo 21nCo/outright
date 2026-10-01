@@ -1021,6 +1021,110 @@ test("shadow copy serves unrelated work and retries after a concurrent source wr
   }
 });
 
+test("automatic shadow cleanup defers for a late run without consuming storage retries", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-late-run-"));
+  const filename = path.join(directory, "outright.db");
+  const copyGate = new Int32Array(new SharedArrayBuffer(4));
+  let storageFailures = 0;
+  const database = createOutrightDatabase({ filename, runtimeLease: true, deletionCopyGate: copyGate.buffer,
+    onDeletionError: () => { storageFailures += 1; } });
+  try {
+    const archived = chat(database, "large old archive");
+    const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    const legacy = new Database(filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(8 * 1024 * 1024), message.id);
+    legacy.close();
+    database.updateConversation(archived.id, { archived: true });
+    ageArchived(filename, [archived.id]);
+    const deletion = database.pruneHistory();
+    const deadline = Date.now() + 5000;
+    while (Atomics.load(copyGate, 0) !== 1) {
+      assert.ok(Date.now() < deadline, "shadow worker did not reach the conflict gate");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    const sibling = chat(database, "admitted sibling");
+    const running = database.createRun(runInput(sibling.id));
+    database.updateRun(running.id, { status: "running" });
+    Atomics.store(copyGate, 0, 2);
+    Atomics.notify(copyGate, 0);
+    assert.equal((await deletion).deferred, 1);
+    assert.equal(storageFailures, 0, "a late run was charged to the storage failure budget");
+    assert.equal(database.capacity().cleanupPaused, 0);
+    assert.ok(database.getConversation(archived.id));
+    database.updateRun(running.id, { status: "completed" });
+    const completed = Date.now() + 8000;
+    while (archivePresentOrMaintaining(database, archived.id)) {
+      assert.ok(Date.now() < completed, "archive did not drain once the run settled");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(database.listAudit().filter((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id).length, 1);
+    assert.equal(database.getRun(running.id).status, "completed");
+    assert.equal(storageFailures, 0);
+  } finally {
+    Atomics.store(copyGate, 0, 2);
+    Atomics.notify(copyGate, 0);
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("rejected shadow replacement preserves queued and recoverable evidence through restart", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-shadow-replacement-"));
+  const filename = path.join(directory, "outright.db");
+  const lockGate = new Int32Array(new SharedArrayBuffer(4));
+  let database = createOutrightDatabase({ filename, runtimeLease: true, deletionWorkerGate: lockGate.buffer });
+  try {
+    const survivor = chat(database, "surviving evidence");
+    const retained = database.addMessage({ conversationId: survivor.id, role: "assistant", body: "original survivor" });
+    const queued = database.createRun(runInput(survivor.id));
+    const recoveryChat = chat(database, "recoverable evidence");
+    const interrupted = database.createRun(runInput(recoveryChat.id));
+    database.updateRun(interrupted.id, { status: "interrupted" });
+    const archived = chat(database, "oversized deletion");
+    const large = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    const legacy = new Database(filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), large.id);
+    legacy.close();
+    database.updateConversation(archived.id, { archived: true });
+    const deletion = database.deleteArchivedConversation(archived.id, archived.id);
+    const deadline = Date.now() + 5000;
+    while (Atomics.load(lockGate, 0) !== 1) {
+      assert.ok(Date.now() < deadline, "candidate did not reach its prepared cutover gate");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    const candidate = new Database(`${filename}.archive-next`);
+    candidate.prepare("UPDATE messages SET body = ? WHERE id = ?").run("substituted survivor", retained.id);
+    candidate.close();
+    Atomics.store(lockGate, 0, 2);
+    Atomics.notify(lockGate, 0);
+    await assert.rejects(deletion, /candidate changed/);
+    await database.close();
+    database = null;
+    const proof = new Database(filename, { readonly: true });
+    try {
+      assert.equal(proof.prepare("SELECT body FROM messages WHERE id = ?").get(retained.id).body, "original survivor");
+      assert.equal(proof.prepare("SELECT status FROM runs WHERE id = ?").get(queued.id).status, "queued");
+      assert.equal(proof.prepare("SELECT status FROM runs WHERE id = ?").get(interrupted.id).status, "interrupted");
+      assert.equal(proof.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes, retainedReadback(proof));
+      assert.equal(proof.prepare("SELECT deleting FROM conversations WHERE id = ?").get(archived.id).deleting, 1);
+    } finally { proof.close(); }
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    const completed = Date.now() + 8000;
+    while (archivePresentOrMaintaining(database, archived.id)) {
+      assert.ok(Date.now() < completed, "durable cleanup marker did not resume after replacement rejection");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(database.listAudit().filter((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id).length, 1);
+    assert.equal(database.getRun(queued.id).status, "queued");
+    assert.equal(database.getRun(interrupted.id).status, "interrupted");
+  } finally {
+    Atomics.store(lockGate, 0, 2);
+    Atomics.notify(lockGate, 0);
+    await database?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("physical directory aliases share one runtime lease", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-lease-alias-"));
   const actual = path.join(root, "actual");
@@ -1141,15 +1245,16 @@ test("failed archive recovery rejects required audit waiters and preserves sourc
       assert.ok(Date.now() < deadline, "archive cutover did not reach failure gate");
       await new Promise((resolve) => setTimeout(resolve, 2));
     }
-    const audit = database.auditRequired("retention.cleaned", { target: archived.id });
+    const audit = database.auditRequired("retention.cleaned", { target: archived.id })
+      .then(() => null, (error) => error);
     // Corrupt only the disposable maintenance marker to force both cutover
     // and its recovery worker to fail. The source must remain protected.
     writeFileSync(`${filename}.archive-state`, "broken marker");
     Atomics.store(lockGate, 0, 2);
     Atomics.notify(lockGate, 0);
     await assert.rejects(deletion, /recovery failed/);
-    await assert.rejects(Promise.race([audit, new Promise((_, reject) => setTimeout(() => reject(new Error("audit waiter hung")), 1000))]),
-      (error) => error.statusCode === 503 && /recovery failed/.test(error.message));
+    const auditResult = await Promise.race([audit, new Promise((_, reject) => setTimeout(() => reject(new Error("audit waiter hung")), 1000))]);
+    assert.ok(auditResult?.statusCode === 503 && /recovery failed/.test(auditResult.message));
     assert.equal(await database.close(), undefined);
     database = null;
     assert.ok(existsSync(filename), "failed recovery removed the original evidence");

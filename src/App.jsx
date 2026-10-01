@@ -51,6 +51,7 @@ const LIVE_OMITTED_PREFIX = "[Earlier live output omitted]\n";
 
 export function App() {
   const [bootstrap, setBootstrap] = useState(null);
+  const bootstrapLoadRef = useRef(null);
   const [selectedProjectId, setSelectedProjectId] = useState(() => localStorage.getItem("outright.selected-project") || "");
   const [selectedWorktreeId, setSelectedWorktreeId] = useState(() => localStorage.getItem("outright.selected-worktree") || "");
   const [selectedConversationId, setSelectedConversationId] = useState(() => localStorage.getItem("outright.selected-conversation") || "");
@@ -225,11 +226,12 @@ export function App() {
       const next = await api(manual ? "/api/projects" : "/api/bootstrap", manual ? { method: "POST" } : undefined);
       if (manual) setBootstrap((current) => ({ ...current, ...next }));
       else setBootstrap(next);
+      if (!manual) setError("");
       if (manual) setToast(`Found ${next.projects.length} Git projects`);
       return true;
     } catch (nextError) {
       if (manual || nextError.status !== 503) setError(nextError.message);
-      return false;
+      return !manual && nextError.status === 503 ? "retry" : "error";
     }
     finally { setIsScanning(false); }
   }, []);
@@ -239,10 +241,11 @@ export function App() {
     let retry;
     const load = async () => {
       const loaded = await loadBootstrap();
-      if (!stopped && !loaded) retry = window.setTimeout(load, 1000);
+      if (!stopped && loaded === "retry") retry = window.setTimeout(load, 1000);
     };
+    bootstrapLoadRef.current = load;
     void load();
-    return () => { stopped = true; window.clearTimeout(retry); };
+    return () => { stopped = true; bootstrapLoadRef.current = null; window.clearTimeout(retry); };
   }, [loadBootstrap]);
   const providersChecking = Boolean(bootstrap?.providers?.some((provider) => provider.checking));
   useEffect(() => {
@@ -1741,7 +1744,7 @@ export function App() {
   }
   function openManageChat() { if (!conversation || !conversationDetailReady || !isSelectedTarget(conversation)) return; setChatDraft({ title: conversation.title, providerSessionId: conversation.providerSessionId ?? "", provider: conversation.provider, model: conversation.model ?? "", destination: `${conversation.projectId}::${conversation.worktreeId}` }); setManageChatOpen(true); }
 
-  if (!bootstrap || !project || !worktree) return <LoadingScreen isScanning={isScanning} />;
+  if (!bootstrap || !project || !worktree) return <LoadingScreen isScanning={isScanning} error={error} onRetry={() => { setError(""); void bootstrapLoadRef.current?.(); }} />;
 
   return <div className={`app-shell ${sidebarOpen ? "sidebar-is-open" : "sidebar-is-closed"}`}>
     <aside className="sidebar" id="project-sidebar" role={isNarrow && sidebarOpen ? "dialog" : undefined} aria-modal={isNarrow && sidebarOpen ? true : undefined} aria-label="Projects and worktrees" aria-hidden={!sidebarOpen} tabIndex={isNarrow ? -1 : undefined} ref={sidebarRef}>
@@ -1855,7 +1858,7 @@ function GitHealth({ worktree }) { if (worktree.isPrunable) return <span classNa
 function TemplateMenu({ templates, onSelect }) { if (!templates.length) return null; return <DropdownMenu><DropdownMenuTrigger render={<Button type="button" variant="ghost" size="icon-sm" aria-label="Prompt templates" />}><ClockCounterClockwise /></DropdownMenuTrigger><DropdownMenuContent align="start"><DropdownMenuGroup><DropdownMenuLabel>Prompt templates</DropdownMenuLabel>{templates.map((template) => <DropdownMenuItem key={template.id} onClick={() => onSelect(template.prompt)}>{template.title}</DropdownMenuItem>)}</DropdownMenuGroup></DropdownMenuContent></DropdownMenu>; }
 function ThemeMenu({ theme, onThemeChange }) { const Icon = theme === "light" ? Sun : theme === "dark" ? Moon : Desktop; return <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Change theme" />}><Icon /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup><DropdownMenuLabel>Appearance</DropdownMenuLabel></DropdownMenuGroup><DropdownMenuRadioGroup value={theme} onValueChange={onThemeChange}><DropdownMenuRadioItem value="system"><Desktop />System</DropdownMenuRadioItem><DropdownMenuRadioItem value="light"><Sun />Light</DropdownMenuRadioItem><DropdownMenuRadioItem value="dark"><Moon />Dark</DropdownMenuRadioItem></DropdownMenuRadioGroup></DropdownMenuContent></DropdownMenu>; }
 function SimpleDialog({ open, onOpenChange, title, description, onSubmit, submit, disabled, children }) { return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><form className="dialog-form" onSubmit={onSubmit}><DialogHeader><DialogTitle>{title}</DialogTitle><DialogDescription>{description}</DialogDescription></DialogHeader>{children}<DialogFooter><Button type="button" variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button><Button type="submit" disabled={disabled}>{submit}</Button></DialogFooter></form></DialogContent></Dialog>; }
-function LoadingScreen({ isScanning }) { return <div className="loading-screen" role="status" aria-live="polite"><span className="brand-glyph"><Sparkle weight="fill" /></span><h1>Outright</h1><p>{isScanning ? "Starting the local runtime…" : "No projects found"}</p></div>; }
+function LoadingScreen({ isScanning, error, onRetry }) { return <div className="loading-screen" role="status" aria-live="polite"><span className="brand-glyph"><Sparkle weight="fill" /></span><h1>Outright</h1>{error ? <><p role="alert">{error}</p><Button onClick={onRetry}>Retry</Button></> : <p>{isScanning ? "Starting the local runtime…" : "No projects found"}</p>}</div>; }
 function buildGroupedProjects(projects, state) { const result = state.groups.map((group) => ({ ...group, projects: projects.filter((project) => state.memberships[project.id] === group.id) })); const ungrouped = projects.filter((project) => !state.groups.some((group) => group.id === state.memberships[project.id])); return ungrouped.length ? [...result, { id: "ungrouped", name: "Ungrouped", projects: ungrouped }] : result; }
 function preferredWorktree(project) { return project.worktrees.find((item) => item.name === "dev" || item.path.endsWith("-dev")) ?? project.worktrees.find((item) => item.branch === "next") ?? project.worktrees[0]; }
 function compactPath(value = "") { return value.replace(/^\/Users\/[^/]+/, "~"); }
