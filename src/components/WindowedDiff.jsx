@@ -214,7 +214,9 @@ export function WindowedDiff({ diff, label }) {
         updatePosition(viewport);
       }
       if (++pending.attempts < 12) frame = window.requestAnimationFrame(align);
-      else if (pendingFindAlignmentRef.current === pending) pendingFindAlignmentRef.current = null;
+      // Keep Find ownership after the settling frames. A later resize changes
+      // the compressed scroll mapping and must align the same match again.
+      // Wheel, pointer, touch, and keyboard gestures explicitly release it.
     };
     align();
     return () => window.cancelAnimationFrame(frame);

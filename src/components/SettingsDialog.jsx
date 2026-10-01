@@ -182,18 +182,20 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
     <Setting icon={Brain} label="Reasoning effort"><select value={draft.reasoningEffort} onChange={(event) => setDraft({ ...draft, reasoningEffort: event.target.value })}>{["low", "medium", "high", "xhigh"].map((value) => <option key={value}>{value}</option>)}</select></Setting>
     <Setting icon={Code} label="Editor"><select value={draft.editor} onChange={(event) => setDraft({ ...draft, editor: event.target.value })}><option value="zed">Zed</option><option value="code">VS Code</option><option value="cursor">Cursor</option><option value="finder">Finder</option></select></Setting>
     <Setting icon={Bell} label="Notifications"><span className="switch-row"><input type="checkbox" aria-label="Notify when runs finish" checked={draft.notifications} onChange={(event) => setDraft({ ...draft, notifications: event.target.checked })} /> Notify when runs finish</span></Setting>
-    <Setting icon={Brain} label="Concurrent runs"><Input type="number" min="1" max="8" step="1" value={draft.maxConcurrentRuns} onChange={(event) => setDraft({ ...draft, maxConcurrentRuns: Number(event.target.value) })} /></Setting>
-    <Setting icon={Brain} label="Queued runs"><Input type="number" min="1" max="256" step="1" value={draft.maxQueuedRuns} onChange={(event) => setDraft({ ...draft, maxQueuedRuns: Number(event.target.value) })} /></Setting>
-    <Setting icon={Brain} label="Retained history (MiB)"><Input type="number" min="64" max="4096" step="1" value={draft.maxRetainedMiB} onChange={(event) => setDraft({ ...draft, maxRetainedMiB: Number(event.target.value) })} /></Setting>
-    <Setting icon={Brain} label="Archived history age (days)"><Input type="number" min="1" max="3650" step="1" value={draft.retentionDays} onChange={(event) => setDraft({ ...draft, retentionDays: Number(event.target.value) })} /></Setting>
+    {Object.entries(BUDGET_RANGES).map(([name, [label, min, max]]) =>
+      <BudgetSetting key={name} name={name} label={label} min={min} max={max} value={draft[name]} setDraft={setDraft} />)}
   </div>
-  {!validBudgetSettings(draft) && <p role="status">Enter whole numbers within the shown ranges before saving.</p>}
+  {!validBudgetSettings(draft) && <p id="budget-settings-error">Enter whole numbers within the shown ranges before saving.</p>}
   <section className="template-settings">
     <header><div><strong>Capacity and retention</strong><small>Cleanup removes unpinned archived chats older than the saved age. You can also select a recent archived chat to delete now. Active and recoverable runs stay protected.</small></div></header>
     {capacity?.limits && <output className="capacity-status">{capacity.queued} of {capacity.limits.maxQueuedRuns} queued · {capacity.active} active · {capacity.recoverable} awaiting recovery · {capacityUsageText(capacity)} ({(capacity.limits.reservedRetainedBytes / 1048576).toFixed(0)} MiB reserved for active runs). CPU, memory and allocated disk use are unknown.</output>}
     <Button ref={cleanupButtonRef} variant="outline" onClick={cleanHistory}>Clean old archived history</Button>
     {cleanupResult && <output className="capacity-status">{cleanupResult}</output>}
-    {archived.length > 0 && <div ref={archivedListRef} className="template-list archived-history-list" aria-label="Archived chats available to delete">{archived.map((item) => <div key={item.id}><span><strong>{item.title}</strong><small title={item.worktreePath}>{item.worktreePath} · Archived {new Date(item.updatedAt).toLocaleDateString()}</small></span><Button variant="outline" size="sm" disabled={deleting} aria-label={`Delete archived chat “${item.title}” in ${item.worktreePath} (${item.id})`} onClick={(event) => { if (deleting) return; deleteTriggerRef.current = event.currentTarget; setPendingDelete(item); }}>Delete now</Button></div>)}</div>}
+    {archived.length > 0 && <div ref={archivedListRef} className="template-list archived-history-list" aria-label="Archived chats available to delete">{archived.map((item) => <div key={item.id}><span><strong>{item.title}</strong><small title={item.worktreePath}>{item.worktreePath} · Archived {new Date(item.updatedAt).toLocaleDateString()}</small></span><Button variant="outline" size="sm" disabled={deleting} aria-label={`Delete archived chat “${item.title}” in ${item.worktreePath} (${item.id})`} onClick={(event) => {
+      if (deleting) return;
+      deleteTriggerRef.current = event.currentTarget;
+      setPendingDelete(item);
+    }}>Delete now</Button></div>)}</div>}
     {showingOlderArchived && <Button ref={backToNewestRef} variant="outline" onClick={() => { restorePageFocusRef.current = true; refreshArchived().catch((error) => { restorePageFocusRef.current = false; onError(error); }); }}>Back to newest archived chats</Button>}
     {archivedCursor && <Button variant="outline" onClick={loadMoreArchived} disabled={loadingArchived}>{loadingArchived ? "Loading archived chats…" : "Next archived page"}</Button>}
     {pendingDelete && <fieldset className="archive-delete-confirm"><legend className="sr-only">Confirm archived chat deletion</legend><p>Delete “{pendingDelete.title}” in {pendingDelete.worktreePath} and its messages and run history permanently?</p><div><Button ref={cancelDeleteRef} variant="outline" onClick={() => { restoreDeleteFocusRef.current = true; setPendingDelete(null); }} disabled={deleting}>Cancel</Button><Button variant="destructive" onClick={deleteSelectedArchive} disabled={deleting}>Delete archived chat</Button></div></fieldset>}
@@ -207,9 +209,23 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
   </DialogContent></Dialog>;
 }
 
+const BUDGET_RANGES = {
+  maxConcurrentRuns: ["Concurrent runs", 1, 8],
+  maxQueuedRuns: ["Queued runs", 1, 256],
+  maxRetainedMiB: ["Retained history (MiB)", 64, 4096],
+  retentionDays: ["Archived history age (days)", 1, 3650],
+};
+
 function validBudgetSettings(settings) {
-  return Object.entries({ maxConcurrentRuns: [1, 8], maxQueuedRuns: [1, 256], maxRetainedMiB: [64, 4096], retentionDays: [1, 3650] })
-    .every(([key, [min, max]]) => Number.isInteger(settings[key]) && settings[key] >= min && settings[key] <= max);
+  return Object.entries(BUDGET_RANGES)
+    .every(([key, [, min, max]]) => Number.isInteger(settings[key]) && settings[key] >= min && settings[key] <= max);
+}
+
+function BudgetSetting({ name, label, min, max, value, setDraft }) {
+  const invalid = !Number.isInteger(value) || value < min || value > max;
+  return <Setting icon={Brain} label={label}><Input type="number" min={min} max={max} step="1" value={value}
+    aria-invalid={invalid || undefined} aria-describedby={invalid ? "budget-settings-error" : undefined}
+    onChange={(event) => setDraft((current) => ({ ...current, [name]: Number(event.target.value) }))} /></Setting>;
 }
 
 function Setting({ icon: Icon, label, children }) { return <label className="setting-row"><span><Icon />{label}</span>{children}</label>; }

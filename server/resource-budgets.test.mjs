@@ -923,6 +923,45 @@ test("oversized cleanup keeps the runtime reader responsive and fails competing 
   }
 });
 
+test("automatic deletion wraps to an archive marked behind its in-flight cursor", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-cursor-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const earlier = chat(database, "earlier archive");
+    database.addMessage({ conversationId: earlier.id, role: "assistant", body: "earlier" });
+    database.updateConversation(earlier.id, { archived: true });
+    const later = chat(database, "later archive");
+    const message = database.addMessage({ conversationId: later.id, role: "assistant", body: "later" });
+    database.updateConversation(later.id, { archived: true });
+    database.close();
+    const legacy = new Database(filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
+    legacy.prepare("UPDATE conversations SET deleting = 1 WHERE id = ?").run(later.id);
+    legacy.close();
+    let markedEarlier = false;
+    database = createOutrightDatabase({ filename, onDeletionWorkerExit: () => {
+      if (markedEarlier) return;
+      const marker = new Database(filename);
+      try { marker.prepare("UPDATE conversations SET deleting = 1 WHERE id = ?").run(earlier.id); }
+      finally { marker.close(); }
+      markedEarlier = true;
+    } });
+    const deadline = Date.now() + 8_000;
+    while (database.getConversation(earlier.id) || database.getConversation(later.id)) {
+      assert.ok(Date.now() < deadline, `archive behind deletion cursor was stranded: earlier=${Boolean(database.getConversation(earlier.id))}, later=${Boolean(database.getConversation(later.id))}, pending=${database.capacity().cleanupPending}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(markedEarlier, true);
+    for (const id of [earlier.id, later.id]) {
+      assert.equal(database.listAudit().filter((entry) => entry.action === "retention.archived.deleted" && entry.target === id).length, 1);
+    }
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("a legacy run error uses the worker and a required cleanup audit waits for its lock", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-run-error-cleanup-"));
   const filename = path.join(directory, "outright.db");

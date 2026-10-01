@@ -166,7 +166,12 @@ export function createOutrightDatabase(options = {}) {
     const candidates = db.prepare("SELECT rowid, id FROM conversations WHERE deleting = 1 AND rowid > ? ORDER BY rowid LIMIT 64");
     const rows = candidates.all(deletionCursor);
     if (!rows.length) {
+      const wrapped = deletionCursor !== 0;
       deletionCursor = 0;
+      // A marker can be added behind the cursor while a worker is running.
+      // Visit the earlier rowids once before going idle; a fully scanned
+      // empty table must not keep scheduling itself.
+      if (wrapped) scheduleDeletionResume();
       return;
     }
     const pending = rows.find((row) => !pausedDeletions.has(row.id) && !deletionsInFlight.has(row.id));

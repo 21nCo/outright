@@ -606,6 +606,13 @@ async function settingsCapacityAndDeletionOrderRegression() {
   setControlValue(queuedInput, "2.5");
   await until(() => [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Save settings")?.disabled,
     "fractional quota disables save");
+  assert(queuedInput.getAttribute("aria-invalid") === "true", "fractional quota did not mark its input invalid");
+  const error = document.getElementById(queuedInput.getAttribute("aria-describedby"));
+  assert(error?.textContent.includes("whole numbers") && !error.hasAttribute("role"),
+    "invalid quota lacks a stable, non-live error description");
+  setControlValue(queuedInput, "32");
+  await until(() => !queuedInput.hasAttribute("aria-invalid") && !queuedInput.hasAttribute("aria-describedby"),
+    "corrected quota clears input error semantics");
 }
 
 async function settingsTemplateCompletionRegression() {

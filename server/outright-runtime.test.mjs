@@ -269,6 +269,16 @@ test("oversized archive writer returns retryable HTTP writes while capacity rema
       { id: archived.id, confirmation: archived.id }), deletionResponse);
     let cleanup;
     let cleanupSettled = false;
+    let signalAuditAttempt;
+    const auditAttempted = new Promise((resolve) => { signalAuditAttempt = resolve; });
+    const auditRequired = database.auditRequired.bind(database);
+    database.auditRequired = (action, details) => {
+      const result = auditRequired(action, details);
+      // The required audit makes its first synchronous SQLite write attempt
+      // before returning a promise that waits for the worker lock.
+      if (action === "retention.cleanup.requested") signalAuditAttempt();
+      return result;
+    };
     const cleanupResponse = responseCapture();
     try {
       const deadline = Date.now() + 5000;
@@ -286,7 +296,13 @@ test("oversized archive writer returns retryable HTTP writes while capacity rema
       assert.match(denied.body.error, /retry shortly/);
       cleanup = runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", {}), cleanupResponse)
         .then(() => { cleanupSettled = true; });
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      let auditTimer;
+      try {
+        await Promise.race([auditAttempted, new Promise((_, reject) => {
+          auditTimer = setTimeout(() => reject(new Error("cleanup did not attempt its required audit")), 5000);
+        })]);
+      } finally { clearTimeout(auditTimer); }
+      await new Promise((resolve) => setImmediate(resolve));
       assert.equal(cleanupSettled, false, "cleanup acknowledged a request before its audit could be written");
     } finally {
       Atomics.store(lockGate, 0, 2);
@@ -298,6 +314,11 @@ test("oversized archive writer returns retryable HTTP writes while capacity rema
     assert.equal(cleanupResponse.statusCode, 200);
     assert.ok(database.listAudit().some((entry) => entry.action === "retention.cleaned"),
       "successful cleanup response lost its required audit while the worker held SQLite");
+    const reopened = new Database(database.filename);
+    try {
+      assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleaned'").get().count, 1,
+        "cleanup response did not leave one durable completion audit");
+    } finally { reopened.close(); }
     const retry = responseCapture();
     await runtime.handleRequest(requestStream("POST", "/api/groups", { name: "Retry after cleanup" }), retry);
     assert.equal(retry.statusCode, 201);
