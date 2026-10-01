@@ -226,11 +226,24 @@ export function App() {
       if (manual) setBootstrap((current) => ({ ...current, ...next }));
       else setBootstrap(next);
       if (manual) setToast(`Found ${next.projects.length} Git projects`);
-    } catch (nextError) { setError(nextError.message); }
+      return true;
+    } catch (nextError) {
+      if (manual || nextError.status !== 503) setError(nextError.message);
+      return false;
+    }
     finally { setIsScanning(false); }
   }, []);
 
-  useEffect(() => { loadBootstrap(); }, [loadBootstrap]);
+  useEffect(() => {
+    let stopped = false;
+    let retry;
+    const load = async () => {
+      const loaded = await loadBootstrap();
+      if (!stopped && !loaded) retry = window.setTimeout(load, 1000);
+    };
+    void load();
+    return () => { stopped = true; window.clearTimeout(retry); };
+  }, [loadBootstrap]);
   const providersChecking = Boolean(bootstrap?.providers?.some((provider) => provider.checking));
   useEffect(() => {
     if (!providersChecking) return;

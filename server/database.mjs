@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { chmodSync, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, rmSync, statfsSync, statSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, realpathSync, rmSync, statfsSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -64,7 +64,12 @@ export function createOutrightDatabase(options = {}) {
     ?? process.env.OUTRIGHT_DATA_DIR
     ?? path.join(os.homedir(), ".outright"));
   mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
-  const filename = options.filename ?? path.join(dataDirectory, "outright.db");
+  const requestedFilename = options.filename ?? path.join(dataDirectory, "outright.db");
+  if (requestedFilename !== ":memory:") mkdirSync(path.dirname(path.resolve(requestedFilename)), { recursive: true, mode: 0o700 });
+  // Lease, sidecars, worker and source must all use one name for the same
+  // physical parent directory. A lexical alias must not acquire a second lease.
+  const filename = requestedFilename === ":memory:" ? requestedFilename
+    : path.join(realpathSync(path.dirname(path.resolve(requestedFilename))), path.basename(requestedFilename));
   // Launch handshake records live next to the database: the launch wrapper
   // durably records its own process identity here before the runtime may
   // authorize the provider to run, so a crash between spawning and recording
@@ -76,7 +81,7 @@ export function createOutrightDatabase(options = {}) {
   // exist for the database (and the launch records beside it) to open.
   if (filename && path.isAbsolute(filename)) mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
   if (filename !== ":memory:" || options.launchDirectory) preparePrivateLaunchDirectory(launchDirectory);
-  const storageFilename = filename === ":memory:" ? filename : path.resolve(filename);
+  const storageFilename = filename;
   let { db, leaseDb } = openRuntimeStorage(filename, storageFilename, Boolean(options.runtimeLease));
   let maintenance = false;
   let maintenanceCapacity;
@@ -109,13 +114,9 @@ export function createOutrightDatabase(options = {}) {
     if (!closing) options.onDeletionWorkerExit?.();
   };
   const deletionContext = { isClosing: () => closing, filename: storageFilename, currentDb: () => db,
-    workers: deletionWorkers, lockGate: options.deletionWorkerGate,
+    workers: deletionWorkers, lockGate: options.deletionWorkerGate, copyGate: options.deletionCopyGate,
     canMaintain: () => activeMessageFinds === 0 && deletionsInFlight.size === 1,
-    onWorkerReady: () => {
-      if (activeMessageFinds || deletionsInFlight.size !== 1
-        || db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
-        throw databaseError(503, "Archive maintenance must wait for other work");
-      }
+    onWorkerStart: () => {
       const free = statfsSync(path.dirname(storageFilename), { bigint: true });
       const sourceBytes = statSync(storageFilename, { bigint: true }).size
         + (existsSync(`${storageFilename}-wal`) ? statSync(`${storageFilename}-wal`, { bigint: true }).size : 0n);
@@ -123,6 +124,21 @@ export function createOutrightDatabase(options = {}) {
         throw databaseError(507, "Archive maintenance needs free disk space for a recoverable copy");
       }
       beginArchiveShadow(storageFilename);
+      return { changes: db.prepare("SELECT total_changes() AS count").get().count, dataVersion: db.pragma("data_version", { simple: true }) };
+    },
+    onWorkerReady: (snapshot) => {
+      if (activeMessageFinds || deletionsInFlight.size !== 1
+        || db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
+        throw databaseError(503, "Archive maintenance must wait for other work");
+      }
+      const currentSnapshot = { changes: db.prepare("SELECT total_changes() AS count").get().count,
+        dataVersion: db.pragma("data_version", { simple: true }) };
+      if (snapshot.changes !== currentSnapshot.changes || snapshot.dataVersion !== currentSnapshot.dataVersion) {
+        if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:archive-snapshot]", snapshot, currentSnapshot);
+        const error = databaseError(503, "Archive changed during shadow cleanup; retry when idle");
+        error.code = "ARCHIVE_SNAPSHOT_CHANGED";
+        throw error;
+      }
       maintenanceCapacity = api.capacity();
       maintenance = true;
       db.close();
@@ -142,6 +158,8 @@ export function createOutrightDatabase(options = {}) {
     },
     onWorkerRecoveryFailure: (error) => {
       maintenanceError = error.message;
+      for (const resolve of deletionIdleWaiters) resolve();
+      deletionIdleWaiters.clear();
       if (closing) releaseLeaseIfIdle();
     } };
   const continueMigrations = () => {
@@ -317,10 +335,10 @@ export function createOutrightDatabase(options = {}) {
       // and terminal transitions.
       const capacity = this.capacity();
       // A durable deletion marker protects its own conversation, but does
-      // not reserve every free agent slot. Only the short-lived SQLite writer
-      // worker pauses launches; a long unrelated run may keep an oversized
-      // delete deferred without starving the queue.
-      return !maintenance && !deletionWorkers.size && capacity.availableForNewWorkBytes >= 64 * 1024;
+      // not reserve every free agent slot. Only the short final cutover
+      // pauses launches; a long unrelated run may keep an oversized delete
+      // deferred without starving the queue.
+      return !maintenance && capacity.availableForNewWorkBytes >= 64 * 1024;
     },
     listDeletableArchivedConversations({ limit = 100, cursor = null } = {}) {
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw databaseError(400, "Archived history page size must be 1 to 100");
@@ -1295,7 +1313,9 @@ export function createOutrightDatabase(options = {}) {
     if (key === "canLaunchRun") return () => false;
     if (key === "audit") return () => false;
     if (key === "auditRequired") return async (...args) => {
+      if (maintenanceError) throw databaseError(503, `Archive maintenance recovery failed: ${maintenanceError}`);
       await new Promise((resolve) => deletionIdleWaiters.add(resolve));
+      if (maintenanceError) throw databaseError(503, `Archive maintenance recovery failed: ${maintenanceError}`);
       if (closing) throw databaseError(503, "Runtime closed during archive maintenance");
       return receiver.auditRequired(...args);
     };
@@ -1387,8 +1407,9 @@ function runPatchAssignments(patch) {
 
 // A marked archive is hidden from new work. Bounded rows are removed on the
 // runtime connection; a giant legacy row is reclaimed in a shadow database
-// while the primary is closed behind the process lease.
-function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosing, filename, workers, lockGate, currentDb, canMaintain, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure }) {
+// while the primary stays available for unrelated work. Only the final
+// cutover closes it behind the process lease.
+function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosing, filename, workers, lockGate, copyGate, currentDb, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure }) {
   if (inFlight.has(id)) throw databaseError(409, "Archived conversation deletion is in progress");
   inFlight.add(id);
   const run = async () => {
@@ -1398,7 +1419,7 @@ function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosin
         if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
         db = currentDb();
         const result = await advanceArchiveDeletion(db, id,
-          { filename, workers, lockGate, canMaintain, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing });
+          { filename, workers, lockGate, copyGate, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing });
         if (result) return result;
         await new Promise((resolve) => setImmediate(resolve));
       }
@@ -1407,7 +1428,7 @@ function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosin
   return run();
 }
 
-async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, canMaintain, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing }) {
+async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, copyGate, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing }) {
   const step = db.transaction(() => deleteArchivedBatch(db, id, filename)).immediate();
   if (step.done) { onWorkerExit(); return { deleted: 1, id }; }
   if (!step.oversized) return null;
@@ -1416,9 +1437,10 @@ async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, can
   if (workers.size || !canMaintain() || db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
     return { deleted: 0, deferred: true, id };
   }
-  try { await deleteOversizedArchivedRow(filename, id, step.oversized, workers, lockGate, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure); }
+  try { await deleteOversizedArchivedRow(filename, id, step.oversized, { workers, lockGate, copyGate, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure }); }
   catch (error) {
     if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
+    if (error.code === "ARCHIVE_SNAPSHOT_CHANGED") return { deleted: 0, deferred: true, id };
     throw error;
   }
   return { deleted: 1, id };
@@ -1472,19 +1494,25 @@ function deleteArchivedBatch(db, id, filename) {
   return { done: true };
 }
 
-function deleteOversizedArchivedRow(filename, conversationId, oversized, workers, lockGate, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure) {
+function deleteOversizedArchivedRow(filename, conversationId, oversized, lifecycle) {
+  const { workers, lockGate, copyGate, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure } = lifecycle;
   return new Promise((resolve, reject) => {
     let worker;
     try {
       worker = new Worker(new URL("./archive-delete-worker.mjs", import.meta.url),
-        { workerData: { filename, conversationId, ...oversized, lockGate } });
+        { workerData: { filename, conversationId, ...oversized, lockGate, copyGate } });
     } catch (error) { reject(error); return; }
     workers.add(worker);
     let reply;
     let failure;
+    let snapshot;
     worker.on("message", (message) => {
       if (message.ready) {
-        try { onWorkerReady(); worker.postMessage("proceed"); }
+        try {
+          if (message.ready === "copy") snapshot = onWorkerStart();
+          else onWorkerReady(snapshot);
+          worker.postMessage("proceed");
+        }
         catch (error) { failure = error; void worker.terminate(); }
       } else reply = message;
     });

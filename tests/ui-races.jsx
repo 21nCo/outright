@@ -2634,8 +2634,9 @@ async function largeDiffWindowRegression() {
   find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("line 35000"), "ordinary diff Find match");
   for (let tick = 0; tick < 16; tick += 1) await frame();
+  const ordinaryHeight = viewport.clientHeight;
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 300 }}><WindowedDiff diff={diff} label="Large diff fixture" /></div>);
-  await until(() => viewport.clientHeight < 400, "ordinary diff resized after Find settled");
+  await until(() => viewport.clientHeight < ordinaryHeight - 40, "ordinary diff resized after Find settled");
   await until(() => {
     const mark = viewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect();
     const bounds = viewport.getBoundingClientRect();
@@ -2724,8 +2725,9 @@ async function extremeDiffHeightRegression() {
   const bounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
   assert(bounds.top < viewport.getBoundingClientRect().bottom && bounds.bottom > viewport.getBoundingClientRect().top, `Tall diff find mark is outside the viewport: mark=${bounds.top}/${bounds.bottom}, viewport=${viewport.getBoundingClientRect().top}/${viewport.getBoundingClientRect().bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}`);
   for (let tick = 0; tick < 16; tick += 1) await frame();
+  const compressedHeight = viewport.clientHeight;
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 300 }}><WindowedDiff diff={"+\n".repeat(10_000) + diff} label="Tall diff" /></div>);
-  await until(() => viewport.clientHeight < 400 && viewport.querySelector('[data-find-match="true"]')?.textContent.includes("TAIL MATCH"), "tail Find survives compressed resize");
+  await until(() => viewport.clientHeight < compressedHeight - 40 && viewport.querySelector('[data-find-match="true"]')?.textContent.includes("TAIL MATCH"), "tail Find survives compressed resize");
   for (let tick = 0; tick < 4; tick += 1) await frame();
   const resizedTail = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
   const resizedTrack = viewport.getBoundingClientRect();
@@ -2762,8 +2764,9 @@ async function extremeDiffHeightRegression() {
   setControlValue(nearInput, "WHEEL A"); await settle();
   nearInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => nearViewport.querySelector('[data-find-match="true"]')?.textContent.includes("WHEEL A"), "near-limit middle marker visible");
+  const nearHeight = nearViewport.clientHeight;
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 360 }}><WindowedDiff diff={nearLimit} label="Near-limit diff" /></div>);
-  await until(() => nearViewport.clientHeight < 400 && nearViewport.querySelector('[data-find-match="true"]')?.textContent.includes("WHEEL A"), "refreshed diff resized");
+  await until(() => nearViewport.clientHeight < nearHeight - 20 && nearViewport.querySelector('[data-find-match="true"]')?.textContent.includes("WHEEL A"), "refreshed diff resized");
   for (let tick = 0; tick < 4; tick += 1) await frame();
   const resizedMark = nearViewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
   const resizedViewport = nearViewport.getBoundingClientRect();
@@ -4240,6 +4243,27 @@ async function providerBootstrapConvergenceRegression() {
   document.querySelector('[role="dialog"] button[aria-label="Close"]')?.click();
 }
 
+async function bootstrapMaintenanceRetryRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  let bootstrapReads = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") {
+      bootstrapReads += 1;
+      if (bootstrapReads === 1) return response({ error: "Archive maintenance is running; retry shortly" }, 503);
+      return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} },
+        settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    }
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => bootstrapReads === 1 && host.querySelector('.loading-screen'), "maintenance blocks initial bootstrap");
+  await until(() => bootstrapReads >= 2 && host.querySelector('[aria-label="Settings"]'), "bootstrap resumes after maintenance");
+  assert(!host.querySelector('[role="alert"]'), "a transient maintenance response left a persistent error");
+}
+
 async function providerCheckingRateRegression() {
   root.render(null); await settle();
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
@@ -4831,6 +4855,7 @@ try {
     ["find in-flight event", findInFlightEventRegression, "an event during find remains reachable when the returned page claims to be latest"],
     ["typing during prepend", typingDuringPrependRegression, "editing a find query does not silently cancel an earlier-page request"],
     ["provider bootstrap convergence", providerBootstrapConvergenceRegression, "a checking bootstrap converges after an earlier provider event"],
+    ["bootstrap maintenance retry", bootstrapMaintenanceRetryRegression, "a transient archive cutover resumes initial loading"],
     ["provider checking rate", providerCheckingRateRegression, "repeated checking snapshots keep a bounded poll cadence"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and inspector contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],

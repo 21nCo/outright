@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
-import { existsSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { allocatedDatabaseBytes, archiveShadowPaths, beginArchiveShadow, recoverArchiveShadow } from "./archive-shadow.mjs";
@@ -68,6 +68,34 @@ test("archive shadow recovery restores the source when the replacement is invali
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
 });
 
+test("an empty reserved shadow never replaces the recoverable source", () => {
+  const item = fixture();
+  try {
+    beginArchiveShadow(item.filename);
+    writeFileSync(item.next, "");
+    renameSync(item.filename, item.old);
+    recoverArchiveShadow(item.filename);
+    assert.equal(body(item.filename), "recoverable payload");
+    assert.equal(existsSync(item.old), false);
+    assert.equal(existsSync(item.next), false);
+  } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
+test("a lexical parent marker recovers through the canonical database path", () => {
+  const item = fixture();
+  const alias = path.join(item.directory, "parent-alias");
+  try {
+    symlinkSync(item.directory, alias, process.platform === "win32" ? "junction" : "dir");
+    const lexical = path.join(alias, path.basename(item.filename));
+    beginArchiveShadow(lexical);
+    writeFileSync(`${lexical}.archive-next`, "incomplete copy");
+    const canonical = path.join(realpathSync(item.directory), path.basename(item.filename));
+    recoverArchiveShadow(canonical);
+    assert.equal(body(canonical), "recoverable payload");
+    assert.equal(existsSync(`${canonical}.archive-state`), false);
+  } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
 test("archive shadow recovery discards an uncheckpointed candidate with its sidecars", () => {
   const item = fixture();
   try {
@@ -100,5 +128,31 @@ test("archive shadow recovery keeps the promoted database and releases its old p
     assert.equal(body(item.filename), "promoted payload");
     assert.equal(existsSync(item.old), false);
     assert.ok(allocatedDatabaseBytes(item.filename) < withOld, "retained old file was omitted from disk accounting");
+  } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
+test("dangling maintenance links are rejected before recovery can discard its marker", () => {
+  const item = fixture();
+  try {
+    beginArchiveShadow(item.filename);
+    symlinkSync(path.join(item.directory, "missing-candidate"), item.next);
+    assert.throws(() => recoverArchiveShadow(item.filename), /Unsafe archive maintenance file/);
+    assert.equal(existsSync(item.state), true, "recovery erased the only ownership marker");
+    assert.equal(body(item.filename), "recoverable payload");
+  } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
+test("physical usage includes candidate and marker bytes until each file is removed", () => {
+  const item = fixture();
+  try {
+    const sourceBytes = allocatedDatabaseBytes(item.filename);
+    assert.ok(sourceBytes > 0);
+    beginArchiveShadow(item.filename);
+    const withMarker = allocatedDatabaseBytes(item.filename);
+    assert.ok(withMarker > sourceBytes, "marker was omitted from physical usage");
+    writeFileSync(item.next, Buffer.alloc(128 * 1024, 1));
+    assert.ok(allocatedDatabaseBytes(item.filename) > withMarker, "candidate was omitted from physical usage");
+    recoverArchiveShadow(item.filename);
+    assert.equal(allocatedDatabaseBytes(item.filename), sourceBytes);
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
 });

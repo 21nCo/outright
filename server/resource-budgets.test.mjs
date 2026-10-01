@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createOutrightDatabase } from "./database.mjs";
@@ -948,10 +948,9 @@ test("oversized cleanup fences the live database and reclaims a shadow before re
       assert.equal(database.capacity().cleanupPending, true);
       assert.equal(database.capacity().migrationStatus, "maintenance");
       assert.equal(database.capacity().diskUsageStatus, "partial");
-      const started = performance.now();
       assert.throws(() => chat(database, `competing ${mode}`),
         (error) => error.statusCode === 503 && /maintenance/.test(error.message));
-      assert.ok(performance.now() - started < 25, "a competing write waited on a giant SQLite row");
+      assert.equal(database.maintenanceActive, true, "the rejection escaped the short cutover fence");
       assert.equal(database.canLaunchRun(), false);
       assert.doesNotThrow(() => database.audit("terminal.exited", { target: mode }),
         "optional terminal audit must not crash its event callback");
@@ -975,6 +974,74 @@ test("oversized cleanup fences the live database and reclaims a shadow before re
     Atomics.notify(lockGate, 0);
     database.close();
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("shadow copy serves unrelated work and retries after a concurrent source write", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-live-copy-"));
+  const filename = path.join(directory, "outright.db");
+  const copyGate = new Int32Array(new SharedArrayBuffer(4));
+  const database = createOutrightDatabase({ filename, runtimeLease: true, deletionCopyGate: copyGate.buffer });
+  try {
+    const archived = chat(database, "large old archive");
+    const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    const legacy = new Database(filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(8 * 1024 * 1024), message.id);
+    legacy.close();
+    database.updateConversation(archived.id, { archived: true });
+    const deletion = database.deleteArchivedConversation(archived.id, archived.id);
+    const deadline = Date.now() + 5000;
+    while (Atomics.load(copyGate, 0) !== 1) {
+      assert.ok(Date.now() < deadline, "shadow copy did not reach the live-source gate");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    assert.equal(database.maintenanceActive, false, "copy fenced the live database");
+    assert.equal(database.canLaunchRun(), true, "copy consumed an agent slot");
+    const sibling = chat(database, "created during copy");
+    const queued = database.createRun(runInput(sibling.id));
+    assert.equal(database.getRun(queued.id).status, "queued");
+    assert.equal(database.capacity().cleanupPending, true);
+    Atomics.store(copyGate, 0, 2);
+    Atomics.notify(copyGate, 0);
+    const first = await deletion;
+    assert.equal(first.deferred, true, "a stale shadow replaced concurrent source changes");
+    assert.ok(database.getConversation(sibling.id));
+    const completed = Date.now() + 8000;
+    while (archivePresentOrMaintaining(database, archived.id)) {
+      assert.ok(Date.now() < completed, "deferred shadow did not resume after source became idle");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(database.getRun(queued.id).status, "queued");
+    assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id));
+  } finally {
+    Atomics.store(copyGate, 0, 2);
+    Atomics.notify(copyGate, 0);
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("physical directory aliases share one runtime lease", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-lease-alias-"));
+  const actual = path.join(root, "actual");
+  const alias = path.join(root, "alias");
+  let owner;
+  let replacement;
+  try {
+    owner = createOutrightDatabase({ filename: path.join(actual, "outright.db"), runtimeLease: true });
+    symlinkSync(actual, alias, process.platform === "win32" ? "junction" : "dir");
+    const queued = owner.createRun(runInput(chat(owner, "lease owner").id));
+    assert.throws(() => createOutrightDatabase({ filename: path.join(alias, "outright.db"), runtimeLease: true }),
+      (error) => error.code === "OUTRIGHT_RUNTIME_LEASE_HELD");
+    assert.equal(owner.getRun(queued.id).status, "queued");
+    await owner.close();
+    owner = null;
+    replacement = createOutrightDatabase({ filename: path.join(alias, "outright.db"), runtimeLease: true });
+    assert.equal(replacement.getRun(queued.id).status, "queued");
+  } finally {
+    await owner?.close();
+    await replacement?.close();
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -1052,6 +1119,50 @@ test("a legacy run error uses the worker and a required cleanup audit waits for 
     Atomics.store(lockGate, 0, 2);
     Atomics.notify(lockGate, 0);
     database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("failed archive recovery rejects required audit waiters and preserves source for restart", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-audit-recovery-"));
+  const filename = path.join(directory, "outright.db");
+  const lockGate = new Int32Array(new SharedArrayBuffer(4));
+  let database = createOutrightDatabase({ filename, runtimeLease: true, deletionWorkerGate: lockGate.buffer });
+  try {
+    const archived = chat(database, "audit recovery");
+    const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    const legacy = new Database(filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
+    legacy.close();
+    database.updateConversation(archived.id, { archived: true });
+    const deletion = database.deleteArchivedConversation(archived.id, archived.id);
+    const deadline = Date.now() + 5000;
+    while (Atomics.load(lockGate, 0) !== 1) {
+      assert.ok(Date.now() < deadline, "archive cutover did not reach failure gate");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    const audit = database.auditRequired("retention.cleaned", { target: archived.id });
+    // Corrupt only the disposable maintenance marker to force both cutover
+    // and its recovery worker to fail. The source must remain protected.
+    writeFileSync(`${filename}.archive-state`, "broken marker");
+    Atomics.store(lockGate, 0, 2);
+    Atomics.notify(lockGate, 0);
+    await assert.rejects(deletion, /recovery failed/);
+    await assert.rejects(Promise.race([audit, new Promise((_, reject) => setTimeout(() => reject(new Error("audit waiter hung")), 1000))]),
+      (error) => error.statusCode === 503 && /recovery failed/.test(error.message));
+    assert.equal(await database.close(), undefined);
+    database = null;
+    assert.ok(existsSync(filename), "failed recovery removed the original evidence");
+    // Restore the marker format; startup recovery discards the uncommitted
+    // candidate and resumes the durable deletion marker.
+    writeFileSync(`${filename}.archive-state`, JSON.stringify({ version: 1, source: realpathSync(filename) }));
+    const reopened = createOutrightDatabase({ filename, runtimeLease: true });
+    try { assert.ok(reopened.getConversation(archived.id)); }
+    finally { await reopened.close(); }
+  } finally {
+    Atomics.store(lockGate, 0, 2);
+    Atomics.notify(lockGate, 0);
+    await database?.close();
     rmSync(directory, { recursive: true, force: true });
   }
 });

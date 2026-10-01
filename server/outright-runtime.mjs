@@ -12,10 +12,10 @@ import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate } = {}) {
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate } = {}) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
-  const database = createOutrightDatabase({ runtimeLease: true, deletionWorkerGate, onMigrationComplete: () => {
+  const database = createOutrightDatabase({ runtimeLease: true, deletionWorkerGate, deletionCopyGate, onMigrationComplete: () => {
     agents.resumeQueued();
     publish({ type: "capacity.changed", payload: database.capacity() });
   }, onDeletionWorkerStart: () => {

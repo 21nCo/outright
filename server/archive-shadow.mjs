@@ -1,23 +1,29 @@
 import Database from "better-sqlite3";
-import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 // The runtime lease is held by the caller for every transition. The source
-// database is closed before the first rename; all large SQLite work happens
-// in the disposable shadow, never on the live writer connection.
+// database is closed only for the final rename. Large SQLite work happens in
+// the disposable shadow while the source remains available.
 export function archiveShadowPaths(filename) {
   return { next: `${filename}.archive-next`, old: `${filename}.archive-old`, state: `${filename}.archive-state` };
 }
 
+function fileInfo(filename) {
+  try { return lstatSync(filename); }
+  catch (error) { if (error.code === "ENOENT") return null; throw error; }
+}
+
 function privateRegularFile(filename) {
-  if (!existsSync(filename)) return false;
-  const info = lstatSync(filename);
+  const info = fileInfo(filename);
+  if (!info) return false;
   if (!info.isFile() || info.nlink !== 1) throw new Error(`Unsafe archive maintenance file: ${filename}`);
   return true;
 }
 
 function durableFile(filename) {
-  const fd = openSync(filename, "r");
+  // FlushFileBuffers requires a write-capable handle on Windows.
+  const fd = openSync(filename, "r+");
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
@@ -30,9 +36,9 @@ function durableDirectory(filename) {
 export function beginArchiveShadow(filename) {
   const state = `${filename}.archive-state`;
   const temporary = `${state}.tmp`;
-  if (existsSync(state) || existsSync(archiveShadowPaths(filename).next)
-    || existsSync(archiveShadowPaths(filename).old)) throw new Error("Archive maintenance state already exists");
-  if (existsSync(temporary)) rmSync(temporary);
+  if (fileInfo(state) || fileInfo(archiveShadowPaths(filename).next)
+    || fileInfo(archiveShadowPaths(filename).old)) throw new Error("Archive maintenance state already exists");
+  if (privateRegularFile(temporary)) rmSync(temporary);
   writeFileSync(temporary, JSON.stringify({ version: 1, source: filename }), { mode: 0o600, flag: "wx" });
   durableFile(temporary);
   renameSync(temporary, state);
@@ -42,6 +48,14 @@ export function beginArchiveShadow(filename) {
 
 function validDatabase(filename) {
   if (!privateRegularFile(filename)) return false;
+  // SQLite treats an empty file as a valid empty database. A reserved but
+  // unfilled candidate must never outrank the recoverable original.
+  if (statSync(filename).size < 512) return false;
+  const fd = openSync(filename, "r");
+  const header = Buffer.alloc(16);
+  try { if (readSync(fd, header, 0, header.length, 0) !== header.length
+    || !header.equals(Buffer.from("SQLite format 3\0"))) return false; }
+  finally { closeSync(fd); }
   let db;
   try {
     db = new Database(filename, { readonly: true, fileMustExist: true });
@@ -53,65 +67,90 @@ function validDatabase(filename) {
 }
 
 function hasNonemptyWal(filename) {
-  return existsSync(`${filename}-wal`) && statSync(`${filename}-wal`).size > 0;
+  return privateRegularFile(`${filename}-wal`) && statSync(`${filename}-wal`).size > 0;
 }
 
 function removeCheckpointedSidecars(filename) {
   if (hasNonemptyWal(filename)) throw new Error(`Uncheckpointed archive database WAL: ${filename}`);
   for (const suffix of ["-wal", "-shm"]) {
-    if (existsSync(`${filename}${suffix}`)) rmSync(`${filename}${suffix}`);
+    if (privateRegularFile(`${filename}${suffix}`)) rmSync(`${filename}${suffix}`);
   }
 }
 
 function discardShadowCandidate(filename) {
   for (const suffix of ["", "-wal", "-shm", "-journal"]) {
-    if (existsSync(`${filename}${suffix}`)) rmSync(`${filename}${suffix}`);
+    if (privateRegularFile(`${filename}${suffix}`)) rmSync(`${filename}${suffix}`);
   }
+}
+
+function markerOwnsDatabase(marker, filename) {
+  if (marker?.version !== 1 || typeof marker.source !== "string" || !path.isAbsolute(marker.source)) return false;
+  if (marker.source === filename) return true;
+  if (path.basename(marker.source) !== path.basename(filename)) return false;
+  // Older runtimes wrote a lexical parent path into the marker. A restart
+  // through its canonical parent still owns the same maintenance files.
+  try { return realpathSync(path.dirname(marker.source)) === path.dirname(filename); }
+  catch (error) { if (error.code === "ENOENT") return false; throw error; }
 }
 
 export function recoverArchiveShadow(filename) {
   const { next, old, state } = archiveShadowPaths(filename);
   const temporary = `${state}.tmp`;
   if (privateRegularFile(temporary)) rmSync(temporary);
-  if (!existsSync(state)) {
-    if (existsSync(next) || existsSync(old)) throw new Error("Unowned archive maintenance files require inspection");
+  if (!privateRegularFile(state)) {
+    if (fileInfo(next) || fileInfo(old)) throw new Error("Unowned archive maintenance files require inspection");
     return;
   }
-  privateRegularFile(state);
   const marker = JSON.parse(readFileSync(state, "utf8"));
-  if (marker.version !== 1 || marker.source !== filename) throw new Error("Archive maintenance marker does not match the database");
+  if (!markerOwnsDatabase(marker, filename)) throw new Error("Archive maintenance marker does not match the database");
   privateRegularFile(next);
   privateRegularFile(old);
-  if (existsSync(old)) {
-    if (!existsSync(filename)) {
+  if (fileInfo(old)) {
+    if (!fileInfo(filename)) {
       if (!hasNonemptyWal(next) && validDatabase(next)) renameSync(next, filename);
       else renameSync(old, filename);
+      durableDirectory(filename);
     }
     if (!validDatabase(filename)) {
       if (!validDatabase(old)) throw new Error("Neither archive maintenance database is valid");
       rmSync(filename);
+      durableDirectory(filename);
       renameSync(old, filename);
+      durableDirectory(filename);
     }
-    if (existsSync(old)) rmSync(old);
+    durableFile(filename);
+    durableDirectory(filename);
+    if (privateRegularFile(old)) { rmSync(old); durableDirectory(filename); }
   } else if (!validDatabase(filename)) {
     throw new Error("Archive maintenance source is missing or invalid");
   }
   // A discarded candidate may have an uncheckpointed WAL. It is safe to
   // remove its sidecars only after the original or promoted source is valid.
   discardShadowCandidate(next);
+  durableDirectory(filename);
   rmSync(state);
   durableDirectory(filename);
 }
 
+export function prepareArchiveShadowCutover(filename) {
+  const { next, state } = archiveShadowPaths(filename);
+  if (!privateRegularFile(state) || !validDatabase(next) || hasNonemptyWal(next)) {
+    throw new Error("Archive shadow is not ready for cutover");
+  }
+  durableFile(next);
+  durableDirectory(next);
+}
+
 export function cutoverArchiveShadow(filename) {
   const { next, old, state } = archiveShadowPaths(filename);
-  if (!privateRegularFile(next) || !validDatabase(next)) throw new Error("Archive shadow failed validation");
-  if (existsSync(old) || !privateRegularFile(state)) throw new Error("Archive cutover state is missing or conflicting");
+  if (!privateRegularFile(next)) throw new Error("Archive shadow is missing");
+  if (fileInfo(old) || !privateRegularFile(state)) throw new Error("Archive cutover state is missing or conflicting");
+  const marker = JSON.parse(readFileSync(state, "utf8"));
+  if (!markerOwnsDatabase(marker, filename)) throw new Error("Archive cutover marker does not match the database");
   // The worker checkpoints and closes the source before publishing `ready`.
   // A nonempty WAL would be left behind by a file rename and is unsafe.
   if (hasNonemptyWal(filename)) throw new Error("Archive source WAL was not checkpointed");
   if (hasNonemptyWal(next)) throw new Error("Archive shadow WAL was not checkpointed");
-  durableFile(next);
   removeCheckpointedSidecars(filename);
   removeCheckpointedSidecars(next);
   renameSync(filename, old);
@@ -119,19 +158,17 @@ export function cutoverArchiveShadow(filename) {
   try { renameSync(next, filename); durableDirectory(filename); }
   catch (error) {
     renameSync(old, filename);
+    durableDirectory(filename);
     discardShadowCandidate(next);
+    durableDirectory(filename);
     rmSync(state);
     durableDirectory(filename);
     throw error;
   }
-  if (!validDatabase(filename)) {
-    rmSync(filename);
-    renameSync(old, filename);
-    rmSync(state);
-    durableDirectory(filename);
-    throw new Error("Archive cutover failed verification");
-  }
+  // The worker validated and flushed this same inode before the fence. A
+  // full integrity scan here would make the service outage size-dependent.
   rmSync(old);
+  durableDirectory(filename);
   rmSync(state);
   durableDirectory(filename);
 }
@@ -145,7 +182,8 @@ export function allocatedDatabaseBytes(filename) {
       try {
         const info = lstatSync(part);
         if (!info.isFile()) throw new Error(`Unsafe database storage file: ${part}`);
-        return total + (typeof info.blocks === "number" ? info.blocks * 512 : info.size);
+        const allocated = typeof info.blocks === "number" ? info.blocks * 512 : 0;
+        return total + (allocated > 0 ? allocated : info.size);
       } catch (error) { if (error.code === "ENOENT") return total; throw error; }
     }, 0);
 }

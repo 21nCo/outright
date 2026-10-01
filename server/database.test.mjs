@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
 import Database from "better-sqlite3";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createOutrightDatabase, defaultProbeRun } from "./database.mjs";
@@ -693,7 +693,7 @@ test("resolves a relative data directory to a stable absolute launch path", () =
     database = createOutrightDatabase({ dataDirectory });
     assert.equal(path.isAbsolute(database.filename), true);
     assert.equal(path.isAbsolute(database.launchDirectory), true);
-    assert.equal(database.launchDirectory, path.join(root, "data", "launches"));
+    assert.equal(database.launchDirectory, path.join(realpathSync(path.join(root, "data")), "launches"));
   } finally {
     database?.close();
     rmSync(root, { recursive: true, force: true });
@@ -1061,7 +1061,7 @@ test("the launch directory follows an explicit absolute database filename", () =
   const filename = path.join(root, "custom", "outright.db");
   try {
     const database = createOutrightDatabase({ filename });
-    assert.equal(database.launchDirectory, path.join(root, "custom", "launches"));
+    assert.equal(database.launchDirectory, path.join(realpathSync(path.join(root, "custom")), "launches"));
     database.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

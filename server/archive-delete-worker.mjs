@@ -1,9 +1,9 @@
 import Database from "better-sqlite3";
 import { closeSync, openSync } from "node:fs";
 import { parentPort, workerData } from "node:worker_threads";
-import { archiveShadowPaths, cutoverArchiveShadow } from "./archive-shadow.mjs";
+import { archiveShadowPaths, cutoverArchiveShadow, prepareArchiveShadowCutover } from "./archive-shadow.mjs";
 
-const { filename, conversationId, table, rowId, lockGate } = workerData;
+const { filename, conversationId, table, rowId, lockGate, copyGate } = workerData;
 const ownership = {
   run_events: `SELECT 1 FROM run_events AS item JOIN runs ON runs.id = item.run_id
     WHERE item.id = ? AND runs.conversation_id = ?`,
@@ -15,32 +15,35 @@ let source;
 let shadow;
 try {
   if (!Object.hasOwn(ownership, table)) throw new Error("Invalid archive deletion source");
-  // Opening the source first lets the primary close without making its WAL
-  // connection the last one. The parent fences runtime operations before it
-  // sends `proceed`; the worker then owns all large copy/delete work.
+  // Keep the primary available throughout the size-dependent copy, deletion
+  // and vacuum. The parent verifies that no source row changed before the
+  // short final fence and cutover; a changed snapshot is discarded on retry.
   source = new Database(filename);
   source.pragma("busy_timeout = 250");
-  parentPort.postMessage({ ready: true });
+  const checkpoint = source.pragma("wal_checkpoint(TRUNCATE)")[0];
+  if (checkpoint?.busy) throw new Error("Archive source WAL is busy");
+  parentPort.postMessage({ ready: "copy" });
   await new Promise((resolve, reject) => {
     parentPort.once("message", (message) => message === "proceed" ? resolve() : reject(new Error("Invalid archive maintenance command")));
   });
   const { next } = archiveShadowPaths(filename);
-  const checkpoint = source.pragma("wal_checkpoint(TRUNCATE)")[0];
-  if (checkpoint?.busy) throw new Error("Archive source WAL is busy");
-  source.pragma("locking_mode = EXCLUSIVE");
-  source.exec("BEGIN EXCLUSIVE; COMMIT");
   // Reserve the fixed sibling name without following a symlink created by a
   // local process between the parent preflight and VACUUM INTO.
   closeSync(openSync(next, "wx", 0o600));
   source.prepare("VACUUM INTO ?").run(next);
+  if (copyGate instanceof SharedArrayBuffer) {
+    const signal = new Int32Array(copyGate);
+    if (Atomics.compareExchange(signal, 0, 0, 1) === 0) {
+      Atomics.notify(signal, 0);
+      if (Atomics.wait(signal, 0, 1, 5000) === "timed-out") throw new Error("Archive copy probe timed out");
+    }
+  }
   shadow = new Database(next);
   shadow.pragma("foreign_keys = ON");
   shadow.pragma("secure_delete = FAST");
-  const beforeUsage = source.prepare("SELECT bytes, measured FROM retained_usage WHERE id = 1").get();
-  const copiedUsage = shadow.prepare("SELECT bytes, measured FROM retained_usage WHERE id = 1").get();
-  if (beforeUsage.bytes !== copiedUsage.bytes || beforeUsage.measured !== copiedUsage.measured) {
-    throw new Error("Archive shadow did not preserve retained usage");
-  }
+  // Source writes remain allowed during the copy, so compare reclamation to
+  // the copied snapshot. The parent rejects this candidate if source changed.
+  const beforeUsage = shadow.prepare("SELECT bytes, measured FROM retained_usage WHERE id = 1").get();
   const archive = shadow.prepare("SELECT archived, deleting FROM conversations WHERE id = ?").get(conversationId);
   if (!archive?.archived || !archive.deleting) throw new Error("Archive deletion marker is missing");
   if (shadow.prepare(`SELECT 1 FROM runs WHERE conversation_id = ? AND (status IN ('queued', 'launching', 'running')
@@ -48,12 +51,6 @@ try {
     throw new Error("Archive has active or recoverable work");
   }
   if (!shadow.prepare(ownership[table]).get(rowId, conversationId)) throw new Error("Archive row ownership changed");
-  if (lockGate instanceof SharedArrayBuffer) {
-    const signal = new Int32Array(lockGate);
-    Atomics.store(signal, 0, 1);
-    Atomics.notify(signal, 0);
-    if (Atomics.wait(signal, 0, 1, 5000) === "timed-out") throw new Error("Archive lock probe timed out");
-  }
   // Finish this archive inside one shadow copy. Every child row has its own
   // transaction, so a second giant row cannot force another full copy of
   // all unrelated retained history. None of these transactions owns the live
@@ -87,14 +84,26 @@ try {
   if (beforeUsage.measured && shadow.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes >= beforeUsage.bytes) {
     throw new Error("Archive shadow did not debit the reclaimed row");
   }
-  // The source remains fenced while the shadow reclaims its freed overflow
-  // pages. This work may grow with old data, but owns no live writer.
+  // The primary remains available while the shadow reclaims overflow pages.
   shadow.exec("VACUUM");
   if (shadow.pragma("integrity_check")[0]?.integrity_check !== "ok" || shadow.pragma("foreign_key_check").length) {
     throw new Error("Archive shadow failed integrity validation");
   }
   shadow.close();
   shadow = undefined;
+  prepareArchiveShadowCutover(filename);
+  parentPort.postMessage({ ready: "cutover" });
+  await new Promise((resolve, reject) => {
+    parentPort.once("message", (message) => message === "proceed" ? resolve() : reject(new Error("Invalid archive cutover command")));
+  });
+  if (lockGate instanceof SharedArrayBuffer) {
+    const signal = new Int32Array(lockGate);
+    Atomics.store(signal, 0, 1);
+    Atomics.notify(signal, 0);
+    if (Atomics.wait(signal, 0, 1, 5000) === "timed-out") throw new Error("Archive lock probe timed out");
+  }
+  const finalCheckpoint = source.pragma("wal_checkpoint(TRUNCATE)")[0];
+  if (finalCheckpoint?.busy) throw new Error("Archive source WAL is busy at cutover");
   source.close();
   source = undefined;
   cutoverArchiveShadow(filename);

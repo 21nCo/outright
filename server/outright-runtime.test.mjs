@@ -254,6 +254,57 @@ test("oversized archived HTTP deletion defers without blocking live output or ca
   assert.equal(database.canLaunchRun(), true);
 }));
 
+test("HTTP bootstrap stays available during shadow copy and preserves a concurrent write", async () => {
+  const configDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-shadow-http-config-"));
+  const configFile = path.join(configDirectory, "outright.config.json");
+  writeFileSync(configFile, JSON.stringify({ scanRoots: [], maxDepth: 1, maxProjects: 1 }));
+  const copyGate = new Int32Array(new SharedArrayBuffer(4));
+  try { await withRuntime(async (runtime) => {
+    const database = runtime.database;
+    const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Old", provider: "codex" });
+    const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "short" });
+    const legacy = new Database(database.filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(8 * 1024 * 1024), message.id);
+    legacy.close();
+    database.updateConversation(archived.id, { archived: true });
+    const deletion = responseCapture();
+    const request = runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived",
+      { id: archived.id, confirmation: archived.id }), deletion);
+    try {
+      const deadline = Date.now() + 5_000;
+      while (Atomics.load(copyGate, 0) !== 1) {
+        assert.ok(Date.now() < deadline, "HTTP cleanup did not enter shadow copy");
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      const bootstrap = responseCapture();
+      await runtime.handleRequest(requestStream("GET", "/api/bootstrap"), bootstrap);
+      assert.equal(bootstrap.statusCode, 200, `shadow copy blocked an unrelated bootstrap: ${bootstrap.raw}`);
+      assert.equal(bootstrap.body.capacity.cleanupPending, true);
+      assert.equal(database.maintenanceActive, false);
+      const survivor = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "New", provider: "codex" });
+      Atomics.store(copyGate, 0, 2);
+      Atomics.notify(copyGate, 0);
+      await request;
+      assert.equal(deletion.statusCode, 202, "a stale shadow replaced the concurrent HTTP-visible write");
+      assert.ok(database.getConversation(survivor.id));
+      const completed = Date.now() + 8_000;
+      while (true) {
+        let remaining;
+        try { remaining = database.getConversation(archived.id); }
+        catch (error) { if (error.statusCode !== 503) throw error; remaining = true; }
+        if (!remaining) break;
+        assert.ok(Date.now() < completed, "deferred HTTP cleanup did not resume");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id));
+    } finally {
+      Atomics.store(copyGate, 0, 2);
+      Atomics.notify(copyGate, 0);
+    }
+  }, { deletionCopyGate: copyGate.buffer, configUrl: pathToFileURL(configFile) })(); }
+  finally { rmSync(configDirectory, { recursive: true, force: true }); }
+});
+
 test("oversized archive writer returns retryable HTTP writes while capacity remains readable", (() => {
   const lockGate = new Int32Array(new SharedArrayBuffer(4));
   return withRuntime(async (runtime) => {
@@ -349,7 +400,9 @@ test("archived HTTP pages bound serialized metadata while cursors reach long-tit
   }
   const seen = [];
   let cursor = null;
+  let pages = 0;
   do {
+    assert.ok(++pages <= ids.length + 1, "archived pagination did not terminate");
     const response = responseCapture();
     const query = cursor ? `?limit=2&cursor=${encodeURIComponent(cursor)}` : "?limit=2";
     await runtime.handleRequest(requestStream("GET", `/api/retention/archived${query}`), response);
