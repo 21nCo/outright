@@ -1,0 +1,21 @@
+server/archive-delete-worker.mjs
+  s_e6f95982c07c7d::t_e92b6ba13c0ceb 4,6,18-20,23-25,34-40,44-46,87,94-106
+server/resource-budgets.test.mjs
+  s_e6f95982c07c7d::t_e01f0ce3bc5732 4,953,980-1047,1126-1169
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a235e46b1c94dd779cb64d3ffd5424c61be827e3",
+  "prompts": {},
+  "sessions": {
+    "s_e6f95982c07c7d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f7ff-1e13-7622-ae7b-44307c0eb82e",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
