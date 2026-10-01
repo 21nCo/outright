@@ -376,19 +376,29 @@ test("persists ordered transcript items instead of one accumulated answer", asyn
   assert.deepEqual(database.messages.map((message) => message.kind), ["text", "tool", "text"]);
 });
 
-test("provider command labels and payloads each stay bounded in a tool transcript", async () => {
-  const database = fakeDatabase();
-  const child = fakeChild();
-  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
-  database.createRun(codexRun("large-command"));
-  await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun("large-command") });
-  child.stdout.write(JSON.stringify({ type: "item.completed", item: {
-    type: "command_execution", command: "x".repeat(512 * 1024),
-  } }) + "\n");
-  child.emit("close", 0, null);
-  assert.equal(database.messages.length, 1);
-  assert.ok(Buffer.byteLength(database.messages[0].body) <= 16 * 1024);
-  assert.ok(Buffer.byteLength(JSON.stringify(database.messages[0].payload)) <= 17 * 1024);
+test("Codex and Claude tool transcripts bound the final serialized payload", async () => {
+  for (const provider of ["codex", "claude"]) {
+    const database = fakeDatabase();
+    const child = fakeChild();
+    const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+    const id = `large-${provider}-tool`;
+    database.createRun({ ...codexRun(id), provider });
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun(id) });
+    const escaped = '\\"\n🪼'.repeat(32 * 1024);
+    const item = provider === "codex"
+      ? { type: "command_execution", command: escaped, output: { nested: escaped } }
+      : { type: "tool_result", content: [{ type: "text", text: escaped }] };
+    child.stdout.write(JSON.stringify(provider === "codex"
+      ? { type: "item.completed", item }
+      : { type: "user", message: { content: [item] } }) + "\n");
+    child.emit("close", 0, null);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(database.messages.length, 1, `${provider} tool output was not persisted`);
+    assert.ok(Buffer.byteLength(database.messages[0].body) <= 16 * 1024);
+    assert.ok(Buffer.byteLength(JSON.stringify(database.messages[0].payload)) <= 16 * 1024,
+      `${provider} final payload exceeded its serialized quota`);
+    assert.equal(database.messages[0].payload.item.truncated, true);
+  }
 });
 
 test("sustained tool output stops growing the durable run transcript", async () => {

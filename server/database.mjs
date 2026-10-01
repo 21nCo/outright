@@ -84,6 +84,7 @@ export function createOutrightDatabase(options = {}) {
   let migrationRetry;
   let deletionTick;
   let deletionTickKind;
+  let deletionCursor = 0;
   let migrationError = null;
   const deletionsInFlight = new Set();
   const deletionWorkers = new Set();
@@ -160,22 +161,33 @@ export function createOutrightDatabase(options = {}) {
   };
   const resumeDeletions = () => {
     if (closing) return;
-    let pending;
-    for (const row of db.prepare("SELECT id FROM conversations WHERE deleting = 1 ORDER BY rowid").iterate()) {
-      if (!pausedDeletions.has(row.id)) { pending = row; break; }
+    // Visit at most one page per tick. Failed markers can be numerous, but
+    // each retry must leave the runtime event loop available to new work.
+    const candidates = db.prepare("SELECT rowid, id FROM conversations WHERE deleting = 1 AND rowid > ? ORDER BY rowid LIMIT 64");
+    const rows = candidates.all(deletionCursor);
+    if (!rows.length) {
+      deletionCursor = 0;
+      return;
     }
-    if (!pending) return;
-    if (deletionsInFlight.has(pending.id)) {
-      scheduleDeletionResume(100);
+    const pending = rows.find((row) => !pausedDeletions.has(row.id) && !deletionsInFlight.has(row.id));
+    deletionCursor = pending?.rowid ?? rows.at(-1).rowid;
+    if (!pending) {
+      if (rows.length === 64) scheduleDeletionResume();
+      else deletionCursor = 0;
       return;
     }
     deleteArchivedInBatches(db, pending.id, deletionsInFlight, { ...deletionContext, automatic: true })
-      .then((result) => { if (result.deleted) deletionFailures.delete(pending.id); scheduleDeletionResume(result.deferred ? 250 : 0); })
+      .then((result) => {
+        if (result.deleted) { deletionFailures.delete(pending.id); pausedDeletions.delete(pending.id); }
+        if (result.deferred) deletionCursor = 0;
+        scheduleDeletionResume(result.deferred ? 250 : 0);
+      })
       .catch((error) => {
         options.onDeletionError?.(error);
         const failures = (deletionFailures.get(pending.id) ?? 0) + 1;
         deletionFailures.set(pending.id, failures);
         if (failures >= 5) pausedDeletions.add(pending.id);
+        else deletionCursor = 0;
         scheduleDeletionResume(pausedDeletions.has(pending.id) ? 0 : Math.min(16_000, 1000 * 2 ** (failures - 1)));
       });
   };
@@ -317,6 +329,7 @@ export function createOutrightDatabase(options = {}) {
       deletionFailures.delete(id);
       return deleteArchivedInBatches(db, id, deletionsInFlight, deletionContext)
         .then((result) => {
+          if (result.deleted) { pausedDeletions.delete(id); deletionFailures.delete(id); }
           if (result.deferred) { scheduleDeletionResume(250); }
           return result;
         })
@@ -349,7 +362,11 @@ export function createOutrightDatabase(options = {}) {
         for (const id of ids) {
           try {
             const result = await deleteArchivedInBatches(db, id, deletionsInFlight, { ...deletionContext, automatic: true });
-            if (result.deleted) deleted.push(id);
+            if (result.deleted) {
+              deleted.push(id);
+              pausedDeletions.delete(id);
+              deletionFailures.delete(id);
+            }
             else if (result.deferred) { deferred += 1; scheduleDeletionResume(250); }
           }
           catch (error) {

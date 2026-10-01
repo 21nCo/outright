@@ -684,11 +684,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   function persistTranscriptItem(state, item) {
     state.transcriptSeq = (state.transcriptSeq ?? 0) + 1;
     const toolItem = item.payload?.item ?? null;
-    const boundedItem = toolItem && Buffer.byteLength(JSON.stringify(toolItem)) > MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES
-      ? { truncated: true, preview: truncateUtf8(JSON.stringify(toolItem), MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES - 256) } : toolItem;
     const payload = item.kind === "text"
       ? { runId: state.run.id, provider: state.run.provider, truncated: Boolean(item.payload?.truncated) }
-      : { runId: state.run.id, item: boundedItem };
+      : boundedToolPayload(state.run.id, toolItem);
     const body = item.kind === "tool" ? truncateUtf8(item.body, MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES) : item.body;
     const input = budgetTranscript(state, { id: `${state.run.id}:${state.transcriptSeq}`, conversationId: state.conversation.id, role: "assistant", kind: item.kind, body, payload });
     if (!input) return;
@@ -1115,6 +1113,24 @@ function boundUtf8(value, maxBytes) {
 }
 
 function truncateUtf8(value, maxBytes) { return boundUtf8(value, maxBytes).text; }
+
+function boundedToolPayload(runId, item) {
+  const payload = { runId, item };
+  if (Buffer.byteLength(JSON.stringify(payload)) <= MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES) return payload;
+  const source = JSON.stringify(item);
+  let low = 0;
+  let high = Math.min(Buffer.byteLength(source), MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES);
+  let bounded = { runId, item: { truncated: true, preview: "" } };
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = { runId, item: { truncated: true, preview: truncateUtf8(source, middle) } };
+    if (Buffer.byteLength(JSON.stringify(candidate)) <= MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES) {
+      bounded = candidate;
+      low = middle + 1;
+    } else high = middle - 1;
+  }
+  return bounded;
+}
 
 export function buildProviderCommand(conversation, run) {
   if (run.provider === "claude") {

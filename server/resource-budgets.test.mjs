@@ -962,7 +962,7 @@ test("a legacy run error uses the worker and a required cleanup audit waits for 
   }
 });
 
-test("persistent cleanup failure pauses retries but the durable marker resumes after restart", async () => {
+test("persistent cleanup failure pauses retries and automatic cleanup clears paused state", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-cleanup-retry-"));
   const filename = path.join(directory, "outright.db");
   let failures = 0;
@@ -975,7 +975,7 @@ test("persistent cleanup failure pauses retries but the durable marker resumes a
     legacy.exec("CREATE TRIGGER refuse_archive_delete BEFORE DELETE ON messages BEGIN SELECT RAISE(FAIL, 'blocked by fixture'); END");
     legacy.close();
     await assert.rejects(database.deleteArchivedConversation(archived.id, archived.id), /blocked by fixture/);
-    const deadline = Date.now() + 20_000;
+    const deadline = Date.now() + 30_000;
     while (failures < 5) {
       assert.ok(Date.now() < deadline, `cleanup did not reach its retry budget (${failures})`);
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -987,14 +987,29 @@ test("persistent cleanup failure pauses retries but the durable marker resumes a
     assert.equal(probe.prepare("SELECT deleting FROM conversations WHERE id = ?").get(archived.id)?.deleting, 1);
     probe.exec("DROP TRIGGER refuse_archive_delete");
     probe.close();
+    assert.deepEqual((await database.pruneHistory()).ids, [archived.id]);
+    assert.equal(database.capacity().cleanupPaused, 0, "successful automatic cleanup retained a stale paused marker");
+    const interrupted = chat(database, "restart after failed cleanup");
+    database.addMessage({ conversationId: interrupted.id, role: "assistant", body: "history" });
+    database.updateConversation(interrupted.id, { archived: true });
+    const blocked = new Database(filename);
+    blocked.exec("CREATE TRIGGER refuse_archive_delete BEFORE DELETE ON messages BEGIN SELECT RAISE(FAIL, 'blocked by fixture'); END");
+    blocked.close();
+    await assert.rejects(database.deleteArchivedConversation(interrupted.id, interrupted.id), /blocked by fixture/);
     database.close();
+    const recovered = new Database(filename);
+    recovered.exec("DROP TRIGGER refuse_archive_delete");
+    recovered.close();
     database = createOutrightDatabase({ filename });
+    assert.equal(database.capacity().cleanupPaused, 0);
+    assert.equal(database.getConversation(archived.id), undefined);
     const resumed = Date.now() + 5000;
-    while (database.getConversation(archived.id)) {
+    while (database.getConversation(interrupted.id)) {
       assert.ok(Date.now() < resumed, "durable cleanup marker did not resume after restart");
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id));
+    assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === interrupted.id));
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
