@@ -1,0 +1,36 @@
+server/archive-delete-worker.mjs
+  h_a39f9495f9ec1d 6,38-41,43-46
+server/archive-shadow.mjs
+  h_a39f9495f9ec1d 20-21,78-85,113,119,133-159,184,229-233,253-256
+server/archive-shadow.test.mjs
+  h_a39f9495f9ec1d 72-85,209,213-218
+server/database.mjs
+  h_a39f9495f9ec1d 120,1423,1433,1442,1451,1511,1516
+server/outright-runtime.mjs
+  h_a39f9495f9ec1d 15,18
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 6,262,268,275-286,301,317
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 918,1008
+src/App.jsx
+  h_a39f9495f9ec1d 54,230,234-235,792-794,861,869,891,974-978,1756,1793
+src/components/SettingsDialog.jsx
+  h_a39f9495f9ec1d 210
+src/styles.css
+  h_a39f9495f9ec1d 387
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 518-554,685-686,2689-2695,2719-2720,4879
+tests/ui-races.test.mjs
+  h_a39f9495f9ec1d 885,888
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4b5ad64eb61998fe63ffddcecea88983a3f4bc0a",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
