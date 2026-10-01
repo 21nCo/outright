@@ -93,11 +93,14 @@ export function createOutrightDatabase(options = {}) {
   let deletionTick;
   let deletionTickKind;
   let deletionCursor = 0;
+  let deletionScanWrapped = false;
   let migrationError = null;
   const deletionsInFlight = new Set();
   const deletionWorkers = new Set();
   const deletionFailures = new Map();
   const pausedDeletions = new Set();
+  const deletionRetryBaseMs = Number.isFinite(options.deletionRetryBaseMs) && options.deletionRetryBaseMs >= 1
+    ? options.deletionRetryBaseMs : 1000;
   const deletionIdleWaiters = new Set();
   const closeWaiters = new Set();
   const releaseLeaseIfIdle = () => {
@@ -198,21 +201,27 @@ export function createOutrightDatabase(options = {}) {
     const candidates = db.prepare("SELECT rowid, id FROM conversations WHERE deleting = 1 AND rowid > ? ORDER BY rowid LIMIT 64");
     const rows = candidates.all(deletionCursor);
     if (!rows.length) {
-      const wrapped = deletionCursor !== 0;
+      const wrap = deletionCursor !== 0 && !deletionScanWrapped;
       deletionCursor = 0;
-      // A marker can be added behind the cursor while a worker is running.
-      // Visit the earlier rowids once before going idle; a fully scanned
-      // empty table must not keep scheduling itself.
-      if (wrapped) scheduleDeletionResume();
+      deletionScanWrapped = wrap;
+      // Visit earlier rowids once, then stop if no marker can run. A full
+      // page of paused markers must not schedule an endless immediate loop.
+      if (wrap) scheduleDeletionResume();
       return;
     }
     const pending = rows.find((row) => !pausedDeletions.has(row.id) && !deletionsInFlight.has(row.id));
     deletionCursor = pending?.rowid ?? rows.at(-1).rowid;
     if (!pending) {
       if (rows.length === 64) scheduleDeletionResume();
-      else deletionCursor = 0;
+      else {
+        const wrap = !deletionScanWrapped;
+        deletionCursor = 0;
+        deletionScanWrapped = wrap;
+        if (wrap) scheduleDeletionResume();
+      }
       return;
     }
+    deletionScanWrapped = false;
     deleteArchivedInBatches(db, pending.id, deletionsInFlight, { ...deletionContext, automatic: true })
       .then((result) => {
         if (result.deleted) { deletionFailures.delete(pending.id); pausedDeletions.delete(pending.id); }
@@ -225,7 +234,7 @@ export function createOutrightDatabase(options = {}) {
         deletionFailures.set(pending.id, failures);
         if (failures >= 5) pausedDeletions.add(pending.id);
         else deletionCursor = 0;
-        scheduleDeletionResume(pausedDeletions.has(pending.id) ? 0 : Math.min(16_000, 1000 * 2 ** (failures - 1)));
+        scheduleDeletionResume(pausedDeletions.has(pending.id) ? 0 : Math.min(16_000, deletionRetryBaseMs * 2 ** (failures - 1)));
       });
   };
   if (db.prepare("SELECT 1 FROM conversations WHERE deleting = 1 LIMIT 1").get()) {

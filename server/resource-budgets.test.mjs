@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHook } from "node:async_hooks";
 import test from "node:test";
 import Database from "better-sqlite3";
 import { existsSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
@@ -1321,6 +1322,56 @@ test("persistent cleanup failure pauses retries and automatic cleanup clears pau
     assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id));
     assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === interrupted.id));
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("a full page of paused archive markers leaves the scheduler idle and drains after restart", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-paused-page-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  const ids = [];
+  try {
+    for (let index = 0; index < 64; index += 1) {
+      const archived = chat(database, `paused ${index}`);
+      database.updateConversation(archived.id, { archived: true });
+      ids.push(archived.id);
+    }
+    await database.close();
+    const legacy = new Database(filename);
+    legacy.prepare("UPDATE conversations SET deleting = 1 WHERE archived = 1").run();
+    legacy.exec("CREATE TRIGGER refuse_archive_delete BEFORE DELETE ON conversations BEGIN SELECT RAISE(FAIL, 'blocked by fixture'); END");
+    legacy.close();
+    database = createOutrightDatabase({ filename, deletionRetryBaseMs: 1 });
+    const deadline = Date.now() + 10_000;
+    while (database.capacity().cleanupPaused < ids.length) {
+      assert.ok(Date.now() < deadline, `cleanup paused ${database.capacity().cleanupPaused} of ${ids.length} failed markers`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    let immediateCount = 0;
+    const hook = createHook({ init(_id, type) { if (type === "Immediate") immediateCount += 1; } });
+    hook.enable();
+    try { await new Promise((resolve) => setTimeout(resolve, 100)); }
+    finally { hook.disable(); }
+    assert.ok(immediateCount < 50, `paused cleanup kept scheduling itself (${immediateCount} immediates in 100ms)`);
+    assert.equal(database.capacity().cleanupPending, true);
+    const repair = new Database(filename);
+    repair.exec("DROP TRIGGER refuse_archive_delete");
+    repair.close();
+    assert.equal((await database.deleteArchivedConversation(ids[0], ids[0])).deleted, 1);
+    await database.close();
+    database = createOutrightDatabase({ filename });
+    const drainDeadline = Date.now() + 8000;
+    while (database.capacity().cleanupPending) {
+      assert.ok(Date.now() < drainDeadline, "paused markers did not drain after restart");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    for (const id of ids) {
+      assert.equal(database.getConversation(id), undefined);
+      assert.equal(database.listAudit().filter((entry) => entry.action === "retention.archived.deleted" && entry.target === id).length, 1);
+    }
+  } finally {
+    await database?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("closing during an oversized archive delete keeps its lease until the worker exits and resumes cleanup", async () => {
