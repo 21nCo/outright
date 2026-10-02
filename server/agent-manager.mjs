@@ -320,9 +320,20 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   const active = new Map();
   const queue = [];
   const launches = new Set();
+  const maintenanceWaiters = new Set();
   let shuttingDown = false;
   let shutdownPromise;
   const providerDiscovery = providerDiscoveryFactory({ onChange: onProvidersChanged });
+
+  function wakeMaintenanceWaiters() {
+    for (const resolve of maintenanceWaiters) resolve();
+    maintenanceWaiters.clear();
+  }
+
+  function waitForMaintenance() {
+    if (!database.maintenanceActive || shuttingDown) return Promise.resolve();
+    return new Promise((resolve) => maintenanceWaiters.add(resolve));
+  }
 
   function providers() {
     return providerDiscovery.list();
@@ -528,16 +539,29 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if (!active.has(state.run.id) || state.finishing) return;
     state.finishing = true;
     clearCheckpointTimer(state);
-    const successful = exitCode === 0 && !error && !state.stopped;
-    const status = state.stopped ? "stopped" : successful ? "completed" : "failed";
-    const message = error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : "");
-    const finishedAt = new Date().toISOString();
-    const transcriptMessage = budgetTranscript(state, pendingAssistantMessage(state), { terminal: true });
-    // The last transcript checkpoint and terminal run state commit together.
-    // A crash can leave the run recoverable. At aggregate capacity the final
-    // segment is explicitly omitted while the terminal run state still commits.
-    const finished = database.finishRun(state.run.id, { status, finishedAt, exitCode, error: message || null, pid: null }, transcriptMessage);
-    if (transcriptMessage && !finished.message) markTranscriptOmitted(state);
+    let status;
+    let message;
+    let finishedAt;
+    let finished;
+    try {
+      const successful = exitCode === 0 && !error && !state.stopped;
+      status = state.stopped ? "stopped" : successful ? "completed" : "failed";
+      message = error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : "");
+      finishedAt = new Date().toISOString();
+      const transcriptMessage = budgetTranscript(state, pendingAssistantMessage(state), { terminal: true });
+      // The last checkpoint and terminal state commit together. Until that
+      // commit succeeds this state still owns its run slot and recovery data.
+      finished = database.finishRun(state.run.id, { status, finishedAt, exitCode, error: message || null, pid: null }, transcriptMessage);
+      if (transcriptMessage && !finished.message) markTranscriptOmitted(state);
+    } catch (writeError) {
+      state.finishing = false;
+      if (writeError.statusCode === 503 && database.maintenanceActive) {
+        state.pendingFinish = { exitCode, error };
+        return false;
+      }
+      throw writeError;
+    }
+    state.pendingFinish = null;
     // A Windows wrapper leaves a completed Job Object proof until this
     // terminal transaction succeeds. Other platforms may leave a record only
     // after a hard kill; both are safe to remove after the durable commit.
@@ -548,6 +572,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     database.audit(`agent.run.${status}`, { target: state.run.id, exitCode, error: message || undefined });
     emit(state.run.id, `run.${status}`, { exitCode, error: message || null, finishedAt });
     drain();
+    return true;
   }
 
   async function stop(runId, preserveOnMaintenance = false) {
@@ -615,24 +640,35 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
             // to a group kill would orphan zombies to PID 1 and recreate the
             // leak this ownership boundary prevents. Fail closed, retain the
             // durable handshake, and never claim the tree stopped.
-            state.stopping = null;
             throw new Error(`Agent process tree did not terminate: ${runId}`);
           }
           await new Promise((resolve) => setTimeout(resolve, 25));
         }
       }
-      try { finish(state, state.exitCode ?? null, null); }
+      try {
+        if (finish(state, state.exitCode ?? null, null) === false) {
+          if (preserveOnMaintenance && !state.child) return false;
+          const unavailable = new Error("Archive maintenance is running; retry shortly");
+          unavailable.statusCode = 503;
+          throw unavailable;
+        }
+      }
       catch (error) {
         // A childless run may still be awaiting validation when cutover
         // starts. Its queued row is recovery evidence; there is no process
         // owner to wait for after the validation promise settles.
         if (preserveOnMaintenance && !state.child && database.maintenanceActive && error.statusCode === 503) return false;
-        state.stopping = null;
         throw error;
       }
       return true;
     })();
-    return state.stopping;
+    const stopping = state.stopping;
+    try { return await stopping; }
+    finally {
+      // A failed durable write or tree teardown must remain retryable. The
+      // async body above can settle before its promise is assigned to state.
+      if (state.stopping === stopping && active.has(runId)) state.stopping = null;
+    }
   }
 
   // Asks the launch wrapper to tear its provider tree down in reaping order
@@ -660,32 +696,47 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       const state = { ...entry, assistantSegments: [], assistantBytes: 0, assistantTruncated: false, assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, transcriptSizes: new Map(), transcriptBytes: 0, transcriptOmitted: false, stderr: "", stopped: false, checkpointPendingBytes: 0, lastCheckpointAt: 0, checkpointTimer: null, checkpointHalted: false };
       active.set(entry.run.id, state);
       state.launch = entry.launch = (async () => {
-        try {
-          const fresh = database.getConversation(entry.run.conversationId);
-          if (!fresh) throw new Error("Conversation no longer exists");
-          if (entry.run.worktreePath && fresh.worktreePath !== entry.run.worktreePath) {
-            throw new Error("Conversation target changed after this run was queued; submit again");
+        while (!state.stopped && !shuttingDown) {
+          try {
+            const fresh = database.getConversation(entry.run.conversationId);
+            if (!fresh) throw new Error("Conversation no longer exists");
+            if (entry.run.worktreePath && fresh.worktreePath !== entry.run.worktreePath) {
+              throw new Error("Conversation target changed after this run was queued; submit again");
+            }
+            const authorize = await validateConversation(fresh);
+            if (state.stopped || shuttingDown) return;
+            const current = database.getConversation(fresh.id);
+            if (!current || ["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== fresh[key])
+              || (entry.run.worktreePath && current.worktreePath !== entry.run.worktreePath)) {
+              throw new Error("Conversation target changed while preparing the run; submit again");
+            }
+            // Recheck mutable trust synchronously immediately before spawning.
+            authorize?.();
+            // A recovery retry explicitly asks for a new provider session even
+            // when the conversation still advertises the interrupted one.
+            state.conversation = entry.providerSessionId !== undefined
+              ? { ...current, providerSessionId: entry.providerSessionId }
+              : entry.forceFreshSession ? { ...current, providerSessionId: null } : current;
+            if (await start(state, authorize) === "deferred") {
+              active.delete(entry.run.id);
+              queue.unshift(entry);
+            }
+            return;
+          } catch (error) {
+            if (error.statusCode === 503 && database.maintenanceActive && !state.child && !state.stopped) {
+              // Validation may have succeeded just as the database closed.
+              // Revalidate the target after reopening before any launch side effect.
+              await waitForMaintenance();
+              continue;
+            }
+            if (!state.stopped && !error?.preserveActiveRun) {
+              if (finish(state, null, error) === false) {
+                await waitForMaintenance();
+                if (!shuttingDown) finish(state, null, error);
+              }
+            }
+            return;
           }
-          const authorize = await validateConversation(fresh);
-          if (state.stopped || shuttingDown) return;
-          const current = database.getConversation(fresh.id);
-          if (!current || ["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== fresh[key])
-            || (entry.run.worktreePath && current.worktreePath !== entry.run.worktreePath)) {
-            throw new Error("Conversation target changed while preparing the run; submit again");
-          }
-          // Recheck mutable trust synchronously immediately before spawning.
-          authorize?.();
-          // A recovery retry explicitly asks for a new provider session even
-          // when the conversation still advertises the interrupted one.
-          state.conversation = entry.providerSessionId !== undefined
-            ? { ...current, providerSessionId: entry.providerSessionId }
-            : entry.forceFreshSession ? { ...current, providerSessionId: null } : current;
-          if (await start(state, authorize) === "deferred") {
-            active.delete(entry.run.id);
-            queue.unshift(entry);
-          }
-        } catch (error) {
-          if (!state.stopped && !error?.preserveActiveRun) finish(state, null, error);
         }
       })();
       launches.add(state.launch);
@@ -851,12 +902,24 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     providers,
     providerAvailable: providerDiscovery.available,
     schedule,
-    resumeQueued: drain,
+    resumeQueued() {
+      if (!database.maintenanceActive) {
+        wakeMaintenanceWaiters();
+        for (const state of active.values()) {
+          if (state.pendingFinish && (!state.child || state.closed)) {
+            const { exitCode, error } = state.pendingFinish;
+            finish(state, exitCode, error);
+          }
+        }
+      }
+      drain();
+    },
     stop,
     activeRuns: () => [...active.keys()],
     shutdown() {
       if (shutdownPromise) return shutdownPromise;
       shuttingDown = true;
+      wakeMaintenanceWaiters();
       const ids = [...queue.map((entry) => entry.run.id), ...active.keys()];
       shutdownPromise = Promise.allSettled([
         ...ids.map((id) => stop(id, true)),

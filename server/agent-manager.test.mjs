@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import Database from "better-sqlite3";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
@@ -9,6 +10,7 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { AGENT_SUPERVISOR, buildProviderCommand, consumeBoundedLines, createAgentManager as createRuntimeAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_AUTHORIZED_CONTROL, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
 import { streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
+import { createOutrightDatabase } from "./database.mjs";
 
 const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
 const fakeLaunchDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-agent-test-"));
@@ -150,6 +152,96 @@ test("shutdown preserves a childless validation run when maintenance rejects its
   await Promise.all([scheduled, shutdown]);
   assert.equal(spawned, 0);
   assert.equal(database.getRun(run.id).status, "queued", "successor must classify the never-started row");
+});
+
+test("a refused childless terminal write can be cancelled again after maintenance", async () => {
+  const database = fakeDatabase();
+  const run = database.createRun({ ...codexRun("retry-validation-stop"), status: "queued" });
+  let releaseValidation;
+  const validation = new Promise((resolve) => { releaseValidation = resolve; });
+  const manager = createAgentManager({ database, publish: () => {}, validateConversation: () => validation });
+  const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  await new Promise((resolve) => setImmediate(resolve));
+  const finishRun = database.finishRun;
+  database.maintenanceActive = true;
+  database.finishRun = () => { throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 }); };
+  await assert.rejects(manager.stop(run.id), (error) => error.statusCode === 503);
+  assert.deepEqual(manager.activeRuns(), [run.id]);
+  assert.equal(database.getRun(run.id).status, "queued");
+  database.finishRun = finishRun;
+  database.maintenanceActive = false;
+  assert.equal(await manager.stop(run.id), true);
+  assert.equal(database.getRun(run.id).status, "stopped");
+  assert.deepEqual(manager.activeRuns(), []);
+  releaseValidation(() => {});
+  await scheduled;
+  await manager.shutdown();
+});
+
+test("validation refusal and success survive a real archive cutover without losing run capacity", { timeout: 20000 }, async () => {
+  for (const outcome of ["refused", "accepted", "cancelled"]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), `outright-validation-cutover-${outcome}-`));
+    const filename = path.join(directory, "outright.db");
+    const gate = new Int32Array(new SharedArrayBuffer(4));
+    let manager;
+    const database = createOutrightDatabase({ filename, runtimeLease: true, deletionWorkerGate: gate.buffer,
+      onDeletionWorkerExit: () => manager?.resumeQueued() });
+    let releaseValidation;
+    const validation = new Promise((resolve, reject) => { releaseValidation = { resolve, reject }; });
+    let validations = 0;
+    let spawns = 0;
+    let child;
+    try {
+      const survivor = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory, title: "Pending", provider: "codex" });
+      const run = database.createRun({ conversationId: survivor.id, provider: "codex", approvalPolicy: "read-only", prompt: "pending validation" });
+      manager = createAgentManager({ database, publish: () => {},
+        validateConversation: () => { validations++; return validations === 1 ? validation : Promise.resolve(() => {}); },
+        launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture", ownsDescendants: false }),
+        spawnProcess: () => { spawns++; child = fakeChild(); return child; },
+      });
+      const scheduling = manager.schedule({ conversation: survivor, run });
+      await new Promise((resolve) => setImmediate(resolve));
+      const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory, title: "Old", provider: "codex" });
+      const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+      const legacy = new Database(filename);
+      legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
+      legacy.close();
+      database.updateConversation(archived.id, { archived: true });
+      const deletion = database.deleteArchivedConversation(archived.id, archived.id);
+      const deadline = Date.now() + 5000;
+      while (Atomics.load(gate, 0) !== 1) {
+        assert.ok(Date.now() < deadline, "archive worker did not reach cutover");
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      if (outcome === "refused") releaseValidation.reject(new Error("Trust was revoked"));
+      else releaseValidation.resolve(() => {});
+      await new Promise((resolve) => setImmediate(resolve));
+      if (outcome === "cancelled") {
+        await assert.rejects(manager.stop(run.id), (error) => error.statusCode === 503);
+        assert.deepEqual(manager.activeRuns(), [run.id], "refused terminal write retains its capacity reservation");
+      }
+      Atomics.store(gate, 0, 2);
+      Atomics.notify(gate, 0);
+      assert.equal((await deletion).deleted, 1);
+      await scheduling;
+      assert.equal(spawns, outcome === "accepted" ? 1 : 0);
+      assert.equal(database.getRun(run.id).status, outcome === "accepted" ? "running" : outcome === "cancelled" ? "stopped" : "failed");
+      if (outcome === "accepted") {
+        child.emit("close", 0, null);
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(database.getRun(run.id).status, "completed");
+      }
+      assert.deepEqual(manager.activeRuns(), []);
+      assert.equal(database.canLaunchRun(), true);
+    } finally {
+      Atomics.store(gate, 0, 2);
+      Atomics.notify(gate, 0);
+      releaseValidation?.resolve(() => {});
+      await manager?.shutdown();
+      await database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
 });
 
 function fakeChild({ autoAcknowledge = true } = {}) {
