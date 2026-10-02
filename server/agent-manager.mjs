@@ -550,13 +550,20 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     drain();
   }
 
-  async function stop(runId) {
+  async function stop(runId, preserveOnMaintenance = false) {
     const state = active.get(runId);
     if (!state) {
       const index = queue.findIndex((entry) => entry.run.id === runId);
       if (index < 0) return false;
+      try { database.updateRun(runId, { status: "stopped", finishedAt: new Date().toISOString() }); }
+      catch (error) {
+        // During archive cutover the database is closed. Shutdown can leave
+        // this never-started row for the successor to reconcile, but an API
+        // cancellation must report failure without losing its queue entry.
+        if (preserveOnMaintenance && database.maintenanceActive && error.statusCode === 503) return false;
+        throw error;
+      }
       queue.splice(index, 1);
-      database.updateRun(runId, { status: "stopped", finishedAt: new Date().toISOString() });
       emit(runId, "run.stopped", { queued: true });
       return true;
     }
@@ -614,7 +621,15 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
           await new Promise((resolve) => setTimeout(resolve, 25));
         }
       }
-      finish(state, state.exitCode ?? null, null);
+      try { finish(state, state.exitCode ?? null, null); }
+      catch (error) {
+        // A childless run may still be awaiting validation when cutover
+        // starts. Its queued row is recovery evidence; there is no process
+        // owner to wait for after the validation promise settles.
+        if (preserveOnMaintenance && !state.child && database.maintenanceActive && error.statusCode === 503) return false;
+        state.stopping = null;
+        throw error;
+      }
       return true;
     })();
     return state.stopping;
@@ -844,7 +859,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       shuttingDown = true;
       const ids = [...queue.map((entry) => entry.run.id), ...active.keys()];
       shutdownPromise = Promise.allSettled([
-        ...ids.map(stop),
+        ...ids.map((id) => stop(id, true)),
         ...launches,
         providerDiscovery.close(),
       ]).then((results) => {

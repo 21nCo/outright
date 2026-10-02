@@ -115,6 +115,43 @@ test("shutdown waits for an already stopped run's capability cleanup", async () 
   assert.equal(database.getRun(run.id).status, "stopped");
 });
 
+test("a rejected queued cancellation remains retryable after maintenance", async () => {
+  const database = fakeDatabase();
+  database.canLaunchRun = () => false;
+  const run = database.createRun({ ...codexRun("maintenance-queued"), status: "queued" });
+  const manager = createAgentManager({ database, publish: () => {} });
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  const updateRun = database.updateRun;
+  database.updateRun = () => { throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 }); };
+  await assert.rejects(manager.stop(run.id), (error) => error.statusCode === 503);
+  assert.equal(database.getRun(run.id).status, "queued");
+  database.updateRun = updateRun;
+  assert.equal(await manager.stop(run.id), true);
+  assert.equal(database.getRun(run.id).status, "stopped");
+  await manager.shutdown();
+});
+
+test("shutdown preserves a childless validation run when maintenance rejects its terminal write", async () => {
+  const database = fakeDatabase();
+  const run = database.createRun({ ...codexRun("maintenance-validating"), status: "queued" });
+  let releaseValidation;
+  const validation = new Promise((resolve) => { releaseValidation = resolve; });
+  let spawned = 0;
+  const manager = createAgentManager({ database, publish: () => {},
+    validateConversation: () => validation,
+    spawnProcess: () => { spawned += 1; return fakeChild(); },
+  });
+  const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  await new Promise((resolve) => setImmediate(resolve));
+  database.maintenanceActive = true;
+  database.finishRun = () => { throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 }); };
+  const shutdown = manager.shutdown();
+  releaseValidation(() => {});
+  await Promise.all([scheduled, shutdown]);
+  assert.equal(spawned, 0);
+  assert.equal(database.getRun(run.id).status, "queued", "successor must classify the never-started row");
+});
+
 function fakeChild({ autoAcknowledge = true } = {}) {
   const child = new PassThrough();
   child.stdout = new PassThrough();

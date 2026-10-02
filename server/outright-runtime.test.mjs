@@ -82,6 +82,59 @@ function withRuntime(fn, options = {}) {
   };
 }
 
+test("shutdown during archive cutover preserves a rejected queued cancellation and releases the runtime lease", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-cutover-shutdown-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  const filename = path.join(dataDirectory, "outright.db");
+  const gate = new Int32Array(new SharedArrayBuffer(4));
+  let runtime;
+  let successor;
+  try {
+    process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json", deletionWorkerGate: gate.buffer });
+    const survivor = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Pending work", provider: "codex" });
+    const run = runtime.database.createRun({ conversationId: survivor.id, provider: "codex", approvalPolicy: "read-only", prompt: "keep this queued" });
+    // Keep the manager's actual queue occupied without starting a provider.
+    runtime.database.canLaunchRun = () => false;
+    await runtime.agents.schedule({ conversation: survivor, run });
+    const archived = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Old archive", provider: "codex" });
+    const message = runtime.database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    const legacy = new Database(filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
+    legacy.close();
+    runtime.database.updateConversation(archived.id, { archived: true });
+    const deletion = runtime.database.deleteArchivedConversation(archived.id, archived.id);
+    const deadline = Date.now() + 5000;
+    while (Atomics.load(gate, 0) !== 1) {
+      assert.ok(Date.now() < deadline, "archive worker did not reach cutover");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    await assert.rejects(runtime.agents.stop(run.id), (error) => error.statusCode === 503);
+    await runtime.shutdown();
+    await assert.rejects(deletion, (error) => error.statusCode === 503);
+    const retained = new Database(filename, { readonly: true });
+    try {
+      assert.equal(retained.prepare("SELECT status FROM runs WHERE id = ?").get(run.id).status, "queued");
+      assert.equal(retained.prepare("SELECT body FROM messages WHERE id = ?").get(message.id).body.length, 4 * 1024 * 1024);
+    } finally { retained.close(); }
+    successor = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    const recovered = successor.database.getRun(run.id);
+    assert.equal(recovered.status, "interrupted");
+    assert.equal(recovered.recoveryClass, "never-started");
+    const response = responseCapture();
+    await successor.handleRequest(requestStream("GET", "/api/capacity"), response);
+    assert.equal(response.statusCode, 200);
+  } finally {
+    Atomics.store(gate, 0, 2);
+    Atomics.notify(gate, 0);
+    await successor?.shutdown();
+    await runtime?.shutdown();
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR;
+    else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
 test("run detail pages a migrated oversized replay tail without returning pruned output", (() => {
   let runId;
   return withRuntime(async (runtime) => {
