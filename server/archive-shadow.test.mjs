@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { existsSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { allocatedDatabaseBytes, archiveShadowPaths, beginArchiveShadow, cutoverArchiveShadow, prepareArchiveShadowCutover, recoverArchiveShadow } from "./archive-shadow.mjs";
+import { createOutrightDatabase, recoverArchiveBeforeStartup } from "./database.mjs";
 
 function fixture() {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-shadow-recover-"));
@@ -186,6 +189,104 @@ test("recovery rejects a substituted candidate after the original is renamed", (
     assert.equal(body(item.filename), "recoverable payload");
     assert.equal(existsSync(item.old), false);
     assert.equal(existsSync(item.next), false);
+  } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
+test("recovery keeps the fallback when the authenticated candidate is replaced during promotion", () => {
+  const item = fixture();
+  const originalRename = fs.renameSync;
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    renameSync(item.filename, item.old);
+    const substitute = `${item.filename}.substitute`;
+    const other = new Database(substitute);
+    other.exec("CREATE TABLE evidence (id INTEGER PRIMARY KEY, body TEXT NOT NULL)");
+    other.prepare("INSERT INTO evidence (body) VALUES (?)").run("unvalidated payload");
+    other.close();
+    fs.renameSync = (from, to) => {
+      originalRename(from, to);
+      if (from === item.next && to === item.filename) {
+        fs.rmSync(to);
+        originalRename(substitute, to);
+      }
+    };
+    syncBuiltinESMExports();
+    recoverArchiveShadow(item.filename);
+    assert.equal(body(item.filename), "recoverable payload");
+    assert.equal(existsSync(item.state), false);
+  } finally {
+    fs.renameSync = originalRename;
+    syncBuiltinESMExports();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
+});
+
+test("recovery keeps the fallback when a previously promoted candidate changes before cleanup", () => {
+  const item = fixture();
+  const originalOpen = fs.openSync;
+  const originalRename = fs.renameSync;
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    renameSync(item.filename, item.old);
+    renameSync(item.next, item.filename);
+    const substitute = `${item.filename}.substitute`;
+    const other = new Database(substitute);
+    other.exec("CREATE TABLE evidence (id INTEGER PRIMARY KEY, body TEXT NOT NULL)");
+    other.prepare("INSERT INTO evidence (body) VALUES (?)").run("unvalidated payload");
+    other.close();
+    fs.openSync = (name, flags, ...rest) => {
+      const fd = originalOpen(name, flags, ...rest);
+      if (name === item.filename && flags === "r+") {
+        fs.rmSync(name);
+        originalRename(substitute, name);
+      }
+      return fd;
+    };
+    syncBuiltinESMExports();
+    recoverArchiveShadow(item.filename);
+    assert.equal(body(item.filename), "recoverable payload");
+    assert.equal(existsSync(item.state), false);
+  } finally {
+    fs.openSync = originalOpen;
+    syncBuiltinESMExports();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
+});
+
+test("large interrupted startup recovery yields while authenticating the candidate", async () => {
+  const item = fixture();
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.exec("CREATE TABLE bulk (body BLOB)");
+    source.exec("INSERT INTO bulk (body) VALUES (zeroblob(67108864))");
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    renameSync(item.filename, item.old);
+    assert.throws(() => createOutrightDatabase({ filename: item.filename }), /asynchronous startup recovery/);
+    let settled = false;
+    const recovery = recoverArchiveBeforeStartup({ filename: item.filename }).finally(() => { settled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, "large candidate authentication blocked the event loop");
+    await recovery;
+    assert.equal(body(item.filename), "recoverable payload");
+    assert.equal(existsSync(item.old), false);
+    beginArchiveShadow(item.filename);
+    let sourceSettled = false;
+    const sourceRecovery = recoverArchiveBeforeStartup({ filename: item.filename }).finally(() => { sourceSettled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(sourceSettled, false, "source integrity validation blocked the event loop");
+    await sourceRecovery;
+    assert.equal(existsSync(item.state), false);
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
 });
 

@@ -5,7 +5,7 @@ import Database from "better-sqlite3";
 import { existsSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createOutrightDatabase } from "./database.mjs";
+import { createOutrightDatabase, recoverArchiveBeforeStartup } from "./database.mjs";
 
 function chat(database, title = "Budget test") {
   return database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title, provider: "codex" });
@@ -55,6 +55,22 @@ function ageArchived(filename, ids) {
   for (const id of ids) admin.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?").run(old, id);
   admin.close();
 }
+
+test("an empty store admits its first write even when a migration tick is exhausted", () => {
+  const originalNow = performance.now;
+  let tick = 0;
+  let database;
+  try {
+    performance.now = () => { tick += 10; return tick; };
+    database = createOutrightDatabase({ filename: ":memory:" });
+    assert.equal(database.capacity().retainedUsageStatus, "measured");
+    assert.ok(chat(database).id);
+    assert.ok(database.capacity().retainedBytes > 0);
+  } finally {
+    database?.close();
+    performance.now = originalNow;
+  }
+});
 
 test("burst admission is bounded and a refused run leaves no user message", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
@@ -1262,6 +1278,7 @@ test("failed archive recovery rejects required audit waiters and preserves sourc
     // Restore the marker format; startup recovery discards the uncommitted
     // candidate and resumes the durable deletion marker.
     writeFileSync(`${filename}.archive-state`, JSON.stringify({ version: 1, source: realpathSync(filename) }));
+    await recoverArchiveBeforeStartup({ filename });
     const reopened = createOutrightDatabase({ filename, runtimeLease: true });
     try { assert.ok(reopened.getConversation(archived.id)); }
     finally { await reopened.close(); }

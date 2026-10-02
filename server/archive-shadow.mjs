@@ -136,8 +136,18 @@ function recoverInterruptedCutover(filename, next, old, marker) {
   let candidateVerified = false;
   if (!fileInfo(filename)) {
     candidateVerified = authenticatedCandidate(next, marker);
-    if (candidateVerified) renameSync(next, filename);
-    else {
+    if (candidateVerified) {
+      renameSync(next, filename);
+      durableDirectory(filename);
+      // Authentication covered the old pathname. Do not release the only
+      // fallback until the promoted pathname still names those same bytes.
+      if (!matchesCandidate(filename, marker.candidate, false, true) || hasNonemptyWal(filename)) {
+        renameSync(filename, next);
+        durableDirectory(filename);
+        candidateVerified = false;
+      }
+    }
+    if (!candidateVerified) {
       // Keep the marker and both names intact if the only fallback is
       // corrupt. Renaming first would erase the evidence of that failure.
       if (!validDatabase(old)) throw new Error("Neither archive maintenance database is valid");
@@ -145,15 +155,25 @@ function recoverInterruptedCutover(filename, next, old, marker) {
     }
     durableDirectory(filename);
   }
-  if (fileInfo(old) && !candidateVerified && !authenticatedCandidate(filename, marker, true)) {
+  if (fileInfo(old) && !candidateVerified) {
+    candidateVerified = authenticatedCandidate(filename, marker, true);
+    if (!candidateVerified) {
+      if (!validDatabase(old)) throw new Error("Neither archive maintenance database is valid");
+      rmSync(filename);
+      durableDirectory(filename);
+      renameSync(old, filename);
+      durableDirectory(filename);
+    }
+  }
+  durableFile(filename);
+  durableDirectory(filename);
+  if (candidateVerified && !matchesCandidate(filename, marker.candidate, false, true)) {
     if (!validDatabase(old)) throw new Error("Neither archive maintenance database is valid");
-    rmSync(filename);
+    renameSync(filename, next);
     durableDirectory(filename);
     renameSync(old, filename);
     durableDirectory(filename);
   }
-  durableFile(filename);
-  durableDirectory(filename);
   if (privateRegularFile(old)) { rmSync(old); durableDirectory(filename); }
 }
 

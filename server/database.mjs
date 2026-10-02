@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import { foldFindText } from "../src/lib/find-text.js";
 import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
-import { allocatedDatabaseBytes, beginArchiveShadow, recoverArchiveShadow } from "./archive-shadow.mjs";
+import { allocatedDatabaseBytes, archiveShadowPaths, beginArchiveShadow, recoverArchiveShadow } from "./archive-shadow.mjs";
 
 const DEFAULT_SETTINGS = {
   provider: "codex",
@@ -29,7 +29,7 @@ const MAX_INLINE_MESSAGE_BYTES = 64 * 1024;
 const FIND_SCAN_BYTES = 8 * 1024 * 1024;
 // Keep one synchronous fold small enough for responsive event delivery even
 // after earlier searches have increased heap pressure in a long session.
-const FIND_CHUNK_BYTES = 32 * 1024;
+const FIND_CHUNK_BYTES = 16 * 1024;
 const RETAINED_COLUMNS = [
   ["settings", "key, value"],
   ["project_groups", "id, name, created_at"],
@@ -58,6 +58,19 @@ const SETTING_RULES = {
   notifications: (value) => typeof value === "boolean",
   theme: (value) => ["system", "light", "dark"].includes(value),
 };
+
+// An interrupted cutover may need to authenticate a multi-gigabyte file.
+// Do that on a worker while holding the runtime lease before opening SQLite.
+export async function recoverArchiveBeforeStartup(options = {}) {
+  const dataDirectory = path.resolve(options.dataDirectory
+    ?? process.env.OUTRIGHT_DATA_DIR
+    ?? path.join(os.homedir(), ".outright"));
+  const requestedFilename = options.filename ?? path.join(dataDirectory, "outright.db");
+  if (requestedFilename === ":memory:") return;
+  mkdirSync(path.dirname(path.resolve(requestedFilename)), { recursive: true, mode: 0o700 });
+  const filename = path.join(realpathSync(path.dirname(path.resolve(requestedFilename))), path.basename(requestedFilename));
+  if (existsSync(archiveShadowPaths(filename).state)) await recoverArchiveOnWorker(filename, false, true);
+}
 
 export function createOutrightDatabase(options = {}) {
   const dataDirectory = path.resolve(options.dataDirectory
@@ -1379,6 +1392,9 @@ function openRuntimeStorage(filename, storageFilename, runtimeLease) {
       leaseDb.exec("BEGIN EXCLUSIVE; COMMIT;");
     }
     if (storageFilename !== ":memory:") {
+      if (existsSync(archiveShadowPaths(storageFilename).state)) {
+        throw new Error("Interrupted archive maintenance requires asynchronous startup recovery");
+      }
       recoverArchiveShadow(storageFilename);
       const source = existsSync(storageFilename) ? lstatSync(storageFilename) : null;
       if (source && (source.nlink !== 1 || !source.isFile())) throw new Error("A runtime database must be a private regular file");
@@ -1551,9 +1567,9 @@ function deleteOversizedArchivedRow(filename, conversationId, oversized, lifecyc
   });
 }
 
-function recoverArchiveOnWorker(filename, sourceUnmoved = false) {
+function recoverArchiveOnWorker(filename, sourceUnmoved = false, runtimeLease = false) {
   return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL("./archive-recover-worker.mjs", import.meta.url), { workerData: { filename, sourceUnmoved } });
+    const worker = new Worker(new URL("./archive-recover-worker.mjs", import.meta.url), { workerData: { filename, sourceUnmoved, runtimeLease } });
     let reply;
     let failure;
     worker.on("message", (message) => { reply = message; });
@@ -1688,9 +1704,15 @@ function prepareRetainedMeasurement(db, version) {
   }
   const counterCreated = db.prepare("INSERT OR IGNORE INTO retained_usage (id, bytes) VALUES (1, 0)").run().changes > 0;
   db.exec("CREATE TABLE IF NOT EXISTS retained_scans (table_name TEXT PRIMARY KEY, cursor INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0)");
-  if (version >= 2 && !counterCreated && !db.prepare("SELECT 1 FROM retained_scans LIMIT 1").get()) {
+  const scanExists = Boolean(db.prepare("SELECT 1 FROM retained_scans LIMIT 1").get());
+  // A genuinely empty store has nothing to backfill. Avoid depending on an
+  // 8 ms migration tick to complete before its first user write under load.
+  if (counterCreated && !scanExists && RETAINED_COLUMNS.every(([table]) =>
+    !db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get())) {
     db.prepare("UPDATE retained_usage SET measured = 1 WHERE id = 1").run();
-  } else if (!db.prepare("SELECT 1 FROM retained_scans LIMIT 1").get()) {
+  } else if (version >= 2 && !counterCreated && !scanExists) {
+    db.prepare("UPDATE retained_usage SET measured = 1 WHERE id = 1").run();
+  } else if (!scanExists) {
     db.transaction(() => {
       db.prepare("UPDATE retained_usage SET bytes = 0, measured = 0 WHERE id = 1").run();
       const insert = db.prepare("INSERT INTO retained_scans (table_name) VALUES (?)");
