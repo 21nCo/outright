@@ -762,7 +762,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   }
 
   function drain() {
-    if (shuttingDown) return;
+    // Every entry point, including the disk retry timer, reaches this guard.
+    // During the archive cutover getSettings cannot read the closed SQLite
+    // connection. onDeletionWorkerExit calls resumeQueued after it reopens.
+    if (shuttingDown || database.maintenanceActive) return;
     const max = database.getSettings().maxConcurrentRuns;
     while (active.size < max && queue.length) {
       if (database.canLaunchRun?.() === false) {
@@ -944,13 +947,12 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     providerAvailable: providerDiscovery.available,
     schedule,
     resumeQueued() {
-      if (!database.maintenanceActive) {
-        wakeMaintenanceWaiters();
-        for (const state of active.values()) {
-          if (state.pendingFinish && (!state.child || state.closed)) {
-            const { exitCode, error } = state.pendingFinish;
-            finish(state, exitCode, error);
-          }
+      if (database.maintenanceActive) return;
+      wakeMaintenanceWaiters();
+      for (const state of active.values()) {
+        if (state.pendingFinish && (!state.child || state.closed)) {
+          const { exitCode, error } = state.pendingFinish;
+          finish(state, exitCode, error);
         }
       }
       drain();

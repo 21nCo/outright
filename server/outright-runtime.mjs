@@ -371,7 +371,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       const runMatch = url.pathname.match(/^\/api\/runs\/([^/]+)$/);
       if (runMatch && request.method === "GET") {
         const run = database.getRun(runMatch[1]);
-        return json(response, run ? 200 : 404, run ? { ...run, events: database.listRunEvents(run.id, Number(url.searchParams.get("after") ?? 0)) } : { error: "Run not found" });
+        if (!run || !database.getConversation(run.conversationId)) return json(response, 404, { error: "Run not found" });
+        return json(response, 200, { ...run, events: database.listRunEvents(run.id, Number(url.searchParams.get("after") ?? 0)) });
       }
       const stopRunMatch = url.pathname.match(/^\/api\/runs\/([^/]+)\/stop$/);
       if (stopRunMatch && request.method === "POST") { const stopped = await agents.stop(stopRunMatch[1]); return json(response, stopped ? 202 : 404, { stopped }); }

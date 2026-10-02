@@ -12,10 +12,17 @@ function chat(database, title = "Budget test") {
   return database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title, provider: "codex" });
 }
 
-function archivePresentOrMaintaining(database, id) {
-  try { return Boolean(database.getConversation(id)); }
+function archivePresentOrMaintaining(database, filename, id) {
+  // Public reads hide a marked archive while cleanup still needs to finish.
+  // Follow the durable row itself when asserting physical completion.
+  if (database.maintenanceActive) return true;
+  try {
+    const probe = new Database(filename, { readonly: true, fileMustExist: true });
+    try { return Boolean(probe.prepare("SELECT 1 FROM conversations WHERE id = ?").get(id)); }
+    finally { probe.close(); }
+  }
   catch (error) {
-    if (error.statusCode === 503 && database.capacity().migrationStatus === "maintenance") return true;
+    if (database.capacity().migrationStatus === "maintenance") return true;
     throw error;
   }
 }
@@ -896,7 +903,7 @@ test("large archived cleanup yields to active work and resumes after interruptio
     assert.throws(() => database.moveConversation(archived.id,
       { projectId: "other", worktreeId: "other", worktreePath: "/tmp/other" }),
     (error) => error.statusCode === 409, "a marked archive must not move before deletion resumes");
-    assert.equal(database.getConversation(archived.id).worktreePath, "/tmp/w");
+    assert.equal(database.getConversation(archived.id), undefined, "a partially deleted archive is hidden");
     await deletion;
     assert.equal(database.getConversation(archived.id), undefined);
     assert.equal(database.getRun(running.id).status, "running");
@@ -908,12 +915,64 @@ test("large archived cleanup yields to active work and resumes after interruptio
     await assert.rejects(interruptedDeletion, (error) => error.statusCode === 503);
     database = createOutrightDatabase({ filename });
     const deadline = Date.now() + 5_000;
-    while (database.getConversation(interrupted.id)) {
+    while (archivePresentOrMaintaining(database, filename, interrupted.id)) {
       assert.ok(Date.now() < deadline, "interrupted deletion did not resume");
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === interrupted.id));
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("partly deleted archives stay hidden across restart until durable cleanup finishes", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-hidden-deletion-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const archived = chat(database, "hidden-deletion-title");
+    const sibling = chat(database, "visible sibling");
+    database.addMessage({ conversationId: sibling.id, role: "assistant", body: "sibling evidence" });
+    let first;
+    for (let index = 0; index < 130; index += 1) {
+      const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "hidden-deletion-body" });
+      first ??= message;
+    }
+    database.updateConversation(archived.id, { archived: true });
+    const blocker = new Database(filename);
+    blocker.exec(`CREATE TRIGGER stop_after_first_batch BEFORE DELETE ON messages
+      WHEN (SELECT COUNT(*) FROM messages WHERE conversation_id = OLD.conversation_id) <= 66
+      BEGIN SELECT RAISE(FAIL, 'hold partial archive'); END`);
+    blocker.close();
+    await assert.rejects(database.deleteArchivedConversation(archived.id, archived.id), /hold partial archive/);
+    const physical = new Database(filename, { readonly: true });
+    try {
+      assert.equal(physical.prepare("SELECT deleting FROM conversations WHERE id = ?").get(archived.id).deleting, 1);
+      assert.equal(physical.prepare("SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?").get(archived.id).count, 66);
+    } finally { physical.close(); }
+    await database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.getConversation(archived.id), undefined);
+    assert.equal(database.listConversations({ archived: true }).some((item) => item.id === archived.id), false);
+    assert.equal(database.search("hidden-deletion").conversations.length, 0);
+    assert.equal(database.search("hidden-deletion").messages.length, 0);
+    for (const read of [
+      () => database.listMessages(archived.id),
+      () => database.messageCount(archived.id),
+      () => database.listMessagePage(archived.id),
+      () => database.getMessageBodyChunk(archived.id, first.id, 0),
+    ]) assert.throws(read, (error) => error.statusCode === 404);
+    await assert.rejects(database.findMessagePage(archived.id, "hidden-deletion", null), (error) => error.statusCode === 404);
+    assert.equal(database.getConversation(sibling.id)?.id, sibling.id);
+    assert.equal(database.search("sibling evidence").messages.length, 1);
+    const unblock = new Database(filename);
+    unblock.exec("DROP TRIGGER stop_after_first_batch");
+    unblock.close();
+    const deadline = Date.now() + 5000;
+    while (archivePresentOrMaintaining(database, filename, archived.id)) {
+      assert.ok(Date.now() < deadline, "restart did not finish hidden archive cleanup");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id));
+  } finally { await database?.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("oversized legacy archive cleanup defers while active runs write, then resumes", async () => {
@@ -951,13 +1010,13 @@ test("oversized legacy archive cleanup defers while active runs write, then resu
       assert.equal(database.capacity().cleanupPending, true);
       assert.equal(database.canLaunchRun(), true, "an unrelated run cannot wait for a marked giant archive delete");
       database.appendRunEvent(running.id, "progress", { during: archived.title });
-      assert.ok(database.getConversation(archived.id), "deferred row was removed before the active run finished");
+      assert.ok(archivePresentOrMaintaining(database, filename, archived.id), "deferred row was removed before the active run finished");
       assert.equal(database.getRun(running.id).status, "running");
     }
     database.updateRun(running.id, { status: "completed" });
     const deadline = Date.now() + 8_000;
     for (const archived of archives) {
-      while (archivePresentOrMaintaining(database, archived.id)) {
+      while (archivePresentOrMaintaining(database, filename, archived.id)) {
         assert.ok(Date.now() < deadline, "deferred giant archive cleanup did not resume");
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
@@ -1059,7 +1118,7 @@ test("shadow copy serves unrelated work and retries after a concurrent source wr
     assert.equal(first.deferred, true, "a stale shadow should defer after concurrent source changes");
     assert.ok(database.getConversation(sibling.id));
     const completed = Date.now() + 8000;
-    while (archivePresentOrMaintaining(database, archived.id)) {
+    while (archivePresentOrMaintaining(database, filename, archived.id)) {
       assert.ok(Date.now() < completed, "deferred shadow did not resume after source became idle");
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
@@ -1102,10 +1161,10 @@ test("automatic shadow cleanup defers for a late run without consuming storage r
     assert.equal((await deletion).deferred, 1);
     assert.equal(storageFailures, 0, "a late run was charged to the storage failure budget");
     assert.equal(database.capacity().cleanupPaused, 0);
-    assert.ok(database.getConversation(archived.id));
+    assert.ok(archivePresentOrMaintaining(database, filename, archived.id));
     database.updateRun(running.id, { status: "completed" });
     const completed = Date.now() + 8000;
-    while (archivePresentOrMaintaining(database, archived.id)) {
+    while (archivePresentOrMaintaining(database, filename, archived.id)) {
       assert.ok(Date.now() < completed, "archive did not drain once the run settled");
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
@@ -1162,7 +1221,7 @@ test("rejected shadow replacement preserves queued and recoverable evidence thro
     } finally { proof.close(); }
     database = createOutrightDatabase({ filename, runtimeLease: true });
     const completed = Date.now() + 8000;
-    while (archivePresentOrMaintaining(database, archived.id)) {
+    while (archivePresentOrMaintaining(database, filename, archived.id)) {
       assert.ok(Date.now() < completed, "durable cleanup marker did not resume after replacement rejection");
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
@@ -1226,7 +1285,7 @@ test("automatic deletion wraps to an archive marked behind its in-flight cursor"
       markedEarlier = true;
     } });
     const deadline = Date.now() + 8_000;
-    while (archivePresentOrMaintaining(database, earlier.id) || archivePresentOrMaintaining(database, later.id)) {
+    while (archivePresentOrMaintaining(database, filename, earlier.id) || archivePresentOrMaintaining(database, filename, later.id)) {
       assert.ok(Date.now() < deadline, `archive behind deletion cursor was stranded: pending=${database.capacity().cleanupPending}`);
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
@@ -1315,7 +1374,7 @@ test("failed archive recovery rejects required audit waiters and preserves sourc
     writeFileSync(`${filename}.archive-state`, JSON.stringify({ version: 1, source: realpathSync(filename) }));
     await recoverArchiveBeforeStartup({ filename });
     const reopened = createOutrightDatabase({ filename, runtimeLease: true });
-    try { assert.ok(reopened.getConversation(archived.id)); }
+    try { assert.ok(archivePresentOrMaintaining(reopened, filename, archived.id)); }
     finally { await reopened.close(); }
   } finally {
     Atomics.store(lockGate, 0, 2);
@@ -1367,7 +1426,7 @@ test("persistent cleanup failure pauses retries and automatic cleanup clears pau
     assert.equal(database.capacity().cleanupPaused, 0);
     assert.equal(database.getConversation(archived.id), undefined);
     const resumed = Date.now() + 5000;
-    while (database.getConversation(interrupted.id)) {
+    while (archivePresentOrMaintaining(database, filename, interrupted.id)) {
       assert.ok(Date.now() < resumed, "durable cleanup marker did not resume after restart");
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
@@ -1463,7 +1522,7 @@ test("closing during an oversized archive delete keeps its lease until the worke
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
     }
-    while (archivePresentOrMaintaining(database, archived.id)) {
+    while (archivePresentOrMaintaining(database, filename, archived.id)) {
       assert.ok(Date.now() < deadline, "oversized archived cleanup did not resume");
       await new Promise((resolve) => setTimeout(resolve, 5));
     }

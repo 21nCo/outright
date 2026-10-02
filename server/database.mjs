@@ -491,14 +491,14 @@ export function createOutrightDatabase(options = {}) {
       else withinRetainedBudget(() => db.prepare("INSERT INTO project_memberships (project_id, group_id) VALUES (?, ?) ON CONFLICT(project_id) DO UPDATE SET group_id = excluded.group_id").run(projectId, groupId));
     },
     listConversations(filters = {}) {
-      const where = ["archived = ?"];
+      const where = ["archived = ?", "deleting = 0"];
       const values = [filters.archived ? 1 : 0];
       if (filters.projectId) { where.push("project_id = ?"); values.push(filters.projectId); }
       if (filters.worktreeId) { where.push("worktree_id = ?"); values.push(filters.worktreeId); }
       return db.prepare(`SELECT ${conversationColumns()} FROM conversations WHERE ${where.join(" AND ")} ORDER BY pinned DESC, tab_position, updated_at DESC`).all(...values);
     },
     getConversation(id) {
-      return db.prepare(`SELECT ${conversationColumns()} FROM conversations WHERE id = ?`).get(id);
+      return db.prepare(`SELECT ${conversationColumns()} FROM conversations WHERE id = ? AND deleting = 0`).get(id);
     },
     createConversation(input) {
       if (retainedBytes(db) >= this.getSettings().maxRetainedMiB * 1024 * 1024) {
@@ -557,14 +557,17 @@ export function createOutrightDatabase(options = {}) {
       return this.getConversation(id);
     },
     listMessages(conversationId) {
+      assertConversationNotDeleting(db, conversationId);
       assertMessageOrderReady(db);
       return db.prepare(`SELECT search_order AS searchOrder, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
         FROM messages WHERE conversation_id = ? AND search_order IS NOT NULL ORDER BY search_order`).all(conversationId).map(hydratePayload);
     },
     messageCount(conversationId) {
+      assertConversationNotDeleting(db, conversationId);
       return db.prepare("SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?").get(conversationId).count;
     },
     listMessagePage(conversationId, options = {}) {
+      assertConversationNotDeleting(db, conversationId);
       assertMessageOrderReady(db);
       const limit = Math.max(1, Math.min(500, Number(options.limit) || 200));
       if (options.beforeId && options.afterId) throw databaseError(400, "Choose one message cursor");
@@ -652,6 +655,7 @@ export function createOutrightDatabase(options = {}) {
     },
     async findMessagePage(conversationId, query, afterId, direction = 1, signal,
       { originId = afterId, wrapped = false, byteOffset = 0, contextOffset = 0, leftContextOffset = 0, leftContextCased = null } = {}) {
+      assertConversationNotDeleting(db, conversationId);
       assertMessageOrderReady(db);
       if (activeMessageFinds >= 8) throw databaseError(429, "Too many conversation searches; retry");
       activeMessageFinds += 1;
@@ -834,6 +838,7 @@ export function createOutrightDatabase(options = {}) {
         let result = await scan(cursor?.rowid ?? (forward ? 0 : Number.MAX_SAFE_INTEGER), wrapped);
         if (!result && origin && !wrapped) result = await scan(forward ? 0 : Number.MAX_SAFE_INTEGER, true);
         if (signal?.aborted || closing) return { matchId: null, messages: [], messagePage: null };
+        assertConversationNotDeleting(db, conversationId);
         if (result?.partial) return result;
         if (!result) return { matchId: null, messages: [], messagePage: null };
         const match = result.match;
@@ -918,6 +923,7 @@ export function createOutrightDatabase(options = {}) {
       } finally { activeMessageFinds -= 1; }
     },
     getMessageBodyChunk(conversationId, messageId, offset) {
+      assertConversationNotDeleting(db, conversationId);
       // Find returns excerpts for oversized matches. Read the full body by
       // identity in fixed-size byte sections. SQLite's TEXT LENGTH and SUBSTR
       // stop at an embedded NUL and count characters from the start of a row.
@@ -1323,8 +1329,10 @@ export function createOutrightDatabase(options = {}) {
     deleteTemplate(id) { return db.prepare("DELETE FROM prompt_templates WHERE id = ?").run(id).changes > 0; },
     search(query, limit = 40) {
       const needle = `%${query}%`;
-      const conversations = db.prepare(`SELECT ${conversationColumns()} FROM conversations WHERE title LIKE ? OR id IN (SELECT conversation_id FROM messages WHERE body LIKE ?) ORDER BY updated_at DESC LIMIT ?`).all(needle, needle, limit);
-      const messages = db.prepare("SELECT id, conversation_id AS conversationId, role, kind, body, created_at AS createdAt FROM messages WHERE body LIKE ? ORDER BY created_at DESC LIMIT ?").all(needle, limit);
+      const conversations = db.prepare(`SELECT ${conversationColumns()} FROM conversations WHERE deleting = 0 AND (title LIKE ? OR id IN (SELECT conversation_id FROM messages WHERE body LIKE ?)) ORDER BY updated_at DESC LIMIT ?`).all(needle, needle, limit);
+      const messages = db.prepare(`SELECT messages.id, messages.conversation_id AS conversationId, messages.role, messages.kind, messages.body, messages.created_at AS createdAt
+        FROM messages JOIN conversations ON conversations.id = messages.conversation_id
+        WHERE conversations.deleting = 0 AND messages.body LIKE ? ORDER BY messages.created_at DESC LIMIT ?`).all(needle, limit);
       return { conversations, messages };
     },
   };
@@ -1897,6 +1905,14 @@ function reserveRecoveryHeadroom(db, configured = Number(db.prepare("SELECT valu
 function conversationColumns() {
   return `id, project_id AS projectId, worktree_id AS worktreeId, worktree_path AS worktreePath, title, provider, model,
     provider_session_id AS providerSessionId, archived, pinned, tab_position AS tabPosition, created_at AS createdAt, updated_at AS updatedAt`;
+}
+
+function assertConversationNotDeleting(db, id) {
+  // A deletion marker is durable across crashes, while child rows disappear
+  // over several transactions. Never expose one of those partial snapshots.
+  if (db.prepare("SELECT 1 FROM conversations WHERE id = ? AND deleting = 1").get(id)) {
+    throw databaseError(404, "Conversation not found");
+  }
 }
 
 function hydratePayload(row) { return { ...row, payload: parseJson(row.payload, null) }; }

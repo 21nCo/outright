@@ -285,6 +285,8 @@ test("oversized archived HTTP deletion defers without blocking live output or ca
   const legacy = new Database(database.filename);
   legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(8 * 1024 * 1024), message.id);
   legacy.close();
+  const oldRun = database.createRun({ conversationId: archived.id, provider: "codex", approvalPolicy: "read-only", prompt: "retained history" });
+  database.updateRun(oldRun.id, { status: "completed" });
   database.updateConversation(archived.id, { archived: true });
   const deleteResponse = responseCapture();
   await runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived", { id: archived.id, confirmation: archived.id }), deleteResponse);
@@ -292,6 +294,9 @@ test("oversized archived HTTP deletion defers without blocking live output or ca
   assert.equal(deleteResponse.body.deleted, 0);
   assert.equal(deleteResponse.body.deferred, true);
   assert.equal(deleteResponse.body.capacity.cleanupPending, true);
+  const hiddenRun = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `/api/runs/${oldRun.id}`), hiddenRun);
+  assert.equal(hiddenRun.statusCode, 404, "a marked archive cannot expose a partial run history");
   assert.equal(database.canLaunchRun(), true, "deferred cleanup must leave unrelated run slots available");
   database.appendRunEvent(running.id, "progress", { text: "still writable" });
   const capacityResponse = responseCapture();
@@ -299,7 +304,7 @@ test("oversized archived HTTP deletion defers without blocking live output or ca
   assert.equal(capacityResponse.statusCode, 200);
   database.updateRun(running.id, { status: "completed" });
   const deadline = Date.now() + 5_000;
-  while (database.maintenanceActive || database.getConversation(archived.id)) {
+  while (database.capacity().cleanupPending || database.maintenanceActive) {
     assert.ok(Date.now() < deadline, "marked HTTP deletion did not resume");
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -354,11 +359,7 @@ test("HTTP bootstrap stays available during shadow copy and preserves a concurre
       assert.equal(deletion.statusCode, 202, "a stale shadow should defer after a concurrent HTTP-visible write");
       assert.ok(database.getConversation(survivor.id));
       const completed = Date.now() + 8_000;
-      while (true) {
-        let remaining;
-        try { remaining = database.getConversation(archived.id); }
-        catch (error) { if (error.statusCode !== 503) throw error; remaining = true; }
-        if (!remaining) break;
+      while (database.capacity().cleanupPending || database.maintenanceActive) {
         assert.ok(Date.now() < completed, "deferred HTTP cleanup did not resume");
         await new Promise((resolve) => setTimeout(resolve, 10));
       }

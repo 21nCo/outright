@@ -134,6 +134,47 @@ test("a rejected queued cancellation remains retryable after maintenance", async
   await manager.shutdown();
 });
 
+test("a prearmed disk retry and queue resume cannot drain a closed maintenance database", async () => {
+  const database = fakeDatabase();
+  let readable = true;
+  let admissible = false;
+  let settingsReadsDuringMaintenance = 0;
+  const getSettings = database.getSettings;
+  const updateRun = database.updateRun;
+  database.getSettings = () => {
+    if (!readable) {
+      settingsReadsDuringMaintenance += 1;
+      throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 });
+    }
+    return getSettings();
+  };
+  database.canLaunchRun = () => admissible;
+  database.capacity = () => ({ diskUsageStatus: "unknown" });
+  database.updateRun = (id, patch) => {
+    if (!readable) throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 });
+    return updateRun(id, patch);
+  };
+  const manager = createAgentManager({ database, publish: () => {} });
+  try {
+    const run = database.createRun({ ...codexRun("disk-retry-cutover"), status: "queued" });
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+    database.maintenanceActive = true;
+    readable = false;
+    manager.resumeQueued();
+    await new Promise((resolve) => setTimeout(resolve, 150)); // The prearmed retry fires at 100 ms.
+    assert.equal(settingsReadsDuringMaintenance, 0);
+    await assert.rejects(manager.stop(run.id), (error) => error.statusCode === 503);
+    assert.equal(database.getRun(run.id).status, "queued");
+    readable = true;
+    database.maintenanceActive = false;
+    assert.equal(await manager.stop(run.id), true);
+    assert.equal(database.getRun(run.id).status, "stopped");
+    admissible = true;
+    manager.resumeQueued();
+    assert.deepEqual(manager.activeRuns(), []);
+  } finally { await manager.shutdown(); }
+});
+
 test("shutdown preserves a childless validation run when maintenance rejects its terminal write", async () => {
   const database = fakeDatabase();
   const run = database.createRun({ ...codexRun("maintenance-validating"), status: "queued" });
@@ -242,6 +283,70 @@ test("validation refusal and success survive a real archive cutover without losi
       await database.close();
       rmSync(directory, { recursive: true, force: true });
     }
+  }
+});
+
+test("a queued disk retry survives real archive cutover and cancellation releases capacity", { timeout: 20000 }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-queued-cutover-"));
+  const filename = path.join(directory, "outright.db");
+  const copyGate = new Int32Array(new SharedArrayBuffer(4));
+  const cutoverGate = new Int32Array(new SharedArrayBuffer(4));
+  let manager;
+  const database = createOutrightDatabase({ filename, runtimeLease: true,
+    deletionCopyGate: copyGate.buffer, deletionWorkerGate: cutoverGate.buffer,
+    onDeletionWorkerExit: () => manager?.resumeQueued() });
+  const canLaunchRun = database.canLaunchRun;
+  const capacity = database.capacity;
+  try {
+    const survivor = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory, title: "Queued", provider: "codex" });
+    const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory, title: "Old", provider: "codex" });
+    const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    const legacy = new Database(filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
+    legacy.close();
+    database.updateConversation(archived.id, { archived: true });
+    manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => { throw new Error("queued run launched during maintenance"); } });
+    const run = database.createRun({ conversationId: survivor.id, provider: "codex", approvalPolicy: "read-only", prompt: "queued during copy" });
+    database.canLaunchRun = () => false;
+    database.capacity = () => ({ ...capacity(), diskUsageStatus: "unknown" });
+    await manager.schedule({ conversation: survivor, run }); // Arms the 100 ms disk retry before the shadow snapshot.
+    const deletion = database.deleteArchivedConversation(archived.id, archived.id);
+    const copyDeadline = Date.now() + 5000;
+    while (Atomics.load(copyGate, 0) !== 1) {
+      assert.ok(Date.now() < copyDeadline, "archive copy did not reach the queue gate");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    Atomics.store(copyGate, 0, 2);
+    Atomics.notify(copyGate, 0);
+    const cutoverDeadline = Date.now() + 5000;
+    while (Atomics.load(cutoverGate, 0) !== 1) {
+      assert.ok(Date.now() < cutoverDeadline, "archive did not enter SQLite cutover");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    database.capacity = capacity;
+    manager.resumeQueued();
+    await new Promise((resolve) => setTimeout(resolve, 1000)); // The armed retry fires while SQLite is closed.
+    await assert.rejects(manager.stop(run.id), (error) => error.statusCode === 503);
+    Atomics.store(cutoverGate, 0, 2);
+    Atomics.notify(cutoverGate, 0);
+    assert.equal((await deletion).deleted, 1);
+    assert.equal(database.getRun(run.id).status, "queued");
+    assert.equal(await manager.stop(run.id), true);
+    assert.equal(database.getRun(run.id).status, "stopped");
+    database.canLaunchRun = canLaunchRun;
+    manager.resumeQueued();
+    assert.deepEqual(manager.activeRuns(), []);
+    assert.equal(database.canLaunchRun(), true);
+  } finally {
+    Atomics.store(copyGate, 0, 2);
+    Atomics.notify(copyGate, 0);
+    Atomics.store(cutoverGate, 0, 2);
+    Atomics.notify(cutoverGate, 0);
+    database.canLaunchRun = canLaunchRun;
+    database.capacity = capacity;
+    await manager?.shutdown();
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
