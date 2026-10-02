@@ -1,0 +1,22 @@
+server/archive-delete-worker.mjs
+  h_a39f9495f9ec1d 102-103,107-108
+server/outright-vite-plugin.mjs
+  h_a39f9495f9ec1d 35-38,51-56
+server/outright-vite-plugin.test.mjs
+  h_a39f9495f9ec1d 10,168-206,291-357
+src/components/TerminalPane.jsx
+  h_a39f9495f9ec1d 339-347
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 2146-2154,2720-2731,2767
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a0972aafe64c42783f17701cedfd7ba1b5c92da0",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
