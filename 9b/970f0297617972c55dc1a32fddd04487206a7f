@@ -1,0 +1,16 @@
+server/agent-manager.mjs
+  h_a39f9495f9ec1d 323,328-337,542-564,575,648-655,665-671,699-738,905-916,922
+server/agent-manager.test.mjs
+  h_a39f9495f9ec1d 3,13,157-246
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9b970f0297617972c55dc1a32fddd04487206a7f",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
