@@ -100,6 +100,7 @@ test("failed Vite recovery reports a terminal API error without taking HMR owner
     const socket = { writes: [], destroyed: false, write(value) { this.writes.push(value); }, destroy() { this.destroyed = true; } };
     httpServer.emit("upgrade", { url: "/" }, socket);
     assert.equal(socket.destroyed, false);
+    assert.deepEqual(socket.writes, [], "failed recovery wrote to Vite's HMR socket");
     httpServer.emit("upgrade", { url: "/api/events" }, socket);
     assert.equal(socket.destroyed, true);
     assert.match(socket.writes[0], /500 Internal Server Error/);
@@ -168,17 +169,24 @@ test("Vite retries a transient archive worker lease conflict before opening the 
 test("a rejected predecessor shutdown lets the successor recheck a released lease", async () => {
   let held = false;
   let attached = 0;
+  let attempts = 0;
+  let finishShutdown;
+  const shutdownGate = new Promise((resolve) => { finishShutdown = resolve; });
   let middleware;
   const options = {
     configUrl: new URL("file:///fixture/rejected-shutdown.json"),
     recoverArchive: async () => {},
     createRuntime: () => {
-      if (held) throw Object.assign(new Error("predecessor owns lease"), { code: "OUTRIGHT_RUNTIME_LEASE_HELD" });
+      attempts += 1;
+      if (held) {
+        throw Object.assign(new Error("predecessor owns lease"), { code: "OUTRIGHT_RUNTIME_LEASE_HELD" });
+      }
       held = true;
       return {
         attach() { attached += 1; },
         async handleRequest(_request, response) { response.writeHead(200); response.end("ready"); return true; },
         async shutdown() {
+          if (attached === 1) await shutdownGate;
           held = false;
           if (attached === 1) throw new Error("cleanup failed after lease release");
         },
@@ -193,15 +201,21 @@ test("a rejected predecessor shutdown lets the successor recheck a released leas
   second.configureServer({ middlewares: { use(fn) { middleware = fn; } } });
   firstServer.httpServer.emit("close");
   try {
-    await assert.rejects(first.closeBundle(), /cleanup failed/);
-    const deadline = Date.now() + 1000;
-    while (attached !== 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.equal(attached, 2, "successor inherited predecessor's disposal error");
+    const contentionDeadline = Date.now() + 1_000;
+    while (attempts < 2 && Date.now() < contentionDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
     let status;
+    middleware({ url: "/api/capacity" }, { writeHead(code) { status = code; }, end() {} }, () => assert.fail("API fell through"));
+    assert.equal(status, 503, "contending successor did not stay retryable while disposal was pending");
+    assert.ok(attempts >= 2, "successor never attempted the held physical lease");
+    finishShutdown();
+    await assert.rejects(first.closeBundle(), /cleanup failed/);
+    const recoveryDeadline = Date.now() + 1_000;
+    while (attached !== 2 && Date.now() < recoveryDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(attached, 2, "successor inherited predecessor's disposal error");
     middleware({ url: "/api/capacity" }, { writeHead(code) { status = code; }, end() {} }, () => assert.fail("API fell through"));
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(status, 200);
-  } finally { await second.closeBundle(); }
+  } finally { finishShutdown(); await Promise.allSettled([first.closeBundle(), second.closeBundle()]); }
 });
 
 test("a slow local Vite shutdown remains retryable beyond the unknown-owner lease deadline", { timeout: 25_000 }, async () => {

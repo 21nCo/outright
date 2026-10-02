@@ -2725,8 +2725,28 @@ async function assertVariableHeightEdgeScrollOwnership(index, input, viewport) {
   viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true }));
   viewport.scrollTop = index === 0 ? 700 : 0;
   viewport.dispatchEvent(new Event("scroll"));
+  await remainsTrue(() => index === 0 ? viewport.scrollTop > 500 : viewport.scrollTop < 50,
+    350, `Edge match ${index} kept snapping the reader back after the scroll gesture`);
+}
+
+async function assertVariableHeightFindResize(viewport, visible) {
+  const initialWidth = viewport.clientWidth;
+  viewport.style.width = "180px";
+  await until(() => viewport.clientWidth < initialWidth - 20, "Find viewport narrowed");
   await settle(); await settle();
-  assert(index === 0 ? viewport.scrollTop > 500 : viewport.scrollTop < 50, `Edge match ${index} kept snapping the reader back`);
+  assert(visible(), "Width-only wrapping displaced the found message");
+  viewport.style.width = "";
+  await until(() => viewport.clientWidth > 200, "Find viewport width restored");
+  await settle(); await settle();
+  assert(visible(), "Restoring viewport width lost the found message");
+  viewport.style.height = "720px";
+  await until(() => viewport.clientHeight > 700, "Find viewport grew");
+  await settle(); await settle();
+  assert(visible(), "Growing the viewport lost the found message beyond the old overscan");
+  viewport.style.height = "300px";
+  await until(() => viewport.clientHeight < 320, "Find viewport shrank");
+  await settle(); await settle();
+  assert(visible(), "Viewport resize lost the found message");
 }
 
 async function variableHeightFindAnchorRegression() {
@@ -2745,18 +2765,7 @@ async function variableHeightFindAnchorRegression() {
   const visible = () => { const row = host.querySelector('[data-find-match="true"]'); const bounds = row?.getBoundingClientRect(); const area = viewport.current.getBoundingClientRect(); return bounds && bounds.top >= area.top && bounds.top < area.bottom; };
   assert(visible(), "Measured tall rows displaced the found message");
   assert(host.querySelectorAll('[role="listitem"]').length < 40, "Variable-height find mounted too many rows");
-  viewport.current.style.width = "180px";
-  await settle(); await settle();
-  assert(visible(), "Width-only wrapping displaced the found message");
-  viewport.current.style.width = "";
-  await settle(); await settle();
-  assert(visible(), "Restoring viewport width lost the found message");
-  viewport.current.style.height = "720px";
-  await settle(); await settle();
-  assert(visible(), "Growing the viewport lost the found message beyond the old overscan");
-  viewport.current.style.height = "300px";
-  await settle(); await settle();
-  assert(visible(), "Viewport resize lost the found message");
+  await assertVariableHeightFindResize(viewport.current, visible);
   viewport.current.dispatchEvent(new WheelEvent("wheel", { bubbles: true }));
   viewport.current.scrollTop = 0; viewport.current.dispatchEvent(new Event("scroll"));
   await settle();
