@@ -880,6 +880,46 @@ test("capacity spent during asynchronous capability setup cannot authorize a que
   children[0].emit("close", 0, null);
 });
 
+test("unknown usage after async launch preparation retries without a new request", async () => {
+  const database = fakeDatabase();
+  let measurable = true;
+  let release;
+  let validations = 0;
+  let launchPreparations = 0;
+  const capability = new Promise((resolve) => { release = resolve; });
+  const command = { executable: process.execPath, args: [], display: "test", handshakePath: "", ownsDescendants: true };
+  database.canLaunchRun = () => measurable;
+  database.capacity = () => ({ diskUsageStatus: measurable ? "measured" : "unknown",
+    availableForNewWorkBytes: measurable ? 1024 * 1024 : 0 });
+  const first = database.createRun(codexRun("late-unknown"));
+  const cancelled = database.createRun(codexRun("late-unknown-cancelled"));
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {},
+    validateConversation: async () => { validations += 1; return () => {}; },
+    launchCommand: () => (++launchPreparations === 1 ? capability : command),
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  try {
+    const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run: first });
+    await new Promise((resolve) => setImmediate(resolve));
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: cancelled });
+    measurable = false;
+    release(command);
+    await scheduled;
+    assert.equal(database.getRun(first.id).status, undefined, "unknown usage crossed the durable launch transition");
+    assert.equal(children.length, 0);
+    assert.equal(await manager.stop(cancelled.id), true);
+    measurable = true;
+    const deadline = Date.now() + 1000;
+    while (!children.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(children.length, 1, "the final admission deferral stranded a recoverable queued run");
+    assert.equal(database.getRun(first.id).status, "running");
+    assert.equal(database.getRun(cancelled.id).status, "stopped");
+    assert.equal(validations, 2, "retry skipped authorization revalidation");
+    assert.equal(launchPreparations, 2, "the queued run launched more than once");
+    children[0].emit("close", 0, null);
+  } finally { await manager.shutdown(); }
+});
+
 test("many assistant segments share one durable transcript byte budget", async () => {
   const database = fakeDatabase();
   const child = fakeChild();

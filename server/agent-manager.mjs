@@ -724,6 +724,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         if (await start(state, prepared.authorize) === "deferred") {
           active.delete(entry.run.id);
           queue.unshift(entry);
+          retryDeferredAdmission();
         }
         return;
       } catch (error) {
@@ -761,6 +762,16 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     diskRetryDelayMs = 100;
   }
 
+  function retryDeferredAdmission() {
+    if (database.maintenanceActive) return;
+    const observed = database.capacity?.();
+    // Unknown physical usage may recover without another capacity event. A
+    // measured budget with room can also race the admission check. A genuinely
+    // full budget waits for an explicit release instead of polling forever.
+    if (observed?.diskUsageStatus === "unknown"
+      || observed?.availableForNewWorkBytes >= 64 * 1024) retryUnknownDiskUsage();
+  }
+
   function drain() {
     // Every entry point, including the disk retry timer, reaches this guard.
     // During the archive cutover getSettings cannot read the closed SQLite
@@ -769,11 +780,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     const max = database.getSettings().maxConcurrentRuns;
     while (active.size < max && queue.length) {
       if (database.canLaunchRun?.() === false) {
-        const observed = database.capacity?.();
-        // The first measurement may have been unknown and the journal may
-        // become readable before this second one. Retry that transition too.
-        if (observed?.diskUsageStatus === "unknown"
-          || (!database.maintenanceActive && observed?.availableForNewWorkBytes >= 64 * 1024)) retryUnknownDiskUsage();
+        retryDeferredAdmission();
         return;
       }
       clearDiskRetry();
