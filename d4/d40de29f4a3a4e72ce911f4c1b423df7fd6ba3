@@ -1,0 +1,32 @@
+server/archive-shadow.mjs
+  h_a39f9495f9ec1d 15-18,133-136,139,142-149,151,154-165
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 6,926-927
+server/outright-vite-plugin.mjs
+  h_a39f9495f9ec1d 4-9,16-26,32-39,46,48-52
+server/outright-vite-plugin.test.mjs
+  h_a39f9495f9ec1d 4-9,64,166-250
+server/standalone.mjs
+  h_a39f9495f9ec1d 34
+server/standalone.test.mjs
+  h_a39f9495f9ec1d 3,12-14,16
+src/components/SettingsDialog.jsx
+  h_a39f9495f9ec1d 210-212
+src/components/TerminalPane.jsx
+  h_a39f9495f9ec1d 32,89-108,110,208,322,337,339
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 539-542,574-579,738,2126-2156,2808-2823,2874,2879,2885,5014
+tests/ui-races.test.mjs
+  h_a39f9495f9ec1d 885
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d4d40de29f4a3a4e72ce911f4c1b423df7fd6ba3",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
