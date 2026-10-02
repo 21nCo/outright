@@ -1,0 +1,28 @@
+server/archive-recover-worker.mjs
+  h_a39f9495f9ec1d 2,5,7-12,16-18
+server/archive-shadow.mjs
+  h_a39f9495f9ec1d 139-150,158-170,172
+server/archive-shadow.test.mjs
+  h_a39f9495f9ec1d 4-5,10,195-292
+server/database.mjs
+  h_a39f9495f9ec1d 9,32,62-74,1395-1397,1570,1572,1707-1713,1715
+server/outright-vite-plugin.mjs
+  h_a39f9495f9ec1d 2,4,6-8,13-32,36-38
+server/outright-vite-plugin.test.mjs
+  h_a39f9495f9ec1d 9-10,12-13,27-55
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 8,59-74,1281
+server/standalone.mjs
+  h_a39f9495f9ec1d 5,12-27,39-47,50,52-53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2441cfa035f0d22e5f69a25eca6d585ce671ddac",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
