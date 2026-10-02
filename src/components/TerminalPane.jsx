@@ -336,7 +336,15 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       stageTerminals(remaining);
       if (focusRequestRef.current?.token === token) focusRequestRef.current.id = next.id;
       await activateTerminal(next, token);
-    } catch (error) { if (token === reconcileTokenRef.current) { recoverSelection(wasReady, wasAwaitingFit); if (focusRequestRef.current?.token === token && !focusRequestRef.current.id) focusRequestRef.current = null; onErrorRef.current(error); } }
+    } catch (error) {
+      if (token === reconcileTokenRef.current) {
+        recoverSelection(wasReady, wasAwaitingFit);
+        if (focusRequestRef.current?.token === token && !focusRequestRef.current.id) {
+          focusRequestRef.current = null;
+        }
+        onErrorRef.current(error);
+      }
+    }
     finally { finishMutation(token); }
   }
 

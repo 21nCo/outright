@@ -2143,14 +2143,15 @@ async function terminalDeleteFocusOwnershipRegression() {
     await until(() => deleting, "terminal deletion held");
     const other = chooseOther ? document.createElement("button") : null;
     if (other) { document.body.append(other); other.focus(); }
-    deletion.resolve(response({}));
-    await until(() => terminalReady("Terminal A2"), "replacement terminal selected");
-    if (other) {
-      assert(document.activeElement === other, "Delayed terminal deletion stole a newer focus choice");
-      other.remove();
-    } else {
-      await until(() => document.activeElement === host.querySelector('[role="tab"][aria-selected="true"]'), "replacement tab receives focus after commit");
-    }
+    try {
+      deletion.resolve(response({}));
+      await until(() => terminalReady("Terminal A2"), "replacement terminal selected");
+      if (other) {
+        assert(document.activeElement === other, "Delayed terminal deletion stole a newer focus choice");
+      } else {
+        await until(() => document.activeElement === host.querySelector('[role="tab"][aria-selected="true"]'), "replacement tab receives focus after commit");
+      }
+    } finally { other?.remove(); }
   }
 }
 
@@ -2716,6 +2717,18 @@ async function previousFindStartRegression() {
   await until(() => host.querySelector('[data-find-match="true"] [data-message-id="first"]'), "loaded transcript matches a ligature fold");
 }
 
+async function assertVariableHeightEdgeScrollOwnership(index, input, viewport) {
+  setControlValue(input, String(index)); await settle();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await until(() => host.querySelector(`[data-find-match="true"] [data-message-id="variable-${index}"]`), `edge match ${index}`);
+  for (let frameIndex = 0; frameIndex < 20; frameIndex += 1) await frame();
+  viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true }));
+  viewport.scrollTop = index === 0 ? 700 : 0;
+  viewport.dispatchEvent(new Event("scroll"));
+  await settle(); await settle();
+  assert(index === 0 ? viewport.scrollTop > 500 : viewport.scrollTop < 50, `Edge match ${index} kept snapping the reader back`);
+}
+
 async function variableHeightFindAnchorRegression() {
   root.render(null); await settle();
   const viewport = React.createRef();
@@ -2751,15 +2764,7 @@ async function variableHeightFindAnchorRegression() {
   await settle();
   assert(viewport.current.scrollTop < 50, "Live append snapped back to an old find target after user scrolling");
   for (const index of [0, 200]) {
-    setControlValue(input, String(index)); await settle();
-    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    await until(() => host.querySelector(`[data-find-match="true"] [data-message-id="variable-${index}"]`), `edge match ${index}`);
-    for (let frameIndex = 0; frameIndex < 20; frameIndex += 1) await frame();
-    viewport.current.dispatchEvent(new WheelEvent("wheel", { bubbles: true }));
-    viewport.current.scrollTop = index === 0 ? 700 : 0;
-    viewport.current.dispatchEvent(new Event("scroll"));
-    await settle(); await settle();
-    assert(index === 0 ? viewport.current.scrollTop > 500 : viewport.current.scrollTop < 50, `Edge match ${index} kept snapping the reader back`);
+    await assertVariableHeightEdgeScrollOwnership(index, input, viewport.current);
   }
   setControlValue(input, "100"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));

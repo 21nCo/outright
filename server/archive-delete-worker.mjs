@@ -99,11 +99,13 @@ try {
   }
   // The primary remains available while the shadow reclaims overflow pages.
   shadow.exec("VACUUM");
-  if (shadow.pragma("integrity_check")[0]?.integrity_check !== "ok" || shadow.pragma("foreign_key_check").length) {
-    throw new Error("Archive shadow failed integrity validation");
+  if (shadow.pragma("foreign_key_check").length) {
+    throw new Error("Archive shadow failed foreign-key validation");
   }
   shadow.close();
   shadow = undefined;
+  // Preparation validates the closed candidate and records its digest. A
+  // second full integrity scan here would read the whole archive twice.
   prepareArchiveShadowCutover(filename);
   parentPort.postMessage({ ready: "cutover" });
   await new Promise((resolve, reject) => {

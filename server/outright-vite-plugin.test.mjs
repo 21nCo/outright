@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
+import Database from "better-sqlite3";
 import { outrightApiPlugin } from "./outright-vite-plugin.mjs";
 
 test("Vite disposal awaits runtime process supervision before completing", async () => {
@@ -164,6 +165,45 @@ test("Vite retries a transient archive worker lease conflict before opening the 
   await plugin.closeBundle();
 });
 
+test("a rejected predecessor shutdown lets the successor recheck a released lease", async () => {
+  let held = false;
+  let attached = 0;
+  let middleware;
+  const options = {
+    configUrl: new URL("file:///fixture/rejected-shutdown.json"),
+    recoverArchive: async () => {},
+    createRuntime: () => {
+      if (held) throw Object.assign(new Error("predecessor owns lease"), { code: "OUTRIGHT_RUNTIME_LEASE_HELD" });
+      held = true;
+      return {
+        attach() { attached += 1; },
+        async handleRequest(_request, response) { response.writeHead(200); response.end("ready"); return true; },
+        async shutdown() {
+          held = false;
+          if (attached === 1) throw new Error("cleanup failed after lease release");
+        },
+      };
+    },
+  };
+  const first = outrightApiPlugin(options);
+  const firstServer = { httpServer: new EventEmitter(), middlewares: { use() {} } };
+  first.configureServer(firstServer);
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = outrightApiPlugin(options);
+  second.configureServer({ middlewares: { use(fn) { middleware = fn; } } });
+  firstServer.httpServer.emit("close");
+  try {
+    await assert.rejects(first.closeBundle(), /cleanup failed/);
+    const deadline = Date.now() + 1000;
+    while (attached !== 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(attached, 2, "successor inherited predecessor's disposal error");
+    let status;
+    middleware({ url: "/api/capacity" }, { writeHead(code) { status = code; }, end() {} }, () => assert.fail("API fell through"));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(status, 200);
+  } finally { await second.closeBundle(); }
+});
+
 test("a slow local Vite shutdown remains retryable beyond the unknown-owner lease deadline", { timeout: 25_000 }, async () => {
   let leaseHeld = false;
   let attached = 0;
@@ -246,5 +286,72 @@ export default defineConfig({ plugins: [outrightApiPlugin({
   } finally {
     try { await server?.close(); }
     finally { rmSync(directory, { recursive: true }); delete globalThis.__out30ViteRestartFixture; }
+  }
+});
+
+test("a real Vite restart waits for recovery that owned the lease before runtime creation", { timeout: 30_000 }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), `out30-vite-recovery-${randomUUID()}-`));
+  const config = join(directory, "vite.config.mjs");
+  writeFileSync(config, `import { defineConfig } from ${JSON.stringify(import.meta.resolve("vite"))};
+import { outrightApiPlugin } from ${JSON.stringify(new URL("./outright-vite-plugin.mjs", import.meta.url).href)};
+export default defineConfig({ plugins: [outrightApiPlugin({
+  configUrl: new URL("file:///fixture/out30-recovery.json"),
+  recoverArchive: globalThis.__out30RecoveryFixture.recoverArchive,
+  createRuntime: globalThis.__out30RecoveryFixture.createRuntime,
+})] });\n`);
+  let finishRecovery;
+  let recoveryStarted;
+  const started = new Promise((resolve) => { recoveryStarted = resolve; });
+  let recoveryCalls = 0;
+  const leaseFile = join(directory, "recovery-lease.db");
+  let recoveryLease;
+  let attached = 0;
+  globalThis.__out30RecoveryFixture = {
+    recoverArchive: async () => {
+      if (++recoveryCalls === 1) {
+        recoveryLease = new Database(leaseFile);
+        recoveryLease.pragma("locking_mode = EXCLUSIVE");
+        recoveryLease.exec("BEGIN EXCLUSIVE; COMMIT;");
+        recoveryStarted();
+        try { await new Promise((resolve) => { finishRecovery = resolve; }); }
+        finally { recoveryLease.close(); recoveryLease = undefined; }
+      } else {
+        const contender = new Database(leaseFile);
+        try {
+          contender.pragma("busy_timeout = 50");
+          contender.pragma("locking_mode = EXCLUSIVE");
+          contender.exec("BEGIN EXCLUSIVE; COMMIT;");
+        } finally { contender.close(); }
+      }
+    },
+    createRuntime: () => ({
+      attach() { attached += 1; },
+      async handleRequest(_request, response) { response.writeHead(200); response.end("ready"); return true; },
+      async shutdown() {},
+    }),
+  };
+  let server;
+  try {
+    server = await createServer({ configFile: config, root: fileURLToPath(new URL("../", import.meta.url)),
+      server: { host: "127.0.0.1", port: 0 }, logLevel: "silent" });
+    await server.listen();
+    await started;
+    const releaseTimer = setTimeout(() => finishRecovery(), 16_200);
+    const restarting = server.restart();
+    const status = () => fetch(new URL("/api/capacity", server.resolvedUrls.local[0])).then((response) => response.status);
+    try { await restarting; } finally { clearTimeout(releaseTimer); finishRecovery(); }
+    const deadline = Date.now() + 3_000;
+    let current;
+    do {
+      current = await status();
+      if (current === 200) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    } while (Date.now() < deadline);
+    assert.equal(current, 200, "restart did not serve API after recovery released its lease");
+    assert.equal(attached, 1, "disposed predecessor created a runtime after recovery");
+  } finally {
+    finishRecovery?.();
+    try { await server?.close(); }
+    finally { recoveryLease?.close(); rmSync(directory, { recursive: true }); delete globalThis.__out30RecoveryFixture; }
   }
 });

@@ -32,7 +32,10 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
         if (!retryCodes.includes(error.code)) throw error;
         const predecessor = shuttingDownRuntimes.get(leaseKey);
         if (predecessor && predecessor !== closing) {
-          await wait(predecessor);
+          // A failed predecessor disposal is not evidence that this lease is
+          // still held. Recheck the physical lease before classifying our own
+          // startup; a failed shutdown may already have released it.
+          await wait(predecessor.catch(() => {}));
           continue;
         }
         if (Date.now() >= deadline) throw error;
@@ -45,11 +48,12 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
     stopping = true;
     abort.abort();
     closing ??= recovery.then(() => runtime?.shutdown());
-    if (runtime) {
-      shuttingDownRuntimes.set(leaseKey, closing);
-      const clear = () => { if (shuttingDownRuntimes.get(leaseKey) === closing) shuttingDownRuntimes.delete(leaseKey); };
-      closing.then(clear, clear);
-    }
+    // Recovery itself can own the SQLite lease before a runtime exists.
+    // Register its disposal too, so a successor does not apply the deadline
+    // for an unknown external owner to a known local handoff.
+    shuttingDownRuntimes.set(leaseKey, closing);
+    const clear = () => { if (shuttingDownRuntimes.get(leaseKey) === closing) shuttingDownRuntimes.delete(leaseKey); };
+    closing.then(clear, clear);
     return closing;
   };
 
