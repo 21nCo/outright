@@ -1,0 +1,18 @@
+server/agent-manager.mjs
+  h_a39f9495f9ec1d 7,757,870-871,878
+server/agent-manager.test.mjs
+  h_a39f9495f9ec1d 14,750-786
+server/resource-budgets.mjs
+  h_a39f9495f9ec1d 12-24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6ed752bf17cc7adca961ed3e10a647696e7ff355",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
