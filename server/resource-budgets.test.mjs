@@ -1132,6 +1132,61 @@ test("shadow copy serves unrelated work and retries after a concurrent source wr
   }
 });
 
+test("an in-flight archive copy does not pin sustained sibling writes in the WAL", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-wal-budget-"));
+  const filename = path.join(directory, "outright.db");
+  const copyStepGate = new Int32Array(new SharedArrayBuffer(4));
+  let database = createOutrightDatabase({ filename, runtimeLease: true, deletionCopyStepGate: copyStepGate.buffer });
+  try {
+    const sibling = chat(database, "retained during copy");
+    const stable = database.addMessage({ conversationId: sibling.id, role: "assistant", body: "a".repeat(4096) });
+    const queued = database.createRun(runInput(sibling.id));
+    const archived = chat(database, "legacy overflow");
+    const oversized = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    const legacy = new Database(filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(8 * 1024 * 1024), oversized.id);
+    legacy.close();
+    database.updateConversation(archived.id, { archived: true });
+    const deletion = database.deleteArchivedConversation(archived.id, archived.id);
+    const deadline = Date.now() + 5000;
+    while (Atomics.load(copyStepGate, 0) !== 1) {
+      assert.ok(Date.now() < deadline, "online copy did not reach a bounded source-read step");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    const writer = new Database(filename);
+    let peakWalBytes = 0;
+    try {
+      const update = writer.prepare("UPDATE messages SET body = ? WHERE id = ?");
+      for (let index = 0; index < 2000; index += 1) {
+        update.run(`${String(index).padStart(4, "0")}${"a".repeat(4092)}`, stable.id);
+        if (index % 100 === 0) peakWalBytes = Math.max(peakWalBytes, statSync(`${filename}-wal`).size);
+      }
+      peakWalBytes = Math.max(peakWalBytes, statSync(`${filename}-wal`).size);
+    } finally { writer.close(); }
+    assert.ok(peakWalBytes < 8 * 1024 * 1024, `copy pinned a growing source WAL: ${peakWalBytes} bytes`);
+    Atomics.store(copyStepGate, 0, 2);
+    Atomics.notify(copyStepGate, 0);
+    assert.equal((await deletion).deferred, true, "the changed source must not be replaced by an older copy");
+    const completeBy = Date.now() + 8000;
+    while (archivePresentOrMaintaining(database, filename, archived.id)) {
+      assert.ok(Date.now() < completeBy, "deferred archive did not clean up after sustained writes stopped");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(database.getRun(queued.id).status, "queued");
+    assert.equal(database.listMessages(sibling.id)[0].body.slice(0, 4), "1999");
+    await database.close();
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    assert.equal(database.getRun(queued.id).status, "queued");
+    assert.equal(database.listMessages(sibling.id)[0].body.slice(0, 4), "1999");
+    assert.equal(database.capacity().cleanupPending, false);
+  } finally {
+    Atomics.store(copyStepGate, 0, 2);
+    Atomics.notify(copyStepGate, 0);
+    await database?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("automatic shadow cleanup defers for a late run without consuming storage retries", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-late-run-"));
   const filename = path.join(directory, "outright.db");
@@ -1297,6 +1352,45 @@ test("automatic deletion wraps to an archive marked behind its in-flight cursor"
     database.close();
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("automatic deletion visits a later eligible marker while an earlier giant row is deferred", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-deferred-cursor-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  try {
+    const active = chat(database, "active sibling");
+    const running = database.createRun(runInput(active.id));
+    database.updateRun(running.id, { status: "running" });
+    const giant = chat(database, "earlier giant archive");
+    const oversized = database.addMessage({ conversationId: giant.id, role: "assistant", body: "small" });
+    database.updateConversation(giant.id, { archived: true });
+    const small = chat(database, "later small archive");
+    database.addMessage({ conversationId: small.id, role: "assistant", body: "later" });
+    database.updateConversation(small.id, { archived: true });
+    await database.close();
+    const legacy = new Database(filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), oversized.id);
+    legacy.prepare("UPDATE conversations SET deleting = 1 WHERE id IN (?, ?)").run(giant.id, small.id);
+    legacy.close();
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    const deadline = Date.now() + 5000;
+    while (archivePresentOrMaintaining(database, filename, small.id)) {
+      assert.ok(Date.now() < deadline, "later eligible marker was stranded behind a deferred giant row");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(archivePresentOrMaintaining(database, filename, giant.id), true);
+    assert.equal(database.getRun(running.id).status, "running");
+    database.updateRun(running.id, { status: "completed" });
+    const finishBy = Date.now() + 8000;
+    while (archivePresentOrMaintaining(database, filename, giant.id)) {
+      assert.ok(Date.now() < finishBy, "deferred giant marker did not resume after the active run settled");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    for (const id of [giant.id, small.id]) {
+      assert.equal(database.listAudit().filter((item) => item.action === "retention.archived.deleted" && item.target === id).length, 1);
+    }
+  } finally { await database?.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("a legacy run error uses the worker and a required cleanup audit waits for its lock", async () => {

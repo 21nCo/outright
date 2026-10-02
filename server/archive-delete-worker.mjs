@@ -1,15 +1,22 @@
 import Database from "better-sqlite3";
-import { closeSync, openSync } from "node:fs";
+import { closeSync, openSync, statSync } from "node:fs";
 import { parentPort, workerData } from "node:worker_threads";
 import { archiveShadowPaths, cutoverArchiveShadow, prepareArchiveShadowCutover } from "./archive-shadow.mjs";
 
-const { filename, conversationId, table, rowId, lockGate, copyGate, copyPhase } = workerData;
+const { filename, conversationId, table, rowId, lockGate, copyGate, copyStepGate, copyPhase } = workerData;
 const ownership = {
   run_events: `SELECT 1 FROM run_events AS item JOIN runs ON runs.id = item.run_id
     WHERE item.id = ? AND runs.conversation_id = ?`,
   messages: "SELECT 1 FROM messages WHERE id = ? AND conversation_id = ?",
   runs: "SELECT 1 FROM runs WHERE id = ? AND conversation_id = ?",
 };
+// The online backup holds a source read lock for one small step at a time.
+// VACUUM INTO held one snapshot for the entire copy, pinning the live WAL
+// while unrelated writers could append without a physical size bound.
+const COPY_STEP_PAGES = 64;
+const COPY_WAL_LIMIT_BYTES = 32 * 1024 * 1024;
+const COPY_RESTART_LIMIT = 2;
+const COPY_TOTAL_WORK_FACTOR = 3;
 
 let source;
 let shadow;
@@ -39,7 +46,43 @@ try {
     Atomics.store(new Int32Array(copyPhase), 0, 1);
     Atomics.notify(new Int32Array(copyPhase), 0);
   }
-  source.prepare("VACUUM INTO ?").run(next);
+  let previousRemaining = Infinity;
+  let restarts = 0;
+  let copiedPages = 0;
+  let initialPages;
+  let probedStep = false;
+  await source.backup(next, { progress({ totalPages, remainingPages }) {
+    if (!probedStep && copyStepGate instanceof SharedArrayBuffer) {
+      probedStep = true;
+      const signal = new Int32Array(copyStepGate);
+      if (Atomics.compareExchange(signal, 0, 0, 1) === 0) {
+        Atomics.notify(signal, 0);
+        if (Atomics.wait(signal, 0, 1, 10_000) === "timed-out") throw new Error("Archive copy step probe timed out");
+      }
+    }
+    // A different connection's write restarts SQLite's online backup. Stop
+    // repeated copies under sustained writes; the durable marker retries
+    // after the source is quiet, without consuming another full shadow copy.
+    if (remainingPages > previousRemaining && ++restarts > COPY_RESTART_LIMIT) {
+      throw Object.assign(new Error("Archive source changed repeatedly during copy"), { code: "ARCHIVE_SOURCE_BUSY" });
+    }
+    initialPages ??= totalPages;
+    copiedPages += COPY_STEP_PAGES;
+    if (copiedPages > Math.max(initialPages, totalPages) * COPY_TOTAL_WORK_FACTOR + 1024) {
+      throw Object.assign(new Error("Archive copy exceeded its bounded work budget"), { code: "ARCHIVE_SOURCE_BUSY" });
+    }
+    previousRemaining = remainingPages;
+    let walBytes;
+    try { walBytes = statSync(`${filename}-wal`, { throwIfNoEntry: false })?.size ?? 0; }
+    catch (error) {
+      if (!["EPERM", "EACCES", "EBUSY"].includes(error.code)) throw error;
+      throw Object.assign(new Error("Archive source WAL usage is temporarily unknown"), { code: "ARCHIVE_SOURCE_BUSY" });
+    }
+    if (walBytes > COPY_WAL_LIMIT_BYTES) {
+      throw Object.assign(new Error("Archive source WAL exceeded the copy budget"), { code: "ARCHIVE_SOURCE_BUSY" });
+    }
+    return COPY_STEP_PAGES;
+  } });
   if (copyPhase instanceof SharedArrayBuffer) {
     Atomics.store(new Int32Array(copyPhase), 0, 2);
     Atomics.notify(new Int32Array(copyPhase), 0);
