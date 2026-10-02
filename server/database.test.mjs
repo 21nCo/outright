@@ -60,6 +60,53 @@ test("global search bounds recent text and response bytes while keeping conversa
   } finally { database.close(); }
 });
 
+test("global search reaches live siblings behind a deferred hidden archive across restart", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-visible-search-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const live = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "visible-title-needle", provider: "codex" });
+    database.addMessage({ conversationId: live.id, role: "assistant", body: "visible-message-needle" });
+    const running = database.createRun({ conversationId: live.id, provider: "codex", approvalPolicy: "read-only", prompt: "keep archive deferred" });
+    database.updateRun(running.id, { status: "running" });
+    const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "hidden-title-needle", provider: "codex" });
+    database.addMessage({ conversationId: archived.id, role: "assistant", body: "hidden-message-needle " + "x".repeat(300 * 1024) });
+    for (let index = 0; index < 300; index += 1) database.addMessage({ conversationId: archived.id, role: "assistant", body: `hidden filler ${index}` });
+    database.updateConversation(archived.id, { archived: true });
+    const deletion = await database.deleteArchivedConversation(archived.id, archived.id);
+    assert.equal(deletion.deferred, true);
+    for (let round = 0; round < 4; round += 1) {
+      assert.deepEqual(database.search("visible-message-needle").conversations.map((row) => row.id), [live.id]);
+      assert.deepEqual(database.search("visible-title-needle").conversations.map((row) => row.id), [live.id]);
+      assert.deepEqual(database.search("hidden-message-needle").conversations, []);
+    }
+    await database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.getConversation(live.id)?.id, live.id);
+    assert.deepEqual(database.search("visible-message-needle").conversations.map((row) => row.id), [live.id]);
+    assert.deepEqual(database.search("visible-title-needle").conversations.map((row) => row.id), [live.id]);
+    assert.deepEqual(database.search("hidden-title-needle").conversations, []);
+    database.updateRun(running.id, { status: "completed" });
+    const deadline = Date.now() + 5_000;
+    while (true) {
+      let remains = true;
+      if (!database.maintenanceActive) {
+        try {
+          const probe = new Database(filename, { readonly: true, fileMustExist: true });
+          try { remains = Boolean(probe.prepare("SELECT 1 FROM conversations WHERE id = ?").get(archived.id)); }
+          finally { probe.close(); }
+        } catch (error) {
+          if (error.code !== "SQLITE_CANTOPEN" || !database.maintenanceActive) throw error;
+        }
+      }
+      if (!remains && !database.maintenanceActive) break;
+      assert.ok(Date.now() < deadline, "deferred cleanup did not resume after the active run finished");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(database.search("visible-message-needle").conversations.map((row) => row.id), [live.id]);
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("conversation find reaches old and new pages, wraps, and treats query text literally", async () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
