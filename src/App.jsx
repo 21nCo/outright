@@ -806,6 +806,16 @@ export function App() {
         sidebarFocusOwnerRef.current = null;
       }
     };
+    const releaseFocusOwner = (event) => {
+      // A click on blank workspace content leaves BODY focused without a
+      // focusin event. Only an actual user gesture releases that ownership;
+      // browser blur during a breakpoint transition still needs restoration.
+      if (event.type === "pointerdown" || event.target === document.body) {
+        sidebarFocusOwnerRef.current = null;
+        sidebarFocusIntentRef.current = null;
+        sidebarFocusSourceRef.current = null;
+      }
+    };
     const synchronizeLayout = () => {
       if (narrow.matches === wasNarrow) return;
       wasNarrow = narrow.matches;
@@ -823,10 +833,14 @@ export function App() {
     narrow.addEventListener("change", synchronizeLayout);
     window.addEventListener("resize", synchronizeLayout);
     document.addEventListener("focusin", trackFocus);
+    document.addEventListener("pointerdown", releaseFocusOwner, true);
+    document.addEventListener("keydown", releaseFocusOwner, true);
     return () => {
       narrow.removeEventListener("change", synchronizeLayout);
       window.removeEventListener("resize", synchronizeLayout);
       document.removeEventListener("focusin", trackFocus);
+      document.removeEventListener("pointerdown", releaseFocusOwner, true);
+      document.removeEventListener("keydown", releaseFocusOwner, true);
     };
   }, []);
   useLayoutEffect(() => {
@@ -975,7 +989,7 @@ export function App() {
     if (!bootstrap || !bootstrapError) return;
     const timer = setTimeout(() => setBootstrapError(""), 6000);
     return () => clearTimeout(timer);
-  }, [bootstrap, bootstrapError]);
+  }, [Boolean(bootstrap), bootstrapError]);
   useEffect(() => {
     const viewport = messageViewportRef.current;
     if (!viewport) return;
@@ -1790,7 +1804,11 @@ export function App() {
     <Dialog open={manageChatOpen} onOpenChange={setManageChatOpen}><DialogContent><form className="dialog-form" onSubmit={saveChatSettings}><DialogHeader><DialogTitle>Conversation settings</DialogTitle><DialogDescription>Rename, move, pin, or attach an existing provider session.</DialogDescription></DialogHeader><label htmlFor="chat-settings-title">Title</label><Input id="chat-settings-title" value={chatDraft.title} onChange={(event) => setChatDraft({ ...chatDraft, title: event.target.value })} /><label htmlFor="chat-settings-destination">Move to worktree</label><select id="chat-settings-destination" value={chatDraft.destination} onChange={(event) => setChatDraft({ ...chatDraft, destination: event.target.value })}>{bootstrap.projects.map((item) => <optgroup key={item.id} label={item.name}>{item.worktrees.filter((entry) => !entry.isPrunable && !entry.isBare).map((entry) => <option key={entry.id} value={`${item.id}::${entry.id}`}>{entry.name} · {entry.branch}</option>)}</optgroup>)}</select><label htmlFor="chat-settings-provider">Provider</label><select id="chat-settings-provider" value={chatDraft.provider} onChange={(event) => setChatDraft({ ...chatDraft, provider: event.target.value })}>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.label}</option>)}</select><label htmlFor="chat-settings-model">Model</label><Input id="chat-settings-model" value={chatDraft.model} onChange={(event) => setChatDraft({ ...chatDraft, model: event.target.value })} placeholder="Provider default" /><label htmlFor="chat-settings-session">Provider session ID</label><Input id="chat-settings-session" value={chatDraft.providerSessionId} onChange={(event) => setChatDraft({ ...chatDraft, providerSessionId: event.target.value })} placeholder="Attach or resume an existing session" /><div className="manage-actions"><Button type="button" variant="outline" onClick={() => updateConversation({ pinned: !conversation.pinned })}><PushPin />{conversation?.pinned ? "Unpin" : "Pin"}</Button><Button type="button" variant="destructive" onClick={archiveConversation}><Archive />Archive conversation</Button></div><DialogFooter><Button variant="outline" type="button" onClick={() => setManageChatOpen(false)}>Cancel</Button><Button type="submit">Save</Button></DialogFooter></form></DialogContent></Dialog>
     <SimpleDialog open={Boolean(worktreeDialog)} onOpenChange={(open) => !open && setWorktreeDialog(null)} title="Create worktree" description={worktreeDialog?.name ?? ""} onSubmit={createWorktree} submit="Create worktree" disabled={!worktreeDraft.branch.trim()}><label htmlFor="worktree-branch">Branch name</label><Input id="worktree-branch" value={worktreeDraft.branch} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, branch: event.target.value })} placeholder="feature/my-change" /><label htmlFor="worktree-directory">Directory name <small>optional</small></label><Input id="worktree-directory" value={worktreeDraft.name} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, name: event.target.value })} placeholder="project-my-change" /><label htmlFor="worktree-base">Base revision</label><Input id="worktree-base" value={worktreeDraft.baseBranch} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, baseBranch: event.target.value })} /></SimpleDialog>
     <Dialog open={removeWorktreeOpen} onOpenChange={setRemoveWorktreeOpen}><DialogContent><DialogHeader><DialogTitle>Remove worktree?</DialogTitle><DialogDescription>This is allowed only when the linked worktree has no uncommitted changes. Type its exact path to confirm.</DialogDescription></DialogHeader><code className="confirm-path">{worktree.path}</code><label htmlFor="remove-worktree-confirmation">Confirmation path</label><Input id="remove-worktree-confirmation" value={removeConfirmation} onChange={(event) => setRemoveConfirmation(event.target.value)} placeholder="Exact worktree path" /><DialogFooter><Button variant="outline" onClick={() => setRemoveWorktreeOpen(false)}>Cancel</Button><Button variant="destructive" disabled={removeConfirmation !== worktree.path} onClick={removeWorktree}>Remove worktree</Button></DialogFooter></DialogContent></Dialog>
-    {toast && <div className="toast" role="status" aria-live="polite"><CheckCircle weight="fill" />{toast}</div>}{error && <div className="error-toast" role="alert" aria-live="assertive"><WarningCircle weight="fill" /><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error"><X /></button></div>}{bootstrapError && <div className={`error-toast ${error ? "error-toast-stacked" : ""}`} role="alert" aria-live="assertive"><WarningCircle weight="fill" /><span>{bootstrapError}</span><button onClick={() => setBootstrapError("")} aria-label="Dismiss loading error"><X /></button></div>}
+    {toast && <div className="toast" role="status" aria-live="polite"><CheckCircle weight="fill" />{toast}</div>}
+    {(error || bootstrapError) && <div className="error-toast-stack">
+      {error && <div className="error-toast" role="alert" aria-live="assertive"><WarningCircle weight="fill" /><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error"><X /></button></div>}
+      {bootstrapError && <div className="error-toast" role="alert" aria-live="assertive"><WarningCircle weight="fill" /><span>{bootstrapError}</span><button onClick={() => setBootstrapError("")} aria-label="Dismiss loading error"><X /></button></div>}
+    </div>}
   </div>;
 }
 

@@ -383,8 +383,8 @@ select { height: 34px; padding: 0 28px 0 10px; border: 1px solid var(--input); b
 .manage-actions { display: flex; align-items: center; justify-content: space-between; }
 .dialog-form > label { display: flex; justify-content: space-between; margin-bottom: -11px; color: var(--muted-foreground); font-size: 11px; font-weight: 600; }
 .dialog-form > label small { font-weight: 400; }
-.error-toast { position: fixed; z-index: 101; right: 20px; bottom: 20px; max-width: min(440px, calc(100vw - 40px)); min-height: 43px; padding: 9px 10px; display: grid; grid-template-columns: 18px minmax(0,1fr) 24px; align-items: center; gap: 8px; border: 1px solid color-mix(in oklab, var(--destructive) 40%, var(--border)); border-radius: 9px; color: var(--foreground); background: var(--popover); box-shadow: 0 14px 40px rgba(0,0,0,.25); font-size: 11px; }
-.error-toast-stacked { bottom: 72px; }
+.error-toast-stack { position: fixed; z-index: 101; right: 20px; bottom: 20px; max-width: min(440px, calc(100vw - 40px)); display: flex; flex-direction: column-reverse; align-items: flex-end; gap: 9px; }
+.error-toast { max-width: 100%; min-height: 43px; padding: 9px 10px; display: grid; grid-template-columns: 18px minmax(0,1fr) 24px; align-items: center; gap: 8px; border: 1px solid color-mix(in oklab, var(--destructive) 40%, var(--border)); border-radius: 9px; color: var(--foreground); background: var(--popover); box-shadow: 0 14px 40px rgba(0,0,0,.25); font-size: 11px; }
 .error-toast > svg { color: var(--destructive); }
 .error-toast button { width: 24px; height: 24px; padding: 0; border: 0; display: flex; align-items: center; justify-content: center; color: var(--muted-foreground); background: transparent; cursor: pointer; }
 

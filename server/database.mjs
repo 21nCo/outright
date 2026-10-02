@@ -1575,7 +1575,8 @@ function recoverArchiveOnWorker(filename, sourceUnmoved = false, runtimeLease = 
     worker.on("message", (message) => { reply = message; });
     worker.on("error", (error) => { failure = error; });
     worker.on("exit", (code) => {
-      if (failure || code !== 0 || !reply?.ok) reject(failure ?? new Error(reply?.error ?? `Archive recovery worker exited ${code}`));
+      if (failure || code !== 0 || !reply?.ok) reject(failure ?? Object.assign(
+        new Error(reply?.error ?? `Archive recovery worker exited ${code}`), { code: reply?.code }));
       else resolve();
     });
   });

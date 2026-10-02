@@ -1012,8 +1012,8 @@ test("shadow copy serves unrelated work and retries after a concurrent source wr
       assert.ok(Date.now() < deadline, "shadow copy did not reach the live-source gate");
       await new Promise((resolve) => setTimeout(resolve, 2));
     }
-    assert.equal(database.maintenanceActive, false, "copy fenced the live database");
-    assert.equal(database.canLaunchRun(), true, "copy consumed an agent slot");
+    assert.equal(database.maintenanceActive, false, "copy unexpectedly fenced the live database");
+    assert.equal(database.canLaunchRun(), true, "copy unexpectedly consumed an agent slot");
     const sibling = chat(database, "created during copy");
     const queued = database.createRun(runInput(sibling.id));
     assert.equal(database.getRun(queued.id).status, "queued");

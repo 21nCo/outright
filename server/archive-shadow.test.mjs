@@ -59,6 +59,25 @@ test("archive shadow recovery finishes a cutover gap and retains the verified re
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
 });
 
+test("archive shadow cutover promotes a validated candidate and releases its fallback", () => {
+  const item = fixture();
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    const candidate = new Database(item.next);
+    candidate.prepare("UPDATE evidence SET body = ? WHERE id = 1").run("retained after cutover");
+    candidate.close();
+    prepareArchiveShadowCutover(item.filename);
+    cutoverArchiveShadow(item.filename);
+    assert.equal(body(item.filename), "retained after cutover");
+    assert.equal(existsSync(item.old), false);
+    assert.equal(existsSync(item.next), false);
+    assert.equal(existsSync(item.state), false);
+  } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
 test("archive shadow recovery restores the source when the replacement is invalid", () => {
   const item = fixture();
   try {
@@ -69,6 +88,7 @@ test("archive shadow recovery restores the source when the replacement is invali
     assert.equal(body(item.filename), "recoverable payload");
     assert.equal(existsSync(item.old), false);
     assert.equal(existsSync(item.state), false);
+    assert.equal(existsSync(item.next), false);
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
 });
 
@@ -168,6 +188,7 @@ test("a valid replacement after preparation cannot displace the recoverable sour
     assert.throws(() => cutoverArchiveShadow(item.filename), /candidate changed/);
     recoverArchiveShadow(item.filename);
     assert.equal(body(item.filename), "recoverable payload");
+    assert.equal(existsSync(item.next), false);
     assert.equal(existsSync(item.old), false);
     assert.equal(existsSync(item.state), false);
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
@@ -228,6 +249,7 @@ test("recovery keeps the fallback when the authenticated candidate is replaced d
 test("recovery keeps the fallback when a previously promoted candidate changes before cleanup", () => {
   const item = fixture();
   const originalOpen = fs.openSync;
+  const originalClose = fs.closeSync;
   const originalRename = fs.renameSync;
   try {
     beginArchiveShadow(item.filename);
@@ -242,21 +264,53 @@ test("recovery keeps the fallback when a previously promoted candidate changes b
     other.exec("CREATE TABLE evidence (id INTEGER PRIMARY KEY, body TEXT NOT NULL)");
     other.prepare("INSERT INTO evidence (body) VALUES (?)").run("unvalidated payload");
     other.close();
+    let flushHandle;
     fs.openSync = (name, flags, ...rest) => {
       const fd = originalOpen(name, flags, ...rest);
-      if (name === item.filename && flags === "r+") {
-        fs.rmSync(name);
-        originalRename(substitute, name);
-      }
+      if (name === item.filename && flags === "r+") flushHandle = fd;
       return fd;
+    };
+    fs.closeSync = (fd) => {
+      originalClose(fd);
+      if (fd === flushHandle) {
+        flushHandle = undefined;
+        fs.rmSync(item.filename);
+        originalRename(substitute, item.filename);
+      }
     };
     syncBuiltinESMExports();
     recoverArchiveShadow(item.filename);
     assert.equal(body(item.filename), "recoverable payload");
     assert.equal(existsSync(item.state), false);
+    assert.equal(existsSync(item.next), false);
+    assert.equal(existsSync(item.old), false);
   } finally {
     fs.openSync = originalOpen;
+    fs.closeSync = originalClose;
     syncBuiltinESMExports();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
+});
+
+test("a leased startup recovery reports a retryable busy code without discarding evidence", async () => {
+  const item = fixture();
+  let lease;
+  try {
+    beginArchiveShadow(item.filename);
+    lease = new Database(`${item.filename}.runtime-lease`);
+    lease.pragma("locking_mode = EXCLUSIVE");
+    lease.exec("BEGIN EXCLUSIVE; COMMIT;");
+    await assert.rejects(recoverArchiveBeforeStartup({ filename: item.filename }),
+      (error) => error.code === "SQLITE_BUSY");
+    assert.equal(body(item.filename), "recoverable payload");
+    assert.equal(existsSync(item.state), true);
+    lease.close();
+    lease = undefined;
+    await recoverArchiveBeforeStartup({ filename: item.filename });
+    assert.equal(body(item.filename), "recoverable payload");
+    assert.equal(existsSync(item.state), false);
+  } finally {
+    lease?.close();
     rmSync(item.directory, { recursive: true, force: true });
   }
 });

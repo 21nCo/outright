@@ -34,6 +34,14 @@ async function until(check, label) {
     await frame();
   }
 }
+async function remainsTrue(check, durationMs, label) {
+  const deadline = performance.now() + durationMs;
+  while (performance.now() < deadline) {
+    assert(check(), label);
+    await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - performance.now()))));
+  }
+  assert(check(), label);
+}
 function assert(value, message) { if (!value) throw new Error(message); }
 function deferred() { let resolve; let reject; const promise = new Promise((done, fail) => { resolve = done; reject = fail; }); return { promise, resolve, reject }; }
 function setControlValue(control, value) {
@@ -522,16 +530,18 @@ async function bootstrapRefreshErrorOwnershipRegression() {
   const linkedProjects = projects.map((item) => item.id === "A"
     ? { ...item, worktrees: [{ ...item.worktrees[0], isLinked: true }] } : item);
   const heldBootstrap = deferred();
+  const scanError = `Scan failed: ${"A long project scan error must stay readable when it wraps. ".repeat(8)}`;
+  const loadingError = `Bootstrap failed: ${"The background refresh could not read the project inventory. ".repeat(5)}`;
   let bootstrapCalls = 0;
   route = async (url, options) => {
     if (url.pathname === "/api/bootstrap") {
       bootstrapCalls += 1;
       return bootstrapCalls === 1 ? response({ projects: linkedProjects, projectGroups: { groups: [], memberships: {} },
         settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] })
-        : heldBootstrap.promise;
+        : bootstrapCalls === 2 ? heldBootstrap.promise : response({ error: loadingError }, 500);
     }
     if (url.pathname === "/api/worktrees" && options.method === "DELETE") return response({});
-    if (url.pathname === "/api/projects" && options.method === "POST") return response({ error: "Scan failed" }, 500);
+    if (url.pathname === "/api/projects" && options.method === "POST") return response({ error: scanError }, 500);
     if (url.pathname === "/api/conversations") return response({ conversations: [] });
     return response({});
   };
@@ -550,6 +560,48 @@ async function bootstrapRefreshErrorOwnershipRegression() {
     settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] }));
   await until(() => host.querySelector('.workspace-context')?.textContent.includes("Review B"), "background bootstrap finished");
   assert(host.querySelector('.error-toast')?.textContent.includes("Scan failed"), "background bootstrap dismissed an unrelated operation error");
+  const nativeSetTimeout = window.setTimeout;
+  const nativeClearTimeout = window.clearTimeout;
+  const dismissTimers = new Map();
+  let virtualNow = 0;
+  let nextTimer = 1_000_000;
+  window.setTimeout = (callback, delay, ...args) => {
+    if (delay !== 6000) return nativeSetTimeout.call(window, callback, delay, ...args);
+    const id = nextTimer++;
+    dismissTimers.set(id, { due: virtualNow + delay, callback, args });
+    return id;
+  };
+  window.clearTimeout = (id) => {
+    if (dismissTimers.delete(id)) return;
+    nativeClearTimeout.call(window, id);
+  };
+  try {
+    fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { restarted: true } }) }));
+    await until(() => host.querySelectorAll('.error-toast').length === 2, "operation and bootstrap errors remain visible together");
+    const [operationToast, bootstrapToast] = host.querySelectorAll('.error-toast');
+    const operationBox = operationToast.getBoundingClientRect();
+    const bootstrapBox = bootstrapToast.getBoundingClientRect();
+    assert(operationBox.height > 52 && bootstrapBox.bottom + 8 <= operationBox.top,
+      `Wrapped errors overlap: operation=${operationBox.top}/${operationBox.bottom}, bootstrap=${bootstrapBox.top}/${bootstrapBox.bottom}`);
+    await settle();
+    // Advance only the six-second dismissal timer. Provider updates replace
+    // bootstrap state, but cannot postpone an error already announced.
+    for (let index = 0; index < 3; index += 1) {
+      virtualNow += 1000;
+      fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "providers.changed", payload: { providers: [{ id: "codex", available: true }] } }) }));
+      await settle();
+    }
+    virtualNow = 6500;
+    for (const [id, timer] of dismissTimers) {
+      if (timer.due <= virtualNow) { dismissTimers.delete(id); timer.callback(...timer.args); }
+    }
+    await settle();
+    assert(!host.querySelector('[aria-label="Dismiss loading error"]'),
+      "bootstrap error timer restarted after unrelated provider updates");
+  } finally {
+    window.setTimeout = nativeSetTimeout;
+    window.clearTimeout = nativeClearTimeout;
+  }
 }
 
 async function settingsMigrationCompletionRegression() {
@@ -4364,8 +4416,7 @@ async function bootstrapHardFailureRegression() {
     root.render(<TooltipProvider><App /></TooltipProvider>);
     await until(() => host.querySelector('.loading-screen [role="alert"]')?.textContent === failure.message,
       `bootstrap ${failure.status ?? "network"} failure is surfaced`);
-    await new Promise((resolve) => setTimeout(resolve, 1150));
-    assert(bootstrapReads === 1, `bootstrap ${failure.status ?? "network"} failure was polled indefinitely`);
+    await remainsTrue(() => bootstrapReads === 1, 1150, `bootstrap ${failure.status ?? "network"} failure was polled indefinitely`);
     assert(host.querySelector('.loading-screen button')?.textContent.includes("Retry"), "hard failure has no explicit retry");
     if (failure.status === 401) {
       fail = false;
@@ -4389,8 +4440,7 @@ async function providerCheckingRateRegression() {
   };
   root.render(<TooltipProvider><App /></TooltipProvider>);
   await until(() => providerReads > 0, "checking provider poll started");
-  await new Promise((resolve) => setTimeout(resolve, 1150));
-  assert(providerReads <= 2, `Checking provider polled ${providerReads} times in 1.15s`);
+  await remainsTrue(() => providerReads <= 2, 1150, "Checking provider polled more than twice in 1.15s");
   root.render(null); await settle();
 }
 
@@ -4507,6 +4557,10 @@ async function responsiveSidebarBreakpointCycles(setWidth) {
     opener.blur();
     await new Promise((resolve) => setTimeout(resolve, 400));
     assert(document.activeElement === document.body, "sidebar watcher reclaimed focus after an intentional blank click");
+    await setWidth(1280);
+    await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "false", "wide sidebar after intentional blank click");
+    await remainsTrue(() => document.activeElement === document.body, 600,
+      "sidebar reclaimed intentional BODY focus on a later breakpoint change");
   } catch (error) {
     throw new Error(`${error.message}; focusTrace=${JSON.stringify(trace.slice(-35))}`);
   } finally {

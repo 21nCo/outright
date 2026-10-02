@@ -23,7 +23,12 @@ app.use((request, response, next) => {
   response.end(JSON.stringify({ error: startupError ? "Runtime recovery failed; database requires inspection" : "Runtime recovery is in progress" }));
 });
 httpServer.on("upgrade", (_request, socket) => {
-  if (!runtime) { socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n"); socket.destroy(); }
+  if (!runtime) {
+    socket.write(startupError
+      ? "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
+      : "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+  }
 });
 
 app.use(sirv(path.resolve(import.meta.dirname, "../dist/client"), {
@@ -36,13 +41,23 @@ httpServer.listen(port, host, () => {
   console.info(`Outright is running at http://${host}:${port}`);
 });
 
-const recovery = recoverArchiveBeforeStartup().then(() => {
-  if (stopping) return;
-  runtime = createOutrightRuntime({ configUrl: new URL("../outright.config.json", import.meta.url) });
-  runtime.attach({ middlewares: { use() {} }, httpServer });
-}).catch((error) => {
+const recovery = recoverArchiveBeforeStartup().catch((error) => {
   startupError = error;
   console.error("Runtime recovery failed; database requires inspection", error);
+}).then(async () => {
+  if (stopping || startupError) return;
+  try {
+    runtime = createOutrightRuntime({ configUrl: new URL("../outright.config.json", import.meta.url) });
+    runtime.attach({ middlewares: { use() {} }, httpServer });
+  } catch (error) {
+    console.error("Runtime initialization failed", error);
+    stopping = true;
+    process.exitCode = 1;
+    try { await runtime?.shutdown(); }
+    catch (shutdownError) { console.error("Runtime initialization cleanup failed", shutdownError); }
+    httpServer.close();
+    httpServer.closeIdleConnections?.();
+  }
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
