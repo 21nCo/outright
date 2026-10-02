@@ -5,8 +5,8 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import { foldFindText } from "../src/lib/find-text.js";
-import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
-import { allocatedDatabaseBytes, archiveShadowPaths, beginArchiveShadow, recoverArchiveShadow } from "./archive-shadow.mjs";
+import { RESOURCE_BUDGETS, RETAINED_MESSAGE_FIELDS, RETAINED_ROW_OVERHEAD_BYTES } from "./resource-budgets.mjs";
+import { allocatedDatabaseUsage, archiveShadowPaths, beginArchiveShadow, recoverArchiveShadow } from "./archive-shadow.mjs";
 
 const DEFAULT_SETTINGS = {
   provider: "codex",
@@ -35,7 +35,7 @@ const RETAINED_COLUMNS = [
   ["project_groups", "id, name, created_at"],
   ["project_memberships", "project_id, group_id"],
   ["conversations", "id, project_id, worktree_id, worktree_path, title, provider, model, provider_session_id, created_at, updated_at"],
-  ["messages", "id, conversation_id, role, kind, body, payload, created_at"],
+  ["messages", RETAINED_MESSAGE_FIELDS.join(", ")],
   ["runs", "id, conversation_id, worktree_path, provider, model, reasoning_effort, approval_policy, prompt, status, pid, provider_session_id, created_at, started_at, finished_at, exit_code, error, cost_usd, input_tokens, output_tokens, recovery_class, recovery_decision, transcript_omitted"],
   ["run_events", "run_id, type, payload, created_at"],
   ["run_event_usage", "run_id"],
@@ -327,6 +327,7 @@ export function createOutrightDatabase(options = {}) {
       return this.getSettings();
     },
     capacity() {
+      const disk = allocatedDatabaseUsage(storageFilename);
       const settings = this.getSettings();
       const queued = db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status = 'queued'").get().count;
       const active = db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status IN ('launching', 'running')").get().count;
@@ -350,8 +351,8 @@ export function createOutrightDatabase(options = {}) {
         maxRetainedBytes, reservedRetainedBytes: retainedReserveBytes, retentionDays: settings.retentionDays,
         maxRunTranscriptItems: RESOURCE_BUDGETS.maxRunTranscriptItems, maxRunTranscriptBytes: RESOURCE_BUDGETS.maxRunTranscriptBytes,
         maxRunEventBytes: MAX_RUN_EVENT_RETAINED_BYTES,
-      }, cpuUsage: null, memoryUsage: null, diskAllocatedBytes: allocatedDatabaseBytes(storageFilename),
-      diskUsageStatus: process.platform === "win32" ? "estimated" : "measured" };
+      }, cpuUsage: null, memoryUsage: null, diskAllocatedBytes: disk.bytes,
+      diskUsageStatus: disk.status };
     },
     canLaunchRun() {
       // Keep enough ordinary retained space for a newly launched run to
@@ -362,7 +363,7 @@ export function createOutrightDatabase(options = {}) {
       // not reserve every free agent slot. Only the short final cutover
       // pauses launches; a long unrelated run may keep an oversized delete
       // deferred without starving the queue.
-      return !maintenance && capacity.availableForNewWorkBytes >= 64 * 1024;
+      return !maintenance && capacity.diskUsageStatus !== "unknown" && capacity.availableForNewWorkBytes >= 64 * 1024;
     },
     listDeletableArchivedConversations({ limit = 100, cursor = null } = {}) {
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw databaseError(400, "Archived history page size must be 1 to 100");
@@ -1213,11 +1214,11 @@ export function createOutrightDatabase(options = {}) {
         const serialized = serializePayload(payload);
         const result = db.prepare("INSERT INTO run_events (run_id, seq, type, payload, created_at) VALUES (?, ?, ?, ?, ?)").run(runId, seq, type, serialized, createdAt);
         db.prepare(`INSERT INTO run_event_usage (run_id, bytes, last_seq) VALUES (?, ?, ?)
-          ON CONFLICT(run_id) DO UPDATE SET bytes = bytes + excluded.bytes, last_seq = excluded.last_seq`).run(runId, Buffer.byteLength(serialized) + 128, seq);
+          ON CONFLICT(run_id) DO UPDATE SET bytes = bytes + excluded.bytes, last_seq = excluded.last_seq`).run(runId, Buffer.byteLength(serialized) + RETAINED_ROW_OVERHEAD_BYTES, seq);
         // Replay is a bounded tail. Durable transcript checkpoints and run
         // rows remain separate, so pruning does not erase recovery evidence.
         let bytes = db.prepare("SELECT bytes FROM run_event_usage WHERE run_id = ?").get(runId).bytes;
-        const old = db.prepare("SELECT id, seq, COALESCE(LENGTH(CAST(payload AS BLOB)), 0) + 128 AS bytes FROM run_events WHERE run_id = ? ORDER BY seq LIMIT 1");
+        const old = db.prepare(`SELECT id, seq, COALESCE(LENGTH(CAST(payload AS BLOB)), 0) + ${RETAINED_ROW_OVERHEAD_BYTES} AS bytes FROM run_events WHERE run_id = ? ORDER BY seq LIMIT 1`);
         const remove = db.prepare("DELETE FROM run_events WHERE id = ?");
         while (bytes > MAX_RUN_EVENT_RETAINED_BYTES || old.get(runId)?.seq <= seq - 2_000) {
           const row = old.get(runId);
@@ -1331,9 +1332,12 @@ export function createOutrightDatabase(options = {}) {
     const member = Reflect.get(target, key, receiver);
     if (typeof member !== "function") return member;
     if (!maintenance || key === "close") return member.bind(receiver);
-    if (key === "capacity") return () => ({ ...maintenanceCapacity, migrationStatus: "maintenance",
-      maintenanceError,
-      availableForNewWorkBytes: 0, diskAllocatedBytes: allocatedDatabaseBytes(storageFilename), diskUsageStatus: "partial" });
+    if (key === "capacity") return () => {
+      const disk = allocatedDatabaseUsage(storageFilename);
+      return { ...maintenanceCapacity, migrationStatus: "maintenance", maintenanceError,
+        availableForNewWorkBytes: 0, diskAllocatedBytes: disk.bytes,
+        diskUsageStatus: disk.status === "unknown" ? "unknown" : "partial" };
+    };
     if (key === "canLaunchRun") return () => false;
     if (key === "audit") return () => false;
     if (key === "auditRequired") return async (...args) => {
@@ -1490,9 +1494,9 @@ function markArchivedForDeletion(db, id, automatic) {
 
 function deleteArchivedBatch(db, id, filename) {
   const sources = [
-    [`SELECT events.id, COALESCE(octet_length(events.payload), 0) + 128 AS bytes FROM run_events AS events
+    [`SELECT events.id, COALESCE(octet_length(events.payload), 0) + ${RETAINED_ROW_OVERHEAD_BYTES} AS bytes FROM run_events AS events
       JOIN runs ON runs.id = events.run_id WHERE runs.conversation_id = ? LIMIT 64`, "run_events"],
-    [`SELECT id, COALESCE(octet_length(body), 0) + COALESCE(octet_length(payload), 0) + 128 AS bytes
+    [`SELECT id, COALESCE(octet_length(body), 0) + COALESCE(octet_length(payload), 0) + ${RETAINED_ROW_OVERHEAD_BYTES} AS bytes
       FROM messages WHERE conversation_id = ? LIMIT 64`, "messages"],
     [`SELECT id, ${retainedSizeExpression(RUN_RETAINED_FIELDS)} AS bytes
       FROM runs WHERE conversation_id = ? LIMIT 64`, "runs"],
@@ -1807,7 +1811,7 @@ function advanceEventMigration(db) {
       bytes = 0;
       items = 0;
     }
-    const rows = db.prepare(`SELECT id, seq, COALESCE(octet_length(payload), 0) + 128 AS size
+    const rows = db.prepare(`SELECT id, seq, COALESCE(octet_length(payload), 0) + ${RETAINED_ROW_OVERHEAD_BYTES} AS size
       FROM run_events WHERE run_id = ? AND seq < ? ORDER BY seq DESC LIMIT 64`).all(runId, cursor);
     const remove = db.prepare("DELETE FROM run_events WHERE id = ?");
     for (const row of rows) {
@@ -1930,7 +1934,7 @@ function retainedBytes(db) {
   return db.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes;
 }
 function retainedSizeExpression(fields, prefix = "") {
-  return `128 + ${fields.split(", ").map((field) => "COALESCE(octet_length(" + prefix + field + "), 0)").join(" + ")}`;
+  return `${RETAINED_ROW_OVERHEAD_BYTES} + ${fields.split(", ").map((field) => "COALESCE(octet_length(" + prefix + field + "), 0)").join(" + ")}`;
 }
 function preparePrivateLaunchDirectory(directory) {
   if (!directory || !path.isAbsolute(directory)) throw new Error("A private absolute launch directory is required");

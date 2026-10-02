@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
+import fs from "node:fs";
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
@@ -267,20 +268,43 @@ export function cutoverArchiveShadow(filename) {
   durableDirectory(filename);
 }
 
-export function allocatedDatabaseBytes(filename) {
-  if (filename === ":memory:") return 0;
+export function allocatedDatabaseUsage(filename) {
+  if (filename === ":memory:") return { bytes: 0, status: "measured" };
   const { next, old, state } = archiveShadowPaths(filename);
   const sqliteFiles = [filename, next, old].flatMap((name) => [name, `${name}-wal`, `${name}-shm`, `${name}-journal`]);
-  return [...sqliteFiles, state, `${state}.tmp`]
-    .reduce((total, part) => {
-      try {
-        const info = lstatSync(part);
-        if (!info.isFile()) throw new Error(`Unsafe database storage file: ${part}`);
-        const allocated = typeof info.blocks === "number" ? info.blocks * 512 : 0;
-        return total + (allocated > 0 ? allocated : info.size);
-      } catch (error) {
-        if (error.code === "ENOENT") { return total; }
-        throw error;
-      }
-    }, 0);
+  const inspect = (part) => {
+    try { return fs.lstatSync(part); }
+    catch (error) { if (error.code === "ENOENT") return null; throw error; }
+  };
+  try {
+    const sourceBefore = inspect(filename);
+    const markerBefore = inspect(state);
+    let bytes = 0;
+    let transition = false;
+    for (const part of [...sqliteFiles, state, `${state}.tmp`]) {
+      const info = inspect(part);
+      if (!info) continue;
+      if (!info.isFile()) throw new Error(`Unsafe database storage file: ${part}`);
+      if (part === state || part === `${state}.tmp`) transition = true;
+      const allocated = typeof info.blocks === "number" ? info.blocks * 512 : 0;
+      bytes += allocated > 0 ? allocated : info.size;
+    }
+    const sourceAfter = inspect(filename);
+    const markerAfter = inspect(state);
+    if (!sourceBefore && !markerBefore && !markerAfter) return { bytes: null, status: "unknown" };
+    // A cutover can rename the source during this scan. Compare both ends so
+    // a transiently absent marker cannot make a moving sum look measured.
+    if (sourceBefore?.dev !== sourceAfter?.dev || sourceBefore?.ino !== sourceAfter?.ino
+      || sourceBefore?.size !== sourceAfter?.size || sourceBefore?.mtimeMs !== sourceAfter?.mtimeMs) transition = true;
+    if (markerBefore || markerAfter) transition = true;
+    let status = "measured";
+    if (transition) status = "partial";
+    else if (process.platform === "win32") status = "estimated";
+    return { bytes, status };
+  } catch (error) {
+    // Windows can deny a stat while SQLite creates or removes a rollback
+    // journal. A missing measurement must never become a plausible zero.
+    if (["EPERM", "EACCES", "EBUSY"].includes(error.code)) return { bytes: null, status: "unknown" };
+    throw error;
+  }
 }

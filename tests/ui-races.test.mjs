@@ -347,16 +347,18 @@ async function closeDevTools(devtools) {
   if (devtools.socket.readyState !== WebSocket.CLOSED) devtools.socket.terminate();
 }
 
-async function waitForFixture(send, deadline) {
+async function waitForFixture(send, deadline, diagnostics = () => "") {
   let state;
   while (Date.now() < deadline) {
     let evaluated;
     try {
       evaluated = await send("Runtime.evaluate", {
-        expression: "({ title: document.title, text: document.getElementById('results')?.textContent ?? '', progress: window.__fixtureProgress && { ...window.__fixtureProgress, elapsedMs: Math.round(performance.now() - window.__fixtureStartedAt), stepElapsedMs: Math.round(performance.now() - window.__fixtureProgress.stepStartedAt) } })",
+        expression: "({ title: document.title, text: document.getElementById('results')?.textContent ?? '', progress: window.__fixtureProgress && { ...window.__fixtureProgress, elapsedMs: Math.round(performance.now() - window.__fixtureStartedAt), stepElapsedMs: Math.round(performance.now() - window.__fixtureProgress.stepStartedAt) }, timings: window.__fixtureTimings?.slice() })",
         returnByValue: true,
       });
-    } catch (error) { throw new Error(`${error.message}; ${fixtureProgress(state)}`, { cause: error }); }
+    } catch (error) {
+      throw new Error(`${error.message}; ${fixtureProgress(state)}; phaseRemaining=${deadline - Date.now()}ms; ${diagnostics()}`, { cause: error });
+    }
     const next = evaluated?.exceptionDetails ? null : evaluated?.result?.value;
     if (next && typeof next.title === "string") {
       state = next;
@@ -365,13 +367,15 @@ async function waitForFixture(send, deadline) {
     }
     await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(0, deadline - Date.now()))));
   }
-  throw new Error(`Interaction phase exceeded its pre-cleanup deadline: ${fixtureProgress(state)}; page=${state?.title ?? "unavailable"}; output=${state?.text?.slice(-1000) ?? "unavailable"}`);
+  throw new Error(`Interaction phase exceeded its pre-cleanup deadline: ${fixtureProgress(state)}; ${diagnostics()}; page=${state?.title ?? "unavailable"}; output=${state?.text?.slice(-1000) ?? "unavailable"}`);
 }
 
 function fixtureProgress(state) {
   const progress = state?.progress;
+  const timing = state?.timings?.length
+    ? `, recent=${JSON.stringify(state.timings.slice(-5))}, slowest=${JSON.stringify([...state.timings].sort((a, b) => b.ms - a.ms).slice(0, 5))}` : "";
   return progress
-    ? `${progress.completed}/${progress.total} complete, current step=${progress.step}, elapsed=${progress.elapsedMs}ms, step=${progress.stepElapsedMs}ms`
+    ? `${progress.completed}/${progress.total} complete, current step=${progress.step}, elapsed=${progress.elapsedMs}ms, step=${progress.stepElapsedMs}ms${timing}`
     : "fixture has not reported a step";
 }
 
@@ -623,13 +627,16 @@ test("a vanished Windows launcher preserves verified descendants without adoptin
   assert.equal(launcher.ownedWindows.has(4103), false);
 });
 
-// The normal child has 180 seconds including its 155-second interaction phase
+// A measured full local run took 133.5 seconds; macOS CI reached 103/108 at
+// 148.4 seconds. Keep a finite phase with room for the final responsive and
+// recovery steps, while preserving their separate performance assertions.
+// The normal child has 235 seconds including its 210-second interaction phase
 // and cleanup. A focused 1000px full-span wheel fixture gets a larger finite
 // phase bound. The parent must outlive either child contract and reserve its
 // own tree/profile cleanup time.
 const smallWheelCap = Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) > 0
   && Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) <= 1000;
-const browserPhaseTimeout = smallWheelCap ? 330_000 : 155_000;
+const browserPhaseTimeout = smallWheelCap ? 330_000 : 210_000;
 const browserFixtureTimeout = browserPhaseTimeout + 25_000;
 const nestedStartupAllowance = 15_000;
 const nestedRunnerBudget = (childBudget, startupAllowance) => childBudget + startupAllowance;
@@ -879,7 +886,9 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       if (viewportError) throw viewportError;
       if (pageErrors.length) throw new Error(`Uncaught browser error: ${pageErrors.join("; ")}`);
       return send(method, params);
-    }, deadline);
+    }, deadline, () => JSON.stringify({ vitePid: vite.pid, viteExit: vite.exitCode, viteSignal: vite.signalCode,
+      browserPid: browser?.pid, browserExit: browser?.exitCode, browserSignal: browser?.signalCode,
+      devtoolsReady: devtools?.socket.readyState, viteOutput: output.slice(-500) }));
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
     const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
     const expectedCount = selectedCount ?? 108;
@@ -889,6 +898,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     const performanceFixture = state.text.match(/Performance fixture: (\{[^\n]+\})/);
     if (!process.env.OUTRIGHT_UI_STEP) assert.ok(performanceFixture, "large fixture measurements were not recorded");
     if (performanceFixture) console.log(`UI performance: ${performanceFixture[1]}`);
+    if (!process.env.OUTRIGHT_UI_STEP) console.log(`UI fixture timings: ${fixtureProgress(state)}`);
     if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
   } catch (error) {
     failure = new Error(`UI fixture ${phase}: ${error.message}`, { cause: error });

@@ -6,7 +6,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { existsSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { allocatedDatabaseBytes, archiveShadowPaths, beginArchiveShadow, cutoverArchiveShadow, prepareArchiveShadowCutover, recoverArchiveShadow } from "./archive-shadow.mjs";
+import { allocatedDatabaseUsage, archiveShadowPaths, beginArchiveShadow, cutoverArchiveShadow, prepareArchiveShadowCutover, recoverArchiveShadow } from "./archive-shadow.mjs";
 import { createOutrightDatabase, recoverArchiveBeforeStartup } from "./database.mjs";
 
 function fixture() {
@@ -30,7 +30,7 @@ test("archive shadow recovery discards an interrupted copy without touching sour
   try {
     beginArchiveShadow(item.filename);
     writeFileSync(item.next, "incomplete copy");
-    assert.ok(allocatedDatabaseBytes(item.filename) > 0);
+    assert.ok(allocatedDatabaseUsage(item.filename).bytes > 0);
     recoverArchiveShadow(item.filename);
     assert.equal(body(item.filename), "recoverable payload");
     assert.equal(existsSync(item.next), false);
@@ -162,11 +162,11 @@ test("archive shadow recovery keeps the promoted database and releases its old p
     prepareArchiveShadowCutover(item.filename);
     renameSync(item.filename, item.old);
     renameSync(item.next, item.filename);
-    const withOld = allocatedDatabaseBytes(item.filename);
+    const withOld = allocatedDatabaseUsage(item.filename).bytes;
     recoverArchiveShadow(item.filename);
     assert.equal(body(item.filename), "promoted payload");
     assert.equal(existsSync(item.old), false);
-    assert.ok(allocatedDatabaseBytes(item.filename) < withOld, "retained old file was omitted from disk accounting");
+    assert.ok(allocatedDatabaseUsage(item.filename).bytes < withOld, "retained old file was omitted from disk accounting");
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
 });
 
@@ -380,14 +380,43 @@ test("dangling maintenance links are rejected before recovery can discard its ma
 test("physical usage includes candidate and marker bytes until each file is removed", () => {
   const item = fixture();
   try {
-    const sourceBytes = allocatedDatabaseBytes(item.filename);
+    const sourceBytes = allocatedDatabaseUsage(item.filename).bytes;
     assert.ok(sourceBytes > 0);
     beginArchiveShadow(item.filename);
-    const withMarker = allocatedDatabaseBytes(item.filename);
+    const withMarker = allocatedDatabaseUsage(item.filename).bytes;
+    assert.equal(allocatedDatabaseUsage(item.filename).status, "partial");
     assert.ok(withMarker > sourceBytes, "marker was omitted from physical usage");
     writeFileSync(item.next, Buffer.alloc(128 * 1024, 1));
-    assert.ok(allocatedDatabaseBytes(item.filename) > withMarker, "candidate was omitted from physical usage");
+    assert.ok(allocatedDatabaseUsage(item.filename).bytes > withMarker, "candidate was omitted from physical usage");
     recoverArchiveShadow(item.filename);
-    assert.equal(allocatedDatabaseBytes(item.filename), sourceBytes);
+    assert.equal(allocatedDatabaseUsage(item.filename).bytes, sourceBytes);
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
+test("inaccessible rollback journal reports unknown usage and pauses launch admission", () => {
+  const item = fixture();
+  const originalStat = fs.lstatSync;
+  let database;
+  try {
+    database = createOutrightDatabase({ filename: path.join(item.directory, "runtime.db") });
+    const journal = path.join(realpathSync(item.directory), "runtime.db.archive-next-journal");
+    fs.lstatSync = (filename, ...args) => {
+      if (filename === journal) throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
+      return originalStat(filename, ...args);
+    };
+    syncBuiltinESMExports();
+    assert.deepEqual(database.capacity().diskAllocatedBytes, null);
+    assert.equal(database.capacity().diskUsageStatus, "unknown");
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: item.directory, title: "sibling", provider: "codex" });
+    const submitted = database.submitRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "queued" }, "queued");
+    assert.equal(database.getRun(submitted.run.id).status, "queued", "journal access prevented durable queueing");
+    assert.equal(database.canLaunchRun(), false, "unknown physical usage admitted a new process");
+  } finally {
+    fs.lstatSync = originalStat;
+    syncBuiltinESMExports();
+    assert.equal(database?.capacity().diskUsageStatus, process.platform === "win32" ? "estimated" : "measured");
+    assert.equal(database?.canLaunchRun(), true, "journal access recovery did not reopen admission");
+    database?.close();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
 });

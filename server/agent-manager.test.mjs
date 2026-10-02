@@ -707,6 +707,50 @@ test("queued siblings defer after output exhausts quota, then resume or cancel s
   assert.equal(database.getRun("cancelled").status, "stopped");
 });
 
+test("unknown journal usage retries a queued launch and leaves cancellation terminal", async () => {
+  const database = fakeDatabase();
+  let measurable = false;
+  database.canLaunchRun = () => measurable;
+  database.capacity = () => ({ diskUsageStatus: measurable ? "measured" : "unknown" });
+  const cancelled = database.createRun(codexRun("journal-cancelled"));
+  const waiting = database.createRun(codexRun("journal-waiting"));
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => {
+    const child = fakeChild(); children.push(child); return child;
+  } });
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: cancelled });
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: waiting });
+  assert.equal(children.length, 0);
+  assert.equal(await manager.stop(cancelled.id), true);
+  measurable = true;
+  const deadline = Date.now() + 1000;
+  while (!children.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(children.length, 1, "journal access recovered without a new request but queue did not drain");
+  assert.equal(database.getRun(cancelled.id).status, "stopped");
+  assert.equal(database.getRun(waiting.id).status, "running");
+  children[0].emit("close", 0, null);
+  await manager.shutdown();
+});
+
+test("journal access recovered between admission and capacity reads still wakes the queue", async () => {
+  const database = fakeDatabase();
+  let attempts = 0;
+  database.canLaunchRun = () => ++attempts > 1;
+  database.capacity = () => ({ diskUsageStatus: "measured", availableForNewWorkBytes: 1024 * 1024 });
+  const run = database.createRun(codexRun("journal-race"));
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => {
+    const child = fakeChild(); children.push(child); return child;
+  } });
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  assert.equal(children.length, 0);
+  const deadline = Date.now() + 1000;
+  while (!children.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(children.length, 1, "a resolved journal access race stranded the queued run");
+  children[0].emit("close", 0, null);
+  await manager.shutdown();
+});
+
 test("capacity spent during asynchronous capability setup cannot authorize a queued launch", async () => {
   const database = fakeDatabase();
   let room = true;

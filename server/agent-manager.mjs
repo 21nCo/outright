@@ -323,6 +323,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   const maintenanceWaiters = new Set();
   let shuttingDown = false;
   let shutdownPromise;
+  let diskRetryTimer;
+  let diskRetryDelayMs = 100;
   const providerDiscovery = providerDiscoveryFactory({ onChange: onProvidersChanged });
 
   function wakeMaintenanceWaiters() {
@@ -545,7 +547,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     let finished;
     try {
       const successful = exitCode === 0 && !error && !state.stopped;
-      status = state.stopped ? "stopped" : successful ? "completed" : "failed";
+      if (state.stopped) status = "stopped";
+      else if (successful) status = "completed";
+      else status = "failed";
       message = error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : "");
       finishedAt = new Date().toISOString();
       const transcriptMessage = budgetTranscript(state, pendingAssistantMessage(state), { terminal: true });
@@ -680,65 +684,102 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   }
 
 
+  function conflictsWithActiveRun(entry) {
+    return [...active.values()].some((state) => {
+      const activeWorktree = state.run.worktreePath ?? state.conversation.worktreePath;
+      const queuedWorktree = entry.run.worktreePath ?? entry.conversation.worktreePath;
+      return state.conversation.id === entry.run.conversationId
+        || (activeWorktree && queuedWorktree && activeWorktree === queuedWorktree);
+    });
+  }
+
+  async function prepareQueuedLaunch(state, entry) {
+    const fresh = database.getConversation(entry.run.conversationId);
+    if (!fresh) throw new Error("Conversation no longer exists");
+    if (entry.run.worktreePath && fresh.worktreePath !== entry.run.worktreePath) {
+      throw new Error("Conversation target changed after this run was queued; submit again");
+    }
+    const authorize = await validateConversation(fresh);
+    if (state.stopped || shuttingDown) return null;
+    const current = database.getConversation(fresh.id);
+    if (!current || ["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== fresh[key])
+      || (entry.run.worktreePath && current.worktreePath !== entry.run.worktreePath)) {
+      throw new Error("Conversation target changed while preparing the run; submit again");
+    }
+    // Recheck mutable trust synchronously immediately before spawning.
+    authorize?.();
+    // Recovery retry explicitly asks for a new provider session even when
+    // the conversation still advertises the interrupted one.
+    if (entry.providerSessionId !== undefined) state.conversation = { ...current, providerSessionId: entry.providerSessionId };
+    else if (entry.forceFreshSession) state.conversation = { ...current, providerSessionId: null };
+    else state.conversation = current;
+    return { authorize };
+  }
+
+  async function launchQueued(state, entry) {
+    while (!state.stopped && !shuttingDown) {
+      try {
+        const prepared = await prepareQueuedLaunch(state, entry);
+        if (!prepared) return;
+        if (await start(state, prepared.authorize) === "deferred") {
+          active.delete(entry.run.id);
+          queue.unshift(entry);
+        }
+        return;
+      } catch (error) {
+        if (error.statusCode === 503 && database.maintenanceActive && !state.child && !state.stopped) {
+          // Validation may have succeeded just as the database closed.
+          // Revalidate the target after reopening before any launch effect.
+          await waitForMaintenance();
+          continue;
+        }
+        if (!state.stopped && !error?.preserveActiveRun) {
+          if (finish(state, null, error) === false) {
+            await waitForMaintenance();
+            if (!shuttingDown) finish(state, null, error);
+          }
+        }
+        return;
+      }
+    }
+  }
+
+  function retryUnknownDiskUsage() {
+    if (diskRetryTimer || shuttingDown) return;
+    const delay = diskRetryDelayMs;
+    diskRetryDelayMs = Math.min(30_000, diskRetryDelayMs * 2);
+    diskRetryTimer = setTimeout(() => {
+      diskRetryTimer = null;
+      drain();
+    }, delay);
+    diskRetryTimer.unref?.();
+  }
+
+  function clearDiskRetry() {
+    if (diskRetryTimer) clearTimeout(diskRetryTimer);
+    diskRetryTimer = null;
+    diskRetryDelayMs = 100;
+  }
+
   function drain() {
     if (shuttingDown) return;
     const max = database.getSettings().maxConcurrentRuns;
     while (active.size < max && queue.length) {
-      if (database.canLaunchRun?.() === false) return;
-      const index = queue.findIndex((entry) => ![...active.values()].some((state) => {
-        const activeWorktree = state.run.worktreePath ?? state.conversation.worktreePath;
-        const queuedWorktree = entry.run.worktreePath ?? entry.conversation.worktreePath;
-        return state.conversation.id === entry.run.conversationId
-          || (activeWorktree && queuedWorktree && activeWorktree === queuedWorktree);
-      }));
+      if (database.canLaunchRun?.() === false) {
+        const observed = database.capacity?.();
+        // The first measurement may have been unknown and the journal may
+        // become readable before this second one. Retry that transition too.
+        if (observed?.diskUsageStatus === "unknown"
+          || (!database.maintenanceActive && observed?.availableForNewWorkBytes >= 64 * 1024)) retryUnknownDiskUsage();
+        return;
+      }
+      clearDiskRetry();
+      const index = queue.findIndex((entry) => !conflictsWithActiveRun(entry));
       if (index < 0) return;
       const entry = queue.splice(index, 1)[0];
       const state = { ...entry, assistantSegments: [], assistantBytes: 0, assistantTruncated: false, assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, transcriptSizes: new Map(), transcriptBytes: 0, transcriptOmitted: false, stderr: "", stopped: false, checkpointPendingBytes: 0, lastCheckpointAt: 0, checkpointTimer: null, checkpointHalted: false };
       active.set(entry.run.id, state);
-      state.launch = entry.launch = (async () => {
-        while (!state.stopped && !shuttingDown) {
-          try {
-            const fresh = database.getConversation(entry.run.conversationId);
-            if (!fresh) throw new Error("Conversation no longer exists");
-            if (entry.run.worktreePath && fresh.worktreePath !== entry.run.worktreePath) {
-              throw new Error("Conversation target changed after this run was queued; submit again");
-            }
-            const authorize = await validateConversation(fresh);
-            if (state.stopped || shuttingDown) return;
-            const current = database.getConversation(fresh.id);
-            if (!current || ["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== fresh[key])
-              || (entry.run.worktreePath && current.worktreePath !== entry.run.worktreePath)) {
-              throw new Error("Conversation target changed while preparing the run; submit again");
-            }
-            // Recheck mutable trust synchronously immediately before spawning.
-            authorize?.();
-            // A recovery retry explicitly asks for a new provider session even
-            // when the conversation still advertises the interrupted one.
-            state.conversation = entry.providerSessionId !== undefined
-              ? { ...current, providerSessionId: entry.providerSessionId }
-              : entry.forceFreshSession ? { ...current, providerSessionId: null } : current;
-            if (await start(state, authorize) === "deferred") {
-              active.delete(entry.run.id);
-              queue.unshift(entry);
-            }
-            return;
-          } catch (error) {
-            if (error.statusCode === 503 && database.maintenanceActive && !state.child && !state.stopped) {
-              // Validation may have succeeded just as the database closed.
-              // Revalidate the target after reopening before any launch side effect.
-              await waitForMaintenance();
-              continue;
-            }
-            if (!state.stopped && !error?.preserveActiveRun) {
-              if (finish(state, null, error) === false) {
-                await waitForMaintenance();
-                if (!shuttingDown) finish(state, null, error);
-              }
-            }
-            return;
-          }
-        }
-      })();
+      state.launch = entry.launch = launchQueued(state, entry);
       launches.add(state.launch);
       state.launch.then(() => launches.delete(state.launch), () => launches.delete(state.launch));
     }
@@ -919,6 +960,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     shutdown() {
       if (shutdownPromise) return shutdownPromise;
       shuttingDown = true;
+      clearDiskRetry();
       wakeMaintenanceWaiters();
       const ids = [...queue.map((entry) => entry.run.id), ...active.keys()];
       shutdownPromise = Promise.allSettled([

@@ -2925,6 +2925,10 @@ async function extremeDiffHeightRegression() {
   await until(() => Number(viewport.dataset.firstLine) < 100, "removed match releases the old virtual window");
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={null} label="Empty diff" /></div>);
   await until(() => host.querySelector(".diff-empty"), "nullable diff shows its empty state");
+  await nearLimitCompressedDiffRegression();
+}
+
+async function nearLimitCompressedDiffRegression() {
   const nearLimit = "+\n".repeat(2_900_000) + `+WHEEL A ${"x".repeat(1_000)}\n+WHEEL B\n` + "+\n".repeat(2_899_998) + "+NEAR LIMIT TAIL\n";
   const heapBefore = performance.memory?.usedJSHeapSize ?? null;
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={nearLimit} label="Near-limit diff" /></div>);
@@ -5082,11 +5086,13 @@ try {
   if (!selectedSteps.length) throw new Error(`Unknown interaction fixture: ${selectedStep}`);
   const startedAt = performance.now();
   window.__fixtureStartedAt = startedAt;
+  window.__fixtureTimings = [];
   let passed = 0;
   for (const [index, [step, run, success, skipped]] of selectedSteps.entries()) {
     const stepStartedAt = performance.now();
     window.__fixtureProgress = { step, completed: index, total: selectedSteps.length, stepStartedAt };
     const ran = await run();
+    window.__fixtureTimings.push({ step, ms: Math.round(performance.now() - stepStartedAt) });
     results.textContent += `${ran === false && skipped ? `SKIP: ${skipped}` : `PASS: ${success}`}\n`;
     if (ran !== false) passed += 1;
   }

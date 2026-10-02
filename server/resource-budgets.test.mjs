@@ -6,6 +6,7 @@ import { existsSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, w
 import os from "node:os";
 import path from "node:path";
 import { createOutrightDatabase, recoverArchiveBeforeStartup } from "./database.mjs";
+import { retainedTranscriptMessageBytes } from "./resource-budgets.mjs";
 
 function chat(database, title = "Budget test") {
   return database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title, provider: "codex" });
@@ -55,6 +56,40 @@ function ageArchived(filename, ids) {
   for (const id of ids) admin.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?").run(old, id);
   admin.close();
 }
+
+test("transcript estimates charge the durable SQLite row for inserts, checkpoints and omission", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const conversation = chat(database, "transcript parity");
+    const fixedAt = "2026-09-21T00:00:00.000Z";
+    const charge = (message, write, exact = true) => {
+      const before = database.capacity().retainedBytes;
+      const stored = write(message);
+      const delta = database.capacity().retainedBytes - before;
+      const estimated = retainedTranscriptMessageBytes(message);
+      if (exact) assert.equal(delta, estimated, "SQLite trigger and transcript estimate diverged");
+      else assert.ok(estimated >= delta, "transcript estimate undercharged a durable row");
+      return stored;
+    };
+    const tool = { id: "tool-σ", conversationId: conversation.id, role: "assistant", kind: "tool",
+      body: "résumé 🧪", payload: { runId: "run-1", command: "echo σ" }, createdAt: fixedAt };
+    charge(tool, (message) => database.addMessage(message));
+    const replacement = { ...tool, body: "revised 🧪 output", payload: { runId: "run-1", exitCode: 0 } };
+    const before = database.capacity().retainedBytes;
+    database.upsertMessage(replacement);
+    assert.equal(database.capacity().retainedBytes - before,
+      retainedTranscriptMessageBytes(replacement) - retainedTranscriptMessageBytes(tool), "upsert charged a different row delta");
+    const checkpoint = { ...tool, id: "checkpoint", kind: "text", body: "assistant Δ",
+      payload: { runId: "run-1", checkpointEventSeq: Number.MAX_SAFE_INTEGER } };
+    charge(checkpoint, (message) => database.addMessage(message));
+    charge({ ...checkpoint, id: "terminal", body: "final ✓" }, (message) => database.addMessage(message));
+    charge({ ...tool, id: "omission", kind: "text", body: "Further output omitted", payload: { runId: "run-1", truncated: true } },
+      (message) => database.addMessage(message), false);
+    const withoutTimestamp = { ...tool, id: "default-time", body: "default", createdAt: undefined };
+    delete withoutTimestamp.createdAt;
+    charge(withoutTimestamp, (message) => database.addMessage(message));
+  } finally { database.close(); }
+});
 
 test("an empty store admits its first write even when a migration tick is exhausted", () => {
   const originalNow = performance.now;
