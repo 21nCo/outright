@@ -563,7 +563,7 @@ export function createOutrightDatabase(options = {}) {
       assertConversationNotDeleting(db, conversationId);
       assertMessageOrderReady(db);
       return db.prepare(`SELECT search_order AS searchOrder, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
-        FROM messages WHERE conversation_id = ? AND search_order IS NOT NULL ORDER BY search_order`).all(conversationId).map(hydratePayload);
+        FROM message_order AS ordered JOIN messages AS m ON m.id = ordered.message_key WHERE ordered.scope = ? ORDER BY ordered.ordinal`).all(conversationId).map(hydratePayload);
     },
     messageCount(conversationId) {
       assertConversationNotDeleting(db, conversationId);
@@ -585,15 +585,15 @@ export function createOutrightDatabase(options = {}) {
         const cursor = db.prepare("SELECT search_order AS rowid FROM messages WHERE conversation_id = ? AND id = ?").get(conversationId, options.beforeId);
         if (!cursor) throw databaseError(400, "Message cursor was not found");
         candidates = db.prepare(`SELECT ${candidateColumns}
-          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order < ? ORDER BY search_order DESC LIMIT ?`).all(conversationId, cursor.rowid, limit);
+          FROM message_order AS ordered JOIN messages AS m ON m.id = ordered.message_key WHERE ordered.scope = ? AND ordered.ordinal < ? ORDER BY ordered.ordinal DESC LIMIT ?`).all(conversationId, cursor.rowid, limit);
       } else if (options.afterId) {
         const cursor = db.prepare("SELECT search_order AS rowid FROM messages WHERE conversation_id = ? AND id = ?").get(conversationId, options.afterId);
         if (!cursor) throw databaseError(400, "Message cursor was not found");
         candidates = db.prepare(`SELECT ${candidateColumns}
-          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order > ? ORDER BY search_order ASC LIMIT ?`).all(conversationId, cursor.rowid, limit);
+          FROM message_order AS ordered JOIN messages AS m ON m.id = ordered.message_key WHERE ordered.scope = ? AND ordered.ordinal > ? ORDER BY ordered.ordinal ASC LIMIT ?`).all(conversationId, cursor.rowid, limit);
       } else {
         candidates = db.prepare(`SELECT ${candidateColumns}
-          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL ORDER BY search_order DESC LIMIT ?`).all(conversationId, limit);
+          FROM message_order AS ordered JOIN messages AS m ON m.id = ordered.message_key WHERE ordered.scope = ? ORDER BY ordered.ordinal DESC LIMIT ?`).all(conversationId, limit);
       }
       let selectedBytes = 2048;
       const selected = [];
@@ -617,7 +617,7 @@ export function createOutrightDatabase(options = {}) {
           CASE WHEN COALESCE(LENGTH(CAST(payload AS BLOB)), 0) BETWEEN ? AND ? THEN CASE WHEN json_valid(payload) THEN json_extract(payload, '$.provider') END END AS provider,
           CASE WHEN COALESCE(LENGTH(CAST(payload AS BLOB)), 0) BETWEEN ? AND ? THEN CASE WHEN json_valid(payload) THEN json_extract(payload, '$.checkpointEventSeq') END END AS checkpointEventSeq,
           created_at AS createdAt
-          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order BETWEEN ? AND ? ORDER BY search_order`)
+          FROM message_order AS ordered JOIN messages AS m ON m.id = ordered.message_key WHERE ordered.scope = ? AND ordered.ordinal BETWEEN ? AND ? ORDER BY ordered.ordinal`)
           .all(MAX_INLINE_MESSAGE_BYTES, MAX_INLINE_MESSAGE_BYTES / 2,
             MAX_INLINE_MESSAGE_BYTES, MAX_INLINE_MESSAGE_BYTES / 2, MAX_INLINE_MESSAGE_BYTES,
             MAX_INLINE_MESSAGE_BYTES + 1, MAX_MESSAGE_PAGE_BYTES,
@@ -646,7 +646,7 @@ export function createOutrightDatabase(options = {}) {
       const oldestRowId = messages[0]?.searchOrder;
       let olderCount = 0;
       if (oldestRowId) {
-        olderCount = db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order < ?")
+        olderCount = db.prepare("SELECT COUNT(*) AS count FROM message_order AS ordered JOIN messages AS m ON m.id = ordered.message_key WHERE ordered.scope = ? AND ordered.ordinal < ?")
           .get(conversationId, oldestRowId).count;
       } else if (options.afterId) olderCount = total;
       const hasMore = olderCount > 0;
@@ -678,8 +678,8 @@ export function createOutrightDatabase(options = {}) {
         // Select identities and byte lengths first. Legacy bodies can exceed
         // the request budget, so each body is read in bounded BLOB sections.
         const columns = "search_order AS rowid, id, COALESCE(LENGTH(CAST(body AS BLOB)), 0) AS bodyBytes";
-        const batch = db.prepare(`SELECT ${columns} FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order ${comparison} ? ORDER BY search_order ${order} LIMIT 8`);
-        const wrappedBatch = origin && db.prepare(`SELECT ${columns} FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order ${comparison} ? AND search_order ${forward ? "<=" : ">="} ? ORDER BY search_order ${order} LIMIT 8`);
+        const batch = db.prepare(`SELECT ${columns} FROM message_order AS ordered JOIN messages AS m ON m.id = ordered.message_key WHERE ordered.scope = ? AND ordered.ordinal ${comparison} ? ORDER BY ordered.ordinal ${order} LIMIT 8`);
+        const wrappedBatch = origin && db.prepare(`SELECT ${columns} FROM message_order AS ordered JOIN messages AS m ON m.id = ordered.message_key WHERE ordered.scope = ? AND ordered.ordinal ${comparison} ? AND ordered.ordinal ${forward ? "<=" : ">="} ? ORDER BY ordered.ordinal ${order} LIMIT 8`);
         const resumeRow = db.prepare(`SELECT ${columns} FROM messages WHERE conversation_id = ? AND id = ?`);
         const bodyChunk = db.prepare("SELECT SUBSTR(CAST(COALESCE(body, '') AS BLOB), ?, ?) AS bytes FROM messages WHERE conversation_id = ? AND id = ?");
         const foldedQuery = foldFindText(query);
@@ -849,9 +849,9 @@ export function createOutrightDatabase(options = {}) {
         // 200-row Find window can otherwise serialize hundreds of MiB even
         // though the search scan itself has an 8 MiB work limit.
         const sizes = `SELECT search_order AS rowid, id, COALESCE(LENGTH(CAST(body AS BLOB)), 0) + COALESCE(LENGTH(CAST(payload AS BLOB)), 0) + 512 AS bytes
-          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order`;
-        const olderCandidates = db.prepare(`${sizes} <= ? ORDER BY search_order DESC LIMIT 100`).all(conversationId, match.rowid);
-        const newerCandidates = db.prepare(`${sizes} > ? ORDER BY search_order ASC LIMIT 100`).all(conversationId, match.rowid);
+          FROM message_order AS ordered JOIN messages AS m ON m.id = ordered.message_key WHERE ordered.scope = ? AND ordered.ordinal`;
+        const olderCandidates = db.prepare(`${sizes} <= ? ORDER BY ordered.ordinal DESC LIMIT 100`).all(conversationId, match.rowid);
+        const newerCandidates = db.prepare(`${sizes} > ? ORDER BY ordered.ordinal ASC LIMIT 100`).all(conversationId, match.rowid);
         if (olderCandidates[0]?.id !== match.id) return { matchId: null, messages: [], messagePage: null };
         const maxBytes = 8 * 1024 * 1024;
         let remaining = maxBytes;
@@ -884,7 +884,7 @@ export function createOutrightDatabase(options = {}) {
           CASE WHEN COALESCE(LENGTH(CAST(payload AS BLOB)), 0) BETWEEN ? AND ? THEN CASE WHEN json_valid(payload) THEN json_extract(payload, '$.provider') END END AS provider,
           CASE WHEN COALESCE(LENGTH(CAST(payload AS BLOB)), 0) BETWEEN ? AND ? THEN CASE WHEN json_valid(payload) THEN json_extract(payload, '$.checkpointEventSeq') END END AS checkpointEventSeq,
           created_at AS createdAt
-          FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order BETWEEN ? AND ? ORDER BY search_order`)
+          FROM message_order AS ordered JOIN messages AS m ON m.id = ordered.message_key WHERE ordered.scope = ? AND ordered.ordinal BETWEEN ? AND ? ORDER BY ordered.ordinal`)
           .all(MAX_INLINE_MESSAGE_BYTES, MAX_INLINE_MESSAGE_BYTES / 2, MAX_INLINE_MESSAGE_BYTES, MAX_INLINE_MESSAGE_BYTES / 2,
             MAX_INLINE_MESSAGE_BYTES, MAX_INLINE_MESSAGE_BYTES + 1, MAX_MESSAGE_PAGE_BYTES,
             MAX_INLINE_MESSAGE_BYTES + 1, MAX_MESSAGE_PAGE_BYTES,
@@ -917,8 +917,8 @@ export function createOutrightDatabase(options = {}) {
             ? messages.shift() : messages.pop();
           serializedBytes -= Buffer.byteLength(JSON.stringify(removed)) + 1;
         }
-        const olderCount = db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order < ?").get(conversationId, messages[0].searchOrder).count;
-        const newerCount = db.prepare("SELECT COUNT(*) AS count FROM messages INDEXED BY messages_search_order WHERE conversation_id = ? AND search_order IS NOT NULL AND search_order > ?").get(conversationId, messages.at(-1).searchOrder).count;
+        const olderCount = db.prepare("SELECT COUNT(*) AS count FROM message_order AS ordered JOIN messages AS m ON m.id = ordered.message_key WHERE ordered.scope = ? AND ordered.ordinal < ?").get(conversationId, messages[0].searchOrder).count;
+        const newerCount = db.prepare("SELECT COUNT(*) AS count FROM message_order AS ordered JOIN messages AS m ON m.id = ordered.message_key WHERE ordered.scope = ? AND ordered.ordinal > ?").get(conversationId, messages.at(-1).searchOrder).count;
         return { matchId: match.id, messages, messagePage: {
           hasMore: olderCount > 0, olderCount, hasLater: newerCount > 0, newerCount,
           total: olderCount + messages.length + newerCount, beforeId: messages[0].id, limit: 200,
@@ -1605,6 +1605,7 @@ function trimAudit(db) {
 
 function migrate(db) {
   const hadRuns = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").get());
+  const hadMessages = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'").get());
   db.exec(`
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS project_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
@@ -1648,7 +1649,7 @@ function migrate(db) {
     max_seq INTEGER NOT NULL DEFAULT 0
   )`);
   if (version < 1) db.prepare("INSERT OR IGNORE INTO migration_progress (kind) VALUES ('events')").run();
-  prepareMessageOrderMigration(db);
+  prepareMessageOrderMigration(db, hadMessages);
   try { db.exec("ALTER TABLE conversations ADD COLUMN tab_position INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE conversations ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
@@ -1696,18 +1697,48 @@ function prepareRecoveryLookup(db, hadRuns, version) {
   }).immediate();
 }
 
-function prepareMessageOrderMigration(db) {
+function prepareMessageOrderMigration(db, hadMessages) {
+  const hadOrderTable = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'message_order'").get());
   if (!db.pragma("table_info(messages)").some((column) => column.name === "search_order")) {
     db.transaction(() => {
       db.exec("ALTER TABLE messages ADD COLUMN search_order INTEGER");
       db.prepare("INSERT OR IGNORE INTO migration_progress (kind) VALUES ('messages')").run();
     }).immediate();
   }
-  db.exec(`CREATE TRIGGER IF NOT EXISTS messages_search_order_insert AFTER INSERT ON messages
-    BEGIN UPDATE messages SET search_order = NEW.rowid WHERE rowid = NEW.rowid; END`);
-  // A partial index starts empty for legacy rows and fills with each bounded
-  // backfill batch. Building a full index on the old table would block startup.
-  db.exec("CREATE INDEX IF NOT EXISTS messages_search_order ON messages(conversation_id, search_order) WHERE search_order IS NOT NULL");
+  // This table's key is constructed while empty. Inserting 64 identities per
+  // migration tick avoids CREATE INDEX scanning a large legacy messages table
+  // on the startup thread. Keep the old column for API cursors and old stores.
+  db.transaction(() => {
+    db.exec(`CREATE TABLE IF NOT EXISTS message_order (
+      scope TEXT NOT NULL, ordinal INTEGER NOT NULL, message_key TEXT NOT NULL,
+      PRIMARY KEY (scope, ordinal, message_key)
+    ) WITHOUT ROWID`);
+    if (hadMessages && !hadOrderTable) {
+      // A pre-existing column migration may have a nonzero cursor, but the
+      // newly created lookup has no entries yet. Restart that scan at zero.
+      db.prepare("INSERT INTO migration_progress (kind, cursor_number) VALUES ('messages', 0) ON CONFLICT(kind) DO UPDATE SET cursor_number = 0").run();
+    }
+  }).immediate();
+  // Earlier releases used this name for a column-only trigger. Replace it
+  // once; avoid schema writes on every subsequent open of a large store.
+  const insertTrigger = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_search_order_insert'").get();
+  if (!insertTrigger?.sql?.includes("message_order")) {
+    db.exec("DROP TRIGGER IF EXISTS messages_search_order_insert");
+    db.exec(`CREATE TRIGGER messages_search_order_insert AFTER INSERT ON messages
+      BEGIN
+        UPDATE messages SET search_order = NEW.rowid WHERE rowid = NEW.rowid;
+        INSERT OR IGNORE INTO message_order (scope, ordinal, message_key)
+          VALUES (NEW.conversation_id, NEW.rowid, NEW.id);
+      END`);
+  }
+  db.exec(`CREATE TRIGGER IF NOT EXISTS messages_search_order_update AFTER UPDATE OF search_order, conversation_id, id ON messages
+    BEGIN
+      DELETE FROM message_order WHERE scope = OLD.conversation_id AND ordinal = OLD.search_order AND message_key = OLD.id;
+      INSERT OR IGNORE INTO message_order (scope, ordinal, message_key)
+        SELECT NEW.conversation_id, NEW.search_order, NEW.id WHERE NEW.search_order IS NOT NULL;
+    END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS messages_search_order_delete AFTER DELETE ON messages
+    BEGIN DELETE FROM message_order WHERE scope = OLD.conversation_id AND ordinal = OLD.search_order AND message_key = OLD.id; END`);
 }
 
 function prepareRetainedMeasurement(db, version) {
@@ -1849,9 +1880,16 @@ function advanceMessageMigration(db) {
   const job = migrationJob(db, "messages");
   if (!job) return;
   db.transaction(() => {
-    const rows = db.prepare("SELECT rowid AS scanRowId FROM messages WHERE rowid > ? ORDER BY rowid LIMIT 64").all(job.cursor_number);
+    const rows = db.prepare("SELECT rowid AS scanRowId, search_order AS ordinal FROM messages WHERE rowid > ? ORDER BY rowid LIMIT 64").all(job.cursor_number);
     const update = db.prepare("UPDATE messages SET search_order = rowid WHERE rowid = ? AND search_order IS NULL");
-    for (const row of rows) update.run(row.scanRowId);
+    // Keep legacy identifiers inside SQLite; old databases can contain large
+    // raw strings that must not be materialized in a 64-row JavaScript batch.
+    const order = db.prepare(`INSERT OR IGNORE INTO message_order (scope, ordinal, message_key)
+      SELECT conversation_id, search_order, id FROM messages WHERE rowid = ?`);
+    for (const row of rows) {
+      if (row.ordinal === null) update.run(row.scanRowId);
+      order.run(row.scanRowId);
+    }
     if (rows.length < 64) db.prepare("DELETE FROM migration_progress WHERE kind = 'messages'").run();
     else db.prepare("UPDATE migration_progress SET cursor_number = ? WHERE kind = 'messages'").run(rows.at(-1).scanRowId);
   }).immediate();

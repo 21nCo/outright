@@ -250,7 +250,7 @@ test("large legacy backfills resume after interruption without admitting new wor
     const run = database.createRun(runInput(conversation.id));
     database.close();
     const legacy = new Database(filename);
-    legacy.exec("DROP TRIGGER messages_search_order_insert; DROP INDEX messages_search_order; ALTER TABLE messages DROP COLUMN search_order");
+    legacy.exec("DROP TRIGGER messages_search_order_insert; DROP TRIGGER messages_search_order_update; DROP TRIGGER messages_search_order_delete; DROP INDEX IF EXISTS messages_search_order; ALTER TABLE messages DROP COLUMN search_order");
     const insertMessage = legacy.prepare("INSERT INTO messages (id, conversation_id, role, kind, body, created_at) VALUES (?, ?, 'assistant', 'text', ?, ?)");
     const insertEvent = legacy.prepare("INSERT INTO run_events (run_id, seq, type, payload, created_at) VALUES (?, ?, 'tool.output', ?, ?)");
     legacy.transaction(() => {
@@ -308,6 +308,64 @@ test("large legacy backfills resume after interruption without admitting new wor
     database.close();
     database = createOutrightDatabase({ filename });
     assert.equal(database.capacity().retainedBytes, measured, "completed accounting persists across restart");
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("a large legacy message store opens without building an index before capacity and sibling reads", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-message-order-upgrade-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const target = chat(database);
+    const sibling = chat(database);
+    database.close();
+    const legacy = new Database(filename);
+    legacy.exec("DROP TRIGGER messages_search_order_insert; DROP TRIGGER messages_search_order_update; DROP TRIGGER messages_search_order_delete; DROP TABLE message_order");
+    const insert = legacy.prepare("INSERT INTO messages (id, conversation_id, role, body, created_at) VALUES (?, ?, 'assistant', ?, '2026-01-01')");
+    legacy.transaction(() => {
+      for (let index = 0; index < 20_000; index += 1) {
+        insert.run(`old-${index}`, target.id, index === 19_999 ? "last needle" : "legacy text");
+      }
+    })();
+    legacy.close();
+
+    const started = performance.now();
+    database = createOutrightDatabase({ filename });
+    assert.ok(performance.now() - started < 1_000, "startup must not synchronously index the large history");
+    assert.equal(database.capacity().migrationStatus, "migrating");
+    assert.equal(database.getConversation(sibling.id).id, sibling.id, "sibling reads remain available during backfill");
+    assert.throws(() => database.listMessagePage(target.id), (error) => error.statusCode === 503);
+    const probe = new Database(filename);
+    assert.ok(probe.prepare("SELECT COUNT(*) AS count FROM message_order").get().count <= 64,
+      "startup inserts only one bounded page into the ordered lookup");
+    assert.equal(probe.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'messages_search_order'").get(), undefined);
+    probe.close();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    database.close();
+    const interrupted = new Database(filename);
+    assert.ok(interrupted.prepare("SELECT cursor_number FROM migration_progress WHERE kind = 'messages'").get().cursor_number > 0);
+    interrupted.close();
+
+    database = createOutrightDatabase({ filename });
+    const deadline = Date.now() + 20_000;
+    while (database.capacity().migrationStatus !== "ready") {
+      assert.ok(Date.now() < deadline, "large message backfill did not finish after restart");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const orderProbe = new Database(filename);
+    const orderCount = orderProbe.prepare("SELECT COUNT(*) AS count FROM message_order").get().count;
+    orderProbe.close();
+    assert.equal(orderCount, 20_000, "every legacy message gained an ordered identity");
+    assert.equal(database.listMessagePage(target.id, { limit: 1 }).messages[0]?.id, "old-19999", `ordered lookup has ${orderCount} of ${database.messageCount(target.id)} messages`);
+    let found = await database.findMessagePage(target.id, "last needle", null);
+    let requests = 0;
+    while (found.partial) {
+      assert.ok(++requests <= 50, "bounded Find never reached the final legacy message");
+      found = await database.findMessagePage(target.id, "last needle", found.nextAfterId, 1,
+        undefined, { originId: found.originId, wrapped: found.wrapped });
+    }
+    assert.equal(found.matchId, "old-19999");
+    assert.equal(database.getConversation(sibling.id).id, sibling.id);
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
