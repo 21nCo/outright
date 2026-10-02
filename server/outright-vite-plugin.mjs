@@ -1,26 +1,55 @@
 import { createOutrightRuntime } from "./outright-runtime.mjs";
 import { recoverArchiveBeforeStartup } from "./database.mjs";
 
+// Config reloads can create the successor plugin before Vite closes the old
+// server. A local shutdown is a known, finite lease owner, unlike an unrelated
+// process holding the same database.
+const shutdownRegistry = Symbol.for("outright.viteRuntimeShutdowns");
+const shuttingDownRuntimes = globalThis[shutdownRegistry] ??= new Map();
+
 export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRuntime, recoverArchive = recoverArchiveBeforeStartup }) {
   let runtime = null;
   let recovery;
   let closing;
   let startupError;
   let stopping = false;
+  const leaseKey = configUrl.href;
+  const abort = new AbortController();
+  const wait = (promise) => new Promise((resolve, reject) => {
+    if (stopping) return resolve();
+    const onAbort = () => resolve();
+    abort.signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(promise).then(
+      (value) => { abort.signal.removeEventListener("abort", onAbort); resolve(value); },
+      (error) => { abort.signal.removeEventListener("abort", onAbort); reject(error); },
+    );
+  });
   const retryLease = async (operation, retryCodes) => {
     const deadline = Date.now() + 15_000;
     while (!stopping) {
       try { return await operation(); }
       catch (error) {
-        if (!retryCodes.includes(error.code) || Date.now() >= deadline) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        if (!retryCodes.includes(error.code)) throw error;
+        const predecessor = shuttingDownRuntimes.get(leaseKey);
+        if (predecessor && predecessor !== closing) {
+          await wait(predecessor);
+          continue;
+        }
+        if (Date.now() >= deadline) throw error;
+        await wait(new Promise((resolve) => setTimeout(resolve, 100)));
       }
     }
   };
   const shutdown = () => {
     if (!recovery) return undefined;
     stopping = true;
+    abort.abort();
     closing ??= recovery.then(() => runtime?.shutdown());
+    if (runtime) {
+      shuttingDownRuntimes.set(leaseKey, closing);
+      const clear = () => { if (shuttingDownRuntimes.get(leaseKey) === closing) shuttingDownRuntimes.delete(leaseKey); };
+      closing.then(clear, clear);
+    }
     return closing;
   };
 

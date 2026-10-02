@@ -882,7 +882,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     }, deadline);
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
     const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
-    const expectedCount = selectedCount ?? 107;
+    const expectedCount = selectedCount ?? 108;
     const completedCount = Number(state.text.match(/(\d+) interaction regressions passed/)?.[1]);
     assert.equal(completedCount, expectedCount,
       `browser fixture completed ${completedCount || 0} of ${expectedCount} expected interactions; last step: ${state.progress?.step ?? "unknown"}`);

@@ -1,27 +1,19 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
-import { createServer } from "node:net";
+import { writeFileSync, mkdtempSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-async function unusedPort() {
-  const server = createServer();
-  server.listen(0, "127.0.0.1");
-  await new Promise((resolve) => server.once("listening", resolve));
-  const port = server.address().port;
-  await new Promise((resolve) => server.close(resolve));
-  return port;
-}
-
 test("standalone closes instead of serving permanent API failures when runtime construction fails", async () => {
   const directory = mkdtempSync(join(tmpdir(), "outright-standalone-init-"));
   writeFileSync(join(directory, "outright.db"), "invalid SQLite file");
-  const port = await unusedPort();
+  const clientDirectory = join(directory, "client");
+  mkdirSync(clientDirectory);
+  writeFileSync(join(clientDirectory, "index.html"), "<!doctype html><title>Fixture</title>");
   const child = spawn(process.execPath, [fileURLToPath(new URL("./standalone.mjs", import.meta.url))], {
-    env: { ...process.env, OUTRIGHT_DATA_DIR: directory, PORT: String(port), HOST: "127.0.0.1" },
+    env: { ...process.env, OUTRIGHT_DATA_DIR: directory, OUTRIGHT_CLIENT_DIR: clientDirectory, PORT: "0", HOST: "127.0.0.1" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stderr = "";

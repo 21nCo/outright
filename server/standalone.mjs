@@ -31,7 +31,7 @@ httpServer.on("upgrade", (_request, socket) => {
   }
 });
 
-app.use(sirv(path.resolve(import.meta.dirname, "../dist/client"), {
+app.use(sirv(process.env.OUTRIGHT_CLIENT_DIR || path.resolve(import.meta.dirname, "../dist/client"), {
   dev: false,
   etag: true,
   single: true,

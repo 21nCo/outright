@@ -12,7 +12,10 @@ export function archiveShadowPaths(filename) {
 
 function fileInfo(filename) {
   try { return lstatSync(filename); }
-  catch (error) { if (error.code === "ENOENT") return null; throw error; }
+  catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
 }
 
 function privateRegularFile(filename) {
@@ -127,34 +130,39 @@ function markerOwnsDatabase(marker, filename) {
   // Older runtimes wrote a lexical parent path into the marker. A restart
   // through its canonical parent still owns the same maintenance files.
   try { return realpathSync(path.dirname(marker.source)) === path.dirname(filename); }
-  catch (error) { if (error.code === "ENOENT") return false; throw error; }
+  catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function recoverMissingSource(filename, next, old, marker) {
+  // Legacy version-1 markers did not pin a candidate. Roll those back to
+  // the original rather than trusting a database that could be substituted.
+  let candidateVerified = authenticatedCandidate(next, marker);
+  if (candidateVerified) {
+    renameSync(next, filename);
+    durableDirectory(filename);
+    // Authentication covered the old pathname. Do not release the only
+    // fallback until the promoted pathname still names those same bytes.
+    if (!matchesCandidate(filename, marker.candidate, false, true) || hasNonemptyWal(filename)) {
+      renameSync(filename, next);
+      durableDirectory(filename);
+      candidateVerified = false;
+    }
+  }
+  if (!candidateVerified) {
+    // Keep the marker and both names intact if the only fallback is
+    // corrupt. Renaming first would erase the evidence of that failure.
+    if (!validDatabase(old)) throw new Error("Neither archive maintenance database is valid");
+    renameSync(old, filename);
+  }
+  durableDirectory(filename);
+  return candidateVerified;
 }
 
 function recoverInterruptedCutover(filename, next, old, marker) {
-  // Legacy version-1 markers did not pin a candidate. Roll those back to
-  // the original rather than trusting a database that could be substituted.
-  let candidateVerified = false;
-  if (!fileInfo(filename)) {
-    candidateVerified = authenticatedCandidate(next, marker);
-    if (candidateVerified) {
-      renameSync(next, filename);
-      durableDirectory(filename);
-      // Authentication covered the old pathname. Do not release the only
-      // fallback until the promoted pathname still names those same bytes.
-      if (!matchesCandidate(filename, marker.candidate, false, true) || hasNonemptyWal(filename)) {
-        renameSync(filename, next);
-        durableDirectory(filename);
-        candidateVerified = false;
-      }
-    }
-    if (!candidateVerified) {
-      // Keep the marker and both names intact if the only fallback is
-      // corrupt. Renaming first would erase the evidence of that failure.
-      if (!validDatabase(old)) throw new Error("Neither archive maintenance database is valid");
-      renameSync(old, filename);
-    }
-    durableDirectory(filename);
-  }
+  let candidateVerified = !fileInfo(filename) && recoverMissingSource(filename, next, old, marker);
   if (fileInfo(old) && !candidateVerified) {
     candidateVerified = authenticatedCandidate(filename, marker, true);
     if (!candidateVerified) {

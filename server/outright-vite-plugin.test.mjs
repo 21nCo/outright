@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createServer } from "vite";
 import { outrightApiPlugin } from "./outright-vite-plugin.mjs";
 
 test("Vite disposal awaits runtime process supervision before completing", async () => {
@@ -55,6 +61,7 @@ test("Vite serves a retryable API response while archive recovery is pending", a
   assert.equal(upgrade.destroyed, false, "Vite HMR upgrade was rejected during archive recovery");
   httpServer.emit("upgrade", { url: "/api/events-other" }, upgrade);
   assert.equal(upgrade.destroyed, false, "Unrelated API upgrade was rejected during archive recovery");
+  assert.equal(upgrade.writes.length, 0, "Unrelated upgrades received an API response");
   httpServer.emit("upgrade", { url: "/api/events?cursor=0" }, upgrade);
   assert.equal(upgrade.destroyed, true);
   assert.match(upgrade.writes[0], /503 Service Unavailable[\s\S]*Retry-After: 1/);
@@ -155,4 +162,89 @@ test("Vite retries a transient archive worker lease conflict before opening the 
   assert.equal(attempts, 2);
   assert.equal(attached, true);
   await plugin.closeBundle();
+});
+
+test("a slow local Vite shutdown remains retryable beyond the unknown-owner lease deadline", { timeout: 25_000 }, async () => {
+  let leaseHeld = false;
+  let attached = 0;
+  let middleware;
+  const createRuntime = () => {
+    if (leaseHeld) throw Object.assign(new Error("old runtime is closing"), { code: "OUTRIGHT_RUNTIME_LEASE_HELD" });
+    leaseHeld = true;
+    return {
+      attach() { attached += 1; },
+      async handleRequest(_request, response) { response.writeHead(200); response.end("ready"); return true; },
+      async shutdown() {
+        await new Promise((resolve) => setTimeout(resolve, attached === 1 ? 16_000 : 0));
+        leaseHeld = false;
+      },
+    };
+  };
+  const options = { configUrl: new URL("file:///fixture/slow-restart.json"), recoverArchive: async () => {}, createRuntime };
+  const first = outrightApiPlugin(options);
+  const firstServer = { httpServer: new EventEmitter(), middlewares: { use() {} } };
+  first.configureServer(firstServer);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(attached, 1);
+  // Vite evaluates a fresh config module before closing the prior server.
+  const { outrightApiPlugin: reloadedPlugin } = await import("./outright-vite-plugin.mjs?slow-restart");
+  const second = reloadedPlugin(options);
+  const secondServer = { httpServer: new EventEmitter(), middlewares: { use(fn) { middleware = fn; } } };
+  second.configureServer(secondServer);
+  firstServer.httpServer.emit("close");
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 15_300));
+    let status;
+    middleware({ url: "/api/capacity" }, { writeHead(code) { status = code; }, end() {} }, () => assert.fail("API fell through"));
+    assert.equal(status, 503, "known local shutdown became a permanent startup error");
+    const deadline = Date.now() + 3_000;
+    while (attached !== 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(attached, 2, "successor never acquired the released local lease");
+    middleware({ url: "/api/capacity" }, { writeHead(code) { status = code; }, end() {} }, () => assert.fail("API fell through"));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(status, 200);
+  } finally {
+    await Promise.all([first.closeBundle(), second.closeBundle()]);
+  }
+});
+
+test("a real Vite config restart serves API after a 16 second predecessor shutdown", { timeout: 30_000 }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), `out30-vite-restart-${randomUUID()}-`));
+  const config = join(directory, "vite.config.mjs");
+  writeFileSync(config, `import { defineConfig } from ${JSON.stringify(import.meta.resolve("vite"))};
+import { outrightApiPlugin } from ${JSON.stringify(new URL("./outright-vite-plugin.mjs", import.meta.url).href)};
+export default defineConfig({ plugins: [outrightApiPlugin({
+  configUrl: new URL("file:///fixture/out30-restart.json"),
+  recoverArchive: async () => {},
+  createRuntime: globalThis.__out30ViteRestartFixture.createRuntime,
+})] });\n`);
+  let leaseHeld = false;
+  let attached = 0;
+  globalThis.__out30ViteRestartFixture = { createRuntime: () => {
+    if (leaseHeld) throw Object.assign(new Error("predecessor lease held"), { code: "OUTRIGHT_RUNTIME_LEASE_HELD" });
+    leaseHeld = true;
+    return {
+      attach() { attached += 1; },
+      async handleRequest(_request, response) { response.writeHead(200); response.end("ready"); return true; },
+      async shutdown() {
+        await new Promise((resolve) => setTimeout(resolve, attached === 1 ? 16_000 : 0));
+        leaseHeld = false;
+      },
+    };
+  } };
+  let server;
+  try {
+    server = await createServer({ configFile: config, root: fileURLToPath(new URL("../", import.meta.url)),
+      server: { host: "127.0.0.1", port: 0 }, logLevel: "silent" });
+    await server.listen();
+    const apiStatus = () => fetch(new URL("/api/capacity", server.resolvedUrls.local[0])).then((response) => response.status);
+    assert.equal(await apiStatus(), 200);
+    assert.equal(attached, 1);
+    await server.restart();
+    assert.equal(await apiStatus(), 200, "restart left a permanent API error after the local lease was released");
+    assert.equal(attached, 2);
+  } finally {
+    try { await server?.close(); }
+    finally { rmSync(directory, { recursive: true }); delete globalThis.__out30ViteRestartFixture; }
+  }
 });

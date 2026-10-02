@@ -3,7 +3,7 @@ import test from "node:test";
 import Database from "better-sqlite3";
 import { Readable } from "node:stream";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -923,7 +923,8 @@ for (const operation of ["send", "recovery"]) {
       await runtime.handleRequest(requestStream("POST", operation === "send" ? `/api/conversations/${conversation.id}/runs` : `/api/runs/${interrupted.id}/resume`, operation === "send" ? { prompt: "measure probe" } : { policy: "retry" }), response);
     } finally { clearInterval(timer); }
     const elapsed = performance.now() - started;
-    assert.equal(readFileSync(probeMarker, "utf8").trim(), "ran", `${operation} did not run the replacement executable`);
+    assert.ok(existsSync(probeMarker), `${operation} did not run the replacement executable`);
+    assert.equal(readFileSync(probeMarker, "utf8").trim(), "ran", `${operation} did not complete the replacement executable`);
     assert.ok(elapsed >= 200 && elapsed < 2500, `${operation} took ${elapsed.toFixed(1)} ms with a 400 ms executable probe`);
     assert.ok(ticks >= 5, `${operation} blocked the event loop during its executable probe`);
     assert.equal(response.statusCode, 202);

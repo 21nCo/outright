@@ -536,9 +536,10 @@ async function bootstrapRefreshErrorOwnershipRegression() {
   route = async (url, options) => {
     if (url.pathname === "/api/bootstrap") {
       bootstrapCalls += 1;
-      return bootstrapCalls === 1 ? response({ projects: linkedProjects, projectGroups: { groups: [], memberships: {} },
-        settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] })
-        : bootstrapCalls === 2 ? heldBootstrap.promise : response({ error: loadingError }, 500);
+      if (bootstrapCalls === 1) return response({ projects: linkedProjects, projectGroups: { groups: [], memberships: {} },
+        settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+      if (bootstrapCalls === 2) return heldBootstrap.promise;
+      return response({ error: loadingError }, 500);
     }
     if (url.pathname === "/api/worktrees" && options.method === "DELETE") return response({});
     if (url.pathname === "/api/projects" && options.method === "POST") return response({ error: scanError }, 500);
@@ -554,12 +555,6 @@ async function bootstrapRefreshErrorOwnershipRegression() {
   setControlValue(document.querySelector("#remove-worktree-confirmation"), "/fixture/A");
   [...document.querySelectorAll('[role="dialog"] button')].find((item) => item.textContent === "Remove worktree").click();
   await until(() => bootstrapCalls === 2, "background bootstrap held after worktree removal");
-  [...host.querySelectorAll("button")].find((item) => item.textContent.includes("Scan projects")).click();
-  await until(() => host.querySelector('.error-toast')?.textContent.includes("Scan failed"), "manual scan error displayed");
-  heldBootstrap.resolve(response({ projects: [projects[1]], projectGroups: { groups: [], memberships: {} },
-    settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] }));
-  await until(() => host.querySelector('.workspace-context')?.textContent.includes("Review B"), "background bootstrap finished");
-  assert(host.querySelector('.error-toast')?.textContent.includes("Scan failed"), "background bootstrap dismissed an unrelated operation error");
   const nativeSetTimeout = window.setTimeout;
   const nativeClearTimeout = window.clearTimeout;
   const dismissTimers = new Map();
@@ -576,6 +571,12 @@ async function bootstrapRefreshErrorOwnershipRegression() {
     nativeClearTimeout.call(window, id);
   };
   try {
+    [...host.querySelectorAll("button")].find((item) => item.textContent.includes("Scan projects")).click();
+    await until(() => host.querySelector('.error-toast')?.textContent.includes("Scan failed"), "manual scan error displayed");
+    heldBootstrap.resolve(response({ projects: [projects[1]], projectGroups: { groups: [], memberships: {} },
+      settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] }));
+    await until(() => host.querySelector('.workspace-context')?.textContent.includes("Review B"), "background bootstrap finished");
+    assert(host.querySelector('.error-toast')?.textContent.includes("Scan failed"), "background bootstrap dismissed an unrelated operation error");
     fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { restarted: true } }) }));
     await until(() => host.querySelectorAll('.error-toast').length === 2, "operation and bootstrap errors remain visible together");
     const [operationToast, bootstrapToast] = host.querySelectorAll('.error-toast');
@@ -734,7 +735,7 @@ async function settingsCapacityAndDeletionOrderRegression() {
     "fractional quota disables save");
   assert(queuedInput.getAttribute("aria-invalid") === "true", "fractional quota did not mark its input invalid");
   const error = document.getElementById(queuedInput.getAttribute("aria-describedby"));
-  assert(error?.textContent.includes("whole numbers") && error.getAttribute("role") === "alert",
+  assert(error?.textContent.includes("whole numbers") && error.getAttribute("role") === "status" && error.getAttribute("aria-live") === "polite",
     "invalid quota lacks a live error announcement");
   setControlValue(queuedInput, "32");
   await until(() => !queuedInput.hasAttribute("aria-invalid") && !queuedInput.hasAttribute("aria-describedby"),
@@ -2122,6 +2123,37 @@ async function terminalMutationFailureRegression() {
   assert(host.querySelector('.xterm-rows')?.textContent.includes("Retained output"), "Rejected list discarded the prior terminal output");
 }
 
+async function terminalDeleteFocusOwnershipRegression() {
+  for (const chooseOther of [false, true]) {
+    root.render(null);
+    await settle();
+    const deletion = deferred();
+    let deleting = false;
+    route = async (url, options) => {
+      if (url.pathname === "/api/terminals" && options.method === "POST") return response(terminal("A"));
+      if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("A2")] });
+      if (url.pathname === "/api/terminals/term-A" && options.method === "DELETE") { deleting = true; return deletion.promise; }
+      return response({ buffer: "ready", status: "running" });
+    };
+    root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => { throw error; }} sendRuntime={() => {}} />);
+    await until(() => terminalReady("Terminal A"), "terminal focus fixture ready");
+    const close = host.querySelector('[aria-label="Close terminal Terminal A"]');
+    close.focus();
+    close.click();
+    await until(() => deleting, "terminal deletion held");
+    const other = chooseOther ? document.createElement("button") : null;
+    if (other) { document.body.append(other); other.focus(); }
+    deletion.resolve(response({}));
+    await until(() => terminalReady("Terminal A2"), "replacement terminal selected");
+    if (other) {
+      assert(document.activeElement === other, "Delayed terminal deletion stole a newer focus choice");
+      other.remove();
+    } else {
+      await until(() => document.activeElement === host.querySelector('[role="tab"][aria-selected="true"]'), "replacement tab receives focus after commit");
+    }
+  }
+}
+
 async function commandPaletteRegression() {
   root.render(null);
   await settle();
@@ -2773,6 +2805,22 @@ async function largeDiffWindowRegression() {
   window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), diff: { elapsedMs, mountedAtEnd: viewport.querySelectorAll("span").length, heapBytes: performance.memory?.usedJSHeapSize ?? null } };
 }
 
+async function awaitPhysicalCompressedMatch(viewport, text, label) {
+  try {
+    await until(() => {
+      const mark = viewport.querySelector('[data-find-match="true"]');
+      if (!mark?.textContent.includes(text)) return false;
+      const row = mark.getBoundingClientRect();
+      const view = viewport.getBoundingClientRect();
+      return row.top < view.bottom && row.bottom > view.top;
+    }, label);
+  } catch (error) {
+    const row = viewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect();
+    const view = viewport.getBoundingClientRect();
+    throw new Error(`${error.message}; mark=${row?.top}/${row?.bottom}, viewport=${view.top}/${view.bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}, first=${viewport.dataset.firstLine}, mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`);
+  }
+}
+
 async function extremeDiffHeightRegression() {
   root.render(null); await settle();
   const diff = "+\n".repeat(600_000) + "+MIDDLE MATCH\n" + "+\n".repeat(650_000) + "+TAIL MATCH\n";
@@ -2823,33 +2871,18 @@ async function extremeDiffHeightRegression() {
     holdPhysicalScroll = false;
     delete viewport.scrollTop;
   }
-  const visibleCompressedMark = (text) => {
-    const mark = viewport.querySelector('[data-find-match="true"]');
-    if (!mark?.textContent.includes(text)) return false;
-    const row = mark.getBoundingClientRect();
-    const view = viewport.getBoundingClientRect();
-    return row.top < view.bottom && row.bottom > view.top;
-  };
-  const awaitCompressedMark = async (text, label) => {
-    try { await until(() => visibleCompressedMark(text), label); }
-    catch (error) {
-      const row = viewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect();
-      const view = viewport.getBoundingClientRect();
-      throw new Error(`${error.message}; mark=${row?.top}/${row?.bottom}, viewport=${view.top}/${view.bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}, first=${viewport.dataset.firstLine}, mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`);
-    }
-  };
-  await awaitCompressedMark("MIDDLE MATCH", "middle compressed diff alignment");
+  await awaitPhysicalCompressedMatch(viewport, "MIDDLE MATCH", "middle compressed diff alignment");
   let middleBounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
   assert(middleBounds.top < viewport.getBoundingClientRect().bottom && middleBounds.bottom > viewport.getBoundingClientRect().top, "Middle compressed diff match was mounted outside the viewport");
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={"+\n".repeat(10_000) + diff} label="Tall diff" /></div>);
   await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("MIDDLE MATCH") && host.querySelector('.window-find [role="status"]')?.textContent === "Line 610001", "Refresh realigns a moved middle match");
-  await awaitCompressedMark("MIDDLE MATCH", "refreshed compressed diff alignment");
+  await awaitPhysicalCompressedMatch(viewport, "MIDDLE MATCH", "refreshed compressed diff alignment");
   middleBounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
   assert(middleBounds.top < viewport.getBoundingClientRect().bottom && middleBounds.bottom > viewport.getBoundingClientRect().top, "Refreshed compressed diff match was outside the viewport");
   setControlValue(input, "TAIL MATCH"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("TAIL MATCH"), "Find reaches final line of tall diff");
-  await awaitCompressedMark("TAIL MATCH", "compressed tail Find alignment");
+  await awaitPhysicalCompressedMatch(viewport, "TAIL MATCH", "compressed tail Find alignment");
   const bounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
   assert(bounds.top < viewport.getBoundingClientRect().bottom && bounds.bottom > viewport.getBoundingClientRect().top, `Tall diff find mark is outside the viewport: mark=${bounds.top}/${bounds.bottom}, viewport=${viewport.getBoundingClientRect().top}/${viewport.getBoundingClientRect().bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}`);
   for (let tick = 0; tick < 16; tick += 1) await frame();
@@ -4978,6 +5011,7 @@ try {
     ["background terminal activation", terminalBackgroundActivationRegression, "background activation settles and fits when visible"],
     ["initial terminal failure", terminalInitialFailureRegression, "failed initial terminal activation retains a keyboard-reachable tab"],
     ["terminal mutation failure", terminalMutationFailureRegression, "create, close and reconnect failures preserve terminal tab ownership"],
+    ["terminal delete focus ownership", terminalDeleteFocusOwnershipRegression, "delete restores the committed successor tab without stealing a newer focus choice"],
     ["command search", commandPaletteRegression, "command search keeps asynchronous results current and selectable"],
     ["changes loading", changesLoadingRegression, "changes pane waits for status before announcing a clean tree"],
     ["changes discarded render", changesDiscardedRenderRegression, "a suspended worktree render cannot steal a committed status request"],

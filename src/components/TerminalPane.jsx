@@ -29,6 +29,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   const selectingRef = useRef(false);
   const mountedRef = useRef(false);
   const queuedReconnectRef = useRef(null);
+  const focusRequestRef = useRef(null);
   const terminalsRef = useRef([]);
   const worktreeNameRef = useRef(worktree.name);
   const onErrorRef = useRef(onError);
@@ -85,7 +86,28 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     if (!loading && activeId) fitSelectedRef.current?.();
   }, [activeId, loading]);
 
+  useLayoutEffect(() => {
+    const request = focusRequestRef.current;
+    if (!request?.id || request.id !== activeId || request.token !== reconcileTokenRef.current) return;
+    focusRequestRef.current = null;
+    if (document.activeElement === document.body) {
+      document.getElementById(domId("terminal-tab", request.id))?.focus({ preventScroll: true });
+    }
+  }, [terminals, activeId, loading]);
+
+  useEffect(() => {
+    const cancelFocus = (event) => {
+      if (event.type === "focusin" && event.target === document.body) return;
+      if (focusRequestRef.current) focusRequestRef.current = null;
+    };
+    for (const type of ["pointerdown", "keydown", "focusin"]) document.addEventListener(type, cancelFocus, true);
+    return () => {
+      for (const type of ["pointerdown", "keydown", "focusin"]) document.removeEventListener(type, cancelFocus, true);
+    };
+  }, []);
+
   function beginSelection() {
+    focusRequestRef.current = null;
     const token = ++reconcileTokenRef.current;
     loadingRef.current = true;
     inputReadyRef.current = false;
@@ -183,7 +205,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       } catch (error) { if (!cancelled && token === reconcileTokenRef.current) { recoverSelection(); onErrorRef.current(error); } }
       finally { if (!cancelled && token === reconcileTokenRef.current) { loadingRef.current = false; setLoading(false); } }
     })();
-    return () => { cancelled = true; mountedRef.current = false; ++reconcileTokenRef.current; selectingRef.current = false; queuedReconnectRef.current = null; pendingOutputRef.current = null; activeIdRef.current = ""; displayedCursorRef.current = 0; };
+    return () => { cancelled = true; mountedRef.current = false; ++reconcileTokenRef.current; selectingRef.current = false; queuedReconnectRef.current = null; focusRequestRef.current = null; pendingOutputRef.current = null; activeIdRef.current = ""; displayedCursorRef.current = 0; };
   }, [worktree.id, worktree.path]);
 
   useEffect(() => {
@@ -297,6 +319,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     const previousId = activeIdRef.current;
     const focusedClose = document.activeElement?.closest(".terminal-tab")?.querySelector('[role="tab"]')?.dataset.tabId === id;
     const token = beginSelection();
+    if (focusedClose) focusRequestRef.current = { id: null, token };
     try {
       await api(`/api/terminals/${id}`, { method: "DELETE" });
       if (token !== reconcileTokenRef.current) return;
@@ -311,14 +334,9 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       }
       if (token !== reconcileTokenRef.current) return;
       stageTerminals(remaining);
-      if (focusedClose) {
-        const nextId = next.id;
-        requestAnimationFrame(() => {
-          if (document.activeElement === document.body) document.getElementById(domId("terminal-tab", nextId))?.focus({ preventScroll: true });
-        });
-      }
+      if (focusRequestRef.current?.token === token) focusRequestRef.current.id = next.id;
       await activateTerminal(next, token);
-    } catch (error) { if (token === reconcileTokenRef.current) { recoverSelection(wasReady, wasAwaitingFit); onErrorRef.current(error); } }
+    } catch (error) { if (token === reconcileTokenRef.current) { recoverSelection(wasReady, wasAwaitingFit); if (focusRequestRef.current?.token === token && !focusRequestRef.current.id) focusRequestRef.current = null; onErrorRef.current(error); } }
     finally { finishMutation(token); }
   }
 
