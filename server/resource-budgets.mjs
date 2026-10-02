@@ -9,3 +9,16 @@ export const RESOURCE_BUDGETS = Object.freeze({
   maxRunTranscriptBytes: 16 * 1024 * 1024,
   maxRunEventBytes: 8 * 1024 * 1024,
 });
+
+// Match the messages row charged by database.mjs retainedSizeExpression.
+// Checkpoints can acquire a cursor in the same commit as their delta event;
+// budget the longest safe integer before that cursor is assigned.
+export function retainedTranscriptMessageBytes(message) {
+  const payload = message.kind === "text"
+    ? { ...message.payload, checkpointEventSeq: Number.MAX_SAFE_INTEGER }
+    : message.payload;
+  return 128 + [
+    message.id, message.conversationId, message.role, message.kind ?? "text",
+    message.body ?? "", JSON.stringify(payload ?? null), message.createdAt,
+  ].reduce((bytes, value) => bytes + Buffer.byteLength(value ?? ""), 0);
+}

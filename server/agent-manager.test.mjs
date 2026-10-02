@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { AGENT_SUPERVISOR, buildProviderCommand, consumeBoundedLines, createAgentManager as createRuntimeAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_AUTHORIZED_CONTROL, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
 import { streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
 import { createOutrightDatabase } from "./database.mjs";
+import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
 
 const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
 const fakeLaunchDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-agent-test-"));
@@ -744,6 +745,43 @@ test("many assistant segments share one durable transcript byte budget", async (
   assert.ok(bytes <= 16 * 1024 * 1024);
   assert.equal(database.messages.some((message) => /retention budget/.test(message.body)), true);
   assert.equal(database.getRun("byte-budget-run").status, "completed");
+});
+
+test("near the item cap, real SQLite transcript rows stay within the retained byte budget", { timeout: 30000 }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-transcript-rows-"));
+  const filename = path.join(directory, "outright.db");
+  const database = createOutrightDatabase({ filename });
+  let manager;
+  try {
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory, title: "Transcript budget", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "produce many items" });
+    const child = fakeChild();
+    manager = createAgentManager({ database, publish: () => {},
+      launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture", ownsDescendants: false }),
+      spawnProcess: () => child });
+    await manager.schedule({ conversation, run });
+    const item = JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "x".repeat(8300) } }) + "\n";
+    for (let index = 0; index < RESOURCE_BUDGETS.maxRunTranscriptItems; index += 1) child.stdout.write(item);
+    child.emit("close", 0, null);
+    assert.equal(database.getRun(run.id).status, "completed");
+    assert.equal(Boolean(database.getRun(run.id).transcriptOmitted), true);
+
+    const probe = new Database(filename, { readonly: true });
+    try {
+      const rows = probe.prepare(`SELECT COUNT(*) AS items, SUM(128 + octet_length(id) + octet_length(conversation_id)
+        + octet_length(role) + octet_length(kind) + octet_length(body) + octet_length(payload)
+        + octet_length(created_at)) AS bytes FROM messages WHERE conversation_id = ?`).get(conversation.id);
+      assert.ok(rows.items <= RESOURCE_BUDGETS.maxRunTranscriptItems);
+      assert.ok(rows.bytes <= RESOURCE_BUDGETS.maxRunTranscriptBytes,
+        `durable transcript charged ${rows.bytes} bytes against ${RESOURCE_BUDGETS.maxRunTranscriptBytes}`);
+      assert.ok(probe.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes >= rows.bytes,
+        "aggregate accounting still includes the bounded transcript rows");
+    } finally { probe.close(); }
+  } finally {
+    await manager?.shutdown();
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("persists partial transcript output before the provider exits", async () => {

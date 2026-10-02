@@ -4,7 +4,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync,
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
-import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
+import { RESOURCE_BUDGETS, retainedTranscriptMessageBytes } from "./resource-budgets.mjs";
 
 const MAX_PROVIDER_LINE_BYTES = 1024 * 1024;
 const MAX_ASSISTANT_BYTES = 1024 * 1024;
@@ -754,7 +754,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       ? { runId: state.run.id, provider: state.run.provider, truncated: Boolean(item.payload?.truncated) }
       : boundedToolPayload(state.run.id, toolItem);
     const body = item.kind === "tool" ? truncateUtf8(item.body, MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES) : item.body;
-    const input = budgetTranscript(state, { id: `${state.run.id}:${state.transcriptSeq}`, conversationId: state.conversation.id, role: "assistant", kind: item.kind, body, payload });
+    const input = budgetTranscript(state, { id: `${state.run.id}:${state.transcriptSeq}`, createdAt: new Date().toISOString(), conversationId: state.conversation.id, role: "assistant", kind: item.kind, body, payload });
     if (!input) return;
     let message;
     try { message = database.addMessage(input); }
@@ -866,16 +866,16 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       markTranscriptOmitted(state);
       return null;
     }
-    const payloadBytes = Buffer.byteLength(JSON.stringify(message.payload ?? null));
     const ceiling = MAX_RUN_TRANSCRIPT_BYTES - (terminal ? 512 : 4096);
-    const allowance = ceiling - state.transcriptBytes + prior - payloadBytes;
+    const metadataBytes = retainedTranscriptMessageBytes({ ...message, body: "" });
+    const allowance = ceiling - state.transcriptBytes + prior - metadataBytes;
     if (allowance <= 0) { markTranscriptOmitted(state); return null; }
     const originalBytes = Buffer.byteLength(message.body ?? "");
     const body = originalBytes > allowance ? truncateUtf8(message.body, Math.max(0, allowance - 64)) : message.body;
     const bounded = originalBytes > allowance
       ? { ...message, body: `${body}\n[Further output omitted: transcript budget reached]`, payload: { ...message.payload, truncated: true } }
       : message;
-    const size = Buffer.byteLength(bounded.body ?? "") + Buffer.byteLength(JSON.stringify(bounded.payload ?? null));
+    const size = retainedTranscriptMessageBytes(bounded);
     if (state.transcriptBytes - prior + size > ceiling) { markTranscriptOmitted(state); return null; }
     state.transcriptSizes.set(message.id, size);
     state.transcriptBytes += size - prior;
