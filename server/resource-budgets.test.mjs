@@ -1011,7 +1011,6 @@ test("partly deleted archives stay hidden across restart until durable cleanup f
     assert.equal(database.getConversation(archived.id), undefined);
     assert.equal(database.listConversations({ archived: true }).some((item) => item.id === archived.id), false);
     assert.equal(database.search("hidden-deletion").conversations.length, 0);
-    assert.equal(database.search("hidden-deletion").messages.length, 0);
     for (const read of [
       () => database.listMessages(archived.id),
       () => database.messageCount(archived.id),
@@ -1020,7 +1019,7 @@ test("partly deleted archives stay hidden across restart until durable cleanup f
     ]) assert.throws(read, (error) => error.statusCode === 404);
     await assert.rejects(database.findMessagePage(archived.id, "hidden-deletion", null), (error) => error.statusCode === 404);
     assert.equal(database.getConversation(sibling.id)?.id, sibling.id);
-    assert.equal(database.search("sibling evidence").messages.length, 1);
+    assert.deepEqual(database.search("sibling evidence").conversations.map((item) => item.id), [sibling.id]);
     const unblock = new Database(filename);
     unblock.exec("DROP TRIGGER stop_after_first_batch");
     unblock.close();

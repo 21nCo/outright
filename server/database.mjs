@@ -30,6 +30,10 @@ const FIND_SCAN_BYTES = 8 * 1024 * 1024;
 // Keep one synchronous fold small enough for responsive event delivery even
 // after earlier searches have increased heap pressure in a long session.
 const FIND_CHUNK_BYTES = 16 * 1024;
+const SEARCH_CANDIDATES = 256;
+const SEARCH_MESSAGE_BYTES = 16 * 1024;
+const SEARCH_QUERY_BYTES = 256;
+const SEARCH_RESPONSE_BYTES = 128 * 1024;
 const RETAINED_COLUMNS = [
   ["settings", "key, value"],
   ["project_groups", "id, name, created_at"],
@@ -1331,12 +1335,55 @@ export function createOutrightDatabase(options = {}) {
     },
     deleteTemplate(id) { return db.prepare("DELETE FROM prompt_templates WHERE id = ?").run(id).changes > 0; },
     search(query, limit = 40) {
-      const needle = `%${query}%`;
-      const conversations = db.prepare(`SELECT ${conversationColumns()} FROM conversations WHERE deleting = 0 AND (title LIKE ? OR id IN (SELECT conversation_id FROM messages WHERE body LIKE ?)) ORDER BY updated_at DESC LIMIT ?`).all(needle, needle, limit);
-      const messages = db.prepare(`SELECT messages.id, messages.conversation_id AS conversationId, messages.role, messages.kind, messages.body, messages.created_at AS createdAt
-        FROM messages JOIN conversations ON conversations.id = messages.conversation_id
-        WHERE conversations.deleting = 0 AND messages.body LIKE ? ORDER BY messages.created_at DESC LIMIT ?`).all(needle, limit);
-      return { conversations, messages };
+      if (typeof query !== "string" || !query.trim() || Buffer.byteLength(query) > SEARCH_QUERY_BYTES) {
+        throw databaseError(400, `Search query must contain 1 to ${SEARCH_QUERY_BYTES} UTF-8 bytes`);
+      }
+      const boundedLimit = Math.max(1, Math.min(40, Number.isInteger(limit) ? limit : 40));
+      const needle = `%${query.trim().replace(/[\\%_]/g, "\\$&")}%`;
+      // The palette only consumes conversation identities. Scan a fixed recent
+      // window and skip oversized bodies before LIKE can materialize them.
+      // Conversation Find remains available for the complete retained text.
+      const fields = `c.id, c.project_id AS projectId, c.worktree_id AS worktreeId,
+        substr(c.title, 1, 256) AS title, substr(c.provider, 1, 64) AS provider,
+        substr(c.worktree_path, 1, 512) AS worktreePath, c.updated_at AS updatedAt`;
+      const safeIdentity = `octet_length(c.id) <= 256 AND octet_length(c.project_id) <= 256
+        AND octet_length(c.worktree_id) <= 256 AND octet_length(c.updated_at) <= 64
+        AND octet_length(c.title) <= ${SEARCH_MESSAGE_BYTES}
+        AND octet_length(c.provider) <= 4096 AND octet_length(c.worktree_path) <= 8192`;
+      const byTitle = db.prepare(`WITH recent AS MATERIALIZED
+        (SELECT rowid FROM conversations ORDER BY rowid DESC LIMIT ${SEARCH_CANDIDATES})
+        SELECT ${fields} FROM recent JOIN conversations AS c ON c.rowid = recent.rowid
+        WHERE c.deleting = 0 AND ${safeIdentity}
+          AND c.title LIKE ? ESCAPE '\\'`).all(needle);
+      const byMessage = db.prepare(`WITH recent AS MATERIALIZED
+        (SELECT rowid FROM messages ORDER BY rowid DESC LIMIT ${SEARCH_CANDIDATES})
+        SELECT DISTINCT ${fields} FROM recent JOIN messages AS m ON m.rowid = recent.rowid
+        JOIN conversations AS c ON c.id = m.conversation_id
+        WHERE c.deleting = 0 AND ${safeIdentity} AND octet_length(m.body) <= ${SEARCH_MESSAGE_BYTES}
+          AND m.body LIKE ? ESCAPE '\\'`).all(needle);
+      const matched = [...new Map([...byTitle, ...byMessage].map((row) => [row.id, row])).values()];
+      const conversations = [];
+      let responseBytes = 64;
+      for (const { updatedAt, ...row } of matched.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))) {
+        if (conversations.length === boundedLimit) break;
+        const bytes = Buffer.byteLength(JSON.stringify(row)) + 1;
+        if (responseBytes + bytes > SEARCH_RESPONSE_BYTES) break;
+        conversations.push(row);
+        responseBytes += bytes;
+      }
+      const partial = matched.length > conversations.length || Boolean(db.prepare(`SELECT 1 FROM messages WHERE rowid <
+        (SELECT MIN(rowid) FROM (SELECT rowid FROM messages ORDER BY rowid DESC LIMIT ${SEARCH_CANDIDATES})) LIMIT 1`).get()
+        || db.prepare(`SELECT 1 FROM conversations WHERE rowid <
+        (SELECT MIN(rowid) FROM (SELECT rowid FROM conversations ORDER BY rowid DESC LIMIT ${SEARCH_CANDIDATES})) LIMIT 1`).get()
+        || db.prepare(`WITH recent AS MATERIALIZED
+          (SELECT rowid FROM messages ORDER BY rowid DESC LIMIT ${SEARCH_CANDIDATES})
+          SELECT 1 FROM recent JOIN messages AS m ON m.rowid = recent.rowid
+          WHERE octet_length(m.body) > ${SEARCH_MESSAGE_BYTES} LIMIT 1`).get()
+        || db.prepare(`WITH recent AS MATERIALIZED
+          (SELECT rowid FROM conversations ORDER BY rowid DESC LIMIT ${SEARCH_CANDIDATES})
+          SELECT 1 FROM recent JOIN conversations AS c ON c.rowid = recent.rowid
+          WHERE NOT (${safeIdentity}) LIMIT 1`).get());
+      return { conversations, partial };
     },
   };
   return new Proxy(api, { get(target, key, receiver) {

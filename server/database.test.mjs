@@ -34,6 +34,32 @@ test("persists settings, groups, conversations, messages, runs, and search", () 
   }
 });
 
+test("global search bounds recent text and response bytes while keeping conversation Find available", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const old = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Old", provider: "codex" });
+    database.addMessage({ conversationId: old.id, role: "assistant", body: "old-needle" });
+    const current = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Current", provider: "codex" });
+    for (let index = 0; index < 260; index += 1) {
+      database.addMessage({ conversationId: current.id, role: "assistant", body: `filler ${index}` });
+    }
+    const large = database.addMessage({ conversationId: current.id, role: "assistant", body: `large-needle ${"x".repeat(4 * 1024 * 1024)}` });
+    database.addMessage({ conversationId: current.id, role: "assistant", body: "recent-needle" });
+    for (let index = 0; index < 12; index += 1) {
+      const result = database.search("recent-needle");
+      assert.deepEqual(result.conversations.map((item) => item.id), [current.id]);
+      assert.equal(result.partial, true);
+      assert.ok(Buffer.byteLength(JSON.stringify(result)) < 4096, "search returned retained body text");
+      assert.equal(database.search("old-needle").conversations.length, 0, "scan crossed the recent candidate budget");
+      assert.equal(database.search("large-needle").conversations.length, 0, "large body entered the synchronous scan");
+    }
+    assert.equal((await database.findMessagePage(current.id, "large-needle", null)).matchId, large.id);
+    assert.equal(database.search("Current").conversations[0].id, current.id);
+    assert.equal(database.search("recent%needle").conversations.length, 0, "LIKE wildcard was treated as query syntax");
+    assert.throws(() => database.search("x".repeat(257)), (error) => error.statusCode === 400);
+  } finally { database.close(); }
+});
+
 test("conversation find reaches old and new pages, wraps, and treats query text literally", async () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

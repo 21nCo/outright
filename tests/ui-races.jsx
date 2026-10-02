@@ -2193,8 +2193,10 @@ async function commandPaletteRegression() {
   oldResults.resolve(response({ conversations: [{ id: "old", title: "Old result", provider: "codex", worktreePath: "/old" }], messages: [] }));
   await settle();
   assert(!document.body.textContent.includes("Old result"), "A stale command search response remained selectable");
-  currentResults.resolve(response({ conversations: [{ id: "current", title: "Current result", provider: "codex", worktreePath: "/current" }], messages: [] }));
+  currentResults.resolve(response({ conversations: [{ id: "current", title: "Current result", provider: "codex", worktreePath: "/current" }], partial: true }));
   await until(() => document.querySelector('[role="option"]')?.textContent.includes("Current result"), "current command result");
+  assert(document.querySelector(".command-search-scope")?.textContent.includes("recent conversations"), "bounded search was not explained");
+  assert(document.querySelector('.command-results [role="status"]')?.textContent.includes("recent conversations"), "bounded search was not announced");
   await until(() => input.getAttribute("aria-activedescendant") === "command-result-0", "active remote command result");
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
   assert(selected?.id === "current", "Enter did not select the asynchronously loaded command result");

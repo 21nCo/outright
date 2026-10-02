@@ -488,6 +488,7 @@ select { height: 34px; padding: 0 28px 0 10px; border: 1px solid var(--input); b
 .command-results small { font-size: 9px; }
 .command-hint { min-height: 120px; padding: 19px; display: flex; flex-direction: column; justify-content: center; gap: 12px; color: var(--muted-foreground); }
 .command-hint span { display: flex; align-items: center; gap: 4px; font-size: 10px; }
+.command-search-scope { margin: 0; padding: 10px 12px; color: var(--muted-foreground); font-size: 11px; line-height: 1.45; }
 kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--line-soft); border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; background: var(--subtle-canvas); font-size: 9px; }
 .no-results { padding: 35px; color: var(--muted-foreground); text-align: center; font-size: 11px; }
 .command-error { padding: 24px; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--destructive); text-align: center; font-size: 11px; }
