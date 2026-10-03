@@ -1,0 +1,28 @@
+server/agent-manager.mjs
+  h_a39f9495f9ec1d 383
+server/agent-manager.test.mjs
+  h_a39f9495f9ec1d 483,2198
+server/database.mjs
+  h_a39f9495f9ec1d 296-303,305,1737-1745
+server/git-service.mjs
+  h_a39f9495f9ec1d 2,49-50,57-60,67-68,82-84,98-99,114-117,158-175,208-213
+server/git-service.test.mjs
+  h_a39f9495f9ec1d 3,29,67,138-299
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 986-1029
+server/terminal-manager.mjs
+  h_a39f9495f9ec1d 13-28,30-31,62-63,66-72,100-105
+server/terminal-manager.test.mjs
+  h_a39f9495f9ec1d 88,106,109,113-131
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "39350f006f480dd8a157ca0c86f3cd0ecc7861d4",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
