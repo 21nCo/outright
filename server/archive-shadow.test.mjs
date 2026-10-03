@@ -75,7 +75,167 @@ test("archive shadow cutover promotes a validated candidate and releases its fal
     assert.equal(existsSync(item.old), false);
     assert.equal(existsSync(item.next), false);
     assert.equal(existsSync(item.state), false);
+    const writer = new Database(item.filename);
+    try { writer.prepare("UPDATE evidence SET body = ? WHERE id = 1").run("writes resumed"); }
+    finally { writer.close(); }
+    assert.equal(body(item.filename), "writes resumed");
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
+test("a direct SQLite writer cannot commit after candidate promotion", () => {
+  const item = fixture();
+  const originalRename = fs.renameSync;
+  let probed = false;
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.pragma("journal_mode = WAL");
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    const fencedSource = new Database(item.filename);
+    fencedSource.pragma("wal_checkpoint(TRUNCATE)");
+    fencedSource.pragma("journal_mode = DELETE");
+    fencedSource.exec("BEGIN EXCLUSIVE");
+    fenceArchiveSource(fencedSource);
+    fencedSource.exec("COMMIT");
+    fencedSource.close();
+    fs.renameSync = (from, to) => {
+      originalRename(from, to);
+      if (from === item.next && to === item.filename) {
+        probed = true;
+        const writer = new Database(to);
+        try {
+          assert.throws(() => writer.prepare("UPDATE evidence SET body = ? WHERE id = 1").run("lost after promotion"),
+            /Archive cutover is in progress/);
+          assert.equal(body(to), "recoverable payload");
+        } finally { writer.close(); }
+      }
+    };
+    syncBuiltinESMExports();
+    cutoverArchiveShadow(item.filename);
+    assert.equal(probed, true);
+    assert.equal(body(item.filename), "recoverable payload");
+    assert.equal(existsSync(item.old), false);
+    assert.equal(existsSync(item.state), false);
+    const writer = new Database(item.filename);
+    try { writer.prepare("UPDATE evidence SET body = ? WHERE id = 1").run("committed after cutover"); }
+    finally { writer.close(); }
+    assert.equal(body(item.filename), "committed after cutover");
+  } finally {
+    fs.renameSync = originalRename;
+    syncBuiltinESMExports();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
+});
+
+test("post-promotion writer cannot lose sibling run, audit, setting or retained evidence", async () => {
+  const item = fixture();
+  const originalRename = fs.renameSync;
+  try {
+    const runtime = createOutrightDatabase({ filename: item.filename });
+    const chat = runtime.createConversation({ projectId: "p", worktreeId: "w", worktreePath: item.directory,
+      title: "retained sibling", provider: "codex" });
+    const message = runtime.addMessage({ conversationId: chat.id, role: "assistant", body: "original sibling" });
+    const queued = runtime.createRun({ conversationId: chat.id, worktreePath: item.directory,
+      provider: "codex", approvalPolicy: "read-only", prompt: "queued prompt" });
+    const interrupted = runtime.createRun({ conversationId: chat.id, worktreePath: item.directory,
+      provider: "codex", approvalPolicy: "read-only", prompt: "recovery prompt" });
+    runtime.updateRun(interrupted.id, { status: "interrupted" });
+    await runtime.close();
+    const baseline = new Database(item.filename, { readonly: true });
+    const retainedBytes = baseline.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes;
+    baseline.close();
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    const fencedSource = new Database(item.filename);
+    fencedSource.exec("BEGIN EXCLUSIVE");
+    fenceArchiveSource(fencedSource);
+    fencedSource.exec("COMMIT");
+    fencedSource.close();
+    let probed = false;
+    fs.renameSync = (from, to) => {
+      originalRename(from, to);
+      if (from === item.next && to === item.filename) {
+        probed = true;
+        const writer = new Database(to);
+        try {
+          assert.throws(() => writer.transaction(() => {
+            writer.prepare("UPDATE messages SET body = ? WHERE id = ?").run("lost sibling", message.id);
+            writer.prepare("UPDATE runs SET prompt = ? WHERE id = ?").run("lost run", queued.id);
+            writer.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("cutover.probe", '"lost"');
+            writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
+              .run("cutover.probe", chat.id, "{}", new Date().toISOString());
+          }).immediate(), /Archive cutover is in progress/);
+        } finally { writer.close(); }
+      }
+    };
+    syncBuiltinESMExports();
+    cutoverArchiveShadow(item.filename);
+    assert.equal(probed, true);
+    const proof = new Database(item.filename, { readonly: true });
+    try {
+      assert.equal(proof.prepare("SELECT body FROM messages WHERE id = ?").get(message.id).body, "original sibling");
+      assert.equal(proof.prepare("SELECT prompt FROM runs WHERE id = ?").get(queued.id).prompt, "queued prompt");
+      assert.equal(proof.prepare("SELECT status FROM runs WHERE id = ?").get(queued.id).status, "queued");
+      assert.equal(proof.prepare("SELECT status FROM runs WHERE id = ?").get(interrupted.id).status, "interrupted");
+      assert.equal(proof.prepare("SELECT value FROM settings WHERE key = 'cutover.probe'").get(), undefined);
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'cutover.probe'").get().count, 0);
+      assert.equal(proof.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes, retainedBytes);
+    } finally { proof.close(); }
+    const restarted = createOutrightDatabase({ filename: item.filename });
+    try {
+      assert.equal(restarted.getRun(queued.id).status, "queued");
+      assert.equal(restarted.getRun(interrupted.id).status, "interrupted");
+    } finally { await restarted.close(); }
+  } finally {
+    fs.renameSync = originalRename;
+    syncBuiltinESMExports();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
+});
+
+test("interruption after promotion validation keeps candidate fenced through recovery", () => {
+  const item = fixture();
+  const originalRemove = fs.rmSync;
+  let probed = false;
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    fs.rmSync = (name, ...args) => {
+      if (name === item.old) {
+        probed = true;
+        const writer = new Database(item.filename);
+        try { assert.throws(() => writer.prepare("INSERT INTO evidence (body) VALUES (?)").run("lost before cleanup"),
+          /Archive cutover is in progress/); }
+        finally { writer.close(); }
+        throw new Error("simulated interruption after validation");
+      }
+      return originalRemove(name, ...args);
+    };
+    syncBuiltinESMExports();
+    assert.throws(() => cutoverArchiveShadow(item.filename), /simulated interruption/);
+    assert.equal(probed, true);
+    assert.equal(existsSync(item.old), true);
+    fs.rmSync = originalRemove;
+    syncBuiltinESMExports();
+    recoverArchiveShadow(item.filename);
+    assert.equal(body(item.filename), "recoverable payload");
+    const writer = new Database(item.filename);
+    try { writer.prepare("INSERT INTO evidence (body) VALUES (?)").run("recovered write"); }
+    finally { writer.close(); }
+    assert.equal(existsSync(item.state), false);
+  } finally {
+    fs.rmSync = originalRemove;
+    syncBuiltinESMExports();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
 });
 
 test("an interrupted closed-source cutover retains its write fence until rollback", () => {
@@ -252,9 +412,15 @@ test("recovery rejects a substituted candidate after the original is renamed", (
     source.close();
     prepareArchiveShadowCutover(item.filename);
     renameSync(item.filename, item.old);
-    const next = new Database(item.next);
-    next.prepare("UPDATE evidence SET body = ? WHERE id = 1").run("changed after prepare");
+    // File replacement remains detectable even though ordinary SQLite DML
+    // against the candidate is fenced after preparation.
+    const substitute = `${item.filename}.substitute`;
+    const next = new Database(substitute);
+    next.exec("CREATE TABLE evidence (id INTEGER PRIMARY KEY, body TEXT NOT NULL)");
+    next.prepare("INSERT INTO evidence (body) VALUES (?)").run("changed after prepare");
     next.close();
+    rmSync(item.next);
+    renameSync(substitute, item.next);
     recoverArchiveShadow(item.filename);
     assert.equal(body(item.filename), "recoverable payload");
     assert.equal(existsSync(item.old), false);

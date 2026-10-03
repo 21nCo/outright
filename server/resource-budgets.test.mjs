@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHook } from "node:async_hooks";
 import test from "node:test";
 import Database from "better-sqlite3";
-import { existsSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createOutrightDatabase, recoverArchiveBeforeStartup } from "./database.mjs";
@@ -1484,9 +1484,9 @@ test("rejected shadow replacement preserves queued and recoverable evidence thro
       assert.ok(Date.now() < deadline, "candidate did not reach its prepared cutover gate");
       await new Promise((resolve) => setTimeout(resolve, 2));
     }
-    const candidate = new Database(`${filename}.archive-next`);
-    candidate.prepare("UPDATE messages SET body = ? WHERE id = ?").run("substituted survivor", retained.id);
-    candidate.close();
+    // SQLite DML is now fenced on a prepared candidate. Change its bytes
+    // outside SQLite to verify the digest still rejects a replaced shadow.
+    appendFileSync(`${filename}.archive-next`, "unvalidated tail");
     Atomics.store(lockGate, 0, 2);
     Atomics.notify(lockGate, 0);
     await assert.rejects(deletion, /candidate changed/);

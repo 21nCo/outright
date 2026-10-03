@@ -127,8 +127,8 @@ function discardShadowCandidate(filename) {
 // A closed SQLite handle is required for a Windows rename. Keep the source
 // write-protected across that close with durable triggers, so a direct SQLite
 // connection cannot commit into the old file between comparison and rename.
-// The shadow never contains this fence. Recovery removes it only after the
-// original has been chosen as the live database again.
+// Fence both the source and the candidate before either can occupy the live
+// pathname. Recovery removes the surviving fence only after choosing it.
 export function fenceArchiveSource(db) {
   const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'
     AND name NOT LIKE 'sqlite_%' AND name != 'archive_cutover_guard'`).all().map((row) => row.name);
@@ -267,6 +267,19 @@ export function prepareArchiveShadowCutover(filename) {
   if (!privateRegularFile(state) || !validDatabase(next) || hasNonemptyWal(next)) {
     throw new Error("Archive shadow is not ready for cutover");
   }
+  // The candidate becomes publicly writable at the second rename. Fence it
+  // before pinning its digest, so a direct SQLite writer cannot commit between
+  // promotion and verification, then make recovery restore an older source.
+  // A closed handle is also required for Windows promotion.
+  const candidateDb = new Database(next);
+  try {
+    if (candidateDb.pragma("journal_mode = DELETE", { simple: true }).toLowerCase() !== "delete") {
+      throw new Error("Archive shadow could not leave WAL mode");
+    }
+    candidateDb.pragma("synchronous = FULL");
+    candidateDb.transaction(() => fenceArchiveSource(candidateDb)).immediate();
+  } finally { candidateDb.close(); }
+  if (hasNonemptyWal(next)) throw new Error("Archive shadow fence left an uncheckpointed WAL");
   durableFile(next);
   durableDirectory(next);
   const marker = JSON.parse(readFileSync(state, "utf8"));
@@ -327,6 +340,10 @@ export function cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate } =
   // full integrity scan here would make the service outage size-dependent.
   rmSync(old);
   durableDirectory(filename);
+  // After the fallback is gone, recovery always keeps this valid candidate.
+  // Releasing the fence before removing the marker is crash-safe: with no old
+  // file, startup cannot roll back later committed writes to this pathname.
+  releaseArchiveSourceFence(filename);
   rmSync(state);
   durableDirectory(filename);
 }
