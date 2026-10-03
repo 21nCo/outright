@@ -15,11 +15,14 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   const terminals = new Map();
   let reservedUnknown = database.terminalUnknownReservations?.() ?? [];
   let reconciliationPromise;
+  // Old audit records may lack a worktree path. Charge their unknown owner
+  // against every worktree until native proof or operator recovery clears it.
+  const reservedForCwd = (cwd) => reservedUnknown.filter((entry) => !entry.cwd || entry.cwd === cwd).length;
 
   function assertCapacity(cwd) {
     pruneExitedForCapacity(cwd);
     if (terminals.size + reservedUnknown.length >= maxTerminals) throw terminalError(429, `At most ${maxTerminals} terminals can run at once`);
-    if ([...terminals.values()].filter((terminal) => terminal.cwd === cwd).length + reservedUnknown.filter((terminal) => terminal.cwd === cwd).length >= maxTerminalsPerCwd) throw terminalError(429, `At most ${maxTerminalsPerCwd} terminals can run for one worktree`);
+    if ([...terminals.values()].filter((terminal) => terminal.cwd === cwd).length + reservedForCwd(cwd) >= maxTerminalsPerCwd) throw terminalError(429, `At most ${maxTerminalsPerCwd} terminals can run for one worktree`);
   }
 
   function reconcileUnknown() {
@@ -52,7 +55,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   async function createManagedEntry(input) {
     if (reservedUnknown.length && (terminals.size + reservedUnknown.length >= maxTerminals
       || [...terminals.values()].filter((terminal) => terminal.cwd === input.cwd).length
-        + reservedUnknown.filter((entry) => entry.cwd === input.cwd).length >= maxTerminalsPerCwd)) {
+        + reservedForCwd(input.cwd) >= maxTerminalsPerCwd)) {
       await reconcileUnknown();
     }
     assertCapacity(input.cwd);
@@ -279,7 +282,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       clearTimeout(exited.cleanupTimer);
       terminals.delete(exited.id);
     }
-    while ([...terminals.values()].filter((terminal) => terminal.cwd === cwd).length + reservedUnknown.filter((terminal) => terminal.cwd === cwd).length >= maxTerminalsPerCwd) {
+    while ([...terminals.values()].filter((terminal) => terminal.cwd === cwd).length + reservedForCwd(cwd) >= maxTerminalsPerCwd) {
       const exited = [...terminals.values()].find((terminal) => terminal.cwd === cwd && terminal.status === "exited");
       if (!exited) break;
       clearTimeout(exited.cleanupTimer);

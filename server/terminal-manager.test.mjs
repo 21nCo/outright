@@ -590,6 +590,17 @@ test("a per-worktree recovery reservation retries native proof before rejecting 
   await manager.shutdown();
 });
 
+test("legacy unknown terminal ownership consumes each worktree limit", async () => {
+  const reservation = { target: "56b5370b-7ff3-470c-bb68-469b01c96915", cwd: null };
+  let launched = false;
+  const manager = createTerminalManager({ maxTerminals: 3, maxTerminalsPerCwd: 1, publish: () => {},
+    database: { launchDirectory: "/tmp", terminalUnknownReservations: () => [reservation] },
+    recoverTerminal: async () => false,
+    startManagedTerminal: async () => { launched = true; throw new Error("unverified owner reached PTY spawn"); } });
+  await assert.rejects(manager.create({ cwd: "/tmp/another-worktree" }), (error) => error.statusCode === 429);
+  assert.equal(launched, false, "a pathless owner did not charge per-worktree admission");
+});
+
 test("offline terminal recovery requires the exclusive runtime lease and records one operator decision", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-operator-"));
   const filename = path.join(directory, "runtime.db");
@@ -686,7 +697,10 @@ test("restart settles crash and maintenance-interrupted PTY evidence before rete
 
     // A process crash can also interrupt a create or close request before
     // the PTY outcome is known. Recovery must settle each correlation key.
-    database.auditCritical("terminal.create.requested", { target: "unborn", operationId: "create-crash" });
+    const interruptedCwd = "/tmp/crashed-create-worktree";
+    database.auditCritical("terminal.create.requested", { target: "unborn", operationId: "create-crash",
+      cwd: interruptedCwd, ownershipLabel: "com.21n.outright.terminal.unborn",
+      handshakePath: "/tmp/terminal-unborn.json", pid: 5432, processIdentity: "owned-start" });
     database.auditCritical("terminal.close.requested", { target: interrupted.id, operationId: "close-crash" });
     database.close();
     database = createOutrightDatabase({ filename, runtimeLease: true });
@@ -711,6 +725,12 @@ test("restart settles crash and maintenance-interrupted PTY evidence before rete
     database.close();
     database = createOutrightDatabase({ filename, runtimeLease: true });
     assert.equal(database.reconcileTerminalAudit(), 0);
+    const recoveredRequest = database.terminalUnknownReservations().find((entry) => entry.target === "unborn");
+    assert.equal(recoveredRequest?.cwd, interruptedCwd, "audit trimming lost the crashed terminal's worktree");
+    assert.equal(recoveredRequest?.ownershipLabel, "com.21n.outright.terminal.unborn");
+    assert.equal(recoveredRequest?.handshakePath, "/tmp/terminal-unborn.json");
+    assert.equal(recoveredRequest?.pid, 5432);
+    assert.equal(recoveredRequest?.processIdentity, "owned-start");
     const proof = new Database(filename, { readonly: true });
     try {
       assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.created'").get().count, 4);
