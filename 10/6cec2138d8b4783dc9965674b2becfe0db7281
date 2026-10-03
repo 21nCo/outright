@@ -1,0 +1,18 @@
+server/archive-shadow.mjs
+  h_a39f9495f9ec1d 130-131,270-282,343-346
+server/archive-shadow.test.mjs
+  h_a39f9495f9ec1d 78-81,85-240,415-420,422-423
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 5,1487-1489
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "106cec2138d8b4783dc9965674b2becfe0db7281",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
