@@ -1,0 +1,18 @@
+server/audit-retention.mjs
+  h_a39f9495f9ec1d 13
+server/terminal-manager.mjs
+  h_a39f9495f9ec1d 18-20,25,58,285
+server/terminal-manager.test.mjs
+  h_a39f9495f9ec1d 593-603,700-703,728-733
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b8a75e1ff0525ef3f0a622c66fb6420c6e7c72db",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
