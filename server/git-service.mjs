@@ -1,12 +1,18 @@
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { access, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
+import { utilityProcesses } from "./subprocess-budget.mjs";
 
-const execFileAsync = promisify(execFile);
-
-export function createGitService({ database, getProjects, getConfig }) {
+export function createGitService({ database, getProjects, getConfig, subprocesses = utilityProcesses }) {
+  const git = (cwd, args, overrides = {}) => runGit(subprocesses, cwd, args, overrides);
+  const safeGit = async (cwd, args, overrides = {}) => {
+    try { return await git(cwd, args, overrides); }
+    catch (error) { if (error.code === "SUBPROCESS_CAPACITY") throw error; return ""; }
+  };
+  const gitOutputOnFailure = async (cwd, args) => {
+    try { return await git(cwd, args, { maxBuffer: 12 * 1024 * 1024 }); }
+    catch (error) { if (error.code === "SUBPROCESS_CAPACITY") throw error; return (error.stdout ?? "").trimEnd(); }
+  };
   async function status(worktreePath) {
     const cwd = await requireWorktree(worktreePath);
     const [branch, porcelain, recent] = await Promise.all([
@@ -112,8 +118,7 @@ export function createGitService({ database, getProjects, getConfig }) {
     };
     const [executable, args] = commands[configured] ?? commands.zed;
     await auditedMutation("editor.open.requested", "editor.open", { target, editor: configured }, () => {
-      const child = execFile(executable, args, { windowsHide: true }, () => {});
-      child.unref?.();
+      return subprocesses.run(executable, args, { windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024 });
     });
     return { opened: true, editor: configured, target };
   }
@@ -134,9 +139,9 @@ export function createGitService({ database, getProjects, getConfig }) {
     }
     let pullRequest = null;
     try {
-      const { stdout } = await execFileAsync("gh", ["pr", "view", "--json", "number,title,url,state,headRefName,baseRefName,statusCheckRollup"], { cwd, env: githubEnvironment(cwd), encoding: "utf8", timeout: 6000, maxBuffer: 2 * 1024 * 1024 });
+      const { stdout } = await subprocesses.run("gh", ["pr", "view", "--json", "number,title,url,state,headRefName,baseRefName,statusCheckRollup"], { cwd, env: githubEnvironment(cwd), encoding: "utf8", timeout: 6000, maxBuffer: 2 * 1024 * 1024 });
       pullRequest = JSON.parse(stdout);
-    } catch { /* A worktree does not need an associated PR. */ }
+    } catch (error) { if (error.code === "SUBPROCESS_CAPACITY") throw error; /* A worktree does not need an associated PR. */ }
     return { instructionFiles, skills, pullRequest };
   }
 
@@ -176,12 +181,10 @@ export function createGitService({ database, getProjects, getConfig }) {
   return { status, diff, stage, unstage, commit, createWorktree, removeWorktree, openInEditor, context, requireWorktree };
 }
 
-async function git(cwd, args, overrides = {}) {
-  const { stdout } = await execFileAsync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 10_000, maxBuffer: 4 * 1024 * 1024, ...overrides });
+async function runGit(subprocesses, cwd, args, overrides = {}) {
+  const { stdout } = await subprocesses.run("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 10_000, maxBuffer: 4 * 1024 * 1024, ...overrides });
   return stdout.trimEnd();
 }
-async function safeGit(cwd, args, overrides = {}) { try { return await git(cwd, args, overrides); } catch { return ""; } }
-async function gitOutputOnFailure(cwd, args) { try { return await git(cwd, args, { maxBuffer: 12 * 1024 * 1024 }); } catch (error) { return (error.stdout ?? "").trimEnd(); } }
 // Porcelain v1 with -z: each record is "XY path"; renames/copies follow with
 // the original path in a second record. No quoting or arrow separators.
 function parsePorcelain(output) {

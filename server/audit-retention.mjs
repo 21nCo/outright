@@ -10,9 +10,9 @@ export function trimAudit(db) {
       AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > audit_log.id
         AND (CASE WHEN json_valid(outcome.details) THEN json_extract(outcome.details, '$.operationId') END)
           = json_extract(audit_log.details, '$.operationId')))
-      OR (action = 'terminal.created'
+      OR (action IN ('terminal.created', 'terminal.create.unknown', 'terminal.unknown')
         AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > audit_log.id
-          AND outcome.target = audit_log.target AND outcome.action IN ('terminal.exited', 'terminal.closed', 'terminal.unknown'))))`).run();
+          AND outcome.target = audit_log.target AND outcome.action IN ('terminal.exited', 'terminal.closed'))))`).run();
 }
 
 export const pendingCleanupSql = `SELECT request.id, json_extract(request.details, '$.operationId') AS operationId

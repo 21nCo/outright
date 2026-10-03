@@ -3,6 +3,7 @@ import test from "node:test";
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
@@ -24,11 +25,11 @@ test("creates a PTY, accepts input, and retains reconnectable output", async () 
     assert.equal(manager.list()[0].status, "running");
     assert.ok(events.some((event) => event.type === "terminal.output"));
   } finally {
-    manager.shutdown();
+    await manager.shutdown();
   }
 });
 
-test("enforces terminal limits, input bounds, and suppresses close-after-exit events", () => {
+test("enforces terminal limits, input bounds, and suppresses close-after-exit events", async () => {
   const events = [];
   const processes = [];
   const manager = createTerminalManager({
@@ -36,6 +37,7 @@ test("enforces terminal limits, input bounds, and suppresses close-after-exit ev
     database: { audit() {}, auditAdmission() {}, auditCritical() {}, auditRequired: async () => {} },
     maxTerminals: 2,
     maxTerminalsPerCwd: 1,
+    terminate: async (terminal) => { terminal.process.kill(); },
     spawnTerminal: () => {
       const callbacks = {};
       const process = {
@@ -55,17 +57,17 @@ test("enforces terminal limits, input bounds, and suppresses close-after-exit ev
   manager.create({ cwd: "/tmp/two", name: "Two" });
   assert.throws(() => manager.create({ cwd: "/tmp/three", name: "Three" }), (error) => error.statusCode === 429);
   assert.equal(manager.write(first.id, "x".repeat(70_000)), false);
-  assert.equal(manager.close(first.id), true);
+  assert.equal(await manager.close(first.id), true);
   assert.equal(events.some((event) => event.type === "terminal.exit" && event.terminalId === first.id), false);
-  manager.shutdown();
+  await manager.shutdown();
 });
 
-test("terminal buffer snapshot carries the output cursor for lossless activation", () => {
+test("terminal buffer snapshot carries the output cursor for lossless activation", async () => {
   const events = [];
   let onData;
   const manager = createTerminalManager({
     publish: (event) => events.push(event), database: { audit() {}, auditAdmission() {}, auditCritical() {}, auditRequired: async () => {} },
-    spawnTerminal: () => ({ pid: 1, onData(callback) { onData = callback; }, onExit() {}, kill() {} }),
+    spawnTerminal: () => ({ pid: 1, onData(callback) { onData = callback; }, onExit() {}, kill() {} }), terminate: async () => {},
   });
   const { id } = manager.create({ cwd: process.cwd() });
   onData("before\n");
@@ -75,7 +77,7 @@ test("terminal buffer snapshot carries the output cursor for lossless activation
   assert.equal(snapshot.outputCursor, 1);
   assert.deepEqual(events.map(({ payload }) => payload.cursor), [1, 2]);
   assert.equal(manager.get(id).outputCursor, 2);
-  manager.shutdown();
+  await manager.shutdown();
 });
 
 test("a full audit budget refuses PTY creation and a natural exit is retained across restart", async () => {
@@ -84,7 +86,7 @@ test("a full audit budget refuses PTY creation and a natural exit is retained ac
   let database = createOutrightDatabase({ filename });
   let spawns = 0;
   let onExit;
-  const manager = createTerminalManager({ database, publish: () => {}, spawnTerminal: () => {
+  const manager = createTerminalManager({ database, publish: () => {}, terminate: async () => {}, spawnTerminal: () => {
     spawns += 1;
     database.updateSettings({ maxRetainedMiB: 64 });
     return { pid: spawns, onData() {}, onExit(callback) { onExit = callback; }, kill() {} };
@@ -99,7 +101,7 @@ test("a full audit budget refuses PTY creation and a natural exit is retained ac
     const terminal = manager.create({ cwd: "/tmp/w" });
     onExit({ exitCode: 7, signal: 0 });
     await waitFor(() => database.listAudit(10).some((entry) => entry.action === "terminal.exited" && entry.target === terminal.id));
-    assert.equal(manager.close(terminal.id), true);
+    assert.equal(await manager.close(terminal.id), true);
     database.close();
     database = createOutrightDatabase({ filename });
     const actions = database.listAudit(10).filter((entry) => entry.target === terminal.id).map((entry) => entry.action);
@@ -108,34 +110,115 @@ test("a full audit budget refuses PTY creation and a natural exit is retained ac
     assert.ok(actions.includes("terminal.exited"));
     assert.ok(actions.includes("terminal.close.requested"));
     assert.ok(actions.includes("terminal.closed"));
-  } finally { manager.shutdown(); database.close(); rmSync(directory, { recursive: true, force: true }); }
+  } finally { await manager.shutdown(); database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("a close that cannot record its outcome reports the pending operation", () => {
+test("a close that cannot record its outcome reports the pending operation", async () => {
   const actions = [];
   let killed = false;
   const manager = createTerminalManager({ publish: () => {}, database: {
     auditAdmission: (action, details) => actions.push({ action, details }),
     auditCritical: (action, details) => {
-      if (action === "terminal.closed") throw Object.assign(new Error("storage interrupted"), { code: "SQLITE_BUSY" });
       actions.push({ action, details });
     },
-    auditRequired: async () => {},
-  }, spawnTerminal: () => ({ pid: 42, onData() {}, onExit() {}, kill() { killed = true; } }) });
+    auditRequired: async (action) => { if (action === "terminal.closed") throw Object.assign(new Error("storage interrupted"), { code: "SQLITE_BUSY" }); },
+  }, spawnTerminal: () => ({ pid: 42, onData() {}, onExit() {}, kill() { killed = true; } }), terminate: async (terminal) => { terminal.process.kill(); } });
   const terminal = manager.create({ cwd: "/tmp/w" });
-  assert.throws(() => manager.close(terminal.id), (error) =>
+  await assert.rejects(manager.close(terminal.id), (error) =>
     error.statusCode === 503 && error.details?.outcomeUnknown === true && Boolean(error.details.operationId));
   assert.equal(killed, true);
-  assert.equal(manager.get(terminal.id), null);
+  assert.equal(manager.get(terminal.id)?.status, "unknown");
   assert.ok(actions.some((entry) => entry.action === "terminal.close.requested"));
 });
 
-test("normal shutdown settles every PTY at a lowered quota and old outcomes trim after restart", () => {
+test("closing keeps the process slot until termination is verified; unknown termination keeps it charged", async () => {
+  let finishTermination;
+  let failTermination = false;
+  const actions = [];
+  const manager = createTerminalManager({ maxTerminals: 1, maxTerminalsPerCwd: 1,
+    database: { auditAdmission: (action) => actions.push(action), auditCritical: (action) => actions.push(action), auditRequired: async () => {} },
+    publish: () => {},
+    spawnTerminal: () => ({ pid: 99999, onData() {}, onExit() {}, kill() {} }),
+    terminate: () => new Promise((resolve, reject) => { finishTermination = () => failTermination ? reject(new Error("still alive")) : resolve(); }),
+  });
+  const first = manager.create({ cwd: "/tmp/one" });
+  const closing = manager.close(first.id);
+  await Promise.resolve();
+  assert.throws(() => manager.create({ cwd: "/tmp/two" }), (error) => error.statusCode === 429);
+  assert.equal(actions.includes("terminal.closed"), false);
+  finishTermination();
+  assert.equal(await closing, true);
+  const second = manager.create({ cwd: "/tmp/two" });
+  failTermination = true;
+  const failedClose = manager.close(second.id);
+  await Promise.resolve();
+  finishTermination();
+  await assert.rejects(failedClose, (error) => error.statusCode === 503 && error.details.outcomeUnknown);
+  assert.equal(manager.get(second.id).status, "unknown");
+  assert.throws(() => manager.create({ cwd: "/tmp/three" }), (error) => error.statusCode === 429);
+  assert.ok(actions.includes("terminal.close.unknown"));
+  failTermination = false;
+  const retry = manager.close(second.id);
+  await Promise.resolve();
+  finishTermination();
+  assert.equal(await retry, true);
+  assert.equal(manager.list().length, 0);
+});
+
+test("failed created audit releases capacity after verified cleanup and durable failure", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-create-cleanup-"));
+  const filename = path.join(directory, "runtime.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  let terminated = false;
+  const manager = createTerminalManager({ publish: () => {}, database: {
+    auditAdmission: (...args) => database.auditAdmission(...args),
+    auditCritical: (action, details) => {
+      if (action === "terminal.created") throw new Error("audit unavailable");
+      database.auditCritical(action, details);
+    },
+    terminalUnknownReservations: () => database.terminalUnknownReservations(),
+  }, spawnTerminal: () => ({ pid: 42, onData() {}, onExit() {}, kill() {} }),
+  terminate: async () => { terminated = true; } });
+  try {
+    assert.throws(() => manager.create({ cwd: "/tmp/w" }), (error) => error.statusCode === 503);
+    await waitFor(() => terminated && manager.list().length === 0 && database.listAudit(10).some((entry) => entry.action === "terminal.create.failed"));
+    assert.deepEqual(manager.list(), []);
+    database.close();
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    database.reconcileTerminalAudit();
+    assert.deepEqual(database.terminalUnknownReservations(), []);
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("real PTY close reaps a foreground child that ignores hangup", { skip: process.platform === "win32" }, async () => {
+  const manager = createTerminalManager({ maxTerminals: 1, publish: () => {},
+    database: { auditAdmission() {}, auditCritical() {}, auditRequired: async () => {} } });
+  const terminal = manager.create({ cwd: process.cwd() });
+  let childPid;
+  try {
+    manager.write(terminal.id, `node -e 'process.on("SIGHUP",()=>{}); process.on("SIGTERM",()=>{}); console.log("OUTRIGHT_CHILD:"+process.pid); setInterval(()=>{},1000)'\r`);
+    await waitFor(() => {
+      const match = manager.get(terminal.id)?.buffer.match(/OUTRIGHT_CHILD:(\d+)/);
+      childPid = Number(match?.[1]);
+      return Number.isSafeInteger(childPid) && childPid > 0;
+    }, 10_000);
+    const closing = manager.close(terminal.id);
+    assert.throws(() => manager.create({ cwd: process.cwd() }), (error) => error.statusCode === 429);
+    await closing;
+    const state = spawnSync("ps", ["-o", "stat=", "-p", String(childPid)], { encoding: "utf8" }).stdout.trim();
+    assert.ok(!state || state.startsWith("Z"), `child ${childPid} remained live: ${state}`);
+  } finally {
+    try { await manager.shutdown(); } catch {}
+    if (childPid) try { process.kill(childPid, "SIGKILL"); } catch {}
+  }
+});
+
+test("normal shutdown settles every PTY at a lowered quota and old outcomes trim after restart", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-shutdown-"));
   const filename = path.join(directory, "runtime.db");
   let database = createOutrightDatabase({ filename, runtimeLease: true });
   const killed = [];
-  const manager = createTerminalManager({ database, publish: () => {}, spawnTerminal: () => ({
+  const manager = createTerminalManager({ database, publish: () => {}, terminate: async (terminal) => { terminal.process.kill(); }, spawnTerminal: () => ({
     pid: killed.length + 1, onData() {}, onExit() {}, kill() { killed.push(true); },
   }) });
   try {
@@ -144,7 +227,7 @@ test("normal shutdown settles every PTY at a lowered quota and old outcomes trim
     const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "quota", provider: "codex" });
     database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(65 * 1024 * 1024) });
     database.updateSettings({ maxRetainedMiB: 64 });
-    manager.shutdown();
+    await manager.shutdown();
     assert.equal(killed.length, 2);
     assert.deepEqual(manager.list(), []);
     database.close();
@@ -174,7 +257,7 @@ test("normal shutdown settles every PTY at a lowered quota and old outcomes trim
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("restart settles crash and maintenance-interrupted PTY evidence before retention trims it", () => {
+test("restart settles crash and maintenance-interrupted PTY evidence before retention trims it", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-recovery-"));
   const filename = path.join(directory, "runtime.db");
   let database = createOutrightDatabase({ filename, runtimeLease: true });
@@ -186,15 +269,19 @@ test("restart settles crash and maintenance-interrupted PTY evidence before rete
       if (unavailable) throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 });
       database.auditCritical(...args);
     },
-  }, publish: () => {}, spawnTerminal: () => ({ pid: 42, onData() {}, onExit() {}, kill() { killed.push(true); } }) });
+  }, publish: () => {}, spawnTerminal: () => ({ pid: 42, onData() {}, onExit() {}, kill() { killed.push(true); } }), terminate: async (terminal) => { terminal.process.kill(); } });
   try {
     const interrupted = manager.create({ cwd: "/tmp/interrupted" });
     unavailable = true;
-    assert.throws(() => manager.shutdown(), (error) => error instanceof AggregateError);
+    await assert.rejects(manager.shutdown(), (error) => error instanceof AggregateError);
     assert.equal(killed.length, 1);
     database.close();
     database = createOutrightDatabase({ filename, runtimeLease: true });
     assert.equal(database.reconcileTerminalAudit(), 1);
+    assert.ok(database.terminalUnknownReservations().some((entry) => entry.target === interrupted.id));
+    const reserved = createTerminalManager({ database, publish: () => {}, maxTerminals: 1,
+      spawnTerminal: () => { throw new Error("unverified capacity must reject before spawning"); } });
+    assert.throws(() => reserved.create({ cwd: "/tmp/other" }), (error) => error.statusCode === 429);
     assert.equal(database.reconcileTerminalAudit(), 0);
     assert.ok(database.listAudit(20).some((entry) => entry.action === "terminal.unknown" && entry.target === interrupted.id));
 
@@ -227,9 +314,8 @@ test("restart settles crash and maintenance-interrupted PTY evidence before rete
     assert.equal(database.reconcileTerminalAudit(), 0);
     const proof = new Database(filename, { readonly: true });
     try {
-      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.created'").get().count, 0);
-      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action LIKE 'terminal.%.requested'").get().count, 0);
-      assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= 10_001);
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.created'").get().count, 4);
+      assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= 10_010);
     } finally { proof.close(); }
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });

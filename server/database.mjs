@@ -1457,6 +1457,20 @@ export function createOutrightDatabase(options = {}) {
       }
       return reconciled;
     },
+    terminalUnknownReservations() {
+      // The lease owner cannot prove that a previous owner's orphaned PTY
+      // tree died. Keep a bounded sample of unresolved targets charged against
+      // terminal capacity. A verified exit/close is the only release signal.
+      return db.prepare(`SELECT target, cwd FROM (
+        SELECT entry.target AS target,
+          CASE WHEN json_valid(entry.details) THEN json_extract(entry.details, '$.cwd') END AS cwd
+        FROM audit_log AS entry
+        WHERE entry.action IN ('terminal.create.requested', 'terminal.created', 'terminal.create.unknown')
+          AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > entry.id
+            AND outcome.target = entry.target
+            AND outcome.action IN ('terminal.create.failed', 'terminal.exited', 'terminal.closed'))
+      ) GROUP BY target LIMIT 13`).all();
+    },
     listAudit(limit = 100) {
       const bounded = Math.max(1, Math.min(500, Number(limit) || 100));
       return db.prepare("SELECT id, action, target, details, created_at AS createdAt FROM audit_log ORDER BY id DESC LIMIT ?").all(bounded).map(hydrateDetails);
