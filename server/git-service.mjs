@@ -68,6 +68,13 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
       try { await git(cwd, ["restore", "--staged", "--", ...validated]); }
       catch (error) {
         if (error.code === "SUBPROCESS_CAPACITY") throw error;
+        // Current Git also needs HEAD as restore's default staged source.
+        // Before the first commit every index entry is an addition; remove
+        // only those entries and leave the working files in place.
+        if (/could not resolve HEAD/i.test(`${error.message}\n${error.stderr ?? ""}`)) {
+          await git(cwd, ["rm", "-f", "--cached", "--ignore-unmatch", "--", ...validated]);
+          return;
+        }
         // Older Git versions may lack restore. A failed restore for any other
         // reason must not turn a tracked modification into a staged deletion.
         if (!/not a git command|unknown subcommand|unknown option/i.test(`${error.message}\n${error.stderr ?? ""}`)) throw error;
@@ -77,7 +84,7 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
           // An unborn branch has no HEAD to reset against. Its staged files
           // are all additions, so removing only the index entries is safe.
           if (!/ambiguous argument ['"]?HEAD|unknown revision.*HEAD|bad revision ['"]?HEAD/i.test(`${resetError.message}\n${resetError.stderr ?? ""}`)) throw resetError;
-          await git(cwd, ["rm", "-f", "--cached", "--", ...validated]);
+          await git(cwd, ["rm", "-f", "--cached", "--ignore-unmatch", "--", ...validated]);
         }
       }
     });

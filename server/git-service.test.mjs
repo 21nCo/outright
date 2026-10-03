@@ -137,6 +137,32 @@ test("Git without restore unstages tracked changes without staging a deletion", 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("unstage on an unborn branch removes index entries and preserves working files", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-unstage-unborn-"));
+  try {
+    await git(root, ["init", "project"]);
+    const repository = await realpath(path.join(root, "project"));
+    await writeFile(path.join(repository, "staged.txt"), "first draft\n");
+    await writeFile(path.join(repository, "untracked.txt"), "second draft\n");
+    await git(repository, ["add", "staged.txt"]);
+    const actions = [];
+    const service = createGitService({
+      database: { auditAdmission: (action) => actions.push(action), auditCritical: (action) => actions.push(action) },
+      getProjects: () => [{ worktrees: [{ path: repository }] }],
+      getConfig: async () => ({ scanRoots: [root] }),
+    });
+    const result = await service.unstage(repository, ["staged.txt", "untracked.txt"]);
+    assert.equal(result.stagedCount, 0);
+    assert.equal(result.unstagedCount, 2);
+    assert.deepEqual(actions, ["git.unstage.requested", "git.unstage"]);
+    await access(path.join(repository, "staged.txt"));
+    await access(path.join(repository, "untracked.txt"));
+    const { stdout } = await execFileAsync("git", ["-C", repository, "status", "--porcelain"]);
+    assert.match(stdout, /\?\? staged\.txt/);
+    assert.match(stdout, /\?\? untracked\.txt/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("a committed Git effect reports success when only its status refresh hits capacity", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "outright-git-refresh-capacity-"));
   try {
