@@ -480,6 +480,7 @@ function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/
     },
     audit: () => {},
     auditAdmission: () => {},
+    auditCritical: () => {},
   };
 }
 
@@ -2194,6 +2195,7 @@ const database = {
   appendRunEvent: () => ({}),
   audit: () => {},
   auditAdmission: () => {},
+  auditCritical: () => {},
 };
 const children = new Map();
 const agent = manager.createAgentManager({

@@ -983,6 +983,50 @@ test("quota refusal cannot silently authorize trust, while terminal run and reco
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("audit retention protects an unfinished external effect while trimming completed history", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-pending-audit-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const writer = new Database(filename);
+    try {
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)");
+      writer.transaction(() => {
+        insert.run("git.commit.requested", "/tmp/pending", JSON.stringify({ operationId: "pending" }), "2026-01-01");
+        insert.run("git.commit.requested", "/tmp/completed", JSON.stringify({ operationId: "completed" }), "2026-01-01");
+        insert.run("git.commit", "/tmp/completed", JSON.stringify({ operationId: "completed" }), "2026-01-01");
+        insert.run("terminal.created", "active-terminal", "{}", "2026-01-01");
+        insert.run("terminal.created", "closed-terminal", "{}", "2026-01-01");
+        insert.run("terminal.closed", "closed-terminal", "{}", "2026-01-01");
+        for (let index = 0; index < 10_050; index += 1) insert.run("telemetry", "", "{}", "2026-01-01");
+      }).immediate();
+    } finally { writer.close(); }
+    database.audit("telemetry", { target: "last" });
+    database.close();
+    database = createOutrightDatabase({ filename });
+    const proof = new Database(filename, { readonly: true });
+    try {
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE target = '/tmp/pending'").get().count, 1);
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE target = '/tmp/completed'").get().count, 0);
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE target = 'active-terminal'").get().count, 1);
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE target = 'closed-terminal'").get().count, 0);
+      assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= 10_002);
+    } finally { proof.close(); }
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("oversized audit details retain the operation id needed to match an outcome", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    database.auditAdmission("git.stage.requested", { target: "/tmp/project", operationId: "large-stage",
+      files: ["x".repeat(16 * 1024)] });
+    const entry = database.listAudit(1)[0];
+    assert.equal(entry.details.operationId, "large-stage");
+    assert.equal(entry.details.truncated, true);
+    assert.ok(Buffer.byteLength(JSON.stringify(entry.details)) <= 4 * 1024);
+  } finally { database.close(); }
+});
+
 test("legacy pinned schema and migration audit survive cleanup and restart", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-legacy-retention-"));
   const filename = path.join(directory, "outright.db");

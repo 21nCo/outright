@@ -85,6 +85,7 @@ test("a full audit budget refuses PTY creation and a natural exit is retained ac
   let onExit;
   const manager = createTerminalManager({ database, publish: () => {}, spawnTerminal: () => {
     spawns += 1;
+    database.updateSettings({ maxRetainedMiB: 64 });
     return { pid: spawns, onData() {}, onExit(callback) { onExit = callback; }, kill() {} };
   } });
   try {
@@ -95,7 +96,6 @@ test("a full audit budget refuses PTY creation and a natural exit is retained ac
     assert.equal(spawns, 0);
     database.updateSettings({ maxRetainedMiB: 128 });
     const terminal = manager.create({ cwd: "/tmp/w" });
-    database.updateSettings({ maxRetainedMiB: 64 });
     onExit({ exitCode: 7, signal: 0 });
     await waitFor(() => database.listAudit(10).some((entry) => entry.action === "terminal.exited" && entry.target === terminal.id));
     assert.equal(manager.close(terminal.id), true);
@@ -103,9 +103,30 @@ test("a full audit budget refuses PTY creation and a natural exit is retained ac
     database = createOutrightDatabase({ filename });
     const actions = database.listAudit(10).filter((entry) => entry.target === terminal.id).map((entry) => entry.action);
     assert.ok(actions.includes("terminal.create.requested"));
+    assert.ok(actions.includes("terminal.created"));
     assert.ok(actions.includes("terminal.exited"));
     assert.ok(actions.includes("terminal.close.requested"));
+    assert.ok(actions.includes("terminal.closed"));
   } finally { manager.shutdown(); database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("a close that cannot record its outcome reports the pending operation", () => {
+  const actions = [];
+  let killed = false;
+  const manager = createTerminalManager({ publish: () => {}, database: {
+    auditAdmission: (action, details) => actions.push({ action, details }),
+    auditCritical: (action, details) => {
+      if (action === "terminal.closed") throw Object.assign(new Error("storage interrupted"), { code: "SQLITE_BUSY" });
+      actions.push({ action, details });
+    },
+    auditRequired: async () => {},
+  }, spawnTerminal: () => ({ pid: 42, onData() {}, onExit() {}, kill() { killed = true; } }) });
+  const terminal = manager.create({ cwd: "/tmp/w" });
+  assert.throws(() => manager.close(terminal.id), (error) =>
+    error.statusCode === 503 && error.details?.outcomeUnknown === true && Boolean(error.details.operationId));
+  assert.equal(killed, true);
+  assert.equal(manager.get(terminal.id), null);
+  assert.ok(actions.some((entry) => entry.action === "terminal.close.requested"));
 });
 
 async function waitFor(predicate, timeout = 3000, diagnostic = () => "") {

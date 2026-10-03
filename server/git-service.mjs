@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { access, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -45,28 +46,26 @@ export function createGitService({ database, getProjects, getConfig }) {
   async function stage(worktreePath, files) {
     const cwd = await requireWorktree(worktreePath);
     const validated = await validateFiles(cwd, files);
-    database.auditAdmission("git.stage.requested", { target: cwd, files: validated });
-    await git(cwd, ["add", "--", ...validated]);
-    database.audit("git.stage", { target: cwd, files: validated });
+    await auditedMutation("git.stage.requested", "git.stage", { target: cwd, files: validated },
+      () => git(cwd, ["add", "--", ...validated]));
     return status(cwd);
   }
 
   async function unstage(worktreePath, files) {
     const cwd = await requireWorktree(worktreePath);
     const validated = await validateFiles(cwd, files);
-    database.auditAdmission("git.unstage.requested", { target: cwd, files: validated });
-    try { await git(cwd, ["restore", "--staged", "--", ...validated]); }
-    catch { await git(cwd, ["rm", "--cached", "--", ...validated]); }
-    database.audit("git.unstage", { target: cwd, files: validated });
+    await auditedMutation("git.unstage.requested", "git.unstage", { target: cwd, files: validated }, async () => {
+      try { await git(cwd, ["restore", "--staged", "--", ...validated]); }
+      catch { await git(cwd, ["rm", "--cached", "--", ...validated]); }
+    });
     return status(cwd);
   }
 
   async function commit(worktreePath, message) {
     const cwd = await requireWorktree(worktreePath);
     if (!message?.trim()) throw httpError(400, "Commit message is required");
-    database.auditAdmission("git.commit.requested", { target: cwd, message: message.trim() });
-    const output = await git(cwd, ["commit", "-m", message.trim()], { maxBuffer: 8 * 1024 * 1024 });
-    database.audit("git.commit", { target: cwd, message: message.trim() });
+    const output = await auditedMutation("git.commit.requested", "git.commit", { target: cwd, message: message.trim() },
+      () => git(cwd, ["commit", "-m", message.trim()], { maxBuffer: 8 * 1024 * 1024 }));
     return { output, status: await status(cwd) };
   }
 
@@ -80,9 +79,9 @@ export function createGitService({ database, getProjects, getConfig }) {
     const destination = path.resolve(path.dirname(project.path), directoryName);
     await requireScanRoot(destination);
     if (await exists(destination)) throw httpError(409, "Destination already exists");
-    database.auditAdmission("git.worktree.create.requested", { target: destination, projectId, branch, baseBranch });
-    await git(root, ["worktree", "add", "-b", branch, destination, baseBranch]);
-    database.audit("git.worktree.created", { target: destination, projectId, branch, baseBranch });
+    await auditedMutation("git.worktree.create.requested", "git.worktree.created",
+      { target: destination, projectId, branch, baseBranch },
+      () => git(root, ["worktree", "add", "-b", branch, destination, baseBranch]));
     return { path: destination, branch };
   }
 
@@ -96,9 +95,8 @@ export function createGitService({ database, getProjects, getConfig }) {
     if (database.findUnresolvedInterruptedRunForWorktree?.(worktreePath)) {
       throw httpError(409, "Resolve the interrupted run before removing this worktree");
     }
-    database.auditAdmission("git.worktree.remove.requested", { target: worktreePath, projectId });
-    await git(project.path, ["worktree", "remove", worktreePath]);
-    database.audit("git.worktree.removed", { target: worktreePath, projectId });
+    await auditedMutation("git.worktree.remove.requested", "git.worktree.removed",
+      { target: worktreePath, projectId }, () => git(project.path, ["worktree", "remove", worktreePath]));
     return { removed: true };
   }
 
@@ -113,10 +111,10 @@ export function createGitService({ database, getProjects, getConfig }) {
       finder: ["open", ["-R", target]],
     };
     const [executable, args] = commands[configured] ?? commands.zed;
-    database.auditAdmission("editor.open.requested", { target, editor: configured });
-    const child = execFile(executable, args, { windowsHide: true }, () => {});
-    child.unref?.();
-    database.audit("editor.open", { target, editor: configured });
+    await auditedMutation("editor.open.requested", "editor.open", { target, editor: configured }, () => {
+      const child = execFile(executable, args, { windowsHide: true }, () => {});
+      child.unref?.();
+    });
     return { opened: true, editor: configured, target };
   }
 
@@ -157,6 +155,24 @@ export function createGitService({ database, getProjects, getConfig }) {
     return resolved;
   }
 
+  async function auditedMutation(requestAction, outcomeAction, details, mutate) {
+    const evidence = { ...details, operationId: randomUUID() };
+    database.auditAdmission(requestAction, evidence);
+    let result;
+    try { result = await mutate(); }
+    catch (error) {
+      try { database.auditCritical(`${outcomeAction}.failed`, { ...evidence, error: String(error.message ?? error).slice(0, 1024) }); }
+      catch (auditError) { throw outcomeUnknown(auditError, evidence.operationId); }
+      throw error;
+    }
+    // An admission can be followed by a quota change while an external
+    // command runs. A required outcome either commits before success returns
+    // or leaves the request as an explicit unresolved operation on failure.
+    try { database.auditCritical(outcomeAction, evidence); }
+    catch (error) { throw outcomeUnknown(error, evidence.operationId); }
+    return result;
+  }
+
   return { status, diff, stage, unstage, commit, createWorktree, removeWorktree, openInEditor, context, requireWorktree };
 }
 
@@ -189,6 +205,12 @@ function isWithin(root, target) { const relative = path.relative(root, target); 
 async function canonicalPath(target) { try { return await realpath(target); } catch { return path.resolve(target); } }
 async function exists(target) { try { await access(target); return true; } catch { return false; } }
 function httpError(statusCode, message) { const error = new Error(message); error.statusCode = statusCode; return error; }
+function outcomeUnknown(cause, operationId) {
+  const error = httpError(503, `Action outcome could not be recorded; inspect the target before retrying (operation ${operationId})`);
+  error.details = { operationId, outcomeUnknown: true };
+  error.cause = cause;
+  return error;
+}
 
 function githubEnvironment(cwd) {
   if (!cwd.includes(`${path.sep}dev${path.sep}n${path.sep}`)) return process.env;

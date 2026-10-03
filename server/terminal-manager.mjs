@@ -10,17 +10,26 @@ export function createTerminalManager({ publish, database, spawnTerminal = pty.s
     if ([...terminals.values()].filter((terminal) => terminal.cwd === cwd).length >= maxTerminalsPerCwd) throw terminalError(429, `At most ${maxTerminalsPerCwd} terminals can run for one worktree`);
     const id = randomUUID();
     const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/zsh");
-    database.auditAdmission("terminal.create.requested", { target: id, cwd, shell });
-    const processInstance = spawnTerminal(shell, [], {
-      name: "xterm-256color",
-      cols: clamp(cols, 20, 400),
-      rows: clamp(rows, 5, 200),
-      cwd,
-      env: { ...terminalEnvironment(process.env), TERM: "xterm-256color", COLORTERM: "truecolor" },
-    });
+    const evidence = { target: id, cwd, shell, operationId: randomUUID() };
+    database.auditAdmission("terminal.create.requested", evidence);
+    let processInstance;
+    try {
+      processInstance = spawnTerminal(shell, [], {
+        name: "xterm-256color",
+        cols: clamp(cols, 20, 400),
+        rows: clamp(rows, 5, 200),
+        cwd,
+        env: { ...terminalEnvironment(process.env), TERM: "xterm-256color", COLORTERM: "truecolor" },
+      });
+    } catch (error) {
+      try { database.auditCritical("terminal.create.failed", { ...evidence, error: String(error.message ?? error).slice(0, 1024) }); }
+      catch (auditError) { throw outcomeUnknown(auditError, evidence.operationId); }
+      throw error;
+    }
     const terminal = { id, cwd, name: name || "Terminal", pid: processInstance.pid, process: processInstance, buffer: "", outputCursor: 0, createdAt: new Date().toISOString(), status: "running" };
+    try { database.auditCritical("terminal.created", { ...evidence, pid: terminal.pid }); }
+    catch (error) { try { processInstance.kill(); } catch { /* Ownership is uncertain; report the operation id. */ } throw outcomeUnknown(error, evidence.operationId); }
     terminals.set(id, terminal);
-    database.audit("terminal.created", { target: id, cwd, pid: terminal.pid });
     processInstance.onData((data) => {
       if (!terminals.has(id)) return;
       terminal.buffer = `${terminal.buffer}${data}`.slice(-maxBufferChars);
@@ -50,11 +59,17 @@ export function createTerminalManager({ publish, database, spawnTerminal = pty.s
   function close(id, audit = true) {
     const terminal = terminals.get(id);
     if (!terminal) return false;
-    if (audit) database.auditCritical("terminal.close.requested", { target: id, cwd: terminal.cwd });
+    const evidence = { target: id, cwd: terminal.cwd, operationId: randomUUID() };
+    if (audit) database.auditCritical("terminal.close.requested", evidence);
     clearTimeout(terminal.cleanupTimer);
     terminals.delete(id);
-    if (terminal.status === "running") terminal.process.kill();
-    database.audit("terminal.closed", { target: id, cwd: terminal.cwd });
+    try {
+      if (terminal.status === "running") terminal.process.kill();
+      if (audit) database.auditCritical("terminal.closed", evidence);
+    } catch (error) {
+      if (audit) throw outcomeUnknown(error, evidence.operationId);
+      throw error;
+    }
     return true;
   }
   // Runtime shutdown must reap PTYs even if storage is closed for archive
@@ -82,6 +97,12 @@ function publicTerminal(terminal) {
 }
 function clamp(value, minimum, maximum) { return Math.max(minimum, Math.min(maximum, Number(value) || minimum)); }
 function terminalError(statusCode, message) { const error = new Error(message); error.statusCode = statusCode; return error; }
+function outcomeUnknown(cause, operationId) {
+  const error = terminalError(503, `Terminal outcome could not be recorded; inspect its state before retrying (operation ${operationId})`);
+  error.details = { operationId, outcomeUnknown: true };
+  error.cause = cause;
+  return error;
+}
 function terminalEnvironment(environment) {
   const blocked = /^(OUTRIGHT_|VITE_|npm_|NODE_OPTIONS$)/i;
   return Object.fromEntries(Object.entries(environment).filter(([key, value]) => value != null && !blocked.test(key)));

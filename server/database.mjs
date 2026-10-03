@@ -293,8 +293,16 @@ export function createOutrightDatabase(options = {}) {
   }
 
   function writeAudit(action, details = {}) {
+    const serialized = serializePayload(details, 4 * 1024);
+    const truncated = parseJson(serialized, null);
+    // Keep the correlation key even when a large file list or error is
+    // shortened. Retention needs it to protect an unfinished effect.
+    const payload = truncated?.truncated && typeof details.operationId === "string"
+      ? JSON.stringify({ operationId: details.operationId.slice(0, 128), truncated: true,
+        originalBytes: truncated.originalBytes, preview: truncated.preview?.slice(0, 512) ?? "" })
+      : serialized;
     db.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
-      .run(action, String(details.target ?? "").slice(0, 512), serializePayload(details, 4 * 1024), now());
+      .run(action, String(details.target ?? "").slice(0, 512), payload, now());
     trimAudit(db);
   }
 
@@ -1726,7 +1734,15 @@ function recoverArchiveOnWorker(filename, sourceUnmoved = false, runtimeLease = 
 function trimAudit(db) {
   db.prepare(`DELETE FROM audit_log WHERE id <= (SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET 9999)
     AND target NOT IN (SELECT id FROM runs WHERE status IN ('queued', 'launching', 'running')
-      OR (status = 'interrupted' AND recovery_decision IS NULL))`).run();
+      OR (status = 'interrupted' AND recovery_decision IS NULL))
+    AND NOT ((action LIKE '%.requested'
+      AND (CASE WHEN json_valid(details) THEN json_extract(details, '$.operationId') END) IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > audit_log.id
+        AND (CASE WHEN json_valid(outcome.details) THEN json_extract(outcome.details, '$.operationId') END)
+          = json_extract(audit_log.details, '$.operationId')))
+      OR (action = 'terminal.created'
+        AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > audit_log.id
+          AND outcome.target = audit_log.target AND outcome.action IN ('terminal.exited', 'terminal.closed'))))`).run();
 }
 
 function migrate(db) {

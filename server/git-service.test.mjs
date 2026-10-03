@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -26,7 +26,7 @@ test("reviews, stages, commits, creates, and safely removes discovered worktrees
     await git(repository, ["commit", "-m", "initial"]);
 
     let interruptedRun = null;
-    const service = createGitService({ database: { audit: (action, details) => audit.push({ action, details }), auditAdmission: (action, details) => audit.push({ action, details }), getSettings: () => ({ editor: "zed" }), findUnresolvedInterruptedRunForWorktree: () => interruptedRun }, getProjects: () => projects, getConfig: async () => ({ scanRoots: [canonicalScanRoot] }) });
+    const service = createGitService({ database: { audit: (action, details) => audit.push({ action, details }), auditAdmission: (action, details) => audit.push({ action, details }), auditCritical: (action, details) => audit.push({ action, details }), getSettings: () => ({ editor: "zed" }), findUnresolvedInterruptedRunForWorktree: () => interruptedRun }, getProjects: () => projects, getConfig: async () => ({ scanRoots: [canonicalScanRoot] }) });
     await writeFile(path.join(repository, "README.md"), "first\nsecond\n");
     assert.equal((await service.status(repository)).unstagedCount, 1);
     assert.match((await service.diff(repository, "README.md")).diff, /\+second/);
@@ -64,7 +64,7 @@ test("parses portable filenames and supported quote characters from NUL porcelai
     const projects = [{ id: "project", name: "project", path: repository, worktrees: [{ id: "main", path: repository, isLinked: false, changedCount: 0 }] }];
     await git(repository, ["config", "user.email", "outright@example.test"]);
     await git(repository, ["config", "user.name", "Outright Test"]);
-    const service = createGitService({ database: { audit: () => {}, auditAdmission: () => {}, getSettings: () => ({ editor: "zed" }) }, getProjects: () => projects, getConfig: async () => ({ scanRoots: [canonicalScanRoot] }) });
+    const service = createGitService({ database: { audit: () => {}, auditAdmission: () => {}, auditCritical: () => {}, getSettings: () => ({ editor: "zed" }) }, getProjects: () => projects, getConfig: async () => ({ scanRoots: [canonicalScanRoot] }) });
 
     await writeFile(path.join(repository, "hello world.txt"), "hello\n");
     let status = await service.status(repository);
@@ -135,7 +135,168 @@ test("Git mutations refuse before changing the repository when audit admission i
     assert.ok(!actions.includes("git.worktree.remove.requested"));
   } finally {
     database?.close();
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("a commit keeps its durable outcome when quota falls inside a Git hook", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-git-outcome-"));
+  const filename = path.join(root, "runtime.db");
+  let database;
+  try {
+    await git(root, ["init", "project"]);
+    const repository = await realpath(path.join(root, "project"));
+    await git(repository, ["config", "user.email", "outright@example.test"]);
+    await git(repository, ["config", "user.name", "Outright Test"]);
+    await writeFile(path.join(repository, "README.md"), "initial\n");
+    await git(repository, ["add", "README.md"]);
+    await git(repository, ["commit", "-m", "initial"]);
+    database = createOutrightDatabase({ filename });
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: repository, title: "quota", provider: "codex" });
+    database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(65 * 1024 * 1024) });
+    const project = { id: "p", name: "project", path: repository, worktrees: [{ path: repository, isLinked: false }] };
+    const service = createGitService({ database, getProjects: () => [project], getConfig: async () => ({ scanRoots: [await realpath(root)] }) });
+    await writeFile(path.join(repository, "README.md"), "changed\n");
+    await service.stage(repository, ["README.md"]);
+    const hook = path.join(repository, ".git", "hooks", "pre-commit");
+    const entered = path.join(root, "hook-entered");
+    const release = path.join(root, "hook-release");
+    await writeFile(hook, `#!/bin/sh\ntouch '${entered}'\nwhile [ ! -f '${release}' ]; do sleep 0.01; done\n`);
+    await chmod(hook, 0o755);
+    const committing = service.commit(repository, "quota changed during hook");
+    try {
+      for (let attempt = 0; attempt < 200 && !await exists(entered); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(await exists(entered), true, "Git never entered the hook");
+      database.updateSettings({ maxRetainedMiB: 64 });
+    } finally { await writeFile(release, "go"); }
+    assert.match((await committing).output, /quota changed during hook/);
+    database.close();
+    database = createOutrightDatabase({ filename });
+    const actions = database.listAudit(20).map((entry) => entry.action);
+    assert.ok(actions.includes("git.commit.requested"));
+    assert.ok(actions.includes("git.commit"), "successful commit lost its outcome after the quota changed");
+    assert.equal((await service.status(repository)).commits[0].subject, "quota changed during hook");
+  } finally {
+    database?.close();
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("failed Git hooks and a later retry have separate durable outcomes", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-git-retry-"));
+  let database;
+  try {
+    await git(root, ["init", "project"]);
+    const repository = await realpath(path.join(root, "project"));
+    await git(repository, ["config", "user.email", "outright@example.test"]);
+    await git(repository, ["config", "user.name", "Outright Test"]);
+    await git(repository, ["commit", "--allow-empty", "-m", "initial"]);
+    database = createOutrightDatabase({ filename: path.join(root, "runtime.db") });
+    const project = { id: "p", path: repository, worktrees: [{ path: repository, isLinked: false }] };
+    const service = createGitService({ database, getProjects: () => [project], getConfig: async () => ({ scanRoots: [root] }) });
+    await writeFile(path.join(repository, "README.md"), "retry\n");
+    await service.stage(repository, ["README.md"]);
+    const hook = path.join(repository, ".git", "hooks", "pre-commit");
+    await writeFile(hook, "#!/bin/sh\nexit 1\n");
+    await chmod(hook, 0o755);
+    await assert.rejects(service.commit(repository, "retry"));
+    assert.equal((await service.status(repository)).commits[0].subject, "initial");
+    await rm(hook);
+    await service.commit(repository, "retry");
+    const entries = database.listAudit(20).filter((entry) => entry.action.startsWith("git.commit"));
+    const requests = entries.filter((entry) => entry.action === "git.commit.requested");
+    assert.equal(requests.length, 2);
+    assert.equal(new Set(requests.map((entry) => entry.details.operationId)).size, 2);
+    for (const request of requests) {
+      const outcomes = entries.filter((entry) => entry.details.operationId === request.details.operationId && entry.action !== request.action);
+      assert.equal(outcomes.length, 1, "each attempt needs one terminal audit outcome");
+    }
+    assert.ok(entries.some((entry) => entry.action === "git.commit.failed"));
+    assert.ok(entries.some((entry) => entry.action === "git.commit"));
+  } finally {
+    database?.close();
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("stage, unstage and worktree changes retain outcomes after quota changes at admission", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-git-siblings-"));
+  const filename = path.join(root, "runtime.db");
+  let database;
+  try {
+    await git(root, ["init", "project"]);
+    const repository = await realpath(path.join(root, "project"));
+    await git(repository, ["config", "user.email", "outright@example.test"]);
+    await git(repository, ["config", "user.name", "Outright Test"]);
+    await writeFile(path.join(repository, "README.md"), "initial\n");
+    await git(repository, ["add", "README.md"]);
+    await git(repository, ["commit", "-m", "initial"]);
+    database = createOutrightDatabase({ filename });
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: repository, title: "quota", provider: "codex" });
+    database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(65 * 1024 * 1024) });
+    const project = { id: "p", name: "project", path: repository, worktrees: [{ path: repository, isLinked: false }] };
+    const service = createGitService({ database, getProjects: () => [project], getConfig: async () => ({ scanRoots: [await realpath(root)] }) });
+    const admit = database.auditAdmission.bind(database);
+    database.auditAdmission = (action, details) => {
+      admit(action, details);
+      database.updateSettings({ maxRetainedMiB: 64 });
+    };
+    const reset = () => database.updateSettings({ maxRetainedMiB: 128 });
+    await writeFile(path.join(repository, "README.md"), "changed\n");
+    await service.stage(repository, ["README.md"]);
+    reset();
+    await service.unstage(repository, ["README.md"]);
+    reset();
+    const linked = await service.createWorktree({ projectId: "p", branch: "feature/outcome", name: "project-outcome" });
+    project.worktrees.push({ path: linked.path, isLinked: true, changedCount: 0 });
+    reset();
+    await service.removeWorktree({ projectId: "p", worktreePath: linked.path, confirmation: linked.path });
+    database.close();
+    database = createOutrightDatabase({ filename });
+    const actions = database.listAudit(30).map((entry) => entry.action);
+    for (const action of ["git.stage", "git.unstage", "git.worktree.created", "git.worktree.removed"]) {
+      assert.ok(actions.includes(action), `${action} was lost when the quota changed during its command`);
+    }
+  } finally {
+    database?.close();
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("an unaudited post-commit outcome reports a recoverable unknown operation", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-git-unknown-"));
+  const filename = path.join(root, "runtime.db");
+  let database;
+  try {
+    await git(root, ["init", "project"]);
+    const repository = await realpath(path.join(root, "project"));
+    await git(repository, ["config", "user.email", "outright@example.test"]);
+    await git(repository, ["config", "user.name", "Outright Test"]);
+    await git(repository, ["commit", "--allow-empty", "-m", "initial"]);
+    database = createOutrightDatabase({ filename });
+    const project = { id: "p", path: repository, worktrees: [{ path: repository, isLinked: false }] };
+    const service = createGitService({ database, getProjects: () => [project], getConfig: async () => ({ scanRoots: [root] }) });
+    await writeFile(path.join(repository, "README.md"), "effect\n");
+    await service.stage(repository, ["README.md"]);
+    const required = database.auditCritical.bind(database);
+    database.auditCritical = (action, details) => {
+      if (action === "git.commit") throw Object.assign(new Error("storage interrupted"), { code: "SQLITE_BUSY" });
+      return required(action, details);
+    };
+    await assert.rejects(service.commit(repository, "effect may have completed"), (error) =>
+      error.statusCode === 503 && error.details?.outcomeUnknown === true && Boolean(error.details.operationId));
+    assert.equal((await service.status(repository)).commits[0].subject, "effect may have completed");
+    database.close();
+    database = createOutrightDatabase({ filename });
+    const entries = database.listAudit(10).filter((entry) => entry.action.startsWith("git.commit"));
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].action, "git.commit.requested");
+    assert.ok(entries[0].details.operationId);
+  } finally {
+    database?.close();
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 

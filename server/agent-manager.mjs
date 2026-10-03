@@ -380,7 +380,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // authorization), so recovery always has an explicit safe continuation
     // instead of being permanently gated on a missing pid.
     database.updateRun(run.id, { status: "launching", startedAt });
-    database.audit("agent.run.started", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath, approvalPolicy: run.approvalPolicy });
+    database.auditCritical("agent.run.started", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath, approvalPolicy: run.approvalPolicy });
     emit(run.id, "run.started", { provider: run.provider, model: run.model, startedAt, command: launch.display ?? command.display });
 
     const child = spawnProcess(launch.executable, launch.args, {
