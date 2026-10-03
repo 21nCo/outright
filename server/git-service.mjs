@@ -45,6 +45,7 @@ export function createGitService({ database, getProjects, getConfig }) {
   async function stage(worktreePath, files) {
     const cwd = await requireWorktree(worktreePath);
     const validated = await validateFiles(cwd, files);
+    database.auditAdmission("git.stage.requested", { target: cwd, files: validated });
     await git(cwd, ["add", "--", ...validated]);
     database.audit("git.stage", { target: cwd, files: validated });
     return status(cwd);
@@ -53,6 +54,7 @@ export function createGitService({ database, getProjects, getConfig }) {
   async function unstage(worktreePath, files) {
     const cwd = await requireWorktree(worktreePath);
     const validated = await validateFiles(cwd, files);
+    database.auditAdmission("git.unstage.requested", { target: cwd, files: validated });
     try { await git(cwd, ["restore", "--staged", "--", ...validated]); }
     catch { await git(cwd, ["rm", "--cached", "--", ...validated]); }
     database.audit("git.unstage", { target: cwd, files: validated });
@@ -62,6 +64,7 @@ export function createGitService({ database, getProjects, getConfig }) {
   async function commit(worktreePath, message) {
     const cwd = await requireWorktree(worktreePath);
     if (!message?.trim()) throw httpError(400, "Commit message is required");
+    database.auditAdmission("git.commit.requested", { target: cwd, message: message.trim() });
     const output = await git(cwd, ["commit", "-m", message.trim()], { maxBuffer: 8 * 1024 * 1024 });
     database.audit("git.commit", { target: cwd, message: message.trim() });
     return { output, status: await status(cwd) };
@@ -77,6 +80,7 @@ export function createGitService({ database, getProjects, getConfig }) {
     const destination = path.resolve(path.dirname(project.path), directoryName);
     await requireScanRoot(destination);
     if (await exists(destination)) throw httpError(409, "Destination already exists");
+    database.auditAdmission("git.worktree.create.requested", { target: destination, projectId, branch, baseBranch });
     await git(root, ["worktree", "add", "-b", branch, destination, baseBranch]);
     database.audit("git.worktree.created", { target: destination, projectId, branch, baseBranch });
     return { path: destination, branch };
@@ -92,6 +96,7 @@ export function createGitService({ database, getProjects, getConfig }) {
     if (database.findUnresolvedInterruptedRunForWorktree?.(worktreePath)) {
       throw httpError(409, "Resolve the interrupted run before removing this worktree");
     }
+    database.auditAdmission("git.worktree.remove.requested", { target: worktreePath, projectId });
     await git(project.path, ["worktree", "remove", worktreePath]);
     database.audit("git.worktree.removed", { target: worktreePath, projectId });
     return { removed: true };
@@ -108,6 +113,7 @@ export function createGitService({ database, getProjects, getConfig }) {
       finder: ["open", ["-R", target]],
     };
     const [executable, args] = commands[configured] ?? commands.zed;
+    database.auditAdmission("editor.open.requested", { target, editor: configured });
     const child = execFile(executable, args, { windowsHide: true }, () => {});
     child.unref?.();
     database.audit("editor.open", { target, editor: configured });

@@ -408,7 +408,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           if (body.confirmation !== interrupted.id) throw apiError(400, "Exact run id confirmation is required for unverifiable legacy cleanup", { code: "RECOVERY_CONFIRMATION_REQUIRED", runId: interrupted.id });
           const resolved = database.resolveInterruptedRun(interrupted.id, policy);
           if (!resolved) throw apiError(409, "Run is not waiting for a recovery decision");
-          database.audit("agent.run.recovery.discard-unverifiable", { target: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
           publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: resolved });
           return json(response, 200, resolved);
         }
@@ -492,7 +491,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (policy === "discard") {
           const resolved = database.resolveInterruptedRun(interrupted.id, policy);
           if (!resolved) throw apiError(409, "Run is not waiting for a recovery decision");
-          database.audit("agent.run.recovery.discard", { target: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
           publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: resolved });
           return json(response, 200, resolved);
         }
@@ -542,7 +540,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         }
         const recovery = database.beginInterruptedRunRecovery(interrupted.id, policy, { providerSessionId: sessionId });
         if (!recovery) throw apiError(409, "Run is not waiting for a recovery decision");
-        database.audit(`agent.run.recovery.${policy}`, { target: recovery.run.id, recoveredFrom: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
         publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: recovery.interrupted });
         return json(response, 202, await agents.schedule({
           conversation: recovery.conversation,
@@ -556,7 +553,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const body = await readJson(request);
         const project = (await projects()).projects.find((item) => item.id === body.projectId && item.path === body.projectPath);
         if (!project || body.confirmation !== project.path) throw apiError(400, "Exact project path confirmation is required");
-        database.trustProject(project.id, project.path); database.audit("project.trusted", { target: project.id, path: project.path });
+        database.trustProject(project.id, project.path);
         return json(response, 200, { trusted: true, projectId: project.id });
       }
       if (url.pathname === "/api/trust" && request.method === "DELETE") {

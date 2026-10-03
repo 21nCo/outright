@@ -499,7 +499,7 @@ test("concurrent HTTP submissions admit only the configured queue budget", { ski
   assert.equal(runtime.database.messageCount(conversation.id), 3, "rejected submissions leave no message");
 }));
 
-test("capacity-reclaim deletion routes wake queued work after restoring launch room", async () => {
+test("capacity-reclaim deletion routes recheck queued work against actual audited headroom", async () => {
   for (const kind of ["group", "membership", "template", "trust"]) {
     await withRuntime(async (runtime) => {
       const database = runtime.database;
@@ -534,7 +534,9 @@ test("capacity-reclaim deletion routes wake queued work after restoring launch r
       const response = responseCapture();
       await runtime.handleRequest(requestStream(method, url, body), response);
       assert.ok([200, 204].includes(response.statusCode), `${kind} deletion succeeded`);
-      assert.equal(database.canLaunchRun(), true, `${kind} deletion restored launch room`);
+      // Revoking trust now commits its own audit row. That row can cost more
+      // bytes than the removed trust record at this exact boundary.
+      assert.equal(database.canLaunchRun(), kind !== "trust", `${kind} deletion reported incorrect launch room`);
       assert.equal(wakeups, 1, `${kind} deletion woke deferred work`);
       assert.equal(database.getRun(queued.id).status, "queued");
     })();

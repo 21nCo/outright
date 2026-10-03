@@ -124,14 +124,32 @@ test("a rejected queued cancellation remains retryable after maintenance", async
   const run = database.createRun({ ...codexRun("maintenance-queued"), status: "queued" });
   const manager = createAgentManager({ database, publish: () => {} });
   await manager.schedule({ conversation: database.getConversation("conv-1"), run });
-  const updateRun = database.updateRun;
-  database.updateRun = () => { throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 }); };
+  const finishRun = database.finishRun;
+  database.finishRun = () => { throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 }); };
   await assert.rejects(manager.stop(run.id), (error) => error.statusCode === 503);
   assert.equal(database.getRun(run.id).status, "queued");
-  database.updateRun = updateRun;
+  database.finishRun = finishRun;
   assert.equal(await manager.stop(run.id), true);
   assert.equal(database.getRun(run.id).status, "stopped");
   await manager.shutdown();
+});
+
+test("audit quota refusal defers an authorized queued run before spawning", async () => {
+  const database = fakeDatabase();
+  const run = database.createRun({ ...codexRun("audit-quota"), status: "queued" });
+  let spawned = 0;
+  database.auditAdmission = () => { throw Object.assign(new Error("Retained history is full"), { statusCode: 507 }); };
+  const manager = createAgentManager({ database, publish: () => {},
+    launchCommand: () => ({ executable: process.execPath, args: [], display: "test" }),
+    spawnProcess: () => { spawned += 1; return fakeChild(); },
+  });
+  try {
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+    assert.equal(spawned, 0);
+    assert.equal(database.getRun(run.id).status, "queued");
+    assert.equal(await manager.stop(run.id), true);
+    assert.equal(database.getRun(run.id).status, "stopped");
+  } finally { await manager.shutdown(); }
 });
 
 test("a prearmed disk retry and queue resume cannot drain a closed maintenance database", async () => {
@@ -140,7 +158,7 @@ test("a prearmed disk retry and queue resume cannot drain a closed maintenance d
   let admissible = false;
   let settingsReadsDuringMaintenance = 0;
   const getSettings = database.getSettings;
-  const updateRun = database.updateRun;
+  const finishRun = database.finishRun;
   database.getSettings = () => {
     if (!readable) {
       settingsReadsDuringMaintenance += 1;
@@ -150,9 +168,9 @@ test("a prearmed disk retry and queue resume cannot drain a closed maintenance d
   };
   database.canLaunchRun = () => admissible;
   database.capacity = () => ({ diskUsageStatus: "unknown" });
-  database.updateRun = (id, patch) => {
+  database.finishRun = (id, patch) => {
     if (!readable) throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 });
-    return updateRun(id, patch);
+    return finishRun(id, patch);
   };
   const manager = createAgentManager({ database, publish: () => {} });
   try {
@@ -461,6 +479,7 @@ function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/
       return { event, message };
     },
     audit: () => {},
+    auditAdmission: () => {},
   };
 }
 
@@ -2174,6 +2193,7 @@ const database = {
   finishRun: (id, patch) => { runs.set(id, { ...runs.get(id), ...patch }); return { run: runs.get(id) }; },
   appendRunEvent: () => ({}),
   audit: () => {},
+  auditAdmission: () => {},
 };
 const children = new Map();
 const agent = manager.createAgentManager({

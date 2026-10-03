@@ -10,6 +10,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = pty.s
     if ([...terminals.values()].filter((terminal) => terminal.cwd === cwd).length >= maxTerminalsPerCwd) throw terminalError(429, `At most ${maxTerminalsPerCwd} terminals can run for one worktree`);
     const id = randomUUID();
     const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/zsh");
+    database.auditAdmission("terminal.create.requested", { target: id, cwd, shell });
     const processInstance = spawnTerminal(shell, [], {
       name: "xterm-256color",
       cols: clamp(cols, 20, 400),
@@ -31,7 +32,11 @@ export function createTerminalManager({ publish, database, spawnTerminal = pty.s
       terminal.status = "exited";
       terminal.exitCode = exitCode;
       publish({ type: "terminal.exit", terminalId: id, payload: { exitCode, signal } });
-      database.audit("terminal.exited", { target: id, exitCode, signal });
+      // A process can exit without an API request. Keep its audit independent
+      // of the PTY callback and retry while offline maintenance holds SQLite.
+      void database.auditRequired("terminal.exited", { target: id, exitCode, signal }).catch((error) => {
+        publish({ type: "terminal.audit-failed", terminalId: id, payload: { error: error.message } });
+      });
       terminal.cleanupTimer = setTimeout(() => terminals.delete(id), exitedRetentionMs);
       terminal.cleanupTimer.unref?.();
     });
@@ -42,16 +47,19 @@ export function createTerminalManager({ publish, database, spawnTerminal = pty.s
   function get(id) { const terminal = terminals.get(id); return terminal ? { ...publicTerminal(terminal), buffer: terminal.buffer, outputCursor: terminal.outputCursor } : null; }
   function write(id, data) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running" || typeof data !== "string" || Buffer.byteLength(data) > 64 * 1024) return false; terminal.process.write(data); return true; }
   function resize(id, cols, rows) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running") return false; terminal.process.resize(clamp(cols, 20, 400), clamp(rows, 5, 200)); return true; }
-  function close(id) {
+  function close(id, audit = true) {
     const terminal = terminals.get(id);
     if (!terminal) return false;
+    if (audit) database.auditCritical("terminal.close.requested", { target: id, cwd: terminal.cwd });
     clearTimeout(terminal.cleanupTimer);
     terminals.delete(id);
     if (terminal.status === "running") terminal.process.kill();
     database.audit("terminal.closed", { target: id, cwd: terminal.cwd });
     return true;
   }
-  function shutdown() { for (const id of terminals.keys()) close(id); }
+  // Runtime shutdown must reap PTYs even if storage is closed for archive
+  // maintenance. User-requested closes still require a committed audit first.
+  function shutdown() { for (const id of terminals.keys()) close(id, false); }
 
   function pruneExitedForCapacity(cwd) {
     while (terminals.size >= maxTerminals) {

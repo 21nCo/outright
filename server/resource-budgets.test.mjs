@@ -945,6 +945,44 @@ test("audit history bounds both an entry and the requested page", () => {
   } finally { database.close(); }
 });
 
+test("quota refusal cannot silently authorize trust, while terminal run and recovery audits survive restart", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-audit-quota-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const conversation = chat(database);
+    const finished = database.createRun(runInput(conversation.id));
+    const interrupted = database.createRun(runInput(conversation.id));
+    const retry = database.createRun(runInput(conversation.id));
+    database.trustProject("existing", "/tmp/existing");
+    database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(65 * 1024 * 1024) });
+    database.updateSettings({ maxRetainedMiB: 64 });
+    assert.equal(database.audit("optional.telemetry", { target: "quota" }), false);
+    assert.throws(() => database.auditAdmission("git.commit.requested", { target: "/tmp/project" }), (error) => error.statusCode === 507);
+    assert.throws(() => database.trustProject("refused", "/tmp/refused"), (error) => error.statusCode === 507);
+    assert.equal(database.isProjectTrusted("refused", "/tmp/refused"), false);
+    database.untrustProject("existing");
+    database.finishRun(finished.id, { status: "completed", finishedAt: new Date().toISOString() });
+    database.updateRun(interrupted.id, { status: "interrupted", recoveryClass: "exited" });
+    database.updateRun(retry.id, { status: "interrupted", recoveryClass: "exited" });
+    assert.equal(database.resolveInterruptedRun(interrupted.id, "discard").status, "failed");
+    assert.throws(() => database.beginInterruptedRunRecovery(retry.id, "retry"), (error) => error.statusCode === 507);
+    assert.equal(database.getRun(retry.id).recoveryDecision, null, "quota refusal consumed a retry decision");
+    assert.equal(database.resolveInterruptedRun(interrupted.id, "discard"), null);
+    database.close();
+    database = createOutrightDatabase({ filename });
+    const entries = database.listAudit(30);
+    const actions = entries.map((entry) => entry.action);
+    assert.ok(actions.includes("agent.run.completed"));
+    assert.ok(actions.includes("agent.run.recovery.discard"));
+    assert.equal(entries.filter((entry) => entry.action === "agent.run.recovery.discard" && entry.target === interrupted.id).length, 1);
+    assert.ok(!actions.includes("agent.run.recovery.retry"));
+    assert.ok(actions.includes("project.untrusted"));
+    assert.ok(!entries.some((entry) => entry.action === "project.trusted" && entry.target === "refused"));
+    assert.ok(!actions.includes("git.commit.requested"));
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("legacy pinned schema and migration audit survive cleanup and restart", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-legacy-retention-"));
   const filename = path.join(directory, "outright.db");

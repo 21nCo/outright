@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createTerminalManager } from "./terminal-manager.mjs";
+import { createOutrightDatabase } from "./database.mjs";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 test("creates a PTY, accepts input, and retains reconnectable output", async () => {
   const events = [];
-  const manager = createTerminalManager({ publish: (event) => events.push(event), database: { audit() {} } });
+  const manager = createTerminalManager({ publish: (event) => events.push(event), database: { audit() {}, auditAdmission() {}, auditCritical() {}, auditRequired: async () => {} } });
   const terminal = manager.create({ cwd: process.cwd(), name: "Test terminal" });
   try {
     // Match the manager's configured shell and avoid matching echoed input.
@@ -28,7 +32,7 @@ test("enforces terminal limits, input bounds, and suppresses close-after-exit ev
   const processes = [];
   const manager = createTerminalManager({
     publish: (event) => events.push(event),
-    database: { audit() {} },
+    database: { audit() {}, auditAdmission() {}, auditCritical() {}, auditRequired: async () => {} },
     maxTerminals: 2,
     maxTerminalsPerCwd: 1,
     spawnTerminal: () => {
@@ -59,7 +63,7 @@ test("terminal buffer snapshot carries the output cursor for lossless activation
   const events = [];
   let onData;
   const manager = createTerminalManager({
-    publish: (event) => events.push(event), database: { audit() {} },
+    publish: (event) => events.push(event), database: { audit() {}, auditAdmission() {}, auditCritical() {}, auditRequired: async () => {} },
     spawnTerminal: () => ({ pid: 1, onData(callback) { onData = callback; }, onExit() {}, kill() {} }),
   });
   const { id } = manager.create({ cwd: process.cwd() });
@@ -71,6 +75,37 @@ test("terminal buffer snapshot carries the output cursor for lossless activation
   assert.deepEqual(events.map(({ payload }) => payload.cursor), [1, 2]);
   assert.equal(manager.get(id).outputCursor, 2);
   manager.shutdown();
+});
+
+test("a full audit budget refuses PTY creation and a natural exit is retained across restart", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-audit-"));
+  const filename = path.join(directory, "runtime.db");
+  let database = createOutrightDatabase({ filename });
+  let spawns = 0;
+  let onExit;
+  const manager = createTerminalManager({ database, publish: () => {}, spawnTerminal: () => {
+    spawns += 1;
+    return { pid: spawns, onData() {}, onExit(callback) { onExit = callback; }, kill() {} };
+  } });
+  try {
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "quota", provider: "codex" });
+    database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(65 * 1024 * 1024) });
+    database.updateSettings({ maxRetainedMiB: 64 });
+    assert.throws(() => manager.create({ cwd: "/tmp/w" }), (error) => error.statusCode === 507);
+    assert.equal(spawns, 0);
+    database.updateSettings({ maxRetainedMiB: 128 });
+    const terminal = manager.create({ cwd: "/tmp/w" });
+    database.updateSettings({ maxRetainedMiB: 64 });
+    onExit({ exitCode: 7, signal: 0 });
+    await waitFor(() => database.listAudit(10).some((entry) => entry.action === "terminal.exited" && entry.target === terminal.id));
+    assert.equal(manager.close(terminal.id), true);
+    database.close();
+    database = createOutrightDatabase({ filename });
+    const actions = database.listAudit(10).filter((entry) => entry.target === terminal.id).map((entry) => entry.action);
+    assert.ok(actions.includes("terminal.create.requested"));
+    assert.ok(actions.includes("terminal.exited"));
+    assert.ok(actions.includes("terminal.close.requested"));
+  } finally { manager.shutdown(); database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
 async function waitFor(predicate, timeout = 3000, diagnostic = () => "") {

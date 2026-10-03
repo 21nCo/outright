@@ -366,6 +366,12 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // Validation and capability setup can yield while a sibling spends the
     // remaining retained budget. Defer before the durable launch transition.
     if (database.canLaunchRun?.() === false) return "deferred";
+    try {
+      database.auditAdmission("agent.run.start.requested", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath });
+    } catch (error) {
+      if (error.statusCode === 507 || (error.statusCode === 503 && database.maintenanceActive)) return "deferred";
+      throw error;
+    }
     const startedAt = new Date().toISOString();
     // Crash-safe launch handshake, phase 1: this durable marker means "a spawn
     // may have been issued, but the provider was never authorized to run". A
@@ -573,7 +579,6 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if (finished.message) publish({ type: "message.created", conversationId: state.conversation.id, payload: finished.message });
     active.delete(state.run.id);
     clearAssistant(state);
-    database.audit(`agent.run.${status}`, { target: state.run.id, exitCode, error: message || undefined });
     emit(state.run.id, `run.${status}`, { exitCode, error: message || null, finishedAt });
     drain();
     return true;
@@ -584,7 +589,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if (!state) {
       const index = queue.findIndex((entry) => entry.run.id === runId);
       if (index < 0) return false;
-      try { database.updateRun(runId, { status: "stopped", finishedAt: new Date().toISOString() }); }
+      try { database.finishRun(runId, { status: "stopped", finishedAt: new Date().toISOString() }); }
       catch (error) {
         // During archive cutover the database is closed. Shutdown can leave
         // this never-started row for the successor to reconcile, but an API

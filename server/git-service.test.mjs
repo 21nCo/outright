@@ -6,6 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { createGitService } from "./git-service.mjs";
+import { createOutrightDatabase } from "./database.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -25,7 +26,7 @@ test("reviews, stages, commits, creates, and safely removes discovered worktrees
     await git(repository, ["commit", "-m", "initial"]);
 
     let interruptedRun = null;
-    const service = createGitService({ database: { audit: (action, details) => audit.push({ action, details }), getSettings: () => ({ editor: "zed" }), findUnresolvedInterruptedRunForWorktree: () => interruptedRun }, getProjects: () => projects, getConfig: async () => ({ scanRoots: [canonicalScanRoot] }) });
+    const service = createGitService({ database: { audit: (action, details) => audit.push({ action, details }), auditAdmission: (action, details) => audit.push({ action, details }), getSettings: () => ({ editor: "zed" }), findUnresolvedInterruptedRunForWorktree: () => interruptedRun }, getProjects: () => projects, getConfig: async () => ({ scanRoots: [canonicalScanRoot] }) });
     await writeFile(path.join(repository, "README.md"), "first\nsecond\n");
     assert.equal((await service.status(repository)).unstagedCount, 1);
     assert.match((await service.diff(repository, "README.md")).diff, /\+second/);
@@ -63,7 +64,7 @@ test("parses portable filenames and supported quote characters from NUL porcelai
     const projects = [{ id: "project", name: "project", path: repository, worktrees: [{ id: "main", path: repository, isLinked: false, changedCount: 0 }] }];
     await git(repository, ["config", "user.email", "outright@example.test"]);
     await git(repository, ["config", "user.name", "Outright Test"]);
-    const service = createGitService({ database: { audit: () => {}, getSettings: () => ({ editor: "zed" }) }, getProjects: () => projects, getConfig: async () => ({ scanRoots: [canonicalScanRoot] }) });
+    const service = createGitService({ database: { audit: () => {}, auditAdmission: () => {}, getSettings: () => ({ editor: "zed" }) }, getProjects: () => projects, getConfig: async () => ({ scanRoots: [canonicalScanRoot] }) });
 
     await writeFile(path.join(repository, "hello world.txt"), "hello\n");
     let status = await service.status(repository);
@@ -89,6 +90,52 @@ test("parses portable filenames and supported quote characters from NUL porcelai
     }
   } finally {
     await rm(scanRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("Git mutations refuse before changing the repository when audit admission is out of quota", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-git-audit-"));
+  let database;
+  try {
+    await git(root, ["init", "project"]);
+    const canonicalRoot = await realpath(root);
+    const repository = await realpath(path.join(root, "project"));
+    await git(repository, ["config", "user.email", "outright@example.test"]);
+    await git(repository, ["config", "user.name", "Outright Test"]);
+    await writeFile(path.join(repository, "README.md"), "initial\n");
+    await git(repository, ["add", "README.md"]);
+    await git(repository, ["commit", "-m", "initial"]);
+    await writeFile(path.join(repository, "README.md"), "changed\n");
+    database = createOutrightDatabase({ filename: path.join(root, "runtime.db") });
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: repository, title: "quota", provider: "codex" });
+    database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(65 * 1024 * 1024) });
+    database.updateSettings({ maxRetainedMiB: 64 });
+    const project = { id: "p", name: "project", path: repository, worktrees: [{ path: repository, isLinked: false }] };
+    const service = createGitService({ database, getProjects: () => [project], getConfig: async () => ({ scanRoots: [canonicalRoot] }) });
+    await assert.rejects(service.stage(repository, ["README.md"]), (error) => error.statusCode === 507);
+    assert.equal((await service.status(repository)).stagedCount, 0);
+    database.updateSettings({ maxRetainedMiB: 128 });
+    assert.equal((await service.stage(repository, ["README.md"])).stagedCount, 1);
+    const created = await service.createWorktree({ projectId: "p", branch: "feature/audit", name: "project-audit" });
+    project.worktrees.push({ path: created.path, isLinked: true, changedCount: 0 });
+    database.updateSettings({ maxRetainedMiB: 64 });
+    await assert.rejects(service.unstage(repository, ["README.md"]), (error) => error.statusCode === 507);
+    assert.equal((await service.status(repository)).stagedCount, 1);
+    await assert.rejects(service.commit(repository, "must not commit"), (error) => error.statusCode === 507);
+    assert.equal((await service.status(repository)).commits[0].subject, "initial");
+    await assert.rejects(service.createWorktree({ projectId: "p", branch: "feature/refused", name: "project-refused" }), (error) => error.statusCode === 507);
+    assert.equal(await exists(path.join(canonicalRoot, "project-refused")), false);
+    await assert.rejects(service.removeWorktree({ projectId: "p", worktreePath: created.path, confirmation: created.path }), (error) => error.statusCode === 507);
+    assert.equal(await exists(created.path), true);
+    database.close();
+    database = createOutrightDatabase({ filename: path.join(root, "runtime.db") });
+    const actions = database.listAudit(10).map((entry) => entry.action);
+    assert.equal(actions.filter((action) => action === "git.stage.requested").length, 1);
+    assert.ok(!actions.includes("git.commit.requested"));
+    assert.ok(!actions.includes("git.worktree.remove.requested"));
+  } finally {
+    database?.close();
+    await rm(root, { recursive: true, force: true });
   }
 });
 

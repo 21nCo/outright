@@ -292,6 +292,20 @@ export function createOutrightDatabase(options = {}) {
     }
   }
 
+  function writeAudit(action, details = {}) {
+    db.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
+      .run(action, String(details.target ?? "").slice(0, 512), serializePayload(details, 4 * 1024), now());
+    trimAudit(db);
+  }
+
+  function writeCriticalAudit(action, details = {}) {
+    db.transaction(() => {
+      reserveRecoveryHeadroom(db, undefined, true);
+      writeAudit(action, details);
+      reserveRecoveryHeadroom(db);
+    }).immediate();
+  }
+
   const api = {
     filename,
     launchDirectory,
@@ -1179,6 +1193,7 @@ export function createOutrightDatabase(options = {}) {
         const result = db.prepare("UPDATE runs SET recovery_decision = ?, status = ?, error = ?, finished_at = ? WHERE id = ? AND status = 'interrupted' AND recovery_decision IS NULL")
           .run(decision, status, error, stamp, id);
         if (!result.changes) return false;
+        writeCriticalAudit(`agent.run.recovery.${decision}`, { target: id, conversationId: run.conversationId, recoveryClass: run.recoveryClass });
         return true;
       });
       if (!resolve.immediate()) return null;
@@ -1210,6 +1225,7 @@ export function createOutrightDatabase(options = {}) {
           prompt: interrupted.prompt,
           providerSessionId: decision === "resume-session" ? providerSessionId : null,
         });
+        writeCriticalAudit(`agent.run.recovery.${decision}`, { target: run.id, recoveredFrom: id, conversationId: interrupted.conversationId, recoveryClass: interrupted.recoveryClass });
         return { interrupted: this.getRun(id), run, conversation: this.getConversation(interrupted.conversationId) };
       });
       return recover.immediate();
@@ -1242,6 +1258,7 @@ export function createOutrightDatabase(options = {}) {
         // The terminal state and the evidence of its omitted final checkpoint
         // must survive the same commit, including a crash immediately after it.
         const run = this.updateRun(id, message || !transcriptMessage ? patch : { ...patch, transcriptOmitted: true });
+        writeCriticalAudit(`agent.run.${patch.status}`, { target: id, exitCode: patch.exitCode, error: patch.error || undefined });
         return { run, message };
       });
       return finish.immediate();
@@ -1296,50 +1313,53 @@ export function createOutrightDatabase(options = {}) {
         .all(runId, cursor).map(hydratePayload);
     },
     trustProject(projectId, projectPath) {
-      withinRetainedBudget(() => db.prepare("INSERT INTO trusted_projects (project_id, project_path, trusted_at) VALUES (?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET project_path = excluded.project_path, trusted_at = excluded.trusted_at")
-        .run(projectId, projectPath, now()));
+      withinRetainedBudget(() => {
+        db.prepare("INSERT INTO trusted_projects (project_id, project_path, trusted_at) VALUES (?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET project_path = excluded.project_path, trusted_at = excluded.trusted_at")
+          .run(projectId, projectPath, now());
+        writeAudit("project.trusted", { target: projectId, path: projectPath });
+      });
     },
-    untrustProject(projectId) { db.prepare("DELETE FROM trusted_projects WHERE project_id = ?").run(projectId); },
+    untrustProject(projectId) { db.transaction(() => {
+      const result = db.prepare("DELETE FROM trusted_projects WHERE project_id = ?").run(projectId);
+      if (result.changes) writeCriticalAudit("project.untrusted", { target: projectId });
+    }).immediate(); },
     isProjectTrusted(projectId, projectPath) {
       const row = db.prepare("SELECT project_path FROM trusted_projects WHERE project_id = ?").get(projectId);
       return row?.project_path === projectPath;
     },
     listTrustedProjects() { return db.prepare("SELECT project_id AS projectId, project_path AS projectPath, trusted_at AS trustedAt FROM trusted_projects ORDER BY trusted_at DESC").all(); },
     audit(action, details = {}) {
-      const writeAudit = () => {
-        db.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)").run(action, String(details.target ?? "").slice(0, 512), serializePayload(details, 4 * 1024), now());
-        trimAudit(db);
-      };
       try {
         // Migration pauses optional history, but reconciliation and deletion
         // still need audit evidence. Triggers account for writes before or
         // after each retained scan cursor without double counting.
         if (migrationPending(db)) db.transaction(() => {
           reserveRecoveryHeadroom(db, undefined, true);
-          writeAudit();
+          writeAudit(action, details);
           reserveRecoveryHeadroom(db);
         }).immediate();
-        else withinRetainedBudget(writeAudit);
+        else withinRetainedBudget(() => writeAudit(action, details));
         return true;
       } catch (error) {
-        // Audit telemetry must not turn a terminal exit or completed Git
-        // operation into an uncaught callback error while archive cleanup
-        // holds the writer. The deletion audit itself runs after that worker.
+        // Optional telemetry can be dropped at quota or during archive
+        // cleanup. Material actions use auditAdmission or a critical audit.
         if (error.statusCode !== 507 && !(deletionWorkers.size && ["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code))) throw error;
         return false;
       }
     },
+    // Admission records are committed before an external side effect. They
+    // spend ordinary retained capacity and can refuse work at the quota edge.
+    auditAdmission(action, details = {}) {
+      withinRetainedBudget(() => writeAudit(action, details));
+    },
+    auditCritical(action, details = {}) {
+      writeCriticalAudit(action, details);
+    },
     async auditRequired(action, details = {}) {
       while (true) {
-        if (closing) throw databaseError(503, "Runtime closed before cleanup audit could be recorded");
+        if (closing) throw databaseError(503, "Runtime closed before required audit could be recorded");
         try {
-          db.transaction(() => {
-            reserveRecoveryHeadroom(db, undefined, true);
-            db.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
-              .run(action, String(details.target ?? "").slice(0, 512), serializePayload(details, 4 * 1024), now());
-            trimAudit(db);
-            reserveRecoveryHeadroom(db);
-          }).immediate();
+          writeCriticalAudit(action, details);
           return;
         } catch (error) {
           if (!deletionWorkers.size || !["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code)) throw error;
