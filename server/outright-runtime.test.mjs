@@ -105,6 +105,30 @@ test("runtime startup settles an orphan PTY before serving requests", withRuntim
   finally { database.close(); }
 } }));
 
+test("runtime startup preserves terminal ownership evidence across run reconciliation", withRuntime(async (runtime) => {
+  const target = "379634b7-8989-47c5-9174-c09529b206a1";
+  const marker = path.join(runtime.database.launchDirectory, `terminal-${target}.json`);
+  assert.equal(existsSync(marker), true, "run-handshake sweeping must not erase the terminal owner's marker");
+  assert.equal(runtime.database.terminalUnknownReservations().some((entry) => entry.target === target), true);
+  assert.equal(runtime.database.listAudit(20).some((entry) => entry.action === "terminal.recovered" && entry.target === target), false);
+  if (process.platform === "linux") {
+    // The marker has no matching live process identity. Native recovery must
+    // keep the reservation and audit pending instead of trusting a dead PID.
+    assert.equal(await runtime.terminals.reconcileUnknown(), 0);
+    assert.equal(runtime.terminals.capacity().active, 1);
+    assert.equal(runtime.database.listAudit(20).some((entry) => entry.action === "terminal.recovered" && entry.target === target), false);
+  }
+}, { seed(dataDirectory) {
+  const database = createOutrightDatabase({ filename: path.join(dataDirectory, "outright.db") });
+  try {
+    const target = "379634b7-8989-47c5-9174-c09529b206a1";
+    database.auditCritical("terminal.created", { target, cwd: "/tmp",
+      ownershipLabel: `com.21n.outright.terminal.${target}` });
+    writeFileSync(path.join(database.launchDirectory, `terminal-${target}.json`),
+      JSON.stringify({ pid: 4242, processIdentity: "linux:owned-terminal" }));
+  } finally { database.close(); }
+} }));
+
 test("shutdown during archive cutover preserves a rejected queued cancellation and releases the runtime lease", async () => {
   const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-cutover-shutdown-"));
   const previousDataDir = process.env.OUTRIGHT_DATA_DIR;

@@ -3,6 +3,7 @@ import test from "node:test";
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { createOutrightDatabase } from "./database.mjs";
+import { createOutrightRuntime } from "./outright-runtime.mjs";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import os from "node:os";
@@ -347,35 +348,43 @@ test("hard runtime exit leaves a detached child owned until restart can reconcil
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-pty-crash-recovery-"));
   const filename = path.join(directory, "runtime.db");
   const pidFile = path.join(directory, "background.pid");
+  const idFile = path.join(directory, "terminal.id");
   const source = `import {createOutrightDatabase} from ${JSON.stringify(new URL("./database.mjs", import.meta.url).href)};
     import {createTerminalManager} from ${JSON.stringify(new URL("./terminal-manager.mjs", import.meta.url).href)};
-    import {existsSync} from 'node:fs';
+    import {existsSync,writeFileSync} from 'node:fs';
     const db=createOutrightDatabase({filename:${JSON.stringify(filename)},runtimeLease:true});
     const manager=createTerminalManager({database:db,publish:()=>{}});
     const terminal=await manager.create({cwd:${JSON.stringify(directory)}});
+    writeFileSync(${JSON.stringify(idFile)},terminal.id);
     manager.write(terminal.id,${JSON.stringify(`nohup sleep 30 >/dev/null 2>&1 & echo $! > ${pidFile}; exit\r`)});
     for(let i=0;i<100&&!existsSync(${JSON.stringify(pidFile)});i++)await new Promise(r=>setTimeout(r,50));
     process.exit(existsSync(${JSON.stringify(pidFile)})?0:2);`;
   let backgroundPid;
-  let database;
+  let runtime;
   try {
     const crashed = spawnSync(process.execPath, ["--input-type=module", "-e", source], { timeout: 15_000, encoding: "utf8" });
     assert.equal(crashed.status, 0, crashed.stderr);
     backgroundPid = Number(readFileSync(pidFile, "utf8").trim());
-    database = createOutrightDatabase({ filename, runtimeLease: true });
-    assert.equal(database.reconcileTerminalAudit(), 1);
-    const manager = createTerminalManager({ database, publish: () => {}, maxTerminals: 1 });
-    assert.equal(manager.capacity().unknown, 1);
-    assert.equal(await manager.reconcileUnknown(), 1);
-    assert.equal(manager.capacity().active, 0);
+    const terminalId = readFileSync(idFile, "utf8");
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json",
+      databaseFactory: (options) => createOutrightDatabase({ ...options, filename }),
+      terminalManagerFactory: (options) => createTerminalManager({ ...options, maxTerminals: 1 }) });
+    if (process.platform === "linux") {
+      assert.equal(existsSync(path.join(runtime.database.launchDirectory, `terminal-${terminalId}.json`)), true,
+        "runtime startup must preserve the native terminal marker before owner proof");
+    }
+    assert.equal(runtime.database.listAudit(20).some((entry) => entry.action === "terminal.unknown" && entry.target === terminalId), true);
+    assert.equal(runtime.terminals.capacity().unknown, 1);
+    assert.equal(await runtime.terminals.reconcileUnknown(), 1);
+    assert.equal(runtime.terminals.capacity().active, 0);
     await waitFor(() => {
       const state = spawnSync("ps", ["-o", "stat=", "-p", String(backgroundPid)], { encoding: "utf8" }).stdout.trim();
       return !state || state.startsWith("Z");
     }, 5000);
-    assert.equal(database.listAudit(20).some((entry) => entry.action === "terminal.recovered"), true);
+    assert.equal(runtime.database.listAudit(20).some((entry) => entry.action === "terminal.recovered" && entry.target === terminalId), true);
   } finally {
     if (backgroundPid) try { process.kill(backgroundPid, "SIGKILL"); } catch {}
-    database?.close();
+    await runtime?.shutdown();
     rmSync(directory, { recursive: true, force: true });
   }
 });

@@ -1160,7 +1160,11 @@ test("reconciliation sweeps stale handshake records but keeps live-wrapper recor
     record(running.id, 222, { ownershipToken: "00000000-0000-4000-8000-000000000001", platformOwnershipId: "com.21n.outright.00000000-0000-4000-8000-000000000001" });
     record(exited.id, 555);
     record(finished.id, 333);
-    record("run-that-never-existed", 444);
+    const staleRun = "b0ed4709-3bd6-4eac-9ab4-f9365a82a7e1";
+    const terminalId = "379634b7-8989-47c5-9174-c09529b206a1";
+    const terminalMarker = path.join(launchDirectory, `terminal-${terminalId}.json`);
+    record(staleRun, 444);
+    writeFileSync(terminalMarker, JSON.stringify({ pid: 444, processIdentity: "owned-terminal" }));
 
     let runningHandshake;
     database.reconcileInterruptedRuns({ probeAlive: (pid, handshake) => {
@@ -1173,7 +1177,8 @@ test("reconciliation sweeps stale handshake records but keeps live-wrapper recor
     assert.equal(runningHandshake.platformOwnershipId, "com.21n.outright.00000000-0000-4000-8000-000000000001", "restart probing receives the durable platform owner, not only its possibly-dead wrapper pid");
     assert.equal(existsSync(path.join(launchDirectory, `${exited.id}.json`)), false, "an exited tree is proven gone, so its hard-killed wrapper's record is swept instead of leaking");
     assert.equal(existsSync(path.join(launchDirectory, `${finished.id}.json`)), false, "a terminal run's stale record is swept");
-    assert.equal(existsSync(path.join(launchDirectory, "run-that-never-existed.json")), false, "a record for an unknown run is swept");
+    assert.equal(existsSync(path.join(launchDirectory, `${staleRun}.json`)), false, "a record for an unknown run is swept");
+    assert.equal(existsSync(terminalMarker), true, "run cleanup preserves the terminal owner's recovery marker");
     database.reconcileInterruptedRuns();
     assert.equal(existsSync(path.join(launchDirectory, `${running.id}.json`)), true, "a second restart preserves unresolved ownership evidence");
     database.resolveInterruptedRun(running.id, "discard");

@@ -2419,7 +2419,11 @@ function sweepLaunchHandshakes(launchDirectory, db) {
   try {
     let entry;
     while ((entry = directory.readSync())) {
-      if (!entry.name.endsWith(".json")) continue;
+      // Run and terminal owners share this directory. Terminal markers are
+      // consumed by terminal recovery, which must verify the native owner
+      // before it can release capacity or settle the pending audit record.
+      // Only a run UUID is in this sweep's ownership namespace.
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i.test(entry.name)) continue;
       const runId = entry.name.slice(0, -".json".length);
       if (keep.get(runId)) continue;
       try { rmSync(path.join(launchDirectory, entry.name), { force: true }); } catch { /* Already gone. */ }
