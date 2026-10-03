@@ -1,0 +1,18 @@
+server/database.mjs
+  h_a39f9495f9ec1d 296,304-306,603-604,616-617,629-632
+server/resource-budgets.mjs
+  h_a39f9495f9ec1d 9
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 73,105-110,117-118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b6c6092b0fc0ff5bece53cfa903f8ee1b8c17c42",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
