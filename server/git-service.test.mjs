@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { access, chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { createGitService } from "./git-service.mjs";
+import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -16,6 +18,48 @@ process.env.GIT_TRACE2_EVENT = "0";
 function capacityError() {
   return Object.assign(new Error("Utility process capacity is full"), { statusCode: 429, code: "SUBPROCESS_CAPACITY" });
 }
+
+test("editor launch releases utility capacity when a GUI stays open and records spawn failure", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-editor-launch-"));
+  try {
+    const cwd = await realpath(root);
+    const actions = [];
+    const launched = [];
+    let failLaunch = false;
+    let holdLaunch = true;
+    const subprocesses = createSubprocessBudget({ limit: 1, launch: (file, args, options) => {
+      const child = new EventEmitter();
+      child.pid = 42 + launched.length;
+      child.unref = () => { child.unreferenced = true; };
+      launched.push({ file, args, options, child });
+      if (!holdLaunch) queueMicrotask(() => child.emit(failLaunch ? "error" : "spawn",
+        failLaunch ? Object.assign(new Error("missing editor"), { code: "ENOENT" }) : undefined));
+      return child;
+    } });
+    const service = createGitService({ database: {
+      getSettings: () => ({ editor: "code" }),
+      auditAdmission: (action) => actions.push(action),
+      auditCritical: (action) => actions.push(action),
+    }, getProjects: () => [{ worktrees: [{ path: cwd }] }], getConfig: async () => ({ scanRoots: [cwd] }), subprocesses });
+    const opening = service.openInEditor(cwd);
+    const deadline = Date.now() + 2_000;
+    while (!launched.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(launched.length, 1, "editor launcher never reached process admission");
+    assert.equal(subprocesses.capacity().active, 1);
+    await assert.rejects(service.openInEditor(cwd), (error) => error.code === "SUBPROCESS_CAPACITY");
+    launched[0].child.emit("spawn");
+    holdLaunch = false;
+    assert.deepEqual(await opening, { opened: true, editor: "code", target: cwd });
+    assert.equal(launched[0].child.unreferenced, true);
+    assert.equal(launched[0].options.stdio, "ignore");
+    assert.equal(subprocesses.capacity().active, 0, "an open editor retained the utility slot");
+    failLaunch = true;
+    await assert.rejects(service.openInEditor(cwd), (error) => error.code === "ENOENT");
+    assert.equal(subprocesses.capacity().active, 0);
+    assert.ok(actions.includes("editor.open") && actions.includes("editor.open.failed"));
+    assert.equal(launched.length, 2, "the live editor prevented another launch attempt");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test("unstage capacity refusal preserves a staged tracked modification", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "outright-unstage-capacity-"));

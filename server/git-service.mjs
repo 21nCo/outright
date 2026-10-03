@@ -131,9 +131,8 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
       finder: ["open", ["-R", target]],
     };
     const [executable, args] = commands[configured] ?? commands.zed;
-    await auditedMutation("editor.open.requested", "editor.open", { target, editor: configured }, () => {
-      return subprocesses.run(executable, args, { windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024 });
-    });
+    await auditedMutation("editor.open.requested", "editor.open", { target, editor: configured }, () =>
+      subprocesses.launchDetached(executable, args, { windowsHide: true }));
     return { opened: true, editor: configured, target };
   }
 
