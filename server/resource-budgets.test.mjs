@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHook } from "node:async_hooks";
 import test from "node:test";
 import Database from "better-sqlite3";
-import { appendFileSync, existsSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createOutrightDatabase, recoverArchiveBeforeStartup } from "./database.mjs";
@@ -69,6 +69,37 @@ function ageArchived(filename, ids) {
   for (const id of ids) admin.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?").run(old, id);
   admin.close();
 }
+
+test("missing SQLite pathname refuses optional retained rows and new queue work", { skip: process.platform === "win32" }, () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-unknown-disk-"));
+  const filename = path.join(directory, "outright.db");
+  const database = createOutrightDatabase({ filename });
+  try {
+    const conversation = chat(database, "active");
+    const run = database.createRun(runInput(conversation.id));
+    database.updateRun(run.id, { status: "interrupted" });
+    unlinkSync(filename);
+    assert.equal(database.capacity().diskUsageStatus, "unknown");
+    assert.equal(database.capacity().diskAllocatedBytes, null);
+    assert.equal(database.canLaunchRun(), false);
+    const refused = (error) => error.statusCode === 507;
+    assert.throws(() => chat(database, "refused"), refused);
+    assert.throws(() => database.createRun(runInput(conversation.id)), refused);
+    assert.throws(() => database.submitRun(runInput(conversation.id), "refused"), refused);
+    assert.throws(() => database.beginInterruptedRunRecovery(run.id, "retry"), refused);
+    assert.equal(database.getRun(run.id).recoveryDecision, null, "failed retry consumed the recovery decision");
+    assert.throws(() => database.addMessage({ conversationId: conversation.id, role: "assistant", body: "refused" }), refused);
+    assert.equal(database.appendRunEvent(run.id, "output", { text: "refused" }), null);
+    assert.throws(() => database.saveTemplate({ title: "refused", prompt: "refused" }), refused);
+    assert.throws(() => database.auditAdmission("git.commit.requested", { target: "refused" }), refused);
+    assert.equal(database.audit("optional", { target: "refused" }), false);
+    assert.equal(database.listRuns(conversation.id).length, 1, "refused submission left a queued run");
+    assert.equal(database.listMessages(conversation.id).length, 0);
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("a pinned SQLite reader cannot turn repeated checkpoints into unbounded physical admission", { timeout: 60_000 }, async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-physical-wal-"));

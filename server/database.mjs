@@ -293,19 +293,23 @@ export function createOutrightDatabase(options = {}) {
     }
     return usage;
   }
-  function withinRetainedBudget(write, reserve = retainedReserveBytes, allowPhysicalArchive = false) {
-    if (migrationPending(db)) throw databaseError(507, "Retained history is being migrated; retry when capacity is available");
+  function requireOptionalPhysicalCapacity(allowPhysicalArchive = false) {
     // WAL pages can grow under an external reader even while a checkpoint
-    // upsert keeps the logical retained count flat. Stop optional writes at
-    // the physical threshold; terminal and recovery evidence use their own
-    // required paths and the reserved physical headroom.
-    const maxRetainedBytes = configuredRetainedLimitBytes();
-    const allocated = physicalUsageForAdmission(maxRetainedBytes * RESOURCE_BUDGETS.physicalDatabaseMultiplier);
-    const physicalThreshold = maxRetainedBytes * RESOURCE_BUDGETS.physicalDatabaseMultiplier;
-    if (allocated.bytes !== null && allocated.bytes >= physicalThreshold
-      && (!allowPhysicalArchive || allocated.bytes >= physicalThreshold + RESOURCE_BUDGETS.physicalArchiveHeadroomBytes)) {
+    // upsert keeps the logical retained count flat. Terminal outcomes and
+    // recovery evidence use separate required paths and reserved headroom.
+    const physicalThreshold = configuredRetainedLimitBytes() * RESOURCE_BUDGETS.physicalDatabaseMultiplier;
+    const allocated = physicalUsageForAdmission(physicalThreshold);
+    // An unknown allocation cannot grant optional capacity. Archiving one
+    // existing row stays eligible so cleanup can recover measurable storage.
+    if ((allocated.bytes === null && !allowPhysicalArchive)
+      || (allocated.bytes !== null && allocated.bytes >= physicalThreshold
+        && (!allowPhysicalArchive || allocated.bytes >= physicalThreshold + RESOURCE_BUDGETS.physicalArchiveHeadroomBytes))) {
       throw databaseError(507, "Allocated database storage is full; close long-running readers and clean archived history");
     }
+  }
+  function withinRetainedBudget(write, reserve = retainedReserveBytes, allowPhysicalArchive = false) {
+    if (migrationPending(db)) throw databaseError(507, "Retained history is being migrated; retry when capacity is available");
+    requireOptionalPhysicalCapacity(allowPhysicalArchive);
     try { return db.transaction(() => {
       const before = retainedBytes(db);
       const result = write();
@@ -1091,6 +1095,9 @@ export function createOutrightDatabase(options = {}) {
           throw databaseError(409, "Archived conversation deletion is in progress");
         }
         if (migrationPending(db)) throw databaseError(507, "Retained history is being migrated; retry when capacity is available");
+        // A retry is still new queued work. Keep the interrupted evidence
+        // intact until physical usage can be measured and budgeted again.
+        requireOptionalPhysicalCapacity();
         const settings = this.getSettings();
         if (db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status = 'queued'").get().count >= settings.maxQueuedRuns) {
           throw databaseError(429, "Run queue is full; stop a queued run or wait for capacity");

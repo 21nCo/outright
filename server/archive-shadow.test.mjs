@@ -919,12 +919,17 @@ test("physical usage includes candidate and marker bytes until each file is remo
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
 });
 
-test("inaccessible rollback journal reports unknown usage and pauses launch admission", () => {
+test("inaccessible rollback journal closes optional admission until measurement recovers", () => {
   const item = fixture();
   const originalStat = fs.lstatSync;
   let database;
+  let run;
+  const runtimeFilename = path.join(item.directory, "runtime.db");
   try {
-    database = createOutrightDatabase({ filename: path.join(item.directory, "runtime.db") });
+    database = createOutrightDatabase({ filename: runtimeFilename });
+    const active = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: item.directory, title: "active", provider: "codex" });
+    const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: item.directory, title: "archive", provider: "codex" });
+    run = database.createRun({ conversationId: active.id, provider: "codex", approvalPolicy: "read-only", prompt: "queued" });
     const journal = path.join(realpathSync(item.directory), "runtime.db.archive-next-journal");
     fs.lstatSync = (filename, ...args) => {
       if (filename === journal) throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
@@ -933,16 +938,26 @@ test("inaccessible rollback journal reports unknown usage and pauses launch admi
     syncBuiltinESMExports();
     assert.deepEqual(database.capacity().diskAllocatedBytes, null);
     assert.equal(database.capacity().diskUsageStatus, "unknown");
-    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: item.directory, title: "sibling", provider: "codex" });
-    const submitted = database.submitRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "queued" }, "queued");
-    assert.equal(database.getRun(submitted.run.id).status, "queued", "journal access prevented durable queueing");
+    assert.throws(() => database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: item.directory, title: "sibling", provider: "codex" }),
+      (error) => error.statusCode === 507, "unknown physical usage admitted retained history");
+    assert.equal(database.appendRunEvent(run.id, "output", { text: "optional" }), null);
+    database.finishRun(run.id, { status: "failed", error: "transient stat failure" });
+    assert.equal(database.getRun(run.id).status, "failed", "required outcome was lost during a transient stat failure");
+    assert.equal(database.updateConversation(archived.id, { archived: true }).archived, 1,
+      "archive eligibility must remain available to cleanup during unknown usage");
     assert.equal(database.canLaunchRun(), false, "unknown physical usage admitted a new process");
   } finally {
     fs.lstatSync = originalStat;
     syncBuiltinESMExports();
     assert.equal(database?.capacity().diskUsageStatus, process.platform === "win32" ? "estimated" : "measured");
     assert.equal(database?.canLaunchRun(), true, "journal access recovery did not reopen admission");
+    assert.ok(database?.createConversation({ projectId: "p", worktreeId: "w", worktreePath: item.directory, title: "recovered", provider: "codex" }));
     database?.close();
+    const reopened = createOutrightDatabase({ filename: runtimeFilename });
+    try {
+      assert.equal(reopened.getRun(run.id).status, "failed", "required outcome did not survive reopen");
+      assert.ok(reopened.listAudit().some((entry) => entry.action === "agent.run.failed" && entry.target === run.id));
+    } finally { reopened.close(); }
     rmSync(item.directory, { recursive: true, force: true });
   }
 });
