@@ -6,7 +6,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { existsSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { allocatedDatabaseUsage, archiveShadowPaths, beginArchiveShadow, cutoverArchiveShadow, prepareArchiveShadowCutover, recoverArchiveShadow } from "./archive-shadow.mjs";
+import { allocatedDatabaseUsage, archiveShadowPaths, beginArchiveShadow, cutoverArchiveShadow, fenceArchiveSource, prepareArchiveShadowCutover, recoverArchiveShadow } from "./archive-shadow.mjs";
 import { createOutrightDatabase, recoverArchiveBeforeStartup } from "./database.mjs";
 
 function fixture() {
@@ -75,6 +75,55 @@ test("archive shadow cutover promotes a validated candidate and releases its fal
     assert.equal(existsSync(item.old), false);
     assert.equal(existsSync(item.next), false);
     assert.equal(existsSync(item.state), false);
+  } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
+test("an interrupted closed-source cutover retains its write fence until rollback", () => {
+  const item = fixture();
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.exec("BEGIN EXCLUSIVE");
+    fenceArchiveSource(source);
+    source.exec("COMMIT");
+    source.close();
+    const writer = new Database(item.filename);
+    try {
+      assert.throws(() => writer.prepare("UPDATE evidence SET body = ? WHERE id = 1").run("lost write"),
+        /Archive cutover is in progress/);
+    } finally { writer.close(); }
+    // A crash before the first rename leaves the original and candidate.
+    recoverArchiveShadow(item.filename, { sourceUnmoved: true });
+    assert.equal(body(item.filename), "recoverable payload");
+    const resumed = new Database(item.filename);
+    try {
+      resumed.prepare("UPDATE evidence SET body = ? WHERE id = 1").run("writes resumed");
+    } finally { resumed.close(); }
+    assert.equal(body(item.filename), "writes resumed");
+    assert.equal(existsSync(item.state), false);
+  } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
+test("rollback after the first rename releases the recovered source fence", () => {
+  const item = fixture();
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.exec("BEGIN EXCLUSIVE");
+    fenceArchiveSource(source);
+    source.exec("COMMIT");
+    source.close();
+    // Without a prepared candidate, recovery must choose the original.
+    renameSync(item.filename, item.old);
+    recoverArchiveShadow(item.filename);
+    assert.equal(body(item.filename), "recoverable payload");
+    const writer = new Database(item.filename);
+    try {
+      writer.prepare("UPDATE evidence SET body = ? WHERE id = 1").run("recovered write");
+    } finally { writer.close(); }
+    assert.equal(body(item.filename), "recovered write");
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
 });
 

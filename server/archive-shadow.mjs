@@ -124,6 +124,44 @@ function discardShadowCandidate(filename) {
   }
 }
 
+// A closed SQLite handle is required for a Windows rename. Keep the source
+// write-protected across that close with durable triggers, so a direct SQLite
+// connection cannot commit into the old file between comparison and rename.
+// The shadow never contains this fence. Recovery removes it only after the
+// original has been chosen as the live database again.
+export function fenceArchiveSource(db) {
+  const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'
+    AND name NOT LIKE 'sqlite_%' AND name != 'archive_cutover_guard'`).all().map((row) => row.name);
+  db.exec("CREATE TABLE archive_cutover_guard (active INTEGER PRIMARY KEY CHECK(active = 1))");
+  for (const table of tables) {
+    const quoted = `"${table.replaceAll('"', '""')}"`;
+    for (const operation of ["INSERT", "UPDATE", "DELETE"]) {
+      const name = `archive_cutover_${operation.toLowerCase()}_${table}`.replaceAll('"', '""');
+      db.exec(`CREATE TRIGGER "${name}" BEFORE ${operation} ON ${quoted}
+        WHEN EXISTS (SELECT 1 FROM archive_cutover_guard)
+        BEGIN SELECT RAISE(ABORT, 'Archive cutover is in progress'); END`);
+    }
+  }
+  db.exec("INSERT INTO archive_cutover_guard (active) VALUES (1)");
+  for (const operation of ["UPDATE", "DELETE"]) {
+    db.exec(`CREATE TRIGGER archive_cutover_guard_${operation.toLowerCase()} BEFORE ${operation}
+      ON archive_cutover_guard BEGIN SELECT RAISE(ABORT, 'Archive cutover is in progress'); END`);
+  }
+}
+
+function releaseArchiveSourceFence(filename) {
+  const db = new Database(filename);
+  try {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'archive_cutover_guard'").get()) return;
+    db.transaction(() => {
+      for (const { name } of db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name GLOB 'archive_cutover_*'").all()) {
+        db.exec(`DROP TRIGGER "${name.replaceAll('"', '""')}"`);
+      }
+      db.exec("DROP TABLE archive_cutover_guard");
+    }).immediate();
+  } finally { db.close(); }
+}
+
 function markerOwnsDatabase(marker, filename) {
   if (![1, 2].includes(marker?.version) || typeof marker.source !== "string" || !path.isAbsolute(marker.source)) return false;
   if (marker.source === filename) return true;
@@ -203,6 +241,7 @@ export function recoverArchiveShadow(filename, { sourceUnmoved = false } = {}) {
   // does not need a whole-database integrity scan on every normal deferral.
   if (sourceUnmoved && !fileInfo(old)) {
     if (!privateRegularFile(filename)) throw new Error("Archive maintenance source is missing or invalid");
+    releaseArchiveSourceFence(filename);
     discardShadowCandidate(next);
     durableDirectory(filename);
     rmSync(state);
@@ -214,6 +253,7 @@ export function recoverArchiveShadow(filename, { sourceUnmoved = false } = {}) {
   } else if (!validDatabase(filename)) {
     throw new Error("Archive maintenance source is missing or invalid");
   }
+  releaseArchiveSourceFence(filename);
   // A discarded candidate may have an uncheckpointed WAL. It is safe to
   // remove its sidecars only after the original or promoted source is valid.
   discardShadowCandidate(next);
@@ -247,8 +287,8 @@ export function cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate } =
   if (!markerOwnsDatabase(marker, filename) || marker.version !== 2 || !matchesCandidate(next, marker.candidate)) {
     throw new Error("Archive cutover candidate changed after validation");
   }
-  // The worker checkpoints and closes the source before publishing `ready`.
-  // A nonempty WAL would be left behind by a file rename and is unsafe.
+  // The worker checkpoints and closes the source before promotion. A
+  // nonempty WAL would be left behind by a file rename and is unsafe.
   if (hasNonemptyWal(filename)) throw new Error("Archive source WAL was not checkpointed");
   if (hasNonemptyWal(next)) throw new Error("Archive shadow WAL was not checkpointed");
   removeCheckpointedSidecars(filename);
@@ -260,8 +300,8 @@ export function cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate } =
     }
   }
   // A test gate at the final comparison catches writes that older cutovers
-  // silently replaced. Production reaches this point with the source's
-  // exclusive SQLite transaction held by the deletion worker.
+  // silently replaced. The durable source fence remains active here even
+  // though the SQLite connection has closed for Windows promotion.
   if (cutoverStatGate instanceof SharedArrayBuffer) {
     const signal = new Int32Array(cutoverStatGate);
     Atomics.store(signal, 0, 1);
@@ -270,8 +310,8 @@ export function cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate } =
   }
   try { renameSync(filename, old); }
   catch (error) {
-    // Windows may prohibit renaming an open SQLite handle. Leave the source
-    // untouched and let the ordinary deferred-cleanup path retry safely.
+    // A separate open SQLite handle may still prohibit rename on Windows.
+    // Leave the source untouched; recovery removes its fence before retry.
     if (["EPERM", "EACCES", "EBUSY"].includes(error.code) && privateRegularFile(filename) && !fileInfo(old)) {
       throw Object.assign(new Error("Archive source cannot be renamed while fenced; retry when idle"), { code: "ARCHIVE_SOURCE_BUSY", cause: error });
     }

@@ -1242,7 +1242,7 @@ test("a committed source write at archive cutover discards the stale shadow and 
   }
 });
 
-test("a direct writer at the final source comparison cannot lose a committed sibling row", async () => {
+test("a direct writer after the source closes cannot commit through shadow promotion", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-final-fence-"));
   const filename = path.join(directory, "outright.db");
   const gate = new Int32Array(new SharedArrayBuffer(4));
@@ -1265,6 +1265,16 @@ test("a direct writer at the final source comparison cannot lose a committed sib
     }
     const writer = new Database(filename);
     writer.pragma("busy_timeout = 0");
+    assert.equal(writer.prepare("SELECT active FROM archive_cutover_guard").get().active, 1,
+      "the source must remain fenced after its SQLite handle closes");
+    for (const statement of [
+      () => writer.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("cutover.late", '"dark"'),
+      () => writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
+        .run("cutover.late", sibling.id, "{}", new Date().toISOString()),
+      () => writer.exec("DELETE FROM archive_cutover_guard"),
+    ]) {
+      assert.throws(statement, /Archive cutover is in progress/);
+    }
     let committed = false;
     try {
       writer.transaction(() => {
@@ -1273,12 +1283,14 @@ test("a direct writer at the final source comparison cannot lose a committed sib
       }).immediate();
       committed = true;
     } catch (error) {
-      assert.ok(["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code), `unexpected direct writer failure: ${error.message}`);
+      assert.ok(["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_CONSTRAINT_TRIGGER"].includes(error.code),
+        `unexpected direct writer failure: ${error.message}`);
     } finally { writer.close(); }
     Atomics.store(gate, 0, 2);
     Atomics.notify(gate, 0);
     const result = await deletion;
     if (committed) assert.equal(result.deferred, true, "a committed post-comparison source write was replaced");
+    else assert.equal(result.deleted, 1, "a fenced source should still promote its compacted shadow");
     await database.close();
     database = null;
     const proof = new Database(filename, { readonly: true });
@@ -1287,6 +1299,9 @@ test("a direct writer at the final source comparison cannot lose a committed sib
         committed ? "late committed evidence" : "original evidence");
       assert.equal(proof.prepare("SELECT prompt FROM runs WHERE id = ?").get(queued.id).prompt,
         committed ? "late queued evidence" : "work");
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'cutover.late'").get().count, 0);
+      assert.equal(proof.prepare("SELECT 1 FROM sqlite_master WHERE name = 'archive_cutover_guard'").get(), undefined,
+        "the promoted database must not retain the source fence");
       assert.equal(proof.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes, retainedReadback(proof));
     } finally { proof.close(); }
     database = createOutrightDatabase({ filename, runtimeLease: true });

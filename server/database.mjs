@@ -115,6 +115,7 @@ export function createOutrightDatabase(options = {}) {
   const deletionsInFlight = new Set();
   const deletionWorkers = new Set();
   const deletionFailures = new Map();
+  const deletionBusyDeferrals = new Map();
   const pausedDeletions = new Set();
   const deletionRetryBaseMs = Number.isFinite(options.deletionRetryBaseMs) && options.deletionRetryBaseMs >= 1
     ? options.deletionRetryBaseMs : 1000;
@@ -242,11 +243,19 @@ export function createOutrightDatabase(options = {}) {
     deletionScanWrapped = false;
     deleteArchivedInBatches(db, pending.id, deletionsInFlight, { ...deletionContext, automatic: true })
       .then((result) => {
-        if (result.deleted) { deletionFailures.delete(pending.id); pausedDeletions.delete(pending.id); }
+        if (result.deleted) {
+          deletionFailures.delete(pending.id);
+          deletionBusyDeferrals.delete(pending.id);
+          pausedDeletions.delete(pending.id);
+        }
+        const busyCount = result.sourceBusy ? (deletionBusyDeferrals.get(pending.id) ?? 0) + 1 : 0;
+        if (busyCount) deletionBusyDeferrals.set(pending.id, busyCount);
+        else deletionBusyDeferrals.delete(pending.id);
         // Keep the deferred marker eligible on the next wrap, but visit
         // later markers first. Resetting to zero here starved every sibling
         // behind a giant row while an unrelated run remained active.
-        scheduleDeletionResume(result.deferred ? 250 : 0);
+        scheduleDeletionResume(result.sourceBusy ? Math.min(300_000, 1000 * 2 ** Math.min(busyCount, 9))
+          : result.deferred ? 250 : 0);
       })
       .catch((error) => {
         options.onDeletionError?.(error);
@@ -1580,7 +1589,7 @@ async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, cut
   catch (error) {
     if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
     if (["ARCHIVE_SNAPSHOT_CHANGED", "ARCHIVE_DEFERRED", "ARCHIVE_SOURCE_BUSY"].includes(error.code)) {
-      return { deleted: 0, deferred: true, id };
+      return { deleted: 0, deferred: true, sourceBusy: error.code === "ARCHIVE_SOURCE_BUSY", id };
     }
     throw error;
   }
