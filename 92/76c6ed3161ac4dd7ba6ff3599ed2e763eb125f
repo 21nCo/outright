@@ -1,0 +1,40 @@
+README.md
+  h_a39f9495f9ec1d 76-86
+scripts/reconcile-terminal-capacity.mjs
+  h_a39f9495f9ec1d 1-33
+server/agent-supervisor-darwin.c
+  h_a39f9495f9ec1d 320-322,406-410
+server/agent-supervisor-windows.c
+  h_a39f9495f9ec1d 59-118,121-122,149-157
+server/agent-supervisor.c
+  h_a39f9495f9ec1d 7,15,96-120,384-390,393,424,480
+server/audit-retention.mjs
+  h_a39f9495f9ec1d 15
+server/database.mjs
+  h_a39f9495f9ec1d 1446,1464-1467,1469-1474,1479,1482-1492
+server/managed-terminal.mjs
+  h_a39f9495f9ec1d 1-238
+server/outright-runtime.mjs
+  h_a39f9495f9ec1d 65-67,597-608
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 52-61
+server/terminal-broker.mjs
+  h_a39f9495f9ec1d 1-73
+server/terminal-manager.mjs
+  h_a39f9495f9ec1d 3,5-8,10-11,13,17-57,76,107-167,172-173,175-176,179,200-203,205,252
+server/terminal-manager.test.mjs
+  h_a39f9495f9ec1d 6-7,10,15-17,19,33-34,200-201,203,206,214,221-222,226-413
+src/components/SettingsDialog.jsx
+  h_a39f9495f9ec1d 215
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9276c6ed3161ac4dd7ba6ff3599ed2e763eb125f",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
