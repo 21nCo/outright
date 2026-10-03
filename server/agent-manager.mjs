@@ -808,12 +808,13 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     const input = budgetTranscript(state, { id: `${state.run.id}:${state.transcriptSeq}`, createdAt: new Date().toISOString(), conversationId: state.conversation.id, role: "assistant", kind: item.kind, body, payload });
     if (!input) return;
     let message;
-    try { message = database.addMessage(input); }
+    try { message = database.addMessage(input, { omissionRunId: state.run.id }); }
     catch (error) {
       if (error.statusCode !== 507) { throw error; }
       markTranscriptOmitted(state);
       return;
     }
+    if (!message) { markTranscriptOmitted(state); return; }
     publish({ type: "message.created", conversationId: state.conversation.id, payload: message });
   }
 
@@ -868,14 +869,15 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // beyond the cap must not schedule further rewrites of the same body.
     if (state.assistantTruncated) state.checkpointHalted = true;
     let stored;
-    try { stored = database.upsertMessage(message); }
+    try { stored = database.upsertMessage(message, { omissionRunId: state.run.id }); }
     catch (error) {
       if (error.statusCode !== 507) { throw error; }
       markTranscriptOmitted(state);
       state.checkpointHalted = true;
       return null;
     }
-    if (publishEvent && stored) publish({ type: "message.created", conversationId: state.conversation.id, payload: stored });
+    if (!stored) { markTranscriptOmitted(state); state.checkpointHalted = true; return null; }
+    if (publishEvent) publish({ type: "message.created", conversationId: state.conversation.id, payload: stored });
     return stored;
   }
 

@@ -956,9 +956,9 @@ export function createOutrightDatabase(options = {}) {
       const nextOffset = offset + end;
       return { id: row.id, body: body ?? "", offset: actualOffset, nextOffset, totalBytes: row.totalBytes, hasMore: nextOffset < row.totalBytes };
     },
-    addMessage(input) {
+    addMessage(input, { omissionRunId } = {}) {
       const message = { id: input.id ?? randomUUID(), createdAt: input.createdAt ?? now(), ...input };
-      return withinRetainedBudget(() => {
+      const insert = () => withinRetainedBudget(() => {
         const inserted = db.prepare("INSERT INTO messages (id, conversation_id, role, kind, body, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
         .run(message.id, message.conversationId, message.role, message.kind ?? "text", message.body ?? "", JSON.stringify(message.payload ?? null), message.createdAt);
       // Clamp instead of overwrite: a message must never move the
@@ -966,10 +966,19 @@ export function createOutrightDatabase(options = {}) {
       db.prepare("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?").run(message.createdAt, message.conversationId);
         return { ...message, searchOrder: Number(inserted.lastInsertRowid) };
       }, retainedReserveBytes);
+      if (!omissionRunId) return insert();
+      return db.transaction(() => {
+        try { return insert(); }
+        catch (error) {
+          if (error.statusCode !== 507) throw error;
+          this.updateRun(omissionRunId, { transcriptOmitted: true });
+          return null;
+        }
+      }).immediate();
     },
-    upsertMessage(input) {
+    upsertMessage(input, { omissionRunId } = {}) {
       const message = { id: input.id ?? randomUUID(), createdAt: input.createdAt ?? now(), ...input };
-      return withinRetainedBudget(() => {
+      const upsert = () => withinRetainedBudget(() => {
         db.prepare(`INSERT INTO messages (id, conversation_id, role, kind, body, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET role = excluded.role, kind = excluded.kind, body = excluded.body, payload = excluded.payload`)
         .run(message.id, message.conversationId, message.role, message.kind ?? "text", message.body ?? "", JSON.stringify(message.payload ?? null), message.createdAt);
@@ -980,6 +989,15 @@ export function createOutrightDatabase(options = {}) {
         return hydratePayload(db.prepare(`SELECT search_order AS searchOrder, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
         FROM messages WHERE id = ?`).get(message.id));
       });
+      if (!omissionRunId) return upsert();
+      return db.transaction(() => {
+        try { return upsert(); }
+        catch (error) {
+          if (error.statusCode !== 507) throw error;
+          this.updateRun(omissionRunId, { transcriptOmitted: true });
+          return null;
+        }
+      }).immediate();
     },
     createRun(input) {
       const insert = db.transaction(() => {
@@ -1257,6 +1275,7 @@ export function createOutrightDatabase(options = {}) {
             ...transcriptMessage.payload, ...(event ? { checkpointEventSeq: event.seq } : {}),
           } });
         } catch (error) { if (error.statusCode !== 507) throw error; }
+        if (!message) this.updateRun(runId, { transcriptOmitted: true });
         return { event, message };
       });
       return commit.immediate();
@@ -1356,8 +1375,8 @@ export function createOutrightDatabase(options = {}) {
       const visible = db.prepare(`SELECT source_rowid AS rowid FROM search_visible_conversations
         ORDER BY source_rowid DESC LIMIT ${SEARCH_CANDIDATES}`).all();
       const byTitle = db.prepare(`WITH recent AS MATERIALIZED
-        (SELECT source_rowid AS rowid FROM search_visible_conversations
-          ORDER BY source_rowid DESC LIMIT ${SEARCH_CANDIDATES})
+        (SELECT source_rowid AS rowid FROM search_recent_titles
+          ORDER BY updated_at DESC, source_rowid DESC LIMIT ${SEARCH_CANDIDATES})
         SELECT ${fields} FROM recent JOIN conversations AS c ON c.rowid = recent.rowid
         WHERE c.deleting = 0 AND ${safeIdentity}
           AND c.title LIKE ? ESCAPE '\\'`).all(needle);
@@ -1398,6 +1417,7 @@ export function createOutrightDatabase(options = {}) {
         responseBytes += bytes;
       }
       const partial = matched.length > conversations.length || Boolean(migrationJob(db, "search-visible")
+        || migrationJob(db, "search-titles")
         || migrationJob(db, "search-heads")
         || migrationJob(db, "messages")
         || (visible.length === SEARCH_CANDIDATES && db.prepare(`SELECT 1 FROM search_visible_conversations
@@ -1731,6 +1751,7 @@ function migrate(db) {
   try { db.exec("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE conversations ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   prepareVisibleConversationLookup(db);
+  prepareRecentTitleLookup(db);
   prepareSearchMessageHeads(db);
   try { db.exec("ALTER TABLE runs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'medium'"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN pid INTEGER"); } catch { /* Already migrated. */ }
@@ -1796,6 +1817,35 @@ function prepareVisibleConversationLookup(db) {
     END`);
     if (!existed && db.prepare("SELECT 1 FROM conversations LIMIT 1").get()) {
       db.prepare("INSERT OR IGNORE INTO migration_progress (kind) VALUES ('search-visible')").run();
+    }
+  }).immediate();
+}
+
+function prepareRecentTitleLookup(db) {
+  db.transaction(() => {
+    const existed = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'search_recent_titles'").get());
+    // Build the ordered index while empty. Legacy titles enter in bounded
+    // batches, and the triggers preserve concurrent edits across restarts.
+    db.exec(`CREATE TABLE IF NOT EXISTS search_recent_titles (
+      source_rowid INTEGER PRIMARY KEY, updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS search_recent_titles_activity
+      ON search_recent_titles(updated_at DESC, source_rowid DESC);
+    CREATE TRIGGER IF NOT EXISTS search_titles_insert AFTER INSERT ON conversations
+      WHEN NEW.deleting = 0 BEGIN
+        INSERT INTO search_recent_titles (source_rowid, updated_at) VALUES (NEW.rowid, NEW.updated_at);
+      END;
+    CREATE TRIGGER IF NOT EXISTS search_titles_update AFTER UPDATE OF updated_at, deleting ON conversations BEGIN
+      DELETE FROM search_recent_titles WHERE source_rowid = OLD.rowid AND NEW.deleting != 0;
+      INSERT INTO search_recent_titles (source_rowid, updated_at)
+        SELECT NEW.rowid, NEW.updated_at WHERE NEW.deleting = 0
+        ON CONFLICT(source_rowid) DO UPDATE SET updated_at = excluded.updated_at;
+      END;
+    CREATE TRIGGER IF NOT EXISTS search_titles_delete AFTER DELETE ON conversations BEGIN
+      DELETE FROM search_recent_titles WHERE source_rowid = OLD.rowid;
+      END`);
+    if (!existed && db.prepare("SELECT 1 FROM conversations LIMIT 1").get()) {
+      db.prepare("INSERT OR IGNORE INTO migration_progress (kind) VALUES ('search-titles')").run();
     }
   }).immediate();
 }
@@ -1953,6 +2003,7 @@ function advanceMigrations(db) {
   advanceEventMigration(db);
   advanceMessageMigration(db);
   advanceVisibleConversationMigration(db);
+  advanceRecentTitleMigration(db);
   advanceSearchHeadsMigration(db);
   advanceRetainedMigration(db);
   if (!migrationPending(db)) db.pragma("user_version = 4");
@@ -1968,6 +2019,20 @@ function advanceVisibleConversationMigration(db) {
     for (const row of rows) insert.run(row.scanRowId);
     if (rows.length < 64) db.prepare("DELETE FROM migration_progress WHERE kind = 'search-visible'").run();
     else db.prepare("UPDATE migration_progress SET cursor_number = ? WHERE kind = 'search-visible'").run(rows.at(-1).scanRowId);
+  }).immediate();
+}
+
+function advanceRecentTitleMigration(db) {
+  const job = migrationJob(db, "search-titles");
+  if (!job) return;
+  db.transaction(() => {
+    const rows = db.prepare("SELECT rowid AS scanRowId FROM conversations WHERE rowid > ? ORDER BY rowid LIMIT 64").all(job.cursor_number);
+    const insert = db.prepare(`INSERT INTO search_recent_titles (source_rowid, updated_at)
+      SELECT rowid, updated_at FROM conversations WHERE rowid = ? AND deleting = 0
+      ON CONFLICT(source_rowid) DO UPDATE SET updated_at = excluded.updated_at`);
+    for (const row of rows) insert.run(row.scanRowId);
+    if (rows.length < 64) db.prepare("DELETE FROM migration_progress WHERE kind = 'search-titles'").run();
+    else db.prepare("UPDATE migration_progress SET cursor_number = ? WHERE kind = 'search-titles'").run(rows.at(-1).scanRowId);
   }).immediate();
 }
 

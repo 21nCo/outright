@@ -166,6 +166,50 @@ test("global search includes the newest message in an older visible conversation
   } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("title search follows recent activity in an old chat after an interrupted lookup migration", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-title-search-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const oldest = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "old title", provider: "codex" });
+    for (let index = 0; index < 256; index += 1) {
+      database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: `new title ${index}`, provider: "codex" });
+    }
+    database.updateConversation(oldest.id, { title: "recent-renamed-needle" });
+    assert.deepEqual(database.search("recent-renamed-needle").conversations.map((row) => row.id), [oldest.id]);
+    await database.close();
+    const legacy = new Database(filename);
+    try {
+      legacy.exec(`DROP TRIGGER search_titles_insert; DROP TRIGGER search_titles_update;
+        DROP TRIGGER search_titles_delete; DROP TABLE search_recent_titles`);
+    } finally { legacy.close(); }
+    database = createOutrightDatabase({ filename });
+    await new Promise((resolve) => setImmediate(resolve));
+    const partial = new Database(filename, { readonly: true });
+    try {
+      const cursor = partial.prepare("SELECT cursor_number AS cursor FROM migration_progress WHERE kind = 'search-titles'").get()?.cursor;
+      assert.ok(cursor > 0 && cursor < 257, "title lookup migration did not stop at a bounded cursor");
+    } finally { partial.close(); }
+    await database.close();
+    database = createOutrightDatabase({ filename });
+    const deadline = Date.now() + 5_000;
+    while (true) {
+      const probe = new Database(filename, { readonly: true });
+      let pending;
+      try { pending = probe.prepare("SELECT 1 FROM migration_progress WHERE kind = 'search-titles'").get(); }
+      finally { probe.close(); }
+      if (!pending) break;
+      assert.ok(Date.now() < deadline, "title lookup migration did not resume after restart");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    for (let round = 0; round < 8; round += 1) {
+      const result = database.search("recent-renamed-needle");
+      assert.deepEqual(result.conversations.map((row) => row.id), [oldest.id]);
+      assert.ok(Buffer.byteLength(JSON.stringify(result)) < 4096);
+    }
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("conversation find reaches old and new pages, wraps, and treats query text literally", async () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

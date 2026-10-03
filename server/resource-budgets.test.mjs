@@ -524,6 +524,41 @@ test("aggregate retained history denies new work until eligible history is clean
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("quota refusal commits transcript omission with delta, timed checkpoint and tool writes", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-atomic-omission-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    database.updateSettings({ maxRetainedMiB: 64 });
+    const sibling = chat(database, "quota filler");
+    const conversation = chat(database, "active run");
+    const runs = [0, 1, 2].map(() => database.createRun(runInput(conversation.id)));
+    const checkpoint = { id: `${runs[1].id}:1`, conversationId: conversation.id, role: "assistant", kind: "text",
+      body: "small prefix", payload: { runId: runs[1].id } };
+    database.upsertMessage(checkpoint);
+    const filler = database.addMessage({ conversationId: sibling.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+    const room = 63 * 1024 * 1024 - database.capacity().retainedBytes - 16 * 1024;
+    database.upsertMessage({ ...filler, body: `${filler.body}${"x".repeat(room)}` });
+    const rejected = { conversationId: conversation.id, role: "assistant", kind: "text",
+      body: "y".repeat(1024 * 1024), payload: { runId: runs[0].id } };
+    const delta = database.appendRunEventWithMessage(runs[0].id, "assistant.delta", { text: "partial" },
+      { ...rejected, id: `${runs[0].id}:1` });
+    assert.ok(delta.event, "the small replay event should fit before the checkpoint is refused");
+    assert.equal(delta.message, null);
+    assert.equal(database.upsertMessage({ ...checkpoint, body: rejected.body }, { omissionRunId: runs[1].id }), null);
+    assert.equal(database.addMessage({ ...rejected, id: `${runs[2].id}:1`, payload: { runId: runs[2].id } },
+      { omissionRunId: runs[2].id }), null);
+    await database.close();
+    database = createOutrightDatabase({ filename });
+    for (const run of runs) assert.equal(database.getRun(run.id).transcriptOmitted, 1,
+      "a crash after any refused write must recover the omission marker");
+    assert.equal(database.listRunEvents(runs[0].id)[0].type, "assistant.delta");
+    assert.deepEqual(database.listMessages(conversation.id).map((message) => message.body), ["small prefix"]);
+    for (const run of runs) database.finishRun(run.id, { status: "stopped", finishedAt: new Date().toISOString(), pid: null });
+    assert.deepEqual(runs.map((run) => database.getRun(run.id).transcriptOmitted), [1, 1, 1]);
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("selected cleanup rechecks archived and run state at deletion, including cancellation and recovery", async () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
