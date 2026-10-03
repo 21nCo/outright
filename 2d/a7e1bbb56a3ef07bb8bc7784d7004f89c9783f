@@ -1,0 +1,24 @@
+server/archive-delete-worker.mjs
+  h_a39f9495f9ec1d 5,137
+server/audit-retention.mjs
+  h_a39f9495f9ec1d 1-24
+server/database.mjs
+  h_a39f9495f9ec1d 2,450,478-490,1383-1414
+server/outright-runtime.mjs
+  h_a39f9495f9ec1d 31,182,184-193
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 71,177,185-190,207-234
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 1018-1086
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2da7e1bbb56a3ef07bb8bc7784d7004f89c9783f",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
