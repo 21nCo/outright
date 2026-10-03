@@ -1,0 +1,44 @@
+server/agent-manager.mjs
+  h_a39f9495f9ec1d 619-621,637,705-715
+server/agent-manager.test.mjs
+  h_a39f9495f9ec1d 1551-1559
+server/agent-supervisor-windows.c
+  h_a39f9495f9ec1d 21-22,30-46,51,76,80-82
+server/archive-shadow.mjs
+  h_a39f9495f9ec1d 290-293
+server/archive-shadow.test.mjs
+  h_a39f9495f9ec1d 32-55
+server/archive-windows-lock.mjs
+  h_a39f9495f9ec1d 64-70,75-76,78
+server/database.mjs
+  h_a39f9495f9ec1d 111-113,282,285-286,290-293,299-304,370-445,450-469,477,1479-1484,1592-1600,1646-1647,1679
+server/git-service.test.mjs
+  h_a39f9495f9ec1d 40-44
+server/outright-runtime.mjs
+  h_a39f9495f9ec1d 20,31-37,67-74,733
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 14,1309-1371
+server/project-scanner.test.mjs
+  h_a39f9495f9ec1d 11,15-16,25
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 5,156-203,238-258
+server/terminal-manager.mjs
+  h_a39f9495f9ec1d 16-18,25-28,35,49,57-62,204-209,310
+server/terminal-manager.test.mjs
+  h_a39f9495f9ec1d 593-667,803-808
+src/components/SettingsDialog.jsx
+  h_a39f9495f9ec1d 219,277-278
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 649-650,654-657,672,676-690,1593-1600
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "95e25724d605de0eeb193107c74d4ceabcc6d46d",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
