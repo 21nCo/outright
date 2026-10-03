@@ -1174,6 +1174,7 @@ export function consumeBoundedLines(stream, { maxLineBytes = MAX_PROVIDER_LINE_B
 function appendAssistantText(state, text, emit) {
   if (state.assistantTruncated) return;
   const segment = String(text ?? "");
+  if (!segment) return;
   state.assistantSegments.push(segment);
   state.assistantBytes += Buffer.byteLength(segment);
   if (state.assistantBytes > MAX_ASSISTANT_BYTES) {
@@ -1327,7 +1328,9 @@ export function normalizeClaude(raw) {
   const events = [];
   if (raw.type === "system" && raw.subtype === "init" && raw.session_id) events.push({ type: "session", payload: { sessionId: raw.session_id } });
   const delta = raw.event?.delta;
-  if (raw.type === "stream_event" && delta?.type === "text_delta") events.push({ type: "assistant.delta", payload: { text: delta.text } });
+  if (raw.type === "stream_event" && delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
+    events.push({ type: "assistant.delta", payload: { text: delta.text } });
+  }
   if (raw.type === "assistant") {
     for (const block of raw.message?.content ?? []) {
       if (block.type === "tool_use") events.push({ type: "tool.started", payload: { item: block } });

@@ -516,6 +516,10 @@ test("normalizes Codex and Claude streaming records", () => {
   assert.deepEqual(normalizeCodex({ type: "thread.started", thread_id: "thread-1" })[0], { type: "session", payload: { sessionId: "thread-1" } });
   assert.deepEqual(normalizeCodex({ type: "item.completed", item: { type: "agent_message", text: "done" } })[0], { type: "assistant.message", payload: { text: "done" } });
   assert.deepEqual(normalizeClaude({ type: "stream_event", event: { delta: { type: "text_delta", text: "hello" } } })[0], { type: "assistant.delta", payload: { text: "hello" } });
+  assert.deepEqual(normalizeClaude({ type: "stream_event", event: { delta: { type: "text_delta", text: "" } } }), [],
+    "empty deltas must not grow the run buffer or durable event stream");
+  assert.deepEqual(normalizeClaude({ type: "stream_event", event: { delta: { type: "text_delta" } } }), [],
+    "missing delta text must not create an empty assistant segment");
   assert.equal(normalizeClaude({ type: "result", result: "finished", total_cost_usd: 0.01, usage: { input_tokens: 2, output_tokens: 3 } }).at(-1).payload.costUsd, 0.01);
 });
 
