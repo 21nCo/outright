@@ -1,0 +1,19 @@
+server/agent-manager.mjs
+  s_ad500513bc9987::t_84407ad6f72d8d 167-172,219-221,272-275
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "27e62f7ec55eeb3fa84d9d7a2a24804256062fea",
+  "prompts": {},
+  "sessions": {
+    "s_ad500513bc9987": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0f222-fb22-76a5-a77e-b7c92826db44",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
