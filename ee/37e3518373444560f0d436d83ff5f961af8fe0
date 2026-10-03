@@ -1,0 +1,16 @@
+server/git-service.mjs
+  h_a39f9495f9ec1d 71-77,87
+server/git-service.test.mjs
+  h_a39f9495f9ec1d 140-165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ee37e3518373444560f0d436d83ff5f961af8fe0",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
