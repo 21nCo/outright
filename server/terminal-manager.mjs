@@ -3,6 +3,7 @@ import { utilityProcesses } from "./subprocess-budget.mjs";
 import { cleanupTerminalSocket, recoverManagedTerminal, spawnManagedTerminal, terminalOwnership } from "./managed-terminal.mjs";
 
 export function createTerminalManager({ publish, database, spawnTerminal = null, startManagedTerminal = spawnManagedTerminal,
+  recoverTerminal = recoverManagedTerminal,
   subprocesses = utilityProcesses, terminate = (terminal, options) => {
   if (typeof terminal.process?.terminate !== "function") throw new Error("PTY owner has no termination verifier");
   return terminal.process.terminate(options);
@@ -27,7 +28,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       let resolved = 0;
       for (const entry of reservedUnknown) {
         try {
-          const empty = await recoverManagedTerminal({ ...entry, launchDirectory: database.launchDirectory, subprocesses });
+          const empty = await recoverTerminal({ ...entry, launchDirectory: database.launchDirectory, subprocesses });
           if (!empty) continue;
           cleanupTerminalSocket(entry.target);
           database.resolveTerminalUnknown(entry.target, `Native ${process.platform} owner was verified empty after restart`);
@@ -49,7 +50,11 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   }
 
   async function createManagedEntry(input) {
-    if (terminals.size + reservedUnknown.length >= maxTerminals) await reconcileUnknown();
+    if (reservedUnknown.length && (terminals.size + reservedUnknown.length >= maxTerminals
+      || [...terminals.values()].filter((terminal) => terminal.cwd === input.cwd).length
+        + reservedUnknown.filter((entry) => entry.cwd === input.cwd).length >= maxTerminalsPerCwd)) {
+      await reconcileUnknown();
+    }
     assertCapacity(input.cwd);
     const { cwd, name, cols = 100, rows = 30 } = input;
     const id = randomUUID();

@@ -276,8 +276,34 @@ export function createOutrightDatabase(options = {}) {
   // database trigger below is the final guard for every tracked table. Keep a
   // reserve for run state, recovery decisions and omission markers.
   const retainedReserveBytes = 1024 * 1024;
+  function physicalUsageForAdmission(limit) {
+    let usage = allocatedDatabaseUsage(storageFilename);
+    if (usage.bytes !== null && usage.bytes >= limit && !db.inTransaction && storageFilename !== ":memory:") {
+      // A completed WAL transaction can still occupy disk until checkpointed.
+      // Give reclaimable pages one short chance to clear; a pinned external
+      // reader must not stall the event loop or reopen admission.
+      const previousTimeout = db.pragma("busy_timeout", { simple: true });
+      try {
+        db.pragma("busy_timeout = 25");
+        db.pragma("wal_checkpoint(TRUNCATE)");
+      } catch (error) {
+        if (!["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code)) throw error;
+      } finally { db.pragma(`busy_timeout = ${previousTimeout}`); }
+      usage = allocatedDatabaseUsage(storageFilename);
+    }
+    return usage;
+  }
   function withinRetainedBudget(write, reserve = retainedReserveBytes) {
     if (migrationPending(db)) throw databaseError(507, "Retained history is being migrated; retry when capacity is available");
+    // WAL pages can grow under an external reader even while a checkpoint
+    // upsert keeps the logical retained count flat. Stop optional writes at
+    // the physical threshold; terminal and recovery evidence use their own
+    // required paths and the reserved physical headroom.
+    const maxRetainedBytes = configuredRetainedLimitBytes();
+    const allocated = physicalUsageForAdmission(maxRetainedBytes * RESOURCE_BUDGETS.physicalDatabaseMultiplier);
+    if (allocated.bytes !== null && allocated.bytes >= maxRetainedBytes * RESOURCE_BUDGETS.physicalDatabaseMultiplier) {
+      throw databaseError(507, "Allocated database storage is full; close long-running readers and clean archived history");
+    }
     try { return db.transaction(() => {
       const before = retainedBytes(db);
       const result = write();
@@ -292,6 +318,11 @@ export function createOutrightDatabase(options = {}) {
       if (error?.message?.includes("OUTRIGHT_RETAINED_LIMIT")) throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
       throw error;
     }
+  }
+
+  function configuredRetainedLimitBytes() {
+    return Number(db.prepare("SELECT value FROM settings WHERE key = 'maxRetainedMiB'").get()?.value
+      ?? DEFAULT_SETTINGS.maxRetainedMiB) * 1024 * 1024;
   }
 
   function writeAudit(action, details = {}, trim = true) {
@@ -377,6 +408,10 @@ export function createOutrightDatabase(options = {}) {
       const migrating = migrationPending(db);
       const bytes = measured ? retainedBytes(db) : null;
       const maxRetainedBytes = settings.maxRetainedMiB * 1024 * 1024;
+      const maxPhysicalBytes = maxRetainedBytes * RESOURCE_BUDGETS.physicalDatabaseMultiplier
+        + RESOURCE_BUDGETS.physicalRecoveryReserveBytes;
+      const availablePhysicalForNewWorkBytes = disk.bytes === null ? 0
+        : Math.max(0, maxPhysicalBytes - RESOURCE_BUDGETS.physicalRecoveryReserveBytes - disk.bytes);
       let migrationStatus = "ready";
       if (migrationError) migrationStatus = "error";
       else if (migrating) migrationStatus = "migrating";
@@ -389,9 +424,11 @@ export function createOutrightDatabase(options = {}) {
         availableForNewWorkBytes: measured && !migrating ? Math.max(0, maxRetainedBytes - retainedReserveBytes - bytes) : 0, limits: {
         maxQueuedRuns: settings.maxQueuedRuns, maxConcurrentRuns: settings.maxConcurrentRuns,
         maxRetainedBytes, reservedRetainedBytes: retainedReserveBytes, retentionDays: settings.retentionDays,
+        maxPhysicalBytes, reservedPhysicalBytes: RESOURCE_BUDGETS.physicalRecoveryReserveBytes,
         maxRunTranscriptItems: RESOURCE_BUDGETS.maxRunTranscriptItems, maxRunTranscriptBytes: RESOURCE_BUDGETS.maxRunTranscriptBytes,
         maxRunEventBytes: MAX_RUN_EVENT_RETAINED_BYTES,
       }, cpuUsage: null, memoryUsage: null, diskAllocatedBytes: disk.bytes,
+      availablePhysicalForNewWorkBytes,
       diskUsageStatus: disk.status };
     },
     canLaunchRun() {
@@ -399,11 +436,15 @@ export function createOutrightDatabase(options = {}) {
       // record its first output. The separate reserve remains for recovery
       // and terminal transitions.
       const capacity = this.capacity();
+      const physicalThreshold = capacity.limits.maxPhysicalBytes - capacity.limits.reservedPhysicalBytes;
+      const physical = capacity.availablePhysicalForNewWorkBytes < 64 * 1024
+        ? physicalUsageForAdmission(physicalThreshold) : { bytes: capacity.diskAllocatedBytes };
       // A durable deletion marker protects its own conversation, but does
       // not reserve every free agent slot. Only the short final cutover
       // pauses launches; a long unrelated run may keep an oversized delete
       // deferred without starving the queue.
-      return !maintenance && capacity.diskUsageStatus !== "unknown" && capacity.availableForNewWorkBytes >= 64 * 1024;
+      return !maintenance && capacity.diskUsageStatus !== "unknown" && capacity.availableForNewWorkBytes >= 64 * 1024
+        && physical.bytes !== null && physical.bytes + 64 * 1024 <= physicalThreshold;
     },
     listDeletableArchivedConversations({ limit = 100, cursor = null } = {}) {
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw databaseError(400, "Archived history page size must be 1 to 100");
@@ -1307,6 +1348,9 @@ export function createOutrightDatabase(options = {}) {
       }
     },
     appendRunEventWithMessage(runId, type, payload, transcriptMessage) {
+      // Reclaim an idle WAL before the atomic event/checkpoint transaction;
+      // SQLite cannot truncate its own WAL from inside that transaction.
+      physicalUsageForAdmission(configuredRetainedLimitBytes() * RESOURCE_BUDGETS.physicalDatabaseMultiplier);
       const commit = db.transaction(() => {
         const event = this.appendRunEvent(runId, type, payload);
         let message = null;
@@ -1597,7 +1641,7 @@ export function createOutrightDatabase(options = {}) {
     if (key === "capacity") return () => {
       const disk = allocatedDatabaseUsage(storageFilename);
       return { ...maintenanceCapacity, migrationStatus: "maintenance", maintenanceError,
-        availableForNewWorkBytes: 0, diskAllocatedBytes: disk.bytes,
+        availableForNewWorkBytes: 0, availablePhysicalForNewWorkBytes: 0, diskAllocatedBytes: disk.bytes,
         diskUsageStatus: disk.status === "unknown" ? "unknown" : "partial" };
     };
     if (key === "canLaunchRun") return () => false;

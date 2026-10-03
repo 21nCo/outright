@@ -272,5 +272,9 @@ function capacityUsageText(capacity) {
 
 function allocatedDiskUsageText(capacity) {
   if (typeof capacity.diskAllocatedBytes !== "number") return "Allocated disk use is unknown.";
-  return `Allocated disk: ${(capacity.diskAllocatedBytes / 1048576).toFixed(1)} MiB (${capacity.diskUsageStatus ?? "estimated"}).`;
+  const limit = capacity.limits?.maxPhysicalBytes;
+  const budget = typeof limit === "number" ? ` of ${(limit / 1048576).toFixed(0)} MiB budget` : "";
+  const room = capacity.availablePhysicalForNewWorkBytes === 0
+    ? " New work is paused at the physical storage threshold." : "";
+  return `Allocated disk: ${(capacity.diskAllocatedBytes / 1048576).toFixed(1)} MiB${budget} (${capacity.diskUsageStatus ?? "estimated"}).${room}`;
 }

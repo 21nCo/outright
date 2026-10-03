@@ -70,6 +70,49 @@ function ageArchived(filename, ids) {
   admin.close();
 }
 
+test("a pinned SQLite reader cannot turn repeated checkpoints into unbounded physical admission", { timeout: 60_000 }, () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-physical-wal-"));
+  const filename = path.join(directory, "outright.db");
+  const database = createOutrightDatabase({ filename });
+  let reader;
+  try {
+    database.updateSettings({ maxRetainedMiB: 64 });
+    const conversation = chat(database, "pinned physical WAL");
+    const body = "w".repeat(1024 * 1024 - 8);
+    const message = database.addMessage({ conversationId: conversation.id, role: "assistant", body: `${body}00000000` });
+    reader = new Database(filename, { readonly: true });
+    reader.exec("BEGIN");
+    assert.equal(reader.prepare("SELECT length(body) AS bytes FROM messages WHERE id = ?").get(message.id).bytes, 1024 * 1024);
+    let refused = false;
+    for (let index = 1; index <= 300; index += 1) {
+      try {
+        database.upsertMessage({ ...message, body: String.fromCharCode(65 + index % 26).repeat(1024 * 1024) });
+      } catch (error) {
+        assert.equal(error.statusCode, 507);
+        refused = true;
+        break;
+      }
+    }
+    assert.equal(refused, true, `repeated same-size checkpoints exceeded the physical threshold without refusal: ${JSON.stringify(database.capacity())}`);
+    const capacity = database.capacity();
+    assert.ok(capacity.retainedBytes < 3 * 1024 * 1024, "logical retained usage unexpectedly grew with WAL pages");
+    assert.equal(capacity.availablePhysicalForNewWorkBytes, 0);
+    assert.equal(database.canLaunchRun(), false, "a new run was admitted while WAL allocation exhausted its physical budget");
+    assert.ok(capacity.diskAllocatedBytes >= capacity.limits.maxPhysicalBytes - capacity.limits.reservedPhysicalBytes);
+    database.auditCritical("storage.physical.limit", { target: conversation.id });
+    assert.ok(database.listAudit().some((entry) => entry.action === "storage.physical.limit"),
+      "physical refusal consumed the recovery audit reserve");
+    reader.exec("COMMIT");
+    reader.close();
+    reader = null;
+    const checkpoint = new Database(filename);
+    try { checkpoint.pragma("wal_checkpoint(TRUNCATE)"); }
+    finally { checkpoint.close(); }
+    assert.ok(database.capacity().availablePhysicalForNewWorkBytes > 64 * 1024);
+    assert.equal(database.canLaunchRun(), true, "verified WAL reclamation did not reopen run admission");
+  } finally { reader?.close(); database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("transcript estimates charge the durable SQLite row for inserts, checkpoints and omission", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

@@ -711,11 +711,13 @@ async function settingsCapacityAndDeletionOrderRegression() {
   await until(() => reads >= 2, "capacity event requested authoritative data");
   const capacity = (retainedBytes) => ({ queued: 0, active: 0, recoverable: 0,
     retainedBytes, migrationStatus: "ready", availableForNewWorkBytes: 64 * 1048576 - retainedBytes,
-    diskAllocatedBytes: 3 * 1048576, diskUsageStatus: "measured",
-    limits: { maxQueuedRuns: 32, maxRetainedBytes: 64 * 1048576, reservedRetainedBytes: 1048576 } });
+    diskAllocatedBytes: 3 * 1048576, diskUsageStatus: "measured", availablePhysicalForNewWorkBytes: 5 * 1048576,
+    limits: { maxQueuedRuns: 32, maxRetainedBytes: 64 * 1048576, reservedRetainedBytes: 1048576,
+      maxPhysicalBytes: 10 * 1048576 } });
   changed.resolve(capacity(2 * 1048576));
   await until(() => document.querySelector(".capacity-status")?.textContent.includes("2.0 of 64 MiB"), "new capacity committed");
-  assert(document.querySelector(".capacity-status")?.textContent.includes("Allocated disk: 3.0 MiB (measured)"), "Settings hid measured allocated disk use");
+  assert(document.querySelector(".capacity-status")?.textContent.includes("Allocated disk: 3.0 MiB of 10 MiB budget (measured)"),
+    "Settings hid the measured physical budget");
   initial.resolve(capacity(60 * 1048576));
   await settle();
   assert(document.querySelector(".capacity-status")?.textContent.includes("2.0 of 64 MiB"), "stale capacity replaced event refresh");

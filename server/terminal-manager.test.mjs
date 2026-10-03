@@ -566,6 +566,30 @@ test("restart reconciles an empty native owner but keeps legacy unknown reservat
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("a per-worktree recovery reservation retries native proof before rejecting a new terminal", async () => {
+  const cwd = "/tmp/outright-reservation-retry";
+  const target = "54d20348-0790-4ba8-b888-e05887e4844c";
+  let reservations = [{ target, cwd, pid: 123 }];
+  let probes = 0;
+  const database = {
+    launchDirectory: "/tmp",
+    terminalUnknownReservations: () => reservations,
+    resolveTerminalUnknown: (id) => { assert.equal(id, target); reservations = []; },
+    auditAdmission() {}, auditCritical() {}, auditRequired: async () => {},
+  };
+  const manager = createTerminalManager({ database, publish: () => {}, maxTerminals: 3, maxTerminalsPerCwd: 1,
+    recoverTerminal: async () => ++probes > 1,
+    startManagedTerminal: async () => ({ pid: 456, onData() {}, onExit() {}, terminate: async () => {} }) });
+  await assert.rejects(manager.create({ cwd }), (error) => error.statusCode === 429);
+  assert.equal(probes, 1, "the first full-worktree admission did not retry native verification");
+  assert.equal(manager.capacity().unknown, 1);
+  const created = await manager.create({ cwd });
+  assert.equal(probes, 2, "the next admission did not retry a transient helper failure");
+  assert.equal(created.status, "running");
+  assert.equal(manager.capacity().unknown, 0);
+  await manager.shutdown();
+});
+
 test("offline terminal recovery requires the exclusive runtime lease and records one operator decision", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-operator-"));
   const filename = path.join(directory, "runtime.db");
