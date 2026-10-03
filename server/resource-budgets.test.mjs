@@ -1015,6 +1015,75 @@ test("audit retention protects an unfinished external effect while trimming comp
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("cleanup request admission is bounded and restart records interrupted outcomes", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-cleanup-audit-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  try {
+    for (let index = 0; index < 16; index += 1) {
+      await database.auditRetentionCleanupRequested({ operationId: `cleanup-${index}`, before: "2020-01-01T00:00:00.000Z" });
+    }
+    await assert.rejects(database.auditRetentionCleanupRequested({ operationId: "overflow" }), (error) => error.statusCode === 429);
+    database.close();
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    assert.equal(database.reconcilePendingRetentionCleanup(), 16);
+    assert.equal(database.reconcilePendingRetentionCleanup(), 0);
+    const entries = database.listAudit(100);
+    assert.equal(entries.filter((entry) => entry.action === "retention.cleanup.unknown").length, 16);
+    await database.auditRetentionCleanupRequested({ operationId: "retry", before: "2020-01-01T00:00:00.000Z" });
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("shadow cleanup preserves unresolved audit and live terminal evidence beyond the trim threshold", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-shadow-audit-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  try {
+    const sibling = chat(database, "survivor");
+    const queued = database.createRun(runInput(sibling.id));
+    const recoveringChat = chat(database, "recoverable");
+    const recovering = database.createRun(runInput(recoveringChat.id));
+    database.updateRun(recovering.id, { status: "interrupted" });
+    const archived = chat(database, "oversized archive");
+    const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    const writer = new Database(filename);
+    try {
+      writer.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)");
+      writer.transaction(() => {
+        for (const [action, target, details] of [
+          ["git.commit.requested", "/tmp/pending", { operationId: "git-pending" }],
+          ["terminal.created", "active-terminal", {}],
+          ["retention.cleanup.requested", "", { operationId: "cleanup-pending" }],
+          ["git.stage.requested", "/tmp/settled", { operationId: "settled" }],
+          ["git.stage", "/tmp/settled", { operationId: "settled" }],
+        ]) insert.run(action, target, JSON.stringify(details), "2026-01-01");
+        for (let index = 0; index < 10_050; index += 1) insert.run("telemetry", "", "{}", "2026-01-01");
+        insert.run("git.commit.requested", "/tmp/recent", JSON.stringify({ operationId: "recent" }), "2026-01-01");
+        insert.run("git.commit", "/tmp/recent", JSON.stringify({ operationId: "recent" }), "2026-01-01");
+      }).immediate();
+    } finally { writer.close(); }
+    database.updateConversation(archived.id, { archived: true });
+    ageArchived(filename, [archived.id]);
+    assert.equal((await database.pruneHistory()).deleted, 1);
+    await database.close();
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    const proof = new Database(filename, { readonly: true });
+    try {
+      for (const target of ["/tmp/pending", "active-terminal"]) {
+        assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE target = ?").get(target).count, 1);
+      }
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleanup.requested'").get().count, 1);
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE target = '/tmp/settled'").get().count, 0);
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE target = '/tmp/recent'").get().count, 2);
+      assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= 10_005);
+      assert.equal(database.getRun(queued.id).status, "queued");
+      assert.equal(database.getRun(recovering.id).status, "interrupted");
+      assert.equal(database.capacity().retainedBytes, retainedReadback(proof));
+    } finally { proof.close(); }
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("oversized audit details retain the operation id needed to match an outcome", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { closeSync, openSync, statSync } from "node:fs";
 import { parentPort, workerData } from "node:worker_threads";
 import { archiveShadowPaths, cutoverArchiveShadow, fenceArchiveSource, prepareArchiveShadowCutover } from "./archive-shadow.mjs";
+import { trimAudit } from "./audit-retention.mjs";
 
 const { filename, conversationId, table, rowId, lockGate, cutoverStatGate, copyGate, copyStepGate, copyPhase } = workerData;
 const ownership = {
@@ -133,9 +134,7 @@ try {
     shadow.prepare("UPDATE retained_usage SET legacy_ceiling = MAX(legacy_ceiling, bytes + 1048576) WHERE id = 1").run();
     shadow.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
       .run("retention.archived.deleted", conversationId, "{}", new Date().toISOString());
-    shadow.prepare(`DELETE FROM audit_log WHERE id <= (SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET 9999)
-      AND target NOT IN (SELECT id FROM runs WHERE status IN ('queued', 'launching', 'running')
-        OR (status = 'interrupted' AND recovery_decision IS NULL))`).run();
+    trimAudit(shadow);
   }).immediate();
   if (beforeUsage.measured && shadow.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes >= beforeUsage.bytes) {
     throw new Error("Archive shadow did not debit the reclaimed row");

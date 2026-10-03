@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { MAX_PENDING_RETENTION_CLEANUPS, pendingCleanupSql, trimAudit } from "./audit-retention.mjs";
 import { chmodSync, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, realpathSync, rmSync, statfsSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -446,16 +447,7 @@ export function createOutrightDatabase(options = {}) {
     // The fence survives restart, so interruption cannot expose a partly
     // deleted conversation to a new run or unarchive operation.
     pruneHistory({ before, limit = 100 } = {}) {
-      const maximum = Date.now() - this.getSettings().retentionDays * 86_400_000;
-      const requested = before ?? new Date(maximum).toISOString();
-      const cutoffTime = typeof requested === "string" ? Date.parse(requested) : Number.NaN;
-      if (!Number.isFinite(cutoffTime) || cutoffTime > maximum) {
-        throw databaseError(400, "Retention cutoff must be a valid date within the saved retention window");
-      }
-      // SQLite compares updated_at as ISO text, so bind the parsed instant in
-      // the same format rather than a caller's locale or timezone spelling.
-      const cutoff = new Date(cutoffTime).toISOString();
-      if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw databaseError(400, "Retention limit must be 1 to 1000");
+      const cutoff = this.validateRetentionCutoff(before, limit);
       const ids = db.prepare(`SELECT id FROM conversations WHERE archived = 1 AND (deleting = 1 OR (pinned = 0 AND updated_at < ?))
           AND NOT EXISTS (SELECT 1 FROM runs WHERE conversation_id = conversations.id
             AND (status IN ('queued', 'launching', 'running') OR (status = 'interrupted' AND recovery_decision IS NULL)))
@@ -482,6 +474,19 @@ export function createOutrightDatabase(options = {}) {
         }
         return { deleted: deleted.length, deferred, ids: deleted };
       })();
+    },
+    validateRetentionCutoff(before, limit = 100) {
+      const maximum = Date.now() - this.getSettings().retentionDays * 86_400_000;
+      const requested = before ?? new Date(maximum).toISOString();
+      const cutoffTime = typeof requested === "string" ? Date.parse(requested) : Number.NaN;
+      if (!Number.isFinite(cutoffTime) || cutoffTime > maximum) {
+        throw databaseError(400, "Retention cutoff must be a valid date within the saved retention window");
+      }
+      // SQLite compares updated_at as ISO text, so bind the parsed instant in
+      // the same format rather than a caller's locale or timezone spelling.
+      const cutoff = new Date(cutoffTime).toISOString();
+      if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw databaseError(400, "Retention limit must be 1 to 1000");
+      return cutoff;
     },
     listGroups() {
       const groups = db.prepare("SELECT id, name, position, created_at AS createdAt FROM project_groups ORDER BY position, created_at").all();
@@ -1375,6 +1380,38 @@ export function createOutrightDatabase(options = {}) {
         }
       }
     },
+    async auditRetentionCleanupRequested(details) {
+      while (true) {
+        if (closing) throw databaseError(503, "Runtime closed before retention cleanup could start");
+        if (maintenance || !db) {
+          if (!deletionWorkers.size) throw databaseError(503, "Archive maintenance is running; retry shortly");
+          await new Promise((resolve) => deletionIdleWaiters.add(resolve));
+          continue;
+        }
+        try {
+          db.transaction(() => {
+            if (db.prepare(`SELECT 1 FROM (${pendingCleanupSql}) LIMIT ?`).all(MAX_PENDING_RETENTION_CLEANUPS).length
+              >= MAX_PENDING_RETENTION_CLEANUPS) {
+              throw databaseError(429, "Too many interrupted retention requests; retry after recovery");
+            }
+            writeCriticalAudit("retention.cleanup.requested", details);
+          }).immediate();
+          return;
+        } catch (error) {
+          if (!deletionWorkers.size || !["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code)) throw error;
+          await new Promise((resolve) => deletionIdleWaiters.add(resolve));
+        }
+      }
+    },
+    reconcilePendingRetentionCleanup() {
+      // This runtime owns the database lease. A request without an outcome
+      // after restart may have partly deleted an archive, so report unknown.
+      const pending = db.prepare(pendingCleanupSql).all();
+      for (const row of pending) writeCriticalAudit("retention.cleanup.unknown", {
+        operationId: row.operationId, reason: "runtime restarted before cleanup outcome",
+      });
+      return pending.length;
+    },
     listAudit(limit = 100) {
       const bounded = Math.max(1, Math.min(500, Number(limit) || 100));
       return db.prepare("SELECT id, action, target, details, created_at AS createdAt FROM audit_log ORDER BY id DESC LIMIT ?").all(bounded).map(hydrateDetails);
@@ -1729,20 +1766,6 @@ function recoverArchiveOnWorker(filename, sourceUnmoved = false, runtimeLease = 
       else resolve();
     });
   });
-}
-
-function trimAudit(db) {
-  db.prepare(`DELETE FROM audit_log WHERE id <= (SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET 9999)
-    AND target NOT IN (SELECT id FROM runs WHERE status IN ('queued', 'launching', 'running')
-      OR (status = 'interrupted' AND recovery_decision IS NULL))
-    AND NOT ((action LIKE '%.requested'
-      AND (CASE WHEN json_valid(details) THEN json_extract(details, '$.operationId') END) IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > audit_log.id
-        AND (CASE WHEN json_valid(outcome.details) THEN json_extract(outcome.details, '$.operationId') END)
-          = json_extract(audit_log.details, '$.operationId')))
-      OR (action = 'terminal.created'
-        AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > audit_log.id
-          AND outcome.target = audit_log.target AND outcome.action IN ('terminal.exited', 'terminal.closed'))))`).run();
 }
 
 function migrate(db) {

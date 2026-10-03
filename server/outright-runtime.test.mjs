@@ -68,7 +68,7 @@ function withRuntime(fn, options = {}) {
     const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-"));
     process.env.OUTRIGHT_DATA_DIR = dataDirectory;
     const { seed, ...runtimeOptions } = options;
-    seed?.(dataDirectory);
+    await seed?.(dataDirectory);
     const runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json", ...runtimeOptions });
     try {
       // The runtime wires its own database, manager, and event hub, so the
@@ -174,6 +174,7 @@ test("run detail pages a migrated oversized replay tail without returning pruned
 test("retention HTTP rejects invalid and future cutoffs without deleting fresh archived history", withRuntime(async (runtime) => {
   const chat = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Fresh archive", provider: "codex" });
   runtime.database.updateConversation(chat.id, { archived: true });
+  const beforeAudit = runtime.database.listAudit(500).length;
   for (const before of ["nonsense", "9999-01-01T00:00:00.000Z", new Date(Date.now() + 60_000).toISOString(),
     new Date(Date.now() + 86_400_000).toISOString().replace("Z", "+00:00")]) {
     const response = responseCapture();
@@ -181,6 +182,12 @@ test("retention HTTP rejects invalid and future cutoffs without deleting fresh a
     assert.equal(response.statusCode, 400);
     assert.ok(runtime.database.getConversation(chat.id));
   }
+  for (let index = 0; index < 20; index += 1) {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", { before: "invalid" }), response);
+    assert.equal(response.statusCode, 400);
+  }
+  assert.equal(runtime.database.listAudit(500).length, beforeAudit, "malformed cleanup accumulated pending audit rows");
   const oldInstant = new Date(Date.now() - 95 * 86_400_000);
   const offsetCutoff = `${new Date(oldInstant.getTime() + 5.5 * 3_600_000).toISOString().slice(0, 19)}+05:30`;
   for (const before of ["Jan 1 2000", offsetCutoff]) {
@@ -196,6 +203,34 @@ test("retention HTTP rejects invalid and future cutoffs without deleting fresh a
   assert.equal(normal.body.deleted, 0);
   assert.ok(runtime.database.getConversation(chat.id));
 }));
+
+test("accepted cleanup failure records a correlated unknown outcome before returning an error", withRuntime(async (runtime) => {
+  const original = runtime.database.pruneHistory;
+  runtime.database.pruneHistory = async () => { throw Object.assign(new Error("cleanup interrupted"), { statusCode: 503 }); };
+  try {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", {}), response);
+    assert.equal(response.statusCode, 503);
+    const entries = runtime.database.listAudit(10);
+    const request = entries.find((entry) => entry.action === "retention.cleanup.requested");
+    const outcome = entries.find((entry) => entry.action === "retention.cleanup.unknown");
+    assert.ok(request);
+    assert.equal(outcome?.details.operationId, request.details.operationId);
+    assert.ok(outcome.id > request.id);
+  } finally { runtime.database.pruneHistory = original; }
+}));
+
+test("runtime startup classifies an interrupted cleanup request before serving work", withRuntime(async (runtime) => {
+  const entries = runtime.database.listAudit(20);
+  const request = entries.find((entry) => entry.action === "retention.cleanup.requested");
+  const outcome = entries.find((entry) => entry.action === "retention.cleanup.unknown");
+  assert.ok(request);
+  assert.equal(outcome?.details.operationId, request.details.operationId);
+}, { async seed(dataDirectory) {
+  const database = createOutrightDatabase({ filename: path.join(dataDirectory, "outright.db") });
+  await database.auditRetentionCleanupRequested({ operationId: "interrupted-cleanup", before: "2020-01-01T00:00:00.000Z" });
+  database.close();
+} }));
 
 test("retention HTTP normalizes timezone cutoffs and keeps unfinished archived runs", withRuntime(async (runtime) => {
   const database = runtime.database;

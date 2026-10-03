@@ -28,6 +28,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   // before reconciliation reads any record, rather than waiting for the agent
   // manager to initialize after recovery has already classified pending rows.
   if (process.platform === "win32") hardenWindowsLaunchDirectory(database.launchDirectory);
+  database.reconcilePendingRetentionCleanup();
   const reconciliation = database.reconcileInterruptedRuns({
     probeAlive: (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync),
   });
@@ -178,10 +179,18 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/retention/cleanup" && request.method === "POST") {
         const body = await readJson(request);
         if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Retention request must be a JSON object");
+        const cutoff = database.validateRetentionCutoff(body.before);
         const operationId = randomUUID();
-        await database.auditRequired("retention.cleanup.requested", { operationId, before: body.before ?? "saved retention window" });
-        const result = await database.pruneHistory({ before: body.before, limit: 100 });
-        await database.auditRequired("retention.cleaned", { operationId, deleted: result.deleted, deferred: result.deferred, before: body.before ?? "saved retention window" });
+        await database.auditRetentionCleanupRequested({ operationId, before: cutoff });
+        let result;
+        try {
+          result = await database.pruneHistory({ before: cutoff, limit: 100 });
+        } catch (error) {
+          await database.auditRequired("retention.cleanup.unknown", { operationId, before: cutoff,
+            reason: "cleanup failed after admission", error: error.message });
+          throw error;
+        }
+        await database.auditRequired("retention.cleaned", { operationId, deleted: result.deleted, deferred: result.deferred, before: cutoff });
         agents.resumeQueued();
         return json(response, 200, { deleted: result.deleted, deferred: result.deferred, capacity: database.capacity() });
       }
