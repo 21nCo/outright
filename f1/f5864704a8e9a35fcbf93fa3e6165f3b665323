@@ -1,0 +1,22 @@
+server/archive-delete-worker.mjs
+  h_a39f9495f9ec1d 4,174-177,188,194-195,202-203
+server/archive-shadow.mjs
+  h_a39f9495f9ec1d 127-164,244,256,290-291,303-304,313-314
+server/archive-shadow.test.mjs
+  h_a39f9495f9ec1d 9,81-129
+server/database.mjs
+  h_a39f9495f9ec1d 118,246-253,257-258,1592
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 1245,1268-1277,1286-1287,1293,1302-1304
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f1f5864704a8e9a35fcbf93fa3e6165f3b665323",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
