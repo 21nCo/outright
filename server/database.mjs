@@ -293,7 +293,7 @@ export function createOutrightDatabase(options = {}) {
     }
     return usage;
   }
-  function withinRetainedBudget(write, reserve = retainedReserveBytes) {
+  function withinRetainedBudget(write, reserve = retainedReserveBytes, allowPhysicalArchive = false) {
     if (migrationPending(db)) throw databaseError(507, "Retained history is being migrated; retry when capacity is available");
     // WAL pages can grow under an external reader even while a checkpoint
     // upsert keeps the logical retained count flat. Stop optional writes at
@@ -301,7 +301,9 @@ export function createOutrightDatabase(options = {}) {
     // required paths and the reserved physical headroom.
     const maxRetainedBytes = configuredRetainedLimitBytes();
     const allocated = physicalUsageForAdmission(maxRetainedBytes * RESOURCE_BUDGETS.physicalDatabaseMultiplier);
-    if (allocated.bytes !== null && allocated.bytes >= maxRetainedBytes * RESOURCE_BUDGETS.physicalDatabaseMultiplier) {
+    const physicalThreshold = maxRetainedBytes * RESOURCE_BUDGETS.physicalDatabaseMultiplier;
+    if (allocated.bytes !== null && allocated.bytes >= physicalThreshold
+      && (!allowPhysicalArchive || allocated.bytes >= physicalThreshold + RESOURCE_BUDGETS.physicalArchiveHeadroomBytes)) {
       throw databaseError(507, "Allocated database storage is full; close long-running readers and clean archived history");
     }
     try { return db.transaction(() => {
@@ -598,7 +600,8 @@ export function createOutrightDatabase(options = {}) {
       return this.getConversation(id);
     },
     updateConversation(id, patch) {
-      if (db.prepare("SELECT deleting FROM conversations WHERE id = ?").get(id)?.deleting) {
+      const current = db.prepare("SELECT archived, deleting FROM conversations WHERE id = ?").get(id);
+      if (current?.deleting) {
         throw databaseError(409, "Archived conversation deletion is in progress");
       }
       if (patch.archived !== undefined && typeof patch.archived !== "boolean") {
@@ -610,6 +613,8 @@ export function createOutrightDatabase(options = {}) {
       if (patch.archived === true && this.findUnresolvedInterruptedRun(id)) {
         throw databaseError(409, "Resolve the interrupted run before archiving this conversation");
       }
+      const archiveOnly = patch.archived === true && Object.keys(patch).length === 1;
+      if (archiveOnly && current?.archived) return this.getConversation(id);
       const fields = [];
       const values = [];
       for (const [key, column] of Object.entries({ title: "title", provider: "provider", model: "model", archived: "archived", pinned: "pinned", providerSessionId: "provider_session_id", tabPosition: "tab_position" })) {
@@ -621,7 +626,10 @@ export function createOutrightDatabase(options = {}) {
         fields.push("updated_at = ?");
         values.push(now(), id);
         const update = () => db.prepare(`UPDATE conversations SET ${fields.join(", ")} WHERE id = ?`).run(...values);
-        withinRetainedBudget(update);
+        // Archiving makes old history eligible for cleanup even after the
+        // physical new-work gate closes. Use only half of the separate
+        // recovery headroom so run and audit outcomes retain space.
+        withinRetainedBudget(update, retainedReserveBytes, archiveOnly);
       }
       return this.getConversation(id);
     },

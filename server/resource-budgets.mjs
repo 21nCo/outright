@@ -6,6 +6,7 @@ export const RESOURCE_BUDGETS = Object.freeze({
   maxRetainedMiB: 512,
   physicalDatabaseMultiplier: 4,
   physicalRecoveryReserveBytes: 64 * 1024 * 1024,
+  physicalArchiveHeadroomBytes: 32 * 1024 * 1024,
   retentionDays: 90,
   maxRunTranscriptItems: 2000,
   maxRunTranscriptBytes: 16 * 1024 * 1024,

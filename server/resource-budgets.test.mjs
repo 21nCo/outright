@@ -70,7 +70,7 @@ function ageArchived(filename, ids) {
   admin.close();
 }
 
-test("a pinned SQLite reader cannot turn repeated checkpoints into unbounded physical admission", { timeout: 60_000 }, () => {
+test("a pinned SQLite reader cannot turn repeated checkpoints into unbounded physical admission", { timeout: 60_000 }, async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-physical-wal-"));
   const filename = path.join(directory, "outright.db");
   const database = createOutrightDatabase({ filename });
@@ -102,12 +102,20 @@ test("a pinned SQLite reader cannot turn repeated checkpoints into unbounded phy
     database.auditCritical("storage.physical.limit", { target: conversation.id });
     assert.ok(database.listAudit().some((entry) => entry.action === "storage.physical.limit"),
       "physical refusal consumed the recovery audit reserve");
+    assert.throws(() => database.updateConversation(conversation.id, { archived: true, title: "extra metadata" }),
+      (error) => error.statusCode === 507, "an archive request smuggled an optional metadata write through recovery headroom");
+    const archived = database.updateConversation(conversation.id, { archived: true });
+    assert.equal(archived.archived, 1, "physical new-work refusal also blocked archive recovery");
+    assert.ok(database.listDeletableArchivedConversations().conversations.some((entry) => entry.id === conversation.id),
+      "the only reclaimable conversation was not eligible for cleanup");
     reader.exec("COMMIT");
     reader.close();
     reader = null;
     const checkpoint = new Database(filename);
     try { checkpoint.pragma("wal_checkpoint(TRUNCATE)"); }
     finally { checkpoint.close(); }
+    assert.equal((await database.deleteArchivedConversation(conversation.id, conversation.id)).deleted, 1,
+      "archive cleanup did not reclaim the physical-budgeted conversation");
     assert.ok(database.capacity().availablePhysicalForNewWorkBytes > 64 * 1024);
     assert.equal(database.canLaunchRun(), true, "verified WAL reclamation did not reopen run admission");
   } finally { reader?.close(); database.close(); rmSync(directory, { recursive: true, force: true }); }
