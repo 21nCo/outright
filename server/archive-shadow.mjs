@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { acquireWindowsArchiveLock } from "./archive-windows-lock.mjs";
 
 // The runtime lease is held by the caller for every transition. The source
 // database is closed only for the final rename. Large SQLite work happens in
@@ -51,8 +52,13 @@ export function beginArchiveShadow(filename) {
   durableDirectory(state);
 }
 
-function candidateIdentity(filename, hash = false) {
-  if (!privateRegularFile(filename)) return null;
+function candidateIdentity(filename, hash = false, allowLinked = false) {
+  if (!allowLinked && !privateRegularFile(filename)) return null;
+  if (allowLinked) {
+    const info = fileInfo(filename);
+    if (!info) return null;
+    if (!info.isFile() || info.nlink < 1 || info.nlink > 2) throw new Error(`Unsafe archive maintenance file: ${filename}`);
+  }
   const fd = openSync(filename, constants.O_RDONLY | (process.platform === "win32" ? 0 : constants.O_NOFOLLOW));
   try {
     const info = fstatSync(fd, { bigint: true });
@@ -101,12 +107,15 @@ function writeArchiveMarker(state, marker) {
   durableDirectory(state);
 }
 
-function matchesCandidate(filename, candidate, hash = false, renamed = false) {
+function candidateMatchesIdentity(current, candidate, hash = false, renamed = false) {
   if (!candidate) return false;
-  const current = candidateIdentity(filename, hash);
   const identityLength = renamed ? 4 : 5; // rename can change ctime without changing file contents.
   return current && JSON.stringify(current.identity.slice(0, identityLength)) === JSON.stringify(candidate.identity.slice(0, identityLength))
     && (!hash || current.digest === candidate.digest);
+}
+
+function matchesCandidate(filename, candidate, hash = false, renamed = false, allowLinked = false) {
+  return candidateMatchesIdentity(candidateIdentity(filename, hash, allowLinked), candidate, hash, renamed);
 }
 
 function authenticatedCandidate(filename, marker, renamed = false) {
@@ -275,9 +284,27 @@ function finishLinkedCandidate(filename, next, old, marker) {
   // A crash between exclusive link creation and unlink leaves two names for
   // the same candidate inode. Lock it before dropping the redundant private
   // name; the public name and every committed byte remain available.
-  const db = lockArchiveDatabase(filename);
-  try { rmSync(next); durableDirectory(filename); }
-  finally { db.close(); }
+  if (process.platform === "win32") {
+    const candidateBefore = candidateIdentity(filename, true, true);
+    if (!candidateMatchesIdentity(candidateBefore, marker.candidate, true, true) || hasNonemptyWal(filename)) {
+      throw new Error("Archive linked candidate failed authentication");
+    }
+    const release = acquireWindowsArchiveLock([filename]);
+    try {
+      const live = fileInfo(filename);
+      const privateLink = fileInfo(next);
+      if (!live || !privateLink || live.dev !== privateLink.dev || live.ino !== privateLink.ino
+        || !matchesCandidate(filename, candidateBefore, false, false, true)) {
+        throw new Error("Archive candidate changed while finishing its promotion link");
+      }
+      rmSync(next);
+      durableDirectory(filename);
+    } finally { release(); }
+  } else {
+    const db = lockArchiveDatabase(filename);
+    try { rmSync(next); durableDirectory(filename); }
+    finally { db.close(); }
+  }
 }
 
 function finishLinkedSource(filename, next, old, marker) {
@@ -287,13 +314,45 @@ function finishLinkedSource(filename, next, old, marker) {
     || publicInfo.nlink !== 2 || oldInfo.nlink !== 2 || !publicInfo.isFile() || !oldInfo.isFile()
     || String(publicInfo.dev) !== marker.sourceSnapshot?.dev
     || String(publicInfo.ino) !== marker.sourceSnapshot?.ino) return;
+  if (process.platform === "win32") {
+    // Checkpoint the restored source before obtaining the helper's SQLite
+    // lock. No SQLite connection may remain open across Windows unlink.
+    if (hasNonemptyWal(old)) {
+      const source = lockArchiveDatabase(filename);
+      try {
+        const checkpoint = source.pragma("wal_checkpoint(TRUNCATE)")[0];
+        if (checkpoint?.busy || source.pragma("journal_mode = DELETE", { simple: true }).toLowerCase() !== "delete") {
+          throw new Error("Restored archive source WAL could not be checkpointed");
+        }
+      } finally { source.close(); }
+      removeCheckpointedSidecars(old);
+    }
+    const candidateBefore = fileInfo(next) ? candidateIdentity(next, true) : null;
+    if (candidateBefore && (!candidateMatchesIdentity(candidateBefore, marker.candidate, true, true)
+      || hasNonemptyWal(next))) {
+      throw new Error("Archive candidate changed after source restoration; preserve both databases");
+    }
+    const release = acquireWindowsArchiveLock([filename, ...(candidateBefore ? [next] : [])]);
+    try {
+      const live = fileInfo(filename);
+      const fallback = fileInfo(old);
+      if (!live || !fallback || live.dev !== fallback.dev || live.ino !== fallback.ino
+        || hasNonemptyWal(old) || (candidateBefore && !matchesCandidate(next, candidateBefore))) {
+        throw new Error("Archive restoration changed before linked-source cleanup");
+      }
+      discardShadowCandidate(next);
+      rmSync(old);
+      durableDirectory(filename);
+    } finally { release(); }
+    return;
+  }
   let sourceDb;
   let candidateDb;
   try {
     sourceDb = lockArchiveDatabase(filename);
     if (fileInfo(next)) {
       candidateDb = lockArchiveDatabase(next);
-      if (!authenticatedCandidate(next, marker)) {
+      if (!authenticatedCandidate(next, marker, true)) {
         throw new Error("Archive candidate changed after source restoration; preserve both databases");
       }
     }
@@ -313,7 +372,73 @@ function finishLinkedSource(filename, next, old, marker) {
   }
 }
 
+function recoverPinnedInterruptedCutoverWindows(filename, next, old, marker) {
+  const candidatePath = fileInfo(filename) ? filename : next;
+  const candidateExists = Boolean(fileInfo(candidatePath));
+  const sourceHadWal = hasNonemptyWal(old);
+  if (sourceHadWal) {
+    const source = lockArchiveDatabase(old);
+    try {
+      const checkpoint = source.pragma("wal_checkpoint(TRUNCATE)")[0];
+      if (checkpoint?.busy || source.pragma("journal_mode = DELETE", { simple: true }).toLowerCase() !== "delete") {
+        throw new Error("Changed archive source WAL could not be checkpointed");
+      }
+    } finally { source.close(); }
+    removeCheckpointedSidecars(old);
+  }
+  // Validate with SQLite before the OS lock, then pin and recheck the exact
+  // bytes under that lock. Validation and file promotion never overlap an
+  // open SQLite handle on Windows.
+  if (!validDatabase(old)) throw new Error("Changed archive source failed integrity validation");
+  if (candidateExists && !authenticatedCandidate(candidatePath, marker, true)) {
+    throw new Error("Promoted archive database changed after interruption; preserve both databases");
+  }
+  const oldBefore = sourceSnapshot(old);
+  const candidateBefore = candidateExists ? candidateIdentity(candidatePath, true) : null;
+  if (candidateBefore && !candidateMatchesIdentity(candidateBefore, marker.candidate, true, true)) {
+    throw new Error("Promoted archive candidate changed before its lock");
+  }
+  const release = acquireWindowsArchiveLock([old, ...(candidateExists ? [candidatePath] : [])]);
+  try {
+    if (!sourceMatchesSnapshot(old, oldBefore) || hasNonemptyWal(old)
+      || (candidateExists && (!matchesCandidate(candidatePath, candidateBefore)
+        || hasNonemptyWal(candidatePath)))) {
+      throw Object.assign(new Error("Archive recovery changed before its lock; retry"), { code: "ARCHIVE_SOURCE_BUSY" });
+    }
+    const sourceChanged = sourceHadWal || !sourceMatchesSnapshot(old, marker.sourceSnapshot);
+    if (sourceChanged || !candidateExists) {
+      if (candidatePath === filename && candidateExists) {
+        linkSync(filename, next);
+        durableDirectory(filename);
+        rmSync(filename);
+        durableDirectory(filename);
+      }
+      linkSync(old, filename);
+      durableDirectory(filename);
+      durableFile(filename);
+      discardShadowCandidate(next);
+      rmSync(old);
+      durableDirectory(filename);
+      return;
+    }
+    if (candidatePath === next) {
+      linkSync(next, filename);
+      durableDirectory(filename);
+      rmSync(next);
+      durableDirectory(filename);
+      if (!matchesCandidate(filename, marker.candidate, false, true)) {
+        throw new Error("Archive candidate changed during recovery promotion");
+      }
+    }
+    durableFile(filename);
+    durableDirectory(filename);
+    rmSync(old);
+    durableDirectory(filename);
+  } finally { release(); }
+}
+
 function recoverPinnedInterruptedCutover(filename, next, old, marker) {
+  if (process.platform === "win32") return recoverPinnedInterruptedCutoverWindows(filename, next, old, marker);
   // Once a crashed process releases SQLite's locks, a direct sibling may
   // write either inode. Lock both before deciding, and keep those locks until
   // the rejected inode is removed. A snapshot-only check has a second race.
@@ -332,7 +457,9 @@ function recoverPinnedInterruptedCutover(filename, next, old, marker) {
       removeCheckpointedSidecars(old);
     }
     const sourceChanged = sourceHadWal || !sourceMatchesSnapshot(old, marker.sourceSnapshot);
-    const candidateMatches = candidateDb && authenticatedCandidate(candidatePath, marker, candidatePath === filename);
+    // A rollback can move the same candidate inode back to `next`, changing
+    // ctime without changing its authenticated contents.
+    const candidateMatches = candidateDb && authenticatedCandidate(candidatePath, marker, true);
     if (candidateDb && !candidateMatches) {
       throw new Error("Promoted archive database changed after interruption; preserve both databases");
     }
@@ -448,16 +575,21 @@ export function cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate } =
   if (!markerOwnsDatabase(marker, filename) || marker.version !== 2 || !matchesCandidate(next, marker.candidate)) {
     throw new Error("Archive cutover candidate changed after validation");
   }
-  // Hold SQLite's exclusive locks on both inodes until the old source is
-  // removed. Row triggers alone cannot fence CREATE TABLE, DROP TRIGGER or
-  // PRAGMA writes from a direct sibling connection. If this platform cannot
-  // rename an open SQLite file, defer before losing any committed write.
+  // Hold exclusive SQLite locks on both inodes until the old source is
+  // removed. Windows uses a native owner with share-delete handles because
+  // an open SQLite connection itself prevents rename there. Row triggers
+  // alone cannot fence CREATE TABLE, DROP TRIGGER or PRAGMA writes.
   let sourceDb;
   let candidateDb;
+  let releaseWindowsLock;
   let promoted = false;
   try {
-    sourceDb = lockArchiveDatabase(filename);
-    candidateDb = lockArchiveDatabase(next);
+    if (process.platform === "win32") {
+      releaseWindowsLock = acquireWindowsArchiveLock([filename, next]);
+    } else {
+      sourceDb = lockArchiveDatabase(filename);
+      candidateDb = lockArchiveDatabase(next);
+    }
     cutoverArchiveShadowLocked(filename, { sourceInfo, cutoverStatGate, state, next, old, marker });
     promoted = true;
   } catch (error) {
@@ -468,6 +600,7 @@ export function cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate } =
   } finally {
     candidateDb?.close();
     sourceDb?.close();
+    releaseWindowsLock?.();
   }
   if (promoted) {
     // The old inode is gone, so any subsequent public-path commit must stay
@@ -545,11 +678,17 @@ export function allocatedDatabaseUsage(filename) {
     const markerBefore = inspect(state);
     let bytes = 0;
     let transition = false;
+    const chargedLinks = new Set();
     for (const part of [...sqliteFiles, state, `${state}.tmp`]) {
       const info = inspect(part);
       if (!info) continue;
       if (!info.isFile()) throw new Error(`Unsafe database storage file: ${part}`);
       if (part === state || part === `${state}.tmp`) transition = true;
+      if (info.nlink > 1 && info.ino > 0) {
+        const identity = `${info.dev}:${info.ino}`;
+        if (chargedLinks.has(identity)) continue;
+        chargedLinks.add(identity);
+      }
       const allocated = typeof info.blocks === "number" ? info.blocks * 512 : 0;
       bytes += allocated > 0 ? allocated : info.size;
     }

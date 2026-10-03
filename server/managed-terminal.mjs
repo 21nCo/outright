@@ -60,19 +60,39 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
   let verified = false;
   let readySeen = false;
   let shellExited = false;
+  let windowsProcessIdentity;
   const verifyEmpty = async (signal, exitCode) => {
     if (process.platform === "linux") return !existsSync(ownership.handshakePath);
     if (process.platform === "darwin") {
+      let status;
       try {
         const probe = await subprocesses.run(AGENT_SUPERVISOR, ["--probe", ownership.label],
           { encoding: "utf8", timeout: 1500, maxBuffer: 4096 });
-        return ["absent", "exited"].includes(probe.stdout.trim());
+        status = probe.stdout.trim();
       } catch (error) {
-        return ["absent", "exited"].includes(error.stdout?.trim());
+        status = error.stdout?.trim();
       }
+      if (status === "absent") return true;
+      if (status !== "exited") return false;
+      try { await subprocesses.run(AGENT_SUPERVISOR, ["--terminate", ownership.label],
+        { encoding: "utf8", timeout: 5000, maxBuffer: 4096 }); }
+      catch { return false; }
+      try { return (await subprocesses.run(AGENT_SUPERVISOR, ["--probe", ownership.label],
+        { encoding: "utf8", timeout: 1500, maxBuffer: 4096 })).stdout.trim() === "absent"; }
+      catch (error) { return error.stdout?.trim() === "absent"; }
     }
-    return process.platform === "win32" && signal == null && Number.isInteger(exitCode)
-      && (exitCode < 70 || exitCode > 79);
+    if (process.platform !== "win32" || signal != null || !Number.isInteger(exitCode)) return false;
+    if (exitCode < 70 || exitCode > 79) return true;
+    // A shell may legitimately exit with a code reserved for native startup
+    // failures. Once launch identity was observed, prove this exact Job Object
+    // owner has exited instead of classifying the shell code as unknown.
+    if (!windowsProcessIdentity) return false;
+    try {
+      const probe = await subprocesses.run(AGENT_SUPERVISOR,
+        ["--probe", String(child.pid), windowsProcessIdentity],
+        { encoding: "utf8", timeout: 1500, maxBuffer: 4096 });
+      return probe.stdout.trim() === "absent";
+    } catch (error) { return error.stdout?.trim() === "absent"; }
   };
   const closeResult = new Promise((resolve) => {
     child.on("error", (error) => { stderr = `${stderr}${error.message}`.slice(-2048); });
@@ -153,7 +173,8 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
       const result = await subprocesses.run(AGENT_SUPERVISOR, ["--identity", String(child.pid)],
         { encoding: "utf8", timeout: 1500, maxBuffer: 4096 });
       if (!/^\d+$/.test(result.stdout.trim())) throw new Error("Windows PTY supervisor identity is unavailable");
-      adapter.processIdentity = result.stdout.trim();
+      windowsProcessIdentity = result.stdout.trim();
+      adapter.processIdentity = windowsProcessIdentity;
     }
     return adapter;
   } catch (error) {
@@ -179,13 +200,13 @@ export async function recoverManagedTerminal({ target, created, ownershipLabel, 
     };
     for (let attempt = 0; attempt < 5; attempt += 1) {
       let status = await probe();
-      if (status === "absent" || status === "exited") return true;
-      if (status === "alive") {
+      if (status === "absent") return true;
+      if (status === "alive" || status === "exited") {
         try { await subprocesses.run(AGENT_SUPERVISOR, ["--terminate", label],
           { encoding: "utf8", timeout: 5000, maxBuffer: 4096 }); }
         catch { /* The owner may be finishing concurrently; probe again. */ }
         status = await probe();
-        if (status === "absent" || status === "exited") return true;
+        if (status === "absent") return true;
       }
       if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 75));
     }
@@ -199,13 +220,14 @@ export async function recoverManagedTerminal({ target, created, ownershipLabel, 
     const pid = Number(handshake.pid);
     if (!Number.isSafeInteger(pid) || pid <= 0 || !handshake.processIdentity
       || linuxProcessIdentity(pid) !== handshake.processIdentity) return false;
-    try { await subprocesses.run(AGENT_SUPERVISOR, ["--terminate-owned", String(pid), handshake.processIdentity],
+    try { await subprocesses.run(AGENT_SUPERVISOR, ["--terminate-owned", String(pid), handshake.processIdentity, handshakePath],
       { encoding: "utf8", timeout: 1500, maxBuffer: 4096 }); }
     catch { return false; }
     for (let retry = 0; retry < 100; retry += 1) {
       if (!existsSync(handshakePath)) return true;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
+    return !existsSync(handshakePath);
   }
   if (process.platform === "win32" && Number.isSafeInteger(pid) && pid > 0
     && typeof processIdentity === "string" && /^\d+$/.test(processIdentity)) {

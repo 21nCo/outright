@@ -164,7 +164,12 @@ const teardown = () => {
   teardownStarted = true;
   if (providerGone) finishWhenOwnedGroupIsEmpty();
   else {
-    try { provider.kill("SIGTERM"); } catch { /* Already gone. */ }
+    // Windows uses the supervisor's stdin as the Job Object control channel.
+    // Killing that supervisor first would let the wrapper report completion
+    // without observing its owned descendants leave the job.
+    if (process.platform === "win32" && executable === ${JSON.stringify(AGENT_SUPERVISOR)}) {
+      try { provider.stdin.end("stop\\n"); } catch { /* The owner already exited. */ }
+    } else try { provider.kill("SIGTERM"); } catch { /* Already gone. */ }
     // The production supervisor owns its descendants and its own escalation:
     // never kill it before it has reaped them. For a direct child (including
     // the wrapper's coalesced go/stop fixture), retain this parent as the
@@ -211,7 +216,9 @@ process.stdin.on("data", (chunk) => {
       // restart recovery never mistakes the pre-submit race for an exited run.
       provider = spawn(executable, commandArgs, darwinLaunch
         ? { stdio: ["ignore", "inherit", "inherit", "pipe"], env: { ...process.env, OUTRIGHT_LAUNCH_GATE_FD: "3" } }
-        : { stdio: ["ignore", "inherit", "inherit"] });
+        : { stdio: [process.platform === "win32" && executable === ${JSON.stringify(AGENT_SUPERVISOR)}
+          ? "pipe" : "ignore", "inherit", "inherit"] });
+      provider.stdin?.on?.("error", () => {});
       // Durable provider identity: escalation targets the provider alone so this
       // wrapper — the provider's parent — survives to reap it. Without this, a
       // group-wide SIGKILL kills the wrapper first and a killed-but-unreaped
@@ -262,7 +269,10 @@ process.stdin.on("data", (chunk) => {
 // The runtime went away before authorizing the launch: exit without ever
 // starting the provider, so an abandoned handshake can never mutate the
 // worktree.
-process.stdin.on("end", () => { if (!authorized) { try { fs.unlinkSync(handshakePath); } catch {} process.exit(0); } });
+process.stdin.on("end", () => {
+  if (!authorized) { try { fs.unlinkSync(handshakePath); } catch {} process.exit(0); }
+  teardown();
+});
 `;
 
 function supervisorCommand(args, timeout) {

@@ -247,12 +247,15 @@ function displayWorktreeName(worktree, projectName) {
 async function mapWithConcurrency(items, concurrency, mapper) {
   const results = new Array(items.length);
   let cursor = 0;
+  let failure;
   async function worker() {
-    while (cursor < items.length) {
+    while (!failure && cursor < items.length) {
       const index = cursor++;
-      results[index] = await mapper(items[index], index);
+      try { results[index] = await mapper(items[index], index); }
+      catch (error) { failure ??= error; }
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  if (failure) throw failure;
   return results;
 }

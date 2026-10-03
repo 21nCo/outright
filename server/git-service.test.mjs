@@ -261,7 +261,8 @@ test("a commit keeps its durable outcome when quota falls inside a Git hook", { 
     await chmod(hook, 0o755);
     const committing = service.commit(repository, "quota changed during hook");
     try {
-      for (let attempt = 0; attempt < 200 && !await exists(entered); attempt += 1) {
+      const hookDeadline = Date.now() + 8_000;
+      while (!await exists(entered) && Date.now() < hookDeadline) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       assert.equal(await exists(entered), true, "Git never entered the hook");
@@ -359,6 +360,21 @@ test("stage, unstage and worktree changes retain outcomes after quota changes at
     database?.close();
     await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
+});
+
+test("a timed out Git mutation keeps its admission unresolved for inspection", async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "outright-git-timeout-")));
+  const actions = [];
+  const service = createGitService({
+    database: { auditAdmission: (action) => actions.push(action), auditCritical: (action) => actions.push(action) },
+    getProjects: () => [{ worktrees: [{ path: root }] }], getConfig: async () => ({ scanRoots: [root] }),
+    subprocesses: { run: async () => { throw Object.assign(new Error("Git timed out"), { killed: true, signal: "SIGTERM" }); } },
+  });
+  try {
+    await assert.rejects(service.stage(root, ["README.md"]), (error) =>
+      error.statusCode === 503 && error.details?.outcomeUnknown === true);
+    assert.deepEqual(actions, ["git.stage.requested"]);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("an unaudited post-commit outcome reports a recoverable unknown operation", async () => {

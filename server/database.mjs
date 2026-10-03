@@ -1460,8 +1460,9 @@ export function createOutrightDatabase(options = {}) {
     },
     terminalUnknownReservations() {
       // The lease owner cannot prove that a previous owner's orphaned PTY
-      // tree died. Keep a bounded sample of unresolved targets charged against
-      // terminal capacity. A verified exit/close is the only release signal.
+      // tree died. Read one more than the largest permitted terminal quota,
+      // so an old backlog cannot silently undercharge a larger configuration.
+      // A verified exit/close is the only release signal.
       return db.prepare(`SELECT target, MAX(cwd) AS cwd,
           MAX(ownershipLabel) AS ownershipLabel, MAX(handshakePath) AS handshakePath,
           MAX(pid) AS pid, MAX(processIdentity) AS processIdentity,
@@ -1478,7 +1479,7 @@ export function createOutrightDatabase(options = {}) {
           AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > entry.id
             AND outcome.target = entry.target
             AND outcome.action IN ('terminal.create.failed', 'terminal.exited', 'terminal.closed', 'terminal.recovered'))
-      ) GROUP BY target LIMIT 13`).all();
+      ) GROUP BY target LIMIT 257`).all();
     },
     resolveTerminalUnknown(target, evidence) {
       if (typeof target !== "string" || !/^[0-9a-f-]{36}$/i.test(target)

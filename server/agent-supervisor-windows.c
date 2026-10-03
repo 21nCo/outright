@@ -5,6 +5,60 @@
 #include <stdlib.h>
 #include <wchar.h>
 
+// Hold SQLite's Windows lock-byte range with a handle that permits rename.
+// SQLite's own handles omit FILE_SHARE_DELETE, so they cannot be retained
+// across archive promotion. The parent rechecks both files after this helper
+// acquires the lock and before any rename.
+static int archive_lock(int argc, wchar_t **argv) {
+  if (argc < 6) return 64;
+  wchar_t *end = NULL;
+  unsigned long parent_pid = wcstoul(argv[2], &end, 10);
+  if (!parent_pid || end == argv[2] || *end != L'\0') return 64;
+  HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, parent_pid);
+  if (!parent) return 70;
+  HANDLE *files = calloc((size_t)(argc - 5), sizeof(HANDLE));
+  if (!files) { CloseHandle(parent); return 72; }
+  int held = 0;
+  int result = 0;
+  for (int index = 5; index < argc; index++) {
+    HANDLE file = CreateFileW(argv[index], GENERIC_READ | GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) { result = 73; break; }
+    OVERLAPPED overlap = {0};
+    overlap.Offset = 0x40000000;
+    if (!LockFileEx(file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+        0, 512, 0, &overlap)) { CloseHandle(file); result = 74; break; }
+    files[held++] = file;
+  }
+  HANDLE ready = CreateFileW(argv[3], GENERIC_WRITE, 0, NULL, CREATE_NEW,
+    FILE_ATTRIBUTE_NORMAL, NULL);
+  if (ready == INVALID_HANDLE_VALUE) result = result ? result : 75;
+  else {
+    char status[16];
+    int length = snprintf(status, sizeof(status), "%d", result);
+    DWORD written = 0;
+    if (!WriteFile(ready, status, (DWORD)length, &written, NULL)
+      || written != (DWORD)length || !FlushFileBuffers(ready)) result = 76;
+    CloseHandle(ready);
+  }
+  // The pipe's only writer belongs to the archive worker thread. A worker
+  // termination closes it even if the runtime process remains alive. The
+  // private stop marker handles normal synchronous release; the process
+  // handle covers a hard runtime exit.
+  HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+  while (WaitForSingleObject(parent, 10) == WAIT_TIMEOUT) {
+    if (GetFileAttributesW(argv[4]) != INVALID_FILE_ATTRIBUTES) break;
+    if (input == NULL || input == INVALID_HANDLE_VALUE
+      || !PeekNamedPipe(input, NULL, 0, NULL, NULL, NULL)) break;
+  }
+  for (int index = held - 1; index >= 0; index--) CloseHandle(files[index]);
+  free(files);
+  CloseHandle(parent);
+  DeleteFileW(argv[3]);
+  return result;
+}
+
 static wchar_t *quote_argument(const wchar_t *value) {
   size_t length = wcslen(value);
   wchar_t *quoted = calloc(length * 2 + 3, sizeof(wchar_t));
@@ -118,6 +172,7 @@ static int inspect_owner(int argc, wchar_t **argv) {
 
 int wmain(int argc, wchar_t **argv) {
   if (argc < 2) return 64;
+  if (wcscmp(argv[1], L"--archive-lock") == 0) return archive_lock(argc, argv);
   if (wcscmp(argv[1], L"--identity") == 0 || wcscmp(argv[1], L"--probe") == 0
       || wcscmp(argv[1], L"--terminate") == 0) return inspect_owner(argc, argv);
   bool test_mode = wcscmp(argv[1], L"--test-runner") == 0;

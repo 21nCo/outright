@@ -381,8 +381,11 @@ function fixtureProgress(state) {
 
 test("browser fixture polling reports its last step and preserves the phase deadline", { timeout: 5_000 }, async () => {
   const progress = { step: "terminal activation", completed: 7, total: 21, elapsedMs: 1234, stepElapsedMs: 250 };
-  const send = async () => ({ result: { value: { title: "Running", text: "Running interaction regressions", progress } } });
-  await assert.rejects(waitForFixture(send, Date.now() + 30), /7\/21 complete, current step=terminal activation, elapsed=1234ms/);
+  const timings = [{ step: "slow", ms: 900 }, { step: "fast", ms: 10 }];
+  const send = async () => ({ result: { value: { title: "Running", text: "Running interaction regressions", progress, timings } } });
+  await assert.rejects(waitForFixture(send, Date.now() + 30, () => "owner=responsive drawer"), (error) =>
+    /7\/21 complete, current step=terminal activation, elapsed=1234ms/.test(error.message)
+    && /recent=.*fast.*slowest=.*slow.*owner=responsive drawer/.test(error.message));
   let polls = 0;
   const completed = await waitForFixture(async () => {
     polls += 1;
@@ -400,6 +403,8 @@ test("browser fixture polling reports its last step and preserves the phase dead
   }, Date.now() + 1_000);
   assert.equal(recovered.title, "PASS");
   assert.equal(transientPolls, 4);
+  await assert.rejects(waitForFixture(async () => { throw new Error("DevTools detached"); }, Date.now() + 100,
+    () => "owner=browser fixture"), /DevTools detached; fixture has not reported a step; phaseRemaining=.*owner=browser fixture/);
   let missing = false;
   let missingPolls = 0;
   await assert.rejects(waitForFixture(async () => {
@@ -891,7 +896,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       devtoolsReady: devtools?.socket.readyState, viteOutput: output.slice(-500) }));
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
     const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
-    const expectedCount = selectedCount ?? 108;
+    const expectedCount = selectedCount ?? 109;
     const completedCount = Number(state.text.match(/(\d+) interaction regressions passed/)?.[1]);
     assert.equal(completedCount, expectedCount,
       `browser fixture completed ${completedCount || 0} of ${expectedCount} expected interactions; last step: ${state.progress?.step ?? "unknown"}`);

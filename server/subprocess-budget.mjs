@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 // Git, scanner and editor requests share one admission point. A permit stays
 // charged until the child closes, including timeout and spawn-error paths.
 export function createSubprocessBudget({ limit = 8, execute = execFile } = {}) {
+  if (!Number.isSafeInteger(limit) || limit < 0) throw new RangeError("Utility process limit must be a non-negative integer");
   let active = 0;
   function run(file, args, options = {}) {
     if (active >= limit) {

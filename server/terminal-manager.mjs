@@ -6,6 +6,10 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   if (typeof terminal.process?.terminate !== "function") throw new Error("PTY owner has no termination verifier");
   return terminal.process.terminate(options);
 }, maxTerminals = 12, maxTerminalsPerCwd = 4, exitedRetentionMs = 15 * 60 * 1000, maxBufferChars = 150_000 }) {
+  if (!Number.isSafeInteger(maxTerminals) || maxTerminals < 1 || maxTerminals > 256
+    || !Number.isSafeInteger(maxTerminalsPerCwd) || maxTerminalsPerCwd < 1 || maxTerminalsPerCwd > 256) {
+    throw new RangeError("Terminal process limits must be whole numbers from 1 to 256");
+  }
   const terminals = new Map();
   let reservedUnknown = database.terminalUnknownReservations?.() ?? [];
   let reconciliationPromise;
@@ -48,7 +52,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     assertCapacity(input.cwd);
     const { cwd, name, cols = 100, rows = 30 } = input;
     const id = randomUUID();
-    const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/zsh");
+    const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/sh");
     const evidence = { target: id, cwd, shell, operationId: randomUUID() };
     return createManaged({ id, cwd, name, cols, rows, shell, evidence });
   }
@@ -56,7 +60,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   function createInjected({ cwd, name, cols = 100, rows = 30 }) {
     assertCapacity(cwd);
     const id = randomUUID();
-    const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/zsh");
+    const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/sh");
     const evidence = { target: id, cwd, shell, operationId: randomUUID() };
     database.auditAdmission("terminal.create.requested", evidence);
     let processInstance;
@@ -201,15 +205,19 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     if (!terminal) return Promise.resolve(false);
     if (terminal.closePromise) return terminal.closePromise;
     const evidence = { target: id, cwd: terminal.cwd, operationId: randomUUID() };
-    database.auditCritical("terminal.close.requested", evidence);
     terminal.status = "closing";
     terminal.closePromise = Promise.resolve().then(async () => {
       try {
+        // Admission may fail during storage maintenance. Still tear down the
+        // owned process before reporting an unknown outcome to the caller.
+        try { database.auditCritical("terminal.close.requested", evidence); }
+        catch { /* A durable terminal.closed outcome can still settle created. */ }
         if (terminal.ready) {
           terminal.process = await terminal.ready;
           terminal.pid = terminal.process.pid;
         }
-        await terminate(terminal);
+        try { await terminate(terminal); }
+        catch (error) { error.terminationUnknown = true; throw error; }
         if (!spawnTerminal) cleanupTerminalSocket(id);
         await database.auditRequired("terminal.closed", evidence);
         clearTimeout(terminal.cleanupTimer);
@@ -231,9 +239,11 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     const results = await Promise.allSettled([...terminals.values()].map((terminal) => Promise.resolve().then(async () => {
       try { await close(terminal.id); }
       catch (error) {
-        // Shutdown must still terminate a PTY if audit admission failed.
-        if (!terminal.closePromise && terminal.status === "running") {
-          try { await terminate(terminal); } catch { /* Preserve the original error and unknown outcome. */ }
+        // A failed first native termination must receive one more attempt
+        // during shutdown. Keep the slot and audit reservation if both fail.
+        if (error.cause?.terminationUnknown && !terminal.closePromise) {
+          try { await close(terminal.id); return; }
+          catch { /* Preserve the first unknown outcome for the caller. */ }
         }
         throw error;
       }

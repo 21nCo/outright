@@ -93,20 +93,45 @@ static bool process_identity(pid_t pid, char *identity, size_t identity_size) {
   return written > 0 && (size_t)written < identity_size;
 }
 
+// Recovery only signals the native owner that still carries this terminal's
+// private launch marker. A same-tick recycled PID must not inherit ownership.
+static bool terminal_owner_command(pid_t pid, const char *handshake_path) {
+  char filename[64];
+  snprintf(filename, sizeof(filename), "/proc/%ld/cmdline", (long)pid);
+  FILE *file = fopen(filename, "rb");
+  if (file == NULL) return false;
+  char command[8192];
+  size_t length = fread(command, 1, sizeof(command), file);
+  bool complete = feof(file) && !ferror(file);
+  fclose(file);
+  if (!complete || length < 3 || command[length - 1] != '\0') return false;
+  size_t first = strnlen(command, length);
+  if (first == length) return false;
+  size_t second = first + 1;
+  if (second >= length) return false;
+  size_t second_length = strnlen(command + second, length - second);
+  size_t third = second + second_length + 1;
+  if (third >= length) return false;
+  return strcmp(command + second, "--stop-on-owner-exit") == 0
+    && strcmp(command + third, handshake_path) == 0;
+}
+
 // A pidfd binds the signal to the same kernel process whose boot-scoped
-// identity was checked. A recycled numeric PID can never redirect recovery.
-static int terminate_owned_process(const char *raw_pid, const char *expected_identity) {
+// identity and marker were checked. A recycled numeric PID cannot be signaled.
+static int terminate_owned_process(const char *raw_pid, const char *expected_identity, const char *handshake_path) {
   char *end = NULL;
   errno = 0;
   long parsed = strtol(raw_pid, &end, 10);
   if (errno != 0 || end == raw_pid || *end != '\0' || parsed <= 0 || parsed > INT_MAX
-      || expected_identity == NULL || strlen(expected_identity) >= 160) return 64;
+      || expected_identity == NULL || strlen(expected_identity) >= 160
+      || handshake_path == NULL || strlen(handshake_path) >= 4096) return 64;
 #if defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
   int descriptor = (int)syscall(SYS_pidfd_open, (pid_t)parsed, 0);
   if (descriptor < 0) return 4;
   char actual[160];
   bool matched = process_identity((pid_t)parsed, actual, sizeof(actual))
-    && strcmp(actual, expected_identity) == 0;
+    && strcmp(actual, expected_identity) == 0
+    && terminal_owner_command((pid_t)parsed, handshake_path);
   if (!matched) { close(descriptor); return 4; }
   int result = (int)syscall(SYS_pidfd_send_signal, descriptor, SIGTERM, NULL, 0);
   close(descriptor);
@@ -381,8 +406,8 @@ static int authorize_provider(char **provider_argv, const char *handshake_path, 
 }
 
 int main(int argc, char **argv) {
-  if (argc == 4 && strcmp(argv[1], "--terminate-owned") == 0) {
-    return terminate_owned_process(argv[2], argv[3]);
+  if (argc == 5 && strcmp(argv[1], "--terminate-owned") == 0) {
+    return terminate_owned_process(argv[2], argv[3], argv[4]);
   }
   bool stop_on_owner_exit = argc > 1 && strcmp(argv[1], "--stop-on-owner-exit") == 0;
   int first = stop_on_owner_exit ? 2 : 1;

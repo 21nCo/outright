@@ -7,11 +7,11 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
   const git = (cwd, args, overrides = {}) => runGit(subprocesses, cwd, args, overrides);
   const safeGit = async (cwd, args, overrides = {}) => {
     try { return await git(cwd, args, overrides); }
-    catch (error) { if (error.code === "SUBPROCESS_CAPACITY") throw error; return ""; }
+    catch (error) { if (error.code === "SUBPROCESS_CAPACITY" || mutationOutcomeUncertain(error)) throw error; return ""; }
   };
   const gitOutputOnFailure = async (cwd, args) => {
     try { return await git(cwd, args, { maxBuffer: 12 * 1024 * 1024 }); }
-    catch (error) { if (error.code === "SUBPROCESS_CAPACITY") throw error; return (error.stdout ?? "").trimEnd(); }
+    catch (error) { if (error.code === "SUBPROCESS_CAPACITY" || mutationOutcomeUncertain(error)) throw error; return (error.stdout ?? "").trimEnd(); }
   };
   async function status(worktreePath) {
     const cwd = await requireWorktree(worktreePath);
@@ -73,7 +73,7 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
           // An unborn branch has no HEAD to reset against. Its staged files
           // are all additions, so removing only the index entries is safe.
           if (!/ambiguous argument ['"]?HEAD|unknown revision.*HEAD|bad revision ['"]?HEAD/i.test(`${resetError.message}\n${resetError.stderr ?? ""}`)) throw resetError;
-          await git(cwd, ["rm", "--cached", "--", ...validated]);
+          await git(cwd, ["rm", "-f", "--cached", "--", ...validated]);
         }
       }
     });
@@ -180,6 +180,10 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     let result;
     try { result = await mutate(); }
     catch (error) {
+      // A signal, timeout or output-limit kill can arrive after Git changed
+      // the index, commit or worktree. Preserve the admission for inspection
+      // instead of recording a false negative and inviting a duplicate retry.
+      if (mutationOutcomeUncertain(error)) throw outcomeUnknown(error, evidence.operationId);
       try { database.auditCritical(`${outcomeAction}.failed`, { ...evidence, error: String(error.message ?? error).slice(0, 1024) }); }
       catch (auditError) { throw outcomeUnknown(auditError, evidence.operationId); }
       throw error;
@@ -200,6 +204,10 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
   }
 
   return { status, diff, stage, unstage, commit, createWorktree, removeWorktree, openInEditor, context, requireWorktree };
+}
+
+function mutationOutcomeUncertain(error) {
+  return Boolean(error?.killed || error?.signal || ["ETIMEDOUT", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"].includes(error?.code));
 }
 
 async function runGit(subprocesses, cwd, args, overrides = {}) {

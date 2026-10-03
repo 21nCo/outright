@@ -38,6 +38,17 @@ test("archive shadow recovery discards an interrupted copy without touching sour
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
 });
 
+test("physical usage charges linked archive names only once during promotion", () => {
+  const item = fixture();
+  try {
+    beginArchiveShadow(item.filename);
+    const before = allocatedDatabaseUsage(item.filename).bytes;
+    fs.linkSync(item.filename, item.old);
+    assert.equal(allocatedDatabaseUsage(item.filename).bytes, before,
+      "a hard link to the same SQLite inode must not double physical usage");
+  } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
 test("archive shadow recovery finishes a cutover gap and retains the verified replacement", () => {
   const item = fixture();
   try {
@@ -397,6 +408,50 @@ test("restart finishes an interrupted source hard link without losing its late c
     assert.equal(existsSync(item.state), false);
   } finally {
     fs.renameSync = originalRename;
+    fs.linkSync = originalLink;
+    syncBuiltinESMExports();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
+});
+
+test("a second rollback interruption authenticates a relocated candidate and keeps the late source", () => {
+  const item = fixture();
+  const originalRemove = fs.rmSync;
+  const originalLink = fs.linkSync;
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    fs.rmSync = (name, ...args) => {
+      if (name === item.old) throw new Error("simulated promoted-source cleanup crash");
+      return originalRemove(name, ...args);
+    };
+    syncBuiltinESMExports();
+    assert.throws(() => cutoverArchiveShadow(item.filename), /simulated promoted-source cleanup crash/);
+    fs.rmSync = originalRemove;
+    syncBuiltinESMExports();
+    const writer = new Database(item.old);
+    try { writer.exec("CREATE TABLE late_source (value TEXT)"); }
+    finally { writer.close(); }
+    fs.linkSync = (from, to) => {
+      originalLink(from, to);
+      if (from === item.old && to === item.filename) throw new Error("simulated rollback relink crash");
+    };
+    syncBuiltinESMExports();
+    assert.throws(() => recoverArchiveShadow(item.filename), /simulated rollback relink crash/);
+    fs.linkSync = originalLink;
+    syncBuiltinESMExports();
+    recoverArchiveShadow(item.filename);
+    const proof = new Database(item.filename, { readonly: true });
+    try { assert.equal(proof.prepare("SELECT name FROM sqlite_master WHERE name = 'late_source'").get()?.name, "late_source"); }
+    finally { proof.close(); }
+    assert.equal(existsSync(item.next), false);
+    assert.equal(existsSync(item.old), false);
+    assert.equal(existsSync(item.state), false);
+  } finally {
+    fs.rmSync = originalRemove;
     fs.linkSync = originalLink;
     syncBuiltinESMExports();
     rmSync(item.directory, { recursive: true, force: true });

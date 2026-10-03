@@ -8,7 +8,13 @@ import { createOutrightDatabase } from "../server/database.mjs";
 import { cleanupTerminalSocket } from "../server/managed-terminal.mjs";
 
 const args = process.argv.slice(2);
-const value = (flag) => { const index = args.indexOf(flag); return index < 0 ? null : args[index + 1]; };
+const value = (flag) => {
+  const index = args.indexOf(flag);
+  if (index < 0) return null;
+  const next = args[index + 1];
+  if (!next || next.startsWith("--")) throw new Error(`${flag} requires a value`);
+  return next;
+};
 const filename = path.resolve(value("--database") ?? path.join(os.homedir(), ".outright", "outright.db"));
 const target = value("--target");
 const evidence = value("--evidence");

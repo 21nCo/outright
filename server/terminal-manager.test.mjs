@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createTerminalManager } from "./terminal-manager.mjs";
+import { recoverManagedTerminal } from "./managed-terminal.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 import { createOutrightRuntime } from "./outright-runtime.mjs";
@@ -19,7 +20,7 @@ test("creates a PTY, accepts input, and retains reconnectable output", async () 
   try {
     const terminal = await manager.create({ cwd: process.cwd(), name: "Test terminal" });
     // Match the manager's configured shell and avoid matching echoed input.
-    const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/zsh");
+    const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/sh");
     const command = /(?:^|[\\/])(?:powershell|pwsh)(?:\.exe)?$/i.test(shell)
       ? "Write-Output ('outright-' + 'terminal-ok')\r"
       : /(?:^|[\\/])cmd(?:\.exe)?$/i.test(shell)
@@ -171,12 +172,13 @@ test("an in-flight or failed natural-exit audit keeps capacity charged through c
 test("a close that cannot record its outcome reports the pending operation", async () => {
   const actions = [];
   let killed = false;
+  let auditUnavailable = true;
   const manager = createTerminalManager({ publish: () => {}, database: {
     auditAdmission: (action, details) => actions.push({ action, details }),
     auditCritical: (action, details) => {
       actions.push({ action, details });
     },
-    auditRequired: async (action) => { if (action === "terminal.closed") throw Object.assign(new Error("storage interrupted"), { code: "SQLITE_BUSY" }); },
+    auditRequired: async (action) => { if (action === "terminal.closed" && auditUnavailable) throw Object.assign(new Error("storage interrupted"), { code: "SQLITE_BUSY" }); },
   }, spawnTerminal: () => ({ pid: 42, onData() {}, onExit() {}, kill() { killed = true; } }), terminate: async (terminal) => { terminal.process.kill(); } });
   const terminal = manager.create({ cwd: "/tmp/w" });
   await assert.rejects(manager.close(terminal.id), (error) =>
@@ -184,6 +186,43 @@ test("a close that cannot record its outcome reports the pending operation", asy
   assert.equal(killed, true);
   assert.equal(manager.get(terminal.id)?.status, "unknown");
   assert.ok(actions.some((entry) => entry.action === "terminal.close.requested"));
+  auditUnavailable = false;
+  await manager.shutdown();
+  assert.equal(manager.capacity().active, 0);
+});
+
+test("failed close admission still terminates and records a durable terminal outcome", async () => {
+  const actions = [];
+  let terminated = 0;
+  const manager = createTerminalManager({ publish: () => {}, database: {
+    auditAdmission: () => {},
+    auditCritical: (action) => {
+      if (action === "terminal.close.requested") throw new Error("admission unavailable");
+      actions.push(action);
+    },
+    auditRequired: async (action) => { actions.push(action); },
+  }, spawnTerminal: () => ({ pid: 42, onData() {}, onExit() {}, kill() {} }),
+  terminate: async () => { terminated += 1; } });
+  const terminal = manager.create({ cwd: "/tmp/w" });
+  assert.equal(await manager.close(terminal.id), true);
+  assert.equal(terminated, 1);
+  assert.ok(actions.includes("terminal.closed"));
+  assert.equal(manager.capacity().active, 0);
+});
+
+test("shutdown retries a failed native termination before releasing capacity", async () => {
+  let attempts = 0;
+  const actions = [];
+  const manager = createTerminalManager({ publish: () => {}, database: {
+    auditAdmission: () => {}, auditCritical: (action) => actions.push(action),
+    auditRequired: async (action) => { actions.push(action); },
+  }, spawnTerminal: () => ({ pid: 42, onData() {}, onExit() {}, kill() {} }),
+  terminate: async () => { if (++attempts === 1) throw new Error("owner still alive"); } });
+  manager.create({ cwd: "/tmp/w" });
+  await manager.shutdown();
+  assert.equal(attempts, 2);
+  assert.ok(actions.includes("terminal.closed"));
+  assert.equal(manager.capacity().active, 0);
 });
 
 test("closing keeps the process slot until termination is verified; unknown termination keeps it charged", async () => {
@@ -218,6 +257,7 @@ test("closing keeps the process slot until termination is verified; unknown term
   finishTermination();
   assert.equal(await retry, true);
   assert.equal(manager.list().length, 0);
+  await manager.shutdown();
 });
 
 test("failed created audit releases capacity after verified cleanup and durable failure", async () => {
@@ -278,22 +318,32 @@ test("detached PTY child keeps the slot until the native ownership boundary is e
   const manager = createTerminalManager({ maxTerminals: 1, publish: () => {}, database });
   const pidFile = path.join(directory, "background.pid");
   let backgroundPid;
+  let pausedOwner = false;
   try {
     const terminal = await manager.create({ cwd: directory });
-    manager.write(terminal.id, `nohup sleep 30 >/dev/null 2>&1 & echo $! > ${pidFile}; exit\r`);
+    manager.write(terminal.id, `nohup sleep 30 >/dev/null 2>&1 & echo $! > ${pidFile}; read hold; exit\r`);
     await waitFor(() => existsSync(pidFile), 5000);
     backgroundPid = Number(readFileSync(pidFile, "utf8").trim());
     assert.ok(Number.isSafeInteger(backgroundPid) && backgroundPid > 0);
-    await new Promise((resolve) => setTimeout(resolve, 700));
+    const beforeClose = spawnSync("ps", ["-o", "stat=", "-p", String(backgroundPid)], { encoding: "utf8" }).stdout.trim();
+    assert.ok(beforeClose && !beforeClose.startsWith("Z"), "fixture must prove a live owned child before testing capacity");
+    if (process.platform === "linux") {
+      process.kill(terminal.pid, "SIGSTOP");
+      pausedOwner = true;
+      manager.write(terminal.id, "\r");
+    }
     assert.equal(manager.capacity().active, 1, "a reparented child still owns terminal capacity");
     assert.equal(database.listAudit(20).some((entry) => entry.action === "terminal.exited" && entry.target === terminal.id), false);
-    await manager.close(terminal.id);
+    const closing = manager.close(terminal.id);
+    if (pausedOwner) { process.kill(terminal.pid, "SIGCONT"); pausedOwner = false; }
+    await closing;
     await waitFor(() => {
       const state = spawnSync("ps", ["-o", "stat=", "-p", String(backgroundPid)], { encoding: "utf8" }).stdout.trim();
       return !state || state.startsWith("Z");
     }, 5000);
     assert.equal(manager.capacity().active, 0);
   } finally {
+    if (pausedOwner) try { process.kill(manager.list()[0]?.pid, "SIGCONT"); } catch {}
     try { await manager.shutdown(); } catch {}
     if (backgroundPid) try { process.kill(backgroundPid, "SIGKILL"); } catch {}
     database.close();
@@ -324,7 +374,7 @@ test("oversized inherited environment is refused before PTY audit admission", as
     await assert.rejects(manager.create({ cwd: "/tmp" }), (error) => error.statusCode === 413);
     assert.equal(admitted, 0);
     assert.equal(manager.capacity().active, 0);
-  } finally { delete process.env.OUT30_TERMINAL_EXTRA; }
+  } finally { delete process.env.OUT30_TERMINAL_EXTRA; await manager.shutdown(); }
 });
 
 test("managed PTY keeps unknown capacity when native proof admission is refused, then retries", { skip: process.platform !== "darwin" }, async () => {
@@ -356,11 +406,16 @@ test("hard runtime exit leaves a detached child owned until restart can reconcil
     const manager=createTerminalManager({database:db,publish:()=>{}});
     const terminal=await manager.create({cwd:${JSON.stringify(directory)}});
     writeFileSync(${JSON.stringify(idFile)},terminal.id);
-    manager.write(terminal.id,${JSON.stringify(`nohup sleep 30 >/dev/null 2>&1 & echo $! > ${pidFile}; exit\r`)});
+    manager.write(terminal.id,${JSON.stringify(`nohup sleep 30 >/dev/null 2>&1 & echo $! > ${pidFile}; read hold; exit\r`)});
     for(let i=0;i<100&&!existsSync(${JSON.stringify(pidFile)});i++)await new Promise(r=>setTimeout(r,50));
+    if(process.platform==='linux'&&existsSync(${JSON.stringify(pidFile)})){
+      process.kill(terminal.pid,'SIGSTOP');
+      manager.write(terminal.id,'\\r');
+    }
     process.exit(existsSync(${JSON.stringify(pidFile)})?0:2);`;
   let backgroundPid;
   let runtime;
+  let ownerPid;
   try {
     const crashed = spawnSync(process.execPath, ["--input-type=module", "-e", source], { timeout: 15_000, encoding: "utf8" });
     assert.equal(crashed.status, 0, crashed.stderr);
@@ -372,10 +427,16 @@ test("hard runtime exit leaves a detached child owned until restart can reconcil
     if (process.platform === "linux") {
       assert.equal(existsSync(path.join(runtime.database.launchDirectory, `terminal-${terminalId}.json`)), true,
         "runtime startup must preserve the native terminal marker before owner proof");
+      assert.equal(runtime.terminals.capacity().unknown, 1);
+      process.kill(backgroundPid, 0);
+      const marker = JSON.parse(readFileSync(path.join(runtime.database.launchDirectory, `terminal-${terminalId}.json`), "utf8"));
+      ownerPid = marker.pid;
+      process.kill(ownerPid, "SIGCONT");
     }
-    assert.equal(runtime.database.listAudit(20).some((entry) => entry.action === "terminal.unknown" && entry.target === terminalId), true);
-    assert.equal(runtime.terminals.capacity().unknown, 1);
-    assert.equal(await runtime.terminals.reconcileUnknown(), 1);
+    await waitFor(async () => {
+      await runtime.terminals.reconcileUnknown();
+      return runtime.terminals.capacity().active === 0;
+    }, 7000);
     assert.equal(runtime.terminals.capacity().active, 0);
     await waitFor(() => {
       const state = spawnSync("ps", ["-o", "stat=", "-p", String(backgroundPid)], { encoding: "utf8" }).stdout.trim();
@@ -383,6 +444,7 @@ test("hard runtime exit leaves a detached child owned until restart can reconcil
     }, 5000);
     assert.equal(runtime.database.listAudit(20).some((entry) => entry.action === "terminal.recovered" && entry.target === terminalId), true);
   } finally {
+    if (ownerPid) try { process.kill(ownerPid, "SIGCONT"); } catch {}
     if (backgroundPid) try { process.kill(backgroundPid, "SIGKILL"); } catch {}
     await runtime?.shutdown();
     rmSync(directory, { recursive: true, force: true });
@@ -406,6 +468,39 @@ test("closing an exited tab never signals a PID now owned by another process", {
     assert.equal(unrelated.signalCode, null);
     assert.ok(actions.includes("terminal.exited"));
   } finally { unrelated.kill("SIGKILL"); await manager.shutdown(); }
+});
+
+test("a larger configured terminal quota still charges every unresolved native owner", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-many-unknown-"));
+  const database = createOutrightDatabase({ filename: path.join(directory, "runtime.db"), runtimeLease: true });
+  try {
+    for (let index = 0; index < 21; index += 1) {
+      database.auditCritical("terminal.created", { target: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`, cwd: directory });
+    }
+    const manager = createTerminalManager({ database, publish: () => {}, maxTerminals: 20,
+      spawnTerminal: () => { throw new Error("unresolved owners must block spawn"); } });
+    assert.equal(manager.capacity().unknown, 21);
+    assert.throws(() => manager.create({ cwd: directory }), (error) => error.statusCode === 429);
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("Darwin recovery keeps a reservation until an exited launchd job is booted out", { skip: process.platform !== "darwin" }, async () => {
+  const target = "379634b7-8989-47c5-9174-c09529b206a1";
+  const owner = { target, created: 1, ownershipLabel: `com.21n.outright.terminal.${target}` };
+  let state = "exited";
+  let allowBootout = false;
+  const commands = [];
+  const subprocesses = { async run(_program, args) {
+    commands.push(args[0]);
+    if (args[0] === "--terminate") { if (allowBootout) state = "absent"; return { stdout: "" }; }
+    return { stdout: state };
+  } };
+  assert.equal(await recoverManagedTerminal({ ...owner, subprocesses }), false,
+    "an empty but registered launchd job still owns recovery capacity");
+  assert.ok(commands.includes("--terminate"), "recovery never attempted launchd bootout");
+  allowBootout = true;
+  assert.equal(await recoverManagedTerminal({ ...owner, subprocesses }), true);
+  assert.equal(state, "absent");
 });
 
 test("restart reconciles an empty native owner but keeps legacy unknown reservations for explicit recovery", { skip: process.platform === "win32" }, async () => {
@@ -578,7 +673,7 @@ test("restart settles crash and maintenance-interrupted PTY evidence before rete
 async function waitFor(predicate, timeout = 3000, diagnostic = () => "") {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`Timed out waiting for PTY output: ${JSON.stringify(diagnostic())}`);

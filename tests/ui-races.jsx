@@ -1535,6 +1535,42 @@ async function terminalKeyboardRegression() {
   assert(document.activeElement === close, "Terminal tablist handled an arrow key from the close control");
 }
 
+async function terminalUnknownRegression() {
+  root.render(null);
+  await settle();
+  const sent = [];
+  let created = 0;
+  let unknown = false;
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") { created += 1; return response(terminal("A2")); }
+    if (url.pathname === "/api/terminals") return response({ terminals: [{ ...terminal("A"), status: unknown ? "unknown" : "running" }] });
+    return response({ buffer: "Retained output\r\n", status: unknown ? "unknown" : "running" });
+  };
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]}
+    runtimeEvent={event} onError={(error) => { throw error; }} sendRuntime={(message) => sent.push(message)} />);
+  show();
+  await until(() => terminalReady("Terminal A"), "running terminal before unknown ownership");
+  const before = sent.length;
+  show({ type: "terminal.audit-failed", terminalId: "term-A" });
+  await until(() => host.querySelector('[data-tab-id="term-A"]')?.getAttribute("aria-label").includes("ownership unverified"), "unknown ownership announcement");
+  assert(host.querySelector('.terminal-pane [role="status"]')?.textContent.includes("ownership is unverified"), "Unknown terminal lacks a spoken status");
+  host.querySelector('.terminal-host').style.width = "540px";
+  const input = host.querySelector('.terminal-host .xterm-helper-textarea');
+  input.focus();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "x", code: "KeyX", keyCode: 88, which: 88, bubbles: true, cancelable: true }));
+  await settle();
+  assert(!sent.slice(before).some((message) => message.type === "terminal.input" || message.type === "terminal.resize"),
+    "Unverified terminal still accepted input or resize");
+  root.render(null);
+  await settle();
+  unknown = true;
+  show();
+  await until(() => terminalReady("Terminal A"), "unknown terminal restored after restart");
+  assert(created === 0, "Unknown terminal silently created a replacement process");
+  assert(host.querySelector('[data-tab-id="term-A"]').getAttribute("aria-label").includes("ownership unverified"),
+    "Unknown terminal restart lost its ownership warning");
+}
+
 async function terminalSelectionReconnectRegression() {
   root.render(null);
   await settle();
@@ -2196,7 +2232,7 @@ async function commandPaletteRegression() {
   currentResults.resolve(response({ conversations: [{ id: "current", title: "Current result", provider: "codex", worktreePath: "/current" }], partial: true }));
   await until(() => document.querySelector('[role="option"]')?.textContent.includes("Current result"), "current command result");
   assert(document.querySelector(".command-search-scope")?.textContent.includes("recent conversations"), "bounded search was not explained");
-  assert(document.querySelector('.command-results [role="status"]')?.textContent.includes("recent conversations"), "bounded search was not announced");
+  assert(!document.querySelector('.command-results [role="status"]')?.textContent.includes("recent conversations"), "static search scope should not repeat in the live region");
   await until(() => input.getAttribute("aria-activedescendant") === "command-result-0", "active remote command result");
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
   assert(selected?.id === "current", "Enter did not select the asynchronously loaded command result");
@@ -5019,6 +5055,7 @@ try {
     ["worktree chat list failure", chatFailedWorktreeListRegression, "a rejected list cannot expose old-owner chat tabs and a retry restores the new owner"],
     ["worktree terminal switch", terminalRace, "worktree switch removes old terminal tabs and rejects stale buffer responses"],
     ["terminal keyboard", terminalKeyboardRegression, "terminal keyboard switching retains focus and ignores non-tab controls"],
+    ["terminal unknown", terminalUnknownRegression, "unverified terminal ownership blocks interaction and survives restart"],
     ["terminal selection during reconnect", terminalSelectionReconnectRegression, "selected terminal and output survive a reconnect while its buffer is pending"],
     ["terminal activation ownership", terminalActivationOwnershipRegression, "terminal activation commits output and current PTY size together"],
     ["rejected terminal switch", terminalRejectedSwitchRegression, "rejected terminal switch restores the selected tab focus"],

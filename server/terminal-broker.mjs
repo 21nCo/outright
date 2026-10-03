@@ -12,19 +12,24 @@ let terminal;
 let peer;
 let pending = "";
 let authenticated = false;
+let shellExited = false;
 const server = net.createServer((socket) => {
   if (peer) { socket.destroy(); return; }
   peer = socket;
   socket.setEncoding("utf8");
+  socket.on("error", () => { socket.destroy(); });
   socket.on("data", (chunk) => {
     pending += chunk;
-    if (pending.length > 128 * 1024) { socket.destroy(); return; }
+    // A permitted 64 KiB write may JSON-escape every control byte as six
+    // characters. Include the launch environment and framing as well.
+    if (pending.length > 512 * 1024) { socket.destroy(); return; }
     let end;
     while ((end = pending.indexOf("\n")) !== -1) {
       const line = pending.slice(0, end);
       pending = pending.slice(end + 1);
       let message;
       try { message = JSON.parse(line); } catch { socket.destroy(); return; }
+      if (!message || typeof message !== "object" || Array.isArray(message)) { socket.destroy(); return; }
       if (!authenticated) {
         if (message.type !== "start" || message.token !== token || typeof message.shell !== "string"
           || typeof message.cwd !== "string" || !message.env || typeof message.env !== "object"
@@ -55,10 +60,10 @@ const server = net.createServer((socket) => {
             offset = end;
           }
         });
-        terminal.onExit(() => { socket.end(`${JSON.stringify({ type: "shell-exited" })}\n`); if (server.listening) server.close(); });
-      } else if (message.type === "write" && typeof message.data === "string"
+        terminal.onExit(() => { shellExited = true; socket.end(`${JSON.stringify({ type: "shell-exited" })}\n`); if (server.listening) server.close(); });
+      } else if (!shellExited && message.type === "write" && typeof message.data === "string"
         && Buffer.byteLength(message.data) <= 64 * 1024) terminal.write(message.data);
-      else if (message.type === "resize" && Number.isInteger(message.cols) && message.cols >= 20 && message.cols <= 400
+      else if (!shellExited && message.type === "resize" && Number.isInteger(message.cols) && message.cols >= 20 && message.cols <= 400
         && Number.isInteger(message.rows) && message.rows >= 5 && message.rows <= 200)
         terminal.resize(message.cols, message.rows);
       else socket.destroy();

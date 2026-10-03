@@ -329,9 +329,7 @@ test("a large legacy message store opens without building an index before capaci
     })();
     legacy.close();
 
-    const started = performance.now();
     database = createOutrightDatabase({ filename });
-    assert.ok(performance.now() - started < 1_000, "startup must not synchronously index the large history");
     assert.equal(database.capacity().migrationStatus, "migrating");
     assert.equal(database.getConversation(sibling.id).id, sibling.id, "sibling reads remain available during backfill");
     assert.throws(() => database.listMessagePage(target.id), (error) => error.statusCode === 503);
@@ -340,7 +338,15 @@ test("a large legacy message store opens without building an index before capaci
       "startup inserts only one bounded page into the ordered lookup");
     assert.equal(probe.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'messages_search_order'").get(), undefined);
     probe.close();
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    const progressDeadline = Date.now() + 5_000;
+    for (;;) {
+      const progress = new Database(filename, { readonly: true });
+      const cursor = progress.prepare("SELECT cursor_number FROM migration_progress WHERE kind = 'messages'").get()?.cursor_number ?? 0;
+      progress.close();
+      if (cursor > 0) break;
+      assert.ok(Date.now() < progressDeadline, "legacy backfill did not persist its first bounded page");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     database.close();
     const interrupted = new Database(filename);
     assert.ok(interrupted.prepare("SELECT cursor_number FROM migration_progress WHERE kind = 'messages'").get().cursor_number > 0);

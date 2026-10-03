@@ -241,9 +241,13 @@ export function App() {
   useEffect(() => {
     let stopped = false;
     let retry;
-    const load = async () => {
+    const load = async (remaining = null) => {
       const loaded = await loadBootstrap();
-      if (!stopped && loaded === "retry") retry = window.setTimeout(load, 1000);
+      if (!stopped && (remaining === null ? loaded === "retry" : loaded !== true && remaining > 0)) {
+        window.clearTimeout(retry);
+        retry = window.setTimeout(() => load(remaining === null ? null : remaining - 1), 1000);
+      }
+      return loaded;
     };
     bootstrapLoadRef.current = load;
     void load();
@@ -846,11 +850,23 @@ export function App() {
   useLayoutEffect(() => {
     if (!isNarrow || !sidebarOpen) return;
     const sidebar = sidebarRef.current;
-    if (!sidebar?.contains(document.activeElement)) {
+    let frame;
+    let attempts = 0;
+    const focusDialog = () => {
+      if (sidebar?.contains(document.activeElement)) return;
+      if (document.activeElement !== document.body
+        && document.activeElement !== sidebarFocusSourceRef.current) return;
       const first = sidebar?.querySelector('button:not(:disabled)');
       if (first?.getClientRects().length) first.focus({ preventScroll: true });
-      else sidebar?.focus();
-    }
+      if (!sidebar?.contains(document.activeElement) && attempts++ < 12) frame = requestAnimationFrame(focusDialog);
+    };
+    focusDialog();
+    const restoreDialog = () => {
+      // Making the workspace inert can blur its opener after the first focus
+      // attempt. Restore only when the browser has left focus on BODY.
+      queueMicrotask(() => { if (document.activeElement === document.body) focusDialog(); });
+    };
+    document.addEventListener("focusout", restoreDialog, true);
     const containFocus = (event) => {
       if (event.key !== "Tab") return;
       const focusable = focusableElements(sidebar);
@@ -861,7 +877,7 @@ export function App() {
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     };
     sidebar?.addEventListener("keydown", containFocus);
-    return () => sidebar?.removeEventListener("keydown", containFocus);
+    return () => { cancelAnimationFrame(frame); document.removeEventListener("focusout", restoreDialog, true); sidebar?.removeEventListener("keydown", containFocus); };
   }, [isNarrow, sidebarOpen]);
   useLayoutEffect(() => {
     const intent = sidebarFocusIntentRef.current;
@@ -1748,11 +1764,11 @@ export function App() {
 
   async function createWorktree(event) {
     event.preventDefault();
-    try { await api("/api/worktrees", { method: "POST", body: { projectId: worktreeDialog.id, ...worktreeDraft } }); setWorktreeDialog(null); setWorktreeDraft({ branch: "", name: "", baseBranch: "HEAD" }); const refreshed = await loadBootstrap(); setToast(refreshed === true ? "Worktree created" : "Worktree created; project refresh delayed"); }
+    try { const result = await api("/api/worktrees", { method: "POST", body: { projectId: worktreeDialog.id, ...worktreeDraft } }); setWorktreeDialog(null); setWorktreeDraft({ branch: "", name: "", baseBranch: "HEAD" }); const refreshed = await bootstrapLoadRef.current?.(result.refreshDeferred ? 3 : 1); setToast(refreshed === true ? "Worktree created" : "Worktree created; project refresh delayed"); }
     catch (nextError) { setError(nextError.message); }
   }
   async function removeWorktree() {
-    try { await api("/api/worktrees", { method: "DELETE", body: { projectId: project.id, worktreePath: worktree.path, confirmation: removeConfirmation } }); setRemoveWorktreeOpen(false); setRemoveConfirmation(""); setSelectedWorktreeId(""); const refreshed = await loadBootstrap(); setToast(refreshed === true ? "Worktree removed" : "Worktree removed; project refresh delayed"); }
+    try { const result = await api("/api/worktrees", { method: "DELETE", body: { projectId: project.id, worktreePath: worktree.path, confirmation: removeConfirmation } }); setRemoveWorktreeOpen(false); setRemoveConfirmation(""); setSelectedWorktreeId(""); const refreshed = await bootstrapLoadRef.current?.(result.refreshDeferred ? 3 : 1); setToast(refreshed === true ? "Worktree removed" : "Worktree removed; project refresh delayed"); }
     catch (nextError) { setError(nextError.message); }
   }
   async function refreshAll(includeTemplates = false) {

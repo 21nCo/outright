@@ -935,7 +935,7 @@ test("unknown usage after async launch preparation retries without a new request
     assert.equal(database.getRun(first.id).status, "running");
     assert.equal(database.getRun(cancelled.id).status, "stopped");
     assert.equal(validations, 2, "retry skipped authorization revalidation");
-    assert.equal(launchPreparations, 2, "the queued run launched more than once");
+    assert.equal(launchPreparations, 2, "the deferred run was not prepared exactly twice");
     children[0].emit("close", 0, null);
   } finally { await manager.shutdown(); }
 });
