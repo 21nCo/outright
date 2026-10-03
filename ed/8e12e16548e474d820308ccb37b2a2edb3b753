@@ -1,0 +1,16 @@
+server/database.mjs
+  h_a39f9495f9ec1d 1364-1371,1373,1401,1734,1803-1842,1956,1974-1990
+server/database.test.mjs
+  h_a39f9495f9ec1d 110-168
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ed8e12e16548e474d820308ccb37b2a2edb3b753",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
