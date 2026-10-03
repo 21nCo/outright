@@ -1,0 +1,20 @@
+server/database.mjs
+  h_a39f9495f9ec1d 2422-2426
+server/database.test.mjs
+  h_a39f9495f9ec1d 1163-1167,1180-1181
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 108-131
+server/terminal-manager.test.mjs
+  h_a39f9495f9ec1d 6,351,354,358,363,368-379,384,387
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "970080d3bab6614c048fd76932ae9cd2a2a591fd",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
