@@ -1,0 +1,31 @@
+server/git-service.mjs
+  s_ee5d9d808851a0::t_61c5ef9ceb4d99 134-135
+server/git-service.test.mjs
+  s_05ee3b445a4a64::t_e20af2e820a863 3,10,22-63
+server/subprocess-budget.mjs
+  s_05ee3b445a4a64::t_245f17586325ac 1,3-5,8,13,16-18,32-54
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "66a379cffb20e0dff1b950463d0c894477d0a2be",
+  "prompts": {},
+  "sessions": {
+    "s_05ee3b445a4a64": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a101ed-0728-79e2-ad19-86fcd77f7413",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_ee5d9d808851a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f1e3-16d3-72f2-af1e-998d62994d47",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
