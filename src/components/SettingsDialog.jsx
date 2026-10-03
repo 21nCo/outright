@@ -35,7 +35,11 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
     const request = ++capacityRequestRef.current;
     const session = archiveSessionRef.current;
     return api("/api/capacity").then((value) => {
-      if (session === archiveSessionRef.current && request === capacityRequestRef.current) setCapacity(value);
+      if (session === archiveSessionRef.current && request === capacityRequestRef.current) {
+        // Polling the same measurement should not replace the live output or
+        // repeat its accessibility announcement every two seconds.
+        setCapacity((current) => JSON.stringify(current) === JSON.stringify(value) ? current : value);
+      }
     }).catch((error) => {
       if (session === archiveSessionRef.current && request === capacityRequestRef.current) onError(error);
     });

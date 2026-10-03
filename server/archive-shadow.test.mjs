@@ -3,11 +3,31 @@ import test from "node:test";
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { existsSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { allocatedDatabaseUsage, archiveShadowPaths, beginArchiveShadow, cutoverArchiveShadow, fenceArchiveSource, prepareArchiveShadowCutover, recoverArchiveShadow } from "./archive-shadow.mjs";
 import { createOutrightDatabase, recoverArchiveBeforeStartup } from "./database.mjs";
+import { acquireWindowsArchiveLock } from "./archive-windows-lock.mjs";
+
+test("Windows archive lock reports readiness, protects the source, and removes its artifacts", { skip: process.platform !== "win32" }, () => {
+  const item = fixture();
+  try {
+    const release = acquireWindowsArchiveLock([item.filename]);
+    try {
+      const writer = new Database(item.filename);
+      try {
+        writer.pragma("busy_timeout = 50");
+        assert.throws(() => writer.prepare("INSERT INTO evidence (body) VALUES ('blocked')").run(),
+          (error) => error.code === "SQLITE_BUSY");
+      } finally { writer.close(); }
+    } finally { release(); }
+    const writer = new Database(item.filename);
+    try { writer.prepare("INSERT INTO evidence (body) VALUES ('released')").run(); }
+    finally { writer.close(); }
+    assert.equal(readdirSync(item.directory).some((name) => name.includes(".archive-lock-")), false);
+  } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
 
 function fixture() {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-shadow-recover-"));
@@ -17,6 +37,14 @@ function fixture() {
   db.prepare("INSERT INTO evidence (body) VALUES (?)").run("recoverable payload");
   db.close();
   return { directory, filename, ...archiveShadowPaths(filename) };
+}
+
+function prepareShadow(item) {
+  beginArchiveShadow(item.filename);
+  const source = new Database(item.filename);
+  try { source.prepare("VACUUM INTO ?").run(item.next); }
+  finally { source.close(); }
+  prepareArchiveShadowCutover(item.filename);
 }
 
 function body(filename) {
@@ -146,11 +174,7 @@ test("schema and header writes cannot bypass the source or promoted candidate cu
   const originalLink = fs.linkSync;
   const stages = [];
   try {
-    beginArchiveShadow(item.filename);
-    const source = new Database(item.filename);
-    source.prepare("VACUUM INTO ?").run(item.next);
-    source.close();
-    prepareArchiveShadowCutover(item.filename);
+    prepareShadow(item);
     const probe = (filename, stage) => {
       const writer = new Database(filename);
       try {
@@ -261,11 +285,7 @@ test("recovery preserves both databases when the promoted candidate receives a p
   const item = fixture();
   const originalLink = fs.linkSync;
   try {
-    beginArchiveShadow(item.filename);
-    const source = new Database(item.filename);
-    source.prepare("VACUUM INTO ?").run(item.next);
-    source.close();
-    prepareArchiveShadowCutover(item.filename);
+    prepareShadow(item);
     fs.linkSync = (from, to) => {
       originalLink(from, to);
       if (from === item.next && to === item.filename) throw new Error("simulated promotion link crash");
@@ -297,11 +317,7 @@ test("recovery keeps the old source locked through its final removal", () => {
   const originalRemove = fs.rmSync;
   let probed = false;
   try {
-    beginArchiveShadow(item.filename);
-    const source = new Database(item.filename);
-    source.prepare("VACUUM INTO ?").run(item.next);
-    source.close();
-    prepareArchiveShadowCutover(item.filename);
+    prepareShadow(item);
     fs.linkSync = (from, to) => {
       originalLink(from, to);
       if (from === item.next && to === item.filename) throw new Error("simulated promotion crash");
@@ -338,11 +354,7 @@ test("a database created in the public-path gap is preserved instead of overwrit
   const item = fixture();
   const originalLink = fs.linkSync;
   try {
-    beginArchiveShadow(item.filename);
-    const source = new Database(item.filename);
-    source.prepare("VACUUM INTO ?").run(item.next);
-    source.close();
-    prepareArchiveShadowCutover(item.filename);
+    prepareShadow(item);
     fs.linkSync = (from, to) => {
       if (from === item.next && to === item.filename) {
         const writer = new Database(to);
@@ -376,11 +388,7 @@ test("restart finishes an interrupted source hard link without losing its late c
   const originalRename = fs.renameSync;
   const originalLink = fs.linkSync;
   try {
-    beginArchiveShadow(item.filename);
-    const source = new Database(item.filename);
-    source.prepare("VACUUM INTO ?").run(item.next);
-    source.close();
-    prepareArchiveShadowCutover(item.filename);
+    prepareShadow(item);
     fs.renameSync = (from, to) => {
       originalRename(from, to);
       if (from === item.filename && to === item.old) throw new Error("simulated first rename crash");
@@ -419,11 +427,7 @@ test("a second rollback interruption authenticates a relocated candidate and kee
   const originalRemove = fs.rmSync;
   const originalLink = fs.linkSync;
   try {
-    beginArchiveShadow(item.filename);
-    const source = new Database(item.filename);
-    source.prepare("VACUUM INTO ?").run(item.next);
-    source.close();
-    prepareArchiveShadowCutover(item.filename);
+    prepareShadow(item);
     fs.rmSync = (name, ...args) => {
       if (name === item.old) throw new Error("simulated promoted-source cleanup crash");
       return originalRemove(name, ...args);
@@ -475,11 +479,7 @@ test("post-promotion writer cannot lose sibling run, audit, setting or retained 
     const baseline = new Database(item.filename, { readonly: true });
     const retainedBytes = baseline.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes;
     baseline.close();
-    beginArchiveShadow(item.filename);
-    const source = new Database(item.filename);
-    source.prepare("VACUUM INTO ?").run(item.next);
-    source.close();
-    prepareArchiveShadowCutover(item.filename);
+    prepareShadow(item);
     const fencedSource = new Database(item.filename);
     fencedSource.exec("BEGIN EXCLUSIVE");
     fenceArchiveSource(fencedSource);
@@ -533,11 +533,7 @@ test("interruption after promotion validation keeps candidate fenced through rec
   const originalRemove = fs.rmSync;
   let probed = false;
   try {
-    beginArchiveShadow(item.filename);
-    const source = new Database(item.filename);
-    source.prepare("VACUUM INTO ?").run(item.next);
-    source.close();
-    prepareArchiveShadowCutover(item.filename);
+    prepareShadow(item);
     fs.rmSync = (name, ...args) => {
       if (name === item.old) {
         probed = true;
@@ -713,11 +709,7 @@ test("archive shadow recovery keeps the promoted database and releases its old p
 test("a valid replacement after preparation cannot displace the recoverable source", () => {
   const item = fixture();
   try {
-    beginArchiveShadow(item.filename);
-    const source = new Database(item.filename);
-    source.prepare("VACUUM INTO ?").run(item.next);
-    source.close();
-    prepareArchiveShadowCutover(item.filename);
+    prepareShadow(item);
     const substitute = `${item.filename}.substitute`;
     const other = new Database(substitute);
     other.exec("CREATE TABLE evidence (id INTEGER PRIMARY KEY, body TEXT NOT NULL)");
@@ -737,11 +729,7 @@ test("a valid replacement after preparation cannot displace the recoverable sour
 test("recovery rejects a substituted candidate after the original is renamed", () => {
   const item = fixture();
   try {
-    beginArchiveShadow(item.filename);
-    const source = new Database(item.filename);
-    source.prepare("VACUUM INTO ?").run(item.next);
-    source.close();
-    prepareArchiveShadowCutover(item.filename);
+    prepareShadow(item);
     renameSync(item.filename, item.old);
     // File replacement remains detectable even though ordinary SQLite DML
     // against the candidate is fenced after preparation.
@@ -763,11 +751,7 @@ test("recovery keeps the fallback when the authenticated candidate is replaced d
   const item = fixture();
   const originalRename = fs.renameSync;
   try {
-    beginArchiveShadow(item.filename);
-    const source = new Database(item.filename);
-    source.prepare("VACUUM INTO ?").run(item.next);
-    source.close();
-    prepareArchiveShadowCutover(item.filename);
+    prepareShadow(item);
     renameSync(item.filename, item.old);
     const substitute = `${item.filename}.substitute`;
     const other = new Database(substitute);
@@ -798,11 +782,7 @@ test("recovery keeps the fallback when a previously promoted candidate changes b
   const originalClose = fs.closeSync;
   const originalRename = fs.renameSync;
   try {
-    beginArchiveShadow(item.filename);
-    const source = new Database(item.filename);
-    source.prepare("VACUUM INTO ?").run(item.next);
-    source.close();
-    prepareArchiveShadowCutover(item.filename);
+    prepareShadow(item);
     renameSync(item.filename, item.old);
     renameSync(item.next, item.filename);
     const substitute = `${item.filename}.substitute`;

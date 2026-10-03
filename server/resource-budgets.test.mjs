@@ -57,6 +57,12 @@ function runInput(conversationId) {
   return { conversationId, provider: "codex", approvalPolicy: "read-only", prompt: "work" };
 }
 
+function expandLegacyMessage(filename, messageId, mebibytes = 4) {
+  const writer = new Database(filename);
+  try { writer.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(mebibytes * 1024 * 1024), messageId); }
+  finally { writer.close(); }
+}
+
 function ageArchived(filename, ids) {
   const admin = new Database(filename);
   const old = new Date(Date.now() - 100 * 86_400_000).toISOString();
@@ -1293,9 +1299,7 @@ test("oversized cleanup fences the live database and reclaims a shadow before re
       Atomics.store(lockGate, 0, 0);
       const archived = chat(database, mode);
       const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
-      const legacy = new Database(filename);
-      legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
-      legacy.close();
+      expandLegacyMessage(filename, message.id);
       const oldPhysicalBytes = statSync(filename).size;
       database.updateConversation(archived.id, { archived: true });
       if (mode === "automatic") ageArchived(filename, [archived.id]);
@@ -1348,9 +1352,7 @@ test("a committed source write at archive cutover discards the stale shadow and 
     const queued = database.createRun(runInput(sibling.id));
     const archived = chat(database, "legacy overflow");
     const large = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
-    const legacy = new Database(filename);
-    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), large.id);
-    legacy.close();
+    expandLegacyMessage(filename, large.id);
     database.updateConversation(archived.id, { archived: true });
     const deletion = database.deleteArchivedConversation(archived.id, archived.id);
     const deadline = Date.now() + 5000;
@@ -1410,9 +1412,7 @@ test("a direct schema commit after source close defers stale shadow promotion", 
     const queued = database.createRun(runInput(sibling.id));
     const archived = chat(database, "large archive");
     const large = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
-    const legacy = new Database(filename);
-    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), large.id);
-    legacy.close();
+    expandLegacyMessage(filename, large.id);
     database.updateConversation(archived.id, { archived: true });
     const deletion = database.deleteArchivedConversation(archived.id, archived.id);
     const deadline = Date.now() + 5000;
@@ -1459,9 +1459,7 @@ test("a direct writer after the source closes cannot commit through shadow promo
     const queued = database.createRun(runInput(sibling.id));
     const archived = chat(database, "large archive");
     const large = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
-    const legacy = new Database(filename);
-    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), large.id);
-    legacy.close();
+    expandLegacyMessage(filename, large.id);
     database.updateConversation(archived.id, { archived: true });
     const deletion = database.deleteArchivedConversation(archived.id, archived.id);
     const deadline = Date.now() + 5000;
@@ -1529,9 +1527,7 @@ test("shadow copy serves unrelated work and retries after a concurrent source wr
   try {
     const archived = chat(database, "large old archive");
     const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
-    const legacy = new Database(filename);
-    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(8 * 1024 * 1024), message.id);
-    legacy.close();
+    expandLegacyMessage(filename, message.id, 8);
     database.updateConversation(archived.id, { archived: true });
     const deletion = database.deleteArchivedConversation(archived.id, archived.id);
     const deadline = Date.now() + 5000;
@@ -1576,9 +1572,7 @@ test("an in-flight archive copy does not pin sustained sibling writes in the WAL
     const queued = database.createRun(runInput(sibling.id));
     const archived = chat(database, "legacy overflow");
     const oversized = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
-    const legacy = new Database(filename);
-    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(8 * 1024 * 1024), oversized.id);
-    legacy.close();
+    expandLegacyMessage(filename, oversized.id, 8);
     database.updateConversation(archived.id, { archived: true });
     const deletion = database.deleteArchivedConversation(archived.id, archived.id);
     const deadline = Date.now() + 5000;
@@ -1630,9 +1624,7 @@ test("automatic shadow cleanup defers for a late run without consuming storage r
   try {
     const archived = chat(database, "large old archive");
     const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
-    const legacy = new Database(filename);
-    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(8 * 1024 * 1024), message.id);
-    legacy.close();
+    expandLegacyMessage(filename, message.id, 8);
     database.updateConversation(archived.id, { archived: true });
     ageArchived(filename, [archived.id]);
     const deletion = database.pruneHistory();
@@ -1681,9 +1673,7 @@ test("rejected shadow replacement preserves queued and recoverable evidence thro
     database.updateRun(interrupted.id, { status: "interrupted" });
     const archived = chat(database, "oversized deletion");
     const large = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
-    const legacy = new Database(filename);
-    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), large.id);
-    legacy.close();
+    expandLegacyMessage(filename, large.id);
     database.updateConversation(archived.id, { archived: true });
     const deletion = database.deleteArchivedConversation(archived.id, archived.id);
     const deadline = Date.now() + 5000;
@@ -1873,9 +1863,7 @@ test("failed archive recovery rejects required audit waiters and preserves sourc
   try {
     const archived = chat(database, "audit recovery");
     const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
-    const legacy = new Database(filename);
-    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
-    legacy.close();
+    expandLegacyMessage(filename, message.id);
     database.updateConversation(archived.id, { archived: true });
     const deletion = database.deleteArchivedConversation(archived.id, archived.id);
     const deadline = Date.now() + 5000;
@@ -2020,9 +2008,7 @@ test("closing during an oversized archive delete keeps its lease until the worke
   try {
     const archived = chat(database);
     const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
-    const legacy = new Database(filename);
-    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(16 * 1024 * 1024), message.id);
-    legacy.close();
+    expandLegacyMessage(filename, message.id, 16);
     database.updateConversation(archived.id, { archived: true });
     const deletion = database.deleteArchivedConversation(archived.id, archived.id);
     const gateDeadline = Date.now() + 5_000;

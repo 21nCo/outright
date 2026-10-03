@@ -1307,7 +1307,8 @@ async function newChatSupersededListRegression(failSuccessor = false) {
     await until(() => host.querySelector('#chat-tab-chat-new[aria-selected="true"]') && !host.querySelector('[aria-label="Send message"]')?.disabled, "successor selected created chat");
   }
   heldPostCreateList.resolve(response({ conversations: [created] }));
-  await settle();
+  await until(() => host.querySelector('.first-prompt-notice')?.textContent.includes("your message was not sent"),
+    `created chat retry notice after superseded list ${lists}`);
   assert(runs.length === 0, "Superseded list submitted a run before the current list/detail owner was ready");
   assert(host.querySelector('textarea[aria-label="Message the agent"]')?.value === "First prompt must survive", "Superseded list discarded the first draft");
   assert(host.textContent.includes("Chat created, but your message was not sent"), "Created chat silently dropped the first prompt without a visible retry instruction");
@@ -1569,6 +1570,31 @@ async function terminalUnknownRegression() {
   assert(created === 0, "Unknown terminal silently created a replacement process");
   assert(host.querySelector('[data-tab-id="term-A"]').getAttribute("aria-label").includes("ownership unverified"),
     "Unknown terminal restart lost its ownership warning");
+}
+
+async function terminalUnknownDuringActivationRegression() {
+  root.render(null);
+  await settle();
+  const staleDetail = deferred();
+  const sent = [];
+  let created = 0;
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") { created += 1; return response(terminal("A2")); }
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A")] });
+    if (url.pathname === "/api/terminals/term-A") return staleDetail.promise;
+    return response({});
+  };
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]}
+    runtimeEvent={event} onError={(error) => { throw error; }} sendRuntime={(message) => sent.push(message)} />);
+  show();
+  await until(() => host.querySelector('.terminal-tab-select[data-tab-id="term-A"]'), "terminal detail request pending");
+  show({ type: "terminal.audit-failed", terminalId: "term-A" });
+  staleDetail.resolve(response({ ...terminal("A"), status: "running", buffer: "old output", outputCursor: 1 }));
+  await until(() => host.querySelector('[data-tab-id="term-A"]')?.getAttribute("aria-label").includes("ownership unverified"),
+    "new unknown ownership survives stale activation detail");
+  assert(!sent.some((message) => message.type === "terminal.input" || message.type === "terminal.resize"),
+    "stale running detail re-enabled terminal interaction");
+  assert(created === 0, "unknown terminal started a replacement process");
 }
 
 async function terminalSelectionReconnectRegression() {
@@ -2232,7 +2258,8 @@ async function commandPaletteRegression() {
   currentResults.resolve(response({ conversations: [{ id: "current", title: "Current result", provider: "codex", worktreePath: "/current" }], partial: true }));
   await until(() => document.querySelector('[role="option"]')?.textContent.includes("Current result"), "current command result");
   assert(document.querySelector(".command-search-scope")?.textContent.includes("recent conversations"), "bounded search was not explained");
-  assert(!document.querySelector('.command-results [role="status"]')?.textContent.includes("recent conversations"), "static search scope should not repeat in the live region");
+  assert(document.querySelector('.command-results [role="status"]')?.textContent.includes("recent conversations and short messages"),
+    "partial search scope was absent from the result announcement");
   await until(() => input.getAttribute("aria-activedescendant") === "command-result-0", "active remote command result");
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
   assert(selected?.id === "current", "Enter did not select the asynchronously loaded command result");
@@ -5056,6 +5083,7 @@ try {
     ["worktree terminal switch", terminalRace, "worktree switch removes old terminal tabs and rejects stale buffer responses"],
     ["terminal keyboard", terminalKeyboardRegression, "terminal keyboard switching retains focus and ignores non-tab controls"],
     ["terminal unknown", terminalUnknownRegression, "unverified terminal ownership blocks interaction and survives restart"],
+    ["terminal unknown during activation", terminalUnknownDuringActivationRegression, "a newer unknown event wins over an in-flight running detail"],
     ["terminal selection during reconnect", terminalSelectionReconnectRegression, "selected terminal and output survive a reconnect while its buffer is pending"],
     ["terminal activation ownership", terminalActivationOwnershipRegression, "terminal activation commits output and current PTY size together"],
     ["rejected terminal switch", terminalRejectedSwitchRegression, "rejected terminal switch restores the selected tab focus"],

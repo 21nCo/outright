@@ -318,7 +318,9 @@ function finishLinkedSource(filename, next, old, marker) {
     // Checkpoint the restored source before obtaining the helper's SQLite
     // lock. No SQLite connection may remain open across Windows unlink.
     if (hasNonemptyWal(old)) {
-      const source = lockArchiveDatabase(filename);
+      // WAL sidecars are named after the private fallback path. Opening the
+      // public hard link would checkpoint a different WAL namespace.
+      const source = lockArchiveDatabase(old);
       try {
         const checkpoint = source.pragma("wal_checkpoint(TRUNCATE)")[0];
         if (checkpoint?.busy || source.pragma("journal_mode = DELETE", { simple: true }).toLowerCase() !== "delete") {
@@ -408,9 +410,10 @@ function recoverPinnedInterruptedCutoverWindows(filename, next, old, marker) {
     const sourceChanged = sourceHadWal || !sourceMatchesSnapshot(old, marker.sourceSnapshot);
     if (sourceChanged || !candidateExists) {
       if (candidatePath === filename && candidateExists) {
-        linkSync(filename, next);
-        durableDirectory(filename);
-        rmSync(filename);
+        // Removing a public hard link while the helper pins its inode can
+        // leave that pathname delete-pending on Windows. Rename keeps the
+        // candidate and makes the public name available for the old source.
+        renameSync(filename, next);
         durableDirectory(filename);
       }
       linkSync(old, filename);

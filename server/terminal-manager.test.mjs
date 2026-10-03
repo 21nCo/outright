@@ -225,6 +225,25 @@ test("shutdown retries a failed native termination before releasing capacity", a
   assert.equal(manager.capacity().active, 0);
 });
 
+test("a rejected managed launch retains a retryable teardown owner through shutdown", async () => {
+  let attempts = 0;
+  const manager = createTerminalManager({ publish: () => {}, maxTerminals: 1,
+    database: { launchDirectory: "/tmp", terminalUnknownReservations: () => [],
+      auditAdmission() {}, auditCritical() {}, auditRequired: async () => {} },
+    startManagedTerminal: async () => {
+      const error = new Error("broker failed after native launch");
+      error.terminationUnknown = true;
+      error.terminalTeardown = { pid: 42, terminate: async () => { attempts += 1; } };
+      throw error;
+    },
+  });
+  await assert.rejects(manager.create({ cwd: "/tmp" }), (error) => error.statusCode === 503);
+  assert.equal(manager.capacity().active, 1);
+  await manager.shutdown();
+  assert.equal(attempts, 1, "shutdown never retried the native teardown after ready rejected");
+  assert.equal(manager.capacity().active, 0);
+});
+
 test("closing keeps the process slot until termination is verified; unknown termination keeps it charged", async () => {
   let finishTermination;
   let failTermination = false;
@@ -518,8 +537,14 @@ test("restart reconciles an empty native owner but keeps legacy unknown reservat
     database.reconcileTerminalAudit();
     const manager = createTerminalManager({ database, publish: () => {}, maxTerminals: 1 });
     assert.equal(manager.capacity().active, 2);
+    assert.deepEqual(manager.list().map((entry) => entry.id).sort(), [legacyId, nativeId].sort());
+    assert.equal(manager.get(legacyId)?.recoveryReservation, true);
+    assert.equal(manager.get(legacyId)?.status, "unknown");
+    assert.equal(manager.write(legacyId, "unsafe"), false);
+    assert.equal(manager.resize(legacyId, 80, 24), false);
     assert.equal(await manager.reconcileUnknown(), 1);
     assert.equal(manager.capacity().active, 1);
+    assert.deepEqual(manager.list().map((entry) => entry.id), [legacyId]);
     assert.deepEqual(database.terminalUnknownReservations().map((entry) => entry.target), [legacyId]);
     assert.equal(database.listAudit(10).some((entry) => entry.action === "terminal.recovered" && entry.target === nativeId), true);
     assert.throws(() => database.resolveTerminalUnknown(legacyId, ""), (error) => error.statusCode === 400);

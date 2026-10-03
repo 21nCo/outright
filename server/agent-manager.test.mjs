@@ -1973,7 +1973,10 @@ test("the Windows supervisor preserves quoted and slash-terminated arguments", {
   const expected = ["plain", "embedded \"quote\"", "slash-before-quote\\\"value", "trailing-slash\\"];
   try {
     const source = `require("node:fs").writeFileSync(${JSON.stringify(marker)}, JSON.stringify(process.argv.slice(1)))`;
-    const result = spawnSync(AGENT_SUPERVISOR, [process.execPath, "-e", source, ...expected], { encoding: "utf8" });
+    // This fixture verifies quoting without simulating a runtime control
+    // pipe. Production mode correctly interprets spawnSync's stdin EOF as
+    // owner exit and terminates the Job Object before the child finishes.
+    const result = spawnSync(AGENT_SUPERVISOR, ["--test-runner", path.join(root, "stop"), process.execPath, "-e", source, ...expected], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(readFileSync(marker, "utf8")), expected);
   } finally {

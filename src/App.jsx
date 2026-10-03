@@ -596,7 +596,7 @@ export function App() {
   const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
   const handleRuntimeEvent = useCallback((event) => {
-    if (["projects.changed", "terminal.output", "terminal.exit", "runtime.connected", "capacity.changed"].includes(event.type)
+    if (["projects.changed", "terminal.output", "terminal.exit", "terminal.audit-failed", "runtime.connected", "capacity.changed"].includes(event.type)
       || (event.type === "run.event" && ["run.completed", "run.failed", "run.stopped"].includes(event.payload?.type))) setRuntimeEvent(event);
     const pendingLoad = pendingConversationLoadRef.current;
     if (["message.created", "run.event"].includes(event.type)
@@ -1399,7 +1399,7 @@ export function App() {
         const listRequest = conversationListRequestRef.current;
         const detail = await api(`/api/conversations/${created.id}`);
         superseded ||= listRequest !== conversationListRequestRef.current;
-        if (listRequest === conversationListRequestRef.current && !conversationListPendingRef.current && !conversationListFailed
+        if (!superseded && listRequest === conversationListRequestRef.current && !conversationListPendingRef.current && !conversationListFailed
           && selectedConversationRef.current === created.id && detail.id === created.id
           && detail.projectId === selectedProjectRef.current && detail.worktreeId === selectedWorktreeRef.current && !detail.archived) return detail;
       }

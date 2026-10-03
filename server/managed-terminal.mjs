@@ -180,6 +180,7 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
   } catch (error) {
     try { await adapter.terminate(); }
     catch { error.terminationUnknown = true; }
+    if (error.terminationUnknown) error.terminalTeardown = adapter;
     if (!error.terminationUnknown) try { cleanupTerminalSocket(id); } catch {}
     throw error;
   }

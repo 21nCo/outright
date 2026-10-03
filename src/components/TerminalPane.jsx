@@ -148,13 +148,12 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   }
 
   async function activateTerminal(terminal, token) {
-    const pending = { id: terminal.id, chunks: [], length: 0, overflow: false, exit: null };
+    const pending = { id: terminal.id, chunks: [], length: 0, overflow: false, exit: null, unknown: false };
     pendingOutputRef.current = pending;
     try {
       const detail = await api(`/api/terminals/${terminal.id}`);
       if (token !== reconcileTokenRef.current) return;
       if (!detail || typeof detail !== "object") throw new Error("Terminal detail is unavailable");
-      const status = detail.status ?? terminal.status;
       // Leave output and exit events staged through the layout handoff. A
       // resize can settle while the snapshot request is in flight.
       await new Promise((resolve) => {
@@ -164,6 +163,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       });
       if (token !== reconcileTokenRef.current) return;
       if (pending.overflow) throw new Error("Terminal output exceeded the activation buffer; retry the tab");
+      const status = pending.unknown ? "unknown" : detail.status ?? terminal.status;
       const xterm = xtermRef.current;
       xterm?.reset();
       if (detail.buffer) xterm?.write(detail.buffer);
@@ -252,6 +252,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       }
     }
     if (runtimeEvent?.type === "terminal.audit-failed") {
+      if (pendingOutputRef.current?.id === runtimeEvent.terminalId) pendingOutputRef.current.unknown = true;
       stageTerminals(terminalsRef.current.map((item) => item.id === runtimeEvent.terminalId
         ? { ...item, status: "unknown" } : item));
       if (runtimeEvent.terminalId === activeIdRef.current) {
@@ -411,7 +412,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   return <section className="terminal-pane" aria-label="Worktree terminals">
     <p className="sr-only" id="terminal-help">Terminal input and output. Use the left and right arrow keys on a terminal tab to switch sessions.</p>
     <header className="terminal-tabs" role="tablist" aria-label="Open terminals" aria-orientation="horizontal" aria-busy={loading} onKeyDown={navigateTerminalTabs}>
-      {terminals.map((terminal) => <div className={`terminal-tab ${terminal.id === activeId ? "is-active" : ""}`} key={terminal.id}><button className="terminal-tab-select" id={domId("terminal-tab", terminal.id)} data-tab-id={terminal.id} role="tab" aria-selected={terminal.id === activeId} aria-controls="terminal-panel" tabIndex={terminal.id === activeId || (!activeId && terminals[0]?.id === terminal.id) ? 0 : -1} aria-disabled={loading || undefined} aria-label={`${terminal.name}${terminal.status === "exited" ? `, process exited ${terminal.exitCode ?? "unknown"}` : terminal.status === "unknown" ? ", ownership unverified" : ""}`} onClick={() => selectTerminal(terminal)}><TerminalWindow /><span>{terminal.name}</span></button><button className="terminal-tab-close" aria-label={`Close terminal ${terminal.name}`} disabled={loading} onClick={() => closeTerminal(terminal.id)}><X /></button></div>)}
+      {terminals.map((terminal) => <div className={`terminal-tab ${terminal.id === activeId ? "is-active" : ""}`} key={terminal.id}><button className="terminal-tab-select" id={domId("terminal-tab", terminal.id)} data-tab-id={terminal.id} role="tab" aria-selected={terminal.id === activeId} aria-controls="terminal-panel" tabIndex={terminal.id === activeId || (!activeId && terminals[0]?.id === terminal.id) ? 0 : -1} aria-disabled={loading || undefined} aria-label={`${terminal.name}${terminal.status === "exited" ? `, process exited ${terminal.exitCode ?? "unknown"}` : terminal.status === "unknown" ? ", ownership unverified" : ""}`} onClick={() => selectTerminal(terminal)}><TerminalWindow /><span>{terminal.name}</span></button><button className="terminal-tab-close" aria-label={`Close terminal ${terminal.name}`} disabled={loading || terminal.recoveryReservation} onClick={() => closeTerminal(terminal.id)}><X /></button></div>)}
       <Button variant="ghost" size="icon-xs" disabled={loading} onClick={createTerminal} aria-label="New terminal"><Plus /></Button>
       {loading && <span className="terminal-loading" role="status"><ArrowsClockwise className="spin" />Loading terminal</span>}
     </header>

@@ -143,6 +143,18 @@ static int terminate_owned_process(const char *raw_pid, const char *expected_ide
 #endif
 }
 
+static bool supports_owned_termination(void) {
+#if defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
+  int descriptor = (int)syscall(SYS_pidfd_open, getpid(), 0);
+  if (descriptor < 0) return false;
+  int result = (int)syscall(SYS_pidfd_send_signal, descriptor, 0, NULL, 0);
+  close(descriptor);
+  return result == 0;
+#else
+  return false;
+#endif
+}
+
 static int ensure_parent_directory(const char *filename) {
   char *copy = strdup(filename);
   if (copy == NULL) return -1;
@@ -414,6 +426,13 @@ int main(int argc, char **argv) {
   if (argc < first + 2) {
     dprintf(STDERR_FILENO, "Usage: %s [--stop-on-owner-exit] HANDSHAKE_PATH EXECUTABLE [ARG...]\n", argv[0]);
     return 64;
+  }
+  // Crash recovery signals a numeric PID only through a verified pidfd. Do
+  // not admit a managed PTY on a kernel where its owner cannot later be
+  // terminated safely after a runtime restart.
+  if (stop_on_owner_exit && !supports_owned_termination()) {
+    dprintf(STDERR_FILENO, "Managed terminals require Linux pidfd_open and pidfd_send_signal support\n");
+    return 69;
   }
   const char *handshake_path = argv[first];
   if (prctl(PR_SET_CHILD_SUBREAPER, 1) != 0) {

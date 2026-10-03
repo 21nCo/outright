@@ -33,7 +33,10 @@ export function acquireWindowsArchiveLock(filenames) {
   const unique = new Map();
   for (const filename of filenames) {
     const info = statSync(filename, { bigint: true });
-    unique.set(`${info.dev}:${info.ino}`, filename);
+    // Some Windows volumes report zero for ino. Do not collapse distinct
+    // files to one lock when their identity is unavailable.
+    const identity = info.ino > 0n ? `${info.dev}:${info.ino}` : path.resolve(filename).toLowerCase();
+    unique.set(identity, filename);
   }
   const token = randomUUID();
   const ready = `${filenames[0]}.archive-lock-${token}.ready`;
@@ -46,7 +49,7 @@ export function acquireWindowsArchiveLock(filenames) {
     let reported = "";
     if (!waitUntil(() => {
       try { reported = readFileSync(ready, "utf8"); return /^\d+$/.test(reported); }
-      catch (error) { if (["ENOENT", "EACCES", "EPERM"].includes(error.code)) return false; throw error; }
+      catch (error) { if (["ENOENT", "EACCES", "EPERM", "EBUSY"].includes(error.code)) return false; throw error; }
     }, 5000)) throw new Error("Windows archive lock did not start");
     const status = Number(reported);
     if (status !== 0) {
@@ -58,8 +61,9 @@ export function acquireWindowsArchiveLock(filenames) {
     try { writeFileSync(stop, "stop", { mode: 0o600, flag: "wx" }); } catch {}
     if (!waitUntil(() => !existsSync(ready), 5000)) child.kill();
     child.stdin.destroy();
-    rmSync(stop, { force: true });
-    rmSync(ready, { force: true });
+    // The helper removes ready only after releasing its file locks. Preserve
+    // stop and ready if that proof has not arrived; a retry must fail closed.
+    if (waitUntil(() => !existsSync(ready), 5000)) rmSync(stop, { force: true });
     throw error;
   }
   return () => {
@@ -67,11 +71,13 @@ export function acquireWindowsArchiveLock(filenames) {
       writeFileSync(stop, "stop", { mode: 0o600, flag: "wx" });
       if (!waitUntil(() => !existsSync(ready), 5000)) {
         child.kill();
-        throw new Error("Windows archive lock did not release");
+        if (!waitUntil(() => !existsSync(ready), 5000)) {
+          throw new Error("Windows archive lock did not release");
+        }
       }
     } finally {
       child.stdin.destroy();
-      rmSync(stop, { force: true });
+      if (!existsSync(ready)) rmSync(stop, { force: true });
     }
   };
 }

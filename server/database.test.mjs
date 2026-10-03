@@ -7,6 +7,19 @@ import os from "node:os";
 import path from "node:path";
 import { createOutrightDatabase, defaultProbeRun } from "./database.mjs";
 
+async function waitForSearchMigration(filename, kind) {
+  const deadline = Date.now() + 5_000;
+  while (true) {
+    const probe = new Database(filename, { readonly: true });
+    let pending;
+    try { pending = probe.prepare("SELECT 1 FROM migration_progress WHERE kind = ?").get(kind); }
+    finally { probe.close(); }
+    if (!pending) return;
+    assert.ok(Date.now() < deadline, `${kind} lookup migration did not resume after restart`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 test("persists settings, groups, conversations, messages, runs, and search", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
@@ -147,16 +160,7 @@ test("global search includes the newest message in an older visible conversation
     } finally { partial.close(); }
     await database.close();
     database = createOutrightDatabase({ filename });
-    const deadline = Date.now() + 5_000;
-    while (true) {
-      const probe = new Database(filename, { readonly: true });
-      let pending;
-      try { pending = probe.prepare("SELECT 1 FROM migration_progress WHERE kind = 'search-heads'").get(); }
-      finally { probe.close(); }
-      if (!pending) break;
-      assert.ok(Date.now() < deadline, "head lookup migration did not resume after restart");
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    await waitForSearchMigration(filename, "search-heads");
     assert.deepEqual(database.search("fresh-active-needle").conversations.map((row) => row.id), [oldest.id]);
     const writer = new Database(filename);
     try { writer.prepare("DELETE FROM messages WHERE id = ?").run(fresh.id); }
@@ -192,16 +196,7 @@ test("title search follows recent activity in an old chat after an interrupted l
     } finally { partial.close(); }
     await database.close();
     database = createOutrightDatabase({ filename });
-    const deadline = Date.now() + 5_000;
-    while (true) {
-      const probe = new Database(filename, { readonly: true });
-      let pending;
-      try { pending = probe.prepare("SELECT 1 FROM migration_progress WHERE kind = 'search-titles'").get(); }
-      finally { probe.close(); }
-      if (!pending) break;
-      assert.ok(Date.now() < deadline, "title lookup migration did not resume after restart");
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    await waitForSearchMigration(filename, "search-titles");
     for (let round = 0; round < 8; round += 1) {
       const result = database.search("recent-renamed-needle");
       assert.deepEqual(result.conversations.map((row) => row.id), [oldest.id]);

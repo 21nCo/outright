@@ -614,11 +614,13 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if (state.stopping) return state.stopping;
     state.stopped = true;
     // Keep the capacity reservation until both validation and tree shutdown end.
-    if (state.child) terminateTree(state.child, "SIGTERM");
+    // On Windows the supervisor's control pipe owns Job Object teardown.
+    // taskkill /T /F here kills the verifier before it can report an empty job.
+    if (state.child && process.platform !== "win32") terminateTree(state.child, "SIGTERM");
     // Cancellation must not wait for an acknowledgement that may never arrive.
     // stdin ordering guarantees a post-authorization stop follows "go", while
     // an unauthorized owner treats stop/end as abandonment.
-    if (state.child && state.ownsDescendants) requestWrapperTeardown(state);
+    if (state.child && (state.ownsDescendants || process.platform === "win32")) requestWrapperTeardown(state);
     state.stopping = (async () => {
       if (state.child) {
         const started = Date.now();

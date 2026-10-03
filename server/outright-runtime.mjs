@@ -717,12 +717,16 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     // shutdown. Stop startup-owned managers before releasing the physical
     // lease. The constructor is synchronous; no agent or PTY has been admitted.
     const cleanupErrors = [];
-    try { void agents?.shutdown().catch((failure) => console.error("Runtime startup agent cleanup failed", failure)); }
+    let agentShutdown;
+    try { agentShutdown = agents?.shutdown(); }
     catch (failure) { cleanupErrors.push(failure); }
+    void Promise.resolve(agentShutdown).catch((failure) => console.error("Runtime startup agent cleanup failed", failure));
     try { eventHub?.shutdown(); } catch (failure) { cleanupErrors.push(failure); }
     try { wss?.close(); } catch (failure) { cleanupErrors.push(failure); }
-    try { void database.close().catch((failure) => console.error("Runtime startup database cleanup failed", failure)); }
+    let databaseShutdown;
+    try { databaseShutdown = database.close(); }
     catch (failure) { cleanupErrors.push(failure); }
+    void Promise.resolve(databaseShutdown).catch((failure) => console.error("Runtime startup database cleanup failed", failure));
     if (cleanupErrors.length) throw new AggregateError([error, ...cleanupErrors], "Runtime startup and cleanup failed");
     throw error;
   }

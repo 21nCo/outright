@@ -31,7 +31,7 @@ static int archive_lock(int argc, wchar_t **argv) {
         0, 512, 0, &overlap)) { CloseHandle(file); result = 74; break; }
     files[held++] = file;
   }
-  HANDLE ready = CreateFileW(argv[3], GENERIC_WRITE, 0, NULL, CREATE_NEW,
+  HANDLE ready = CreateFileW(argv[3], GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, CREATE_NEW,
     FILE_ATTRIBUTE_NORMAL, NULL);
   if (ready == INVALID_HANDLE_VALUE) result = result ? result : 75;
   else {

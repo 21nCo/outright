@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { utilityProcesses } from "./subprocess-budget.mjs";
 import { cleanupTerminalSocket, recoverManagedTerminal, spawnManagedTerminal, terminalOwnership } from "./managed-terminal.mjs";
 
-export function createTerminalManager({ publish, database, spawnTerminal = null, subprocesses = utilityProcesses, terminate = (terminal, options) => {
+export function createTerminalManager({ publish, database, spawnTerminal = null, startManagedTerminal = spawnManagedTerminal,
+  subprocesses = utilityProcesses, terminate = (terminal, options) => {
   if (typeof terminal.process?.terminate !== "function") throw new Error("PTY owner has no termination verifier");
   return terminal.process.terminate(options);
 }, maxTerminals = 12, maxTerminalsPerCwd = 4, exitedRetentionMs = 15 * 60 * 1000, maxBufferChars = 150_000 }) {
@@ -122,7 +123,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       recorded: false };
     terminals.set(id, terminal);
     try {
-      terminal.ready = spawnManagedTerminal({ id, ownership, shell, cwd, cols: clamp(cols, 20, 400),
+      terminal.ready = startManagedTerminal({ id, ownership, shell, cwd, cols: clamp(cols, 20, 400),
         rows: clamp(rows, 5, 200), env, subprocesses });
       const processInstance = await terminal.ready;
       terminal.process = processInstance;
@@ -155,6 +156,10 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       return publicTerminal(terminal);
     } catch (error) {
       terminal.status = "closing";
+      if (error.terminalTeardown) {
+        terminal.process = error.terminalTeardown;
+        terminal.pid = terminal.process.pid;
+      }
       if (error.terminationUnknown) {
         terminal.status = "unknown";
         throw outcomeUnknown(error, evidence.operationId);
@@ -169,10 +174,20 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     }
   }
 
-  function list() { return [...terminals.values()].map(publicTerminal); }
+  function reservationTerminal(entry) {
+    return { id: entry.target, cwd: entry.cwd, name: "Terminal recovery required", pid: entry.pid,
+      status: "unknown", createdAt: null, recoveryReservation: true };
+  }
+  function list() { return [...terminals.values()].map(publicTerminal).concat(reservedUnknown
+    .filter((entry) => !terminals.has(entry.target)).map(reservationTerminal)); }
   function capacity() { return { active: [...terminals.values()].filter((terminal) => terminal.status !== "exited").length + reservedUnknown.length,
     unknown: [...terminals.values()].filter((terminal) => terminal.status === "unknown").length + reservedUnknown.length, limit: maxTerminals }; }
-  function get(id) { const terminal = terminals.get(id); return terminal ? { ...publicTerminal(terminal), buffer: terminal.buffer, outputCursor: terminal.outputCursor } : null; }
+  function get(id) {
+    const terminal = terminals.get(id);
+    if (terminal) return { ...publicTerminal(terminal), buffer: terminal.buffer, outputCursor: terminal.outputCursor };
+    const reservation = reservedUnknown.find((entry) => entry.target === id);
+    return reservation ? { ...reservationTerminal(reservation), buffer: "", outputCursor: 0 } : null;
+  }
   function write(id, data) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running" || typeof data !== "string" || Buffer.byteLength(data) > 64 * 1024) return false; return terminal.process.write(data) !== false; }
   function resize(id, cols, rows) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running") return false; return terminal.process.resize(clamp(cols, 20, 400), clamp(rows, 5, 200)) !== false; }
   function startNaturalExit(terminal) {
@@ -212,7 +227,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
         // owned process before reporting an unknown outcome to the caller.
         try { database.auditCritical("terminal.close.requested", evidence); }
         catch { /* A durable terminal.closed outcome can still settle created. */ }
-        if (terminal.ready) {
+        if (terminal.ready && !terminal.process) {
           terminal.process = await terminal.ready;
           terminal.pid = terminal.process.pid;
         }

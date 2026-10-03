@@ -19,6 +19,43 @@ function capacityError() {
   return Object.assign(new Error("Utility process capacity is full"), { statusCode: 429, code: "SUBPROCESS_CAPACITY" });
 }
 
+async function stagedTrackedFixture(root) {
+  await git(root, ["init", "project"]);
+  const repository = await realpath(path.join(root, "project"));
+  await git(repository, ["config", "user.email", "outright@example.test"]);
+  await git(repository, ["config", "user.name", "Outright Test"]);
+  await writeFile(path.join(repository, "tracked.txt"), "first\n");
+  await git(repository, ["add", "tracked.txt"]);
+  await git(repository, ["commit", "-m", "initial"]);
+  await writeFile(path.join(repository, "tracked.txt"), "second\n");
+  await git(repository, ["add", "tracked.txt"]);
+  return repository;
+}
+
+test("optional Git history failure leaves required status usable", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-git-optional-log-"));
+  try {
+    await git(root, ["init", "project"]);
+    const repository = await realpath(path.join(root, "project"));
+    await writeFile(path.join(repository, "new file.txt"), "untracked\n");
+    let failRequired = false;
+    const service = createGitService({
+      database: {}, getProjects: () => [{ worktrees: [{ path: repository }] }],
+      getConfig: async () => ({ scanRoots: [root] }),
+      subprocesses: { run: (file, args, options) => {
+        if (args[2] === "log") return Promise.reject(Object.assign(new Error("history timed out"), { code: "ETIMEDOUT" }));
+        if (failRequired && args[2] === "status") return Promise.reject(capacityError());
+        return execFileAsync(file, args, options);
+      } },
+    });
+    const status = await service.status(repository);
+    assert.equal(status.files[0].path, "new file.txt");
+    assert.deepEqual(status.commits, []);
+    failRequired = true;
+    await assert.rejects(service.status(repository), (error) => error.code === "SUBPROCESS_CAPACITY");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("editor launch releases utility capacity when a GUI stays open and records spawn failure", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "outright-editor-launch-"));
   try {
@@ -64,15 +101,7 @@ test("editor launch releases utility capacity when a GUI stays open and records 
 test("unstage capacity refusal preserves a staged tracked modification", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "outright-unstage-capacity-"));
   try {
-    await git(root, ["init", "project"]);
-    const repository = await realpath(path.join(root, "project"));
-    await git(repository, ["config", "user.email", "outright@example.test"]);
-    await git(repository, ["config", "user.name", "Outright Test"]);
-    await writeFile(path.join(repository, "tracked.txt"), "first\n");
-    await git(repository, ["add", "tracked.txt"]);
-    await git(repository, ["commit", "-m", "initial"]);
-    await writeFile(path.join(repository, "tracked.txt"), "second\n");
-    await git(repository, ["add", "tracked.txt"]);
+    const repository = await stagedTrackedFixture(root);
     const service = createGitService({
       database: { auditAdmission() {}, auditCritical() {} },
       getProjects: () => [{ worktrees: [{ path: repository }] }],
@@ -88,15 +117,7 @@ test("unstage capacity refusal preserves a staged tracked modification", async (
 test("Git without restore unstages tracked changes without staging a deletion", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "outright-unstage-compat-"));
   try {
-    await git(root, ["init", "project"]);
-    const repository = await realpath(path.join(root, "project"));
-    await git(repository, ["config", "user.email", "outright@example.test"]);
-    await git(repository, ["config", "user.name", "Outright Test"]);
-    await writeFile(path.join(repository, "tracked.txt"), "first\n");
-    await git(repository, ["add", "tracked.txt"]);
-    await git(repository, ["commit", "-m", "initial"]);
-    await writeFile(path.join(repository, "tracked.txt"), "second\n");
-    await git(repository, ["add", "tracked.txt"]);
+    const repository = await stagedTrackedFixture(root);
     const service = createGitService({
       database: { auditAdmission() {}, auditCritical() {} },
       getProjects: () => [{ worktrees: [{ path: repository }] }],

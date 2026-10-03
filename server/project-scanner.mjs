@@ -244,18 +244,19 @@ function displayWorktreeName(worktree, projectName) {
     : directoryName;
 }
 
-async function mapWithConcurrency(items, concurrency, mapper) {
+export async function mapWithConcurrency(items, concurrency, mapper) {
   const results = new Array(items.length);
   let cursor = 0;
+  let failed = false;
   let failure;
   async function worker() {
-    while (!failure && cursor < items.length) {
+    while (!failed && cursor < items.length) {
       const index = cursor++;
       try { results[index] = await mapper(items[index], index); }
-      catch (error) { failure ??= error; }
+      catch (error) { if (!failed) { failed = true; failure = error; } }
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
-  if (failure) throw failure;
+  if (failed) throw failure;
   return results;
 }

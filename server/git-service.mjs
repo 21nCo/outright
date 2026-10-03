@@ -9,6 +9,10 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     try { return await git(cwd, args, overrides); }
     catch (error) { if (error.code === "SUBPROCESS_CAPACITY" || mutationOutcomeUncertain(error)) throw error; return ""; }
   };
+  const optionalGit = async (cwd, args) => {
+    try { return await git(cwd, args); }
+    catch { return ""; }
+  };
   const gitOutputOnFailure = async (cwd, args) => {
     try { return await git(cwd, args, { maxBuffer: 12 * 1024 * 1024 }); }
     catch (error) { if (error.code === "SUBPROCESS_CAPACITY" || mutationOutcomeUncertain(error)) throw error; return (error.stdout ?? "").trimEnd(); }
@@ -19,7 +23,7 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
       git(cwd, ["branch", "--show-current"]),
       // NUL-delimited output keeps filenames with spaces or quotes intact.
       git(cwd, ["status", "--porcelain=v1", "--branch", "-z"]),
-      safeGit(cwd, ["log", "-8", "--pretty=format:%h%x09%an%x09%ar%x09%s"]),
+      optionalGit(cwd, ["log", "-8", "--pretty=format:%h%x09%an%x09%ar%x09%s"]),
     ]);
     const { header, files } = parsePorcelain(porcelain);
     return {
