@@ -1,0 +1,16 @@
+server/outright-runtime.mjs
+  h_a39f9495f9ec1d 16,19-22,31-33,37,44,46,55,57,59,66,68,70,715-728
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 1252-1283
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "95deb51bbebf91fae6065f9bfacdf6448762c210",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
