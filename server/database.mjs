@@ -111,6 +111,9 @@ export function createOutrightDatabase(options = {}) {
   let terminalAuditTick;
   let terminalAuditScan;
   let terminalReservationsCache;
+  let terminalAuditCompletion = Promise.resolve();
+  let completeTerminalAudit;
+  let failTerminalAudit;
   let deletionTick;
   let deletionTickKind;
   let deletionCursor = 0;
@@ -370,6 +373,14 @@ export function createOutrightDatabase(options = {}) {
   function beginTerminalAuditScan() {
     const lastId = db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM audit_log").get().id;
     terminalAuditScan = { cursor: 0, lastId, requests: new Map(), owners: new Map(), outcomes: null, written: 0 };
+    terminalAuditCompletion = new Promise((resolve, reject) => {
+      completeTerminalAudit = resolve;
+      failTerminalAudit = reject;
+    });
+    // The runtime does not await startup recovery, but an offline caller can.
+    // Attach a handler now so a storage failure never becomes an unhandled
+    // rejection when no caller is waiting.
+    void terminalAuditCompletion.catch(() => {});
     terminalAuditTick = setImmediate(advanceTerminalAuditScan);
   }
 
@@ -435,9 +446,12 @@ export function createOutrightDatabase(options = {}) {
       }
       terminalReservationsCache = [...scan.owners.values()];
       terminalAuditScan = null;
-      options.onTerminalAuditReconciled?.();
+      completeTerminalAudit?.();
+      try { options.onTerminalAuditReconciled?.(); }
+      catch (error) { options.onTerminalAuditError?.(error); }
     } catch (error) {
       scan.error = error;
+      failTerminalAudit?.(error);
       options.onTerminalAuditError?.(error);
       // Keep terminal admission paused. A restart retries the bounded scan.
     }
@@ -449,12 +463,14 @@ export function createOutrightDatabase(options = {}) {
     get maintenanceActive() { return maintenance; },
     get terminalAuditScanPending() { return Boolean(terminalAuditScan); },
     get terminalAuditScanError() { return terminalAuditScan?.error?.message ?? null; },
+    waitForTerminalAuditReconciliation() { return terminalAuditCompletion; },
     closeFailedStartup() {
       // The runtime constructor has not yielded to the event loop, so no
       // scheduled deletion worker or migration tick has run. Release both
       // SQLite handles synchronously before a successor acquires the lease.
       if (deletionWorkers.size || maintenance) throw new Error("Startup cleanup found active archive maintenance");
       closing = true;
+      if (terminalAuditScan) failTerminalAudit?.(databaseError(503, "Terminal audit recovery stopped during startup cleanup"));
       if (migrationTick) clearImmediate(migrationTick);
       if (migrationRetry) clearTimeout(migrationRetry);
       if (terminalAuditTick) clearImmediate(terminalAuditTick);
@@ -470,6 +486,7 @@ export function createOutrightDatabase(options = {}) {
     close: () => {
       if (closing) return deletionWorkers.size ? new Promise((resolve) => closeWaiters.add(resolve)) : Promise.resolve();
       closing = true;
+      if (terminalAuditScan) failTerminalAudit?.(databaseError(503, "Terminal audit recovery stopped when the database closed"));
       for (const resolve of deletionIdleWaiters) resolve();
       deletionIdleWaiters.clear();
       if (migrationTick) clearImmediate(migrationTick);

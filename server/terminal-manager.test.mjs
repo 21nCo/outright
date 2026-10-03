@@ -641,7 +641,9 @@ test("legacy terminal audit history yields startup and resumes safely after inte
     database = createOutrightDatabase({ filename, runtimeLease: true });
     database.reconcileTerminalAudit();
     assert.equal(database.terminalAuditScanPending, true, "large legacy history was scanned before startup returned");
+    const interruptedWait = database.waitForTerminalAuditReconciliation();
     await database.close();
+    await assert.rejects(interruptedWait, /database closed/);
     database = createOutrightDatabase({ filename, runtimeLease: true });
     database.reconcileTerminalAudit();
     assert.equal(database.terminalAuditScanPending, true,
@@ -695,6 +697,56 @@ test("offline terminal recovery requires the exclusive runtime lease and records
     assert.deepEqual(database.terminalUnknownReservations(), []);
     assert.equal(database.listAudit(10).find((entry) => entry.action === "terminal.recovered")?.details.evidence,
       "Operator verified native owner empty: Observed no owned process");
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("offline terminal recovery waits for a large audit scan before listing or resolving", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-operator-legacy-"));
+  const filename = path.join(directory, "runtime.db");
+  const target = "7989e1ba-29df-41a2-a795-73cfc2d4896d";
+  const cli = fileURLToPath(new URL("../scripts/reconcile-terminal-capacity.mjs", import.meta.url));
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  try {
+    await database.close();
+    const writer = new Database(filename);
+    try {
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)");
+      writer.transaction(() => {
+        for (let index = 0; index < 2_100; index += 1) insert.run("legacy.telemetry", "", "{}", "2026-09-01");
+        insert.run("terminal.created", target, JSON.stringify({ cwd: directory }), "2026-09-01");
+      }).immediate();
+    } finally { writer.close(); }
+    const listed = spawnSync(process.execPath, [cli, "--database", filename, "--list"],
+      { encoding: "utf8", timeout: 10_000 });
+    assert.equal(listed.status, 0, listed.stderr);
+    assert.equal(JSON.parse(listed.stdout).find((entry) => entry.target === target)?.cwd, directory);
+    const resolved = spawnSync(process.execPath, [cli, "--database", filename, "--target", target,
+      "--verified-empty", "--evidence", "Observed no owned process"], { encoding: "utf8", timeout: 10_000 });
+    assert.equal(resolved.status, 0, resolved.stderr);
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    assert.deepEqual(database.terminalUnknownReservations(), []);
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("terminal audit scan exposes a bounded owner-index failure to offline waiters", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-audit-limit-"));
+  const filename = path.join(directory, "runtime.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  try {
+    await database.close();
+    const writer = new Database(filename);
+    try {
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES ('terminal.created', ?, '{}', '2026-09-01')");
+      writer.transaction(() => {
+        for (let index = 0; index <= 10_000; index += 1) {
+          insert.run(`00000000-0000-4000-8000-${String(index).padStart(12, "0")}`);
+        }
+      }).immediate();
+    } finally { writer.close(); }
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    database.reconcileTerminalAudit();
+    await assert.rejects(database.waitForTerminalAuditReconciliation(), /bounded owner index/);
+    assert.match(database.terminalAuditScanError, /bounded owner index/);
   } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 

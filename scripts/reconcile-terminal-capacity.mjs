@@ -26,6 +26,7 @@ if (!target && !args.includes("--list")) throw new Error("Use --list or --target
 const database = createOutrightDatabase({ filename, runtimeLease: true });
 try {
   database.reconcileTerminalAudit();
+  await database.waitForTerminalAuditReconciliation();
   if (target) {
     if (!database.terminalUnknownReservations().some((entry) => entry.target === target)) {
       throw new Error("The terminal has no unresolved capacity reservation");
