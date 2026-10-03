@@ -107,6 +107,65 @@ test("global search reaches live siblings behind a deferred hidden archive acros
   } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("global search includes the newest message in an older visible conversation", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-recent-search-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const oldest = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "old chat", provider: "codex" });
+    for (let index = 0; index < 256; index += 1) {
+      const newer = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: `new chat ${index}`, provider: "codex" });
+      database.addMessage({ conversationId: newer.id, role: "assistant", body: `filler ${index}` });
+    }
+    database.addMessage({ conversationId: oldest.id, role: "assistant", body: "fallback-active-needle" });
+    const fresh = database.addMessage({ conversationId: oldest.id, role: "assistant", body: "fresh-active-needle" });
+    const durations = [];
+    for (let round = 0; round < 8; round += 1) {
+      const started = performance.now();
+      const result = database.search("fresh-active-needle");
+      durations.push(performance.now() - started);
+      assert.deepEqual(result.conversations.map((row) => row.id), [oldest.id]);
+      assert.ok(Buffer.byteLength(JSON.stringify(result)) < 4096);
+    }
+    assert.ok(durations.sort((a, b) => a - b)[4] < 250, "repeated global searches blocked the runtime");
+    await database.close();
+    // Model an upgrade from a store that predates the global head lookup.
+    // The backfill must resume after an interrupted, bounded first page.
+    const oldStore = new Database(filename);
+    oldStore.exec(`DROP TRIGGER search_heads_message_insert;
+      DROP TRIGGER search_heads_message_delete;
+      DROP TRIGGER search_heads_conversation_update;
+      DROP TRIGGER search_heads_conversation_delete;
+      DROP TABLE search_message_heads`);
+    oldStore.close();
+    database = createOutrightDatabase({ filename });
+    await new Promise((resolve) => setImmediate(resolve));
+    const partial = new Database(filename, { readonly: true });
+    try {
+      const cursor = partial.prepare("SELECT cursor_number AS cursor FROM migration_progress WHERE kind = 'search-heads'").get()?.cursor;
+      assert.ok(cursor > 0 && cursor < 257, "head lookup migration did not advance in a bounded page");
+    } finally { partial.close(); }
+    await database.close();
+    database = createOutrightDatabase({ filename });
+    const deadline = Date.now() + 5_000;
+    while (true) {
+      const probe = new Database(filename, { readonly: true });
+      let pending;
+      try { pending = probe.prepare("SELECT 1 FROM migration_progress WHERE kind = 'search-heads'").get(); }
+      finally { probe.close(); }
+      if (!pending) break;
+      assert.ok(Date.now() < deadline, "head lookup migration did not resume after restart");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(database.search("fresh-active-needle").conversations.map((row) => row.id), [oldest.id]);
+    const writer = new Database(filename);
+    try { writer.prepare("DELETE FROM messages WHERE id = ?").run(fresh.id); }
+    finally { writer.close(); }
+    assert.deepEqual(database.search("fresh-active-needle").conversations, []);
+    assert.deepEqual(database.search("fallback-active-needle").conversations.map((row) => row.id), [oldest.id]);
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("conversation find reaches old and new pages, wraps, and treats query text literally", async () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

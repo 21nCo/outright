@@ -1361,13 +1361,16 @@ export function createOutrightDatabase(options = {}) {
         SELECT ${fields} FROM recent JOIN conversations AS c ON c.rowid = recent.rowid
         WHERE c.deleting = 0 AND ${safeIdentity}
           AND c.title LIKE ? ESCAPE '\\'`).all(needle);
-      // Merge indexed per-conversation heads by the global message ordinal.
-      // Each step advances exactly one cursor, so both lookup work and body
-      // checks stay bounded even if a hidden archive holds millions of rows.
-      const scopes = db.prepare(`SELECT c.id FROM search_visible_conversations AS visible
-        JOIN conversations AS c ON c.rowid = visible.source_rowid
+      // The 256 newest visible conversation heads cover the 256 newest
+      // visible messages: an omitted head already has 256 newer heads ahead
+      // of it. This keeps old, active chats eligible after many new chats.
+      const scopes = db.prepare(`WITH recent_heads AS MATERIALIZED
+        (SELECT source_rowid FROM search_message_heads
+          ORDER BY latest_ordinal DESC LIMIT ${SEARCH_CANDIDATES})
+        SELECT c.id FROM recent_heads AS heads
+        JOIN conversations AS c ON c.rowid = heads.source_rowid
         WHERE c.deleting = 0 AND octet_length(c.id) <= 256
-        ORDER BY visible.source_rowid DESC LIMIT ${SEARCH_CANDIDATES}`).all();
+        LIMIT ${SEARCH_CANDIDATES}`).all();
       const nextOrdinal = db.prepare(`SELECT ordinal FROM message_order WHERE scope = ? AND ordinal < ?
         ORDER BY ordinal DESC LIMIT 1`);
       const heads = scopes.map(({ id }) => ({ id, ordinal: nextOrdinal.get(id, Number.MAX_SAFE_INTEGER)?.ordinal ?? 0 }));
@@ -1395,6 +1398,7 @@ export function createOutrightDatabase(options = {}) {
         responseBytes += bytes;
       }
       const partial = matched.length > conversations.length || Boolean(migrationJob(db, "search-visible")
+        || migrationJob(db, "search-heads")
         || migrationJob(db, "messages")
         || (visible.length === SEARCH_CANDIDATES && db.prepare(`SELECT 1 FROM search_visible_conversations
           WHERE source_rowid < ? LIMIT 1`).get(visible.at(-1).rowid))
@@ -1727,6 +1731,7 @@ function migrate(db) {
   try { db.exec("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE conversations ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   prepareVisibleConversationLookup(db);
+  prepareSearchMessageHeads(db);
   try { db.exec("ALTER TABLE runs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'medium'"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN pid INTEGER"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN recovery_class TEXT"); } catch { /* Already migrated. */ }
@@ -1792,6 +1797,46 @@ function prepareVisibleConversationLookup(db) {
     if (!existed && db.prepare("SELECT 1 FROM conversations LIMIT 1").get()) {
       db.prepare("INSERT OR IGNORE INTO migration_progress (kind) VALUES ('search-visible')").run();
     }
+  }).immediate();
+}
+
+function prepareSearchMessageHeads(db) {
+  db.transaction(() => {
+    const existed = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'search_message_heads'").get());
+    // Creating the ordered index while the table is empty keeps startup
+    // independent of legacy history size. Backfill advances by conversation.
+    db.exec(`CREATE TABLE IF NOT EXISTS search_message_heads (
+      source_rowid INTEGER PRIMARY KEY, latest_ordinal INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS search_message_heads_recent ON search_message_heads(latest_ordinal DESC)`);
+    if (!existed && db.prepare("SELECT 1 FROM conversations LIMIT 1").get()) {
+      db.prepare("INSERT OR IGNORE INTO migration_progress (kind) VALUES ('search-heads')").run();
+    }
+    db.exec(`CREATE TRIGGER IF NOT EXISTS search_heads_message_insert AFTER INSERT ON message_order BEGIN
+      INSERT INTO search_message_heads (source_rowid, latest_ordinal)
+        SELECT rowid, NEW.ordinal FROM conversations WHERE id = NEW.scope AND deleting = 0
+        ON CONFLICT(source_rowid) DO UPDATE SET latest_ordinal = MAX(latest_ordinal, excluded.latest_ordinal);
+    END;
+    CREATE TRIGGER IF NOT EXISTS search_heads_message_delete AFTER DELETE ON message_order BEGIN
+      UPDATE search_message_heads SET latest_ordinal =
+        (SELECT ordinal FROM message_order WHERE scope = OLD.scope ORDER BY ordinal DESC LIMIT 1)
+        WHERE source_rowid = (SELECT rowid FROM conversations WHERE id = OLD.scope)
+          AND latest_ordinal = OLD.ordinal
+          AND EXISTS (SELECT 1 FROM message_order WHERE scope = OLD.scope);
+      DELETE FROM search_message_heads
+        WHERE source_rowid = (SELECT rowid FROM conversations WHERE id = OLD.scope)
+          AND latest_ordinal = OLD.ordinal
+          AND NOT EXISTS (SELECT 1 FROM message_order WHERE scope = OLD.scope);
+    END;
+    CREATE TRIGGER IF NOT EXISTS search_heads_conversation_update AFTER UPDATE OF deleting ON conversations BEGIN
+      DELETE FROM search_message_heads WHERE source_rowid = OLD.rowid;
+      INSERT INTO search_message_heads (source_rowid, latest_ordinal)
+        SELECT NEW.rowid, ordinal FROM message_order WHERE scope = NEW.id AND NEW.deleting = 0
+        ORDER BY ordinal DESC LIMIT 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS search_heads_conversation_delete AFTER DELETE ON conversations BEGIN
+      DELETE FROM search_message_heads WHERE source_rowid = OLD.rowid;
+    END`);
   }).immediate();
 }
 
@@ -1908,6 +1953,7 @@ function advanceMigrations(db) {
   advanceEventMigration(db);
   advanceMessageMigration(db);
   advanceVisibleConversationMigration(db);
+  advanceSearchHeadsMigration(db);
   advanceRetainedMigration(db);
   if (!migrationPending(db)) db.pragma("user_version = 4");
 }
@@ -1922,6 +1968,23 @@ function advanceVisibleConversationMigration(db) {
     for (const row of rows) insert.run(row.scanRowId);
     if (rows.length < 64) db.prepare("DELETE FROM migration_progress WHERE kind = 'search-visible'").run();
     else db.prepare("UPDATE migration_progress SET cursor_number = ? WHERE kind = 'search-visible'").run(rows.at(-1).scanRowId);
+  }).immediate();
+}
+
+function advanceSearchHeadsMigration(db) {
+  const job = migrationJob(db, "search-heads");
+  if (!job) return;
+  db.transaction(() => {
+    const rows = db.prepare("SELECT rowid AS scanRowId FROM conversations WHERE rowid > ? ORDER BY rowid LIMIT 64").all(job.cursor_number);
+    const insert = db.prepare(`INSERT INTO search_message_heads (source_rowid, latest_ordinal)
+      SELECT c.rowid, ordered.ordinal FROM conversations AS c
+      JOIN message_order AS ordered ON ordered.scope = c.id
+      WHERE c.rowid = ? AND c.deleting = 0
+      ORDER BY ordered.ordinal DESC LIMIT 1
+      ON CONFLICT(source_rowid) DO UPDATE SET latest_ordinal = MAX(latest_ordinal, excluded.latest_ordinal)`);
+    for (const row of rows) insert.run(row.scanRowId);
+    if (rows.length < 64) db.prepare("DELETE FROM migration_progress WHERE kind = 'search-heads'").run();
+    else db.prepare("UPDATE migration_progress SET cursor_number = ? WHERE kind = 'search-heads'").run(rows.at(-1).scanRowId);
   }).immediate();
 }
 
