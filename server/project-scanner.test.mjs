@@ -8,10 +8,12 @@ test("a falsy mapper rejection fails the whole scan after active workers settle"
   let finishOther;
   const other = new Promise((resolve) => { finishOther = resolve; });
   let settled = false;
+  let laterAdmissions = 0;
   const scan = mapWithConcurrency([0, 1, 2], 2, async (item) => {
     if (item === 0) return first;
     if (item === 1) { await other; settled = true; return item; }
-    assert.fail("new work was admitted after the first rejection");
+    laterAdmissions += 1;
+    return item;
   });
   rejectFirst(undefined);
   await Promise.resolve();
@@ -20,6 +22,7 @@ test("a falsy mapper rejection fails the whole scan after active workers settle"
   try { await scan; } catch (error) { rejected = true; assert.equal(error, undefined); }
   assert.equal(rejected, true, "a rejected mapper returned partial successes");
   assert.equal(settled, true, "an active worker was abandoned");
+  assert.equal(laterAdmissions, 0, "new work was admitted after the first rejection");
 });
 
 test("parses git worktree porcelain records", () => {

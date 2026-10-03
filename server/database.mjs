@@ -108,6 +108,9 @@ export function createOutrightDatabase(options = {}) {
   let closing = false;
   let migrationTick;
   let migrationRetry;
+  let terminalAuditTick;
+  let terminalAuditScan;
+  let terminalReservationsCache;
   let deletionTick;
   let deletionTickKind;
   let deletionCursor = 0;
@@ -276,18 +279,29 @@ export function createOutrightDatabase(options = {}) {
   // database trigger below is the final guard for every tracked table. Keep a
   // reserve for run state, recovery decisions and omission markers.
   const retainedReserveBytes = 1024 * 1024;
+  let nextPhysicalCheckpointAt = 0;
   function physicalUsageForAdmission(limit) {
     let usage = allocatedDatabaseUsage(storageFilename);
-    if (usage.bytes !== null && usage.bytes >= limit && !db.inTransaction && storageFilename !== ":memory:") {
+    if (usage.bytes !== null && usage.bytes >= limit && !db.inTransaction && storageFilename !== ":memory:"
+      && Date.now() >= nextPhysicalCheckpointAt) {
       // A completed WAL transaction can still occupy disk until checkpointed.
       // Give reclaimable pages one short chance to clear; a pinned external
       // reader must not stall the event loop or reopen admission.
+      // A pinned reader can make every checkpoint wait for its busy timeout.
+      // Keep measuring allocation on every admission, but try reclamation at
+      // most once per interval while the reader remains pinned.
+      nextPhysicalCheckpointAt = Date.now() + 500;
       const previousTimeout = db.pragma("busy_timeout", { simple: true });
       try {
         db.pragma("busy_timeout = 25");
         db.pragma("wal_checkpoint(TRUNCATE)");
       } catch (error) {
-        if (!["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code)) throw error;
+        if (!["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code)) {
+          if (/^SQLITE_(?:FULL|IOERR|READONLY)(?:_|$)/.test(error.code ?? "")) {
+            throw databaseError(507, "Allocated database storage cannot be reclaimed; close long-running readers and clean archived history");
+          }
+          throw error;
+        }
       } finally { db.pragma(`busy_timeout = ${previousTimeout}`); }
       usage = allocatedDatabaseUsage(storageFilename);
     }
@@ -353,10 +367,106 @@ export function createOutrightDatabase(options = {}) {
     }).immediate();
   }
 
+  function beginTerminalAuditScan() {
+    const lastId = db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM audit_log").get().id;
+    terminalAuditScan = { cursor: 0, lastId, requests: new Map(), owners: new Map(), outcomes: null, written: 0 };
+    terminalAuditTick = setImmediate(advanceTerminalAuditScan);
+  }
+
+  function advanceTerminalAuditScan() {
+    terminalAuditTick = undefined;
+    if (closing || !terminalAuditScan) return;
+    const scan = terminalAuditScan;
+    try {
+      if (!scan.outcomes) {
+        const rows = db.prepare(`SELECT id, action, substr(target, 1, 512) AS target,
+          CASE WHEN octet_length(details) <= 4096 THEN details END AS details FROM audit_log
+          WHERE id > ? AND id <= ? ORDER BY id LIMIT 256`).all(scan.cursor, scan.lastId);
+        for (const row of rows) {
+          scan.cursor = row.id;
+          const details = parseJson(row.details, {});
+          const operationId = typeof details?.operationId === "string" && details.operationId.length <= 128
+            ? details.operationId : null;
+          if (operationId) scan.requests.delete(operationId);
+          if (["terminal.create.requested", "terminal.close.requested"].includes(row.action) && operationId) {
+            const evidence = {};
+            for (const key of ["cwd", "ownershipLabel", "handshakePath", "pid", "processIdentity"]) {
+              if (details?.[key] != null) evidence[key] = details[key];
+            }
+            scan.requests.set(operationId, { action: row.action, target: row.target, operationId, details: evidence });
+          }
+          if (["terminal.create.requested", "terminal.created", "terminal.create.unknown", "terminal.unknown"].includes(row.action)
+            && row.target) {
+            const current = scan.owners.get(row.target) ?? { target: row.target, created: 0 };
+            for (const key of ["cwd", "ownershipLabel", "handshakePath", "pid", "processIdentity"]) {
+              if (details?.[key] != null) current[key] = details[key];
+            }
+            if (row.action === "terminal.created") current.created = 1;
+            if (row.action === "terminal.unknown") current.unknownRecorded = true;
+            scan.owners.set(row.target, current);
+          }
+          if (["terminal.create.failed", "terminal.exited", "terminal.closed", "terminal.recovered"].includes(row.action)) {
+            scan.owners.delete(row.target);
+          }
+          if (scan.requests.size > 10_000 || scan.owners.size > 10_000) {
+            throw new Error("Terminal audit recovery exceeds the bounded owner index");
+          }
+        }
+        if (rows.length) { terminalAuditTick = setImmediate(advanceTerminalAuditScan); return; }
+        scan.outcomes = [
+          ...scan.requests.values().map((request) => ({ action: request.action === "terminal.create.requested"
+            ? "terminal.create.unknown" : "terminal.close.unknown",
+          details: { target: request.target, operationId: request.operationId,
+            reason: "runtime restarted before terminal outcome", ...request.details } })),
+          ...scan.owners.values().filter((owner) => owner.created && !owner.unknownRecorded).map((owner) => ({ action: "terminal.unknown",
+            details: { target: owner.target, reason: "runtime restarted before terminal exit was recorded" } })),
+        ];
+      }
+      const batch = scan.outcomes.slice(scan.written, scan.written + 64);
+      if (batch.length) {
+        db.transaction(() => {
+          reserveRecoveryHeadroom(db, undefined, true);
+          for (const outcome of batch) writeAudit(outcome.action, outcome.details, false);
+          reserveRecoveryHeadroom(db);
+        }).immediate();
+        scan.written += batch.length;
+        terminalAuditTick = setImmediate(advanceTerminalAuditScan);
+        return;
+      }
+      terminalReservationsCache = [...scan.owners.values()];
+      terminalAuditScan = null;
+      options.onTerminalAuditReconciled?.();
+    } catch (error) {
+      scan.error = error;
+      options.onTerminalAuditError?.(error);
+      // Keep terminal admission paused. A restart retries the bounded scan.
+    }
+  }
+
   const api = {
     filename,
     launchDirectory,
     get maintenanceActive() { return maintenance; },
+    get terminalAuditScanPending() { return Boolean(terminalAuditScan); },
+    get terminalAuditScanError() { return terminalAuditScan?.error?.message ?? null; },
+    closeFailedStartup() {
+      // The runtime constructor has not yielded to the event loop, so no
+      // scheduled deletion worker or migration tick has run. Release both
+      // SQLite handles synchronously before a successor acquires the lease.
+      if (deletionWorkers.size || maintenance) throw new Error("Startup cleanup found active archive maintenance");
+      closing = true;
+      if (migrationTick) clearImmediate(migrationTick);
+      if (migrationRetry) clearTimeout(migrationRetry);
+      if (terminalAuditTick) clearImmediate(terminalAuditTick);
+      if (deletionTickKind === "timeout") clearTimeout(deletionTick);
+      else if (deletionTickKind === "immediate") clearImmediate(deletionTick);
+      const errors = [];
+      try { db?.close(); } catch (error) { errors.push(error); }
+      finally { db = undefined; }
+      try { leaseDb?.close(); } catch (error) { errors.push(error); }
+      finally { leaseDb = undefined; }
+      if (errors.length) throw new AggregateError(errors, "Startup storage cleanup failed");
+    },
     close: () => {
       if (closing) return deletionWorkers.size ? new Promise((resolve) => closeWaiters.add(resolve)) : Promise.resolve();
       closing = true;
@@ -364,6 +474,7 @@ export function createOutrightDatabase(options = {}) {
       deletionIdleWaiters.clear();
       if (migrationTick) clearImmediate(migrationTick);
       if (migrationRetry) clearTimeout(migrationRetry);
+      if (terminalAuditTick) clearImmediate(terminalAuditTick);
       if (deletionTickKind === "timeout") clearTimeout(deletionTick);
       else if (deletionTickKind === "immediate") clearImmediate(deletionTick);
       for (const worker of deletionWorkers) void worker.terminate().catch(() => {});
@@ -1365,7 +1476,12 @@ export function createOutrightDatabase(options = {}) {
     appendRunEventWithMessage(runId, type, payload, transcriptMessage) {
       // Reclaim an idle WAL before the atomic event/checkpoint transaction;
       // SQLite cannot truncate its own WAL from inside that transaction.
-      physicalUsageForAdmission(configuredRetainedLimitBytes() * RESOURCE_BUDGETS.physicalDatabaseMultiplier);
+      try { physicalUsageForAdmission(configuredRetainedLimitBytes() * RESOURCE_BUDGETS.physicalDatabaseMultiplier); }
+      catch (error) {
+        if (error.statusCode !== 507) throw error;
+        this.updateRun(runId, { transcriptOmitted: true });
+        return { event: null, message: null };
+      }
       const commit = db.transaction(() => {
         const event = this.appendRunEvent(runId, type, payload);
         let message = null;
@@ -1473,6 +1589,15 @@ export function createOutrightDatabase(options = {}) {
       return pending.length;
     },
     reconcileTerminalAudit() {
+      if (terminalAuditScan || terminalReservationsCache) return 0;
+      // A legacy audit table can predate bounded retention. Scanning it with
+      // correlated outcome lookups before readiness would block every API.
+      // The raw-id cursor below yields between fixed pages; terminal admission
+      // stays paused until it has reconstructed every prior owner.
+      if (db.prepare("SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET 2047").get()) {
+        beginTerminalAuditScan();
+        return 0;
+      }
       // The runtime lease guarantees that no prior owner can still create or
       // close a PTY. A crash may have left either a request or a created PTY
       // without a durable outcome. Settle a bounded page at a time so old
@@ -1518,6 +1643,8 @@ export function createOutrightDatabase(options = {}) {
       return reconciled;
     },
     terminalUnknownReservations() {
+      if (terminalAuditScan) return [];
+      if (terminalReservationsCache) return terminalReservationsCache.map((entry) => ({ ...entry }));
       // The lease owner cannot prove that a previous owner's orphaned PTY
       // tree died. Read one more than the largest permitted terminal quota,
       // so an old backlog cannot silently undercharge a larger configuration.
@@ -1549,6 +1676,7 @@ export function createOutrightDatabase(options = {}) {
         throw databaseError(404, "Unresolved terminal reservation was not found");
       }
       writeCriticalAudit("terminal.recovered", { target, evidence: evidence.trim() });
+      if (terminalReservationsCache) terminalReservationsCache = terminalReservationsCache.filter((entry) => entry.target !== target);
       return true;
     },
     listAudit(limit = 100) {

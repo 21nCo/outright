@@ -287,7 +287,10 @@ function finishLinkedCandidate(filename, next, old, marker) {
   if (process.platform === "win32") {
     const candidateBefore = candidateIdentity(filename, true, true);
     if (!candidateMatchesIdentity(candidateBefore, marker.candidate, true, true) || hasNonemptyWal(filename)) {
-      throw new Error("Archive linked candidate failed authentication");
+      // Leave both hard links and the old source in place for inspection.
+      // This is the same post-promotion conflict reported by the normal
+      // recovery path, including when a direct writer used the public name.
+      throw new Error("Promoted archive database changed after interruption; preserve both databases");
     }
     const release = acquireWindowsArchiveLock([filename]);
     try {

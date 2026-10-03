@@ -646,12 +646,15 @@ async function settingsCapacityWithoutEventRegression() {
   const settings = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
     editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
   let reads = 0;
-  let otherClientCapacity = { queued: 0, active: 0, recoverable: 0, retainedBytes: 0 };
+  let otherClientCapacity = { queued: 0, active: 0, recoverable: 0, retainedBytes: 0,
+    diskAllocatedBytes: 3 * 1048576, diskUsageStatus: "measured", availablePhysicalForNewWorkBytes: 5 * 1048576 };
   route = async (url) => {
     if (url.pathname === "/api/capacity") {
       reads += 1;
-      return response({ ...otherClientCapacity, migrationStatus: "ready", availableForNewWorkBytes: 63 * 1048576 - otherClientCapacity.retainedBytes,
-        limits: { maxQueuedRuns: 32, maxConcurrentRuns: 2, maxRetainedBytes: 64 * 1048576, reservedRetainedBytes: 1048576 } });
+      return response({ migrationStatus: "ready", ...otherClientCapacity,
+        availableForNewWorkBytes: 63 * 1048576 - otherClientCapacity.retainedBytes,
+        limits: { maxQueuedRuns: 32, maxConcurrentRuns: 2, maxRetainedBytes: 64 * 1048576,
+          reservedRetainedBytes: 1048576, maxPhysicalBytes: 10 * 1048576 } });
     }
     if (url.pathname === "/api/retention/archived") return response({ conversations: [] });
     return response({});
@@ -666,10 +669,25 @@ async function settingsCapacityWithoutEventRegression() {
   await until(() => host.querySelector("button")?.textContent === "Open live capacity", "live capacity fixture");
   host.querySelector("button").click();
   await until(() => document.querySelector(".capacity-status")?.textContent.includes("0 of 32 queued"), "initial capacity read");
-  otherClientCapacity = { queued: 2, active: 1, recoverable: 0, retainedBytes: 4 * 1048576 };
+  otherClientCapacity = { ...otherClientCapacity, queued: 2, active: 1, recoverable: 0, retainedBytes: 4 * 1048576 };
   await until(() => document.querySelector(".capacity-status")?.textContent.includes("2 of 32 queued")
     && document.querySelector(".capacity-status")?.textContent.includes("4.0 of 64 MiB retained"),
   "capacity converges without an event after another client writes");
+  const capacityText = () => document.querySelector(".capacity-status")?.textContent ?? "";
+  otherClientCapacity = { ...otherClientCapacity, availablePhysicalForNewWorkBytes: 32 * 1024 };
+  await until(() => capacityText().includes("New work is paused at the physical storage threshold"),
+    "32 KiB physical headroom announces the same pause as run admission");
+  otherClientCapacity = { ...otherClientCapacity, migrationStatus: "maintenance",
+    diskUsageStatus: "partial", availablePhysicalForNewWorkBytes: 0 };
+  await until(() => capacityText().includes("(partial)") && !capacityText().includes("physical storage threshold"),
+    "maintenance pause is not mislabeled as a physical limit");
+  otherClientCapacity = { ...otherClientCapacity, migrationStatus: "ready",
+    diskUsageStatus: "measured", availablePhysicalForNewWorkBytes: 0 };
+  await until(() => capacityText().includes("(measured)") && capacityText().includes("physical storage threshold"),
+    "zero physical headroom keeps the pause warning");
+  otherClientCapacity = { ...otherClientCapacity, diskAllocatedBytes: null, diskUsageStatus: "unknown" };
+  await until(() => capacityText().includes("Allocated disk use is unknown"),
+    "an unknown measurement does not present a numeric budget");
   [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Cancel").click();
   const readsAtClose = reads;
   await new Promise((resolve) => setTimeout(resolve, 2200));
@@ -1572,6 +1590,14 @@ async function terminalUnknownRegression() {
   assert(created === 0, "Unknown terminal silently created a replacement process");
   assert(host.querySelector('[data-tab-id="term-A"]').getAttribute("aria-label").includes("ownership unverified"),
     "Unknown terminal restart lost its ownership warning");
+  const afterRemount = sent.length;
+  const restoredInput = host.querySelector('.terminal-host .xterm-helper-textarea');
+  restoredInput.focus();
+  restoredInput.dispatchEvent(new KeyboardEvent("keydown", { key: "x", code: "KeyX", keyCode: 88, which: 88, bubbles: true, cancelable: true }));
+  host.querySelector('.terminal-host').style.width = "600px";
+  await settle();
+  assert(!sent.slice(afterRemount).some((message) => message.type === "terminal.input" || message.type === "terminal.resize"),
+    "Restored unknown terminal accepted input or resize");
 }
 
 async function terminalUnknownDuringActivationRegression() {

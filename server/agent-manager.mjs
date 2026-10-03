@@ -616,7 +616,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // Keep the capacity reservation until both validation and tree shutdown end.
     // On Windows the supervisor's control pipe owns Job Object teardown.
     // taskkill /T /F here kills the verifier before it can report an empty job.
-    if (state.child && process.platform !== "win32") terminateTree(state.child, "SIGTERM");
+    // An injected or legacy leaf has no native Job Object to ask for cleanup.
+    // Its ordinary child signal remains necessary on Windows too.
+    if (state.child && (process.platform !== "win32" || !state.ownsDescendants)) terminateTree(state.child, "SIGTERM");
     // Cancellation must not wait for an acknowledgement that may never arrive.
     // stdin ordering guarantees a post-authorization stop follows "go", while
     // an unauthorized owner treats stop/end as abandonment.
@@ -632,7 +634,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         let escalated = false;
         let groupEscalated = false;
         while (state.ownsDescendants
-          ? !state.closed || Boolean(state.launchHandshakePath && existsSync(state.launchHandshakePath))
+          ? !state.closed || nativeOwnershipPending(state)
           : !state.closed || processGroupAlive(state.child)) {
           const elapsed = Date.now() - started;
           if (!teardownRequested && elapsed >= terminationGraceMs) {
@@ -698,6 +700,17 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   // the escalation fallbacks in stop() still apply.
   function requestWrapperTeardown(state) {
     try { state.child?.stdin?.write?.("stop\n"); } catch { /* The wrapper already exited. */ }
+  }
+
+  function nativeOwnershipPending(state) {
+    if (!state.launchHandshakePath || !existsSync(state.launchHandshakePath)) return false;
+    // Only the Windows wrapper writes this marker after its supervisor exits
+    // with an empty Job Object. It remains until the terminal database commit.
+    if (process.platform !== "win32") return true;
+    try {
+      const record = JSON.parse(readFileSync(state.launchHandshakePath, "utf8"));
+      return record.completed !== true || record.pid !== state.child?.pid;
+    } catch { return true; }
   }
 
 

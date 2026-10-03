@@ -17,6 +17,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
   let agents;
+  let terminals;
   let publish;
   let runtimeCapacity;
   const database = databaseFactory({ runtimeLease: true, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, onMigrationComplete: () => {
@@ -27,6 +28,13 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   }, onDeletionWorkerExit: () => {
     agents.resumeQueued();
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
+  }, onTerminalAuditReconciled: () => {
+    if (!terminals) return;
+    terminals.reloadUnknownReservations();
+    void terminals.reconcileUnknown().then(() => publish({ type: "capacity.changed", payload: runtimeCapacity() }))
+      .catch((error) => { if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:terminal-recovery]", error); });
+  }, onTerminalAuditError: (error) => {
+    if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:terminal-audit]", error);
   } });
   let eventHub;
   let wss;
@@ -56,6 +64,14 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     return eventHub.publish(event);
   };
 
+  terminals = terminalManagerFactory({ database, publish, subprocesses });
+  const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl), subprocesses });
+  runtimeCapacity = function runtimeCapacity() {
+    return { ...database.capacity(), utilityProcesses: subprocesses.capacity(), terminalProcesses: terminals.capacity() };
+  };
+  // Construct the agent manager after the remaining synchronous startup
+  // checks. No provider discovery owner then needs asynchronous teardown on
+  // a failed synchronous constructor path.
   agents = createAgentManager({ database, publish, onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }), validateConversation: async (conversation) => {
     const target = await resolveWorktreeTarget(conversation);
     return () => {
@@ -63,11 +79,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required");
     };
   } });
-  const terminals = terminalManagerFactory({ database, publish, subprocesses });
-  const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl), subprocesses });
-  runtimeCapacity = function runtimeCapacity() {
-    return { ...database.capacity(), utilityProcesses: subprocesses.capacity(), terminalProcesses: terminals.capacity() };
-  };
   void terminals.reconcileUnknown().then((resolved) => {
     if (resolved) publish({ type: "capacity.changed", payload: runtimeCapacity() });
   }).catch(() => {});
@@ -717,16 +728,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     // shutdown. Stop startup-owned managers before releasing the physical
     // lease. The constructor is synchronous; no agent or PTY has been admitted.
     const cleanupErrors = [];
-    let agentShutdown;
-    try { agentShutdown = agents?.shutdown(); }
-    catch (failure) { cleanupErrors.push(failure); }
-    void Promise.resolve(agentShutdown).catch((failure) => console.error("Runtime startup agent cleanup failed", failure));
     try { eventHub?.shutdown(); } catch (failure) { cleanupErrors.push(failure); }
     try { wss?.close(); } catch (failure) { cleanupErrors.push(failure); }
-    let databaseShutdown;
-    try { databaseShutdown = database.close(); }
+    try { database.closeFailedStartup(); }
     catch (failure) { cleanupErrors.push(failure); }
-    void Promise.resolve(databaseShutdown).catch((failure) => console.error("Runtime startup database cleanup failed", failure));
     if (cleanupErrors.length) throw new AggregateError([error, ...cleanupErrors], "Runtime startup and cleanup failed");
     throw error;
   }

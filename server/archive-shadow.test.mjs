@@ -29,6 +29,30 @@ test("Windows archive lock reports readiness, protects the source, and removes i
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
 });
 
+test("Windows archive lock collapses two hard-link names when Node reports zero inode", { skip: process.platform !== "win32" }, () => {
+  const item = fixture();
+  const originalStat = fs.statSync;
+  try {
+    fs.linkSync(item.filename, item.next);
+    fs.statSync = (...args) => new Proxy(originalStat(...args), {
+      get(info, key) { return key === "ino" ? 0n : Reflect.get(info, key, info); },
+    });
+    syncBuiltinESMExports();
+    const release = acquireWindowsArchiveLock([item.filename, item.next]);
+    try {
+      const writer = new Database(item.filename);
+      try { assert.throws(() => writer.prepare("INSERT INTO evidence (body) VALUES ('blocked')").run(),
+        (error) => error.code === "SQLITE_BUSY"); }
+      finally { writer.close(); }
+    } finally { release(); }
+    assert.equal(readdirSync(item.directory).some((name) => name.includes(".archive-lock-")), false);
+  } finally {
+    fs.statSync = originalStat;
+    syncBuiltinESMExports();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
+});
+
 function fixture() {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-shadow-recover-"));
   const filename = path.join(directory, "outright.db");

@@ -1548,7 +1548,15 @@ test("shutdown between the authorization write and owner acknowledgement still c
   const child = fakeChild({ autoAcknowledge: false });
   const writes = [];
   const originalWrite = child.stdin.write.bind(child.stdin);
-  child.stdin.write = (chunk, ...args) => { writes.push(String(chunk)); return originalWrite(chunk, ...args); };
+  child.stdin.write = (chunk, ...args) => {
+    writes.push(String(chunk));
+    if (process.platform === "win32" && String(chunk).includes("stop\n")) {
+      // This fake owner has no Job Object. Model its control-pipe completion;
+      // a real Windows supervisor is checked by the native fixture below.
+      setImmediate(() => child.emit("close", 0, null));
+    }
+    return originalWrite(chunk, ...args);
+  };
   child.kill = (signal) => {
     child.signals.push(signal);
     setImmediate(() => child.emit("close", null, signal));

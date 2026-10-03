@@ -590,6 +590,81 @@ test("a per-worktree recovery reservation retries native proof before rejecting 
   await manager.shutdown();
 });
 
+test("partial recovery does not count a live terminal's audit reservation twice", async () => {
+  const cwd = "/tmp/outright-partial-recovery";
+  const unknown = { target: "54d20348-0790-4ba8-b888-e05887e4844d", cwd };
+  let liveId;
+  let unresolved = true;
+  const database = {
+    launchDirectory: "/tmp",
+    terminalUnknownReservations: () => [
+      ...(unresolved ? [unknown] : []),
+      ...(liveId ? [{ target: liveId, cwd }] : []),
+    ],
+    resolveTerminalUnknown: (id) => { assert.equal(id, unknown.target); unresolved = false; },
+    auditAdmission() {}, auditCritical() {}, auditRequired: async () => {},
+  };
+  const manager = createTerminalManager({ database, publish: () => {}, maxTerminals: 2, maxTerminalsPerCwd: 2,
+    recoverTerminal: async () => true,
+    startManagedTerminal: async () => ({ pid: 456, onData() {}, onExit() {}, terminate: async () => {} }) });
+  try {
+    liveId = (await manager.create({ cwd })).id;
+    assert.equal(await manager.reconcileUnknown(), 1);
+    assert.deepEqual(manager.capacity(), { active: 1, unknown: 0, limit: 2 });
+    assert.equal(manager.list().length, 1);
+    assert.equal(manager.get(liveId)?.status, "running");
+    assert.equal((await manager.create({ cwd })).status, "running", "a duplicate audit row must not cause a false 429");
+  } finally { await manager.shutdown(); }
+});
+
+test("legacy terminal audit history yields startup and resumes safely after interruption", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-audit-scan-"));
+  const filename = path.join(directory, "runtime.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  try {
+    await database.close();
+    const writer = new Database(filename);
+    try {
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)");
+      writer.transaction(() => {
+        for (let index = 0; index < 12_000; index += 1) insert.run("legacy.telemetry", "", "{}", "2026-09-01T00:00:00.000Z");
+        insert.run("terminal.create.requested", "54d20348-0790-4ba8-b888-e05887e4844e",
+          JSON.stringify({ operationId: "pending-create", cwd: directory }), "2026-09-01T00:00:00.000Z");
+        insert.run("terminal.created", "54d20348-0790-4ba8-b888-e05887e4844f",
+          JSON.stringify({ cwd: directory, pid: 333 }), "2026-09-01T00:00:00.000Z");
+        insert.run("terminal.created", "54d20348-0790-4ba8-b888-e05887e48450",
+          JSON.stringify({ cwd: directory, pid: 444 }), "2026-09-01T00:00:00.000Z");
+        insert.run("terminal.closed", "54d20348-0790-4ba8-b888-e05887e48450",
+          "{}", "2026-09-01T00:00:00.000Z");
+      }).immediate();
+    } finally { writer.close(); }
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    database.reconcileTerminalAudit();
+    assert.equal(database.terminalAuditScanPending, true, "large legacy history was scanned before startup returned");
+    await database.close();
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    database.reconcileTerminalAudit();
+    assert.equal(database.terminalAuditScanPending, true,
+      "terminal audit recovery did not yield startup to its bounded cursor");
+    const manager = createTerminalManager({ database, publish: () => {}, maxTerminals: 2, maxTerminalsPerCwd: 2,
+      recoverTerminal: async () => false,
+      startManagedTerminal: async () => { throw new Error("PTY launched before audit recovery"); } });
+    try {
+      assert.equal(manager.capacity().recoveryPending, true);
+      await assert.rejects(manager.create({ cwd: directory }), (error) => error.statusCode === 503);
+      const deadline = Date.now() + 10_000;
+      while (database.terminalAuditScanPending && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(database.terminalAuditScanPending, false, "legacy scan did not finish");
+      manager.reloadUnknownReservations();
+      assert.equal(manager.capacity().unknown, 2);
+      assert.deepEqual(database.terminalUnknownReservations().map((entry) => entry.target).sort(),
+        ["54d20348-0790-4ba8-b888-e05887e4844e", "54d20348-0790-4ba8-b888-e05887e4844f"]);
+      assert.ok(database.listAudit(10).some((entry) => entry.action === "terminal.create.unknown"));
+      assert.ok(database.listAudit(10).some((entry) => entry.action === "terminal.unknown"));
+    } finally { await manager.shutdown(); }
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("legacy unknown terminal ownership consumes each worktree limit", async () => {
   const reservation = { target: "56b5370b-7ff3-470c-bb68-469b01c96915", cwd: null };
   let launched = false;
@@ -725,6 +800,12 @@ test("restart settles crash and maintenance-interrupted PTY evidence before rete
     database.close();
     database = createOutrightDatabase({ filename, runtimeLease: true });
     assert.equal(database.reconcileTerminalAudit(), 0);
+    const scanDeadline = Date.now() + 10_000;
+    while (database.terminalAuditScanPending && !database.terminalAuditScanError && Date.now() < scanDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(database.terminalAuditScanError, null);
+    assert.equal(database.terminalAuditScanPending, false);
     const recoveredRequest = database.terminalUnknownReservations().find((entry) => entry.target === "unborn");
     assert.equal(recoveredRequest?.cwd, interruptedCwd, "audit trimming lost the crashed terminal's worktree");
     assert.equal(recoveredRequest?.ownershipLabel, "com.21n.outright.terminal.unborn");

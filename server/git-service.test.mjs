@@ -37,6 +37,11 @@ test("optional Git history failure leaves required status usable", async () => {
   try {
     await git(root, ["init", "project"]);
     const repository = await realpath(path.join(root, "project"));
+    await git(repository, ["config", "user.email", "outright@example.test"]);
+    await git(repository, ["config", "user.name", "Outright Test"]);
+    await writeFile(path.join(repository, "tracked.txt"), "committed history\n");
+    await git(repository, ["add", "tracked.txt"]);
+    await git(repository, ["commit", "-m", "history exists"]);
     await writeFile(path.join(repository, "new file.txt"), "untracked\n");
     let failRequired = false;
     const service = createGitService({

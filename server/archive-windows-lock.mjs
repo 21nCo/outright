@@ -59,18 +59,23 @@ export function acquireWindowsArchiveLock(filenames) {
     }
   } catch (error) {
     try { writeFileSync(stop, "stop", { mode: 0o600, flag: "wx" }); } catch {}
-    if (!waitUntil(() => !existsSync(ready), 5000)) child.kill();
     child.stdin.destroy();
     // The helper removes ready only after releasing its file locks. Preserve
-    // stop and ready if that proof has not arrived; a retry must fail closed.
-    if (waitUntil(() => !existsSync(ready), 5000)) rmSync(stop, { force: true });
+    // stop and ready if that proof has not arrived; killing the helper would
+    // strand the ready marker while its OS lock had already disappeared.
+    if (!waitUntil(() => !existsSync(ready), 5000)) {
+      throw new AggregateError([error, new Error("Windows archive lock owner did not release")],
+        "Windows archive lock startup and release failed");
+    }
+    rmSync(stop, { force: true });
     throw error;
   }
   return () => {
     try {
-      writeFileSync(stop, "stop", { mode: 0o600, flag: "wx" });
+      try { writeFileSync(stop, "stop", { mode: 0o600, flag: "wx" }); }
+      catch (error) { if (error.code !== "EEXIST") throw error; }
       if (!waitUntil(() => !existsSync(ready), 5000)) {
-        child.kill();
+        child.stdin.destroy();
         if (!waitUntil(() => !existsSync(ready), 5000)) {
           throw new Error("Windows archive lock did not release");
         }

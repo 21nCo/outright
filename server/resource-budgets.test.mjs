@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHook } from "node:async_hooks";
 import test from "node:test";
 import Database from "better-sqlite3";
+import fs from "node:fs";
 import { appendFileSync, existsSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -152,6 +153,54 @@ test("a pinned SQLite reader cannot turn repeated checkpoints into unbounded phy
   } finally { reader?.close(); database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("checkpoint storage failures omit optional output and preserve the durable run", async () => {
+  for (const code of ["SQLITE_FULL", "SQLITE_IOERR_WRITE", "SQLITE_READONLY_CANTLOCK"]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-checkpoint-refusal-"));
+    const filename = path.join(realpathSync(directory), "outright.db");
+    const database = createOutrightDatabase({ filename });
+    database.updateSettings({ maxRetainedMiB: 64 });
+    const conversation = chat(database);
+    const run = database.createRun(runInput(conversation.id));
+    const originalStat = fs.lstatSync;
+    const originalPragma = Database.prototype.pragma;
+    let checkpoints = 0;
+    try {
+      fs.lstatSync = (part, ...args) => {
+        const info = originalStat(part, ...args);
+        if (part !== filename) return info;
+        return new Proxy(info, { get(target, key) {
+          return key === "blocks" ? 1024 * 1024 : Reflect.get(target, key, target);
+        } });
+      };
+      Database.prototype.pragma = function (command, ...args) {
+        if (command === "wal_checkpoint(TRUNCATE)") {
+          checkpoints += 1;
+          throw Object.assign(new Error("injected checkpoint failure"), { code });
+        }
+        return originalPragma.call(this, command, ...args);
+      };
+      assert.ok(database.capacity().diskAllocatedBytes >= database.capacity().limits.maxPhysicalBytes,
+        `the fixture must reach physical checkpoint admission: ${JSON.stringify(database.capacity())}`);
+      const result = database.appendRunEventWithMessage(run.id, "assistant.delta", { text: "partial" }, {
+        id: `${run.id}:1`, conversationId: conversation.id, role: "assistant", kind: "text",
+        body: "partial", payload: { runId: run.id },
+      });
+      assert.deepEqual(result, { event: null, message: null }, `${code} escaped as a raw SQLite error`);
+      assert.equal(checkpoints, 1);
+      assert.equal(database.getRun(run.id).transcriptOmitted, 1);
+      assert.equal(database.listRunEvents(run.id).length, 0);
+      assert.throws(() => database.addMessage({ conversationId: conversation.id, role: "assistant", body: "later" }),
+        (error) => error.statusCode === 507);
+      assert.equal(checkpoints, 1, "a burst at the threshold must not synchronously retry checkpointing");
+    } finally {
+      fs.lstatSync = originalStat;
+      Database.prototype.pragma = originalPragma;
+      await database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
 test("transcript estimates charge the durable SQLite row for inserts, checkpoints and omission", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
@@ -184,6 +233,27 @@ test("transcript estimates charge the durable SQLite row for inserts, checkpoint
     delete withoutTimestamp.createdAt;
     charge(withoutTimestamp, (message) => database.addMessage(message));
   } finally { database.close(); }
+});
+
+test("UTF-8 transcript estimate matches an independent persisted SQLite row", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-transcript-readback-"));
+  const filename = path.join(realpathSync(directory), "outright.db");
+  const database = createOutrightDatabase({ filename });
+  try {
+    const conversation = chat(database);
+    const message = { id: "escaped-🧪", conversationId: conversation.id, role: "assistant", kind: "tool",
+      body: "quote \" and newline\nΔ 😀", payload: { command: "printf 'é\\n'", note: "🧪\"" },
+      createdAt: "2026-09-21T00:00:00.000Z" };
+    database.addMessage(message);
+    const reader = new Database(filename, { readonly: true });
+    try {
+      const stored = reader.prepare(`SELECT 128 + octet_length(id) + octet_length(conversation_id)
+        + octet_length(role) + octet_length(kind) + octet_length(body)
+        + octet_length(payload) + octet_length(created_at) AS bytes
+        FROM messages WHERE id = ?`).get(message.id);
+      assert.equal(retainedTranscriptMessageBytes(message), stored.bytes);
+    } finally { reader.close(); }
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("an empty store admits its first write even when a migration tick is exhausted", () => {

@@ -13,19 +13,26 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     throw new RangeError("Terminal process limits must be whole numbers from 1 to 256");
   }
   const terminals = new Map();
-  let reservedUnknown = database.terminalUnknownReservations?.() ?? [];
+  const unresolvedReservations = () => (database.terminalUnknownReservations?.() ?? [])
+    .filter((entry) => !terminals.has(entry.target));
+  let reservedUnknown = unresolvedReservations();
   let reconciliationPromise;
   // Old audit records may lack a worktree path. Charge their unknown owner
   // against every worktree until native proof or operator recovery clears it.
   const reservedForCwd = (cwd) => reservedUnknown.filter((entry) => !entry.cwd || entry.cwd === cwd).length;
 
   function assertCapacity(cwd) {
+    if (database.terminalAuditScanPending) throw terminalError(503,
+      database.terminalAuditScanError
+        ? "Terminal ownership recovery stopped; restart Outright after checking storage"
+        : "Terminal ownership recovery is scanning retained audit history; retry shortly");
     pruneExitedForCapacity(cwd);
     if (terminals.size + reservedUnknown.length >= maxTerminals) throw terminalError(429, `At most ${maxTerminals} terminals can run at once`);
     if ([...terminals.values()].filter((terminal) => terminal.cwd === cwd).length + reservedForCwd(cwd) >= maxTerminalsPerCwd) throw terminalError(429, `At most ${maxTerminalsPerCwd} terminals can run for one worktree`);
   }
 
   function reconcileUnknown() {
+    if (database.terminalAuditScanPending) return Promise.resolve(0);
     if (reconciliationPromise) return reconciliationPromise;
     reconciliationPromise = (async () => {
       let resolved = 0;
@@ -39,12 +46,18 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
         } catch { /* A refused helper or unavailable audit keeps capacity unknown. */ }
       }
       if (resolved) {
-        reservedUnknown = database.terminalUnknownReservations();
+        reservedUnknown = unresolvedReservations();
         publish({ type: "capacity.changed" });
       }
       return resolved;
     })().finally(() => { reconciliationPromise = null; });
     return reconciliationPromise;
+  }
+
+  function reloadUnknownReservations() {
+    if (database.terminalAuditScanPending) return;
+    reservedUnknown = unresolvedReservations();
+    publish({ type: "capacity.changed" });
   }
 
   function create(input) {
@@ -188,8 +201,12 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   }
   function list() { return [...terminals.values()].map(publicTerminal).concat(reservedUnknown
     .filter((entry) => !terminals.has(entry.target)).map(reservationTerminal)); }
-  function capacity() { return { active: [...terminals.values()].filter((terminal) => terminal.status !== "exited").length + reservedUnknown.length,
-    unknown: [...terminals.values()].filter((terminal) => terminal.status === "unknown").length + reservedUnknown.length, limit: maxTerminals }; }
+  function capacity() {
+    if (database.terminalAuditScanPending) return { active: maxTerminals, unknown: maxTerminals, limit: maxTerminals,
+      recoveryPending: true, recoveryError: database.terminalAuditScanError ?? null };
+    return { active: [...terminals.values()].filter((terminal) => terminal.status !== "exited").length + reservedUnknown.length,
+      unknown: [...terminals.values()].filter((terminal) => terminal.status === "unknown").length + reservedUnknown.length, limit: maxTerminals };
+  }
   function get(id) {
     const terminal = terminals.get(id);
     if (terminal) return { ...publicTerminal(terminal), buffer: terminal.buffer, outputCursor: terminal.outputCursor };
@@ -290,7 +307,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     }
   }
 
-  return { create, list, capacity, get, write, resize, close, shutdown, reconcileUnknown };
+  return { create, list, capacity, get, write, resize, close, shutdown, reconcileUnknown, reloadUnknownReservations };
 }
 
 function publicTerminal(terminal) {

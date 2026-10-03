@@ -11,6 +11,7 @@ import { promisify } from "node:util";
 import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAlive, defaultRecoveryProcessIdentity, defaultTerminateRecoveryProcess, runtimeAllowedHosts } from "./outright-runtime.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
+import { createTerminalManager } from "./terminal-manager.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -1302,6 +1303,69 @@ test("failed startup releases its lease and preserves queued work through recove
       if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
       rmSync(dataDirectory, { recursive: true, force: true });
     }
+  }
+});
+
+test("failed startup reports both construction and synchronous cleanup failures", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-startup-errors-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+  const startupFailure = new Error("launch directory denied");
+  const cleanupFailure = new Error("cleanup report failed");
+  let replacement;
+  try {
+    assert.throws(() => createOutrightRuntime({ configUrl: "file:///nonexistent-config.json",
+      hardenLaunchDirectory: () => { throw startupFailure; },
+      databaseFactory: (options) => {
+        const database = createOutrightDatabase(options);
+        const close = database.closeFailedStartup.bind(database);
+        database.closeFailedStartup = () => { close(); throw cleanupFailure; };
+        return database;
+      },
+    }), (error) => error instanceof AggregateError
+      && error.errors[0] === startupFailure && error.errors[1] === cleanupFailure);
+    replacement = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    assert.ok(replacement.database.capacity(), "the failed constructor retained its SQLite lease");
+  } finally {
+    await replacement?.shutdown();
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR;
+    else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+test("large terminal audit recovery refreshes runtime capacity after startup", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-runtime-audit-scan-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+  let runtime;
+  try {
+    const seed = createOutrightDatabase();
+    await seed.close();
+    const writer = new Database(path.join(dataDirectory, "outright.db"));
+    const target = "54d20348-0790-4ba8-b888-e05887e48451";
+    try {
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)");
+      writer.transaction(() => {
+        for (let index = 0; index < 3_000; index += 1) insert.run("legacy.telemetry", "", "{}", "2026-09-01T00:00:00.000Z");
+        insert.run("terminal.created", target, JSON.stringify({ cwd: dataDirectory, pid: 333 }), "2026-09-01T00:00:00.000Z");
+      }).immediate();
+    } finally { writer.close(); }
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json",
+      terminalManagerFactory: (options) => createTerminalManager({ ...options, recoverTerminal: async () => false }) });
+    assert.equal(runtime.terminals.capacity().recoveryPending, true);
+    const deadline = Date.now() + 10_000;
+    while (runtime.terminals.capacity().recoveryPending && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(runtime.terminals.capacity().unknown, 1,
+      "completed audit scan did not refresh the live terminal manager's reservations");
+    assert.equal(runtime.terminals.get(target)?.status, "unknown");
+  } finally {
+    await runtime?.shutdown();
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR;
+    else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
   }
 });
 

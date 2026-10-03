@@ -18,6 +18,8 @@ static int archive_lock(int argc, wchar_t **argv) {
   if (!parent) return 70;
   HANDLE *files = calloc((size_t)(argc - 5), sizeof(HANDLE));
   if (!files) { CloseHandle(parent); return 72; }
+  BY_HANDLE_FILE_INFORMATION *identities = calloc((size_t)(argc - 5), sizeof(BY_HANDLE_FILE_INFORMATION));
+  if (!identities) { free(files); CloseHandle(parent); return 72; }
   int held = 0;
   int result = 0;
   for (int index = 5; index < argc; index++) {
@@ -25,10 +27,28 @@ static int archive_lock(int argc, wchar_t **argv) {
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file == INVALID_HANDLE_VALUE) { result = 73; break; }
+    BY_HANDLE_FILE_INFORMATION identity = {0};
+    if (!GetFileInformationByHandle(file, &identity)) { CloseHandle(file); result = 73; break; }
+    // Node can report ino=0 for a Windows volume. Resolve hard-link aliases
+    // from native handles before attempting the same exclusive byte lock a
+    // second time. An unavailable file index never collapses distinct files.
+    bool duplicate = false;
+    if (identity.nFileIndexHigh || identity.nFileIndexLow) {
+      for (int previous = 0; previous < held; previous++) {
+        if (identities[previous].dwVolumeSerialNumber == identity.dwVolumeSerialNumber
+          && identities[previous].nFileIndexHigh == identity.nFileIndexHigh
+          && identities[previous].nFileIndexLow == identity.nFileIndexLow) {
+          duplicate = true;
+          break;
+        }
+      }
+    }
+    if (duplicate) { CloseHandle(file); continue; }
     OVERLAPPED overlap = {0};
     overlap.Offset = 0x40000000;
     if (!LockFileEx(file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
         0, 512, 0, &overlap)) { CloseHandle(file); result = 74; break; }
+    identities[held] = identity;
     files[held++] = file;
   }
   HANDLE ready = CreateFileW(argv[3], GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, CREATE_NEW,
@@ -53,9 +73,13 @@ static int archive_lock(int argc, wchar_t **argv) {
       || !PeekNamedPipe(input, NULL, 0, NULL, NULL, NULL)) break;
   }
   for (int index = held - 1; index >= 0; index--) CloseHandle(files[index]);
+  free(identities);
   free(files);
   CloseHandle(parent);
   DeleteFileW(argv[3]);
+  // The stop marker belongs to this same lock lifetime. Removing it after
+  // the ready marker keeps an interrupted JS worker from leaking artifacts.
+  DeleteFileW(argv[4]);
   return result;
 }
 
