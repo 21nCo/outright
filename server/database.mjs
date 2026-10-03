@@ -293,7 +293,7 @@ export function createOutrightDatabase(options = {}) {
     }
   }
 
-  function writeAudit(action, details = {}) {
+  function writeAudit(action, details = {}, trim = true) {
     const serialized = serializePayload(details, 4 * 1024);
     const truncated = parseJson(serialized, null);
     // Keep the correlation key even when a large file list or error is
@@ -304,7 +304,7 @@ export function createOutrightDatabase(options = {}) {
       : serialized;
     db.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
       .run(action, String(details.target ?? "").slice(0, 512), payload, now());
-    trimAudit(db);
+    if (trim) trimAudit(db);
   }
 
   function writeCriticalAudit(action, details = {}) {
@@ -1411,6 +1411,51 @@ export function createOutrightDatabase(options = {}) {
         operationId: row.operationId, reason: "runtime restarted before cleanup outcome",
       });
       return pending.length;
+    },
+    reconcileTerminalAudit() {
+      // The runtime lease guarantees that no prior owner can still create or
+      // close a PTY. A crash may have left either a request or a created PTY
+      // without a durable outcome. Settle a bounded page at a time so old
+      // databases do not require an unbounded in-memory recovery set.
+      let reconciled = 0;
+      while (true) {
+        const pending = db.prepare(`SELECT id, action, target,
+            CASE WHEN json_valid(details) THEN json_extract(details, '$.operationId') END AS operationId
+          FROM audit_log AS request
+          WHERE action IN ('terminal.create.requested', 'terminal.close.requested')
+            AND CASE WHEN json_valid(details) THEN json_extract(details, '$.operationId') END IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > request.id
+              AND CASE WHEN json_valid(outcome.details) THEN json_extract(outcome.details, '$.operationId') END
+                = json_extract(request.details, '$.operationId'))
+          ORDER BY id LIMIT 64`).all();
+        if (!pending.length) break;
+        db.transaction(() => {
+          reserveRecoveryHeadroom(db, undefined, true);
+          for (const row of pending) writeAudit(row.action === "terminal.create.requested" ? "terminal.create.unknown" : "terminal.close.unknown",
+            { target: row.target, operationId: row.operationId, reason: "runtime restarted before terminal outcome" }, false);
+          trimAudit(db);
+          reserveRecoveryHeadroom(db);
+        }).immediate();
+        reconciled += pending.length;
+      }
+      while (true) {
+        const pending = db.prepare(`SELECT id, target FROM audit_log AS created
+          WHERE action = 'terminal.created'
+            AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > created.id
+              AND outcome.target = created.target
+              AND outcome.action IN ('terminal.exited', 'terminal.closed', 'terminal.unknown'))
+          ORDER BY id LIMIT 64`).all();
+        if (!pending.length) break;
+        db.transaction(() => {
+          reserveRecoveryHeadroom(db, undefined, true);
+          for (const row of pending) writeAudit("terminal.unknown",
+            { target: row.target, reason: "runtime restarted before terminal exit was recorded" }, false);
+          trimAudit(db);
+          reserveRecoveryHeadroom(db);
+        }).immediate();
+        reconciled += pending.length;
+      }
+      return reconciled;
     },
     listAudit(limit = 100) {
       const bounded = Math.max(1, Math.min(500, Number(limit) || 100));

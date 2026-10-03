@@ -29,6 +29,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   // manager to initialize after recovery has already classified pending rows.
   if (process.platform === "win32") hardenWindowsLaunchDirectory(database.launchDirectory);
   database.reconcilePendingRetentionCleanup();
+  database.reconcileTerminalAudit();
   const reconciliation = database.reconcileInterruptedRuns({
     probeAlive: (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync),
   });
@@ -659,12 +660,16 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     shuttingDown = true;
     clearTimeout(watcherTimer);
     shutdownPromise = (async () => {
-      await Promise.all([watcher?.close(), agents.shutdown()]);
+      const shutdownErrors = [];
+      const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown()]);
+      for (const result of preliminaries) if (result.status === "rejected") shutdownErrors.push(result.reason);
       await inFlightScan?.catch(() => {});
-      terminals.shutdown();
+      try { terminals.shutdown(); }
+      catch (error) { shutdownErrors.push(error); }
       eventHub.shutdown();
       wss.close();
       await database.close();
+      if (shutdownErrors.length) throw new AggregateError(shutdownErrors, "Runtime shutdown did not finish cleanly");
     })();
     return shutdownPromise;
   }

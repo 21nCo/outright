@@ -56,25 +56,38 @@ export function createTerminalManager({ publish, database, spawnTerminal = pty.s
   function get(id) { const terminal = terminals.get(id); return terminal ? { ...publicTerminal(terminal), buffer: terminal.buffer, outputCursor: terminal.outputCursor } : null; }
   function write(id, data) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running" || typeof data !== "string" || Buffer.byteLength(data) > 64 * 1024) return false; terminal.process.write(data); return true; }
   function resize(id, cols, rows) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running") return false; terminal.process.resize(clamp(cols, 20, 400), clamp(rows, 5, 200)); return true; }
-  function close(id, audit = true) {
+  function close(id) {
     const terminal = terminals.get(id);
     if (!terminal) return false;
     const evidence = { target: id, cwd: terminal.cwd, operationId: randomUUID() };
-    if (audit) database.auditCritical("terminal.close.requested", evidence);
+    database.auditCritical("terminal.close.requested", evidence);
     clearTimeout(terminal.cleanupTimer);
     terminals.delete(id);
     try {
-      if (terminal.status === "running") terminal.process.kill();
-      if (audit) database.auditCritical("terminal.closed", evidence);
+      if (terminal.status === "running") { terminal.process.kill(); terminal.killIssued = true; }
+      database.auditCritical("terminal.closed", evidence);
     } catch (error) {
-      if (audit) throw outcomeUnknown(error, evidence.operationId);
-      throw error;
+      throw outcomeUnknown(error, evidence.operationId);
     }
     return true;
   }
-  // Runtime shutdown must reap PTYs even if storage is closed for archive
-  // maintenance. User-requested closes still require a committed audit first.
-  function shutdown() { for (const id of terminals.keys()) close(id, false); }
+  // Reap every PTY even when storage is unavailable during archive maintenance.
+  // A failed audit leaves terminal.created pending for lease-owned recovery.
+  function shutdown() {
+    const errors = [];
+    for (const terminal of [...terminals.values()]) {
+      try { close(terminal.id); }
+      catch (error) {
+        errors.push(error);
+        clearTimeout(terminal.cleanupTimer);
+        terminals.delete(terminal.id);
+        if (terminal.status === "running" && !terminal.killIssued) {
+          try { terminal.process.kill(); } catch (killError) { errors.push(killError); }
+        }
+      }
+    }
+    if (errors.length) throw new AggregateError(errors, "Terminal shutdown could not record every outcome");
+  }
 
   function pruneExitedForCapacity(cwd) {
     while (terminals.size >= maxTerminals) {

@@ -5,6 +5,7 @@ import { createOutrightDatabase } from "./database.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 
 test("creates a PTY, accepts input, and retains reconnectable output", async () => {
   const events = [];
@@ -129,6 +130,110 @@ test("a close that cannot record its outcome reports the pending operation", () 
   assert.ok(actions.some((entry) => entry.action === "terminal.close.requested"));
 });
 
+test("normal shutdown settles every PTY at a lowered quota and old outcomes trim after restart", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-shutdown-"));
+  const filename = path.join(directory, "runtime.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  const killed = [];
+  const manager = createTerminalManager({ database, publish: () => {}, spawnTerminal: () => ({
+    pid: killed.length + 1, onData() {}, onExit() {}, kill() { killed.push(true); },
+  }) });
+  try {
+    const first = manager.create({ cwd: "/tmp/one" });
+    const second = manager.create({ cwd: "/tmp/two" });
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "quota", provider: "codex" });
+    database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(65 * 1024 * 1024) });
+    database.updateSettings({ maxRetainedMiB: 64 });
+    manager.shutdown();
+    assert.equal(killed.length, 2);
+    assert.deepEqual(manager.list(), []);
+    database.close();
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    assert.equal(database.reconcileTerminalAudit(), 0);
+    for (const id of [first.id, second.id]) {
+      const actions = database.listAudit(20).filter((entry) => entry.target === id).map((entry) => entry.action);
+      assert.ok(actions.includes("terminal.created"));
+      assert.ok(actions.includes("terminal.closed"));
+    }
+    database.updateSettings({ maxRetainedMiB: 128 });
+    const retainedBeforeTrim = database.capacity().retainedBytes;
+    const auditBeforeTrim = auditRetainedBytes(filename);
+    const writer = new Database(filename);
+    try {
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES ('telemetry', '', '{}', '2026-01-01')");
+      writer.transaction(() => { for (let index = 0; index < 10_050; index += 1) insert.run(); }).immediate();
+    } finally { writer.close(); }
+    database.audit("telemetry", { target: "trim" });
+    assert.equal(database.capacity().retainedBytes - retainedBeforeTrim,
+      auditRetainedBytes(filename) - auditBeforeTrim, "audit trimming updates retained bytes exactly");
+    const proof = new Database(filename, { readonly: true });
+    try {
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.created'").get().count, 0);
+      assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= 10_001);
+    } finally { proof.close(); }
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("restart settles crash and maintenance-interrupted PTY evidence before retention trims it", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-recovery-"));
+  const filename = path.join(directory, "runtime.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  let unavailable = false;
+  const killed = [];
+  const manager = createTerminalManager({ database: {
+    auditAdmission: (...args) => database.auditAdmission(...args),
+    auditCritical: (...args) => {
+      if (unavailable) throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 });
+      database.auditCritical(...args);
+    },
+  }, publish: () => {}, spawnTerminal: () => ({ pid: 42, onData() {}, onExit() {}, kill() { killed.push(true); } }) });
+  try {
+    const interrupted = manager.create({ cwd: "/tmp/interrupted" });
+    unavailable = true;
+    assert.throws(() => manager.shutdown(), (error) => error instanceof AggregateError);
+    assert.equal(killed.length, 1);
+    database.close();
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    assert.equal(database.reconcileTerminalAudit(), 1);
+    assert.equal(database.reconcileTerminalAudit(), 0);
+    assert.ok(database.listAudit(20).some((entry) => entry.action === "terminal.unknown" && entry.target === interrupted.id));
+
+    // A process crash can also interrupt a create or close request before
+    // the PTY outcome is known. Recovery must settle each correlation key.
+    database.auditCritical("terminal.create.requested", { target: "unborn", operationId: "create-crash" });
+    database.auditCritical("terminal.close.requested", { target: interrupted.id, operationId: "close-crash" });
+    database.close();
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    assert.equal(database.reconcileTerminalAudit(), 2);
+    const actions = database.listAudit(20).map((entry) => entry.action);
+    assert.ok(actions.includes("terminal.create.unknown"));
+    assert.ok(actions.includes("terminal.close.unknown"));
+
+    for (let index = 0; index < 3; index += 1) {
+      database.auditCritical("terminal.created", { target: `restart-${index}` });
+      database.close();
+      database = createOutrightDatabase({ filename, runtimeLease: true });
+      assert.equal(database.reconcileTerminalAudit(), 1);
+    }
+
+    const writer = new Database(filename);
+    try {
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES ('telemetry', '', '{}', '2026-01-01')");
+      writer.transaction(() => { for (let index = 0; index < 10_050; index += 1) insert.run(); }).immediate();
+    } finally { writer.close(); }
+    database.audit("telemetry", { target: "trim" });
+    database.close();
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    assert.equal(database.reconcileTerminalAudit(), 0);
+    const proof = new Database(filename, { readonly: true });
+    try {
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.created'").get().count, 0);
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action LIKE 'terminal.%.requested'").get().count, 0);
+      assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= 10_001);
+    } finally { proof.close(); }
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 async function waitFor(predicate, timeout = 3000, diagnostic = () => "") {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
@@ -136,4 +241,14 @@ async function waitFor(predicate, timeout = 3000, diagnostic = () => "") {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`Timed out waiting for PTY output: ${JSON.stringify(diagnostic())}`);
+}
+
+function auditRetainedBytes(filename) {
+  const proof = new Database(filename, { readonly: true });
+  try {
+    return proof.prepare(`SELECT COALESCE(SUM(128 + LENGTH(CAST(action AS BLOB))
+      + COALESCE(LENGTH(CAST(target AS BLOB)), 0)
+      + COALESCE(LENGTH(CAST(details AS BLOB)), 0)
+      + LENGTH(CAST(created_at AS BLOB))), 0) AS bytes FROM audit_log`).get().bytes;
+  } finally { proof.close(); }
 }

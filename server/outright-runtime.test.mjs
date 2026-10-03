@@ -82,6 +82,16 @@ function withRuntime(fn, options = {}) {
   };
 }
 
+test("runtime startup settles an orphan PTY before serving requests", withRuntime(async (runtime) => {
+  const audit = runtime.database.listAudit(20);
+  assert.ok(audit.some((entry) => entry.action === "terminal.unknown" && entry.target === "orphan-terminal"));
+  assert.equal(runtime.database.reconcileTerminalAudit(), 0);
+}, { seed(dataDirectory) {
+  const database = createOutrightDatabase({ filename: path.join(dataDirectory, "outright.db") });
+  try { database.auditCritical("terminal.created", { target: "orphan-terminal" }); }
+  finally { database.close(); }
+} }));
+
 test("shutdown during archive cutover preserves a rejected queued cancellation and releases the runtime lease", async () => {
   const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-cutover-shutdown-"));
   const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
