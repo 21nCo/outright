@@ -317,6 +317,9 @@ int main(int argc, char **argv) {
     return 64;
   }
   if (!launch_authorized()) return 75;
+  bool terminal_control = getenv("OUTRIGHT_TERMINAL_CONTROL") != NULL;
+  unsetenv("OUTRIGHT_TERMINAL_CONTROL");
+  if (terminal_control) fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
 
   struct sigaction action;
   memset(&action, 0, sizeof(action));
@@ -400,6 +403,11 @@ int main(int argc, char **argv) {
   for (;;) {
     relay(stdout_fd, STDOUT_FILENO);
     relay(stderr_fd, STDERR_FILENO);
+    if (terminal_control) {
+      char command[16];
+      ssize_t received = read(STDIN_FILENO, command, sizeof(command));
+      if (received > 0 || received == 0) stop_requested = 1;
+    }
     if ((stop_requested || getppid() != owner_pid) && !stopping) {
       stopping = true;
     }

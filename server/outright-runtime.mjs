@@ -62,6 +62,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   function runtimeCapacity() {
     return { ...database.capacity(), utilityProcesses: subprocesses.capacity(), terminalProcesses: terminals.capacity() };
   }
+  void terminals.reconcileUnknown().then((resolved) => {
+    if (resolved) publish({ type: "capacity.changed", payload: runtimeCapacity() });
+  }).catch(() => {});
 
   // Validates that a project/worktree/path triple names exactly one discovered
   // worktree belonging to that project. Trust and execution then bind to the
@@ -591,7 +594,18 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       }
 
       if (url.pathname === "/api/terminals" && request.method === "GET") return json(response, 200, { terminals: terminals.list() });
-      if (url.pathname === "/api/terminals" && request.method === "POST") { const body = await readJson(request); await projects(); const cwd = await git.requireWorktree(body.cwd); return json(response, 201, terminals.create({ ...body, cwd })); }
+      if (url.pathname === "/api/terminals" && request.method === "POST") {
+        const body = await readJson(request);
+        if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.cwd !== "string" || !body.cwd
+          || (body.name !== undefined && (typeof body.name !== "string" || body.name.length > 200))
+          || (body.cols !== undefined && (!Number.isInteger(body.cols) || body.cols < 20 || body.cols > 400))
+          || (body.rows !== undefined && (!Number.isInteger(body.rows) || body.rows < 5 || body.rows > 200))) {
+          throw apiError(400, "Terminal path, name, or dimensions are invalid");
+        }
+        await projects();
+        const cwd = await git.requireWorktree(body.cwd);
+        return json(response, 201, await terminals.create({ ...body, cwd }));
+      }
       const terminalMatch = url.pathname.match(/^\/api\/terminals\/([^/]+)$/);
       if (terminalMatch && request.method === "GET") { const terminal = terminals.get(terminalMatch[1]); return json(response, terminal ? 200 : 404, terminal ?? { error: "Terminal not found" }); }
       if (terminalMatch && request.method === "DELETE") return json(response, await terminals.close(terminalMatch[1]) ? 204 : 404, null);

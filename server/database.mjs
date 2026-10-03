@@ -1443,7 +1443,7 @@ export function createOutrightDatabase(options = {}) {
           WHERE action = 'terminal.created'
             AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > created.id
               AND outcome.target = created.target
-              AND outcome.action IN ('terminal.exited', 'terminal.closed', 'terminal.unknown'))
+              AND outcome.action IN ('terminal.exited', 'terminal.closed', 'terminal.unknown', 'terminal.recovered'))
           ORDER BY id LIMIT 64`).all();
         if (!pending.length) break;
         db.transaction(() => {
@@ -1461,15 +1461,34 @@ export function createOutrightDatabase(options = {}) {
       // The lease owner cannot prove that a previous owner's orphaned PTY
       // tree died. Keep a bounded sample of unresolved targets charged against
       // terminal capacity. A verified exit/close is the only release signal.
-      return db.prepare(`SELECT target, cwd FROM (
+      return db.prepare(`SELECT target, MAX(cwd) AS cwd,
+          MAX(ownershipLabel) AS ownershipLabel, MAX(handshakePath) AS handshakePath,
+          MAX(pid) AS pid, MAX(processIdentity) AS processIdentity,
+          MAX(created) AS created FROM (
         SELECT entry.target AS target,
-          CASE WHEN json_valid(entry.details) THEN json_extract(entry.details, '$.cwd') END AS cwd
+          CASE WHEN json_valid(entry.details) THEN json_extract(entry.details, '$.cwd') END AS cwd,
+          CASE WHEN json_valid(entry.details) THEN json_extract(entry.details, '$.ownershipLabel') END AS ownershipLabel,
+          CASE WHEN json_valid(entry.details) THEN json_extract(entry.details, '$.handshakePath') END AS handshakePath,
+          CASE WHEN json_valid(entry.details) THEN json_extract(entry.details, '$.pid') END AS pid,
+          CASE WHEN json_valid(entry.details) THEN json_extract(entry.details, '$.processIdentity') END AS processIdentity,
+          CASE WHEN entry.action = 'terminal.created' THEN 1 ELSE 0 END AS created
         FROM audit_log AS entry
         WHERE entry.action IN ('terminal.create.requested', 'terminal.created', 'terminal.create.unknown')
           AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > entry.id
             AND outcome.target = entry.target
-            AND outcome.action IN ('terminal.create.failed', 'terminal.exited', 'terminal.closed'))
+            AND outcome.action IN ('terminal.create.failed', 'terminal.exited', 'terminal.closed', 'terminal.recovered'))
       ) GROUP BY target LIMIT 13`).all();
+    },
+    resolveTerminalUnknown(target, evidence) {
+      if (typeof target !== "string" || !/^[0-9a-f-]{36}$/i.test(target)
+        || typeof evidence !== "string" || !evidence.trim() || Buffer.byteLength(evidence) > 2048) {
+        throw databaseError(400, "A terminal id and bounded verification evidence are required");
+      }
+      if (!this.terminalUnknownReservations().some((entry) => entry.target === target)) {
+        throw databaseError(404, "Unresolved terminal reservation was not found");
+      }
+      writeCriticalAudit("terminal.recovered", { target, evidence: evidence.trim() });
+      return true;
     },
     listAudit(limit = 100) {
       const bounded = Math.max(1, Math.min(500, Number(limit) || 100));

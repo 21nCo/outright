@@ -56,8 +56,70 @@ static wchar_t *command_line(int argc, wchar_t **argv, int first_argument) {
   return line;
 }
 
+// The runtime owns the only writer of this control pipe. Closing it on a hard
+// runtime exit tears down the Job Object; an explicit stop uses the same path.
+// The supervisor remains alive until the kernel reports zero job members.
+static DWORD WINAPI watch_owner(void *raw_job) {
+  HANDLE job = (HANDLE)raw_job;
+  HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+  if (input == NULL || input == INVALID_HANDLE_VALUE) {
+    TerminateJobObject(job, 137);
+    return 0;
+  }
+  char buffer[32];
+  DWORD count = 0;
+  // Only the runtime holds the write end. Any command means stop; this also
+  // handles a control message split across pipe reads.
+  ReadFile(input, buffer, sizeof(buffer), &count, NULL);
+  TerminateJobObject(job, 137);
+  return 0;
+}
+
+static unsigned long long process_birth(HANDLE process) {
+  FILETIME created, exited, kernel, user;
+  if (!GetProcessTimes(process, &created, &exited, &kernel, &user)) return 0;
+  return ((unsigned long long)created.dwHighDateTime << 32) | created.dwLowDateTime;
+}
+
+static int inspect_owner(int argc, wchar_t **argv) {
+  bool identity = wcscmp(argv[1], L"--identity") == 0;
+  bool terminate = wcscmp(argv[1], L"--terminate") == 0;
+  if ((identity && argc != 3) || (!identity && argc != 4)) return 64;
+  wchar_t *end = NULL;
+  unsigned long pid = wcstoul(argv[2], &end, 10);
+  if (pid == 0 || end == argv[2] || *end != L'\0') return 64;
+  unsigned long long expected = 0;
+  if (!identity) {
+    end = NULL;
+    expected = _wcstoui64(argv[3], &end, 10);
+    if (expected == 0 || end == argv[3] || *end != L'\0') return 64;
+  }
+  DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+  if (terminate) access |= PROCESS_TERMINATE;
+  HANDLE process = OpenProcess(access, FALSE, (DWORD)pid);
+  if (!process) {
+    if (GetLastError() == ERROR_INVALID_PARAMETER) { wprintf(L"absent\n"); return 3; }
+    wprintf(L"unknown\n"); return 4;
+  }
+  unsigned long long birth = process_birth(process);
+  if (birth == 0) { CloseHandle(process); wprintf(L"unknown\n"); return 4; }
+  if (identity) { wprintf(L"%llu\n", birth); CloseHandle(process); return 0; }
+  if (birth != expected || WaitForSingleObject(process, 0) == WAIT_OBJECT_0) {
+    CloseHandle(process); wprintf(L"absent\n"); return 3;
+  }
+  if (terminate) {
+    if (!TerminateProcess(process, 137) || WaitForSingleObject(process, 5000) != WAIT_OBJECT_0) {
+      CloseHandle(process); wprintf(L"unknown\n"); return 4;
+    }
+    CloseHandle(process); wprintf(L"exited\n"); return 0;
+  }
+  CloseHandle(process); wprintf(L"alive\n"); return 0;
+}
+
 int wmain(int argc, wchar_t **argv) {
   if (argc < 2) return 64;
+  if (wcscmp(argv[1], L"--identity") == 0 || wcscmp(argv[1], L"--probe") == 0
+      || wcscmp(argv[1], L"--terminate") == 0) return inspect_owner(argc, argv);
   bool test_mode = wcscmp(argv[1], L"--test-runner") == 0;
   if (test_mode && argc < 4) return 64;
   HANDLE job = CreateJobObjectW(NULL, NULL);
@@ -83,6 +145,15 @@ int wmain(int argc, wchar_t **argv) {
     return 75;
   }
   CloseHandle(process.hThread);
+
+  if (!test_mode) {
+    HANDLE owner_thread = CreateThread(NULL, 0, watch_owner, job, 0, NULL);
+    if (owner_thread == NULL) {
+      TerminateJobObject(job, 137);
+      return 79;
+    }
+    CloseHandle(owner_thread);
+  }
 
   if (test_mode) {
     for (;;) {

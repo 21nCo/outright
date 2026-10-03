@@ -1,15 +1,60 @@
-import * as pty from "node-pty";
 import { randomUUID } from "node:crypto";
 import { utilityProcesses } from "./subprocess-budget.mjs";
+import { cleanupTerminalSocket, recoverManagedTerminal, spawnManagedTerminal, terminalOwnership } from "./managed-terminal.mjs";
 
-export function createTerminalManager({ publish, database, spawnTerminal = pty.spawn, subprocesses = utilityProcesses, terminate = (terminal, options) => terminatePty(terminal, options, subprocesses), maxTerminals = 12, maxTerminalsPerCwd = 4, exitedRetentionMs = 15 * 60 * 1000, maxBufferChars = 150_000 }) {
+export function createTerminalManager({ publish, database, spawnTerminal = null, subprocesses = utilityProcesses, terminate = (terminal, options) => {
+  if (typeof terminal.process?.terminate !== "function") throw new Error("PTY owner has no termination verifier");
+  return terminal.process.terminate(options);
+}, maxTerminals = 12, maxTerminalsPerCwd = 4, exitedRetentionMs = 15 * 60 * 1000, maxBufferChars = 150_000 }) {
   const terminals = new Map();
-  const reservedUnknown = database.terminalUnknownReservations?.() ?? [];
+  let reservedUnknown = database.terminalUnknownReservations?.() ?? [];
+  let reconciliationPromise;
 
-  function create({ cwd, name, cols = 100, rows = 30 }) {
+  function assertCapacity(cwd) {
     pruneExitedForCapacity(cwd);
     if (terminals.size + reservedUnknown.length >= maxTerminals) throw terminalError(429, `At most ${maxTerminals} terminals can run at once`);
     if ([...terminals.values()].filter((terminal) => terminal.cwd === cwd).length + reservedUnknown.filter((terminal) => terminal.cwd === cwd).length >= maxTerminalsPerCwd) throw terminalError(429, `At most ${maxTerminalsPerCwd} terminals can run for one worktree`);
+  }
+
+  function reconcileUnknown() {
+    if (reconciliationPromise) return reconciliationPromise;
+    reconciliationPromise = (async () => {
+      let resolved = 0;
+      for (const entry of reservedUnknown) {
+        try {
+          const empty = await recoverManagedTerminal({ ...entry, launchDirectory: database.launchDirectory, subprocesses });
+          if (!empty) continue;
+          cleanupTerminalSocket(entry.target);
+          database.resolveTerminalUnknown(entry.target, `Native ${process.platform} owner was verified empty after restart`);
+          resolved += 1;
+        } catch { /* A refused helper or unavailable audit keeps capacity unknown. */ }
+      }
+      if (resolved) {
+        reservedUnknown = database.terminalUnknownReservations();
+        publish({ type: "capacity.changed" });
+      }
+      return resolved;
+    })().finally(() => { reconciliationPromise = null; });
+    return reconciliationPromise;
+  }
+
+  function create(input) {
+    if (!spawnTerminal) return createManagedEntry(input);
+    return createInjected(input);
+  }
+
+  async function createManagedEntry(input) {
+    if (terminals.size + reservedUnknown.length >= maxTerminals) await reconcileUnknown();
+    assertCapacity(input.cwd);
+    const { cwd, name, cols = 100, rows = 30 } = input;
+    const id = randomUUID();
+    const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/zsh");
+    const evidence = { target: id, cwd, shell, operationId: randomUUID() };
+    return createManaged({ id, cwd, name, cols, rows, shell, evidence });
+  }
+
+  function createInjected({ cwd, name, cols = 100, rows = 30 }) {
+    assertCapacity(cwd);
     const id = randomUUID();
     const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/zsh");
     const evidence = { target: id, cwd, shell, operationId: randomUUID() };
@@ -28,8 +73,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = pty.s
       catch (auditError) { throw outcomeUnknown(auditError, evidence.operationId); }
       throw error;
     }
-    const terminal = { id, cwd, name: name || "Terminal", pid: processInstance.pid, process: processInstance, buffer: "", outputCursor: 0, createdAt: new Date().toISOString(), status: "running", exitSeen: false,
-      ownsGroup: process.platform !== "win32" ? ownsProcessGroup(processInstance.pid, subprocesses) : Promise.resolve(false) };
+    const terminal = { id, cwd, name: name || "Terminal", pid: processInstance.pid, process: processInstance, buffer: "", outputCursor: 0, createdAt: new Date().toISOString(), status: "running", exitSeen: false };
     terminals.set(id, terminal);
     processInstance.onData((data) => {
       if (!terminals.has(id)) return;
@@ -60,17 +104,79 @@ export function createTerminalManager({ publish, database, spawnTerminal = pty.s
     return publicTerminal(terminal);
   }
 
+  async function createManaged({ id, cwd, name, cols, rows, shell, evidence }) {
+    if (!database.launchDirectory) throw new Error("Managed PTYs require a private launch directory");
+    const env = { ...terminalEnvironment(process.env), TERM: "xterm-256color", COLORTERM: "truecolor" };
+    if (Buffer.byteLength(JSON.stringify(env)) > 96 * 1024) {
+      throw terminalError(413, "Terminal environment exceeds 96 KiB");
+    }
+    const ownership = terminalOwnership(id, database.launchDirectory);
+    database.auditAdmission("terminal.create.requested", { ...evidence, ownershipLabel: ownership.label,
+      handshakePath: ownership.handshakePath });
+    const terminal = { id, cwd, name: name || "Terminal", pid: null, process: null,
+      buffer: "", outputCursor: 0, createdAt: new Date().toISOString(), status: "launching", exitSeen: false,
+      recorded: false };
+    terminals.set(id, terminal);
+    try {
+      terminal.ready = spawnManagedTerminal({ id, ownership, shell, cwd, cols: clamp(cols, 20, 400),
+        rows: clamp(rows, 5, 200), env, subprocesses });
+      const processInstance = await terminal.ready;
+      terminal.process = processInstance;
+      terminal.pid = processInstance.pid;
+      processInstance.onData((data) => {
+        if (!terminals.has(id)) return;
+        terminal.buffer = `${terminal.buffer}${data}`.slice(-maxBufferChars);
+        terminal.outputCursor += 1;
+        publish({ type: "terminal.output", terminalId: id, payload: { data: data.slice(-64 * 1024), cursor: terminal.outputCursor } });
+      });
+      processInstance.onExit(({ exitCode, signal, verified }) => {
+        if (!terminals.has(id)) return;
+        if (!verified) {
+          terminal.status = "unknown";
+          publish({ type: "terminal.audit-failed", terminalId: id, payload: { error: "PTY ownership could not be verified empty" } });
+          return;
+        }
+        terminal.exitSeen = true;
+        terminal.exitCode = exitCode;
+        terminal.signal = signal;
+        if (terminal.recorded && !terminal.closePromise && terminal.status !== "closing") void settleNaturalExit(terminal);
+      });
+      database.auditCritical("terminal.created", { ...evidence, pid: terminal.pid,
+        processIdentity: processInstance.processIdentity,
+        ownershipLabel: ownership.label, handshakePath: ownership.handshakePath });
+      terminal.recorded = true;
+      if (terminal.status === "unknown") throw new Error("PTY ownership could not be verified after launch");
+      if (terminal.status === "launching") terminal.status = "running";
+      if (terminal.exitSeen && !terminal.closePromise && terminal.status !== "closing") void settleNaturalExit(terminal);
+      return publicTerminal(terminal);
+    } catch (error) {
+      terminal.status = "closing";
+      if (error.terminationUnknown) {
+        terminal.status = "unknown";
+        throw outcomeUnknown(error, evidence.operationId);
+      }
+      if (terminal.process) {
+        try { await terminal.process.terminate(); } catch { terminal.status = "unknown"; throw outcomeUnknown(error, evidence.operationId); }
+      }
+      try { database.auditCritical("terminal.create.failed", { ...evidence, error: String(error.message ?? error).slice(0, 1024) }); }
+      catch { terminal.status = "unknown"; throw outcomeUnknown(error, evidence.operationId); }
+      terminals.delete(id);
+      throw error;
+    }
+  }
+
   function list() { return [...terminals.values()].map(publicTerminal); }
   function capacity() { return { active: [...terminals.values()].filter((terminal) => terminal.status !== "exited").length + reservedUnknown.length,
     unknown: [...terminals.values()].filter((terminal) => terminal.status === "unknown").length + reservedUnknown.length, limit: maxTerminals }; }
   function get(id) { const terminal = terminals.get(id); return terminal ? { ...publicTerminal(terminal), buffer: terminal.buffer, outputCursor: terminal.outputCursor } : null; }
-  function write(id, data) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running" || typeof data !== "string" || Buffer.byteLength(data) > 64 * 1024) return false; terminal.process.write(data); return true; }
-  function resize(id, cols, rows) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running") return false; terminal.process.resize(clamp(cols, 20, 400), clamp(rows, 5, 200)); return true; }
+  function write(id, data) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running" || typeof data !== "string" || Buffer.byteLength(data) > 64 * 1024) return false; return terminal.process.write(data) !== false; }
+  function resize(id, cols, rows) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running") return false; return terminal.process.resize(clamp(cols, 20, 400), clamp(rows, 5, 200)) !== false; }
   async function settleNaturalExit(terminal) {
-    // A PTY leader may exit while a shell child remains in its process group.
-    // Keep the slot until the group has been reaped or forcefully stopped.
+    // Native supervisors report exit only after their ownership boundary is
+    // empty. Keep the slot if that proof or its required audit is unavailable.
     try {
       await terminate(terminal, { alreadyExited: true });
+      if (!spawnTerminal) cleanupTerminalSocket(terminal.id);
       if (!terminals.has(terminal.id) || terminal.closePromise) return;
       terminal.status = "exited";
       publish({ type: "terminal.exit", terminalId: terminal.id, payload: { exitCode: terminal.exitCode, signal: terminal.signal } });
@@ -91,7 +197,12 @@ export function createTerminalManager({ publish, database, spawnTerminal = pty.s
     terminal.status = "closing";
     terminal.closePromise = Promise.resolve().then(async () => {
       try {
+        if (terminal.ready) {
+          terminal.process = await terminal.ready;
+          terminal.pid = terminal.process.pid;
+        }
         await terminate(terminal);
+        if (!spawnTerminal) cleanupTerminalSocket(id);
         await database.auditRequired("terminal.closed", evidence);
         clearTimeout(terminal.cleanupTimer);
         terminals.delete(id);
@@ -138,7 +249,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = pty.s
     }
   }
 
-  return { create, list, capacity, get, write, resize, close, shutdown };
+  return { create, list, capacity, get, write, resize, close, shutdown, reconcileUnknown };
 }
 
 function publicTerminal(terminal) {
@@ -156,80 +267,3 @@ function terminalEnvironment(environment) {
   const blocked = /^(OUTRIGHT_|VITE_|npm_|NODE_OPTIONS$)/i;
   return Object.fromEntries(Object.entries(environment).filter(([key, value]) => value != null && !blocked.test(key)));
 }
-
-async function terminatePty(terminal, { alreadyExited = false } = {}, subprocesses = utilityProcesses) {
-  const pid = terminal.pid;
-  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("PTY process identity is unavailable");
-  const ownsGroup = await terminal.ownsGroup;
-  const owned = new Set([pid]);
-  collectDescendants(owned, await processSnapshot(subprocesses));
-  if (process.platform === "win32") {
-    await killWindowsTree(pid, subprocesses);
-  } else if (!alreadyExited && !terminal.exitSeen) terminal.process.kill();
-  const deadline = Date.now() + 4000;
-  let escalated = false;
-  while (Date.now() < deadline) {
-    const snapshot = process.platform === "win32" ? null : await processSnapshot(subprocesses);
-    if (snapshot) collectDescendants(owned, snapshot);
-    const membersAlive = snapshot
-      ? [...owned].some((member) => liveProcess(snapshot.get(member)))
-        || (ownsGroup && [...snapshot.values()].some((member) => member.pgid === pid && liveProcess(member)))
-      : pidAlive(pid);
-    if (terminal.exitSeen && !membersAlive) return;
-    if (!escalated && Date.now() > deadline - 3500) {
-      escalated = true;
-      if (process.platform === "win32") {
-        await killWindowsTree(pid, subprocesses);
-      } else {
-        // The foreground job may have its own process group. Kill every
-        // descendant captured while the shell was still its parent.
-        for (const member of [...owned].reverse()) {
-          if (!liveProcess(snapshot?.get(member))) continue;
-          try { process.kill(member, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
-        }
-        if (ownsGroup) {
-          try { process.kill(-pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
-        }
-      }
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  throw new Error("PTY process tree exit could not be verified");
-}
-
-function pidAlive(pid) {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return error.code !== "ESRCH"; }
-}
-
-async function ownsProcessGroup(pid, subprocesses) {
-  try {
-    const { stdout } = await subprocesses.run("ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8", timeout: 1000, maxBuffer: 4096 });
-    return Number(stdout.trim()) === pid;
-  } catch { return false; }
-}
-async function killWindowsTree(pid, subprocesses) {
-  try { await subprocesses.run("taskkill", ["/PID", String(pid), "/T", "/F"], { timeout: 1500, maxBuffer: 4096 }); }
-  catch (error) { if (error.code === "SUBPROCESS_CAPACITY" || pidAlive(pid)) throw error; }
-}
-async function processSnapshot(subprocesses) {
-  if (process.platform === "win32") return null;
-  const { stdout } = await subprocesses.run("ps", ["-A", "-o", "pid=,ppid=,pgid=,stat="], { encoding: "utf8", timeout: 1000, maxBuffer: 4 * 1024 * 1024 });
-  const processes = new Map();
-  for (const line of stdout.split("\n")) {
-    const [pid, ppid, pgid, state] = line.trim().split(/\s+/);
-    if (Number.isSafeInteger(Number(pid)) && Number(pid) > 0) processes.set(Number(pid), { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), state });
-  }
-  return processes;
-}
-function collectDescendants(owned, snapshot) {
-  if (!snapshot) return;
-  let changed;
-  do {
-    changed = false;
-    for (const entry of snapshot.values()) {
-      if (owned.has(entry.ppid) && !owned.has(entry.pid)) { owned.add(entry.pid); changed = true; }
-    }
-  } while (changed);
-}
-function liveProcess(entry) { return entry && !entry.state?.startsWith("Z"); }

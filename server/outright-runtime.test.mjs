@@ -49,6 +49,16 @@ test("retention POST bodies reject null and arrays without deleting archived his
   }
 }));
 
+test("malformed terminal requests refuse before discovery, audit admission, or native launch", withRuntime(async (runtime) => {
+  for (const body of [null, [], "wrong shape", {}, { cwd: "/tmp", name: {} },
+    { cwd: "/tmp", cols: "100" }, { cwd: "/tmp", rows: 1000 }]) {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/terminals", body), response);
+    assert.equal(response.statusCode, 400);
+  }
+  assert.equal(runtime.database.listAudit(100).some((entry) => entry.action === "terminal.create.requested"), false);
+}));
+
 function responseCapture() {
   return {
     statusCode: null,
