@@ -1249,6 +1249,38 @@ test("holds an exclusive runtime lease before startup reconciliation", async () 
   }
 });
 
+test("failed startup releases its lease and preserves queued work through recovery and manager failures", async () => {
+  for (const stage of ["launch directory", "retention reconciliation", "terminal manager"]) {
+    const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-startup-lease-"));
+    const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+    process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+    let replacement;
+    try {
+      const seed = createOutrightDatabase();
+      const conversation = seed.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recoverable", provider: "codex" });
+      const queued = seed.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "keep queued" });
+      await seed.close();
+
+      const failure = new Error(`${stage} failed`);
+      const options = stage === "launch directory" ? { hardenLaunchDirectory: () => { throw failure; } }
+        : stage === "retention reconciliation" ? { databaseFactory: (settings) => {
+          const database = createOutrightDatabase(settings);
+          database.reconcilePendingRetentionCleanup = () => { throw failure; };
+          return database;
+        } } : { terminalManagerFactory: () => { throw failure; } };
+      assert.throws(() => createOutrightRuntime({ configUrl: "file:///nonexistent-config.json", ...options }), (error) => error === failure);
+      replacement = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+      assert.equal(replacement.database.getRun(queued.id).status, "interrupted", `${stage} lost recoverable run state`);
+      assert.equal(replacement.database.getRun(queued.id).prompt, "keep queued");
+      assert.equal(replacement.database.getConversation(conversation.id)?.id, conversation.id);
+    } finally {
+      await replacement?.shutdown();
+      if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+      rmSync(dataDirectory, { recursive: true, force: true });
+    }
+  }
+});
+
 test("rejects a malformed recovery policy with 400", withRuntime(async (runtime) => {
   const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
   const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });

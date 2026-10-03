@@ -13,10 +13,13 @@ import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { utilityProcesses } from "./subprocess-budget.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase } = {}) {
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, databaseFactory = createOutrightDatabase, hardenLaunchDirectory = process.platform === "win32" ? hardenWindowsLaunchDirectory : () => {}, terminalManagerFactory = createTerminalManager } = {}) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
-  const database = createOutrightDatabase({ runtimeLease: true, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, onMigrationComplete: () => {
+  let agents;
+  let publish;
+  let runtimeCapacity;
+  const database = databaseFactory({ runtimeLease: true, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, onMigrationComplete: () => {
     agents.resumeQueued();
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
   }, onDeletionWorkerStart: () => {
@@ -25,19 +28,22 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     agents.resumeQueued();
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
   } });
+  let eventHub;
+  let wss;
+  try {
   // Completion markers are trusted recovery evidence. Secure their directory
   // before reconciliation reads any record, rather than waiting for the agent
   // manager to initialize after recovery has already classified pending rows.
-  if (process.platform === "win32") hardenWindowsLaunchDirectory(database.launchDirectory);
+  hardenLaunchDirectory(database.launchDirectory);
   database.reconcilePendingRetentionCleanup();
   database.reconcileTerminalAudit();
   const reconciliation = database.reconcileInterruptedRuns({
     probeAlive: (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync),
   });
   if (reconciliation.count) database.audit("runtime.runs.reconciled", { target: "runtime", ...reconciliation });
-  const eventHub = createRuntimeEventHub();
+  eventHub = createRuntimeEventHub();
   const runtimeInstanceId = randomUUID();
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024 });
+  wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024 });
   let latestScan = null;
   let latestScanAt = 0;
   let inFlightScan = null;
@@ -46,22 +52,22 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   let shuttingDown = false;
   let shutdownPromise;
 
-  function publish(event) {
+  publish = function publish(event) {
     return eventHub.publish(event);
-  }
+  };
 
-  const agents = createAgentManager({ database, publish, onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }), validateConversation: async (conversation) => {
+  agents = createAgentManager({ database, publish, onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }), validateConversation: async (conversation) => {
     const target = await resolveWorktreeTarget(conversation);
     return () => {
       if (database.getConversation(conversation.id)?.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
       if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required");
     };
   } });
-  const terminals = createTerminalManager({ database, publish, subprocesses });
+  const terminals = terminalManagerFactory({ database, publish, subprocesses });
   const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl), subprocesses });
-  function runtimeCapacity() {
+  runtimeCapacity = function runtimeCapacity() {
     return { ...database.capacity(), utilityProcesses: subprocesses.capacity(), terminalProcesses: terminals.capacity() };
-  }
+  };
   void terminals.reconcileUnknown().then((resolved) => {
     if (resolved) publish({ type: "capacity.changed", payload: runtimeCapacity() });
   }).catch(() => {});
@@ -706,6 +712,20 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   }
 
   return { attach, handleRequest, projects, publish, database, agents, terminals, git, shutdown };
+  } catch (error) {
+    // No runtime was returned, so neither Vite nor standalone can call its
+    // shutdown. Stop startup-owned managers before releasing the physical
+    // lease. The constructor is synchronous; no agent or PTY has been admitted.
+    const cleanupErrors = [];
+    try { void agents?.shutdown().catch((failure) => console.error("Runtime startup agent cleanup failed", failure)); }
+    catch (failure) { cleanupErrors.push(failure); }
+    try { eventHub?.shutdown(); } catch (failure) { cleanupErrors.push(failure); }
+    try { wss?.close(); } catch (failure) { cleanupErrors.push(failure); }
+    try { void database.close().catch((failure) => console.error("Runtime startup database cleanup failed", failure)); }
+    catch (failure) { cleanupErrors.push(failure); }
+    if (cleanupErrors.length) throw new AggregateError([error, ...cleanupErrors], "Runtime startup and cleanup failed");
+    throw error;
+  }
 }
 
 function readJson(request) {
