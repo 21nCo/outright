@@ -1,0 +1,28 @@
+server/git-service.mjs
+  h_a39f9495f9ec1d 57,65-78,80,88-89,195-201
+server/git-service.test.mjs
+  h_a39f9495f9ec1d 12-107
+server/outright-runtime.mjs
+  h_a39f9495f9ec1d 16,60-61,63,83,96-108,607-608
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 5,10,15-16,766-796
+server/terminal-manager.mjs
+  h_a39f9495f9ec1d 3,5,32,160,165,167,172,182,205,207,211-213,215,217
+server/terminal-manager.test.mjs
+  h_a39f9495f9ec1d 4,7,169-217
+src/App.jsx
+  h_a39f9495f9ec1d 1751,1755
+src/components/ChangesPane.jsx
+  h_a39f9495f9ec1d 51,72-76,104-107,116-118,126
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a66ed2e79ba4016d266be85d29bb6d77d472a69c",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
