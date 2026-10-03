@@ -2,14 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
 import { Readable } from "node:stream";
-import { spawn, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAlive, defaultRecoveryProcessIdentity, defaultTerminateRecoveryProcess, runtimeAllowedHosts } from "./outright-runtime.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
+
+const execFileAsync = promisify(execFile);
 
 if (process.env.CI && process.platform !== "win32") {
   const group = spawnSync("/bin/ps", ["-o", "pgid=", "-p", String(process.pid)], { encoding: "utf8", timeout: 1000 });
@@ -759,6 +762,37 @@ function withWorktreeRuntime(fn, options = {}) {
     }
   };
 }
+
+const worktreeRefreshBehavior = { blockScan: false };
+test("worktree create and remove report committed effects when the following scan has no utility capacity", { skip: process.platform === "win32" },
+  withWorktreeRuntime(async (runtime, { project }) => {
+    const create = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/worktrees", {
+      projectId: project.id, branch: "capacity-test", name: "capacity-test",
+    }), create);
+    assert.equal(create.statusCode, 201);
+    assert.equal(create.body.refreshDeferred, true);
+    assert.ok(existsSync(create.body.path));
+
+    worktreeRefreshBehavior.blockScan = false;
+    await runtime.projects(true);
+    const remove = responseCapture();
+    await runtime.handleRequest(requestStream("DELETE", "/api/worktrees", {
+      projectId: project.id, worktreePath: create.body.path, confirmation: create.body.path,
+    }), remove);
+    assert.equal(remove.statusCode, 200);
+    assert.equal(remove.body.removed, true);
+    assert.equal(remove.body.refreshDeferred, true);
+    assert.equal(existsSync(create.body.path), false);
+    const actions = runtime.database.listAudit(20).map((entry) => entry.action);
+    assert.ok(actions.includes("git.worktree.created"));
+    assert.ok(actions.includes("git.worktree.removed"));
+  }, { subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: async (file, args, options) => {
+      if (worktreeRefreshBehavior.blockScan && args[2] === "rev-parse") throw Object.assign(new Error("capacity"), { code: "SUBPROCESS_CAPACITY", statusCode: 429 });
+      const result = await execFileAsync(file, args, options);
+      if (args[2] === "worktree" && ["add", "remove"].includes(args[3])) worktreeRefreshBehavior.blockScan = true;
+      return result;
+    } } }));
 
 test("reconciles runs at startup and resolves discard decisions through the API", withRuntime(async (runtime) => {
   const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });

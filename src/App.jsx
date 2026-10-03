@@ -1748,11 +1748,11 @@ export function App() {
 
   async function createWorktree(event) {
     event.preventDefault();
-    try { await api("/api/worktrees", { method: "POST", body: { projectId: worktreeDialog.id, ...worktreeDraft } }); setWorktreeDialog(null); setWorktreeDraft({ branch: "", name: "", baseBranch: "HEAD" }); await loadBootstrap(); setToast("Worktree created"); }
+    try { await api("/api/worktrees", { method: "POST", body: { projectId: worktreeDialog.id, ...worktreeDraft } }); setWorktreeDialog(null); setWorktreeDraft({ branch: "", name: "", baseBranch: "HEAD" }); const refreshed = await loadBootstrap(); setToast(refreshed === true ? "Worktree created" : "Worktree created; project refresh delayed"); }
     catch (nextError) { setError(nextError.message); }
   }
   async function removeWorktree() {
-    try { await api("/api/worktrees", { method: "DELETE", body: { projectId: project.id, worktreePath: worktree.path, confirmation: removeConfirmation } }); setRemoveWorktreeOpen(false); setRemoveConfirmation(""); setSelectedWorktreeId(""); await loadBootstrap(); setToast("Worktree removed"); }
+    try { await api("/api/worktrees", { method: "DELETE", body: { projectId: project.id, worktreePath: worktree.path, confirmation: removeConfirmation } }); setRemoveWorktreeOpen(false); setRemoveConfirmation(""); setSelectedWorktreeId(""); const refreshed = await loadBootstrap(); setToast(refreshed === true ? "Worktree removed" : "Worktree removed; project refresh delayed"); }
     catch (nextError) { setError(nextError.message); }
   }
   async function refreshAll(includeTemplates = false) {

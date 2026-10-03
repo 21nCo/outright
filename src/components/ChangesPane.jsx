@@ -48,7 +48,7 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
     } catch (error) { if (ownerRef.current === owner && request === diffRequestRef.current && selectionRef.current.file === filePath && selectionRef.current.mode === mode) onError(error); }
   }, [worktree.path, onError]);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (afterMutation = false) => {
     const owner = ownerRef.current;
     if (owner.path !== worktree.path) return;
     const request = ++statusRequestRef.current;
@@ -69,7 +69,11 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
       if (nextFile) {
         await loadDiff(nextFile, mode);
       } else { ++diffRequestRef.current; setDiff(""); }
-    } catch (error) { if (ownerRef.current === owner && request === statusRequestRef.current) onError(error); }
+      return true;
+    } catch (error) {
+      if (ownerRef.current === owner && request === statusRequestRef.current && !(afterMutation && error.status === 429)) onError(error);
+      return false;
+    }
     finally { if (ownerRef.current === owner && request === statusRequestRef.current) setLoading(false); }
   }, [worktree.path, loadDiff, onError]);
 
@@ -97,7 +101,10 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
     const path = worktree.path;
     try {
       await api(endpoint, { method: "POST", body: { path, files } });
-      if (ownerRef.current === owner) await refresh();
+      if (ownerRef.current === owner) {
+        const refreshed = await refresh(true);
+        if (ownerRef.current === owner && !refreshed) onToast("Change saved; refresh when utility capacity is available");
+      }
     } catch (error) { if (ownerRef.current === owner) onError(error); }
   }
   async function commit() {
@@ -106,7 +113,9 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
     try {
       await api("/api/git/commit", { method: "POST", body: { path, message: commitMessage } });
       if (ownerRef.current !== owner) return;
-      setCommitMessage(""); onToast("Commit created"); await refresh();
+      setCommitMessage("");
+      const refreshed = await refresh(true);
+      if (ownerRef.current === owner) onToast(refreshed ? "Commit created" : "Commit created; refresh when utility capacity is available");
     } catch (error) { if (ownerRef.current === owner) onError(error); }
   }
 
@@ -114,7 +123,7 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
   const stagedEligible = hasStaged(selected);
 
   return <section className="changes-pane">
-    <header className="pane-toolbar"><div><strong>{status?.branch || worktree.branch}</strong><span>{status?.files.length ?? 0} changed files</span></div><Button variant="ghost" size="icon-sm" onClick={refresh} aria-label="Refresh changes"><ArrowsClockwise className={loading ? "spin" : ""} /></Button></header>
+    <header className="pane-toolbar"><div><strong>{status?.branch || worktree.branch}</strong><span>{status?.files.length ?? 0} changed files</span></div><Button variant="ghost" size="icon-sm" onClick={() => refresh()} aria-label="Refresh changes"><ArrowsClockwise className={loading ? "spin" : ""} /></Button></header>
     <div className="changes-layout">
       <div className="changed-files" aria-busy={loading}>
         {status && !status.files.length && <div className="clean-state" role="status"><Check />Working tree is clean</div>}

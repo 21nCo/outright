@@ -1,11 +1,8 @@
 import * as pty from "node-pty";
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { utilityProcesses } from "./subprocess-budget.mjs";
 
-const execFileAsync = promisify(execFile);
-
-export function createTerminalManager({ publish, database, spawnTerminal = pty.spawn, terminate = terminatePty, maxTerminals = 12, maxTerminalsPerCwd = 4, exitedRetentionMs = 15 * 60 * 1000, maxBufferChars = 150_000 }) {
+export function createTerminalManager({ publish, database, spawnTerminal = pty.spawn, subprocesses = utilityProcesses, terminate = (terminal, options) => terminatePty(terminal, options, subprocesses), maxTerminals = 12, maxTerminalsPerCwd = 4, exitedRetentionMs = 15 * 60 * 1000, maxBufferChars = 150_000 }) {
   const terminals = new Map();
   const reservedUnknown = database.terminalUnknownReservations?.() ?? [];
 
@@ -32,7 +29,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = pty.s
       throw error;
     }
     const terminal = { id, cwd, name: name || "Terminal", pid: processInstance.pid, process: processInstance, buffer: "", outputCursor: 0, createdAt: new Date().toISOString(), status: "running", exitSeen: false,
-      ownsGroup: process.platform !== "win32" ? ownsProcessGroup(processInstance.pid) : Promise.resolve(false) };
+      ownsGroup: process.platform !== "win32" ? ownsProcessGroup(processInstance.pid, subprocesses) : Promise.resolve(false) };
     terminals.set(id, terminal);
     processInstance.onData((data) => {
       if (!terminals.has(id)) return;
@@ -160,19 +157,19 @@ function terminalEnvironment(environment) {
   return Object.fromEntries(Object.entries(environment).filter(([key, value]) => value != null && !blocked.test(key)));
 }
 
-async function terminatePty(terminal, { alreadyExited = false } = {}) {
+async function terminatePty(terminal, { alreadyExited = false } = {}, subprocesses = utilityProcesses) {
   const pid = terminal.pid;
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("PTY process identity is unavailable");
   const ownsGroup = await terminal.ownsGroup;
   const owned = new Set([pid]);
-  collectDescendants(owned, await processSnapshot());
+  collectDescendants(owned, await processSnapshot(subprocesses));
   if (process.platform === "win32") {
-    await killWindowsTree(pid);
+    await killWindowsTree(pid, subprocesses);
   } else if (!alreadyExited && !terminal.exitSeen) terminal.process.kill();
   const deadline = Date.now() + 4000;
   let escalated = false;
   while (Date.now() < deadline) {
-    const snapshot = process.platform === "win32" ? null : await processSnapshot();
+    const snapshot = process.platform === "win32" ? null : await processSnapshot(subprocesses);
     if (snapshot) collectDescendants(owned, snapshot);
     const membersAlive = snapshot
       ? [...owned].some((member) => liveProcess(snapshot.get(member)))
@@ -182,7 +179,7 @@ async function terminatePty(terminal, { alreadyExited = false } = {}) {
     if (!escalated && Date.now() > deadline - 3500) {
       escalated = true;
       if (process.platform === "win32") {
-        await killWindowsTree(pid);
+        await killWindowsTree(pid, subprocesses);
       } else {
         // The foreground job may have its own process group. Kill every
         // descendant captured while the shell was still its parent.
@@ -205,19 +202,19 @@ function pidAlive(pid) {
   catch (error) { return error.code !== "ESRCH"; }
 }
 
-async function ownsProcessGroup(pid) {
+async function ownsProcessGroup(pid, subprocesses) {
   try {
-    const { stdout } = await execFileAsync("ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8", timeout: 1000, maxBuffer: 4096 });
+    const { stdout } = await subprocesses.run("ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8", timeout: 1000, maxBuffer: 4096 });
     return Number(stdout.trim()) === pid;
   } catch { return false; }
 }
-async function killWindowsTree(pid) {
-  try { await execFileAsync("taskkill", ["/PID", String(pid), "/T", "/F"], { timeout: 1500, maxBuffer: 4096 }); }
-  catch (error) { if (pidAlive(pid)) throw error; }
+async function killWindowsTree(pid, subprocesses) {
+  try { await subprocesses.run("taskkill", ["/PID", String(pid), "/T", "/F"], { timeout: 1500, maxBuffer: 4096 }); }
+  catch (error) { if (error.code === "SUBPROCESS_CAPACITY" || pidAlive(pid)) throw error; }
 }
-async function processSnapshot() {
+async function processSnapshot(subprocesses) {
   if (process.platform === "win32") return null;
-  const { stdout } = await execFileAsync("ps", ["-A", "-o", "pid=,ppid=,pgid=,stat="], { encoding: "utf8", timeout: 1000, maxBuffer: 4 * 1024 * 1024 });
+  const { stdout } = await subprocesses.run("ps", ["-A", "-o", "pid=,ppid=,pgid=,stat="], { encoding: "utf8", timeout: 1000, maxBuffer: 4 * 1024 * 1024 });
   const processes = new Map();
   for (const line of stdout.split("\n")) {
     const [pid, ppid, pgid, state] = line.trim().split(/\s+/);

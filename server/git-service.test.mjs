@@ -9,6 +9,102 @@ import { createGitService } from "./git-service.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 
 const execFileAsync = promisify(execFile);
+// The host may attach a Git Trace2 consumer that writes into disposable .git
+// directories after a command exits, racing their removal in these tests.
+process.env.GIT_TRACE2_EVENT = "0";
+
+function capacityError() {
+  return Object.assign(new Error("Utility process capacity is full"), { statusCode: 429, code: "SUBPROCESS_CAPACITY" });
+}
+
+test("unstage capacity refusal preserves a staged tracked modification", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-unstage-capacity-"));
+  try {
+    await git(root, ["init", "project"]);
+    const repository = await realpath(path.join(root, "project"));
+    await git(repository, ["config", "user.email", "outright@example.test"]);
+    await git(repository, ["config", "user.name", "Outright Test"]);
+    await writeFile(path.join(repository, "tracked.txt"), "first\n");
+    await git(repository, ["add", "tracked.txt"]);
+    await git(repository, ["commit", "-m", "initial"]);
+    await writeFile(path.join(repository, "tracked.txt"), "second\n");
+    await git(repository, ["add", "tracked.txt"]);
+    const service = createGitService({
+      database: { auditAdmission() {}, auditCritical() {} },
+      getProjects: () => [{ worktrees: [{ path: repository }] }],
+      getConfig: async () => ({ scanRoots: [root] }),
+      subprocesses: { run: (file, args, options) => args.includes("restore") ? Promise.reject(capacityError()) : execFileAsync(file, args, options) },
+    });
+    await assert.rejects(service.unstage(repository, ["tracked.txt"]), (error) => error.code === "SUBPROCESS_CAPACITY");
+    const { stdout } = await execFileAsync("git", ["-C", repository, "status", "--porcelain"]);
+    assert.equal(stdout.trim(), "M  tracked.txt");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("Git without restore unstages tracked changes without staging a deletion", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-unstage-compat-"));
+  try {
+    await git(root, ["init", "project"]);
+    const repository = await realpath(path.join(root, "project"));
+    await git(repository, ["config", "user.email", "outright@example.test"]);
+    await git(repository, ["config", "user.name", "Outright Test"]);
+    await writeFile(path.join(repository, "tracked.txt"), "first\n");
+    await git(repository, ["add", "tracked.txt"]);
+    await git(repository, ["commit", "-m", "initial"]);
+    await writeFile(path.join(repository, "tracked.txt"), "second\n");
+    await git(repository, ["add", "tracked.txt"]);
+    const service = createGitService({
+      database: { auditAdmission() {}, auditCritical() {} },
+      getProjects: () => [{ worktrees: [{ path: repository }] }],
+      getConfig: async () => ({ scanRoots: [root] }),
+      subprocesses: { run: (file, args, options) => args.includes("restore")
+        ? Promise.reject(Object.assign(new Error("git: 'restore' is not a git command"), { stderr: "git: 'restore' is not a git command" }))
+        : execFileAsync(file, args, options) },
+    });
+    assert.equal((await service.unstage(repository, ["tracked.txt"])).unstagedCount, 1);
+    const { stdout } = await execFileAsync("git", ["-C", repository, "status", "--porcelain"]);
+    assert.equal(stdout.trimStart(), "M tracked.txt\n");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a committed Git effect reports success when only its status refresh hits capacity", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-git-refresh-capacity-"));
+  try {
+    await git(root, ["init", "project"]);
+    const repository = await realpath(path.join(root, "project"));
+    await git(repository, ["config", "user.email", "outright@example.test"]);
+    await git(repository, ["config", "user.name", "Outright Test"]);
+    await writeFile(path.join(repository, "tracked.txt"), "first\n");
+    await git(repository, ["add", "tracked.txt"]);
+    await git(repository, ["commit", "-m", "initial"]);
+    await writeFile(path.join(repository, "tracked.txt"), "second\n");
+    let mutated = false;
+    const actions = [];
+    const service = createGitService({
+      database: { auditAdmission: (action) => actions.push(action), auditCritical: (action) => actions.push(action) },
+      getProjects: () => [{ worktrees: [{ path: repository }] }],
+      getConfig: async () => ({ scanRoots: [root] }),
+      subprocesses: { run: async (file, args, options) => {
+        if (mutated && ["branch", "status", "log"].includes(args[2])) throw capacityError();
+        const result = await execFileAsync(file, args, options);
+        if (["add", "restore", "commit"].includes(args[2])) mutated = true;
+        return result;
+      } },
+    });
+    assert.deepEqual(await service.stage(repository, ["tracked.txt"]), { refreshDeferred: true });
+    mutated = false;
+    assert.deepEqual(await service.unstage(repository, ["tracked.txt"]), { refreshDeferred: true });
+    mutated = false;
+    await git(repository, ["add", "tracked.txt"]);
+    const committed = await service.commit(repository, "capacity after effect");
+    assert.equal(committed.refreshDeferred, true);
+    assert.equal(committed.status, null);
+    assert.match(committed.output, /capacity after effect/);
+    const { stdout } = await execFileAsync("git", ["-C", repository, "log", "-1", "--format=%s"]);
+    assert.equal(stdout.trim(), "capacity after effect");
+    for (const action of ["git.stage", "git.unstage", "git.commit"]) assert.ok(actions.includes(action));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test("reviews, stages, commits, creates, and safely removes discovered worktrees", async () => {
   const scanRoot = await mkdtemp(path.join(os.tmpdir(), "outright-git-test-"));

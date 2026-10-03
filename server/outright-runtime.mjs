@@ -13,7 +13,7 @@ import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { utilityProcesses } from "./subprocess-budget.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase } = {}) {
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase } = {}) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
   const database = createOutrightDatabase({ runtimeLease: true, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, onMigrationComplete: () => {
@@ -57,10 +57,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required");
     };
   } });
-  const terminals = createTerminalManager({ database, publish });
-  const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl) });
+  const terminals = createTerminalManager({ database, publish, subprocesses });
+  const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl), subprocesses });
   function runtimeCapacity() {
-    return { ...database.capacity(), utilityProcesses: utilityProcesses.capacity(), terminalProcesses: terminals.capacity() };
+    return { ...database.capacity(), utilityProcesses: subprocesses.capacity(), terminalProcesses: terminals.capacity() };
   }
 
   // Validates that a project/worktree/path triple names exactly one discovered
@@ -80,7 +80,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     if (!force && latestScan && timestamp - latestScanAt < 1500) return latestScan;
     if (!inFlightScan) {
       inFlightScan = loadOutrightConfig(configUrl)
-        .then(scanProjects)
+        .then((config) => scanProjects(config, subprocesses))
         .then(async (result) => {
           latestScan = result;
           latestScanAt = Date.now();
@@ -91,6 +91,19 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         .finally(() => { inFlightScan = null; });
     }
     return inFlightScan;
+  }
+
+  async function refreshProjectsAfterMutation(result) {
+    try {
+      await projects(true);
+      publish({ type: "projects.changed", payload: latestScan });
+      return result;
+    } catch {
+      // The Git effect and its audit outcome have already committed. A scan
+      // failure cannot turn that success into a retryable failure.
+      latestScanAt = 0;
+      return { ...result, refreshDeferred: true };
+    }
   }
 
   async function refreshWatcher(projectList) {
@@ -591,8 +604,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/context" && request.method === "GET") return json(response, 200, await git.context(requiredQuery(url, "path")));
       if (url.pathname === "/api/editor/open" && request.method === "POST") { const body = await readJson(request); return json(response, 200, await git.openInEditor(body.path, body.file, body.editor)); }
 
-      if (url.pathname === "/api/worktrees" && request.method === "POST") { const result = await git.createWorktree(await readJson(request)); await projects(true); publish({ type: "projects.changed", payload: latestScan }); return json(response, 201, result); }
-      if (url.pathname === "/api/worktrees" && request.method === "DELETE") { const result = await git.removeWorktree(await readJson(request)); await projects(true); publish({ type: "projects.changed", payload: latestScan }); return json(response, 200, result); }
+      if (url.pathname === "/api/worktrees" && request.method === "POST") { const result = await git.createWorktree(await readJson(request)); return json(response, 201, await refreshProjectsAfterMutation(result)); }
+      if (url.pathname === "/api/worktrees" && request.method === "DELETE") { const result = await git.removeWorktree(await readJson(request)); return json(response, 200, await refreshProjectsAfterMutation(result)); }
 
       if (url.pathname === "/api/templates" && request.method === "GET") return json(response, 200, { templates: database.listTemplates() });
       if (url.pathname === "/api/templates" && request.method === "POST") {

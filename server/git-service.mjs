@@ -54,7 +54,7 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     const validated = await validateFiles(cwd, files);
     await auditedMutation("git.stage.requested", "git.stage", { target: cwd, files: validated },
       () => git(cwd, ["add", "--", ...validated]));
-    return status(cwd);
+    return statusAfterMutation(cwd);
   }
 
   async function unstage(worktreePath, files) {
@@ -62,9 +62,22 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     const validated = await validateFiles(cwd, files);
     await auditedMutation("git.unstage.requested", "git.unstage", { target: cwd, files: validated }, async () => {
       try { await git(cwd, ["restore", "--staged", "--", ...validated]); }
-      catch { await git(cwd, ["rm", "--cached", "--", ...validated]); }
+      catch (error) {
+        if (error.code === "SUBPROCESS_CAPACITY") throw error;
+        // Older Git versions may lack restore. A failed restore for any other
+        // reason must not turn a tracked modification into a staged deletion.
+        if (!/not a git command|unknown subcommand|unknown option/i.test(`${error.message}\n${error.stderr ?? ""}`)) throw error;
+        try { await git(cwd, ["reset", "HEAD", "--", ...validated]); }
+        catch (resetError) {
+          if (resetError.code === "SUBPROCESS_CAPACITY") throw resetError;
+          // An unborn branch has no HEAD to reset against. Its staged files
+          // are all additions, so removing only the index entries is safe.
+          if (!/ambiguous argument ['"]?HEAD|unknown revision.*HEAD|bad revision ['"]?HEAD/i.test(`${resetError.message}\n${resetError.stderr ?? ""}`)) throw resetError;
+          await git(cwd, ["rm", "--cached", "--", ...validated]);
+        }
+      }
     });
-    return status(cwd);
+    return statusAfterMutation(cwd);
   }
 
   async function commit(worktreePath, message) {
@@ -72,7 +85,8 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     if (!message?.trim()) throw httpError(400, "Commit message is required");
     const output = await auditedMutation("git.commit.requested", "git.commit", { target: cwd, message: message.trim() },
       () => git(cwd, ["commit", "-m", message.trim()], { maxBuffer: 8 * 1024 * 1024 }));
-    return { output, status: await status(cwd) };
+    const refreshed = await statusAfterMutation(cwd);
+    return { output, status: refreshed.refreshDeferred ? null : refreshed, refreshDeferred: refreshed.refreshDeferred ?? false };
   }
 
   async function createWorktree({ projectId, branch, name, baseBranch = "HEAD" }) {
@@ -176,6 +190,13 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     try { database.auditCritical(outcomeAction, evidence); }
     catch (error) { throw outcomeUnknown(error, evidence.operationId); }
     return result;
+  }
+
+  async function statusAfterMutation(cwd) {
+    try { return await status(cwd); }
+    // The effect has a durable audit outcome. A read failure after that point
+    // must ask the client to refresh later, not invite a duplicate mutation.
+    catch { return { refreshDeferred: true }; }
   }
 
   return { status, diff, stage, unstage, commit, createWorktree, removeWorktree, openInEditor, context, requireWorktree };

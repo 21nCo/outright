@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createTerminalManager } from "./terminal-manager.mjs";
+import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
@@ -163,6 +164,55 @@ test("closing keeps the process slot until termination is verified; unknown term
   finishTermination();
   assert.equal(await retry, true);
   assert.equal(manager.list().length, 0);
+});
+
+test("PTY supervision helpers share utility admission and a refused close keeps its slot", { skip: process.platform === "win32" }, async () => {
+  const calls = [];
+  const subprocesses = createSubprocessBudget({ limit: 1, execute: (file, args, options, callback) => {
+    calls.push(file);
+    return execFile(file, args, options, callback);
+  } });
+  let onExit;
+  const manager = createTerminalManager({ maxTerminals: 1, subprocesses, publish: () => {},
+    database: { auditAdmission() {}, auditCritical() {}, auditRequired: async () => {} },
+    spawnTerminal: () => ({ pid: 999999, onData() {}, onExit(callback) { onExit = callback; }, kill() { onExit?.({ exitCode: 0, signal: 1 }); } }),
+  });
+  const hold = subprocesses.run(process.execPath, ["-e", "setTimeout(() => {}, 350)"], { timeout: 1000 });
+  const terminal = manager.create({ cwd: process.cwd() });
+  assert.equal(subprocesses.capacity().active, 1);
+  await assert.rejects(manager.close(terminal.id), (error) => error.statusCode === 503 && error.details?.outcomeUnknown);
+  assert.deepEqual(calls, [process.execPath], "no unbudgeted ps helper was started");
+  assert.equal(manager.capacity().unknown, 1);
+  assert.throws(() => manager.create({ cwd: process.cwd() }), (error) => error.statusCode === 429);
+  await hold;
+  assert.equal(await manager.close(terminal.id), true);
+  assert.ok(calls.includes("ps"));
+  assert.equal(manager.capacity().active, 0);
+  assert.equal(subprocesses.capacity().active, 0);
+});
+
+test("a burst of PTY closes never starts more supervision helpers than the shared limit", { skip: process.platform === "win32" }, async () => {
+  let running = 0;
+  let peak = 0;
+  const subprocesses = createSubprocessBudget({ limit: 8, execute: (_file, _args, _options, callback) => {
+    running += 1;
+    peak = Math.max(peak, running);
+    setTimeout(() => { running -= 1; callback(null, "", ""); }, 15);
+  } });
+  let nextPid = 900000;
+  const manager = createTerminalManager({ maxTerminals: 12, maxTerminalsPerCwd: 12, subprocesses, publish: () => {},
+    database: { auditAdmission() {}, auditCritical() {}, auditRequired: async () => {} },
+    spawnTerminal: () => {
+      let onExit;
+      return { pid: ++nextPid, onData() {}, onExit(callback) { onExit = callback; }, kill() { onExit?.({ exitCode: 0, signal: 1 }); } };
+    },
+  });
+  const ids = Array.from({ length: 12 }, () => manager.create({ cwd: process.cwd() }).id);
+  await Promise.allSettled(ids.map((id) => manager.close(id)));
+  assert.ok(peak <= 8);
+  assert.equal(subprocesses.capacity().active, 0);
+  for (const id of ids) if (manager.get(id)) await manager.close(id);
+  assert.equal(manager.capacity().active, 0);
 });
 
 test("failed created audit releases capacity after verified cleanup and durable failure", async () => {
