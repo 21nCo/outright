@@ -84,7 +84,7 @@ test("archive shadow cutover promotes a validated candidate and releases its fal
 
 test("a direct SQLite writer cannot commit after candidate promotion", () => {
   const item = fixture();
-  const originalRename = fs.renameSync;
+  const originalLink = fs.linkSync;
   let probed = false;
   try {
     beginArchiveShadow(item.filename);
@@ -100,15 +100,15 @@ test("a direct SQLite writer cannot commit after candidate promotion", () => {
     fenceArchiveSource(fencedSource);
     fencedSource.exec("COMMIT");
     fencedSource.close();
-    fs.renameSync = (from, to) => {
-      originalRename(from, to);
+    fs.linkSync = (from, to) => {
+      originalLink(from, to);
       if (from === item.next && to === item.filename) {
         probed = true;
         const writer = new Database(to);
         try {
+          writer.pragma("busy_timeout = 50");
           assert.throws(() => writer.prepare("UPDATE evidence SET body = ? WHERE id = 1").run("lost after promotion"),
-            /Archive cutover is in progress/);
-          assert.equal(body(to), "recoverable payload");
+            (error) => error.code === "SQLITE_BUSY" || /Archive cutover is in progress/.test(error.message));
         } finally { writer.close(); }
       }
     };
@@ -123,7 +123,281 @@ test("a direct SQLite writer cannot commit after candidate promotion", () => {
     finally { writer.close(); }
     assert.equal(body(item.filename), "committed after cutover");
   } finally {
+    fs.linkSync = originalLink;
+    syncBuiltinESMExports();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
+});
+
+test("schema and header writes cannot bypass the source or promoted candidate cutover locks", () => {
+  const item = fixture();
+  const originalRename = fs.renameSync;
+  const originalLink = fs.linkSync;
+  const stages = [];
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    const probe = (filename, stage) => {
+      const writer = new Database(filename);
+      try {
+        writer.pragma("busy_timeout = 50");
+        assert.throws(() => writer.exec("CREATE TABLE late_schema (value TEXT)"),
+          (error) => error.code === "SQLITE_BUSY");
+        assert.throws(() => writer.pragma("user_version = 42"),
+          (error) => error.code === "SQLITE_BUSY");
+        assert.throws(() => writer.exec("DROP TRIGGER archive_cutover_update_evidence"),
+          (error) => error.code === "SQLITE_BUSY");
+        stages.push(stage);
+      } finally { writer.close(); }
+    };
+    fs.renameSync = (from, to) => {
+      if (from === item.filename && to === item.old) probe(from, "source");
+      originalRename(from, to);
+    };
+    fs.linkSync = (from, to) => {
+      originalLink(from, to);
+      if (from === item.next && to === item.filename) probe(to, "candidate");
+    };
+    syncBuiltinESMExports();
+    cutoverArchiveShadow(item.filename);
+    assert.deepEqual(stages, ["source", "candidate"]);
+    const proof = new Database(item.filename);
+    try {
+      assert.equal(proof.prepare("SELECT name FROM sqlite_master WHERE name = 'late_schema'").get(), undefined);
+      assert.equal(proof.pragma("user_version", { simple: true }), 0);
+      assert.equal(proof.prepare("SELECT body FROM evidence WHERE id = 1").get().body, "recoverable payload");
+    } finally { proof.close(); }
+  } finally {
     fs.renameSync = originalRename;
+    fs.linkSync = originalLink;
+    syncBuiltinESMExports();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
+});
+
+test("a schema commit before lock acquisition defers promotion and survives rollback", () => {
+  const item = fixture();
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.transaction(() => fenceArchiveSource(source)).immediate();
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    const sourceInfo = fs.statSync(item.filename, { bigint: true });
+    const writer = new Database(item.filename);
+    try {
+      writer.exec("CREATE TABLE late_schema (value TEXT)");
+      writer.pragma("user_version = 42");
+      writer.exec("DROP TRIGGER archive_cutover_update_evidence");
+      writer.prepare("UPDATE evidence SET body = ? WHERE id = 1").run("committed before lock");
+    } finally { writer.close(); }
+    assert.throws(() => cutoverArchiveShadow(item.filename, { sourceInfo }),
+      (error) => error.code === "ARCHIVE_SOURCE_BUSY");
+    recoverArchiveShadow(item.filename, { sourceUnmoved: true });
+    const proof = new Database(item.filename);
+    try {
+      assert.equal(proof.prepare("SELECT body FROM evidence").get().body, "committed before lock");
+      assert.equal(proof.prepare("SELECT name FROM sqlite_master WHERE name = 'late_schema'").get().name, "late_schema");
+      assert.equal(proof.pragma("user_version", { simple: true }), 42);
+    } finally { proof.close(); }
+  } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
+test("recovery keeps a direct schema and row commit on the old source after first rename", () => {
+  const item = fixture();
+  const originalRename = fs.renameSync;
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.transaction(() => fenceArchiveSource(source)).immediate();
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    fs.renameSync = (from, to) => {
+      originalRename(from, to);
+      if (from === item.filename && to === item.old) throw new Error("simulated first rename crash");
+    };
+    syncBuiltinESMExports();
+    assert.throws(() => cutoverArchiveShadow(item.filename), /simulated first rename crash/);
+    fs.renameSync = originalRename;
+    syncBuiltinESMExports();
+    const writer = new Database(item.old);
+    try {
+      writer.exec("CREATE TABLE late_schema (value TEXT)");
+      writer.pragma("user_version = 42");
+      writer.exec("DROP TRIGGER archive_cutover_update_evidence");
+      writer.prepare("UPDATE evidence SET body = ? WHERE id = 1").run("late committed row");
+    } finally { writer.close(); }
+    recoverArchiveShadow(item.filename);
+    const proof = new Database(item.filename);
+    try {
+      assert.equal(proof.prepare("SELECT name FROM sqlite_master WHERE name = 'late_schema'").get().name, "late_schema");
+      assert.equal(proof.pragma("user_version", { simple: true }), 42);
+      assert.equal(proof.prepare("SELECT body FROM evidence WHERE id = 1").get().body, "late committed row");
+    } finally { proof.close(); }
+  } finally {
+    fs.renameSync = originalRename;
+    syncBuiltinESMExports();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
+});
+
+test("recovery preserves both databases when the promoted candidate receives a post-crash schema write", () => {
+  const item = fixture();
+  const originalLink = fs.linkSync;
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    fs.linkSync = (from, to) => {
+      originalLink(from, to);
+      if (from === item.next && to === item.filename) throw new Error("simulated promotion link crash");
+    };
+    syncBuiltinESMExports();
+    assert.throws(() => cutoverArchiveShadow(item.filename), /simulated promotion link crash/);
+    fs.linkSync = originalLink;
+    syncBuiltinESMExports();
+    const writer = new Database(item.filename);
+    try { writer.exec("CREATE TABLE late_candidate (value TEXT)"); }
+    finally { writer.close(); }
+    assert.throws(() => recoverArchiveShadow(item.filename), /Promoted archive database changed/);
+    assert.equal(existsSync(item.old), true);
+    assert.equal(existsSync(item.filename), true);
+    assert.equal(existsSync(item.state), true);
+    const proof = new Database(item.filename, { readonly: true });
+    try { assert.equal(proof.prepare("SELECT name FROM sqlite_master WHERE name = 'late_candidate'").get().name, "late_candidate"); }
+    finally { proof.close(); }
+  } finally {
+    fs.linkSync = originalLink;
+    syncBuiltinESMExports();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
+});
+
+test("recovery keeps the old source locked through its final removal", () => {
+  const item = fixture();
+  const originalLink = fs.linkSync;
+  const originalRemove = fs.rmSync;
+  let probed = false;
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    fs.linkSync = (from, to) => {
+      originalLink(from, to);
+      if (from === item.next && to === item.filename) throw new Error("simulated promotion crash");
+    };
+    syncBuiltinESMExports();
+    assert.throws(() => cutoverArchiveShadow(item.filename), /simulated promotion crash/);
+    fs.linkSync = originalLink;
+    fs.rmSync = (name, ...args) => {
+      if (name === item.old) {
+        probed = true;
+        const writer = new Database(name);
+        try {
+          writer.pragma("busy_timeout = 50");
+          assert.throws(() => writer.exec("CREATE TABLE lost_after_recovery_check (value TEXT)"),
+            (error) => error.code === "SQLITE_BUSY");
+        } finally { writer.close(); }
+      }
+      return originalRemove(name, ...args);
+    };
+    syncBuiltinESMExports();
+    recoverArchiveShadow(item.filename);
+    assert.equal(probed, true);
+    assert.equal(body(item.filename), "recoverable payload");
+    assert.equal(existsSync(item.state), false);
+  } finally {
+    fs.linkSync = originalLink;
+    fs.rmSync = originalRemove;
+    syncBuiltinESMExports();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
+});
+
+test("a database created in the public-path gap is preserved instead of overwritten", () => {
+  const item = fixture();
+  const originalLink = fs.linkSync;
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    fs.linkSync = (from, to) => {
+      if (from === item.next && to === item.filename) {
+        const writer = new Database(to);
+        try {
+          writer.exec("CREATE TABLE late_public (value TEXT)");
+          writer.prepare("INSERT INTO late_public (value) VALUES (?)").run("committed in gap");
+        } finally { writer.close(); }
+      }
+      return originalLink(from, to);
+    };
+    syncBuiltinESMExports();
+    assert.throws(() => cutoverArchiveShadow(item.filename), (error) => error.code === "EEXIST");
+    fs.linkSync = originalLink;
+    syncBuiltinESMExports();
+    assert.throws(() => recoverArchiveShadow(item.filename), /Promoted archive database changed/);
+    assert.equal(existsSync(item.old), true);
+    assert.equal(existsSync(item.next), true);
+    assert.equal(existsSync(item.state), true);
+    const proof = new Database(item.filename, { readonly: true });
+    try { assert.equal(proof.prepare("SELECT value FROM late_public").get().value, "committed in gap"); }
+    finally { proof.close(); }
+  } finally {
+    fs.linkSync = originalLink;
+    syncBuiltinESMExports();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
+});
+
+test("restart finishes an interrupted source hard link without losing its late commit", () => {
+  const item = fixture();
+  const originalRename = fs.renameSync;
+  const originalLink = fs.linkSync;
+  try {
+    beginArchiveShadow(item.filename);
+    const source = new Database(item.filename);
+    source.prepare("VACUUM INTO ?").run(item.next);
+    source.close();
+    prepareArchiveShadowCutover(item.filename);
+    fs.renameSync = (from, to) => {
+      originalRename(from, to);
+      if (from === item.filename && to === item.old) throw new Error("simulated first rename crash");
+    };
+    syncBuiltinESMExports();
+    assert.throws(() => cutoverArchiveShadow(item.filename), /simulated first rename crash/);
+    fs.renameSync = originalRename;
+    syncBuiltinESMExports();
+    const writer = new Database(item.old);
+    try { writer.exec("CREATE TABLE late_source (value TEXT)"); }
+    finally { writer.close(); }
+    fs.linkSync = (from, to) => {
+      originalLink(from, to);
+      if (from === item.old && to === item.filename) throw new Error("simulated source restoration crash");
+    };
+    syncBuiltinESMExports();
+    assert.throws(() => recoverArchiveShadow(item.filename), /simulated source restoration crash/);
+    fs.linkSync = originalLink;
+    syncBuiltinESMExports();
+    recoverArchiveShadow(item.filename);
+    const proof = new Database(item.filename);
+    try { assert.equal(proof.prepare("SELECT name FROM sqlite_master WHERE name = 'late_source'").get().name, "late_source"); }
+    finally { proof.close(); }
+    assert.equal(existsSync(item.old), false);
+    assert.equal(existsSync(item.state), false);
+  } finally {
+    fs.renameSync = originalRename;
+    fs.linkSync = originalLink;
     syncBuiltinESMExports();
     rmSync(item.directory, { recursive: true, force: true });
   }
@@ -131,7 +405,7 @@ test("a direct SQLite writer cannot commit after candidate promotion", () => {
 
 test("post-promotion writer cannot lose sibling run, audit, setting or retained evidence", async () => {
   const item = fixture();
-  const originalRename = fs.renameSync;
+  const originalLink = fs.linkSync;
   try {
     const runtime = createOutrightDatabase({ filename: item.filename });
     const chat = runtime.createConversation({ projectId: "p", worktreeId: "w", worktreePath: item.directory,
@@ -157,19 +431,20 @@ test("post-promotion writer cannot lose sibling run, audit, setting or retained 
     fencedSource.exec("COMMIT");
     fencedSource.close();
     let probed = false;
-    fs.renameSync = (from, to) => {
-      originalRename(from, to);
+    fs.linkSync = (from, to) => {
+      originalLink(from, to);
       if (from === item.next && to === item.filename) {
         probed = true;
         const writer = new Database(to);
         try {
+          writer.pragma("busy_timeout = 50");
           assert.throws(() => writer.transaction(() => {
             writer.prepare("UPDATE messages SET body = ? WHERE id = ?").run("lost sibling", message.id);
             writer.prepare("UPDATE runs SET prompt = ? WHERE id = ?").run("lost run", queued.id);
             writer.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("cutover.probe", '"lost"');
             writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
               .run("cutover.probe", chat.id, "{}", new Date().toISOString());
-          }).immediate(), /Archive cutover is in progress/);
+          }).immediate(), (error) => error.code === "SQLITE_BUSY" || /Archive cutover is in progress/.test(error.message));
         } finally { writer.close(); }
       }
     };
@@ -192,7 +467,7 @@ test("post-promotion writer cannot lose sibling run, audit, setting or retained 
       assert.equal(restarted.getRun(interrupted.id).status, "interrupted");
     } finally { await restarted.close(); }
   } finally {
-    fs.renameSync = originalRename;
+    fs.linkSync = originalLink;
     syncBuiltinESMExports();
     rmSync(item.directory, { recursive: true, force: true });
   }
@@ -212,8 +487,9 @@ test("interruption after promotion validation keeps candidate fenced through rec
       if (name === item.old) {
         probed = true;
         const writer = new Database(item.filename);
-        try { assert.throws(() => writer.prepare("INSERT INTO evidence (body) VALUES (?)").run("lost before cleanup"),
-          /Archive cutover is in progress/); }
+        try { writer.pragma("busy_timeout = 50");
+          assert.throws(() => writer.prepare("INSERT INTO evidence (body) VALUES (?)").run("lost before cleanup"),
+            (error) => error.code === "SQLITE_BUSY" || /Archive cutover is in progress/.test(error.message)); }
         finally { writer.close(); }
         throw new Error("simulated interruption after validation");
       }

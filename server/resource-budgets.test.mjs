@@ -1416,15 +1416,16 @@ test("a direct writer after the source closes cannot commit through shadow promo
     }
     const writer = new Database(filename);
     writer.pragma("busy_timeout = 0");
-    assert.equal(writer.prepare("SELECT active FROM archive_cutover_guard").get().active, 1,
-      "the source must remain fenced after its SQLite handle closes");
     for (const statement of [
+      () => writer.exec("CREATE TABLE cutover_late_schema (value TEXT)"),
+      () => writer.pragma("user_version = 42"),
+      () => writer.exec("DROP TRIGGER archive_cutover_update_messages"),
       () => writer.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("cutover.late", '"dark"'),
       () => writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
         .run("cutover.late", sibling.id, "{}", new Date().toISOString()),
       () => writer.exec("DELETE FROM archive_cutover_guard"),
     ]) {
-      assert.throws(statement, /Archive cutover is in progress/);
+      assert.throws(statement, (error) => error.code === "SQLITE_BUSY" || /Archive cutover is in progress/.test(error.message));
     }
     let committed = false;
     try {

@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import { closeSync, constants, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 // The runtime lease is held by the caller for every transition. The source
@@ -69,6 +69,36 @@ function candidateIdentity(filename, hash = false) {
     }
     return { identity, digest: digest.digest("hex") };
   } finally { closeSync(fd); }
+}
+
+function sourceSnapshot(filename) {
+  const info = statSync(filename, { bigint: true });
+  const fd = openSync(filename, "r");
+  const header = Buffer.alloc(100);
+  try {
+    if (readSync(fd, header, 0, header.length, 0) !== header.length) {
+      throw new Error("Archive source has an incomplete SQLite header");
+    }
+  } finally { closeSync(fd); }
+  // A rename can change ctime, but a SQLite commit changes the header change
+  // counter (or the file's mtime/size). This is a conflict detector, not a
+  // substitute for the candidate's full digest and integrity check.
+  return { dev: String(info.dev), ino: String(info.ino), size: String(info.size),
+    mtimeNs: String(info.mtimeNs), header: header.toString("hex") };
+}
+
+function sourceMatchesSnapshot(filename, snapshot) {
+  if (!snapshot) return true; // Older maintenance markers did not pin source state.
+  const current = sourceSnapshot(filename);
+  return Object.keys(current).every((key) => current[key] === snapshot[key]);
+}
+
+function writeArchiveMarker(state, marker) {
+  const temporary = `${state}.tmp`;
+  writeFileSync(temporary, JSON.stringify(marker), { mode: 0o600, flag: "wx" });
+  durableFile(temporary);
+  renameSync(temporary, state);
+  durableDirectory(state);
 }
 
 function matchesCandidate(filename, candidate, hash = false, renamed = false) {
@@ -224,6 +254,125 @@ function recoverInterruptedCutover(filename, next, old, marker) {
   if (privateRegularFile(old)) { rmSync(old); durableDirectory(filename); }
 }
 
+function lockArchiveDatabase(filename) {
+  const db = new Database(filename);
+  try {
+    db.pragma("busy_timeout = 250");
+    db.pragma("locking_mode = EXCLUSIVE");
+    db.exec("BEGIN EXCLUSIVE; COMMIT;");
+    return db;
+  } catch (error) { db.close(); throw error; }
+}
+
+function finishLinkedCandidate(filename, next, old, marker) {
+  const publicInfo = fileInfo(filename);
+  const nextInfo = fileInfo(next);
+  if (!publicInfo || !nextInfo || !fileInfo(old)) return;
+  if (publicInfo.dev !== nextInfo.dev || publicInfo.ino !== nextInfo.ino || publicInfo.nlink !== 2
+    || nextInfo.nlink !== 2 || !publicInfo.isFile() || !nextInfo.isFile()
+    || String(publicInfo.dev) !== marker.candidate?.identity?.[0]
+    || String(publicInfo.ino) !== marker.candidate?.identity?.[1]) return;
+  // A crash between exclusive link creation and unlink leaves two names for
+  // the same candidate inode. Lock it before dropping the redundant private
+  // name; the public name and every committed byte remain available.
+  const db = lockArchiveDatabase(filename);
+  try { rmSync(next); durableDirectory(filename); }
+  finally { db.close(); }
+}
+
+function finishLinkedSource(filename, next, old, marker) {
+  const publicInfo = fileInfo(filename);
+  const oldInfo = fileInfo(old);
+  if (!publicInfo || !oldInfo || publicInfo.dev !== oldInfo.dev || publicInfo.ino !== oldInfo.ino
+    || publicInfo.nlink !== 2 || oldInfo.nlink !== 2 || !publicInfo.isFile() || !oldInfo.isFile()
+    || String(publicInfo.dev) !== marker.sourceSnapshot?.dev
+    || String(publicInfo.ino) !== marker.sourceSnapshot?.ino) return;
+  let sourceDb;
+  let candidateDb;
+  try {
+    sourceDb = lockArchiveDatabase(filename);
+    if (fileInfo(next)) {
+      candidateDb = lockArchiveDatabase(next);
+      if (!authenticatedCandidate(next, marker)) {
+        throw new Error("Archive candidate changed after source restoration; preserve both databases");
+      }
+    }
+    if (hasNonemptyWal(old)) {
+      const checkpoint = sourceDb.pragma("wal_checkpoint(TRUNCATE)")[0];
+      if (checkpoint?.busy || sourceDb.pragma("journal_mode = DELETE", { simple: true }).toLowerCase() !== "delete") {
+        throw new Error("Restored archive source WAL could not be checkpointed");
+      }
+      removeCheckpointedSidecars(old);
+    }
+    discardShadowCandidate(next);
+    rmSync(old);
+    durableDirectory(filename);
+  } finally {
+    candidateDb?.close();
+    sourceDb?.close();
+  }
+}
+
+function recoverPinnedInterruptedCutover(filename, next, old, marker) {
+  // Once a crashed process releases SQLite's locks, a direct sibling may
+  // write either inode. Lock both before deciding, and keep those locks until
+  // the rejected inode is removed. A snapshot-only check has a second race.
+  const candidatePath = fileInfo(filename) ? filename : next;
+  let oldDb;
+  let candidateDb;
+  try {
+    oldDb = lockArchiveDatabase(old);
+    if (fileInfo(candidatePath)) candidateDb = lockArchiveDatabase(candidatePath);
+    const sourceHadWal = hasNonemptyWal(old);
+    if (sourceHadWal) {
+      const checkpoint = oldDb.pragma("wal_checkpoint(TRUNCATE)")[0];
+      if (checkpoint?.busy || oldDb.pragma("journal_mode = DELETE", { simple: true }).toLowerCase() !== "delete") {
+        throw new Error("Changed archive source WAL could not be checkpointed");
+      }
+      removeCheckpointedSidecars(old);
+    }
+    const sourceChanged = sourceHadWal || !sourceMatchesSnapshot(old, marker.sourceSnapshot);
+    const candidateMatches = candidateDb && authenticatedCandidate(candidatePath, marker, candidatePath === filename);
+    if (candidateDb && !candidateMatches) {
+      throw new Error("Promoted archive database changed after interruption; preserve both databases");
+    }
+    if (sourceChanged || !candidateDb) {
+      if (oldDb.pragma("integrity_check")[0]?.integrity_check !== "ok") {
+        throw new Error("Changed archive source failed integrity validation");
+      }
+      if (candidatePath === filename && fileInfo(filename)) {
+        linkSync(filename, next);
+        durableDirectory(filename);
+        rmSync(filename);
+        durableDirectory(filename);
+      }
+      linkSync(old, filename);
+      durableDirectory(filename);
+      durableFile(filename);
+      discardShadowCandidate(next);
+      rmSync(old);
+      durableDirectory(filename);
+      return;
+    }
+    if (candidatePath === next) {
+      linkSync(next, filename);
+      durableDirectory(filename);
+      rmSync(next);
+      durableDirectory(filename);
+      if (!matchesCandidate(filename, marker.candidate, false, true)) {
+        throw new Error("Archive candidate changed during recovery promotion");
+      }
+    }
+    durableFile(filename);
+    durableDirectory(filename);
+    rmSync(old);
+    durableDirectory(filename);
+  } finally {
+    candidateDb?.close();
+    oldDb?.close();
+  }
+}
+
 export function recoverArchiveShadow(filename, { sourceUnmoved = false } = {}) {
   const { next, old, state } = archiveShadowPaths(filename);
   const temporary = `${state}.tmp`;
@@ -234,6 +383,8 @@ export function recoverArchiveShadow(filename, { sourceUnmoved = false } = {}) {
   }
   const marker = JSON.parse(readFileSync(state, "utf8"));
   if (!markerOwnsDatabase(marker, filename)) throw new Error("Archive maintenance marker does not match the database");
+  if (marker.sourceSnapshot) finishLinkedSource(filename, next, old, marker);
+  if (marker.sourceSnapshot && fileInfo(old)) finishLinkedCandidate(filename, next, old, marker);
   privateRegularFile(next);
   privateRegularFile(old);
   // An expected live conflict is reported only before either rename. The
@@ -249,7 +400,8 @@ export function recoverArchiveShadow(filename, { sourceUnmoved = false } = {}) {
     return;
   }
   if (fileInfo(old)) {
-    recoverInterruptedCutover(filename, next, old, marker);
+    if (marker.sourceSnapshot) recoverPinnedInterruptedCutover(filename, next, old, marker);
+    else recoverInterruptedCutover(filename, next, old, marker);
   } else if (!validDatabase(filename)) {
     throw new Error("Archive maintenance source is missing or invalid");
   }
@@ -267,10 +419,10 @@ export function prepareArchiveShadowCutover(filename) {
   if (!privateRegularFile(state) || !validDatabase(next) || hasNonemptyWal(next)) {
     throw new Error("Archive shadow is not ready for cutover");
   }
-  // The candidate becomes publicly writable at the second rename. Fence it
-  // before pinning its digest, so a direct SQLite writer cannot commit between
-  // promotion and verification, then make recovery restore an older source.
-  // A closed handle is also required for Windows promotion.
+  // The candidate becomes publicly reachable at promotion. Fence it before
+  // pinning its digest, so a direct SQLite writer cannot commit after a
+  // crash and make recovery restore an older source. Platforms that cannot
+  // promote an open SQLite file defer safely at cutover.
   const candidateDb = new Database(next);
   try {
     if (candidateDb.pragma("journal_mode = DELETE", { simple: true }).toLowerCase() !== "delete") {
@@ -285,11 +437,7 @@ export function prepareArchiveShadowCutover(filename) {
   const marker = JSON.parse(readFileSync(state, "utf8"));
   if (marker.version !== 2 || !markerOwnsDatabase(marker, filename)) throw new Error("Archive marker is not owned by this database");
   const candidate = candidateIdentity(next, true);
-  const temporary = `${state}.tmp`;
-  writeFileSync(temporary, JSON.stringify({ ...marker, candidate }), { mode: 0o600, flag: "wx" });
-  durableFile(temporary);
-  renameSync(temporary, state);
-  durableDirectory(state);
+  writeArchiveMarker(state, { ...marker, candidate });
 }
 
 export function cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate } = {}) {
@@ -300,7 +448,41 @@ export function cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate } =
   if (!markerOwnsDatabase(marker, filename) || marker.version !== 2 || !matchesCandidate(next, marker.candidate)) {
     throw new Error("Archive cutover candidate changed after validation");
   }
-  // The worker checkpoints and closes the source before promotion. A
+  // Hold SQLite's exclusive locks on both inodes until the old source is
+  // removed. Row triggers alone cannot fence CREATE TABLE, DROP TRIGGER or
+  // PRAGMA writes from a direct sibling connection. If this platform cannot
+  // rename an open SQLite file, defer before losing any committed write.
+  let sourceDb;
+  let candidateDb;
+  let promoted = false;
+  try {
+    sourceDb = lockArchiveDatabase(filename);
+    candidateDb = lockArchiveDatabase(next);
+    cutoverArchiveShadowLocked(filename, { sourceInfo, cutoverStatGate, state, next, old, marker });
+    promoted = true;
+  } catch (error) {
+    if (["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code)) {
+      throw Object.assign(new Error("Archive cutover database is busy; retry when idle", { cause: error }), { code: "ARCHIVE_SOURCE_BUSY" });
+    }
+    throw error;
+  } finally {
+    candidateDb?.close();
+    sourceDb?.close();
+  }
+  if (promoted) {
+    // The old inode is gone, so any subsequent public-path commit must stay
+    // on the promoted source even if fence removal is interrupted.
+    releaseArchiveSourceFence(filename);
+    rmSync(state);
+    durableDirectory(filename);
+  }
+}
+
+function cutoverArchiveShadowLocked(filename, { sourceInfo, cutoverStatGate, state, next, old, marker }) {
+  if (!matchesCandidate(next, marker.candidate)) {
+    throw Object.assign(new Error("Archive candidate changed before exclusive cutover; retry when idle"), { code: "ARCHIVE_SOURCE_BUSY" });
+  }
+  // The worker checkpoints and closes its source before promotion. A
   // nonempty WAL would be left behind by a file rename and is unsafe.
   if (hasNonemptyWal(filename)) throw new Error("Archive source WAL was not checkpointed");
   if (hasNonemptyWal(next)) throw new Error("Archive shadow WAL was not checkpointed");
@@ -312,9 +494,11 @@ export function cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate } =
       throw Object.assign(new Error("Archive source changed under cutover fence; retry when idle"), { code: "ARCHIVE_SOURCE_BUSY" });
     }
   }
+  // Pin the fenced source so a process crash followed by a direct schema
+  // write to the old inode cannot silently promote an older shadow.
+  writeArchiveMarker(state, { ...marker, sourceSnapshot: sourceSnapshot(filename) });
   // A test gate at the final comparison catches writes that older cutovers
-  // silently replaced. The durable source fence remains active here even
-  // though the SQLite connection has closed for Windows promotion.
+  // silently replaced. Both SQLite handles remain exclusively locked here.
   if (cutoverStatGate instanceof SharedArrayBuffer) {
     const signal = new Int32Array(cutoverStatGate);
     Atomics.store(signal, 0, 1);
@@ -333,18 +517,18 @@ export function cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate } =
   durableDirectory(filename);
   // An interrupted promotion keeps both names and the durable marker. The
   // parent recovers it on a worker while HTTP can return bounded 503s.
-  renameSync(next, filename);
+  // link(2) is an exclusive create: an unrelated SQLite writer that creates
+  // the public path during the rename gap cannot be overwritten. The two
+  // names briefly refer to the same locked inode; recovery recognizes that
+  // interrupted state before enforcing the normal single-link rule.
+  linkSync(next, filename);
+  durableDirectory(filename);
+  rmSync(next);
   durableDirectory(filename);
   if (!matchesCandidate(filename, marker.candidate, false, true)) throw new Error("Archive cutover candidate changed during promotion");
   // The worker validated and flushed this same inode before the fence. A
   // full integrity scan here would make the service outage size-dependent.
   rmSync(old);
-  durableDirectory(filename);
-  // After the fallback is gone, recovery always keeps this valid candidate.
-  // Releasing the fence before removing the marker is crash-safe: with no old
-  // file, startup cannot roll back later committed writes to this pathname.
-  releaseArchiveSourceFence(filename);
-  rmSync(state);
   durableDirectory(filename);
 }
 
