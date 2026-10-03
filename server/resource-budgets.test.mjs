@@ -1242,6 +1242,63 @@ test("a committed source write at archive cutover discards the stale shadow and 
   }
 });
 
+test("a direct writer at the final source comparison cannot lose a committed sibling row", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-final-fence-"));
+  const filename = path.join(directory, "outright.db");
+  const gate = new Int32Array(new SharedArrayBuffer(4));
+  let database = createOutrightDatabase({ filename, runtimeLease: true, deletionCutoverStatGate: gate.buffer });
+  try {
+    const sibling = chat(database, "retained sibling");
+    const retained = database.addMessage({ conversationId: sibling.id, role: "assistant", body: "original evidence" });
+    const queued = database.createRun(runInput(sibling.id));
+    const archived = chat(database, "large archive");
+    const large = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    const legacy = new Database(filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), large.id);
+    legacy.close();
+    database.updateConversation(archived.id, { archived: true });
+    const deletion = database.deleteArchivedConversation(archived.id, archived.id);
+    const deadline = Date.now() + 5000;
+    while (Atomics.load(gate, 0) !== 1) {
+      assert.ok(Date.now() < deadline, "cutover did not reach the final source comparison");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    const writer = new Database(filename);
+    writer.pragma("busy_timeout = 0");
+    let committed = false;
+    try {
+      writer.transaction(() => {
+        writer.prepare("UPDATE messages SET body = ? WHERE id = ?").run("late committed evidence", retained.id);
+        writer.prepare("UPDATE runs SET prompt = ? WHERE id = ?").run("late queued evidence", queued.id);
+      }).immediate();
+      committed = true;
+    } catch (error) {
+      assert.ok(["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code), `unexpected direct writer failure: ${error.message}`);
+    } finally { writer.close(); }
+    Atomics.store(gate, 0, 2);
+    Atomics.notify(gate, 0);
+    const result = await deletion;
+    if (committed) assert.equal(result.deferred, true, "a committed post-comparison source write was replaced");
+    await database.close();
+    database = null;
+    const proof = new Database(filename, { readonly: true });
+    try {
+      assert.equal(proof.prepare("SELECT body FROM messages WHERE id = ?").get(retained.id).body,
+        committed ? "late committed evidence" : "original evidence");
+      assert.equal(proof.prepare("SELECT prompt FROM runs WHERE id = ?").get(queued.id).prompt,
+        committed ? "late queued evidence" : "work");
+      assert.equal(proof.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes, retainedReadback(proof));
+    } finally { proof.close(); }
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    assert.equal(database.getRun(queued.id).status, "queued");
+  } finally {
+    Atomics.store(gate, 0, 2);
+    Atomics.notify(gate, 0);
+    await database?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("shadow copy serves unrelated work and retries after a concurrent source write", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-live-copy-"));
   const filename = path.join(directory, "outright.db");

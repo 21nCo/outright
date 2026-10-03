@@ -3,7 +3,7 @@ import { closeSync, openSync, statSync } from "node:fs";
 import { parentPort, workerData } from "node:worker_threads";
 import { archiveShadowPaths, cutoverArchiveShadow, prepareArchiveShadowCutover } from "./archive-shadow.mjs";
 
-const { filename, conversationId, table, rowId, lockGate, copyGate, copyStepGate, copyPhase } = workerData;
+const { filename, conversationId, table, rowId, lockGate, cutoverStatGate, copyGate, copyStepGate, copyPhase } = workerData;
 const ownership = {
   run_events: `SELECT 1 FROM run_events AS item JOIN runs ON runs.id = item.run_id
     WHERE item.id = ? AND runs.conversation_id = ?`,
@@ -171,20 +171,37 @@ try {
     throw Object.assign(new Error("Archive source WAL is busy at cutover"), { code: "ARCHIVE_SOURCE_BUSY" });
   }
   if (finalCheckpoint?.busy) throw Object.assign(new Error("Archive source WAL is busy at cutover"), { code: "ARCHIVE_SOURCE_BUSY" });
-  if (source.pragma("data_version", { simple: true }) !== cutoverSourceVersion) {
-    throw Object.assign(new Error("Archive source changed at cutover; retry when idle"), { code: "ARCHIVE_SOURCE_BUSY" });
+  // Acquire SQLite's persistent exclusive locking mode before checking the
+  // source snapshot. It keeps other connections out across the WAL-to-delete
+  // journal switch, where data_version may reset. The final transaction then
+  // remains open through promotion, so no direct writer can commit into the
+  // old inode after the final comparison.
+  try {
+    source.pragma("locking_mode = EXCLUSIVE");
+    source.exec("BEGIN IMMEDIATE");
+    if (source.pragma("data_version", { simple: true }) !== cutoverSourceVersion) {
+      throw Object.assign(new Error("Archive source changed before cutover fence; retry when idle"), { code: "ARCHIVE_SOURCE_BUSY" });
+    }
+    source.exec("COMMIT");
+    if (source.pragma("journal_mode = DELETE", { simple: true }).toLowerCase() !== "delete") {
+      throw new Error("Archive source could not leave WAL mode");
+    }
+    const afterJournalSwitch = source.pragma("data_version", { simple: true });
+    source.exec("BEGIN EXCLUSIVE");
+    if (source.pragma("data_version", { simple: true }) !== afterJournalSwitch) {
+      throw Object.assign(new Error("Archive source changed while acquiring cutover fence; retry when idle"), { code: "ARCHIVE_SOURCE_BUSY" });
+    }
+  } catch (error) {
+    if (!["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code)) throw error;
+    throw Object.assign(new Error("Archive source could not be fenced at cutover"), { code: "ARCHIVE_SOURCE_BUSY" });
   }
-  const beforeClose = statSync(filename, { bigint: true });
+  // The source remains locked and open until promotion finishes. Closing it
+  // here would reopen the compare-to-rename race for direct SQLite writers.
+  const sourceInfo = statSync(filename, { bigint: true });
+  cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate });
+  source.exec("ROLLBACK");
   source.close();
   source = undefined;
-  // Closing SQLite may checkpoint its own sidecars. Pin the resulting file
-  // identity so a commit/checkpoint after close cannot silently replace the
-  // newer source with the prepared shadow.
-  const sourceInfo = statSync(filename, { bigint: true });
-  if (["dev", "ino", "size", "mtimeNs", "ctimeNs"].some((key) => beforeClose[key] !== sourceInfo[key])) {
-    throw Object.assign(new Error("Archive source changed while closing; retry when idle"), { code: "ARCHIVE_SOURCE_BUSY" });
-  }
-  cutoverArchiveShadow(filename, { sourceInfo });
   parentPort.postMessage({ ok: true });
 } catch (error) {
   parentPort.postMessage({ ok: false, error: error.message, code: error.code });

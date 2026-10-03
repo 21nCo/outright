@@ -239,7 +239,7 @@ export function prepareArchiveShadowCutover(filename) {
   durableDirectory(state);
 }
 
-export function cutoverArchiveShadow(filename, { sourceInfo } = {}) {
+export function cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate } = {}) {
   const { next, old, state } = archiveShadowPaths(filename);
   if (!privateRegularFile(next)) throw new Error("Archive shadow is missing");
   if (fileInfo(old) || !privateRegularFile(state)) throw new Error("Archive cutover state is missing or conflicting");
@@ -256,10 +256,27 @@ export function cutoverArchiveShadow(filename, { sourceInfo } = {}) {
   if (sourceInfo) {
     const current = statSync(filename, { bigint: true });
     if (["dev", "ino", "size", "mtimeNs", "ctimeNs"].some((key) => current[key] !== sourceInfo[key])) {
-      throw Object.assign(new Error("Archive source changed after close; retry when idle"), { code: "ARCHIVE_SOURCE_BUSY" });
+      throw Object.assign(new Error("Archive source changed under cutover fence; retry when idle"), { code: "ARCHIVE_SOURCE_BUSY" });
     }
   }
-  renameSync(filename, old);
+  // A test gate at the final comparison catches writes that older cutovers
+  // silently replaced. Production reaches this point with the source's
+  // exclusive SQLite transaction held by the deletion worker.
+  if (cutoverStatGate instanceof SharedArrayBuffer) {
+    const signal = new Int32Array(cutoverStatGate);
+    Atomics.store(signal, 0, 1);
+    Atomics.notify(signal, 0);
+    if (Atomics.wait(signal, 0, 1, 5000) === "timed-out") throw new Error("Archive final stat probe timed out");
+  }
+  try { renameSync(filename, old); }
+  catch (error) {
+    // Windows may prohibit renaming an open SQLite handle. Leave the source
+    // untouched and let the ordinary deferred-cleanup path retry safely.
+    if (["EPERM", "EACCES", "EBUSY"].includes(error.code) && privateRegularFile(filename) && !fileInfo(old)) {
+      throw Object.assign(new Error("Archive source cannot be renamed while fenced; retry when idle"), { code: "ARCHIVE_SOURCE_BUSY", cause: error });
+    }
+    throw error;
+  }
   durableDirectory(filename);
   // An interrupted promotion keeps both names and the durable marker. The
   // parent recovers it on a worker while HTTP can return bounded 503s.
