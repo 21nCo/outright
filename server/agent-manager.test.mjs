@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import Database from "better-sqlite3";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
@@ -9,6 +10,8 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { AGENT_SUPERVISOR, buildProviderCommand, consumeBoundedLines, createAgentManager as createRuntimeAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_AUTHORIZED_CONTROL, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
 import { streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
+import { createOutrightDatabase } from "./database.mjs";
+import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
 
 const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
 const fakeLaunchDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-agent-test-"));
@@ -113,6 +116,256 @@ test("shutdown waits for an already stopped run's capability cleanup", async () 
   await Promise.all([scheduled, shutdown]);
   assert.equal(spawned, 0);
   assert.equal(database.getRun(run.id).status, "stopped");
+});
+
+test("a rejected queued cancellation remains retryable after maintenance", async () => {
+  const database = fakeDatabase();
+  database.canLaunchRun = () => false;
+  const run = database.createRun({ ...codexRun("maintenance-queued"), status: "queued" });
+  const manager = createAgentManager({ database, publish: () => {} });
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  const finishRun = database.finishRun;
+  database.finishRun = () => { throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 }); };
+  await assert.rejects(manager.stop(run.id), (error) => error.statusCode === 503);
+  assert.equal(database.getRun(run.id).status, "queued");
+  database.finishRun = finishRun;
+  assert.equal(await manager.stop(run.id), true);
+  assert.equal(database.getRun(run.id).status, "stopped");
+  await manager.shutdown();
+});
+
+test("audit quota refusal defers an authorized queued run before spawning", async () => {
+  const database = fakeDatabase();
+  const run = database.createRun({ ...codexRun("audit-quota"), status: "queued" });
+  let spawned = 0;
+  database.auditAdmission = () => { throw Object.assign(new Error("Retained history is full"), { statusCode: 507 }); };
+  const manager = createAgentManager({ database, publish: () => {},
+    launchCommand: () => ({ executable: process.execPath, args: [], display: "test" }),
+    spawnProcess: () => { spawned += 1; return fakeChild(); },
+  });
+  try {
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+    assert.equal(spawned, 0);
+    assert.equal(database.getRun(run.id).status, "queued");
+    assert.equal(await manager.stop(run.id), true);
+    assert.equal(database.getRun(run.id).status, "stopped");
+  } finally { await manager.shutdown(); }
+});
+
+test("a prearmed disk retry and queue resume cannot drain a closed maintenance database", async () => {
+  const database = fakeDatabase();
+  let readable = true;
+  let admissible = false;
+  let settingsReadsDuringMaintenance = 0;
+  const getSettings = database.getSettings;
+  const finishRun = database.finishRun;
+  database.getSettings = () => {
+    if (!readable) {
+      settingsReadsDuringMaintenance += 1;
+      throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 });
+    }
+    return getSettings();
+  };
+  database.canLaunchRun = () => admissible;
+  database.capacity = () => ({ diskUsageStatus: "unknown" });
+  database.finishRun = (id, patch) => {
+    if (!readable) throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 });
+    return finishRun(id, patch);
+  };
+  const manager = createAgentManager({ database, publish: () => {} });
+  try {
+    const run = database.createRun({ ...codexRun("disk-retry-cutover"), status: "queued" });
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+    database.maintenanceActive = true;
+    readable = false;
+    manager.resumeQueued();
+    await new Promise((resolve) => setTimeout(resolve, 150)); // The prearmed retry fires at 100 ms.
+    assert.equal(settingsReadsDuringMaintenance, 0);
+    await assert.rejects(manager.stop(run.id), (error) => error.statusCode === 503);
+    assert.equal(database.getRun(run.id).status, "queued");
+    readable = true;
+    database.maintenanceActive = false;
+    assert.equal(await manager.stop(run.id), true);
+    assert.equal(database.getRun(run.id).status, "stopped");
+    admissible = true;
+    manager.resumeQueued();
+    assert.deepEqual(manager.activeRuns(), []);
+  } finally { await manager.shutdown(); }
+});
+
+test("shutdown preserves a childless validation run when maintenance rejects its terminal write", async () => {
+  const database = fakeDatabase();
+  const run = database.createRun({ ...codexRun("maintenance-validating"), status: "queued" });
+  let releaseValidation;
+  const validation = new Promise((resolve) => { releaseValidation = resolve; });
+  let spawned = 0;
+  const manager = createAgentManager({ database, publish: () => {},
+    validateConversation: () => validation,
+    spawnProcess: () => { spawned += 1; return fakeChild(); },
+  });
+  const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  await new Promise((resolve) => setImmediate(resolve));
+  database.maintenanceActive = true;
+  database.finishRun = () => { throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 }); };
+  const shutdown = manager.shutdown();
+  releaseValidation(() => {});
+  await Promise.all([scheduled, shutdown]);
+  assert.equal(spawned, 0);
+  assert.equal(database.getRun(run.id).status, "queued", "successor must classify the never-started row");
+});
+
+test("a refused childless terminal write can be cancelled again after maintenance", async () => {
+  const database = fakeDatabase();
+  const run = database.createRun({ ...codexRun("retry-validation-stop"), status: "queued" });
+  let releaseValidation;
+  const validation = new Promise((resolve) => { releaseValidation = resolve; });
+  const manager = createAgentManager({ database, publish: () => {}, validateConversation: () => validation });
+  const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  await new Promise((resolve) => setImmediate(resolve));
+  const finishRun = database.finishRun;
+  database.maintenanceActive = true;
+  database.finishRun = () => { throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 }); };
+  await assert.rejects(manager.stop(run.id), (error) => error.statusCode === 503);
+  assert.deepEqual(manager.activeRuns(), [run.id]);
+  assert.equal(database.getRun(run.id).status, "queued");
+  database.finishRun = finishRun;
+  database.maintenanceActive = false;
+  assert.equal(await manager.stop(run.id), true);
+  assert.equal(database.getRun(run.id).status, "stopped");
+  assert.deepEqual(manager.activeRuns(), []);
+  releaseValidation(() => {});
+  await scheduled;
+  await manager.shutdown();
+});
+
+test("validation refusal and success survive a real archive cutover without losing run capacity", { timeout: 20000 }, async () => {
+  for (const outcome of ["refused", "accepted", "cancelled"]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), `outright-validation-cutover-${outcome}-`));
+    const filename = path.join(directory, "outright.db");
+    const gate = new Int32Array(new SharedArrayBuffer(4));
+    let manager;
+    const database = createOutrightDatabase({ filename, runtimeLease: true, deletionWorkerGate: gate.buffer,
+      onDeletionWorkerExit: () => manager?.resumeQueued() });
+    let releaseValidation;
+    const validation = new Promise((resolve, reject) => { releaseValidation = { resolve, reject }; });
+    let validations = 0;
+    let spawns = 0;
+    let child;
+    try {
+      const survivor = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory, title: "Pending", provider: "codex" });
+      const run = database.createRun({ conversationId: survivor.id, provider: "codex", approvalPolicy: "read-only", prompt: "pending validation" });
+      manager = createAgentManager({ database, publish: () => {},
+        validateConversation: () => { validations++; return validations === 1 ? validation : Promise.resolve(() => {}); },
+        launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture", ownsDescendants: false }),
+        spawnProcess: () => { spawns++; child = fakeChild(); return child; },
+      });
+      const scheduling = manager.schedule({ conversation: survivor, run });
+      await new Promise((resolve) => setImmediate(resolve));
+      const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory, title: "Old", provider: "codex" });
+      const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+      const legacy = new Database(filename);
+      legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
+      legacy.close();
+      database.updateConversation(archived.id, { archived: true });
+      const deletion = database.deleteArchivedConversation(archived.id, archived.id);
+      const deadline = Date.now() + 5000;
+      while (Atomics.load(gate, 0) !== 1) {
+        assert.ok(Date.now() < deadline, "archive worker did not reach cutover");
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      if (outcome === "refused") releaseValidation.reject(new Error("Trust was revoked"));
+      else releaseValidation.resolve(() => {});
+      await new Promise((resolve) => setImmediate(resolve));
+      if (outcome === "cancelled") {
+        await assert.rejects(manager.stop(run.id), (error) => error.statusCode === 503);
+        assert.deepEqual(manager.activeRuns(), [run.id], "refused terminal write retains its capacity reservation");
+      }
+      Atomics.store(gate, 0, 2);
+      Atomics.notify(gate, 0);
+      assert.equal((await deletion).deleted, 1);
+      await scheduling;
+      assert.equal(spawns, outcome === "accepted" ? 1 : 0);
+      assert.equal(database.getRun(run.id).status, outcome === "accepted" ? "running" : outcome === "cancelled" ? "stopped" : "failed");
+      if (outcome === "accepted") {
+        child.emit("close", 0, null);
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(database.getRun(run.id).status, "completed");
+      }
+      assert.deepEqual(manager.activeRuns(), []);
+      assert.equal(database.canLaunchRun(), true);
+    } finally {
+      Atomics.store(gate, 0, 2);
+      Atomics.notify(gate, 0);
+      releaseValidation?.resolve(() => {});
+      await manager?.shutdown();
+      await database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a queued disk retry survives real archive cutover and cancellation releases capacity", { timeout: 20000 }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-queued-cutover-"));
+  const filename = path.join(directory, "outright.db");
+  const copyGate = new Int32Array(new SharedArrayBuffer(4));
+  const cutoverGate = new Int32Array(new SharedArrayBuffer(4));
+  let manager;
+  const database = createOutrightDatabase({ filename, runtimeLease: true,
+    deletionCopyGate: copyGate.buffer, deletionWorkerGate: cutoverGate.buffer,
+    onDeletionWorkerExit: () => manager?.resumeQueued() });
+  const canLaunchRun = database.canLaunchRun;
+  const capacity = database.capacity;
+  try {
+    const survivor = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory, title: "Queued", provider: "codex" });
+    const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory, title: "Old", provider: "codex" });
+    const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    const legacy = new Database(filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
+    legacy.close();
+    database.updateConversation(archived.id, { archived: true });
+    manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => { throw new Error("queued run launched during maintenance"); } });
+    const run = database.createRun({ conversationId: survivor.id, provider: "codex", approvalPolicy: "read-only", prompt: "queued during copy" });
+    database.canLaunchRun = () => false;
+    database.capacity = () => ({ ...capacity(), diskUsageStatus: "unknown" });
+    await manager.schedule({ conversation: survivor, run }); // Arms the 100 ms disk retry before the shadow snapshot.
+    const deletion = database.deleteArchivedConversation(archived.id, archived.id);
+    const copyDeadline = Date.now() + 5000;
+    while (Atomics.load(copyGate, 0) !== 1) {
+      assert.ok(Date.now() < copyDeadline, "archive copy did not reach the queue gate");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    Atomics.store(copyGate, 0, 2);
+    Atomics.notify(copyGate, 0);
+    const cutoverDeadline = Date.now() + 5000;
+    while (Atomics.load(cutoverGate, 0) !== 1) {
+      assert.ok(Date.now() < cutoverDeadline, "archive did not enter SQLite cutover");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    database.capacity = capacity;
+    manager.resumeQueued();
+    await new Promise((resolve) => setTimeout(resolve, 1000)); // The armed retry fires while SQLite is closed.
+    await assert.rejects(manager.stop(run.id), (error) => error.statusCode === 503);
+    Atomics.store(cutoverGate, 0, 2);
+    Atomics.notify(cutoverGate, 0);
+    assert.equal((await deletion).deleted, 1);
+    assert.equal(database.getRun(run.id).status, "queued");
+    assert.equal(await manager.stop(run.id), true);
+    assert.equal(database.getRun(run.id).status, "stopped");
+    database.canLaunchRun = canLaunchRun;
+    manager.resumeQueued();
+    assert.deepEqual(manager.activeRuns(), []);
+    assert.equal(database.canLaunchRun(), true);
+  } finally {
+    Atomics.store(copyGate, 0, 2);
+    Atomics.notify(copyGate, 0);
+    Atomics.store(cutoverGate, 0, 2);
+    Atomics.notify(cutoverGate, 0);
+    database.canLaunchRun = canLaunchRun;
+    database.capacity = capacity;
+    await manager?.shutdown();
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 function fakeChild({ autoAcknowledge = true } = {}) {
@@ -226,6 +479,8 @@ function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/
       return { event, message };
     },
     audit: () => {},
+    auditAdmission: () => {},
+    auditCritical: () => {},
   };
 }
 
@@ -261,6 +516,10 @@ test("normalizes Codex and Claude streaming records", () => {
   assert.deepEqual(normalizeCodex({ type: "thread.started", thread_id: "thread-1" })[0], { type: "session", payload: { sessionId: "thread-1" } });
   assert.deepEqual(normalizeCodex({ type: "item.completed", item: { type: "agent_message", text: "done" } })[0], { type: "assistant.message", payload: { text: "done" } });
   assert.deepEqual(normalizeClaude({ type: "stream_event", event: { delta: { type: "text_delta", text: "hello" } } })[0], { type: "assistant.delta", payload: { text: "hello" } });
+  assert.deepEqual(normalizeClaude({ type: "stream_event", event: { delta: { type: "text_delta", text: "" } } }), [],
+    "empty deltas must not grow the run buffer or durable event stream");
+  assert.deepEqual(normalizeClaude({ type: "stream_event", event: { delta: { type: "text_delta" } } }), [],
+    "missing delta text must not create an empty assistant segment");
   assert.equal(normalizeClaude({ type: "result", result: "finished", total_cost_usd: 0.01, usage: { input_tokens: 2, output_tokens: 3 } }).at(-1).payload.costUsd, 0.01);
 });
 
@@ -275,6 +534,21 @@ test("keeps recovered session ids run-local when the conversation switched provi
   assert.equal(database.getRun(run.id).providerSessionId, "codex-session");
   assert.equal(database.getConversation("conv-1").providerSessionId, "claude-session");
   child.emit("close", 0, null);
+});
+
+test("a full conversation metadata budget does not fail a provider session event", async () => {
+  const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex", providerSessionId: null });
+  database.updateConversation = () => { const error = new Error("Retained history is full"); error.statusCode = 507; throw error; };
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  const run = database.createRun(codexRun("quota-session"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  child.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "session-at-quota" }) + "\n");
+  assert.equal(database.getRun(run.id).providerSessionId, "session-at-quota");
+  assert.equal(database.getConversation("conv-1").providerSessionId, null);
+  child.emit("close", 0, null);
+  await manager.shutdown();
+  assert.equal(database.getRun(run.id).status, "completed");
 });
 
 test("handles asynchronous authorization-pipe errors without an uncaught stream error", async () => {
@@ -359,6 +633,368 @@ test("persists ordered transcript items instead of one accumulated answer", asyn
 
   assert.deepEqual(database.messages.map((message) => message.body), ["First update", "Tool completed: ls -la", "Final answer"]);
   assert.deepEqual(database.messages.map((message) => message.kind), ["text", "tool", "text"]);
+});
+
+test("Codex and Claude tool transcripts bound the final serialized payload", async () => {
+  for (const provider of ["codex", "claude"]) {
+    const database = fakeDatabase();
+    const child = fakeChild();
+    const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+    const id = `large-${provider}-tool`;
+    database.createRun({ ...codexRun(id), provider });
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun(id) });
+    const escaped = '\\"\n🪼'.repeat(32 * 1024);
+    const item = provider === "codex"
+      ? { type: "command_execution", command: escaped, output: { nested: escaped } }
+      : { type: "tool_result", content: [{ type: "text", text: escaped }] };
+    child.stdout.write(JSON.stringify(provider === "codex"
+      ? { type: "item.completed", item }
+      : { type: "user", message: { content: [item] } }) + "\n");
+    child.emit("close", 0, null);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(database.messages.length, 1, `${provider} tool output was not persisted`);
+    assert.ok(Buffer.byteLength(database.messages[0].body) <= 16 * 1024);
+    assert.ok(Buffer.byteLength(JSON.stringify(database.messages[0].payload)) <= 16 * 1024,
+      `${provider} final payload exceeded its serialized quota`);
+    assert.equal(database.messages[0].payload.item.truncated, true);
+  }
+});
+
+test("sustained tool output stops growing the durable run transcript", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  database.createRun(codexRun("budget-run"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun("budget-run") });
+  for (let index = 0; index < 2100; index += 1) {
+    child.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: `command-${index}` } }) + "\n");
+  }
+  child.emit("close", 0, null);
+  assert.equal(database.messages.length, 1999);
+  assert.match(database.messages.at(-1).body, /retention budget/);
+  assert.equal(database.getRun("budget-run").status, "completed");
+});
+
+test("reserves a final assistant segment after the item cap is reached", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  database.createRun({ ...codexRun("final-budget-run"), provider: "claude" });
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun("final-budget-run") });
+  for (let index = 0; index < 2000; index += 1) {
+    child.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: `tool-${index}` }] } }) + "\n");
+  }
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "Final segment" } } }) + "\n");
+  child.emit("close", 0, null);
+  assert.equal(database.getRun("final-budget-run").status, "completed");
+  assert.ok(database.messages.length <= 2000);
+  assert.ok(database.messages.some((message) => message.body === "Final segment"));
+});
+
+test("aggregate event refusal does not crash a streaming run", async () => {
+  const database = fakeDatabase();
+  database.appendRunEvent = () => null;
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child, checkpointIntervalMs: Date.now() + 60_000 });
+  database.createRun({ ...codexRun("aggregate-stream-run"), provider: "claude" });
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun("aggregate-stream-run") });
+  child.stdout.write(JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "hello" } } }) + "\n");
+  child.emit("close", 0, null);
+  assert.equal(database.getRun("aggregate-stream-run").status, "completed");
+});
+
+for (const provider of ["codex", "claude"]) {
+  test(`${provider} quota-refused usage cannot interrupt provider output or terminal state`, async () => {
+    const database = fakeDatabase();
+    const originalUpdate = database.updateRun.bind(database);
+    let refused = 0;
+    database.updateRun = (id, patch) => {
+      if (patch.inputTokens !== undefined || patch.costUsd !== undefined) {
+        refused += 1;
+        throw Object.assign(new Error("retained quota"), { statusCode: 507 });
+      }
+      return originalUpdate(id, patch);
+    };
+    const child = fakeChild();
+    const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+    const run = database.createRun({ ...codexRun(`usage-${provider}`), provider });
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+    const usage = provider === "codex"
+      ? { type: "turn.completed", usage: { input_tokens: 12, output_tokens: 7 } }
+      : { type: "result", usage: { input_tokens: 12, output_tokens: 7 }, total_cost_usd: 0.02 };
+    assert.doesNotThrow(() => child.stdout.write(`${JSON.stringify(usage)}\n`));
+    child.stdout.write(`${JSON.stringify(provider === "codex"
+      ? { type: "item.completed", item: { type: "agent_message", text: "after usage" } }
+      : { type: "stream_event", event: { delta: { type: "text_delta", text: "after usage" } } })}\n`);
+    child.emit("close", 0, null);
+    assert.equal(refused, 1);
+    assert.equal(database.getRun(run.id).status, "completed");
+    assert.ok(database.messages.some((message) => message.body.includes("after usage")));
+  });
+}
+
+test("unexpected usage persistence errors remain visible to the provider stream owner", async () => {
+  const database = fakeDatabase();
+  const originalUpdate = database.updateRun.bind(database);
+  database.updateRun = (id, patch) => {
+    if (patch.inputTokens !== undefined) throw Object.assign(new Error("usage I/O failed"), { statusCode: 500 });
+    return originalUpdate(id, patch);
+  };
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  const run = database.createRun(codexRun("usage-io-error"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  assert.throws(() => child.stdout.write(`${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } })}\n`),
+    /usage I\/O failed/);
+  child.emit("close", 0, null);
+});
+
+test("quota-refused transcript writes mark omission while replay-only stdout loss does not", async () => {
+  for (const scenario of ["stdout", "tool", "tool-cancel", "assistant-message", "assistant-delta"]) {
+    const database = fakeDatabase();
+    const child = fakeChild();
+    const provider = scenario === "assistant-delta" ? "claude" : "codex";
+    const run = { ...codexRun(`quota-${scenario}`), provider };
+    database.createRun(run);
+    const full = Object.assign(new Error("Retained history is full"), { statusCode: 507 });
+    database.addMessage = () => { throw full; };
+    database.upsertMessage = () => { throw full; };
+    database.appendRunEventWithMessage = () => ({ event: null, message: null });
+    database.finishRun = (id, patch, transcriptMessage) => {
+      const next = { ...database.getRun(id), ...patch, transcriptOmitted: transcriptMessage ? true : database.getRun(id).transcriptOmitted };
+      database.runs.set(id, next);
+      return { run: next, message: null };
+    };
+    const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun(run.id) });
+    database.appendRunEvent = () => null;
+    const line = scenario === "stdout" ? null : scenario.startsWith("tool")
+      ? { type: "item.completed", item: { type: "command_execution", command: "echo hello" } }
+      : scenario === "assistant-message"
+        ? { type: "item.completed", item: { type: "agent_message", text: "answer" } }
+        : { type: "stream_event", event: { delta: { type: "text_delta", text: "answer" } } };
+    child.stdout.write(scenario === "stdout" ? "malformed output\n" : `${JSON.stringify(line)}\n`);
+    assert.equal(Boolean(database.getRun(run.id).transcriptOmitted), scenario !== "stdout",
+      `${scenario} must distinguish replay loss from transcript loss before process exit`);
+    if (scenario === "tool-cancel") {
+      const stopped = manager.stop(run.id);
+      child.emit("close", null, "SIGTERM");
+      await stopped;
+    } else child.emit("close", 0, null);
+    assert.equal(database.getRun(run.id).status, scenario === "tool-cancel" ? "stopped" : "completed");
+    assert.equal(Boolean(database.getRun(run.id).transcriptOmitted), scenario !== "stdout");
+  }
+});
+
+test("a terminal run still notifies connected clients when its event cannot be retained", async () => {
+  const database = fakeDatabase();
+  const published = [];
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: (event) => published.push(event), spawnProcess: () => child });
+  database.createRun(codexRun("terminal-at-quota"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun("terminal-at-quota") });
+  database.appendRunEvent = () => null;
+  child.emit("close", 0, null);
+  assert.equal(database.getRun("terminal-at-quota").status, "completed");
+  assert.ok(published.some((event) => event.type === "run.event" && event.payload?.type === "run.completed"
+    && event.payload?.transient === true && event.runId === "terminal-at-quota"));
+});
+
+test("queued siblings defer after output exhausts quota, then resume or cancel safely", async () => {
+  const database = fakeDatabase();
+  let room = true;
+  database.getSettings = () => ({ maxConcurrentRuns: 1 });
+  database.canLaunchRun = () => room;
+  database.createRun(codexRun("first"));
+  database.createRun({ ...codexRun("second"), conversationId: "conv-2", worktreePath: "/tmp/second" });
+  database.getConversation = (id) => ({ id, worktreePath: id === "conv-1" ? "/tmp/project" : "/tmp/second" });
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => {
+    const child = fakeChild(); children.push(child); return child;
+  } });
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun("first") });
+  await manager.schedule({ conversation: database.getConversation("conv-2"), run: database.getRun("second") });
+  room = false;
+  children[0].emit("close", 0, null);
+  assert.equal(database.getRun("first").status, "completed");
+  assert.equal(database.getRun("second").status, undefined);
+  assert.equal(children.length, 1, "queued sibling spawned after its budget was spent");
+  room = true;
+  manager.resumeQueued();
+  for (let retry = 0; children.length < 2 && retry < 100; retry += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(children.length, 2);
+  assert.equal(database.getRun("second").status, "running");
+  children[1].emit("close", 0, null);
+
+  database.createRun({ ...codexRun("cancelled"), conversationId: "conv-2", worktreePath: "/tmp/second" });
+  room = false;
+  await manager.schedule({ conversation: database.getConversation("conv-2"), run: database.getRun("cancelled") });
+  assert.equal(await manager.stop("cancelled"), true);
+  room = true;
+  manager.resumeQueued();
+  assert.equal(children.length, 2, "cancelled queued run was launched after capacity returned");
+  assert.equal(database.getRun("cancelled").status, "stopped");
+});
+
+test("unknown journal usage retries a queued launch and leaves cancellation terminal", async () => {
+  const database = fakeDatabase();
+  let measurable = false;
+  database.canLaunchRun = () => measurable;
+  database.capacity = () => ({ diskUsageStatus: measurable ? "measured" : "unknown" });
+  const cancelled = database.createRun(codexRun("journal-cancelled"));
+  const waiting = database.createRun(codexRun("journal-waiting"));
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => {
+    const child = fakeChild(); children.push(child); return child;
+  } });
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: cancelled });
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: waiting });
+  assert.equal(children.length, 0);
+  assert.equal(await manager.stop(cancelled.id), true);
+  measurable = true;
+  const deadline = Date.now() + 1000;
+  while (!children.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(children.length, 1, "journal access recovered without a new request but queue did not drain");
+  assert.equal(database.getRun(cancelled.id).status, "stopped");
+  assert.equal(database.getRun(waiting.id).status, "running");
+  children[0].emit("close", 0, null);
+  await manager.shutdown();
+});
+
+test("journal access recovered between admission and capacity reads still wakes the queue", async () => {
+  const database = fakeDatabase();
+  let attempts = 0;
+  database.canLaunchRun = () => ++attempts > 1;
+  database.capacity = () => ({ diskUsageStatus: "measured", availableForNewWorkBytes: 1024 * 1024 });
+  const run = database.createRun(codexRun("journal-race"));
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => {
+    const child = fakeChild(); children.push(child); return child;
+  } });
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  assert.equal(children.length, 0);
+  const deadline = Date.now() + 1000;
+  while (!children.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(children.length, 1, "a resolved journal access race stranded the queued run");
+  children[0].emit("close", 0, null);
+  await manager.shutdown();
+});
+
+test("capacity spent during asynchronous capability setup cannot authorize a queued launch", async () => {
+  const database = fakeDatabase();
+  let room = true;
+  let release;
+  const capability = new Promise((resolve) => { release = resolve; });
+  database.canLaunchRun = () => room;
+  const run = database.createRun(codexRun("late-budget"));
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {}, launchCommand: () => capability,
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  room = false;
+  release({ executable: process.execPath, args: [], display: "test", handshakePath: "", ownsDescendants: true });
+  await scheduled;
+  assert.equal(children.length, 0);
+  assert.equal(database.getRun(run.id).status, undefined, "deferred run crossed the durable launch transition");
+  room = true;
+  manager.resumeQueued();
+  for (let retry = 0; children.length < 1 && retry < 100; retry += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(children.length, 1);
+  children[0].emit("close", 0, null);
+});
+
+test("unknown usage after async launch preparation retries without a new request", async () => {
+  const database = fakeDatabase();
+  let measurable = true;
+  let release;
+  let validations = 0;
+  let launchPreparations = 0;
+  const capability = new Promise((resolve) => { release = resolve; });
+  const command = { executable: process.execPath, args: [], display: "test", handshakePath: "", ownsDescendants: true };
+  database.canLaunchRun = () => measurable;
+  database.capacity = () => ({ diskUsageStatus: measurable ? "measured" : "unknown",
+    availableForNewWorkBytes: measurable ? 1024 * 1024 : 0 });
+  const first = database.createRun(codexRun("late-unknown"));
+  const cancelled = database.createRun(codexRun("late-unknown-cancelled"));
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {},
+    validateConversation: async () => { validations += 1; return () => {}; },
+    launchCommand: () => (++launchPreparations === 1 ? capability : command),
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  try {
+    const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run: first });
+    await new Promise((resolve) => setImmediate(resolve));
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: cancelled });
+    measurable = false;
+    release(command);
+    await scheduled;
+    assert.equal(database.getRun(first.id).status, undefined, "unknown usage crossed the durable launch transition");
+    assert.equal(children.length, 0);
+    assert.equal(await manager.stop(cancelled.id), true);
+    measurable = true;
+    const deadline = Date.now() + 1000;
+    while (!children.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(children.length, 1, "the final admission deferral stranded a recoverable queued run");
+    assert.equal(database.getRun(first.id).status, "running");
+    assert.equal(database.getRun(cancelled.id).status, "stopped");
+    assert.equal(validations, 2, "retry skipped authorization revalidation");
+    assert.equal(launchPreparations, 2, "the deferred run was not prepared exactly twice");
+    children[0].emit("close", 0, null);
+  } finally { await manager.shutdown(); }
+});
+
+test("many assistant segments share one durable transcript byte budget", async () => {
+  const database = fakeDatabase();
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  database.createRun(codexRun("byte-budget-run"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.getRun("byte-budget-run") });
+  for (let index = 0; index < 40; index += 1) {
+    child.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: `${index}:${"x".repeat(512 * 1024)}` } }) + "\n");
+  }
+  child.emit("close", 0, null);
+  const bytes = database.messages.reduce((sum, message) => sum + Buffer.byteLength(message.body) + Buffer.byteLength(JSON.stringify(message.payload)), 0);
+  assert.ok(bytes <= 16 * 1024 * 1024);
+  assert.equal(database.messages.some((message) => /retention budget/.test(message.body)), true);
+  assert.equal(database.getRun("byte-budget-run").status, "completed");
+});
+
+test("near the item cap, real SQLite transcript rows stay within the retained byte budget", { timeout: 30000 }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-transcript-rows-"));
+  const filename = path.join(directory, "outright.db");
+  const database = createOutrightDatabase({ filename });
+  let manager;
+  try {
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory, title: "Transcript budget", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "produce many items" });
+    const child = fakeChild();
+    manager = createAgentManager({ database, publish: () => {},
+      launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture", ownsDescendants: false }),
+      spawnProcess: () => child });
+    await manager.schedule({ conversation, run });
+    const item = JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "x".repeat(8300) } }) + "\n";
+    for (let index = 0; index < RESOURCE_BUDGETS.maxRunTranscriptItems; index += 1) child.stdout.write(item);
+    child.emit("close", 0, null);
+    assert.equal(database.getRun(run.id).status, "completed");
+    assert.equal(Boolean(database.getRun(run.id).transcriptOmitted), true);
+
+    const probe = new Database(filename, { readonly: true });
+    try {
+      const rows = probe.prepare(`SELECT COUNT(*) AS items, SUM(128 + octet_length(id) + octet_length(conversation_id)
+        + octet_length(role) + octet_length(kind) + octet_length(body) + octet_length(payload)
+        + octet_length(created_at)) AS bytes FROM messages WHERE conversation_id = ?`).get(conversation.id);
+      assert.ok(rows.items <= RESOURCE_BUDGETS.maxRunTranscriptItems);
+      assert.ok(rows.bytes <= RESOURCE_BUDGETS.maxRunTranscriptBytes,
+        `durable transcript charged ${rows.bytes} bytes against ${RESOURCE_BUDGETS.maxRunTranscriptBytes}`);
+      assert.ok(probe.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes >= rows.bytes,
+        "aggregate accounting still includes the bounded transcript rows");
+    } finally { probe.close(); }
+  } finally {
+    await manager?.shutdown();
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("persists partial transcript output before the provider exits", async () => {
@@ -1341,7 +1977,10 @@ test("the Windows supervisor preserves quoted and slash-terminated arguments", {
   const expected = ["plain", "embedded \"quote\"", "slash-before-quote\\\"value", "trailing-slash\\"];
   try {
     const source = `require("node:fs").writeFileSync(${JSON.stringify(marker)}, JSON.stringify(process.argv.slice(1)))`;
-    const result = spawnSync(AGENT_SUPERVISOR, [process.execPath, "-e", source, ...expected], { encoding: "utf8" });
+    // This fixture verifies quoting without simulating a runtime control
+    // pipe. Production mode correctly interprets spawnSync's stdin EOF as
+    // owner exit and terminates the Job Object before the child finishes.
+    const result = spawnSync(AGENT_SUPERVISOR, ["--test-runner", path.join(root, "stop"), process.execPath, "-e", source, ...expected], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(readFileSync(marker, "utf8")), expected);
   } finally {
@@ -1562,6 +2201,8 @@ const database = {
   finishRun: (id, patch) => { runs.set(id, { ...runs.get(id), ...patch }); return { run: runs.get(id) }; },
   appendRunEvent: () => ({}),
   audit: () => {},
+  auditAdmission: () => {},
+  auditCritical: () => {},
 };
 const children = new Map();
 const agent = manager.createAgentManager({

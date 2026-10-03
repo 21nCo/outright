@@ -4,11 +4,15 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync,
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
+import { RESOURCE_BUDGETS, retainedTranscriptMessageBytes } from "./resource-budgets.mjs";
 
 const MAX_PROVIDER_LINE_BYTES = 1024 * 1024;
 const MAX_ASSISTANT_BYTES = 1024 * 1024;
 const MAX_PROCESS_EVENT_BYTES = 64 * 1024;
 const MAX_ASSISTANT_EVENT_BYTES = 255 * 1024;
+const MAX_RUN_TRANSCRIPT_ITEMS = RESOURCE_BUDGETS.maxRunTranscriptItems;
+const MAX_RUN_TRANSCRIPT_BYTES = RESOURCE_BUDGETS.maxRunTranscriptBytes;
+const MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES = 16 * 1024;
 const ASSISTANT_TRUNCATION_MARKER = "\n\n[Output truncated by Outright at 1 MiB]";
 // Assistant checkpoints are coalesced: a new durable checkpoint is written
 // only after this many new stream bytes (or this much time) accumulate, so a
@@ -160,7 +164,12 @@ const teardown = () => {
   teardownStarted = true;
   if (providerGone) finishWhenOwnedGroupIsEmpty();
   else {
-    try { provider.kill("SIGTERM"); } catch { /* Already gone. */ }
+    // Windows uses the supervisor's stdin as the Job Object control channel.
+    // Killing that supervisor first would let the wrapper report completion
+    // without observing its owned descendants leave the job.
+    if (process.platform === "win32" && executable === ${JSON.stringify(AGENT_SUPERVISOR)}) {
+      try { provider.stdin.end("stop\\n"); } catch { /* The owner already exited. */ }
+    } else try { provider.kill("SIGTERM"); } catch { /* Already gone. */ }
     // The production supervisor owns its descendants and its own escalation:
     // never kill it before it has reaped them. For a direct child (including
     // the wrapper's coalesced go/stop fixture), retain this parent as the
@@ -207,7 +216,9 @@ process.stdin.on("data", (chunk) => {
       // restart recovery never mistakes the pre-submit race for an exited run.
       provider = spawn(executable, commandArgs, darwinLaunch
         ? { stdio: ["ignore", "inherit", "inherit", "pipe"], env: { ...process.env, OUTRIGHT_LAUNCH_GATE_FD: "3" } }
-        : { stdio: ["ignore", "inherit", "inherit"] });
+        : { stdio: [process.platform === "win32" && executable === ${JSON.stringify(AGENT_SUPERVISOR)}
+          ? "pipe" : "ignore", "inherit", "inherit"] });
+      provider.stdin?.on?.("error", () => {});
       // Durable provider identity: escalation targets the provider alone so this
       // wrapper — the provider's parent — survives to reap it. Without this, a
       // group-wide SIGKILL kills the wrapper first and a killed-but-unreaped
@@ -258,7 +269,10 @@ process.stdin.on("data", (chunk) => {
 // The runtime went away before authorizing the launch: exit without ever
 // starting the provider, so an abandoned handshake can never mutate the
 // worktree.
-process.stdin.on("end", () => { if (!authorized) { try { fs.unlinkSync(handshakePath); } catch {} process.exit(0); } });
+process.stdin.on("end", () => {
+  if (!authorized) { try { fs.unlinkSync(handshakePath); } catch {} process.exit(0); }
+  teardown();
+});
 `;
 
 function supervisorCommand(args, timeout) {
@@ -316,9 +330,22 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   const active = new Map();
   const queue = [];
   const launches = new Set();
+  const maintenanceWaiters = new Set();
   let shuttingDown = false;
   let shutdownPromise;
+  let diskRetryTimer;
+  let diskRetryDelayMs = 100;
   const providerDiscovery = providerDiscoveryFactory({ onChange: onProvidersChanged });
+
+  function wakeMaintenanceWaiters() {
+    for (const resolve of maintenanceWaiters) resolve();
+    maintenanceWaiters.clear();
+  }
+
+  function waitForMaintenance() {
+    if (!database.maintenanceActive || shuttingDown) return Promise.resolve();
+    return new Promise((resolve) => maintenanceWaiters.add(resolve));
+  }
 
   function providers() {
     return providerDiscovery.list();
@@ -346,6 +373,15 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       throw new Error("Conversation target changed while preparing the run; submit again");
     }
     authorize?.();
+    // Validation and capability setup can yield while a sibling spends the
+    // remaining retained budget. Defer before the durable launch transition.
+    if (database.canLaunchRun?.() === false) return "deferred";
+    try {
+      database.auditAdmission("agent.run.start.requested", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath });
+    } catch (error) {
+      if (error.statusCode === 507 || (error.statusCode === 503 && database.maintenanceActive)) return "deferred";
+      throw error;
+    }
     const startedAt = new Date().toISOString();
     // Crash-safe launch handshake, phase 1: this durable marker means "a spawn
     // may have been issued, but the provider was never authorized to run". A
@@ -354,7 +390,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // authorization), so recovery always has an explicit safe continuation
     // instead of being permanently gated on a missing pid.
     database.updateRun(run.id, { status: "launching", startedAt });
-    database.audit("agent.run.started", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath, approvalPolicy: run.approvalPolicy });
+    database.auditCritical("agent.run.started", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath, approvalPolicy: run.approvalPolicy });
     emit(run.id, "run.started", { provider: run.provider, model: run.model, startedAt, command: launch.display ?? command.display });
 
     const child = spawnProcess(launch.executable, launch.args, {
@@ -469,6 +505,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     for (const event of events) {
       let checkpointDelta = null;
       if (event.type === "session") {
+        if (typeof event.payload.sessionId !== "string" || Buffer.byteLength(event.payload.sessionId) > 4096) continue;
         state.run.providerSessionId = event.payload.sessionId;
         database.updateRun(state.run.id, { providerSessionId: event.payload.sessionId });
         // A recovered run keeps its immutable provider, while the conversation
@@ -476,7 +513,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         // never replace another provider's conversation-level resume token.
         const currentConversation = database.getConversation(state.conversation.id);
         if (currentConversation?.provider === state.run.provider) {
-          database.updateConversation(state.conversation.id, { providerSessionId: event.payload.sessionId });
+          try { database.updateConversation(state.conversation.id, { providerSessionId: event.payload.sessionId }); }
+          catch (error) { if (error.statusCode !== 507) throw error; }
         }
       }
       if (event.type === "assistant.delta") {
@@ -497,7 +535,12 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         archiveAssistant(state, (current) => persistAssistantCheckpoint(current, { publishEvent: true }));
         persistTranscriptItem(state, { kind: "tool", body: toolTranscriptLabel(event), payload: { item: event.payload.item ?? null } });
       }
-      if (event.type === "usage") database.updateRun(state.run.id, event.payload);
+      if (event.type === "usage") {
+        // Provider usage is optional telemetry. A quota refusal must not
+        // escape the stdout listener and terminate supervision of every run.
+        try { database.updateRun(state.run.id, event.payload); }
+        catch (error) { if (error.statusCode !== 507) throw error; }
+      }
       const emittedPayload = ["assistant.delta", "assistant.message"].includes(event.type)
         ? { ...event.payload, text: truncateUtf8(event.payload.text ?? "", MAX_ASSISTANT_EVENT_BYTES), truncated: Buffer.byteLength(event.payload.text ?? "") > MAX_ASSISTANT_EVENT_BYTES }
         : event.payload;
@@ -506,7 +549,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         continue;
       }
       const emitted = emit(state.run.id, event.type, emittedPayload);
-      if (event.type === "assistant.delta") state.lastAssistantDeltaSeq = emitted.seq;
+      if (event.type === "assistant.delta" && emitted) state.lastAssistantDeltaSeq = emitted.seq;
     }
   }
 
@@ -514,15 +557,31 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if (!active.has(state.run.id) || state.finishing) return;
     state.finishing = true;
     clearCheckpointTimer(state);
-    const successful = exitCode === 0 && !error && !state.stopped;
-    const status = state.stopped ? "stopped" : successful ? "completed" : "failed";
-    const message = error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : "");
-    const finishedAt = new Date().toISOString();
-    const transcriptMessage = pendingAssistantMessage(state);
-    // The last transcript checkpoint and terminal run state commit together.
-    // A crash can therefore leave the run recoverable, but never terminal with
-    // its final assistant segment missing.
-    const finished = database.finishRun(state.run.id, { status, finishedAt, exitCode, error: message || null, pid: null }, transcriptMessage);
+    let status;
+    let message;
+    let finishedAt;
+    let finished;
+    try {
+      const successful = exitCode === 0 && !error && !state.stopped;
+      if (state.stopped) status = "stopped";
+      else if (successful) status = "completed";
+      else status = "failed";
+      message = error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : "");
+      finishedAt = new Date().toISOString();
+      const transcriptMessage = budgetTranscript(state, pendingAssistantMessage(state), { terminal: true });
+      // The last checkpoint and terminal state commit together. Until that
+      // commit succeeds this state still owns its run slot and recovery data.
+      finished = database.finishRun(state.run.id, { status, finishedAt, exitCode, error: message || null, pid: null }, transcriptMessage);
+      if (transcriptMessage && !finished.message) markTranscriptOmitted(state);
+    } catch (writeError) {
+      state.finishing = false;
+      if (writeError.statusCode === 503 && database.maintenanceActive) {
+        state.pendingFinish = { exitCode, error };
+        return false;
+      }
+      throw writeError;
+    }
+    state.pendingFinish = null;
     // A Windows wrapper leaves a completed Job Object proof until this
     // terminal transaction succeeds. Other platforms may leave a record only
     // after a hard kill; both are safe to remove after the durable commit.
@@ -530,29 +589,38 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if (finished.message) publish({ type: "message.created", conversationId: state.conversation.id, payload: finished.message });
     active.delete(state.run.id);
     clearAssistant(state);
-    database.audit(`agent.run.${status}`, { target: state.run.id, exitCode, error: message || undefined });
     emit(state.run.id, `run.${status}`, { exitCode, error: message || null, finishedAt });
     drain();
+    return true;
   }
 
-  async function stop(runId) {
+  async function stop(runId, preserveOnMaintenance = false) {
     const state = active.get(runId);
     if (!state) {
       const index = queue.findIndex((entry) => entry.run.id === runId);
       if (index < 0) return false;
+      try { database.finishRun(runId, { status: "stopped", finishedAt: new Date().toISOString() }); }
+      catch (error) {
+        // During archive cutover the database is closed. Shutdown can leave
+        // this never-started row for the successor to reconcile, but an API
+        // cancellation must report failure without losing its queue entry.
+        if (preserveOnMaintenance && database.maintenanceActive && error.statusCode === 503) return false;
+        throw error;
+      }
       queue.splice(index, 1);
-      database.updateRun(runId, { status: "stopped", finishedAt: new Date().toISOString() });
       emit(runId, "run.stopped", { queued: true });
       return true;
     }
     if (state.stopping) return state.stopping;
     state.stopped = true;
     // Keep the capacity reservation until both validation and tree shutdown end.
-    if (state.child) terminateTree(state.child, "SIGTERM");
+    // On Windows the supervisor's control pipe owns Job Object teardown.
+    // taskkill /T /F here kills the verifier before it can report an empty job.
+    if (state.child && process.platform !== "win32") terminateTree(state.child, "SIGTERM");
     // Cancellation must not wait for an acknowledgement that may never arrive.
     // stdin ordering guarantees a post-authorization stop follows "go", while
     // an unauthorized owner treats stop/end as abandonment.
-    if (state.child && state.ownsDescendants) requestWrapperTeardown(state);
+    if (state.child && (state.ownsDescendants || process.platform === "win32")) requestWrapperTeardown(state);
     state.stopping = (async () => {
       if (state.child) {
         const started = Date.now();
@@ -593,16 +661,35 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
             // to a group kill would orphan zombies to PID 1 and recreate the
             // leak this ownership boundary prevents. Fail closed, retain the
             // durable handshake, and never claim the tree stopped.
-            state.stopping = null;
             throw new Error(`Agent process tree did not terminate: ${runId}`);
           }
           await new Promise((resolve) => setTimeout(resolve, 25));
         }
       }
-      finish(state, state.exitCode ?? null, null);
+      try {
+        if (finish(state, state.exitCode ?? null, null) === false) {
+          if (preserveOnMaintenance && !state.child) return false;
+          const unavailable = new Error("Archive maintenance is running; retry shortly");
+          unavailable.statusCode = 503;
+          throw unavailable;
+        }
+      }
+      catch (error) {
+        // A childless run may still be awaiting validation when cutover
+        // starts. Its queued row is recovery evidence; there is no process
+        // owner to wait for after the validation promise settles.
+        if (preserveOnMaintenance && !state.child && database.maintenanceActive && error.statusCode === 503) return false;
+        throw error;
+      }
       return true;
     })();
-    return state.stopping;
+    const stopping = state.stopping;
+    try { return await stopping; }
+    finally {
+      // A failed durable write or tree teardown must remain retryable. The
+      // async body above can settle before its promise is assigned to state.
+      if (state.stopping === stopping && active.has(runId)) state.stopping = null;
+    }
   }
 
   // Asks the launch wrapper to tear its provider tree down in reaping order
@@ -614,46 +701,112 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   }
 
 
+  function conflictsWithActiveRun(entry) {
+    return [...active.values()].some((state) => {
+      const activeWorktree = state.run.worktreePath ?? state.conversation.worktreePath;
+      const queuedWorktree = entry.run.worktreePath ?? entry.conversation.worktreePath;
+      return state.conversation.id === entry.run.conversationId
+        || (activeWorktree && queuedWorktree && activeWorktree === queuedWorktree);
+    });
+  }
+
+  async function prepareQueuedLaunch(state, entry) {
+    const fresh = database.getConversation(entry.run.conversationId);
+    if (!fresh) throw new Error("Conversation no longer exists");
+    if (entry.run.worktreePath && fresh.worktreePath !== entry.run.worktreePath) {
+      throw new Error("Conversation target changed after this run was queued; submit again");
+    }
+    const authorize = await validateConversation(fresh);
+    if (state.stopped || shuttingDown) return null;
+    const current = database.getConversation(fresh.id);
+    if (!current || ["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== fresh[key])
+      || (entry.run.worktreePath && current.worktreePath !== entry.run.worktreePath)) {
+      throw new Error("Conversation target changed while preparing the run; submit again");
+    }
+    // Recheck mutable trust synchronously immediately before spawning.
+    authorize?.();
+    // Recovery retry explicitly asks for a new provider session even when
+    // the conversation still advertises the interrupted one.
+    if (entry.providerSessionId !== undefined) state.conversation = { ...current, providerSessionId: entry.providerSessionId };
+    else if (entry.forceFreshSession) state.conversation = { ...current, providerSessionId: null };
+    else state.conversation = current;
+    return { authorize };
+  }
+
+  async function launchQueued(state, entry) {
+    while (!state.stopped && !shuttingDown) {
+      try {
+        const prepared = await prepareQueuedLaunch(state, entry);
+        if (!prepared) return;
+        if (await start(state, prepared.authorize) === "deferred") {
+          active.delete(entry.run.id);
+          queue.unshift(entry);
+          retryDeferredAdmission();
+        }
+        return;
+      } catch (error) {
+        if (error.statusCode === 503 && database.maintenanceActive && !state.child && !state.stopped) {
+          // Validation may have succeeded just as the database closed.
+          // Revalidate the target after reopening before any launch effect.
+          await waitForMaintenance();
+          continue;
+        }
+        if (!state.stopped && !error?.preserveActiveRun) {
+          if (finish(state, null, error) === false) {
+            await waitForMaintenance();
+            if (!shuttingDown) finish(state, null, error);
+          }
+        }
+        return;
+      }
+    }
+  }
+
+  function retryUnknownDiskUsage() {
+    if (diskRetryTimer || shuttingDown) return;
+    const delay = diskRetryDelayMs;
+    diskRetryDelayMs = Math.min(30_000, diskRetryDelayMs * 2);
+    diskRetryTimer = setTimeout(() => {
+      diskRetryTimer = null;
+      drain();
+    }, delay);
+    diskRetryTimer.unref?.();
+  }
+
+  function clearDiskRetry() {
+    if (diskRetryTimer) clearTimeout(diskRetryTimer);
+    diskRetryTimer = null;
+    diskRetryDelayMs = 100;
+  }
+
+  function retryDeferredAdmission() {
+    if (database.maintenanceActive) return;
+    const observed = database.capacity?.();
+    // Unknown physical usage may recover without another capacity event. A
+    // measured budget with room can also race the admission check. A genuinely
+    // full budget waits for an explicit release instead of polling forever.
+    if (observed?.diskUsageStatus === "unknown"
+      || observed?.availableForNewWorkBytes >= 64 * 1024) retryUnknownDiskUsage();
+  }
+
   function drain() {
-    if (shuttingDown) return;
+    // Every entry point, including the disk retry timer, reaches this guard.
+    // During the archive cutover getSettings cannot read the closed SQLite
+    // connection. onDeletionWorkerExit calls resumeQueued after it reopens.
+    if (shuttingDown || database.maintenanceActive) return;
     const max = database.getSettings().maxConcurrentRuns;
     while (active.size < max && queue.length) {
-      const index = queue.findIndex((entry) => ![...active.values()].some((state) => {
-        const activeWorktree = state.run.worktreePath ?? state.conversation.worktreePath;
-        const queuedWorktree = entry.run.worktreePath ?? entry.conversation.worktreePath;
-        return state.conversation.id === entry.run.conversationId
-          || (activeWorktree && queuedWorktree && activeWorktree === queuedWorktree);
-      }));
+      if (database.canLaunchRun?.() === false) {
+        retryDeferredAdmission();
+        return;
+      }
+      clearDiskRetry();
+      const index = queue.findIndex((entry) => !conflictsWithActiveRun(entry));
       if (index < 0) return;
       const entry = queue.splice(index, 1)[0];
-      const state = { ...entry, assistantSegments: [], assistantBytes: 0, assistantTruncated: false, assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, stderr: "", stopped: false, checkpointPendingBytes: 0, lastCheckpointAt: 0, checkpointTimer: null, checkpointHalted: false };
+      const state = { ...entry, assistantSegments: [], assistantBytes: 0, assistantTruncated: false, assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, transcriptSizes: new Map(), transcriptBytes: 0, transcriptOmitted: false, stderr: "", stopped: false, checkpointPendingBytes: 0, lastCheckpointAt: 0, checkpointTimer: null, checkpointHalted: false };
       active.set(entry.run.id, state);
-      state.launch = entry.launch = (async () => {
-        try {
-          const fresh = database.getConversation(entry.run.conversationId);
-          if (!fresh) throw new Error("Conversation no longer exists");
-          if (entry.run.worktreePath && fresh.worktreePath !== entry.run.worktreePath) {
-            throw new Error("Conversation target changed after this run was queued; submit again");
-          }
-          const authorize = await validateConversation(fresh);
-          if (state.stopped || shuttingDown) return;
-          const current = database.getConversation(fresh.id);
-          if (!current || ["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== fresh[key])
-            || (entry.run.worktreePath && current.worktreePath !== entry.run.worktreePath)) {
-            throw new Error("Conversation target changed while preparing the run; submit again");
-          }
-          // Recheck mutable trust synchronously immediately before spawning.
-          authorize?.();
-          // A recovery retry explicitly asks for a new provider session even
-          // when the conversation still advertises the interrupted one.
-          state.conversation = entry.providerSessionId !== undefined
-            ? { ...current, providerSessionId: entry.providerSessionId }
-            : entry.forceFreshSession ? { ...current, providerSessionId: null } : current;
-          await start(state, authorize);
-        } catch (error) {
-          if (!state.stopped && !error?.preserveActiveRun) finish(state, null, error);
-        }
-      })();
+      state.launch = entry.launch = launchQueued(state, entry);
       launches.add(state.launch);
       state.launch.then(() => launches.delete(state.launch), () => launches.delete(state.launch));
     }
@@ -664,10 +817,21 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   // one message rather than duplicating partial content.
   function persistTranscriptItem(state, item) {
     state.transcriptSeq = (state.transcriptSeq ?? 0) + 1;
+    const toolItem = item.payload?.item ?? null;
     const payload = item.kind === "text"
       ? { runId: state.run.id, provider: state.run.provider, truncated: Boolean(item.payload?.truncated) }
-      : { runId: state.run.id, item: item.payload?.item ?? null };
-    const message = database.addMessage({ id: `${state.run.id}:${state.transcriptSeq}`, conversationId: state.conversation.id, role: "assistant", kind: item.kind, body: item.body, payload });
+      : boundedToolPayload(state.run.id, toolItem);
+    const body = item.kind === "tool" ? truncateUtf8(item.body, MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES) : item.body;
+    const input = budgetTranscript(state, { id: `${state.run.id}:${state.transcriptSeq}`, createdAt: new Date().toISOString(), conversationId: state.conversation.id, role: "assistant", kind: item.kind, body, payload });
+    if (!input) return;
+    let message;
+    try { message = database.addMessage(input, { omissionRunId: state.run.id }); }
+    catch (error) {
+      if (error.statusCode !== 507) { throw error; }
+      markTranscriptOmitted(state);
+      return;
+    }
+    if (!message) { markTranscriptOmitted(state); return; }
     publish({ type: "message.created", conversationId: state.conversation.id, payload: message });
   }
 
@@ -716,12 +880,20 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     clearCheckpointTimer(state);
     state.checkpointPendingBytes = 0;
     state.lastCheckpointAt = Date.now();
-    const message = pendingAssistantMessage(state);
+    const message = budgetTranscript(state, pendingAssistantMessage(state));
     if (!message) return null;
     // The capped body plus truncation marker is now durable; discarded deltas
     // beyond the cap must not schedule further rewrites of the same body.
     if (state.assistantTruncated) state.checkpointHalted = true;
-    const stored = database.upsertMessage(message);
+    let stored;
+    try { stored = database.upsertMessage(message, { omissionRunId: state.run.id }); }
+    catch (error) {
+      if (error.statusCode !== 507) { throw error; }
+      markTranscriptOmitted(state);
+      state.checkpointHalted = true;
+      return null;
+    }
+    if (!stored) { markTranscriptOmitted(state); state.checkpointHalted = true; return null; }
     if (publishEvent) publish({ type: "message.created", conversationId: state.conversation.id, payload: stored });
     return stored;
   }
@@ -730,37 +902,97 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     clearCheckpointTimer(state);
     state.checkpointPendingBytes = 0;
     state.lastCheckpointAt = Date.now();
-    const message = pendingAssistantMessage(state);
+    const message = budgetTranscript(state, pendingAssistantMessage(state));
     if (!message) return emit(state.run.id, "assistant.delta", payload);
     if (state.assistantTruncated) state.checkpointHalted = true;
     // The delta event and the transcript prefix that already contains it are
     // one SQLite commit. The message records the event cursor, so a page load
     // racing publication can discard that already-durable delta exactly once.
     const committed = database.appendRunEventWithMessage(state.run.id, "assistant.delta", payload, message);
-    state.lastAssistantDeltaSeq = committed.event.seq;
-    publish({ type: "run.event", conversationId: state.conversation.id, runId: state.run.id, payload: committed.event });
+    if (!committed.message) { markTranscriptOmitted(state); state.checkpointHalted = true; }
+    if (committed.event) state.lastAssistantDeltaSeq = committed.event.seq;
+    if (committed.event) publish({ type: "run.event", conversationId: state.conversation.id, runId: state.run.id, payload: committed.event });
     return committed.event;
   }
 
   function emit(runId, type, payload) {
     const event = database.appendRunEvent(runId, type, payload);
     const run = database.getRun(runId);
-    publish({ type: "run.event", conversationId: run?.conversationId, runId, payload: event });
+    // Terminal state is already durable even if the event log is full. Send a
+    // bounded runtime notification so connected clients refresh that state.
+    const terminal = ["run.completed", "run.failed", "run.stopped"].includes(type);
+    // Event replay and transcript persistence have separate quotas. A dropped
+    // replay event does not imply that the visible transcript lost a message.
+    if (event || terminal) publish({ type: "run.event", conversationId: run?.conversationId, runId,
+      payload: event ?? { runId, type, payload, seq: null, transient: true, createdAt: new Date().toISOString() } });
     return event;
+  }
+
+  function budgetTranscript(state, message, { terminal = false } = {}) {
+    if (!message) return null;
+    const prior = state.transcriptSizes.get(message.id) ?? 0;
+    // Leave room for both the omission notice and a final assistant segment.
+    if (!prior && state.transcriptSizes.size >= MAX_RUN_TRANSCRIPT_ITEMS - (terminal ? 0 : 2)) {
+      markTranscriptOmitted(state);
+      return null;
+    }
+    const ceiling = MAX_RUN_TRANSCRIPT_BYTES - (terminal ? 512 : 4096);
+    const metadataBytes = retainedTranscriptMessageBytes({ ...message, body: "" });
+    const allowance = ceiling - state.transcriptBytes + prior - metadataBytes;
+    if (allowance <= 0) { markTranscriptOmitted(state); return null; }
+    const originalBytes = Buffer.byteLength(message.body ?? "");
+    const body = originalBytes > allowance ? truncateUtf8(message.body, Math.max(0, allowance - 64)) : message.body;
+    const bounded = originalBytes > allowance
+      ? { ...message, body: `${body}\n[Further output omitted: transcript budget reached]`, payload: { ...message.payload, truncated: true } }
+      : message;
+    const size = retainedTranscriptMessageBytes(bounded);
+    if (state.transcriptBytes - prior + size > ceiling) { markTranscriptOmitted(state); return null; }
+    state.transcriptSizes.set(message.id, size);
+    state.transcriptBytes += size - prior;
+    if (originalBytes > allowance) markTranscriptOmitted(state);
+    return bounded;
+  }
+
+  function markTranscriptOmitted(state) {
+    if (state.transcriptOmitted) return;
+    // The optional message can itself be refused at the aggregate cap. The
+    // run row uses reserved transition space, so it remains a durable marker
+    // through cancellation, finalization and restart.
+    database.updateRun(state.run.id, { transcriptOmitted: true });
+    state.transcriptOmitted = true;
+    try {
+      const message = database.addMessage({ id: `${state.run.id}:budget`, conversationId: state.conversation.id,
+        role: "assistant", kind: "text", body: "Further run transcript items omitted because the retention budget was reached.",
+        payload: { runId: state.run.id, provider: state.run.provider, truncated: true } });
+      publish({ type: "message.created", conversationId: state.conversation.id, payload: message });
+    } catch (error) { if (error.statusCode !== 507) throw error; }
   }
 
   return {
     providers,
     providerAvailable: providerDiscovery.available,
     schedule,
+    resumeQueued() {
+      if (database.maintenanceActive) return;
+      wakeMaintenanceWaiters();
+      for (const state of active.values()) {
+        if (state.pendingFinish && (!state.child || state.closed)) {
+          const { exitCode, error } = state.pendingFinish;
+          finish(state, exitCode, error);
+        }
+      }
+      drain();
+    },
     stop,
     activeRuns: () => [...active.keys()],
     shutdown() {
       if (shutdownPromise) return shutdownPromise;
       shuttingDown = true;
+      clearDiskRetry();
+      wakeMaintenanceWaiters();
       const ids = [...queue.map((entry) => entry.run.id), ...active.keys()];
       shutdownPromise = Promise.allSettled([
-        ...ids.map(stop),
+        ...ids.map((id) => stop(id, true)),
         ...launches,
         providerDiscovery.close(),
       ]).then((results) => {
@@ -942,6 +1174,7 @@ export function consumeBoundedLines(stream, { maxLineBytes = MAX_PROVIDER_LINE_B
 function appendAssistantText(state, text, emit) {
   if (state.assistantTruncated) return;
   const segment = String(text ?? "");
+  if (!segment) return;
   state.assistantSegments.push(segment);
   state.assistantBytes += Buffer.byteLength(segment);
   if (state.assistantBytes > MAX_ASSISTANT_BYTES) {
@@ -1030,6 +1263,24 @@ function boundUtf8(value, maxBytes) {
 
 function truncateUtf8(value, maxBytes) { return boundUtf8(value, maxBytes).text; }
 
+function boundedToolPayload(runId, item) {
+  const payload = { runId, item };
+  if (Buffer.byteLength(JSON.stringify(payload)) <= MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES) return payload;
+  const source = JSON.stringify(item);
+  let low = 0;
+  let high = Math.min(Buffer.byteLength(source), MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES);
+  let bounded = { runId, item: { truncated: true, preview: "" } };
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = { runId, item: { truncated: true, preview: truncateUtf8(source, middle) } };
+    if (Buffer.byteLength(JSON.stringify(candidate)) <= MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES) {
+      bounded = candidate;
+      low = middle + 1;
+    } else high = middle - 1;
+  }
+  return bounded;
+}
+
 export function buildProviderCommand(conversation, run) {
   if (run.provider === "claude") {
     const args = ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-prompts", "none"];
@@ -1077,7 +1328,9 @@ export function normalizeClaude(raw) {
   const events = [];
   if (raw.type === "system" && raw.subtype === "init" && raw.session_id) events.push({ type: "session", payload: { sessionId: raw.session_id } });
   const delta = raw.event?.delta;
-  if (raw.type === "stream_event" && delta?.type === "text_delta") events.push({ type: "assistant.delta", payload: { text: delta.text } });
+  if (raw.type === "stream_event" && delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
+    events.push({ type: "assistant.delta", payload: { text: delta.text } });
+  }
   if (raw.type === "assistant") {
     for (const block of raw.message?.content ?? []) {
       if (block.type === "tool_use") events.push({ type: "tool.started", payload: { item: block } });

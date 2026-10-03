@@ -10,23 +10,40 @@ import { AGENT_SUPERVISOR, createAgentManager, defaultGroupMembers, hardenWindow
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
+import { utilityProcesses } from "./subprocess-budget.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000 }) {
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, databaseFactory = createOutrightDatabase, hardenLaunchDirectory = process.platform === "win32" ? hardenWindowsLaunchDirectory : () => {}, terminalManagerFactory = createTerminalManager } = {}) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
-  const database = createOutrightDatabase({ runtimeLease: true });
+  let agents;
+  let publish;
+  let runtimeCapacity;
+  const database = databaseFactory({ runtimeLease: true, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, onMigrationComplete: () => {
+    agents.resumeQueued();
+    publish({ type: "capacity.changed", payload: runtimeCapacity() });
+  }, onDeletionWorkerStart: () => {
+    publish({ type: "capacity.changed", payload: runtimeCapacity() });
+  }, onDeletionWorkerExit: () => {
+    agents.resumeQueued();
+    publish({ type: "capacity.changed", payload: runtimeCapacity() });
+  } });
+  let eventHub;
+  let wss;
+  try {
   // Completion markers are trusted recovery evidence. Secure their directory
   // before reconciliation reads any record, rather than waiting for the agent
   // manager to initialize after recovery has already classified pending rows.
-  if (process.platform === "win32") hardenWindowsLaunchDirectory(database.launchDirectory);
+  hardenLaunchDirectory(database.launchDirectory);
+  database.reconcilePendingRetentionCleanup();
+  database.reconcileTerminalAudit();
   const reconciliation = database.reconcileInterruptedRuns({
     probeAlive: (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync),
   });
   if (reconciliation.count) database.audit("runtime.runs.reconciled", { target: "runtime", ...reconciliation });
-  const eventHub = createRuntimeEventHub();
+  eventHub = createRuntimeEventHub();
   const runtimeInstanceId = randomUUID();
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024 });
+  wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024 });
   let latestScan = null;
   let latestScanAt = 0;
   let inFlightScan = null;
@@ -35,19 +52,25 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   let shuttingDown = false;
   let shutdownPromise;
 
-  function publish(event) {
+  publish = function publish(event) {
     return eventHub.publish(event);
-  }
+  };
 
-  const agents = createAgentManager({ database, publish, onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }), validateConversation: async (conversation) => {
+  agents = createAgentManager({ database, publish, onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }), validateConversation: async (conversation) => {
     const target = await resolveWorktreeTarget(conversation);
     return () => {
       if (database.getConversation(conversation.id)?.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
       if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required");
     };
   } });
-  const terminals = createTerminalManager({ database, publish });
-  const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl) });
+  const terminals = terminalManagerFactory({ database, publish, subprocesses });
+  const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl), subprocesses });
+  runtimeCapacity = function runtimeCapacity() {
+    return { ...database.capacity(), utilityProcesses: subprocesses.capacity(), terminalProcesses: terminals.capacity() };
+  };
+  void terminals.reconcileUnknown().then((resolved) => {
+    if (resolved) publish({ type: "capacity.changed", payload: runtimeCapacity() });
+  }).catch(() => {});
 
   // Validates that a project/worktree/path triple names exactly one discovered
   // worktree belonging to that project. Trust and execution then bind to the
@@ -66,7 +89,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     if (!force && latestScan && timestamp - latestScanAt < 1500) return latestScan;
     if (!inFlightScan) {
       inFlightScan = loadOutrightConfig(configUrl)
-        .then(scanProjects)
+        .then((config) => scanProjects(config, subprocesses))
         .then(async (result) => {
           latestScan = result;
           latestScanAt = Date.now();
@@ -77,6 +100,19 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         .finally(() => { inFlightScan = null; });
     }
     return inFlightScan;
+  }
+
+  async function refreshProjectsAfterMutation(result) {
+    try {
+      await projects(true);
+      publish({ type: "projects.changed", payload: latestScan });
+      return result;
+    } catch {
+      // The Git effect and its audit outcome have already committed. A scan
+      // failure cannot turn that success into a retryable failure.
+      latestScanAt = 0;
+      return { ...result, refreshDeferred: true };
+    }
   }
 
   async function refreshWatcher(projectList) {
@@ -106,13 +142,20 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   }
 
   function ensureDefaultGroups(projectList) {
-    const current = database.listGroups();
-    if (current.groups.length) return;
-    const core = database.createGroup("Core systems");
-    const experiments = database.createGroup("Experiments");
-    for (const project of projectList) {
-      database.setProjectGroup(project.id, /experiment|prototype|playground/i.test(`${project.name} ${project.path}`) ? experiments.id : core.id);
+    try {
+      database.ensureDefaultGroups(projectList);
+    } catch (error) {
+      // An over-quota legacy database still needs bootstrap and retention UI.
+      // The next scan can finish creating defaults once space is reclaimed.
+      if (error.statusCode !== 507) throw error;
     }
+  }
+
+  function editRetainedData(edit) {
+    const launchable = database.canLaunchRun();
+    const result = edit();
+    if (!launchable && database.canLaunchRun()) agents.resumeQueued();
+    return result;
   }
 
   async function handleRequest(request, response) {
@@ -121,6 +164,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     try {
       assertRuntimeRequest(request, allowedHosts);
       if (shuttingDown) throw apiError(503, "Runtime is shutting down");
+      if (database.maintenanceActive && url.pathname !== "/api/capacity") {
+        throw apiError(503, "Archive maintenance is running; retry shortly");
+      }
       if (url.pathname === "/api/bootstrap" && request.method === "GET") {
         const scan = await projects();
         return json(response, 200, {
@@ -132,12 +178,49 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           templates: database.listTemplates(),
           terminals: terminals.list(),
           activeRuns: agents.activeRuns(),
+          capacity: runtimeCapacity(),
         });
       }
       if (url.pathname === "/api/projects" && ["GET", "POST"].includes(request.method)) return json(response, 200, await projects(request.method === "POST"));
       if (url.pathname === "/api/providers" && request.method === "GET") return json(response, 200, { providers: agents.providers() });
       if (url.pathname === "/api/settings" && request.method === "GET") return json(response, 200, database.getSettings());
-      if (url.pathname === "/api/settings" && request.method === "PATCH") return json(response, 200, database.updateSettings(await readJson(request)));
+      if (url.pathname === "/api/settings" && request.method === "PATCH") {
+        const settings = database.updateSettings(await readJson(request));
+        agents.resumeQueued();
+        publish({ type: "capacity.changed", payload: runtimeCapacity() });
+        return json(response, 200, settings);
+      }
+      if (url.pathname === "/api/capacity" && request.method === "GET") return json(response, 200, runtimeCapacity());
+      if (url.pathname === "/api/retention/archived" && request.method === "GET") {
+        const limitText = url.searchParams.get("limit");
+        const limit = limitText === null ? 100 : Number(limitText);
+        return json(response, 200, database.listDeletableArchivedConversations({ limit, cursor: url.searchParams.get("cursor") }));
+      }
+      if (url.pathname === "/api/retention/delete-archived" && request.method === "POST") {
+        const body = await readJson(request);
+        if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Retention request must be a JSON object");
+        const result = await database.deleteArchivedConversation(body.id, body.confirmation);
+        agents.resumeQueued();
+        return json(response, result.deferred ? 202 : 200, { deleted: result.deleted, deferred: Boolean(result.deferred), capacity: runtimeCapacity() });
+      }
+      if (url.pathname === "/api/retention/cleanup" && request.method === "POST") {
+        const body = await readJson(request);
+        if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Retention request must be a JSON object");
+        const cutoff = database.validateRetentionCutoff(body.before);
+        const operationId = randomUUID();
+        await database.auditRetentionCleanupRequested({ operationId, before: cutoff });
+        let result;
+        try {
+          result = await database.pruneHistory({ before: cutoff, limit: 100 });
+        } catch (error) {
+          await database.auditRequired("retention.cleanup.unknown", { operationId, before: cutoff,
+            reason: "cleanup failed after admission", error: error.message });
+          throw error;
+        }
+        await database.auditRequired("retention.cleaned", { operationId, deleted: result.deleted, deferred: result.deferred, before: cutoff });
+        agents.resumeQueued();
+        return json(response, 200, { deleted: result.deleted, deferred: result.deferred, capacity: runtimeCapacity() });
+      }
 
       if (url.pathname === "/api/groups" && request.method === "GET") return json(response, 200, database.listGroups());
       if (url.pathname === "/api/groups" && request.method === "POST") {
@@ -146,10 +229,21 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         return json(response, 201, database.createGroup(body.name));
       }
       const groupMatch = url.pathname.match(/^\/api\/groups\/([^/]+)$/);
-      if (groupMatch && request.method === "PATCH") return json(response, 200, database.updateGroup(groupMatch[1], await readJson(request)));
-      if (groupMatch && request.method === "DELETE") return json(response, database.deleteGroup(groupMatch[1]) ? 204 : 404, null);
+      if (groupMatch && request.method === "PATCH") {
+        const patch = await readJson(request);
+        const group = editRetainedData(() => database.updateGroup(groupMatch[1], patch));
+        return json(response, 200, group);
+      }
+      if (groupMatch && request.method === "DELETE") {
+        const deleted = database.deleteGroup(groupMatch[1]);
+        if (deleted) agents.resumeQueued();
+        return json(response, deleted ? 204 : 404, null);
+      }
       if (url.pathname === "/api/project-memberships" && request.method === "PUT") {
-        const body = await readJson(request); database.setProjectGroup(body.projectId, body.groupId); return json(response, 200, database.listGroups());
+        const body = await readJson(request);
+        database.setProjectGroup(body.projectId, body.groupId);
+        if (!body.groupId) agents.resumeQueued();
+        return json(response, 200, database.listGroups());
       }
 
       if (url.pathname === "/api/conversations" && request.method === "GET") return json(response, 200, { conversations: database.listConversations({ projectId: url.searchParams.get("projectId"), worktreeId: url.searchParams.get("worktreeId"), archived: url.searchParams.get("archived") === "true" }) });
@@ -188,7 +282,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         });
       }
       if (conversationMatch && request.method === "PATCH") {
-        const conversation = database.updateConversation(conversationMatch[1], await readJson(request));
+        const patch = await readJson(request);
+        const conversation = editRetainedData(() => database.updateConversation(conversationMatch[1], patch));
         publish({ type: "conversation.updated", conversationId: conversationMatch[1], payload: conversation });
         return json(response, conversation ? 200 : 404, conversation);
       }
@@ -270,7 +365,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           throw apiError(409, "Resolve the interrupted run before moving this conversation away from its recovery worktree", { code: "RUN_RECOVERY_REQUIRED" });
         }
         const { worktreePath: destinationPath } = await resolveWorktreeTarget(body);
-        const conversation = database.moveConversation(conversationMoveMatch[1], { projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath });
+        const conversation = editRetainedData(() => database.moveConversation(conversationMoveMatch[1],
+          { projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath }));
         database.audit("conversation.moved", { target: conversation.id, projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath });
         publish({ type: "conversation.updated", conversationId: conversation.id, payload: conversation });
         return json(response, 200, conversation);
@@ -304,15 +400,15 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         }
         const currentInterrupted = database.findUnresolvedInterruptedRunForWorktree(conversation.worktreePath);
         if (currentInterrupted) throw apiError(409, "Resolve the interrupted run before starting more agent work", { code: "RUN_RECOVERY_REQUIRED", runId: currentInterrupted.id });
-        const userMessage = database.addMessage({ conversationId: conversation.id, role: "user", kind: "text", body: prompt });
+        const { run, message: userMessage } = database.submitRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, provider, model: body.model ?? conversation.model ?? settings.model, reasoningEffort: body.reasoningEffort || settings.reasoningEffort, approvalPolicy: body.approvalPolicy || settings.approvalPolicy, prompt }, prompt);
         publish({ type: "message.created", conversationId: conversation.id, payload: userMessage });
-        const run = database.createRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, provider, model: body.model ?? conversation.model ?? settings.model, reasoningEffort: body.reasoningEffort || settings.reasoningEffort, approvalPolicy: body.approvalPolicy || settings.approvalPolicy, prompt });
         return json(response, 202, await agents.schedule({ conversation: database.getConversation(conversation.id), run }));
       }
       const runMatch = url.pathname.match(/^\/api\/runs\/([^/]+)$/);
       if (runMatch && request.method === "GET") {
         const run = database.getRun(runMatch[1]);
-        return json(response, run ? 200 : 404, run ? { ...run, events: database.listRunEvents(run.id, Number(url.searchParams.get("after") ?? 0)) } : { error: "Run not found" });
+        if (!run || !database.getConversation(run.conversationId)) return json(response, 404, { error: "Run not found" });
+        return json(response, 200, { ...run, events: database.listRunEvents(run.id, Number(url.searchParams.get("after") ?? 0)) });
       }
       const stopRunMatch = url.pathname.match(/^\/api\/runs\/([^/]+)\/stop$/);
       if (stopRunMatch && request.method === "POST") { const stopped = await agents.stop(stopRunMatch[1]); return json(response, stopped ? 202 : 404, { stopped }); }
@@ -348,7 +444,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           if (body.confirmation !== interrupted.id) throw apiError(400, "Exact run id confirmation is required for unverifiable legacy cleanup", { code: "RECOVERY_CONFIRMATION_REQUIRED", runId: interrupted.id });
           const resolved = database.resolveInterruptedRun(interrupted.id, policy);
           if (!resolved) throw apiError(409, "Run is not waiting for a recovery decision");
-          database.audit("agent.run.recovery.discard-unverifiable", { target: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
           publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: resolved });
           return json(response, 200, resolved);
         }
@@ -432,7 +527,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (policy === "discard") {
           const resolved = database.resolveInterruptedRun(interrupted.id, policy);
           if (!resolved) throw apiError(409, "Run is not waiting for a recovery decision");
-          database.audit("agent.run.recovery.discard", { target: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
           publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: resolved });
           return json(response, 200, resolved);
         }
@@ -482,7 +576,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         }
         const recovery = database.beginInterruptedRunRecovery(interrupted.id, policy, { providerSessionId: sessionId });
         if (!recovery) throw apiError(409, "Run is not waiting for a recovery decision");
-        database.audit(`agent.run.recovery.${policy}`, { target: recovery.run.id, recoveredFrom: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
         publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: recovery.interrupted });
         return json(response, 202, await agents.schedule({
           conversation: recovery.conversation,
@@ -496,16 +589,32 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const body = await readJson(request);
         const project = (await projects()).projects.find((item) => item.id === body.projectId && item.path === body.projectPath);
         if (!project || body.confirmation !== project.path) throw apiError(400, "Exact project path confirmation is required");
-        database.trustProject(project.id, project.path); database.audit("project.trusted", { target: project.id, path: project.path });
+        database.trustProject(project.id, project.path);
         return json(response, 200, { trusted: true, projectId: project.id });
       }
-      if (url.pathname === "/api/trust" && request.method === "DELETE") { const body = await readJson(request); database.untrustProject(body.projectId); return json(response, 200, { trusted: false }); }
+      if (url.pathname === "/api/trust" && request.method === "DELETE") {
+        const body = await readJson(request);
+        database.untrustProject(body.projectId);
+        agents.resumeQueued();
+        return json(response, 200, { trusted: false });
+      }
 
       if (url.pathname === "/api/terminals" && request.method === "GET") return json(response, 200, { terminals: terminals.list() });
-      if (url.pathname === "/api/terminals" && request.method === "POST") { const body = await readJson(request); await projects(); const cwd = await git.requireWorktree(body.cwd); return json(response, 201, terminals.create({ ...body, cwd })); }
+      if (url.pathname === "/api/terminals" && request.method === "POST") {
+        const body = await readJson(request);
+        if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.cwd !== "string" || !body.cwd
+          || (body.name !== undefined && (typeof body.name !== "string" || body.name.length > 200))
+          || (body.cols !== undefined && (!Number.isInteger(body.cols) || body.cols < 20 || body.cols > 400))
+          || (body.rows !== undefined && (!Number.isInteger(body.rows) || body.rows < 5 || body.rows > 200))) {
+          throw apiError(400, "Terminal path, name, or dimensions are invalid");
+        }
+        await projects();
+        const cwd = await git.requireWorktree(body.cwd);
+        return json(response, 201, await terminals.create({ ...body, cwd }));
+      }
       const terminalMatch = url.pathname.match(/^\/api\/terminals\/([^/]+)$/);
       if (terminalMatch && request.method === "GET") { const terminal = terminals.get(terminalMatch[1]); return json(response, terminal ? 200 : 404, terminal ?? { error: "Terminal not found" }); }
-      if (terminalMatch && request.method === "DELETE") return json(response, terminals.close(terminalMatch[1]) ? 204 : 404, null);
+      if (terminalMatch && request.method === "DELETE") return json(response, await terminals.close(terminalMatch[1]) ? 204 : 404, null);
 
       if (url.pathname === "/api/git/status" && request.method === "GET") return json(response, 200, await git.status(requiredQuery(url, "path")));
       if (url.pathname === "/api/git/diff" && request.method === "GET") return json(response, 200, await git.diff(requiredQuery(url, "path"), url.searchParams.get("file"), url.searchParams.get("staged") === "true"));
@@ -515,18 +624,30 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/context" && request.method === "GET") return json(response, 200, await git.context(requiredQuery(url, "path")));
       if (url.pathname === "/api/editor/open" && request.method === "POST") { const body = await readJson(request); return json(response, 200, await git.openInEditor(body.path, body.file, body.editor)); }
 
-      if (url.pathname === "/api/worktrees" && request.method === "POST") { const result = await git.createWorktree(await readJson(request)); await projects(true); publish({ type: "projects.changed", payload: latestScan }); return json(response, 201, result); }
-      if (url.pathname === "/api/worktrees" && request.method === "DELETE") { const result = await git.removeWorktree(await readJson(request)); await projects(true); publish({ type: "projects.changed", payload: latestScan }); return json(response, 200, result); }
+      if (url.pathname === "/api/worktrees" && request.method === "POST") { const result = await git.createWorktree(await readJson(request)); return json(response, 201, await refreshProjectsAfterMutation(result)); }
+      if (url.pathname === "/api/worktrees" && request.method === "DELETE") { const result = await git.removeWorktree(await readJson(request)); return json(response, 200, await refreshProjectsAfterMutation(result)); }
 
       if (url.pathname === "/api/templates" && request.method === "GET") return json(response, 200, { templates: database.listTemplates() });
-      if (url.pathname === "/api/templates" && request.method === "POST") return json(response, 201, database.saveTemplate(await readJson(request)));
+      if (url.pathname === "/api/templates" && request.method === "POST") {
+        const input = await readJson(request);
+        const template = editRetainedData(() => database.saveTemplate(input));
+        return json(response, 201, template);
+      }
       const templateMatch = url.pathname.match(/^\/api\/templates\/([^/]+)$/);
-      if (templateMatch && request.method === "DELETE") return json(response, database.deleteTemplate(templateMatch[1]) ? 204 : 404, null);
+      if (templateMatch && request.method === "DELETE") {
+        const deleted = database.deleteTemplate(templateMatch[1]);
+        if (deleted) agents.resumeQueued();
+        return json(response, deleted ? 204 : 404, null);
+      }
       if (url.pathname === "/api/search" && request.method === "GET") return json(response, 200, database.search(requiredQuery(url, "q")));
       if (url.pathname === "/api/audit" && request.method === "GET") return json(response, 200, { entries: database.listAudit(Number(url.searchParams.get("limit") ?? 100)) });
       throw apiError(404, "API route not found");
     } catch (error) {
       if (response.destroyed) return true;
+      if (["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error?.code)) {
+        return json(response, 503, { error: "Storage cleanup is writing; retry shortly" });
+      }
+      if (error?.message?.includes("OUTRIGHT_RETAINED_LIMIT")) return json(response, 507, { error: "Retained history is full; archive conversations, then delete selected archived chats or clean up older history" });
       return json(response, error.statusCode ?? 500, { error: error.message || "Internal server error", ...(error.details ?? {}) });
     }
   }
@@ -576,17 +697,39 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     shuttingDown = true;
     clearTimeout(watcherTimer);
     shutdownPromise = (async () => {
-      await Promise.all([watcher?.close(), agents.shutdown()]);
+      const shutdownErrors = [];
+      const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown()]);
+      for (const result of preliminaries) if (result.status === "rejected") shutdownErrors.push(result.reason);
       await inFlightScan?.catch(() => {});
-      terminals.shutdown();
+      try { await terminals.shutdown(); }
+      catch (error) { shutdownErrors.push(error); }
       eventHub.shutdown();
       wss.close();
-      database.close();
+      await database.close();
+      if (shutdownErrors.length) throw new AggregateError(shutdownErrors, "Runtime shutdown did not finish cleanly");
     })();
     return shutdownPromise;
   }
 
   return { attach, handleRequest, projects, publish, database, agents, terminals, git, shutdown };
+  } catch (error) {
+    // No runtime was returned, so neither Vite nor standalone can call its
+    // shutdown. Stop startup-owned managers before releasing the physical
+    // lease. The constructor is synchronous; no agent or PTY has been admitted.
+    const cleanupErrors = [];
+    let agentShutdown;
+    try { agentShutdown = agents?.shutdown(); }
+    catch (failure) { cleanupErrors.push(failure); }
+    void Promise.resolve(agentShutdown).catch((failure) => console.error("Runtime startup agent cleanup failed", failure));
+    try { eventHub?.shutdown(); } catch (failure) { cleanupErrors.push(failure); }
+    try { wss?.close(); } catch (failure) { cleanupErrors.push(failure); }
+    let databaseShutdown;
+    try { databaseShutdown = database.close(); }
+    catch (failure) { cleanupErrors.push(failure); }
+    void Promise.resolve(databaseShutdown).catch((failure) => console.error("Runtime startup database cleanup failed", failure));
+    if (cleanupErrors.length) throw new AggregateError([error, ...cleanupErrors], "Runtime startup and cleanup failed");
+    throw error;
+  }
 }
 
 function readJson(request) {

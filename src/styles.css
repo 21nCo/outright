@@ -383,7 +383,8 @@ select { height: 34px; padding: 0 28px 0 10px; border: 1px solid var(--input); b
 .manage-actions { display: flex; align-items: center; justify-content: space-between; }
 .dialog-form > label { display: flex; justify-content: space-between; margin-bottom: -11px; color: var(--muted-foreground); font-size: 11px; font-weight: 600; }
 .dialog-form > label small { font-weight: 400; }
-.error-toast { position: fixed; z-index: 101; right: 20px; bottom: 20px; max-width: min(440px, calc(100vw - 40px)); min-height: 43px; padding: 9px 10px; display: grid; grid-template-columns: 18px minmax(0,1fr) 24px; align-items: center; gap: 8px; border: 1px solid color-mix(in oklab, var(--destructive) 40%, var(--border)); border-radius: 9px; color: var(--foreground); background: var(--popover); box-shadow: 0 14px 40px rgba(0,0,0,.25); font-size: 11px; }
+.error-toast-stack { position: fixed; z-index: 101; right: 20px; bottom: 20px; max-width: min(440px, calc(100vw - 40px)); display: flex; flex-direction: column-reverse; align-items: flex-end; gap: 9px; }
+.error-toast { max-width: 100%; min-height: 43px; padding: 9px 10px; display: grid; grid-template-columns: 18px minmax(0,1fr) 24px; align-items: center; gap: 8px; border: 1px solid color-mix(in oklab, var(--destructive) 40%, var(--border)); border-radius: 9px; color: var(--foreground); background: var(--popover); box-shadow: 0 14px 40px rgba(0,0,0,.25); font-size: 11px; }
 .error-toast > svg { color: var(--destructive); }
 .error-toast button { width: 24px; height: 24px; padding: 0; border: 0; display: flex; align-items: center; justify-content: center; color: var(--muted-foreground); background: transparent; cursor: pointer; }
 
@@ -487,6 +488,7 @@ select { height: 34px; padding: 0 28px 0 10px; border: 1px solid var(--input); b
 .command-results small { font-size: 9px; }
 .command-hint { min-height: 120px; padding: 19px; display: flex; flex-direction: column; justify-content: center; gap: 12px; color: var(--muted-foreground); }
 .command-hint span { display: flex; align-items: center; gap: 4px; font-size: 10px; }
+.command-search-scope { margin: 0; padding: 10px 12px; color: var(--muted-foreground); font-size: 11px; line-height: 1.45; }
 kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--line-soft); border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; background: var(--subtle-canvas); font-size: 9px; }
 .no-results { padding: 35px; color: var(--muted-foreground); text-align: center; font-size: 11px; }
 .command-error { padding: 24px; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--destructive); text-align: center; font-size: 11px; }
@@ -500,6 +502,11 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
 .template-settings { padding-top: 15px; border-top: 1px solid var(--line-soft); }
 .template-settings > header strong { display: block; font-size: 11px; }
 .template-settings > header small { color: var(--muted-foreground); font-size: 9px; }
+.archived-history-list { max-height: 160px; overflow-y: auto; }
+.archive-delete-confirm { margin-top: 9px; padding: 10px; border: 1px solid var(--destructive); border-radius: 6px; font-size: 11px; }
+.archive-delete-confirm p { margin: 0 0 8px; }
+.archive-delete-confirm > div { display: flex; flex-wrap: wrap; gap: 8px; }
+.capacity-status { display: block; }
 .template-list { margin: 9px 0; display: grid; gap: 4px; }
 .template-list > div { min-height: 38px; padding: 4px 5px 4px 9px; display: flex; align-items: center; border: 1px solid var(--line-soft); border-radius: 6px; }
 .template-list > div > span { min-width: 0; display: flex; flex: 1; flex-direction: column; }

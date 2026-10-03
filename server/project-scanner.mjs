@@ -1,10 +1,7 @@
-import { execFile } from "node:child_process";
 import { access, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
 import { createObservability } from "@superfunctions/observability";
-
-const execFileAsync = promisify(execFile);
+import { utilityProcesses } from "./subprocess-budget.mjs";
 
 const observability = createObservability({
   service: "outright",
@@ -32,7 +29,12 @@ export async function loadOutrightConfig(configUrl) {
   };
 }
 
-export async function scanProjects(config) {
+export async function scanProjects(config, subprocesses = utilityProcesses) {
+  const git = (directory, args) => runGit(subprocesses, directory, args);
+  const safeGit = async (directory, args) => {
+    try { return await git(directory, args); }
+    catch (error) { if (error.code === "SUBPROCESS_CAPACITY") throw error; return ""; }
+  };
   const request = observability.startRequest({ method: "SCAN", path: "/api/projects" });
 
   return observability.runWithRequest(request, async () => {
@@ -48,16 +50,18 @@ export async function scanProjects(config) {
         if (!repositories.has(commonPath)) {
           repositories.set(commonPath, candidate);
         }
-      } catch {
+      } catch (error) {
+        if (error.code === "SUBPROCESS_CAPACITY") throw error;
         // A stale or unsupported .git entry should not prevent the remaining projects from loading.
       }
     }
 
     const repositoryEntries = [...repositories.entries()].slice(0, config.maxProjects);
-    const projects = (await mapWithConcurrency(repositoryEntries, 4, async ([commonPath, candidate]) => {
+    const projects = (await mapWithConcurrency(repositoryEntries, 2, async ([commonPath, candidate]) => {
       try {
-        return await readProject(candidate, commonPath);
+        return await readProject(candidate, commonPath, git, safeGit);
       } catch (error) {
+        if (error.code === "SUBPROCESS_CAPACITY") throw error;
         if (process.env.OUTRIGHT_DEBUG === "1") {
           console.warn(`[outright] skipped ${candidate}:`, error.message);
         }
@@ -116,10 +120,10 @@ async function discoverGitDirectories(config) {
   return discovered;
 }
 
-async function readProject(candidate, commonPath) {
+async function readProject(candidate, commonPath, git, safeGit) {
   const worktreeOutput = await git(candidate, ["worktree", "list", "--porcelain"]);
   const records = parseWorktreePorcelain(worktreeOutput);
-  const worktrees = await Promise.all(records.map((record, index) => readWorktree(record, index > 0)));
+  const worktrees = await mapWithConcurrency(records, 2, (record, index) => readWorktree(record, index > 0, safeGit));
 
   const primary = worktrees.find((worktree) => !worktree.isLinked) ?? worktrees[0];
   const projectPath = primary?.path ?? candidate;
@@ -138,10 +142,10 @@ async function readProject(candidate, commonPath) {
   };
 }
 
-async function readWorktree(record, isLinked) {
+async function readWorktree(record, isLinked, safeGit) {
   const statusOutput = record.bare ? "" : await safeGit(record.path, ["status", "--porcelain=v1"]);
   const changedFiles = parseStatus(statusOutput);
-  const divergence = record.bare ? null : await readDivergence(record.path);
+  const divergence = record.bare ? null : await readDivergence(record.path, safeGit);
 
   return {
     id: slug(record.path),
@@ -160,7 +164,7 @@ async function readWorktree(record, isLinked) {
   };
 }
 
-async function readDivergence(directory) {
+async function readDivergence(directory, safeGit) {
   const output = await safeGit(directory, ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"]);
   const [behind, ahead] = output.trim().split(/\s+/).map(Number);
   return Number.isFinite(ahead) && Number.isFinite(behind) ? { ahead, behind } : null;
@@ -200,21 +204,13 @@ function parseStatus(output) {
     }));
 }
 
-async function git(directory, args) {
-  const { stdout } = await execFileAsync("git", ["-C", directory, ...args], {
+async function runGit(subprocesses, directory, args) {
+  const { stdout } = await subprocesses.run("git", ["-C", directory, ...args], {
     encoding: "utf8",
     maxBuffer: 4 * 1024 * 1024,
     timeout: 5000,
   });
   return stdout.trim();
-}
-
-async function safeGit(directory, args) {
-  try {
-    return await git(directory, args);
-  } catch {
-    return "";
-  }
 }
 
 async function exists(target) {
@@ -248,15 +244,19 @@ function displayWorktreeName(worktree, projectName) {
     : directoryName;
 }
 
-async function mapWithConcurrency(items, concurrency, mapper) {
+export async function mapWithConcurrency(items, concurrency, mapper) {
   const results = new Array(items.length);
   let cursor = 0;
+  let failed = false;
+  let failure;
   async function worker() {
-    while (cursor < items.length) {
+    while (!failed && cursor < items.length) {
       const index = cursor++;
-      results[index] = await mapper(items[index], index);
+      try { results[index] = await mapper(items[index], index); }
+      catch (error) { if (!failed) { failed = true; failure = error; } }
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  if (failed) throw failure;
   return results;
 }

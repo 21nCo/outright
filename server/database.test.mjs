@@ -2,10 +2,23 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
 import Database from "better-sqlite3";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createOutrightDatabase, defaultProbeRun } from "./database.mjs";
+
+async function waitForSearchMigration(filename, kind) {
+  const deadline = Date.now() + 5_000;
+  while (true) {
+    const probe = new Database(filename, { readonly: true });
+    let pending;
+    try { pending = probe.prepare("SELECT 1 FROM migration_progress WHERE kind = ?").get(kind); }
+    finally { probe.close(); }
+    if (!pending) return;
+    assert.ok(Date.now() < deadline, `${kind} lookup migration did not resume after restart`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 test("persists settings, groups, conversations, messages, runs, and search", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
@@ -32,6 +45,164 @@ test("persists settings, groups, conversations, messages, runs, and search", () 
   } finally {
     database.close();
   }
+});
+
+test("global search bounds recent text and response bytes while keeping conversation Find available", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const old = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Old", provider: "codex" });
+    database.addMessage({ conversationId: old.id, role: "assistant", body: "old-needle" });
+    const current = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Current", provider: "codex" });
+    for (let index = 0; index < 260; index += 1) {
+      database.addMessage({ conversationId: current.id, role: "assistant", body: `filler ${index}` });
+    }
+    const large = database.addMessage({ conversationId: current.id, role: "assistant", body: `large-needle ${"x".repeat(4 * 1024 * 1024)}` });
+    database.addMessage({ conversationId: current.id, role: "assistant", body: "recent-needle" });
+    for (let index = 0; index < 12; index += 1) {
+      const result = database.search("recent-needle");
+      assert.deepEqual(result.conversations.map((item) => item.id), [current.id]);
+      assert.equal(result.partial, true);
+      assert.ok(Buffer.byteLength(JSON.stringify(result)) < 4096, "search returned retained body text");
+      assert.equal(database.search("old-needle").conversations.length, 0, "scan crossed the recent candidate budget");
+      assert.equal(database.search("large-needle").conversations.length, 0, "large body entered the synchronous scan");
+    }
+    assert.equal((await database.findMessagePage(current.id, "large-needle", null)).matchId, large.id);
+    assert.equal(database.search("Current").conversations[0].id, current.id);
+    assert.equal(database.search("recent%needle").conversations.length, 0, "LIKE wildcard was treated as query syntax");
+    assert.throws(() => database.search("x".repeat(257)), (error) => error.statusCode === 400);
+  } finally { database.close(); }
+});
+
+test("global search reaches live siblings behind a deferred hidden archive across restart", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-visible-search-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const live = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "visible-title-needle", provider: "codex" });
+    database.addMessage({ conversationId: live.id, role: "assistant", body: "visible-message-needle" });
+    const running = database.createRun({ conversationId: live.id, provider: "codex", approvalPolicy: "read-only", prompt: "keep archive deferred" });
+    database.updateRun(running.id, { status: "running" });
+    const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "hidden-title-needle", provider: "codex" });
+    database.addMessage({ conversationId: archived.id, role: "assistant", body: "hidden-message-needle " + "x".repeat(300 * 1024) });
+    for (let index = 0; index < 300; index += 1) database.addMessage({ conversationId: archived.id, role: "assistant", body: `hidden filler ${index}` });
+    database.updateConversation(archived.id, { archived: true });
+    const deletion = await database.deleteArchivedConversation(archived.id, archived.id);
+    assert.equal(deletion.deferred, true);
+    for (let round = 0; round < 4; round += 1) {
+      assert.deepEqual(database.search("visible-message-needle").conversations.map((row) => row.id), [live.id]);
+      assert.deepEqual(database.search("visible-title-needle").conversations.map((row) => row.id), [live.id]);
+      assert.deepEqual(database.search("hidden-message-needle").conversations, []);
+    }
+    await database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.getConversation(live.id)?.id, live.id);
+    assert.deepEqual(database.search("visible-message-needle").conversations.map((row) => row.id), [live.id]);
+    assert.deepEqual(database.search("visible-title-needle").conversations.map((row) => row.id), [live.id]);
+    assert.deepEqual(database.search("hidden-title-needle").conversations, []);
+    database.updateRun(running.id, { status: "completed" });
+    const deadline = Date.now() + 5_000;
+    while (true) {
+      let remains = true;
+      if (!database.maintenanceActive) {
+        try {
+          const probe = new Database(filename, { readonly: true, fileMustExist: true });
+          try { remains = Boolean(probe.prepare("SELECT 1 FROM conversations WHERE id = ?").get(archived.id)); }
+          finally { probe.close(); }
+        } catch (error) {
+          if (error.code !== "SQLITE_CANTOPEN" || !database.maintenanceActive) throw error;
+        }
+      }
+      if (!remains && !database.maintenanceActive) break;
+      assert.ok(Date.now() < deadline, "deferred cleanup did not resume after the active run finished");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(database.search("visible-message-needle").conversations.map((row) => row.id), [live.id]);
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("global search includes the newest message in an older visible conversation", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-recent-search-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const oldest = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "old chat", provider: "codex" });
+    for (let index = 0; index < 256; index += 1) {
+      const newer = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: `new chat ${index}`, provider: "codex" });
+      database.addMessage({ conversationId: newer.id, role: "assistant", body: `filler ${index}` });
+    }
+    database.addMessage({ conversationId: oldest.id, role: "assistant", body: "fallback-active-needle" });
+    const fresh = database.addMessage({ conversationId: oldest.id, role: "assistant", body: "fresh-active-needle" });
+    const durations = [];
+    for (let round = 0; round < 8; round += 1) {
+      const started = performance.now();
+      const result = database.search("fresh-active-needle");
+      durations.push(performance.now() - started);
+      assert.deepEqual(result.conversations.map((row) => row.id), [oldest.id]);
+      assert.ok(Buffer.byteLength(JSON.stringify(result)) < 4096);
+    }
+    assert.ok(durations.sort((a, b) => a - b)[4] < 250, "repeated global searches blocked the runtime");
+    await database.close();
+    // Model an upgrade from a store that predates the global head lookup.
+    // The backfill must resume after an interrupted, bounded first page.
+    const oldStore = new Database(filename);
+    oldStore.exec(`DROP TRIGGER search_heads_message_insert;
+      DROP TRIGGER search_heads_message_delete;
+      DROP TRIGGER search_heads_conversation_update;
+      DROP TRIGGER search_heads_conversation_delete;
+      DROP TABLE search_message_heads`);
+    oldStore.close();
+    database = createOutrightDatabase({ filename });
+    await new Promise((resolve) => setImmediate(resolve));
+    const partial = new Database(filename, { readonly: true });
+    try {
+      const cursor = partial.prepare("SELECT cursor_number AS cursor FROM migration_progress WHERE kind = 'search-heads'").get()?.cursor;
+      assert.ok(cursor > 0 && cursor < 257, "head lookup migration did not advance in a bounded page");
+    } finally { partial.close(); }
+    await database.close();
+    database = createOutrightDatabase({ filename });
+    await waitForSearchMigration(filename, "search-heads");
+    assert.deepEqual(database.search("fresh-active-needle").conversations.map((row) => row.id), [oldest.id]);
+    const writer = new Database(filename);
+    try { writer.prepare("DELETE FROM messages WHERE id = ?").run(fresh.id); }
+    finally { writer.close(); }
+    assert.deepEqual(database.search("fresh-active-needle").conversations, []);
+    assert.deepEqual(database.search("fallback-active-needle").conversations.map((row) => row.id), [oldest.id]);
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("title search follows recent activity in an old chat after an interrupted lookup migration", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-title-search-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const oldest = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "old title", provider: "codex" });
+    for (let index = 0; index < 256; index += 1) {
+      database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: `new title ${index}`, provider: "codex" });
+    }
+    database.updateConversation(oldest.id, { title: "recent-renamed-needle" });
+    assert.deepEqual(database.search("recent-renamed-needle").conversations.map((row) => row.id), [oldest.id]);
+    await database.close();
+    const legacy = new Database(filename);
+    try {
+      legacy.exec(`DROP TRIGGER search_titles_insert; DROP TRIGGER search_titles_update;
+        DROP TRIGGER search_titles_delete; DROP TABLE search_recent_titles`);
+    } finally { legacy.close(); }
+    database = createOutrightDatabase({ filename });
+    await new Promise((resolve) => setImmediate(resolve));
+    const partial = new Database(filename, { readonly: true });
+    try {
+      const cursor = partial.prepare("SELECT cursor_number AS cursor FROM migration_progress WHERE kind = 'search-titles'").get()?.cursor;
+      assert.ok(cursor > 0 && cursor < 257, "title lookup migration did not stop at a bounded cursor");
+    } finally { partial.close(); }
+    await database.close();
+    database = createOutrightDatabase({ filename });
+    await waitForSearchMigration(filename, "search-titles");
+    for (let round = 0; round < 8; round += 1) {
+      const result = database.search("recent-renamed-needle");
+      assert.deepEqual(result.conversations.map((row) => row.id), [oldest.id]);
+      assert.ok(Buffer.byteLength(JSON.stringify(result)) < 4096);
+    }
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("conversation find reaches old and new pages, wraps, and treats query text literally", async () => {
@@ -693,7 +864,7 @@ test("resolves a relative data directory to a stable absolute launch path", () =
     database = createOutrightDatabase({ dataDirectory });
     assert.equal(path.isAbsolute(database.filename), true);
     assert.equal(path.isAbsolute(database.launchDirectory), true);
-    assert.equal(database.launchDirectory, path.join(root, "data", "launches"));
+    assert.equal(database.launchDirectory, path.join(realpathSync(path.join(root, "data")), "launches"));
   } finally {
     database?.close();
     rmSync(root, { recursive: true, force: true });
@@ -984,7 +1155,11 @@ test("reconciliation sweeps stale handshake records but keeps live-wrapper recor
     record(running.id, 222, { ownershipToken: "00000000-0000-4000-8000-000000000001", platformOwnershipId: "com.21n.outright.00000000-0000-4000-8000-000000000001" });
     record(exited.id, 555);
     record(finished.id, 333);
-    record("run-that-never-existed", 444);
+    const staleRun = "b0ed4709-3bd6-4eac-9ab4-f9365a82a7e1";
+    const terminalId = "379634b7-8989-47c5-9174-c09529b206a1";
+    const terminalMarker = path.join(launchDirectory, `terminal-${terminalId}.json`);
+    record(staleRun, 444);
+    writeFileSync(terminalMarker, JSON.stringify({ pid: 444, processIdentity: "owned-terminal" }));
 
     let runningHandshake;
     database.reconcileInterruptedRuns({ probeAlive: (pid, handshake) => {
@@ -997,7 +1172,13 @@ test("reconciliation sweeps stale handshake records but keeps live-wrapper recor
     assert.equal(runningHandshake.platformOwnershipId, "com.21n.outright.00000000-0000-4000-8000-000000000001", "restart probing receives the durable platform owner, not only its possibly-dead wrapper pid");
     assert.equal(existsSync(path.join(launchDirectory, `${exited.id}.json`)), false, "an exited tree is proven gone, so its hard-killed wrapper's record is swept instead of leaking");
     assert.equal(existsSync(path.join(launchDirectory, `${finished.id}.json`)), false, "a terminal run's stale record is swept");
-    assert.equal(existsSync(path.join(launchDirectory, "run-that-never-existed.json")), false, "a record for an unknown run is swept");
+    assert.equal(existsSync(path.join(launchDirectory, `${staleRun}.json`)), false, "a record for an unknown run is swept");
+    assert.equal(existsSync(terminalMarker), true, "run cleanup preserves the terminal owner's recovery marker");
+    database.reconcileInterruptedRuns();
+    assert.equal(existsSync(path.join(launchDirectory, `${running.id}.json`)), true, "a second restart preserves unresolved ownership evidence");
+    database.resolveInterruptedRun(running.id, "discard");
+    database.reconcileInterruptedRuns();
+    assert.equal(existsSync(path.join(launchDirectory, `${running.id}.json`)), false, "resolved ownership evidence is swept");
   } finally {
     database.close();
     rmSync(launchDirectory, { recursive: true, force: true });
@@ -1056,7 +1237,7 @@ test("the launch directory follows an explicit absolute database filename", () =
   const filename = path.join(root, "custom", "outright.db");
   try {
     const database = createOutrightDatabase({ filename });
-    assert.equal(database.launchDirectory, path.join(root, "custom", "launches"));
+    assert.equal(database.launchDirectory, path.join(realpathSync(path.join(root, "custom")), "launches"));
     database.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

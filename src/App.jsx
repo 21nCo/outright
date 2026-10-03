@@ -51,6 +51,8 @@ const LIVE_OMITTED_PREFIX = "[Earlier live output omitted]\n";
 
 export function App() {
   const [bootstrap, setBootstrap] = useState(null);
+  const [bootstrapError, setBootstrapError] = useState("");
+  const bootstrapLoadRef = useRef(null);
   const [selectedProjectId, setSelectedProjectId] = useState(() => localStorage.getItem("outright.selected-project") || "");
   const [selectedWorktreeId, setSelectedWorktreeId] = useState(() => localStorage.getItem("outright.selected-worktree") || "");
   const [selectedConversationId, setSelectedConversationId] = useState(() => localStorage.getItem("outright.selected-conversation") || "");
@@ -149,6 +151,8 @@ export function App() {
   const conversationOwnerRef = useRef("");
   const conversationsRef = useRef([]);
   const archiveFocusRef = useRef(null);
+  const settingsRefreshRef = useRef(0);
+  const settingsVersionRef = useRef(0);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
 
   const applyStreamingText = useCallback((change, immediate = false) => {
@@ -223,12 +227,32 @@ export function App() {
       const next = await api(manual ? "/api/projects" : "/api/bootstrap", manual ? { method: "POST" } : undefined);
       if (manual) setBootstrap((current) => ({ ...current, ...next }));
       else setBootstrap(next);
+      if (!manual) setBootstrapError("");
       if (manual) setToast(`Found ${next.projects.length} Git projects`);
-    } catch (nextError) { setError(nextError.message); }
+      return true;
+    } catch (nextError) {
+      if (manual) setError(nextError.message);
+      else if (nextError.status !== 503) setBootstrapError(nextError.message);
+      return !manual && nextError.status === 503 ? "retry" : "error";
+    }
     finally { setIsScanning(false); }
   }, []);
 
-  useEffect(() => { loadBootstrap(); }, [loadBootstrap]);
+  useEffect(() => {
+    let stopped = false;
+    let retry;
+    const load = async (remaining = null) => {
+      const loaded = await loadBootstrap();
+      if (!stopped && (remaining === null ? loaded === "retry" : loaded !== true && remaining > 0)) {
+        window.clearTimeout(retry);
+        retry = window.setTimeout(() => load(remaining === null ? null : remaining - 1), 1000);
+      }
+      return loaded;
+    };
+    bootstrapLoadRef.current = load;
+    void load();
+    return () => { stopped = true; bootstrapLoadRef.current = null; window.clearTimeout(retry); };
+  }, [loadBootstrap]);
   const providersChecking = Boolean(bootstrap?.providers?.some((provider) => provider.checking));
   useEffect(() => {
     if (!providersChecking) return;
@@ -572,7 +596,7 @@ export function App() {
   const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
   const handleRuntimeEvent = useCallback((event) => {
-    if (["projects.changed", "terminal.output", "terminal.exit", "runtime.connected"].includes(event.type)
+    if (["projects.changed", "terminal.output", "terminal.exit", "terminal.audit-failed", "runtime.connected", "capacity.changed"].includes(event.type)
       || (event.type === "run.event" && ["run.completed", "run.failed", "run.stopped"].includes(event.payload?.type))) setRuntimeEvent(event);
     const pendingLoad = pendingConversationLoadRef.current;
     if (["message.created", "run.event"].includes(event.type)
@@ -715,8 +739,10 @@ export function App() {
           // Browser timer throttling can delay a 32 ms stream flush while the
           // reader is on an older page. Show the first suffix byte after each
           // durable checkpoint now; coalesce the following deltas as usual.
-          const firstReadingDelta = Boolean(conversationRef.current?.messagePage?.hasLater) && !streamingTextRef.current;
-          applyStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event, checkpointEventSeq)), firstReadingDelta);
+          // The first byte must be visible without waiting for a throttled
+          // timer, including when the tab has been hidden during a long run.
+          const firstDelta = !streamingTextRef.current;
+          applyStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event, checkpointEventSeq)), firstDelta);
         }
       }
       if (runEvent.type === "assistant.message" && ownsLiveOutput) {
@@ -767,9 +793,14 @@ export function App() {
     const narrow = window.matchMedia("(max-width: 760px)");
     let wasNarrow = narrow.matches;
     const trackFocus = (event) => {
+      // A layout transition can briefly focus BODY before the replacement
+      // control commits. Pointer and keyboard input cancel the intent below.
+      if (event.target === document.body) return;
+      const target = sidebarFocusIntentRef.current === "opener"
+        ? document.querySelector('[aria-label="Open projects sidebar"]')
+        : sidebarRef.current?.querySelector('button:not(:disabled)');
       if (sidebarFocusIntentRef.current && event.target !== sidebarFocusSourceRef.current
-        && event.target !== sidebarRef.current && !sidebarRef.current?.contains(event.target)
-        && !event.target.matches?.('[aria-label="Open projects sidebar"]')) {
+        && event.target !== target) {
         sidebarFocusIntentRef.current = null;
         sidebarFocusSourceRef.current = null;
       }
@@ -777,6 +808,16 @@ export function App() {
       else if (sidebarRef.current?.contains(event.target)) sidebarFocusOwnerRef.current = "sidebar";
       else {
         sidebarFocusOwnerRef.current = null;
+      }
+    };
+    const releaseFocusOwner = (event) => {
+      // A click on blank workspace content leaves BODY focused without a
+      // focusin event. Only an actual user gesture releases that ownership;
+      // browser blur during a breakpoint transition still needs restoration.
+      if (event.type === "pointerdown" || event.target === document.body) {
+        sidebarFocusOwnerRef.current = null;
+        sidebarFocusIntentRef.current = null;
+        sidebarFocusSourceRef.current = null;
       }
     };
     const synchronizeLayout = () => {
@@ -796,20 +837,36 @@ export function App() {
     narrow.addEventListener("change", synchronizeLayout);
     window.addEventListener("resize", synchronizeLayout);
     document.addEventListener("focusin", trackFocus);
+    document.addEventListener("pointerdown", releaseFocusOwner, true);
+    document.addEventListener("keydown", releaseFocusOwner, true);
     return () => {
       narrow.removeEventListener("change", synchronizeLayout);
       window.removeEventListener("resize", synchronizeLayout);
       document.removeEventListener("focusin", trackFocus);
+      document.removeEventListener("pointerdown", releaseFocusOwner, true);
+      document.removeEventListener("keydown", releaseFocusOwner, true);
     };
   }, []);
   useLayoutEffect(() => {
     if (!isNarrow || !sidebarOpen) return;
     const sidebar = sidebarRef.current;
-    if (!sidebar?.contains(document.activeElement)) {
+    let frame;
+    let attempts = 0;
+    const focusDialog = () => {
+      if (sidebar?.contains(document.activeElement)) return;
+      if (document.activeElement !== document.body
+        && document.activeElement !== sidebarFocusSourceRef.current) return;
       const first = sidebar?.querySelector('button:not(:disabled)');
       if (first?.getClientRects().length) first.focus({ preventScroll: true });
-      else sidebar?.focus();
-    }
+      if (!sidebar?.contains(document.activeElement) && attempts++ < 12) frame = requestAnimationFrame(focusDialog);
+    };
+    focusDialog();
+    const restoreDialog = () => {
+      // Making the workspace inert can blur its opener after the first focus
+      // attempt. Restore only when the browser has left focus on BODY.
+      queueMicrotask(() => { if (document.activeElement === document.body) focusDialog(); });
+    };
+    document.addEventListener("focusout", restoreDialog, true);
     const containFocus = (event) => {
       if (event.key !== "Tab") return;
       const focusable = focusableElements(sidebar);
@@ -820,22 +877,38 @@ export function App() {
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     };
     sidebar?.addEventListener("keydown", containFocus);
-    return () => sidebar?.removeEventListener("keydown", containFocus);
+    return () => { cancelAnimationFrame(frame); document.removeEventListener("focusout", restoreDialog, true); sidebar?.removeEventListener("keydown", containFocus); };
   }, [isNarrow, sidebarOpen]);
   useLayoutEffect(() => {
     const intent = sidebarFocusIntentRef.current;
     if (!intent || (intent === "opener" && sidebarOpen) || (intent === "sidebar" && !sidebarOpen)) return;
     let cancelRetry = () => {};
-    const deadline = performance.now() + 3_000;
+    let active = true;
+    let attempts = 0;
+    const maxAttempts = 30;
+    let target;
+    const watchFocus = () => {
+      if (!active || sidebarFocusIntentRef.current !== intent) return;
+      const focused = document.activeElement;
+      if (focused === document.body) { transfer(); return; }
+      if (focused !== target) {
+        sidebarFocusIntentRef.current = null;
+        sidebarFocusSourceRef.current = null;
+        return;
+      }
+      const timer = window.setTimeout(watchFocus, 500);
+      cancelRetry = () => clearTimeout(timer);
+    };
     const transfer = () => {
-      if (sidebarFocusIntentRef.current !== intent) return;
-      const target = intent === "opener" ? document.querySelector('[aria-label="Open projects sidebar"]')
+      if (!active || sidebarFocusIntentRef.current !== intent) return;
+      cancelRetry();
+      cancelRetry = () => {};
+      attempts += 1;
+      target = intent === "opener" ? document.querySelector('[aria-label="Open projects sidebar"]')
         : sidebarRef.current?.querySelector('button:not(:disabled)');
-      const active = document.activeElement;
-      const fromPriorControl = active === sidebarFocusSourceRef.current || (intent === "opener"
-        ? sidebarRef.current?.contains(active)
-        : active?.matches?.('[aria-label="Open projects sidebar"]') || active === sidebarRef.current);
-      if (active !== document.body && active !== target && !fromPriorControl) {
+      const focused = document.activeElement;
+      const fromPriorControl = focused === sidebarFocusSourceRef.current;
+      if (focused !== document.body && focused !== target && !fromPriorControl) {
         sidebarFocusIntentRef.current = null; // Do not override a newer user focus choice.
         sidebarFocusSourceRef.current = null;
         return;
@@ -844,12 +917,13 @@ export function App() {
         target.focus({ preventScroll: true });
         if (document.activeElement === target && target.getBoundingClientRect().width > 0) {
           sidebarFocusOwnerRef.current = intent;
-          sidebarFocusIntentRef.current = null;
-          sidebarFocusSourceRef.current = null;
+          attempts = 0;
+          const timer = window.setTimeout(watchFocus, 500);
+          cancelRetry = () => clearTimeout(timer);
           return;
         }
       }
-      if (performance.now() < deadline) {
+      if (attempts < maxAttempts) {
         let pending = true;
         let frame;
         let timer;
@@ -863,8 +937,39 @@ export function App() {
         cancelRetry = () => { pending = false; cancelAnimationFrame(frame); clearTimeout(timer); };
       }
     };
+    // A breakpoint can detach or blur a control after focus() succeeds.
+    // Some browser viewports omit focusout, so the bounded watch also checks
+    // ownership after delayed layout tasks.
+    const restoreAfterBlur = (event) => {
+      const ownedControl = event.target === sidebarFocusSourceRef.current || (intent === "opener"
+        ? event.target.matches?.('[aria-label="Open projects sidebar"]')
+        : sidebarRef.current?.contains(event.target));
+      if (!ownedControl || sidebarFocusIntentRef.current !== intent) return;
+      queueMicrotask(() => {
+        if (active && sidebarFocusIntentRef.current === intent && document.activeElement === document.body) transfer();
+      });
+      // Some engines dispatch focusout while the old control is still active
+      // and clear activeElement only after this microtask. A committed layout
+      // task gets another chance without overriding a newer focus owner.
+      window.setTimeout(() => {
+        if (active && sidebarFocusIntentRef.current === intent && document.activeElement === document.body) transfer();
+      }, 0);
+    };
+    document.addEventListener("focusout", restoreAfterBlur, true);
+    const releaseOnUserInput = (event) => {
+      if (event.type === "pointerdown" && event.target === target) return;
+      sidebarFocusIntentRef.current = null;
+      sidebarFocusSourceRef.current = null;
+      cancelRetry();
+    };
+    document.addEventListener("pointerdown", releaseOnUserInput, true);
+    document.addEventListener("keydown", releaseOnUserInput, true);
+    const observer = new ResizeObserver(() => {
+      if (active && sidebarFocusIntentRef.current === intent && document.activeElement === document.body) transfer();
+    });
+    if (sidebarRef.current) observer.observe(sidebarRef.current);
     transfer();
-    return () => cancelRetry();
+    return () => { active = false; cancelRetry(); observer.disconnect(); document.removeEventListener("focusout", restoreAfterBlur, true); document.removeEventListener("pointerdown", releaseOnUserInput, true); document.removeEventListener("keydown", releaseOnUserInput, true); };
   }, [isNarrow, sidebarOpen]);
   useLayoutEffect(() => {
     if (!inspector) return;
@@ -896,6 +1001,11 @@ export function App() {
   }, [conversations, selectedConversationId]);
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 2800); return () => clearTimeout(timer); }, [toast]);
   useEffect(() => { if (!error) return; const timer = setTimeout(() => setError(""), 6000); return () => clearTimeout(timer); }, [error]);
+  useEffect(() => {
+    if (!bootstrap || !bootstrapError) return;
+    const timer = setTimeout(() => setBootstrapError(""), 6000);
+    return () => clearTimeout(timer);
+  }, [Boolean(bootstrap), bootstrapError]);
   useEffect(() => {
     const viewport = messageViewportRef.current;
     if (!viewport) return;
@@ -1289,7 +1399,7 @@ export function App() {
         const listRequest = conversationListRequestRef.current;
         const detail = await api(`/api/conversations/${created.id}`);
         superseded ||= listRequest !== conversationListRequestRef.current;
-        if (listRequest === conversationListRequestRef.current && !conversationListPendingRef.current && !conversationListFailed
+        if (!superseded && listRequest === conversationListRequestRef.current && !conversationListPendingRef.current && !conversationListFailed
           && selectedConversationRef.current === created.id && detail.id === created.id
           && detail.projectId === selectedProjectRef.current && detail.worktreeId === selectedWorktreeRef.current && !detail.archived) return detail;
       }
@@ -1654,19 +1764,26 @@ export function App() {
 
   async function createWorktree(event) {
     event.preventDefault();
-    try { await api("/api/worktrees", { method: "POST", body: { projectId: worktreeDialog.id, ...worktreeDraft } }); setWorktreeDialog(null); setWorktreeDraft({ branch: "", name: "", baseBranch: "HEAD" }); await loadBootstrap(); setToast("Worktree created"); }
+    try { const result = await api("/api/worktrees", { method: "POST", body: { projectId: worktreeDialog.id, ...worktreeDraft } }); setWorktreeDialog(null); setWorktreeDraft({ branch: "", name: "", baseBranch: "HEAD" }); const refreshed = await bootstrapLoadRef.current?.(result.refreshDeferred ? 3 : 1); setToast(refreshed === true ? "Worktree created" : "Worktree created; project refresh delayed"); }
     catch (nextError) { setError(nextError.message); }
   }
   async function removeWorktree() {
-    try { await api("/api/worktrees", { method: "DELETE", body: { projectId: project.id, worktreePath: worktree.path, confirmation: removeConfirmation } }); setRemoveWorktreeOpen(false); setRemoveConfirmation(""); setSelectedWorktreeId(""); await loadBootstrap(); setToast("Worktree removed"); }
+    try { const result = await api("/api/worktrees", { method: "DELETE", body: { projectId: project.id, worktreePath: worktree.path, confirmation: removeConfirmation } }); setRemoveWorktreeOpen(false); setRemoveConfirmation(""); setSelectedWorktreeId(""); const refreshed = await bootstrapLoadRef.current?.(result.refreshDeferred ? 3 : 1); setToast(refreshed === true ? "Worktree removed" : "Worktree removed; project refresh delayed"); }
     catch (nextError) { setError(nextError.message); }
   }
   async function refreshAll(includeTemplates = false) {
-    try { const next = await api("/api/bootstrap"); setBootstrap(next); if (includeTemplates) setToast("Templates updated"); } catch (nextError) { setError(nextError.message); }
+    const request = ++settingsRefreshRef.current;
+    const settingsVersion = settingsVersionRef.current;
+    try {
+      const next = await api("/api/bootstrap");
+      if (request !== settingsRefreshRef.current) return;
+      setBootstrap((current) => ({ ...next, settings: settingsVersion === settingsVersionRef.current ? next.settings : current.settings }));
+      if (includeTemplates) setToast("Templates updated");
+    } catch (nextError) { if (request === settingsRefreshRef.current) setError(nextError.message); }
   }
   function openManageChat() { if (!conversation || !conversationDetailReady || !isSelectedTarget(conversation)) return; setChatDraft({ title: conversation.title, providerSessionId: conversation.providerSessionId ?? "", provider: conversation.provider, model: conversation.model ?? "", destination: `${conversation.projectId}::${conversation.worktreeId}` }); setManageChatOpen(true); }
 
-  if (!bootstrap || !project || !worktree) return <LoadingScreen isScanning={isScanning} />;
+  if (!bootstrap || !project || !worktree) return <LoadingScreen isScanning={isScanning} error={bootstrapError} onRetry={() => { setBootstrapError(""); void bootstrapLoadRef.current?.(); }} />;
 
   return <div className={`app-shell ${sidebarOpen ? "sidebar-is-open" : "sidebar-is-closed"}`}>
     <aside className="sidebar" id="project-sidebar" role={isNarrow && sidebarOpen ? "dialog" : undefined} aria-modal={isNarrow && sidebarOpen ? true : undefined} aria-label="Projects and worktrees" aria-hidden={!sidebarOpen} tabIndex={isNarrow ? -1 : undefined} ref={sidebarRef}>
@@ -1695,7 +1812,7 @@ export function App() {
     </main>
 
     <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} projects={bootstrap.projects} onSelectProject={chooseProject} onSelectConversation={(item) => { const nextProject = bootstrap.projects.find((entry) => entry.id === item.projectId); const nextWorktree = nextProject?.worktrees.find((entry) => entry.id === item.worktreeId); if (nextProject && nextWorktree) { pendingConversationRef.current = item.id; chooseProject(nextProject, nextWorktree); } }} />
-    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} onSaved={(nextSettings, refresh) => { setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") Notification.requestPermission(); if (refresh) refreshAll(true); }} onError={handleError} />
+    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} runtimeEvent={runtimeEvent} onSaved={(nextSettings, refresh) => { if (refresh !== "history" && refresh !== "settings" && refresh !== "templates") { ++settingsVersionRef.current; setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") requestNotificationPermission(); } if (refresh) void refreshAll(refresh === "templates"); }} onError={handleError} />
 
     <SimpleDialog open={newChatOpen} onOpenChange={setNewChatOpen} title="New agent chat" description={`${project.name} / ${worktree.name}`} onSubmit={(event) => { event.preventDefault(); createConversation(); }} submit="Create chat"><label htmlFor="chat-title">What should the agent work on?</label><Input id="chat-title" autoFocus value={newChatTitle} onChange={(event) => setNewChatTitle(event.target.value)} placeholder="Review the worktree scanner" /></SimpleDialog>
     <SimpleDialog open={newGroupOpen} onOpenChange={setNewGroupOpen} title="Create project group" description="Organize related projects together in the sidebar." onSubmit={createGroup} submit="Create group" disabled={!newGroupName.trim()}><label htmlFor="group-name">Group name</label><Input id="group-name" autoFocus value={newGroupName} onChange={(event) => setNewGroupName(event.target.value)} placeholder="Client work" /></SimpleDialog>
@@ -1703,7 +1820,11 @@ export function App() {
     <Dialog open={manageChatOpen} onOpenChange={setManageChatOpen}><DialogContent><form className="dialog-form" onSubmit={saveChatSettings}><DialogHeader><DialogTitle>Conversation settings</DialogTitle><DialogDescription>Rename, move, pin, or attach an existing provider session.</DialogDescription></DialogHeader><label htmlFor="chat-settings-title">Title</label><Input id="chat-settings-title" value={chatDraft.title} onChange={(event) => setChatDraft({ ...chatDraft, title: event.target.value })} /><label htmlFor="chat-settings-destination">Move to worktree</label><select id="chat-settings-destination" value={chatDraft.destination} onChange={(event) => setChatDraft({ ...chatDraft, destination: event.target.value })}>{bootstrap.projects.map((item) => <optgroup key={item.id} label={item.name}>{item.worktrees.filter((entry) => !entry.isPrunable && !entry.isBare).map((entry) => <option key={entry.id} value={`${item.id}::${entry.id}`}>{entry.name} · {entry.branch}</option>)}</optgroup>)}</select><label htmlFor="chat-settings-provider">Provider</label><select id="chat-settings-provider" value={chatDraft.provider} onChange={(event) => setChatDraft({ ...chatDraft, provider: event.target.value })}>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.label}</option>)}</select><label htmlFor="chat-settings-model">Model</label><Input id="chat-settings-model" value={chatDraft.model} onChange={(event) => setChatDraft({ ...chatDraft, model: event.target.value })} placeholder="Provider default" /><label htmlFor="chat-settings-session">Provider session ID</label><Input id="chat-settings-session" value={chatDraft.providerSessionId} onChange={(event) => setChatDraft({ ...chatDraft, providerSessionId: event.target.value })} placeholder="Attach or resume an existing session" /><div className="manage-actions"><Button type="button" variant="outline" onClick={() => updateConversation({ pinned: !conversation.pinned })}><PushPin />{conversation?.pinned ? "Unpin" : "Pin"}</Button><Button type="button" variant="destructive" onClick={archiveConversation}><Archive />Archive conversation</Button></div><DialogFooter><Button variant="outline" type="button" onClick={() => setManageChatOpen(false)}>Cancel</Button><Button type="submit">Save</Button></DialogFooter></form></DialogContent></Dialog>
     <SimpleDialog open={Boolean(worktreeDialog)} onOpenChange={(open) => !open && setWorktreeDialog(null)} title="Create worktree" description={worktreeDialog?.name ?? ""} onSubmit={createWorktree} submit="Create worktree" disabled={!worktreeDraft.branch.trim()}><label htmlFor="worktree-branch">Branch name</label><Input id="worktree-branch" value={worktreeDraft.branch} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, branch: event.target.value })} placeholder="feature/my-change" /><label htmlFor="worktree-directory">Directory name <small>optional</small></label><Input id="worktree-directory" value={worktreeDraft.name} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, name: event.target.value })} placeholder="project-my-change" /><label htmlFor="worktree-base">Base revision</label><Input id="worktree-base" value={worktreeDraft.baseBranch} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, baseBranch: event.target.value })} /></SimpleDialog>
     <Dialog open={removeWorktreeOpen} onOpenChange={setRemoveWorktreeOpen}><DialogContent><DialogHeader><DialogTitle>Remove worktree?</DialogTitle><DialogDescription>This is allowed only when the linked worktree has no uncommitted changes. Type its exact path to confirm.</DialogDescription></DialogHeader><code className="confirm-path">{worktree.path}</code><label htmlFor="remove-worktree-confirmation">Confirmation path</label><Input id="remove-worktree-confirmation" value={removeConfirmation} onChange={(event) => setRemoveConfirmation(event.target.value)} placeholder="Exact worktree path" /><DialogFooter><Button variant="outline" onClick={() => setRemoveWorktreeOpen(false)}>Cancel</Button><Button variant="destructive" disabled={removeConfirmation !== worktree.path} onClick={removeWorktree}>Remove worktree</Button></DialogFooter></DialogContent></Dialog>
-    {toast && <div className="toast" role="status" aria-live="polite"><CheckCircle weight="fill" />{toast}</div>}{error && <div className="error-toast" role="alert" aria-live="assertive"><WarningCircle weight="fill" /><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error"><X /></button></div>}
+    {toast && <div className="toast" role="status" aria-live="polite"><CheckCircle weight="fill" />{toast}</div>}
+    {(error || bootstrapError) && <div className="error-toast-stack">
+      {error && <div className="error-toast" role="alert" aria-live="assertive"><WarningCircle weight="fill" /><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error"><X /></button></div>}
+      {bootstrapError && <div className="error-toast" role="alert" aria-live="assertive"><WarningCircle weight="fill" /><span>{bootstrapError}</span><button onClick={() => setBootstrapError("")} aria-label="Dismiss loading error"><X /></button></div>}
+    </div>}
   </div>;
 }
 
@@ -1767,17 +1888,31 @@ function RecoveryNotice({ run, conversation, recoveryConversation, onOpenRecover
 function ToolActivity({ events }) { if (!events.length) return null; return <div className="tool-activity">{events.slice(-4).map((event) => <div key={event.id}><CheckCircle /><span>{toolLabel(event)}</span></div>)}</div>; }
 function EmptyChat({ worktree, onCreate }) { return <div className="empty-chat"><ChatCircle size={29} /><h2>Start in {worktree.name}</h2><p>Create a durable conversation, then run Codex or Claude directly in this worktree.</p><Button onClick={onCreate}><Plus />New chat</Button></div>; }
 function WorktreeState({ worktree }) { if (worktree.isPrunable) return <span className="worktree-state warning"><WarningCircle />stale</span>; if (worktree.changedCount) return <span className="worktree-state warning"><GitDiff />{worktree.changedCount} changed</span>; return <span className="worktree-state clean"><Check />clean</span>; }
-function RunState({ run }) { if (!run) return null; const running = ["queued", "launching", "running"].includes(run.status); const pendingDecision = run.status === "interrupted" && !run.recoveryDecision; return <span className={`run-state ${run.status}`} role="status" aria-live="polite" title={pendingDecision ? "Restart interrupted this run; choose a continuation below" : undefined}><span className={`status-dot ${running || pendingDecision ? "demo" : run.status === "completed" ? "live" : "error"}`} aria-hidden="true" />{run.status}{run.costUsd != null && <small>${Number(run.costUsd).toFixed(3)}</small>}</span>; }
+function RunState({ run }) {
+  if (!run) return null;
+  const running = ["queued", "launching", "running"].includes(run.status);
+  const pendingDecision = run.status === "interrupted" && !run.recoveryDecision;
+  let dotState = "error";
+  if (running || pendingDecision) dotState = "demo";
+  else if (run.status === "completed") dotState = "live";
+  return <span className={`run-state ${run.status}`} role="status" aria-live="polite" title={pendingDecision ? "Restart interrupted this run; choose a continuation below" : undefined}><span className={`status-dot ${dotState}`} aria-hidden="true" />{run.status}{run.transcriptOmitted ? " · output omitted" : ""}{run.costUsd != null && <small>${Number(run.costUsd).toFixed(3)}</small>}</span>;
+}
 function GitHealth({ worktree }) { if (worktree.isPrunable) return <span className="git-health warning"><WarningCircle /></span>; if (worktree.changedCount) return <span className="git-health warning"><span className="status-dot demo" />{worktree.changedCount}</span>; return <span className="git-health clean"><Check /></span>; }
 function TemplateMenu({ templates, onSelect }) { if (!templates.length) return null; return <DropdownMenu><DropdownMenuTrigger render={<Button type="button" variant="ghost" size="icon-sm" aria-label="Prompt templates" />}><ClockCounterClockwise /></DropdownMenuTrigger><DropdownMenuContent align="start"><DropdownMenuGroup><DropdownMenuLabel>Prompt templates</DropdownMenuLabel>{templates.map((template) => <DropdownMenuItem key={template.id} onClick={() => onSelect(template.prompt)}>{template.title}</DropdownMenuItem>)}</DropdownMenuGroup></DropdownMenuContent></DropdownMenu>; }
 function ThemeMenu({ theme, onThemeChange }) { const Icon = theme === "light" ? Sun : theme === "dark" ? Moon : Desktop; return <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Change theme" />}><Icon /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup><DropdownMenuLabel>Appearance</DropdownMenuLabel></DropdownMenuGroup><DropdownMenuRadioGroup value={theme} onValueChange={onThemeChange}><DropdownMenuRadioItem value="system"><Desktop />System</DropdownMenuRadioItem><DropdownMenuRadioItem value="light"><Sun />Light</DropdownMenuRadioItem><DropdownMenuRadioItem value="dark"><Moon />Dark</DropdownMenuRadioItem></DropdownMenuRadioGroup></DropdownMenuContent></DropdownMenu>; }
 function SimpleDialog({ open, onOpenChange, title, description, onSubmit, submit, disabled, children }) { return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><form className="dialog-form" onSubmit={onSubmit}><DialogHeader><DialogTitle>{title}</DialogTitle><DialogDescription>{description}</DialogDescription></DialogHeader>{children}<DialogFooter><Button type="button" variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button><Button type="submit" disabled={disabled}>{submit}</Button></DialogFooter></form></DialogContent></Dialog>; }
-function LoadingScreen({ isScanning }) { return <div className="loading-screen" role="status" aria-live="polite"><span className="brand-glyph"><Sparkle weight="fill" /></span><h1>Outright</h1><p>{isScanning ? "Starting the local runtime…" : "No projects found"}</p></div>; }
+function LoadingScreen({ isScanning, error, onRetry }) { return <div className="loading-screen" role="status" aria-live="polite"><span className="brand-glyph"><Sparkle weight="fill" /></span><h1>Outright</h1>{error ? <><p role="alert">{error}</p><Button onClick={onRetry}>Retry</Button></> : <p>{isScanning ? "Starting the local runtime…" : "No projects found"}</p>}</div>; }
 function buildGroupedProjects(projects, state) { const result = state.groups.map((group) => ({ ...group, projects: projects.filter((project) => state.memberships[project.id] === group.id) })); const ungrouped = projects.filter((project) => !state.groups.some((group) => group.id === state.memberships[project.id])); return ungrouped.length ? [...result, { id: "ungrouped", name: "Ungrouped", projects: ungrouped }] : result; }
 function preferredWorktree(project) { return project.worktrees.find((item) => item.name === "dev" || item.path.endsWith("-dev")) ?? project.worktrees.find((item) => item.branch === "next") ?? project.worktrees[0]; }
 function compactPath(value = "") { return value.replace(/^\/Users\/[^/]+/, "~"); }
 function defaultSettings() { return { provider: "codex", model: "", reasoningEffort: "medium", approvalPolicy: "workspace-write", editor: "zed", notifications: true, maxConcurrentRuns: 3 }; }
 function focusableElements(container) { return container ? [...container.querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')].filter((element) => element.getClientRects().length && element.getAttribute("aria-hidden") !== "true") : []; }
+
+function requestNotificationPermission() {
+  // The microtask also turns older browsers' synchronous throws into a
+  // rejection, so both failure paths are handled by the same promise chain.
+  void Promise.resolve().then(() => Notification.requestPermission()).catch(() => {});
+}
 function boundStreamingText(value) { return value.length > MAX_STREAMING_CHARACTERS ? `${value.slice(0, MAX_STREAMING_CHARACTERS)}${LIVE_TRUNCATION_MARKER}` : value; }
 
 function boundPageMessage(message, matchNeedle = "") {
@@ -1855,5 +1990,11 @@ function readingLivePreview(checkpoint, suffix) {
   return truncated ? `[Earlier live output omitted]\n${visible}` : visible;
 }
 function formatTime(value) { return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(value)); }
-function runSummary(run) { const tokens = Number(run.inputTokens ?? 0) + Number(run.outputTokens ?? 0); return `${run.status}${tokens ? ` · ${tokens.toLocaleString()} tokens` : ""}${run.costUsd != null ? ` · $${Number(run.costUsd).toFixed(3)}` : ""}`; }
+function runSummary(run) {
+  const tokens = Number(run.inputTokens ?? 0) + Number(run.outputTokens ?? 0);
+  const omission = run.transcriptOmitted ? " · output omitted" : "";
+  const tokenSummary = tokens ? ` · ${tokens.toLocaleString()} tokens` : "";
+  const costSummary = run.costUsd == null ? "" : ` · $${Number(run.costUsd).toFixed(3)}`;
+  return `${run.status}${omission}${tokenSummary}${costSummary}`;
+}
 function toolLabel(event) { const item = event.payload?.item ?? {}; return item.command || item.name || item.type || (event.type === "tool.started" ? "Tool started" : "Tool completed"); }
