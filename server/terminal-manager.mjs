@@ -86,7 +86,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       terminal.exitSeen = true;
       terminal.exitCode = exitCode;
       terminal.signal = signal;
-      if (!terminal.closePromise) void settleNaturalExit(terminal);
+      if (!terminal.closePromise) startNaturalExit(terminal);
     });
     try { database.auditCritical("terminal.created", { ...evidence, pid: terminal.pid }); }
     catch (error) {
@@ -139,7 +139,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
         terminal.exitSeen = true;
         terminal.exitCode = exitCode;
         terminal.signal = signal;
-        if (terminal.recorded && !terminal.closePromise && terminal.status !== "closing") void settleNaturalExit(terminal);
+        if (terminal.recorded && !terminal.closePromise && terminal.status !== "closing") startNaturalExit(terminal);
       });
       database.auditCritical("terminal.created", { ...evidence, pid: terminal.pid,
         processIdentity: processInstance.processIdentity,
@@ -147,7 +147,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       terminal.recorded = true;
       if (terminal.status === "unknown") throw new Error("PTY ownership could not be verified after launch");
       if (terminal.status === "launching") terminal.status = "running";
-      if (terminal.exitSeen && !terminal.closePromise && terminal.status !== "closing") void settleNaturalExit(terminal);
+      if (terminal.exitSeen && !terminal.closePromise && terminal.status !== "closing") startNaturalExit(terminal);
       return publicTerminal(terminal);
     } catch (error) {
       terminal.status = "closing";
@@ -171,6 +171,11 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   function get(id) { const terminal = terminals.get(id); return terminal ? { ...publicTerminal(terminal), buffer: terminal.buffer, outputCursor: terminal.outputCursor } : null; }
   function write(id, data) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running" || typeof data !== "string" || Buffer.byteLength(data) > 64 * 1024) return false; return terminal.process.write(data) !== false; }
   function resize(id, cols, rows) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running") return false; return terminal.process.resize(clamp(cols, 20, 400), clamp(rows, 5, 200)) !== false; }
+  function startNaturalExit(terminal) {
+    if (terminal.settlePromise) return;
+    terminal.status = "settling";
+    terminal.settlePromise = settleNaturalExit(terminal).finally(() => { terminal.settlePromise = null; });
+  }
   async function settleNaturalExit(terminal) {
     // Native supervisors report exit only after their ownership boundary is
     // empty. Keep the slot if that proof or its required audit is unavailable.
@@ -178,14 +183,17 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       await terminate(terminal, { alreadyExited: true });
       if (!spawnTerminal) cleanupTerminalSocket(terminal.id);
       if (!terminals.has(terminal.id) || terminal.closePromise) return;
+      await database.auditRequired("terminal.exited", { target: terminal.id, exitCode: terminal.exitCode, signal: terminal.signal });
+      if (!terminals.has(terminal.id) || terminal.closePromise) return;
       terminal.status = "exited";
       publish({ type: "terminal.exit", terminalId: terminal.id, payload: { exitCode: terminal.exitCode, signal: terminal.signal } });
-      await database.auditRequired("terminal.exited", { target: terminal.id, exitCode: terminal.exitCode, signal: terminal.signal });
       terminal.cleanupTimer = setTimeout(() => terminals.delete(terminal.id), exitedRetentionMs);
       terminal.cleanupTimer.unref?.();
     } catch (error) {
-      terminal.status = "unknown";
-      publish({ type: "terminal.audit-failed", terminalId: terminal.id, payload: { error: error.message } });
+      if (terminals.get(terminal.id) === terminal && !terminal.closePromise) {
+        terminal.status = "unknown";
+        publish({ type: "terminal.audit-failed", terminalId: terminal.id, payload: { error: error.message } });
+      }
     }
   }
   function close(id) {

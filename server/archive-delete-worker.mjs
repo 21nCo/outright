@@ -4,7 +4,7 @@ import { parentPort, workerData } from "node:worker_threads";
 import { archiveShadowPaths, cutoverArchiveShadow, fenceArchiveSource, prepareArchiveShadowCutover } from "./archive-shadow.mjs";
 import { trimAudit } from "./audit-retention.mjs";
 
-const { filename, conversationId, table, rowId, lockGate, cutoverStatGate, copyGate, copyStepGate, copyPhase } = workerData;
+const { filename, conversationId, table, rowId, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase } = workerData;
 const ownership = {
   run_events: `SELECT 1 FROM run_events AS item JOIN runs ON runs.id = item.run_id
     WHERE item.id = ? AND runs.conversation_id = ?`,
@@ -196,9 +196,17 @@ try {
     if (!["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code)) throw error;
     throw Object.assign(new Error("Archive source could not be fenced at cutover"), { code: "ARCHIVE_SOURCE_BUSY" });
   }
+  // Capture the source identity while the exclusive SQLite fence is still
+  // held. A direct connection may commit as soon as close releases it.
+  const sourceInfo = statSync(filename, { bigint: true });
   source.close();
   source = undefined;
-  const sourceInfo = statSync(filename, { bigint: true });
+  if (cutoverCloseGate instanceof SharedArrayBuffer) {
+    const signal = new Int32Array(cutoverCloseGate);
+    Atomics.store(signal, 0, 1);
+    Atomics.notify(signal, 0);
+    if (Atomics.wait(signal, 0, 1, 5000) === "timed-out") throw new Error("Archive close-gap probe timed out");
+  }
   cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate });
   parentPort.postMessage({ ok: true });
 } catch (error) {

@@ -136,7 +136,8 @@ export function createOutrightDatabase(options = {}) {
     if (!closing) options.onDeletionWorkerExit?.();
   };
   const deletionContext = { isClosing: () => closing, filename: storageFilename, currentDb: () => db,
-    workers: deletionWorkers, lockGate: options.deletionWorkerGate, cutoverStatGate: options.deletionCutoverStatGate, copyGate: options.deletionCopyGate,
+    workers: deletionWorkers, lockGate: options.deletionWorkerGate, cutoverStatGate: options.deletionCutoverStatGate,
+    cutoverCloseGate: options.deletionCutoverCloseGate, copyGate: options.deletionCopyGate,
     copyStepGate: options.deletionCopyStepGate, copyPhase: options.deletionCopyPhase,
     canMaintain: () => activeMessageFinds === 0 && deletionsInFlight.size === 1,
     onWorkerStart: () => {
@@ -1700,7 +1701,7 @@ function runPatchAssignments(patch) {
 // runtime connection; a giant legacy row is reclaimed in a shadow database
 // while the primary stays available for unrelated work. Only the final
 // cutover closes it behind the process lease.
-function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosing, filename, workers, lockGate, cutoverStatGate, copyGate, copyStepGate, copyPhase, currentDb, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure }) {
+function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosing, filename, workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase, currentDb, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure }) {
   if (inFlight.has(id)) throw databaseError(409, "Archived conversation deletion is in progress");
   inFlight.add(id);
   const run = async () => {
@@ -1710,7 +1711,7 @@ function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosin
         if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
         db = currentDb();
         const result = await advanceArchiveDeletion(db, id,
-          { filename, workers, lockGate, cutoverStatGate, copyGate, copyStepGate, copyPhase, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing });
+          { filename, workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing });
         if (result) return result;
         await new Promise((resolve) => setImmediate(resolve));
       }
@@ -1719,7 +1720,7 @@ function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosin
   return run();
 }
 
-async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, cutoverStatGate, copyGate, copyStepGate, copyPhase, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing }) {
+async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing }) {
   const step = db.transaction(() => deleteArchivedBatch(db, id, filename)).immediate();
   if (step.done) { onWorkerExit(); return { deleted: 1, id }; }
   if (!step.oversized) return null;
@@ -1728,7 +1729,7 @@ async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, cut
   if (workers.size || !canMaintain() || db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
     return { deleted: 0, deferred: true, id };
   }
-  try { await deleteOversizedArchivedRow(filename, id, step.oversized, { workers, lockGate, cutoverStatGate, copyGate, copyStepGate, copyPhase, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure }); }
+  try { await deleteOversizedArchivedRow(filename, id, step.oversized, { workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure }); }
   catch (error) {
     if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
     if (["ARCHIVE_SNAPSHOT_CHANGED", "ARCHIVE_DEFERRED", "ARCHIVE_SOURCE_BUSY"].includes(error.code)) {
@@ -1788,12 +1789,12 @@ function deleteArchivedBatch(db, id, filename) {
 }
 
 function deleteOversizedArchivedRow(filename, conversationId, oversized, lifecycle) {
-  const { workers, lockGate, cutoverStatGate, copyGate, copyStepGate, copyPhase, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure } = lifecycle;
+  const { workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure } = lifecycle;
   return new Promise((resolve, reject) => {
     let worker;
     try {
       worker = new Worker(new URL("./archive-delete-worker.mjs", import.meta.url),
-        { workerData: { filename, conversationId, ...oversized, lockGate, cutoverStatGate, copyGate, copyStepGate, copyPhase } });
+        { workerData: { filename, conversationId, ...oversized, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase } });
     } catch (error) { reject(error); return; }
     workers.add(worker);
     let reply;

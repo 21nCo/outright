@@ -119,6 +119,54 @@ test("a full audit budget refuses PTY creation and a natural exit is retained ac
   } finally { await manager.shutdown(); database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("an in-flight or failed natural-exit audit keeps capacity charged through close and restart", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-exit-audit-"));
+  const filename = path.join(directory, "runtime.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  let rejectExitAudit;
+  let reportExit;
+  const pending = new Promise((_, reject) => { rejectExitAudit = reject; });
+  const audited = {
+    auditAdmission: (...args) => database.auditAdmission(...args),
+    auditCritical: (...args) => database.auditCritical(...args),
+    auditRequired: (action, ...args) => action === "terminal.exited" ? pending : database.auditRequired(action, ...args),
+  };
+  const manager = createTerminalManager({ database: audited, publish: () => {}, maxTerminals: 1,
+    spawnTerminal: () => ({ pid: 42, onData() {}, onExit(callback) { reportExit = callback; }, kill() {} }),
+    terminate: async () => {} });
+  try {
+    const first = manager.create({ cwd: directory });
+    reportExit({ exitCode: 0, signal: null });
+    await waitFor(() => manager.get(first.id)?.status === "settling");
+    assert.equal(manager.capacity().active, 1);
+    assert.throws(() => manager.create({ cwd: directory }), (error) => error.statusCode === 429);
+    rejectExitAudit(Object.assign(new Error("audit busy"), { code: "SQLITE_BUSY" }));
+    await waitFor(() => manager.get(first.id)?.status === "unknown");
+    assert.equal(manager.capacity().unknown, 1);
+    assert.throws(() => manager.create({ cwd: directory }), (error) => error.statusCode === 429);
+    assert.equal(database.listAudit(20).some((entry) => entry.action === "terminal.exited" && entry.target === first.id), false);
+    assert.equal(await manager.close(first.id), true);
+    const second = manager.create({ cwd: directory });
+    assert.equal(manager.capacity().active, 1);
+    await manager.shutdown();
+    assert.equal(manager.get(second.id), null);
+    await database.close();
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    database.reconcileTerminalAudit();
+    assert.deepEqual(database.terminalUnknownReservations(), []);
+    const writer = new Database(filename);
+    try {
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES ('telemetry', '', '{}', '2026-01-01')");
+      writer.transaction(() => { for (let index = 0; index < 10_050; index += 1) insert.run(); }).immediate();
+    } finally { writer.close(); }
+    database.audit("telemetry", { target: "trim" });
+    assert.equal(database.listAudit(10_100).some((entry) => entry.action === "terminal.created" && entry.target === first.id), false);
+  } finally {
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("a close that cannot record its outcome reports the pending operation", async () => {
   const actions = [];
   let killed = false;

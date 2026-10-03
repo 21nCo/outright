@@ -1393,6 +1393,55 @@ test("a committed source write at archive cutover discards the stale shadow and 
   }
 });
 
+test("a direct schema commit after source close defers stale shadow promotion", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-close-gap-"));
+  const filename = path.join(directory, "outright.db");
+  const gate = new Int32Array(new SharedArrayBuffer(4));
+  let database = createOutrightDatabase({ filename, runtimeLease: true, deletionCutoverCloseGate: gate.buffer });
+  try {
+    const sibling = chat(database, "recoverable sibling");
+    database.addMessage({ conversationId: sibling.id, role: "assistant", body: "before close" });
+    const queued = database.createRun(runInput(sibling.id));
+    const archived = chat(database, "large archive");
+    const large = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    const legacy = new Database(filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), large.id);
+    legacy.close();
+    database.updateConversation(archived.id, { archived: true });
+    const deletion = database.deleteArchivedConversation(archived.id, archived.id);
+    const deadline = Date.now() + 5000;
+    while (Atomics.load(gate, 0) !== 1) {
+      assert.ok(Date.now() < deadline, "worker did not release the fenced source");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    const writer = new Database(filename);
+    try {
+      writer.exec("CREATE TABLE close_gap_schema (value TEXT)");
+      writer.pragma("user_version = 42");
+    } finally { writer.close(); }
+    Atomics.store(gate, 0, 2);
+    Atomics.notify(gate, 0);
+    assert.equal((await deletion).deferred, true, "post-close source commits must reject a stale candidate");
+    await database.close();
+    database = null;
+    const proof = new Database(filename, { readonly: true });
+    try {
+      assert.ok(proof.prepare("SELECT 1 FROM sqlite_master WHERE name = 'close_gap_schema'").get());
+      assert.equal(proof.pragma("user_version", { simple: true }), 42);
+      assert.equal(proof.prepare("SELECT body FROM messages WHERE conversation_id = ?").get(sibling.id).body, "before close");
+      assert.equal(proof.prepare("SELECT prompt FROM runs WHERE id = ?").get(queued.id).prompt, "work");
+      assert.equal(proof.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes, retainedReadback(proof));
+    } finally { proof.close(); }
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    assert.equal(database.getRun(queued.id).status, "queued");
+  } finally {
+    Atomics.store(gate, 0, 2);
+    Atomics.notify(gate, 0);
+    await database?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("a direct writer after the source closes cannot commit through shadow promotion", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-final-fence-"));
   const filename = path.join(directory, "outright.db");
