@@ -150,6 +150,10 @@ try {
   // Preparation validates the closed candidate and records its digest. A
   // second full integrity scan here would read the whole archive twice.
   prepareArchiveShadowCutover(filename);
+  // The parent checks its own source snapshot before closing the runtime
+  // connection. Keep a second, worker-local version across that handoff:
+  // another SQLite connection can still commit while the parent is closed.
+  const cutoverSourceVersion = source.pragma("data_version", { simple: true });
   parentPort.postMessage({ ready: "cutover" });
   await new Promise((resolve, reject) => {
     parentPort.once("message", (message) => message === "proceed" ? resolve() : reject(new Error("Invalid archive cutover command")));
@@ -167,9 +171,20 @@ try {
     throw Object.assign(new Error("Archive source WAL is busy at cutover"), { code: "ARCHIVE_SOURCE_BUSY" });
   }
   if (finalCheckpoint?.busy) throw Object.assign(new Error("Archive source WAL is busy at cutover"), { code: "ARCHIVE_SOURCE_BUSY" });
+  if (source.pragma("data_version", { simple: true }) !== cutoverSourceVersion) {
+    throw Object.assign(new Error("Archive source changed at cutover; retry when idle"), { code: "ARCHIVE_SOURCE_BUSY" });
+  }
+  const beforeClose = statSync(filename, { bigint: true });
   source.close();
   source = undefined;
-  cutoverArchiveShadow(filename);
+  // Closing SQLite may checkpoint its own sidecars. Pin the resulting file
+  // identity so a commit/checkpoint after close cannot silently replace the
+  // newer source with the prepared shadow.
+  const sourceInfo = statSync(filename, { bigint: true });
+  if (["dev", "ino", "size", "mtimeNs", "ctimeNs"].some((key) => beforeClose[key] !== sourceInfo[key])) {
+    throw Object.assign(new Error("Archive source changed while closing; retry when idle"), { code: "ARCHIVE_SOURCE_BUSY" });
+  }
+  cutoverArchiveShadow(filename, { sourceInfo });
   parentPort.postMessage({ ok: true });
 } catch (error) {
   parentPort.postMessage({ ok: false, error: error.message, code: error.code });

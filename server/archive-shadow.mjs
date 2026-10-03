@@ -239,7 +239,7 @@ export function prepareArchiveShadowCutover(filename) {
   durableDirectory(state);
 }
 
-export function cutoverArchiveShadow(filename) {
+export function cutoverArchiveShadow(filename, { sourceInfo } = {}) {
   const { next, old, state } = archiveShadowPaths(filename);
   if (!privateRegularFile(next)) throw new Error("Archive shadow is missing");
   if (fileInfo(old) || !privateRegularFile(state)) throw new Error("Archive cutover state is missing or conflicting");
@@ -253,6 +253,12 @@ export function cutoverArchiveShadow(filename) {
   if (hasNonemptyWal(next)) throw new Error("Archive shadow WAL was not checkpointed");
   removeCheckpointedSidecars(filename);
   removeCheckpointedSidecars(next);
+  if (sourceInfo) {
+    const current = statSync(filename, { bigint: true });
+    if (["dev", "ino", "size", "mtimeNs", "ctimeNs"].some((key) => current[key] !== sourceInfo[key])) {
+      throw Object.assign(new Error("Archive source changed after close; retry when idle"), { code: "ARCHIVE_SOURCE_BUSY" });
+    }
+  }
   renameSync(filename, old);
   durableDirectory(filename);
   // An interrupted promotion keeps both names and the durable marker. The

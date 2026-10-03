@@ -1180,6 +1180,68 @@ test("oversized cleanup fences the live database and reclaims a shadow before re
   }
 });
 
+test("a committed source write at archive cutover discards the stale shadow and survives restart", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-late-write-"));
+  const filename = path.join(directory, "outright.db");
+  const lockGate = new Int32Array(new SharedArrayBuffer(4));
+  let database = createOutrightDatabase({ filename, runtimeLease: true, deletionWorkerGate: lockGate.buffer });
+  try {
+    const sibling = chat(database, "retained sibling");
+    const retained = database.addMessage({ conversationId: sibling.id, role: "assistant", body: "before cutover" });
+    const queued = database.createRun(runInput(sibling.id));
+    const archived = chat(database, "legacy overflow");
+    const large = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    const legacy = new Database(filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), large.id);
+    legacy.close();
+    database.updateConversation(archived.id, { archived: true });
+    const deletion = database.deleteArchivedConversation(archived.id, archived.id);
+    const deadline = Date.now() + 5000;
+    while (Atomics.load(lockGate, 0) !== 1) {
+      assert.ok(Date.now() < deadline, "shadow did not reach the cutover gate");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    const writer = new Database(filename);
+    try {
+      writer.transaction(() => {
+        writer.prepare("UPDATE messages SET body = ? WHERE id = ?").run("committed at cutover", retained.id);
+        writer.prepare("UPDATE runs SET prompt = ? WHERE id = ?").run("queued evidence at cutover", queued.id);
+        writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
+          .run("cutover.probe", sibling.id, "{}", new Date().toISOString());
+        writer.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+          .run("cutover.probe", "committed");
+      }).immediate();
+    } finally { writer.close(); }
+    Atomics.store(lockGate, 0, 2);
+    Atomics.notify(lockGate, 0);
+    assert.equal((await deletion).deferred, true, "a stale shadow replaced a committed source transaction");
+    await database.close();
+    database = null;
+    const proof = new Database(filename, { readonly: true });
+    try {
+      assert.equal(proof.prepare("SELECT body FROM messages WHERE id = ?").get(retained.id).body, "committed at cutover");
+      assert.equal(proof.prepare("SELECT prompt FROM runs WHERE id = ?").get(queued.id).prompt, "queued evidence at cutover");
+      assert.equal(proof.prepare("SELECT value FROM settings WHERE key = ?").get("cutover.probe").value, "committed");
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = ?").get("cutover.probe").count, 1);
+      assert.equal(proof.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes, retainedReadback(proof));
+    } finally { proof.close(); }
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    const completed = Date.now() + 8000;
+    while (archivePresentOrMaintaining(database, filename, archived.id)) {
+      assert.ok(Date.now() < completed, "deferred deletion did not resume after restart");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(database.listMessages(sibling.id)[0].body, "committed at cutover");
+    assert.equal(database.getRun(queued.id).prompt, "queued evidence at cutover");
+    assert.equal(database.listAudit().filter((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id).length, 1);
+  } finally {
+    Atomics.store(lockGate, 0, 2);
+    Atomics.notify(lockGate, 0);
+    await database?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("shadow copy serves unrelated work and retries after a concurrent source write", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-live-copy-"));
   const filename = path.join(directory, "outright.db");
