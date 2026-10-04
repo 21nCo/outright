@@ -1369,6 +1369,44 @@ test("large terminal audit recovery refreshes runtime capacity after startup", a
   }
 });
 
+test("shutdown waits for a native terminal recovery started by the audit scan", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-runtime-audit-shutdown-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+  let runtime;
+  try {
+    const target = "54d20348-0790-4ba8-b888-e05887e48452";
+    const seed = createOutrightDatabase();
+    seed.auditCritical("terminal.created", { target, cwd: dataDirectory, pid: 333 });
+    await seed.close();
+    let markRecoveryStarted;
+    const recoveryStarted = new Promise((resolve) => { markRecoveryStarted = resolve; });
+    let finishRecovery;
+    const recoveryResult = new Promise((resolve) => { finishRecovery = resolve; });
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json",
+      terminalManagerFactory: (options) => createTerminalManager({ ...options, recoverTerminal: () => {
+        markRecoveryStarted();
+        return recoveryResult;
+      } }) });
+    await recoveryStarted;
+    let shutdownSettled = false;
+    const shutdown = runtime.shutdown().then(() => { shutdownSettled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(shutdownSettled, false, "shutdown cannot close SQLite while native recovery owns an audit outcome");
+    finishRecovery(true);
+    await shutdown;
+    const writer = new Database(path.join(dataDirectory, "outright.db"), { readonly: true });
+    try {
+      assert.equal(writer.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.recovered' AND target = ?").get(target).count, 1);
+    } finally { writer.close(); }
+  } finally {
+    await runtime?.shutdown();
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR;
+    else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
 test("rejects a malformed recovery policy with 400", withRuntime(async (runtime) => {
   const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
   const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });

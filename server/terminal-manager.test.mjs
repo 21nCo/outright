@@ -663,6 +663,11 @@ test("legacy terminal audit history yields startup and resumes safely after inte
         ["54d20348-0790-4ba8-b888-e05887e4844e", "54d20348-0790-4ba8-b888-e05887e4844f"]);
       assert.ok(database.listAudit(10).some((entry) => entry.action === "terminal.create.unknown"));
       assert.ok(database.listAudit(10).some((entry) => entry.action === "terminal.unknown"));
+      const readback = new Database(filename, { readonly: true });
+      try {
+        assert.ok(readback.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= 10_000,
+          "legacy telemetry was not trimmed after ownership was reconstructed");
+      } finally { readback.close(); }
     } finally { await manager.shutdown(); }
   } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
 });

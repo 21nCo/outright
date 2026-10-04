@@ -674,6 +674,8 @@ async function settingsCapacityWithoutEventRegression() {
     && document.querySelector(".capacity-status")?.textContent.includes("4.0 of 64 MiB retained"),
   "capacity converges without an event after another client writes");
   const capacityText = () => document.querySelector(".capacity-status")?.textContent ?? "";
+  assert(document.querySelector(".capacity-status")?.tagName === "P",
+    "polled measurements should be readable without a live status announcement on every value change");
   otherClientCapacity = { ...otherClientCapacity, availablePhysicalForNewWorkBytes: 32 * 1024 };
   await until(() => capacityText().includes("New work is paused at the physical storage threshold"),
     "32 KiB physical headroom announces the same pause as run admission");
@@ -688,6 +690,8 @@ async function settingsCapacityWithoutEventRegression() {
   otherClientCapacity = { ...otherClientCapacity, diskAllocatedBytes: null, diskUsageStatus: "unknown" };
   await until(() => capacityText().includes("Allocated disk use is unknown"),
     "an unknown measurement does not present a numeric budget");
+  assert(!capacityText().includes(" MiB budget") && !capacityText().includes("physical storage threshold"),
+    "unknown physical use cannot show a measured budget or threshold warning");
   [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Cancel").click();
   const readsAtClose = reads;
   await new Promise((resolve) => setTimeout(resolve, 2200));
@@ -1571,10 +1575,10 @@ async function terminalUnknownRegression() {
     runtimeEvent={event} onError={(error) => { throw error; }} sendRuntime={(message) => sent.push(message)} />);
   show();
   await until(() => terminalReady("Terminal A"), "running terminal before unknown ownership");
-  const before = sent.length;
   show({ type: "terminal.audit-failed", terminalId: "term-A" });
   await until(() => host.querySelector('[data-tab-id="term-A"]')?.getAttribute("aria-label").includes("ownership unverified"), "unknown ownership announcement");
   assert(host.querySelector('.terminal-pane [role="status"]')?.textContent.includes("ownership is unverified"), "Unknown terminal lacks a spoken status");
+  const before = sent.length;
   host.querySelector('.terminal-host').style.width = "540px";
   const input = host.querySelector('.terminal-host .xterm-helper-textarea');
   input.focus();

@@ -1493,6 +1493,81 @@ test("oversized cleanup fences the live database and reclaims a shadow before re
   }
 });
 
+test("archive cutover defers while legacy terminal ownership is being reconstructed", { timeout: 20_000 }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-audit-cutover-"));
+  const filename = path.join(directory, "outright.db");
+  const copyGate = new Int32Array(new SharedArrayBuffer(4));
+  const database = createOutrightDatabase({ filename, runtimeLease: true, deletionCopyGate: copyGate.buffer });
+  const terminalId = "54d20348-0790-4ba8-b888-e05887e48453";
+  let resumeScan;
+  try {
+    const archived = chat(database, "archive with pending terminal audit");
+    const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    expandLegacyMessage(filename, message.id);
+    database.updateConversation(archived.id, { archived: true });
+    const writer = new Database(filename);
+    try {
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)");
+      writer.transaction(() => {
+        for (let index = 0; index < 2_100; index += 1) insert.run("legacy.telemetry", "", "{}", "2026-09-01");
+        insert.run("terminal.created", terminalId,
+          JSON.stringify({ cwd: directory, pid: 333 }), "2026-09-01");
+      }).immediate();
+    } finally { writer.close(); }
+    const deletion = database.deleteArchivedConversation(archived.id, archived.id);
+    const copyDeadline = Date.now() + 5_000;
+    while (Atomics.load(copyGate, 0) !== 1) {
+      assert.ok(Date.now() < copyDeadline, "archive copy did not reach its controlled cutover gate");
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    const originalSetImmediate = globalThis.setImmediate;
+    globalThis.setImmediate = (callback, ...args) => {
+      if (callback.name === "advanceTerminalAuditScan") {
+        resumeScan = () => originalSetImmediate(callback, ...args);
+        return originalSetImmediate(() => {});
+      }
+      return originalSetImmediate(callback, ...args);
+    };
+    try { database.reconcileTerminalAudit(); }
+    finally { globalThis.setImmediate = originalSetImmediate; }
+    assert.equal(database.terminalAuditScanPending, true);
+    assert.equal(typeof resumeScan, "function");
+    Atomics.store(copyGate, 0, 2);
+    Atomics.notify(copyGate, 0);
+    const deferred = await deletion;
+    assert.equal(deferred.deferred, true, "cutover closed SQLite during the pending ownership scan");
+    assert.equal(database.maintenanceActive, false);
+    assert.equal(database.terminalAuditScanPending, true);
+    const source = new Database(filename, { readonly: true });
+    try { assert.equal(source.prepare("SELECT COUNT(*) AS count FROM conversations WHERE id = ?").get(archived.id).count, 1); }
+    finally { source.close(); }
+    resumeScan();
+    await database.waitForTerminalAuditReconciliation();
+    const deadline = Date.now() + 8_000;
+    while (true) {
+      let remaining = 1;
+      try {
+        const probe = new Database(filename, { readonly: true, fileMustExist: true });
+        try { remaining = probe.prepare("SELECT COUNT(*) AS count FROM conversations WHERE id = ?").get(archived.id).count; }
+        finally { probe.close(); }
+      } catch (error) {
+        if (!["SQLITE_BUSY", "SQLITE_CANTOPEN", "ENOENT", "EBUSY"].includes(error.code)) throw error;
+      }
+      if (!remaining) break;
+      assert.ok(Date.now() < deadline, "deferred archive did not resume after ownership recovery");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(database.terminalUnknownReservations().some((entry) => entry.target === terminalId),
+      "resumed archive lost the unresolved native terminal reservation");
+  } finally {
+    Atomics.store(copyGate, 0, 2);
+    Atomics.notify(copyGate, 0);
+    if (resumeScan && database.terminalAuditScanPending) resumeScan();
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("a committed source write at archive cutover discards the stale shadow and survives restart", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-archive-late-write-"));
   const filename = path.join(directory, "outright.db");

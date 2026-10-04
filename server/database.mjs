@@ -157,7 +157,7 @@ export function createOutrightDatabase(options = {}) {
       return { changes: db.prepare("SELECT total_changes() AS count").get().count, dataVersion: db.pragma("data_version", { simple: true }) };
     },
     onWorkerReady: (snapshot) => {
-      if (activeMessageFinds || deletionsInFlight.size !== 1
+      if (activeMessageFinds || terminalAuditScan || deletionsInFlight.size !== 1
         || db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
         const error = databaseError(503, "Archive maintenance must wait for other work");
         error.code = "ARCHIVE_DEFERRED";
@@ -359,7 +359,7 @@ export function createOutrightDatabase(options = {}) {
       : serialized;
     db.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
       .run(action, String(details.target ?? "").slice(0, 512), payload, now());
-    if (trim) trimAudit(db);
+    if (trim && !terminalAuditScan) trimAudit(db);
   }
 
   function writeCriticalAudit(action, details = {}) {
@@ -425,11 +425,11 @@ export function createOutrightDatabase(options = {}) {
         }
         if (rows.length) { terminalAuditTick = setImmediate(advanceTerminalAuditScan); return; }
         scan.outcomes = [
-          ...scan.requests.values().map((request) => ({ action: request.action === "terminal.create.requested"
+          ...Array.from(scan.requests.values(), (request) => ({ action: request.action === "terminal.create.requested"
             ? "terminal.create.unknown" : "terminal.close.unknown",
           details: { target: request.target, operationId: request.operationId,
             reason: "runtime restarted before terminal outcome", ...request.details } })),
-          ...scan.owners.values().filter((owner) => owner.created && !owner.unknownRecorded).map((owner) => ({ action: "terminal.unknown",
+          ...Array.from(scan.owners.values()).filter((owner) => owner.created && !owner.unknownRecorded).map((owner) => ({ action: "terminal.unknown",
             details: { target: owner.target, reason: "runtime restarted before terminal exit was recorded" } })),
         ];
       }
@@ -441,6 +441,13 @@ export function createOutrightDatabase(options = {}) {
           reserveRecoveryHeadroom(db);
         }).immediate();
         scan.written += batch.length;
+        terminalAuditTick = setImmediate(advanceTerminalAuditScan);
+        return;
+      }
+      // Earlier live audit writes did not trim while the cursor was reading
+      // that history. Reclaim it in bounded slices before releasing terminal
+      // admission; unresolved owner evidence remains protected by trimAudit.
+      if (trimAudit(db, 256) > 0) {
         terminalAuditTick = setImmediate(advanceTerminalAuditScan);
         return;
       }

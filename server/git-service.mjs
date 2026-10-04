@@ -17,6 +17,16 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     try { return await git(cwd, args, { maxBuffer: 12 * 1024 * 1024 }); }
     catch (error) { if (error.code === "SUBPROCESS_CAPACITY" || mutationOutcomeUncertain(error)) throw error; return (error.stdout ?? "").trimEnd(); }
   };
+  const headIsUnborn = async (cwd) => {
+    const headRef = await git(cwd, ["symbolic-ref", "--quiet", "HEAD"]);
+    try { await git(cwd, ["show-ref", "--verify", "--quiet", headRef]); return false; }
+    catch (error) {
+      // Git returns 1 only when the branch has no ref. A broken existing ref
+      // returns 128; keep every staged entry on any uncertain failure.
+      if (error.code === 1) return true;
+      throw error;
+    }
+  };
   async function status(worktreePath) {
     const cwd = await requireWorktree(worktreePath);
     const [branch, porcelain, recent] = await Promise.all([
@@ -71,7 +81,8 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
         // Current Git also needs HEAD as restore's default staged source.
         // Before the first commit every index entry is an addition; remove
         // only those entries and leave the working files in place.
-        if (/could not resolve HEAD/i.test(`${error.message}\n${error.stderr ?? ""}`)) {
+        if (/could not resolve ['"]?HEAD['"]?/i.test(`${error.message}\n${error.stderr ?? ""}`)) {
+          if (!await headIsUnborn(cwd)) throw error;
           await git(cwd, ["rm", "-f", "--cached", "--ignore-unmatch", "--", ...validated]);
           return;
         }
@@ -83,7 +94,8 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
           if (resetError.code === "SUBPROCESS_CAPACITY") throw resetError;
           // An unborn branch has no HEAD to reset against. Its staged files
           // are all additions, so removing only the index entries is safe.
-          if (!/ambiguous argument ['"]?HEAD|unknown revision.*HEAD|bad revision ['"]?HEAD/i.test(`${resetError.message}\n${resetError.stderr ?? ""}`)) throw resetError;
+          if (!/ambiguous argument ['"]?HEAD|unknown revision.*HEAD|bad revision ['"]?HEAD|could not resolve ['"]?HEAD/i.test(`${resetError.message}\n${resetError.stderr ?? ""}`)) throw resetError;
+          if (!await headIsUnborn(cwd)) throw resetError;
           await git(cwd, ["rm", "-f", "--cached", "--ignore-unmatch", "--", ...validated]);
         }
       }

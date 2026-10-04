@@ -618,7 +618,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // taskkill /T /F here kills the verifier before it can report an empty job.
     // An injected or legacy leaf has no native Job Object to ask for cleanup.
     // Its ordinary child signal remains necessary on Windows too.
-    if (state.child && (process.platform !== "win32" || !state.ownsDescendants)) terminateTree(state.child, "SIGTERM");
+    if (state.child && (process.platform !== "win32" || !state.ownsDescendants || !state.child.pid)) terminateTree(state.child, "SIGTERM");
     // Cancellation must not wait for an acknowledgement that may never arrive.
     // stdin ordering guarantees a post-authorization stop follows "go", while
     // an unauthorized owner treats stop/end as abandonment.

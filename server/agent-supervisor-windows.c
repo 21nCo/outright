@@ -1,9 +1,47 @@
+#define _WIN32_WINNT 0x0602
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
+
+// Windows volumes may report ino=0 to Node. Compare native file IDs before
+// treating two pathnames as a hard-link pair or skipping a second byte lock.
+// Unknown identity is never evidence that two paths are the same file.
+static int compare_file_handles(HANDLE left, HANDLE right) {
+  FILE_ID_INFO first = {0}, second = {0};
+  if (GetFileInformationByHandleEx(left, FileIdInfo, &first, sizeof(first))
+    && GetFileInformationByHandleEx(right, FileIdInfo, &second, sizeof(second))) {
+    unsigned char zero[sizeof(first.FileId.Identifier)] = {0};
+    if (memcmp(first.FileId.Identifier, zero, sizeof(zero)) != 0
+      && memcmp(second.FileId.Identifier, zero, sizeof(zero)) != 0) {
+      return first.VolumeSerialNumber == second.VolumeSerialNumber
+        && memcmp(first.FileId.Identifier, second.FileId.Identifier, sizeof(zero)) == 0;
+    }
+  }
+  BY_HANDLE_FILE_INFORMATION a = {0}, b = {0};
+  if (!GetFileInformationByHandle(left, &a) || !GetFileInformationByHandle(right, &b)
+    || (!a.nFileIndexHigh && !a.nFileIndexLow)
+    || (!b.nFileIndexHigh && !b.nFileIndexLow)) return -1;
+  return a.dwVolumeSerialNumber == b.dwVolumeSerialNumber
+    && a.nFileIndexHigh == b.nFileIndexHigh && a.nFileIndexLow == b.nFileIndexLow;
+}
+
+static int same_file(int argc, wchar_t **argv) {
+  if (argc != 4) return 64;
+  HANDLE left = CreateFileW(argv[2], FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (left == INVALID_HANDLE_VALUE) return 4;
+  HANDLE right = CreateFileW(argv[3], FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (right == INVALID_HANDLE_VALUE) { CloseHandle(left); return 4; }
+  int comparison = compare_file_handles(left, right);
+  CloseHandle(right);
+  CloseHandle(left);
+  return comparison == 1 ? 0 : comparison == 0 ? 3 : 4;
+}
 
 // Hold SQLite's Windows lock-byte range with a handle that permits rename.
 // SQLite's own handles omit FILE_SHARE_DELETE, so they cannot be retained
@@ -18,8 +56,6 @@ static int archive_lock(int argc, wchar_t **argv) {
   if (!parent) return 70;
   HANDLE *files = calloc((size_t)(argc - 5), sizeof(HANDLE));
   if (!files) { CloseHandle(parent); return 72; }
-  BY_HANDLE_FILE_INFORMATION *identities = calloc((size_t)(argc - 5), sizeof(BY_HANDLE_FILE_INFORMATION));
-  if (!identities) { free(files); CloseHandle(parent); return 72; }
   int held = 0;
   int result = 0;
   for (int index = 5; index < argc; index++) {
@@ -27,20 +63,11 @@ static int archive_lock(int argc, wchar_t **argv) {
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file == INVALID_HANDLE_VALUE) { result = 73; break; }
-    BY_HANDLE_FILE_INFORMATION identity = {0};
-    if (!GetFileInformationByHandle(file, &identity)) { CloseHandle(file); result = 73; break; }
-    // Node can report ino=0 for a Windows volume. Resolve hard-link aliases
-    // from native handles before attempting the same exclusive byte lock a
-    // second time. An unavailable file index never collapses distinct files.
     bool duplicate = false;
-    if (identity.nFileIndexHigh || identity.nFileIndexLow) {
-      for (int previous = 0; previous < held; previous++) {
-        if (identities[previous].dwVolumeSerialNumber == identity.dwVolumeSerialNumber
-          && identities[previous].nFileIndexHigh == identity.nFileIndexHigh
-          && identities[previous].nFileIndexLow == identity.nFileIndexLow) {
-          duplicate = true;
-          break;
-        }
+    for (int previous = 0; previous < held; previous++) {
+      if (compare_file_handles(files[previous], file) == 1) {
+        duplicate = true;
+        break;
       }
     }
     if (duplicate) { CloseHandle(file); continue; }
@@ -48,7 +75,6 @@ static int archive_lock(int argc, wchar_t **argv) {
     overlap.Offset = 0x40000000;
     if (!LockFileEx(file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
         0, 512, 0, &overlap)) { CloseHandle(file); result = 74; break; }
-    identities[held] = identity;
     files[held++] = file;
   }
   HANDLE ready = CreateFileW(argv[3], GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, CREATE_NEW,
@@ -73,7 +99,6 @@ static int archive_lock(int argc, wchar_t **argv) {
       || !PeekNamedPipe(input, NULL, 0, NULL, NULL, NULL)) break;
   }
   for (int index = held - 1; index >= 0; index--) CloseHandle(files[index]);
-  free(identities);
   free(files);
   CloseHandle(parent);
   DeleteFileW(argv[3]);
@@ -196,6 +221,7 @@ static int inspect_owner(int argc, wchar_t **argv) {
 
 int wmain(int argc, wchar_t **argv) {
   if (argc < 2) return 64;
+  if (wcscmp(argv[1], L"--same-file") == 0) return same_file(argc, argv);
   if (wcscmp(argv[1], L"--archive-lock") == 0) return archive_lock(argc, argv);
   if (wcscmp(argv[1], L"--identity") == 0 || wcscmp(argv[1], L"--probe") == 0
       || wcscmp(argv[1], L"--terminate") == 0) return inspect_owner(argc, argv);

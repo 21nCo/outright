@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { access, chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -160,6 +160,37 @@ test("unstage on an unborn branch removes index entries and preserves working fi
     const { stdout } = await execFileAsync("git", ["-C", repository, "status", "--porcelain"]);
     assert.match(stdout, /\?\? staged\.txt/);
     assert.match(stdout, /\?\? untracked\.txt/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("unstage preserves the index when an existing HEAD ref points to a missing commit", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-unstage-broken-head-"));
+  try {
+    await git(root, ["init", "project"]);
+    const repository = await realpath(path.join(root, "project"));
+    await git(repository, ["config", "user.email", "outright@example.test"]);
+    await git(repository, ["config", "user.name", "Outright Test"]);
+    await writeFile(path.join(repository, "tracked.txt"), "original\n");
+    await git(repository, ["add", "tracked.txt"]);
+    await git(repository, ["commit", "-m", "initial"]);
+    await writeFile(path.join(repository, "tracked.txt"), "staged work\n");
+    await git(repository, ["add", "tracked.txt"]);
+    const { stdout: headRef } = await execFileAsync("git", ["-C", repository, "symbolic-ref", "HEAD"]);
+    await writeFile(path.join(repository, ".git", headRef.trim()), `${"0".repeat(40)}\n`);
+    const service = createGitService({
+      database: { auditAdmission: () => {}, auditCritical: () => {} },
+      getProjects: () => [{ worktrees: [{ path: repository }] }],
+      getConfig: async () => ({ scanRoots: [root] }),
+      // Older Git emits this unquoted spelling for a broken existing ref.
+      // The prior fallback removed its staged index entry as if it were unborn.
+      subprocesses: { run: (file, args, options) => args[2] === "restore"
+        ? Promise.reject(Object.assign(new Error("fatal: could not resolve HEAD"), { stderr: "fatal: could not resolve HEAD" }))
+        : execFileAsync(file, args, options) },
+    });
+    await assert.rejects(service.unstage(repository, ["tracked.txt"]), /bad ref/i);
+    const { stdout: staged } = await execFileAsync("git", ["-C", repository, "ls-files", "--stage", "--", "tracked.txt"]);
+    assert.match(staged, /tracked\.txt/);
+    assert.equal(await readFile(path.join(repository, "tracked.txt"), "utf8"), "staged work\n");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

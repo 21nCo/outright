@@ -33,17 +33,24 @@ test("Windows archive lock collapses two hard-link names when Node reports zero 
   const item = fixture();
   const originalStat = fs.statSync;
   try {
+    const source = new Database(item.filename);
+    try { source.prepare("VACUUM INTO ?").run(item.old); }
+    finally { source.close(); }
     fs.linkSync(item.filename, item.next);
     fs.statSync = (...args) => new Proxy(originalStat(...args), {
       get(info, key) { return key === "ino" ? 0n : Reflect.get(info, key, info); },
     });
     syncBuiltinESMExports();
-    const release = acquireWindowsArchiveLock([item.filename, item.next]);
+    const release = acquireWindowsArchiveLock([item.filename, item.next, item.old]);
     try {
-      const writer = new Database(item.filename);
-      try { assert.throws(() => writer.prepare("INSERT INTO evidence (body) VALUES ('blocked')").run(),
-        (error) => error.code === "SQLITE_BUSY"); }
-      finally { writer.close(); }
+      for (const filename of [item.filename, item.old]) {
+        const writer = new Database(filename);
+        try {
+          writer.pragma("busy_timeout = 50");
+          assert.throws(() => writer.prepare("INSERT INTO evidence (body) VALUES ('blocked')").run(),
+            (error) => error.code === "SQLITE_BUSY");
+        } finally { writer.close(); }
+      }
     } finally { release(); }
     assert.equal(readdirSync(item.directory).some((name) => name.includes(".archive-lock-")), false);
   } finally {

@@ -20,6 +20,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   let terminals;
   let publish;
   let runtimeCapacity;
+  let shuttingDown = false;
+  let terminalAuditReconciliation = Promise.resolve();
   const database = databaseFactory({ runtimeLease: true, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, onMigrationComplete: () => {
     agents.resumeQueued();
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
@@ -29,9 +31,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     agents.resumeQueued();
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
   }, onTerminalAuditReconciled: () => {
-    if (!terminals) return;
+    if (shuttingDown || !terminals) return;
     terminals.reloadUnknownReservations();
-    void terminals.reconcileUnknown().then(() => publish({ type: "capacity.changed", payload: runtimeCapacity() }))
+    terminalAuditReconciliation = terminals.reconcileUnknown().then(() => {
+      if (!shuttingDown) publish({ type: "capacity.changed", payload: runtimeCapacity() });
+    })
       .catch((error) => { if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:terminal-recovery]", error); });
   }, onTerminalAuditError: (error) => {
     if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:terminal-audit]", error);
@@ -57,7 +61,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   let inFlightScan = null;
   let watcher = null;
   let watcherTimer = null;
-  let shuttingDown = false;
   let shutdownPromise;
 
   publish = function publish(event) {
@@ -79,8 +82,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required");
     };
   } });
-  void terminals.reconcileUnknown().then((resolved) => {
-    if (resolved) publish({ type: "capacity.changed", payload: runtimeCapacity() });
+  terminalAuditReconciliation = terminals.reconcileUnknown().then((resolved) => {
+    if (resolved && !shuttingDown) publish({ type: "capacity.changed", payload: runtimeCapacity() });
   }).catch(() => {});
 
   // Validates that a project/worktree/path triple names exactly one discovered
@@ -712,6 +715,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown()]);
       for (const result of preliminaries) if (result.status === "rejected") shutdownErrors.push(result.reason);
       await inFlightScan?.catch(() => {});
+      await terminalAuditReconciliation;
       try { await terminals.shutdown(); }
       catch (error) { shutdownErrors.push(error); }
       eventHub.shutdown();

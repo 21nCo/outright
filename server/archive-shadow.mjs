@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { acquireWindowsArchiveLock } from "./archive-windows-lock.mjs";
+import { acquireWindowsArchiveLock, sameWindowsArchiveFile } from "./archive-windows-lock.mjs";
 
 // The runtime lease is held by the caller for every transition. The source
 // database is closed only for the final rename. Large SQLite work happens in
@@ -18,6 +18,12 @@ function fileInfo(filename) {
     if (error.code === "ENOENT") return null;
     throw error;
   }
+}
+
+function sameArchiveFile(left, right, leftInfo = fileInfo(left), rightInfo = fileInfo(right)) {
+  if (!leftInfo?.isFile() || !rightInfo?.isFile()) return false;
+  if (process.platform === "win32") return sameWindowsArchiveFile(left, right);
+  return leftInfo.dev === rightInfo.dev && leftInfo.ino > 0 && leftInfo.ino === rightInfo.ino;
 }
 
 function privateRegularFile(filename) {
@@ -277,7 +283,7 @@ function finishLinkedCandidate(filename, next, old, marker) {
   const publicInfo = fileInfo(filename);
   const nextInfo = fileInfo(next);
   if (!publicInfo || !nextInfo || !fileInfo(old)) return;
-  if (publicInfo.dev !== nextInfo.dev || publicInfo.ino !== nextInfo.ino || publicInfo.nlink !== 2
+  if (!sameArchiveFile(filename, next, publicInfo, nextInfo) || publicInfo.nlink !== 2
     || nextInfo.nlink !== 2 || !publicInfo.isFile() || !nextInfo.isFile()
     || String(publicInfo.dev) !== marker.candidate?.identity?.[0]
     || String(publicInfo.ino) !== marker.candidate?.identity?.[1]) return;
@@ -296,7 +302,7 @@ function finishLinkedCandidate(filename, next, old, marker) {
     try {
       const live = fileInfo(filename);
       const privateLink = fileInfo(next);
-      if (!live || !privateLink || live.dev !== privateLink.dev || live.ino !== privateLink.ino
+      if (!live || !privateLink || !sameArchiveFile(filename, next, live, privateLink)
         || !matchesCandidate(filename, candidateBefore, false, false, true)) {
         throw new Error("Archive candidate changed while finishing its promotion link");
       }
@@ -313,7 +319,7 @@ function finishLinkedCandidate(filename, next, old, marker) {
 function finishLinkedSource(filename, next, old, marker) {
   const publicInfo = fileInfo(filename);
   const oldInfo = fileInfo(old);
-  if (!publicInfo || !oldInfo || publicInfo.dev !== oldInfo.dev || publicInfo.ino !== oldInfo.ino
+  if (!publicInfo || !oldInfo || !sameArchiveFile(filename, old, publicInfo, oldInfo)
     || publicInfo.nlink !== 2 || oldInfo.nlink !== 2 || !publicInfo.isFile() || !oldInfo.isFile()
     || String(publicInfo.dev) !== marker.sourceSnapshot?.dev
     || String(publicInfo.ino) !== marker.sourceSnapshot?.ino) return;
@@ -341,7 +347,7 @@ function finishLinkedSource(filename, next, old, marker) {
     try {
       const live = fileInfo(filename);
       const fallback = fileInfo(old);
-      if (!live || !fallback || live.dev !== fallback.dev || live.ino !== fallback.ino
+      if (!live || !fallback || !sameArchiveFile(filename, old, live, fallback)
         || hasNonemptyWal(old) || (candidateBefore && !matchesCandidate(next, candidateBefore))) {
         throw new Error("Archive restoration changed before linked-source cleanup");
       }
