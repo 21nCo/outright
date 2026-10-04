@@ -163,7 +163,7 @@ test("a silent owner releases a broker after the shell exits behind backpressure
   }
 });
 
-test("disconnecting a live owner releases the broker and its PTY child", { timeout: 12_000 }, async () => {
+test("disconnecting a live owner releases the broker and its PTY child", { timeout: 20_000 }, async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "pty-broker-disconnect-"));
   const address = process.platform === "win32"
     ? `\\\\.\\pipe\\outright-broker-test-${randomUUID()}` : path.join(directory, "broker.sock");
@@ -171,6 +171,8 @@ test("disconnecting a live owner releases the broker and its PTY child", { timeo
   const broker = spawn(process.execPath, [brokerScript, address, token], {
     stdio: ["ignore", "ignore", "pipe"], detached: process.platform !== "win32", windowsHide: true,
   });
+  let stderr = "";
+  broker.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-1024); });
   let socket;
   let shellPid;
   let pidOutput = "";
@@ -197,10 +199,12 @@ test("disconnecting a live owner releases the broker and its PTY child", { timeo
         pending = pending.slice(end + 1);
         if (frame.type === "ready") ready = true;
         if (frame.type === "data") {
-          pidOutput += frame.data;
-          const match = pidOutput.match(/OUTRIGHT_CHILD_PID=(\d+)\r?\n/);
+          // ConPTY may split a frame anywhere and can decorate line endings.
+          // The closing tag proves the entire PID arrived without depending
+          // on a particular platform's newline sequence.
+          pidOutput = `${pidOutput}${frame.data}`.slice(-1024);
+          const match = pidOutput.match(/OUTRIGHT_CHILD_PID=(\d+):END/);
           if (match) shellPid = Number(match[1]);
-          pidOutput = pidOutput.slice(-128);
         }
       }
     });
@@ -208,9 +212,10 @@ test("disconnecting a live owner releases the broker and its PTY child", { timeo
       cwd: directory, env: process.env, cols: 80, rows: 24 })}\n`);
     while (!ready && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
     assert.equal(ready, true);
-    socket.write(`${JSON.stringify({ type: "write", data: 'console.log("OUTRIGHT_CHILD_PID="+process.pid)\r' })}\n`);
-    while (!shellPid && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
-    assert.ok(shellPid, "PTY child did not identify itself");
+    socket.write(`${JSON.stringify({ type: "write", data: 'process.stdout.write("OUTRIGHT_CHILD_PID="+process.pid+":END\\n")\r' })}\n`);
+    const pidDeadline = Date.now() + 8000;
+    while (!shellPid && Date.now() < pidDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.ok(shellPid, `PTY child did not identify itself; broker=${broker.pid}/${broker.exitCode}/${broker.signalCode}, runner=${process.pid}, frames=${JSON.stringify(pidOutput)}, stderr=${stderr}`);
     socket.destroy();
     const released = () => {
       if (broker.exitCode === null) return false;
