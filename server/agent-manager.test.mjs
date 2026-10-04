@@ -152,6 +152,203 @@ test("audit quota refusal defers an authorized queued run before spawning", asyn
   } finally { await manager.shutdown(); }
 });
 
+test("transient admission audit faults keep runs queued and revalidate before sibling launch", async () => {
+  const database = fakeDatabase();
+  database.getSettings = () => ({ maxConcurrentRuns: 1 });
+  database.capacity = () => ({ diskUsageStatus: "measured", availableForNewWorkBytes: 1024 * 1024 });
+  const first = database.createRun({ ...codexRun("audit-fault-first"), status: "queued" });
+  const second = database.createRun({ ...codexRun("audit-fault-second"), status: "queued" });
+  const originalAudit = database.auditAdmission;
+  const admitted = [];
+  const children = [];
+  let validations = 0;
+  let faults = ["SQLITE_BUSY", "SQLITE_IOERR_WRITE"];
+  database.auditAdmission = (action, details) => {
+    if (faults.length) throw Object.assign(new Error("transient audit write"), { code: faults.shift() });
+    originalAudit(action, details);
+    admitted.push(details.target);
+  };
+  const manager = createAgentManager({ database, publish: () => {},
+    validateConversation: async () => { validations += 1; return () => {}; },
+    launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  try {
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: first });
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: second });
+    assert.equal(children.length, 0, "audit failure crossed the provider launch boundary");
+    assert.equal(database.getRun(first.id).status, "queued");
+    assert.equal(database.finishes.length, 0, "a transient pre-effect fault terminalized the queued run");
+    const deadline = Date.now() + 1500;
+    while (!children.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(children.length, 1, "bounded retry did not resume admission");
+    assert.deepEqual(admitted, [first.id], "a provider launched without its required admission audit");
+    assert.ok(validations >= 3, "the retried launch skipped authorization validation");
+    children[0].emit("close", 0, null);
+    while (children.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(children.length, 2, "the waiting sibling did not receive the released slot");
+    assert.deepEqual(admitted, [first.id, second.id]);
+    children[1].emit("close", 0, null);
+    assert.equal(database.getRun(first.id).status, "completed");
+    assert.equal(database.getRun(second.id).status, "completed");
+  } finally { await manager.shutdown(); }
+});
+
+test("repeated terminal storage faults retain the slot and retry the durable outcome", async () => {
+  const database = fakeDatabase();
+  database.getSettings = () => ({ maxConcurrentRuns: 1 });
+  const first = database.createRun({ ...codexRun("terminal-fault-first"), status: "queued" });
+  const second = database.createRun({ ...codexRun("terminal-fault-second"), status: "queued" });
+  const originalFinish = database.finishRun;
+  const children = [];
+  let faults = ["SQLITE_BUSY", "SQLITE_IOERR_WRITE"];
+  database.finishRun = (...args) => {
+    if (faults.length) throw Object.assign(new Error("transient terminal write"), { code: faults.shift() });
+    return originalFinish(...args);
+  };
+  database.auditCritical = (action) => {
+    if (action === "agent.run.started" && database.getRun(first.id).status === "launching") {
+      throw new Error("pre-spawn setup failed");
+    }
+  };
+  const manager = createAgentManager({ database, publish: () => {},
+    launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  try {
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: first });
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: second });
+    assert.deepEqual(manager.activeRuns(), [first.id], "a failed terminal commit released its capacity slot");
+    assert.equal(database.getRun(first.id).status, "launching");
+    assert.equal(database.getRun(second.id).status, "queued");
+    assert.equal(children.length, 0, "a failed start audit spawned a provider");
+    const deadline = Date.now() + 1500;
+    while (!children.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(database.getRun(first.id).status, "failed");
+    assert.equal(database.finishes.filter(({ id }) => id === first.id).length, 1, "terminal outcome was duplicated");
+    assert.equal(children.length, 1, "the sibling remained stranded after durable recovery");
+    children[0].emit("close", 0, null);
+  } finally { await manager.shutdown(); }
+});
+
+test("a completed run keeps its slot through repeated SQLite finish faults and survives reopen", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-finish-retry-"));
+  const filename = path.join(realpathSync(directory), "outright.db");
+  let database = createOutrightDatabase({ filename });
+  let manager;
+  const children = [];
+  try {
+    database.updateSettings({ maxConcurrentRuns: 1 });
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory,
+      title: "Finish retry", provider: "codex" });
+    const first = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "first" });
+    const second = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "second" });
+    const durableFinish = database.finishRun;
+    let faults = ["SQLITE_BUSY", "SQLITE_IOERR_WRITE"];
+    database.finishRun = (...args) => {
+      if (args[0] === first.id && faults.length) {
+        throw Object.assign(new Error("injected terminal transaction failure"), { code: faults.shift() });
+      }
+      return durableFinish(...args);
+    };
+    manager = createAgentManager({ database, publish: () => {},
+      launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+      spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+    await manager.schedule({ conversation, run: first });
+    await manager.schedule({ conversation, run: second });
+    children[0].emit("close", 0, null);
+    assert.deepEqual(manager.activeRuns(), [first.id], "the failed finish lost process-slot ownership");
+    assert.equal(database.getRun(second.id).status, "queued");
+    const deadline = Date.now() + 1500;
+    while (children.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(children.length, 2, "the sibling stayed queued after terminal storage recovered");
+    assert.equal(database.getRun(first.id).status, "completed");
+    children[1].emit("close", 0, null);
+    assert.equal(database.getRun(second.id).status, "completed");
+    await manager.shutdown();
+    await database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.getRun(first.id).status, "completed", "restart lost the first durable outcome");
+    assert.equal(database.getRun(second.id).status, "completed", "restart lost the sibling outcome");
+    const audit = database.listAudit(100);
+    assert.ok(audit.some((row) => row.action === "agent.run.completed" && row.target === first.id),
+      "restart lost the first run's completion audit");
+    assert.ok(audit.some((row) => row.action === "agent.run.start.requested" && row.target === second.id),
+      "the sibling started without its required audit");
+  } finally {
+    await manager?.shutdown();
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("cancellation retains the run slot until its stopped outcome is durable", async () => {
+  const database = fakeDatabase();
+  database.getSettings = () => ({ maxConcurrentRuns: 1 });
+  const first = database.createRun({ ...codexRun("cancel-fault-first"), status: "queued" });
+  const second = database.createRun({ ...codexRun("cancel-fault-second"), status: "queued" });
+  const durableFinish = database.finishRun;
+  let failed = false;
+  database.finishRun = (...args) => {
+    if (!failed && args[0] === first.id) {
+      failed = true;
+      throw Object.assign(new Error("transient cancellation write"), { code: "SQLITE_BUSY_SNAPSHOT" });
+    }
+    return durableFinish(...args);
+  };
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {},
+    launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  try {
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: first });
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: second });
+    const stopping = manager.stop(first.id);
+    children[0].emit("close", null, "SIGTERM");
+    await assert.rejects(stopping, (error) => error.statusCode === 503);
+    assert.deepEqual(manager.activeRuns(), [first.id]);
+    assert.equal(database.getRun(second.id).status, "queued");
+    const deadline = Date.now() + 1000;
+    while (children.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(database.getRun(first.id).status, "stopped");
+    assert.equal(children.length, 2, "cancellation retry did not release the slot");
+    children[1].emit("close", 0, null);
+  } finally { await manager.shutdown(); }
+});
+
+test("a sibling drain cannot cancel another run's pending terminal retry", async () => {
+  const database = fakeDatabase();
+  database.getSettings = () => ({ maxConcurrentRuns: 2 });
+  for (const id of ["conv-2", "conv-3"]) database.updateConversation(id, { id, worktreePath: `/tmp/${id}` });
+  const first = database.createRun({ ...codexRun("parallel-fault-first"), status: "queued" });
+  const second = database.createRun({ ...codexRun("parallel-fault-second"), conversationId: "conv-2", status: "queued" });
+  const third = database.createRun({ ...codexRun("parallel-fault-third"), conversationId: "conv-3", status: "queued" });
+  const durableFinish = database.finishRun;
+  let faults = 2;
+  database.finishRun = (...args) => {
+    if (args[0] === first.id && faults-- > 0) throw Object.assign(new Error("busy terminal write"), { code: "SQLITE_BUSY" });
+    return durableFinish(...args);
+  };
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {},
+    launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  try {
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: first });
+    await manager.schedule({ conversation: database.getConversation("conv-2"), run: second });
+    await manager.schedule({ conversation: database.getConversation("conv-3"), run: third });
+    children[0].emit("close", 0, null);
+    children[1].emit("close", 0, null);
+    const deadline = Date.now() + 1500;
+    while (children.length < 3 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(children.length, 3, "the free sibling slot did not drain the queue");
+    assert.equal(database.getRun(first.id).status, "running", "the failed owner was terminalized early");
+    while (database.getRun(first.id).status !== "completed" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(database.getRun(first.id).status, "completed", "sibling drainage cancelled the terminal retry");
+    children[2].emit("close", 0, null);
+  } finally { await manager.shutdown(); }
+});
+
 test("a prearmed disk retry and queue resume cannot drain a closed maintenance database", async () => {
   const database = fakeDatabase();
   let readable = true;

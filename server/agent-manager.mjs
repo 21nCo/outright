@@ -389,7 +389,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     try {
       database.auditAdmission("agent.run.start.requested", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath });
     } catch (error) {
-      if (error.statusCode === 507 || (error.statusCode === 503 && database.maintenanceActive)) return "deferred";
+      // No process has been spawned yet. A transient SQLite lock or I/O
+      // failure must leave the run queued for a fresh admission attempt;
+      // terminalizing it can itself fail under the same storage fault.
+      if (storageAdmissionFailure(error) || (error.statusCode === 503 && database.maintenanceActive)) return "deferred";
       throw error;
     }
     const startedAt = new Date().toISOString();
@@ -585,8 +588,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       if (transcriptMessage && !finished.message) markTranscriptOmitted(state);
     } catch (writeError) {
       state.finishing = false;
-      if (writeError.statusCode === 503 && database.maintenanceActive) {
+      if (storageAdmissionFailure(writeError) || (writeError.statusCode === 503 && database.maintenanceActive)) {
         state.pendingFinish = { exitCode, error };
+        if (!database.maintenanceActive) retryUnknownDiskUsage();
         return false;
       }
       throw writeError;
@@ -681,7 +685,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       try {
         if (finish(state, state.exitCode ?? null, null) === false) {
           if (preserveOnMaintenance && !state.child) return false;
-          const unavailable = new Error("Archive maintenance is running; retry shortly");
+          const unavailable = new Error("Run outcome storage is unavailable; retry shortly");
           unavailable.statusCode = 503;
           throw unavailable;
         }
@@ -765,6 +769,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
           active.delete(entry.run.id);
           queue.unshift(entry);
           retryDeferredAdmission();
+          // The archive worker closes SQLite while promoting its snapshot.
+          // Keep schedule's readback pending until the reopened connection is
+          // available, even though this run is safely queued again.
+          if (database.maintenanceActive) await waitForMaintenance();
         }
         return;
       } catch (error) {
@@ -775,10 +783,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
           continue;
         }
         if (!state.stopped && !error?.preserveActiveRun) {
-          if (finish(state, null, error) === false) {
-            await waitForMaintenance();
-            if (!shuttingDown) finish(state, null, error);
-          }
+          // finish retains the active slot and schedules a bounded retry when
+          // its durable transaction is temporarily unavailable.
+          if (finish(state, null, error) === false && database.maintenanceActive) await waitForMaintenance();
         }
         return;
       }
@@ -791,15 +798,29 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     diskRetryDelayMs = Math.min(30_000, diskRetryDelayMs * 2);
     diskRetryTimer = setTimeout(() => {
       diskRetryTimer = null;
+      retryPendingFinishes();
       drain();
     }, delay);
     diskRetryTimer.unref?.();
   }
 
   function clearDiskRetry() {
+    // A sibling may free a slot and drain the queue while another completed
+    // run still awaits its terminal commit. Keep that retry armed until every
+    // such owner has durable outcome evidence.
+    if (!shuttingDown && [...active.values()].some((state) => state.pendingFinish)) return;
     if (diskRetryTimer) clearTimeout(diskRetryTimer);
     diskRetryTimer = null;
     diskRetryDelayMs = 100;
+  }
+
+  function retryPendingFinishes() {
+    if (shuttingDown || database.maintenanceActive) return;
+    for (const state of active.values()) {
+      if (!state.pendingFinish || (state.child && !state.closed)) continue;
+      const { exitCode, error } = state.pendingFinish;
+      finish(state, exitCode, error);
+    }
   }
 
   function retryDeferredAdmission() {
@@ -1017,12 +1038,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     resumeQueued() {
       if (database.maintenanceActive) return;
       wakeMaintenanceWaiters();
-      for (const state of active.values()) {
-        if (state.pendingFinish && (!state.child || state.closed)) {
-          const { exitCode, error } = state.pendingFinish;
-          finish(state, exitCode, error);
-        }
-      }
+      retryPendingFinishes();
       drain();
     },
     stop,
