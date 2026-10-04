@@ -31,12 +31,15 @@ const server = net.createServer((socket) => {
     if (!outputPaused) {
       outputPaused = true;
       if (!shellExited) {
-        terminal.pause();
-        // A peer that never reads must not hold the shell at a blocked PTY
-        // write forever. After a grace period, consume and count later output
-        // without adding more socket frames.
-        shedTimer = setTimeout(() => { if (outputPaused && !shellExited) terminal.resume(); }, 2000);
-        shedTimer.unref();
+        // Windows ConPTY can hold shell progress (and even its exit notice)
+        // while paused. Drain and shed there immediately; the owner socket is
+        // still bounded by its writable high-water mark. Unix PTYs can pause
+        // briefly, then also shed if the peer stays silent.
+        if (process.platform !== "win32") {
+          terminal.pause();
+          shedTimer = setTimeout(() => { if (outputPaused && !shellExited) terminal.resume(); }, 2000);
+          shedTimer.unref();
+        }
       }
     }
   };
@@ -68,7 +71,7 @@ const server = net.createServer((socket) => {
     } else if (outputPaused && !shellExited) {
       outputPaused = false;
       clearTimeout(shedTimer);
-      terminal.resume();
+      if (process.platform !== "win32") terminal.resume();
     }
   };
   socket.on("drain", flushOutput);

@@ -4,7 +4,7 @@ import { createTerminalManager } from "./terminal-manager.mjs";
 import { recoverManagedTerminal } from "./managed-terminal.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { createOutrightDatabase } from "./database.mjs";
-import { AUDIT_RETENTION_LIMIT } from "./audit-retention.mjs";
+import { AUDIT_RETENTION_LIMIT, trimAudit, trimAuditPage } from "./audit-retention.mjs";
 import { createOutrightRuntime } from "./outright-runtime.mjs";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { execFile, spawn, spawnSync } from "node:child_process";
@@ -703,6 +703,108 @@ test("failed legacy audit trimming can restart without releasing an unknown term
   } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("a transient audit read fault keeps its original waiter and terminal reservation through retry", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-audit-busy-"));
+  const filename = path.join(directory, "runtime.db");
+  const target = "54d20348-0790-4ba8-b888-e05887e48452";
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  let writer;
+  let failNextTick = true;
+  try {
+    await database.close();
+    writer = new Database(filename);
+    const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, '{}', '2026-09-01')");
+    writer.transaction(() => {
+      for (let index = 0; index < 2_100; index += 1) insert.run("legacy.telemetry", "");
+      insert.run("terminal.created", target);
+    }).immediate();
+    writer.close();
+    writer = null;
+    database = createOutrightDatabase({ filename, runtimeLease: true,
+      beforeTerminalAuditTick: () => {
+        if (failNextTick) {
+          failNextTick = false;
+          throw Object.assign(new Error("injected audit read fault"), { code: "SQLITE_IOERR" });
+        }
+      },
+      onTerminalAuditError: () => { throw new Error("observer failure must not escape scan tick"); } });
+    database.reconcileTerminalAudit();
+    const waiter = database.waitForTerminalAuditReconciliation();
+    let settled = false;
+    void waiter.then(() => { settled = true; }, () => { settled = true; });
+    await waitFor(() => Boolean(database.terminalAuditScanError), 2_000);
+    assert.equal(settled, false, "a retryable lock rejected its original recovery waiter");
+    assert.equal(database.terminalAuditScanPending, true);
+    await waiter;
+    assert.equal(database.terminalAuditScanPending, false);
+    assert.deepEqual(database.terminalUnknownReservations().map((entry) => entry.target), [target]);
+  } finally {
+    writer?.close();
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("persistent audit faults stop after the bounded retry budget and allow an explicit recovery", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-audit-retry-limit-"));
+  const filename = path.join(directory, "runtime.db");
+  const target = "54d20348-0790-4ba8-b888-e05887e48455";
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  try {
+    await database.close();
+    const writer = new Database(filename);
+    try {
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, '{}', '2026-09-01')");
+      writer.transaction(() => {
+        for (let index = 0; index < 2_100; index += 1) insert.run("legacy.telemetry", "");
+        insert.run("terminal.created", target);
+      }).immediate();
+    } finally { writer.close(); }
+    let fault = true;
+    let attempts = 0;
+    database = createOutrightDatabase({ filename, runtimeLease: true, terminalAuditRetryBaseMs: 1,
+      beforeTerminalAuditTick: () => {
+        attempts += 1;
+        if (fault) throw Object.assign(new Error("persistent audit fault"), { code: "SQLITE_IOERR" });
+      } });
+    database.reconcileTerminalAudit();
+    await assert.rejects(database.waitForTerminalAuditReconciliation(), /persistent audit fault/);
+    assert.equal(attempts, 6, "storage retries escaped their five-retry budget");
+    assert.equal(database.terminalAuditScanPending, true);
+    assert.deepEqual(database.terminalUnknownReservations(), [], "failure released a terminal reservation");
+    fault = false;
+    database.reconcileTerminalAudit();
+    await database.waitForTerminalAuditReconciliation();
+    assert.deepEqual(database.terminalUnknownReservations().map((entry) => entry.target), [target]);
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("audit paging retains a late completion until its earlier owner is retired", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-audit-dependent-"));
+  const filename = path.join(directory, "runtime.db");
+  const target = "54d20348-0790-4ba8-b888-e05887e48454";
+  const database = createOutrightDatabase({ filename });
+  await database.close();
+  const writer = new Database(filename);
+  try {
+    const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, '{}', '2026-09-01')");
+    const created = insert.run("terminal.created", target).lastInsertRowid;
+    writer.transaction(() => { for (let index = 0; index < 10_050; index += 1) insert.run("telemetry", ""); }).immediate();
+    trimAuditPage(writer, 1);
+    assert.equal(writer.prepare("SELECT cursor FROM audit_retention_cursor WHERE id = 1").get().cursor, created);
+    const closed = insert.run("terminal.closed", target).lastInsertRowid;
+    writer.transaction(() => { for (let index = 0; index < 10_050; index += 1) insert.run("telemetry", ""); }).immediate();
+    trimAudit(writer, 32, created, closed);
+    assert.deepEqual(writer.prepare("SELECT action FROM audit_log WHERE target = ? ORDER BY id").all(target)
+      .map((row) => row.action), ["terminal.created", "terminal.closed"],
+    "a completion was removed while the cursor had passed its retained owner");
+    trimAudit(writer);
+    trimAudit(writer);
+    assert.deepEqual(writer.prepare("SELECT action FROM audit_log WHERE target = ?").all(target), [],
+      "completed owner and outcome did not eventually retire together");
+  } finally { writer.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("legacy unknown terminal ownership consumes each worktree limit", async () => {
   const reservation = { target: "56b5370b-7ff3-470c-bb68-469b01c96915", cwd: null };
   let launched = false;
@@ -820,6 +922,14 @@ test("normal shutdown settles every PTY at a lowered quota and old outcomes trim
       writer.transaction(() => { for (let index = 0; index < 10_050; index += 1) insert.run(); }).immediate();
     } finally { writer.close(); }
     database.audit("telemetry", { target: "trim" });
+    const trimmer = new Database(filename);
+    try {
+      let completedSweeps = 0;
+      for (let page = 0; page < 512 && completedSweeps < 2; page += 1) {
+        if (trimAuditPage(trimmer).complete) completedSweeps += 1;
+      }
+      assert.equal(completedSweeps, 2, "bounded pages did not revisit completed terminal owners");
+    } finally { trimmer.close(); }
     assert.equal(database.capacity().retainedBytes - retainedBeforeTrim,
       auditRetainedBytes(filename) - auditBeforeTrim, "audit trimming updates retained bytes exactly");
     const proof = new Database(filename, { readonly: true });

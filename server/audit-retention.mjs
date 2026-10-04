@@ -12,10 +12,21 @@ export function trimAudit(db, limit = -1, afterId = 0, throughId = Number.MAX_SA
       AND (CASE WHEN json_valid(details) THEN json_extract(details, '$.operationId') END) IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > audit_log.id
         AND (CASE WHEN json_valid(outcome.details) THEN json_extract(outcome.details, '$.operationId') END)
-          = json_extract(audit_log.details, '$.operationId')))
+          = (CASE WHEN json_valid(audit_log.details) THEN json_extract(audit_log.details, '$.operationId') END)))
       OR (action IN ('terminal.create.requested', 'terminal.created', 'terminal.create.unknown', 'terminal.unknown')
         AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > audit_log.id
-          AND outcome.target = audit_log.target AND outcome.action IN ('terminal.exited', 'terminal.closed', 'terminal.recovered', 'terminal.create.failed'))))
+          AND outcome.target = audit_log.target AND outcome.action IN ('terminal.exited', 'terminal.closed', 'terminal.recovered', 'terminal.create.failed')))
+      -- A cursor may already have passed an owner when its completion arrives.
+      -- Keep the completion until that retained owner is visited and removed.
+      OR (action IN ('terminal.exited', 'terminal.closed', 'terminal.recovered', 'terminal.create.failed')
+        AND EXISTS (SELECT 1 FROM audit_log AS owner WHERE owner.id < audit_log.id
+          AND owner.target = audit_log.target
+          AND owner.action IN ('terminal.create.requested', 'terminal.created', 'terminal.create.unknown', 'terminal.unknown')))
+      OR ((CASE WHEN json_valid(details) THEN json_extract(details, '$.operationId') END) IS NOT NULL
+        AND EXISTS (SELECT 1 FROM audit_log AS request WHERE request.id < audit_log.id
+          AND request.action LIKE '%.requested'
+          AND (CASE WHEN json_valid(request.details) THEN json_extract(request.details, '$.operationId') END)
+            = (CASE WHEN json_valid(audit_log.details) THEN json_extract(audit_log.details, '$.operationId') END))))
     ORDER BY audit_log.id LIMIT ?)`).run(afterId, throughId, limit).changes;
 }
 
@@ -24,17 +35,22 @@ export function trimAudit(db, limit = -1, afterId = 0, throughId = Number.MAX_SA
 // interrupted cleanup can resume without losing its recovery evidence.
 export function trimAuditPage(db, pageSize = 32, upperId = Number.MAX_SAFE_INTEGER) {
   return db.transaction(() => {
-    const cursor = db.prepare("SELECT cursor FROM audit_retention_cursor WHERE id = 1").get().cursor;
+    const state = db.prepare("SELECT cursor, sweep_upper FROM audit_retention_cursor WHERE id = 1").get();
+    const cursor = state.cursor;
+    // Freeze the high-water mark for this pass. Continuous writes cannot keep
+    // extending the pass and strand an old protected owner behind the cursor.
+    const sweepUpper = state.sweep_upper || (db.prepare(`SELECT id FROM audit_log ORDER BY id DESC
+      LIMIT 1 OFFSET ${AUDIT_RETENTION_LIMIT - 1}`).get()?.id ?? 0);
     const rows = db.prepare(`SELECT id FROM audit_log WHERE id > ? AND id <= ?
-      AND id <= (SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET ${AUDIT_RETENTION_LIMIT - 1})
-      ORDER BY id LIMIT ?`).all(cursor, upperId, pageSize);
+      ORDER BY id LIMIT ?`).all(cursor, Math.min(upperId, sweepUpper), pageSize);
     if (!rows.length) {
-      db.prepare("UPDATE audit_retention_cursor SET cursor = 0 WHERE id = 1").run();
+      db.prepare("UPDATE audit_retention_cursor SET cursor = 0, sweep_upper = 0 WHERE id = 1").run();
       return { scanned: 0, deleted: 0, complete: true };
     }
     const lastId = rows.at(-1).id;
-    const deleted = trimAudit(db, pageSize, cursor, lastId);
-    db.prepare("UPDATE audit_retention_cursor SET cursor = ? WHERE id = 1").run(lastId);
+    let deleted = trimAudit(db, pageSize, cursor, lastId);
+    if (deleted) deleted += trimAudit(db, pageSize, cursor, lastId);
+    db.prepare("UPDATE audit_retention_cursor SET cursor = ?, sweep_upper = ? WHERE id = 1").run(lastId, sweepUpper);
     return { scanned: rows.length, deleted, complete: false };
   }).immediate();
 }

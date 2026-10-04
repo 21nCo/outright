@@ -124,7 +124,7 @@ test("storage stat failures report unknown capacity and fail closed until measur
         (error) => error.statusCode === 507, `${code} admitted optional work`);
     }
     fs.lstatSync = originalStat;
-    assert.equal(database.capacity().diskUsageStatus, "measured");
+    assert.equal(database.capacity().diskUsageStatus, process.platform === "win32" ? "estimated" : "measured");
     assert.equal(database.canLaunchRun(), true, "recovered measurement did not reopen admission");
   } finally {
     fs.lstatSync = originalStat;
@@ -1531,10 +1531,19 @@ test("archive cutover defers while legacy terminal ownership is being reconstruc
   const filename = path.join(directory, "outright.db");
   const copyGate = new Int32Array(new SharedArrayBuffer(4));
   const deletionErrors = [];
-  const database = createOutrightDatabase({ filename, runtimeLease: true, deletionCopyGate: copyGate.buffer,
-    onDeletionError: (error) => deletionErrors.push(error.message) });
-  const terminalId = "54d20348-0790-4ba8-b888-e05887e48453";
   let resumeScan;
+  let scanHeld = false;
+  const database = createOutrightDatabase({ filename, runtimeLease: true, deletionCopyGate: copyGate.buffer,
+    onDeletionError: (error) => deletionErrors.push(error.message),
+    terminalAuditSchedule: (callback) => {
+      if (!scanHeld) {
+        scanHeld = true;
+        resumeScan = () => setImmediate(callback);
+        return setImmediate(() => {});
+      }
+      return setImmediate(callback);
+    } });
+  const terminalId = "54d20348-0790-4ba8-b888-e05887e48453";
   try {
     const archived = chat(database, "archive with pending terminal audit");
     const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
@@ -1555,16 +1564,7 @@ test("archive cutover defers while legacy terminal ownership is being reconstruc
       assert.ok(Date.now() < copyDeadline, "archive copy did not reach its controlled cutover gate");
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
-    const originalSetImmediate = globalThis.setImmediate;
-    globalThis.setImmediate = (callback, ...args) => {
-      if (callback.name === "advanceTerminalAuditScan") {
-        resumeScan = () => originalSetImmediate(callback, ...args);
-        return originalSetImmediate(() => {});
-      }
-      return originalSetImmediate(callback, ...args);
-    };
-    try { database.reconcileTerminalAudit(); }
-    finally { globalThis.setImmediate = originalSetImmediate; }
+    database.reconcileTerminalAudit();
     assert.equal(database.terminalAuditScanPending, true);
     assert.equal(typeof resumeScan, "function");
     Atomics.store(copyGate, 0, 2);
@@ -1582,7 +1582,8 @@ test("archive cutover defers while legacy terminal ownership is being reconstruc
     while (true) {
       // The on-disk row can disappear during promotion before the runtime
       // reopens its live connection. Observe the public API after maintenance.
-      if (!database.maintenanceActive && !database.getConversation(archived.id)) break;
+      if (!database.maintenanceActive && !database.capacity().cleanupPending
+        && !archivePresentOrMaintaining(database, filename, archived.id)) break;
       assert.ok(Date.now() < deadline,
         `deferred archive did not resume after ownership recovery (maintenance=${database.maintenanceActive}, pending=${database.capacity().cleanupPending}, errors=${deletionErrors.slice(-3).join(" | ")})`);
       await new Promise((resolve) => setTimeout(resolve, 10));

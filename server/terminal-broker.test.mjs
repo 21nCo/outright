@@ -23,13 +23,14 @@ test("a slow broker reader backpressures sustained PTY output without losing its
   let socket;
   let pending = "";
   let closed = false;
+  let brokerExited = false;
   let dataBytes = 0;
   let recentData = "";
   let omissionReset = false;
   const received = [];
   const waiters = new Set();
   const notify = () => { for (const waiter of waiters) waiter(); };
-  broker.on("close", () => { closed = true; notify(); });
+  broker.on("close", () => { brokerExited = true; closed = true; notify(); });
   try {
     const deadline = Date.now() + 8000;
     while (!socket && Date.now() < deadline && !closed) {
@@ -87,7 +88,7 @@ test("a slow broker reader backpressures sustained PTY output without losing its
     socket.pause();
     socket.write(`${JSON.stringify({ type: "write",
       data: 'process.stdout.write("\\u001b[31m"+"c".repeat(8*1024*1024))\r' })}\n`);
-    await new Promise((resolve) => setTimeout(resolve, 2500));
+    await new Promise((resolve) => setTimeout(resolve, 4000));
     socket.resume();
     await until(() => omissionReset, "shed colored output did not reset styling before its notice");
 
@@ -95,7 +96,9 @@ test("a slow broker reader backpressures sustained PTY output without losing its
     await until(() => received.includes("OUTRIGHT_LATER"), "shell did not accept later input");
     socket.write(`${JSON.stringify({ type: "write", data: ".exit\r" })}\n`);
     await until(() => received.includes("shell-exited"), "shell exit was not delivered");
-    await until(() => closed, "broker did not close after its shell exited", 5000);
+    const exitDeadline = Date.now() + 5000;
+    while (!brokerExited && Date.now() < exitDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(brokerExited, true, "broker process did not exit after its shell exited");
   } finally {
     socket?.destroy();
     if (broker.exitCode === null) {

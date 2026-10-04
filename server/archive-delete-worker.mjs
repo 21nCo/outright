@@ -134,6 +134,9 @@ try {
     shadow.prepare("UPDATE retained_usage SET legacy_ceiling = MAX(legacy_ceiling, bytes + 1048576) WHERE id = 1").run();
     shadow.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
       .run("retention.archived.deleted", conversationId, "{}", new Date().toISOString());
+    // The first pass may retire an owner and leave its dependent completion
+    // protected by the statement snapshot. The second pass can retire it.
+    trimAudit(shadow);
     trimAudit(shadow);
   }).immediate();
   if (beforeUsage.measured && shadow.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes >= beforeUsage.bytes) {

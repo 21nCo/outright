@@ -111,11 +111,14 @@ export function createOutrightDatabase(options = {}) {
   let terminalAuditTick;
   let terminalAuditRetry;
   let terminalAuditRetries = 0;
+  const terminalAuditRetryBaseMs = Number.isFinite(options.terminalAuditRetryBaseMs)
+    && options.terminalAuditRetryBaseMs >= 1 ? options.terminalAuditRetryBaseMs : 1000;
   let terminalAuditScan;
   let terminalReservationsCache;
   let terminalAuditCompletion = Promise.resolve();
   let completeTerminalAudit;
   let failTerminalAudit;
+  const scheduleTerminalAudit = options.terminalAuditSchedule ?? setImmediate;
   let deletionTick;
   let deletionTickKind;
   let deletionCursor = 0;
@@ -380,9 +383,9 @@ export function createOutrightDatabase(options = {}) {
   }
 
   function beginTerminalAuditScan() {
-    const lastId = db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM audit_log").get().id;
-    db.prepare("UPDATE audit_retention_cursor SET cursor = 0 WHERE id = 1").run();
-    terminalAuditScan = { cursor: 0, lastId, requests: new Map(), owners: new Map(), outcomes: null, written: 0 };
+    // All SQLite work belongs to the tick. A retry timer must never throw
+    // synchronously out of a process-level callback on a storage fault.
+    terminalAuditScan = { cursor: 0, lastId: null, requests: new Map(), owners: new Map(), outcomes: null, written: 0 };
     terminalAuditCompletion = new Promise((resolve, reject) => {
       completeTerminalAudit = resolve;
       failTerminalAudit = reject;
@@ -391,7 +394,7 @@ export function createOutrightDatabase(options = {}) {
     // Attach a handler now so a storage failure never becomes an unhandled
     // rejection when no caller is waiting.
     void terminalAuditCompletion.catch(() => {});
-    terminalAuditTick = setImmediate(advanceTerminalAuditScan);
+    terminalAuditTick = scheduleTerminalAudit(advanceTerminalAuditScan);
   }
 
   function advanceTerminalAuditScan() {
@@ -399,6 +402,11 @@ export function createOutrightDatabase(options = {}) {
     if (closing || !terminalAuditScan) return;
     const scan = terminalAuditScan;
     try {
+      options.beforeTerminalAuditTick?.();
+      if (scan.lastId === null) {
+        scan.lastId = db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM audit_log").get().id;
+        db.prepare("UPDATE audit_retention_cursor SET cursor = 0, sweep_upper = 0 WHERE id = 1").run();
+      }
       if (!scan.outcomes) {
         const rows = db.prepare(`SELECT id, action, substr(target, 1, 512) AS target,
           CASE WHEN octet_length(details) <= 4096 THEN details END AS details FROM audit_log
@@ -433,7 +441,7 @@ export function createOutrightDatabase(options = {}) {
             throw new Error("Terminal audit recovery exceeds the bounded owner index");
           }
         }
-        if (rows.length) { terminalAuditTick = setImmediate(advanceTerminalAuditScan); return; }
+        if (rows.length) { terminalAuditTick = scheduleTerminalAudit(advanceTerminalAuditScan); return; }
         scan.outcomes = [
           ...Array.from(scan.requests.values(), (request) => ({ action: request.action === "terminal.create.requested"
             ? "terminal.create.unknown" : "terminal.close.unknown",
@@ -451,14 +459,14 @@ export function createOutrightDatabase(options = {}) {
           reserveRecoveryHeadroom(db);
         }).immediate();
         scan.written += batch.length;
-        terminalAuditTick = setImmediate(advanceTerminalAuditScan);
+        terminalAuditTick = scheduleTerminalAudit(advanceTerminalAuditScan);
         return;
       }
       // Earlier live audit writes did not trim while the cursor was reading
       // that history. Reclaim it in bounded slices before releasing terminal
       // admission; unresolved owner evidence remains protected by trimAudit.
       if (!trimAuditPage(db, 32, scan.lastId).complete) {
-        terminalAuditTick = setImmediate(advanceTerminalAuditScan);
+        terminalAuditTick = scheduleTerminalAudit(advanceTerminalAuditScan);
         return;
       }
       terminalReservationsCache = [...scan.owners.values()];
@@ -469,19 +477,26 @@ export function createOutrightDatabase(options = {}) {
       catch (error) { options.onTerminalAuditError?.(error); }
     } catch (error) {
       scan.error = error;
-      failTerminalAudit?.(error);
-      options.onTerminalAuditError?.(error);
-      // Keep terminal admission paused. A restart retries the bounded scan.
-      if (["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_IOERR", "SQLITE_FULL"].includes(error.code)) {
-        const delay = Math.min(30_000, 1000 * 2 ** Math.min(terminalAuditRetries++, 5));
+      try { options.onTerminalAuditError?.(error); } catch { /* Keep the scan owner alive. */ }
+      // A transient read or write failure keeps the original waiter pending
+      // across retries. Only an exhausted/fatal scan rejects it.
+      if (["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_IOERR", "SQLITE_FULL"].includes(error.code)
+        && terminalAuditRetries < 5) {
+        const delay = Math.min(30_000, terminalAuditRetryBaseMs * 2 ** Math.min(terminalAuditRetries++, 5));
         terminalAuditRetry = setTimeout(() => {
           terminalAuditRetry = undefined;
           if (!closing && terminalAuditScan === scan) {
-            terminalAuditScan = null;
-            beginTerminalAuditScan();
+            scan.cursor = 0;
+            scan.lastId = null;
+            scan.requests.clear();
+            scan.owners.clear();
+            scan.outcomes = null;
+            scan.written = 0;
+            scan.error = null;
+            terminalAuditTick = scheduleTerminalAudit(advanceTerminalAuditScan);
           }
         }, delay);
-      }
+      } else failTerminalAudit?.(error);
     }
   }
 
@@ -1648,6 +1663,7 @@ export function createOutrightDatabase(options = {}) {
       if (terminalReservationsCache) return 0;
       if (terminalAuditScan?.error && !terminalAuditRetry) {
         terminalAuditScan = null;
+        terminalAuditRetries = 0;
         beginTerminalAuditScan();
         return 0;
       }
@@ -2032,7 +2048,11 @@ function deleteArchivedBatch(db, id, filename) {
     reserveRecoveryHeadroom(db, undefined, true);
     db.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
       .run("retention.archived.deleted", id, "{}", now());
-    trimAudit(db);
+    // Keep a live archive delete independent of a legacy audit table's size.
+    // Subsequent writes continue the durable sweep from this same cursor.
+    for (let page = 0; page < 4; page += 1) {
+      if (trimAuditPage(db).complete) break;
+    }
     reserveRecoveryHeadroom(db);
   }
   return { done: true };
@@ -2132,10 +2152,14 @@ function migrate(db) {
     CREATE TABLE IF NOT EXISTS run_event_usage (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, bytes INTEGER NOT NULL, last_seq INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS trusted_projects (project_id TEXT PRIMARY KEY, project_path TEXT NOT NULL, trusted_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, target TEXT, details TEXT, created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS audit_retention_cursor (id INTEGER PRIMARY KEY CHECK (id = 1), cursor INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS audit_retention_cursor (id INTEGER PRIMARY KEY CHECK (id = 1), cursor INTEGER NOT NULL DEFAULT 0,
+      sweep_upper INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS prompt_templates (id TEXT PRIMARY KEY, title TEXT NOT NULL, prompt TEXT NOT NULL, created_at TEXT NOT NULL);
   `);
   db.prepare("INSERT OR IGNORE INTO audit_retention_cursor (id) VALUES (1)").run();
+  if (!db.pragma("table_info(audit_retention_cursor)").some((column) => column.name === "sweep_upper")) {
+    db.exec("ALTER TABLE audit_retention_cursor ADD COLUMN sweep_upper INTEGER NOT NULL DEFAULT 0");
+  }
   db.exec("DROP TRIGGER IF EXISTS retained_hard_limit");
   try { db.exec("ALTER TABLE run_event_usage ADD COLUMN last_seq INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   const version = db.pragma("user_version", { simple: true });

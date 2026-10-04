@@ -4746,11 +4746,16 @@ async function responsiveSidebarBreakpointCycles(setWidth) {
   try {
     for (let round = 0; round < 3; round += 1) {
       const desktopSidebarControl = host.querySelector('[aria-label="Close projects sidebar"]');
-      desktopSidebarControl.focus();
+      await until(() => {
+        desktopSidebarControl?.focus({ preventScroll: true });
+        return visibleFocus(desktopSidebarControl);
+      }, `focused desktop sidebar precondition ${round + 1}`);
       await setWidth(640);
       await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), `sidebar closed from focused desktop control ${round + 1}`);
       await expectResponsiveFocus(`visible focus restored after hiding desktop sidebar ${round + 1}`,
         () => host.querySelector('[aria-label="Open projects sidebar"]'));
+      assert(visibleFocus(host.querySelector('[aria-label="Open projects sidebar"]')),
+        "narrow opener was not focused before the wide transition");
       if (round === 0) {
         // A busy main thread can deliver a blur timer after the old three-second
         // wall-clock retry window. The visible opener must regain ownership.
