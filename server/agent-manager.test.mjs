@@ -193,6 +193,78 @@ test("transient admission audit faults keep runs queued and revalidate before si
   } finally { await manager.shutdown(); }
 });
 
+test("an audit fault keeps retry ownership even while measured launch capacity is low", async () => {
+  const database = fakeDatabase();
+  const run = database.createRun({ ...codexRun("audit-low-space"), status: "queued" });
+  const audit = database.auditAdmission;
+  let room = true;
+  let attempts = 0;
+  let validations = 0;
+  const children = [];
+  database.canLaunchRun = () => room;
+  database.capacity = () => ({ diskUsageStatus: "measured", availableForNewWorkBytes: room ? 1024 * 1024 : 0 });
+  database.auditAdmission = (...args) => {
+    attempts += 1;
+    if (attempts === 1) {
+      room = false;
+      throw Object.assign(new Error("busy admission audit"), { code: "SQLITE_BUSY" });
+    }
+    audit(...args);
+  };
+  const manager = createAgentManager({ database, publish: () => {},
+    validateConversation: async () => { validations += 1; return () => {}; },
+    launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  try {
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    assert.equal(children.length, 0, "the fault or low capacity launched work without an audit");
+    assert.equal(database.getRun(run.id).status, "queued");
+    room = true;
+    const deadline = Date.now() + 1800;
+    while (!children.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(children.length, 1, "low capacity discarded the fault retry owner");
+    assert.equal(attempts, 2);
+    assert.ok(validations >= 2, "retry skipped authorization validation");
+    children[0].emit("close", 0, null);
+    assert.equal(database.getRun(run.id).status, "completed");
+  } finally { await manager.shutdown(); }
+});
+
+test("persistent terminal storage refusal retains the slot until recovery", async () => {
+  for (const [name, fault] of [["quota", { statusCode: 507 }], ["read-only", { code: "SQLITE_READONLY" }], ["no-space", { code: "ENOSPC" }]]) {
+    const database = fakeDatabase();
+    database.getSettings = () => ({ maxConcurrentRuns: 1 });
+    const first = database.createRun({ ...codexRun(`terminal-${name}`), status: "queued" });
+    const second = database.createRun({ ...codexRun(`sibling-${name}`), status: "queued" });
+    const durableFinish = database.finishRun;
+    let blocked = true;
+    database.finishRun = (...args) => {
+      if (args[0] === first.id && blocked) throw Object.assign(new Error("storage unavailable"), fault);
+      return durableFinish(...args);
+    };
+    const children = [];
+    const manager = createAgentManager({ database, publish: () => {},
+      launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+      spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+    try {
+      await manager.schedule({ conversation: database.getConversation("conv-1"), run: first });
+      await manager.schedule({ conversation: database.getConversation("conv-1"), run: second });
+      children[0].emit("close", 0, null);
+      await new Promise((resolve) => setTimeout(resolve, 160));
+      assert.deepEqual(manager.activeRuns(), [first.id], "a refused terminal commit released its slot");
+      assert.equal(database.getRun(second.id).status, "queued");
+      blocked = false;
+      const deadline = Date.now() + 1800;
+      while (children.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(children.length, 2, "the restored store did not release the sibling");
+      assert.equal(database.getRun(first.id).status, "completed");
+      assert.equal(database.finishes.filter((entry) => entry.id === first.id).length, 1);
+      children[1].emit("close", 0, null);
+    } finally { await manager.shutdown(); }
+  }
+});
+
 test("repeated terminal storage faults retain the slot and retry the durable outcome", async () => {
   const database = fakeDatabase();
   database.getSettings = () => ({ maxConcurrentRuns: 1 });
@@ -273,6 +345,57 @@ test("a completed run keeps its slot through repeated SQLite finish faults and s
       "restart lost the first run's completion audit");
     assert.ok(audit.some((row) => row.action === "agent.run.start.requested" && row.target === second.id),
       "the sibling started without its required audit");
+  } finally {
+    await manager?.shutdown();
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("an optional omission write fault after terminal commit does not repeat the audit", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-postcommit-omission-"));
+  const filename = path.join(realpathSync(directory), "outright.db");
+  let database = createOutrightDatabase({ filename });
+  let manager;
+  const children = [];
+  try {
+    database.updateSettings({ maxConcurrentRuns: 1 });
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory,
+      title: "Postcommit omission", provider: "claude" });
+    const first = database.createRun({ conversationId: conversation.id, provider: "claude", approvalPolicy: "read-only", prompt: "first" });
+    const second = database.createRun({ conversationId: conversation.id, provider: "claude", approvalPolicy: "read-only", prompt: "second" });
+    manager = createAgentManager({ database, publish: () => {},
+      launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+      spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+    await manager.schedule({ conversation, run: first });
+    await manager.schedule({ conversation, run: second });
+    children[0].stdout.write(`${JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "partial answer" } } })}\n`);
+    const upsertMessage = database.upsertMessage;
+    const updateRun = database.updateRun;
+    database.upsertMessage = () => { throw Object.assign(new Error("optional transcript full"), { statusCode: 507 }); };
+    database.updateRun = (id, patch) => {
+      if (id === first.id && Object.keys(patch).length === 1 && patch.transcriptOmitted === true) {
+        throw Object.assign(new Error("postcommit omission write busy"), { code: "SQLITE_BUSY" });
+      }
+      return updateRun(id, patch);
+    };
+    children[0].emit("close", 0, null);
+    assert.equal(database.getRun(first.id).status, "completed");
+    assert.equal(Boolean(database.getRun(first.id).transcriptOmitted), true,
+      "the terminal transaction lost its durable omission marker");
+    const deadline = Date.now() + 1500;
+    while (children.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(children.length, 2, "a postcommit notice fault stranded the sibling");
+    database.upsertMessage = upsertMessage;
+    database.updateRun = updateRun;
+    children[1].emit("close", 0, null);
+    await manager.shutdown();
+    await database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.getRun(first.id).status, "completed");
+    assert.equal(Boolean(database.getRun(first.id).transcriptOmitted), true);
+    assert.equal(database.listAudit(100).filter((row) => row.action === "agent.run.completed" && row.target === first.id).length, 1,
+      "the committed finish was audited more than once");
   } finally {
     await manager?.shutdown();
     await database.close();

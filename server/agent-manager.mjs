@@ -335,6 +335,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   let shutdownPromise;
   let diskRetryTimer;
   let diskRetryDelayMs = 100;
+  let admissionStorageFault = false;
   const providerDiscovery = providerDiscoveryFactory({ onChange: onProvidersChanged });
 
   function storageAdmissionFailure(error) {
@@ -383,7 +384,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     try {
       if (database.canLaunchRun?.() === false) return "deferred";
     } catch (error) {
-      if (storageAdmissionFailure(error)) return "deferred";
+      if (storageAdmissionFailure(error)) return "retry-deferred";
       throw error;
     }
     try {
@@ -392,9 +393,12 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       // No process has been spawned yet. A transient SQLite lock or I/O
       // failure must leave the run queued for a fresh admission attempt;
       // terminalizing it can itself fail under the same storage fault.
-      if (storageAdmissionFailure(error) || (error.statusCode === 503 && database.maintenanceActive)) return "deferred";
+      if (storageAdmissionFailure(error)) return "retry-deferred";
+      if (error.statusCode === 503 && database.maintenanceActive) return "deferred";
       throw error;
     }
+    admissionStorageFault = false;
+    clearDiskRetry();
     const startedAt = new Date().toISOString();
     // Crash-safe launch handshake, phase 1: this durable marker means "a spawn
     // may have been issued, but the provider was never authorized to run". A
@@ -574,6 +578,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     let message;
     let finishedAt;
     let finished;
+    let transcriptMessage;
     try {
       const successful = exitCode === 0 && !error && !state.stopped;
       if (state.stopped) status = "stopped";
@@ -581,11 +586,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       else status = "failed";
       message = error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : "");
       finishedAt = new Date().toISOString();
-      const transcriptMessage = budgetTranscript(state, pendingAssistantMessage(state), { terminal: true });
+      transcriptMessage = budgetTranscript(state, pendingAssistantMessage(state), { terminal: true });
       // The last checkpoint and terminal state commit together. Until that
       // commit succeeds this state still owns its run slot and recovery data.
       finished = database.finishRun(state.run.id, { status, finishedAt, exitCode, error: message || null, pid: null }, transcriptMessage);
-      if (transcriptMessage && !finished.message) markTranscriptOmitted(state);
     } catch (writeError) {
       state.finishing = false;
       if (storageAdmissionFailure(writeError) || (writeError.statusCode === 503 && database.maintenanceActive)) {
@@ -596,6 +600,16 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       throw writeError;
     }
     state.pendingFinish = null;
+    if (transcriptMessage && !finished.message) {
+      // finishRun committed the terminal state, omission flag and audit in one
+      // transaction. A failure to write the optional notice cannot retry that
+      // transaction or duplicate its audit after a process restart.
+      try { markTranscriptOmitted(state); }
+      catch (noticeError) {
+        state.transcriptOmitted = true;
+        if (!storageAdmissionFailure(noticeError)) console.warn("Run transcript omission notice failed after terminal commit", noticeError);
+      }
+    } else if (finished.run?.transcriptOmitted) state.transcriptOmitted = true;
     // A Windows wrapper leaves a completed Job Object proof until this
     // terminal transaction succeeds. Other platforms may leave a record only
     // after a hard kill; both are safe to remove after the durable commit.
@@ -765,10 +779,11 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       try {
         const prepared = await prepareQueuedLaunch(state, entry);
         if (!prepared) return;
-        if (await start(state, prepared.authorize) === "deferred") {
+        const admission = await start(state, prepared.authorize);
+        if (admission === "deferred" || admission === "retry-deferred") {
           active.delete(entry.run.id);
           queue.unshift(entry);
-          retryDeferredAdmission();
+          retryDeferredAdmission(admission === "retry-deferred");
           // The archive worker closes SQLite while promoting its snapshot.
           // Keep schedule's readback pending until the reopened connection is
           // available, even though this run is safely queued again.
@@ -808,7 +823,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // A sibling may free a slot and drain the queue while another completed
     // run still awaits its terminal commit. Keep that retry armed until every
     // such owner has durable outcome evidence.
-    if (!shuttingDown && [...active.values()].some((state) => state.pendingFinish)) return;
+    if (!shuttingDown && (admissionStorageFault || [...active.values()].some((state) => state.pendingFinish))) return;
     if (diskRetryTimer) clearTimeout(diskRetryTimer);
     diskRetryTimer = null;
     diskRetryDelayMs = 100;
@@ -823,8 +838,13 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     }
   }
 
-  function retryDeferredAdmission() {
+  function retryDeferredAdmission(storageFault = false) {
     if (database.maintenanceActive) return;
+    if (storageFault) admissionStorageFault = true;
+    // A failed SQLite write/read needs its own retry owner even if the last
+    // measured capacity was below the ordinary launch threshold. Capacity
+    // alone cannot tell whether the fault has cleared.
+    if (admissionStorageFault) { retryUnknownDiskUsage(); return; }
     let observed;
     try { observed = database.capacity?.(); }
     catch (error) {
@@ -843,7 +863,12 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // Every entry point, including the disk retry timer, reaches this guard.
     // During the archive cutover getSettings cannot read the closed SQLite
     // connection. onDeletionWorkerExit calls resumeQueued after it reopens.
-    if (shuttingDown || database.maintenanceActive || !queue.length) return;
+    if (shuttingDown || database.maintenanceActive) return;
+    if (!queue.length) {
+      admissionStorageFault = false;
+      clearDiskRetry();
+      return;
+    }
     let max;
     try { max = database.getSettings().maxConcurrentRuns; }
     catch (error) {
