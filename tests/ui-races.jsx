@@ -674,15 +674,22 @@ async function settingsCapacityWithoutEventRegression() {
     && document.querySelector(".capacity-status")?.textContent.includes("4.0 of 64 MiB retained"),
   "capacity converges without an event after another client writes");
   const capacityText = () => document.querySelector(".capacity-status")?.textContent ?? "";
+  const capacityAnnouncement = () => document.querySelector('[aria-labelledby="capacity-retention-heading"] [role="status"]')?.textContent ?? "";
   assert(document.querySelector(".capacity-status")?.tagName === "P",
     "polled measurements should be readable without a live status announcement on every value change");
+  assert(capacityAnnouncement() === "Capacity is available for new work.", "initial capacity state was not announced");
+  assert(document.querySelector('[aria-labelledby="capacity-retention-heading"] h3')?.textContent === "Capacity and retention",
+    "capacity controls lost their named heading");
   otherClientCapacity = { ...otherClientCapacity, availablePhysicalForNewWorkBytes: 32 * 1024 };
   await until(() => capacityText().includes("New work is paused at the physical storage threshold"),
     "32 KiB physical headroom announces the same pause as run admission");
+  assert(capacityAnnouncement() === "Physical storage is full. New work is paused.", "physical pause was not announced");
   otherClientCapacity = { ...otherClientCapacity, migrationStatus: "maintenance",
     diskUsageStatus: "partial", availablePhysicalForNewWorkBytes: 0 };
   await until(() => capacityText().includes("(partial)") && !capacityText().includes("physical storage threshold"),
     "maintenance pause is not mislabeled as a physical limit");
+  assert(capacityAnnouncement() === "Archived storage cleanup is in progress. New work is paused.",
+    "cleanup transition was not announced");
   otherClientCapacity = { ...otherClientCapacity, migrationStatus: "ready",
     diskUsageStatus: "measured", availablePhysicalForNewWorkBytes: 0 };
   await until(() => capacityText().includes("(measured)") && capacityText().includes("physical storage threshold"),
@@ -690,6 +697,8 @@ async function settingsCapacityWithoutEventRegression() {
   otherClientCapacity = { ...otherClientCapacity, diskAllocatedBytes: null, diskUsageStatus: "unknown" };
   await until(() => capacityText().includes("Allocated disk use is unknown"),
     "an unknown measurement does not present a numeric budget");
+  assert(capacityAnnouncement() === "Physical storage use is unknown. New work is paused.",
+    "unknown storage state was not announced");
   assert(!capacityText().includes(" MiB budget") && !capacityText().includes("physical storage threshold"),
     "unknown physical use cannot show a measured budget or threshold warning");
   [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Cancel").click();
@@ -1575,10 +1584,10 @@ async function terminalUnknownRegression() {
     runtimeEvent={event} onError={(error) => { throw error; }} sendRuntime={(message) => sent.push(message)} />);
   show();
   await until(() => terminalReady("Terminal A"), "running terminal before unknown ownership");
+  const before = sent.length;
   show({ type: "terminal.audit-failed", terminalId: "term-A" });
   await until(() => host.querySelector('[data-tab-id="term-A"]')?.getAttribute("aria-label").includes("ownership unverified"), "unknown ownership announcement");
   assert(host.querySelector('.terminal-pane [role="status"]')?.textContent.includes("ownership is unverified"), "Unknown terminal lacks a spoken status");
-  const before = sent.length;
   host.querySelector('.terminal-host').style.width = "540px";
   const input = host.querySelector('.terminal-host .xterm-helper-textarea');
   input.focus();

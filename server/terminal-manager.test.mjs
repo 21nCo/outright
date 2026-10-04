@@ -4,6 +4,7 @@ import { createTerminalManager } from "./terminal-manager.mjs";
 import { recoverManagedTerminal } from "./managed-terminal.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { createOutrightDatabase } from "./database.mjs";
+import { AUDIT_RETENTION_LIMIT } from "./audit-retention.mjs";
 import { createOutrightRuntime } from "./outright-runtime.mjs";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { execFile, spawn, spawnSync } from "node:child_process";
@@ -654,8 +655,8 @@ test("legacy terminal audit history yields startup and resumes safely after inte
     try {
       assert.equal(manager.capacity().recoveryPending, true);
       await assert.rejects(manager.create({ cwd: directory }), (error) => error.statusCode === 503);
-      const deadline = Date.now() + 10_000;
-      while (database.terminalAuditScanPending && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      await waitFor(() => !database.terminalAuditScanPending || database.terminalAuditScanError, 10_000,
+        () => database.terminalAuditScanError);
       assert.equal(database.terminalAuditScanPending, false, "legacy scan did not finish");
       manager.reloadUnknownReservations();
       assert.equal(manager.capacity().unknown, 2);
@@ -665,10 +666,40 @@ test("legacy terminal audit history yields startup and resumes safely after inte
       assert.ok(database.listAudit(10).some((entry) => entry.action === "terminal.unknown"));
       const readback = new Database(filename, { readonly: true });
       try {
-        assert.ok(readback.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= 10_000,
+        assert.ok(readback.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= AUDIT_RETENTION_LIMIT,
           "legacy telemetry was not trimmed after ownership was reconstructed");
       } finally { readback.close(); }
     } finally { await manager.shutdown(); }
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("failed legacy audit trimming can restart without releasing an unknown terminal", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-audit-retry-"));
+  const filename = path.join(directory, "runtime.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  const terminalId = "54d20348-0790-4ba8-b888-e05887e48451";
+  try {
+    await database.close();
+    const writer = new Database(filename);
+    try {
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, '{}', '2026-09-01')");
+      writer.transaction(() => {
+        for (let index = 0; index < 12_000; index += 1) insert.run("legacy.telemetry", "");
+        insert.run("terminal.created", terminalId);
+      }).immediate();
+      writer.exec("CREATE TRIGGER refuse_audit_trim BEFORE DELETE ON audit_log BEGIN SELECT RAISE(FAIL, 'audit trim blocked'); END");
+    } finally { writer.close(); }
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    database.reconcileTerminalAudit();
+    await assert.rejects(database.waitForTerminalAuditReconciliation(), /audit trim blocked/);
+    assert.equal(database.terminalAuditScanPending, true);
+    assert.deepEqual(database.terminalUnknownReservations(), [], "failed scan released unresolved ownership");
+    const repair = new Database(filename);
+    try { repair.exec("DROP TRIGGER refuse_audit_trim"); }
+    finally { repair.close(); }
+    database.reconcileTerminalAudit();
+    await database.waitForTerminalAuditReconciliation();
+    assert.deepEqual(database.terminalUnknownReservations().map((entry) => entry.target), [terminalId]);
   } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
@@ -743,7 +774,7 @@ test("terminal audit scan exposes a bounded owner-index failure to offline waite
     try {
       const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES ('terminal.created', ?, '{}', '2026-09-01')");
       writer.transaction(() => {
-        for (let index = 0; index <= 10_000; index += 1) {
+        for (let index = 0; index <= AUDIT_RETENTION_LIMIT; index += 1) {
           insert.run(`00000000-0000-4000-8000-${String(index).padStart(12, "0")}`);
         }
       }).immediate();
@@ -794,7 +825,7 @@ test("normal shutdown settles every PTY at a lowered quota and old outcomes trim
     const proof = new Database(filename, { readonly: true });
     try {
       assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.created'").get().count, 0);
-      assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= 10_001);
+      assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= AUDIT_RETENTION_LIMIT + 1);
     } finally { proof.close(); }
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
@@ -857,10 +888,8 @@ test("restart settles crash and maintenance-interrupted PTY evidence before rete
     database.close();
     database = createOutrightDatabase({ filename, runtimeLease: true });
     assert.equal(database.reconcileTerminalAudit(), 0);
-    const scanDeadline = Date.now() + 10_000;
-    while (database.terminalAuditScanPending && !database.terminalAuditScanError && Date.now() < scanDeadline) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
+    await waitFor(() => !database.terminalAuditScanPending || database.terminalAuditScanError, 10_000,
+      () => database.terminalAuditScanError);
     assert.equal(database.terminalAuditScanError, null);
     assert.equal(database.terminalAuditScanPending, false);
     const recoveredRequest = database.terminalUnknownReservations().find((entry) => entry.target === "unborn");
@@ -872,7 +901,7 @@ test("restart settles crash and maintenance-interrupted PTY evidence before rete
     const proof = new Database(filename, { readonly: true });
     try {
       assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.created'").get().count, 4);
-      assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= 10_010);
+      assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= AUDIT_RETENTION_LIMIT + 10);
     } finally { proof.close(); }
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });

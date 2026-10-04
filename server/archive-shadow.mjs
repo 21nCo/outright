@@ -285,8 +285,8 @@ function finishLinkedCandidate(filename, next, old, marker) {
   if (!publicInfo || !nextInfo || !fileInfo(old)) return;
   if (!sameArchiveFile(filename, next, publicInfo, nextInfo) || publicInfo.nlink !== 2
     || nextInfo.nlink !== 2 || !publicInfo.isFile() || !nextInfo.isFile()
-    || String(publicInfo.dev) !== marker.candidate?.identity?.[0]
-    || String(publicInfo.ino) !== marker.candidate?.identity?.[1]) return;
+    || (process.platform !== "win32" && (String(publicInfo.dev) !== marker.candidate?.identity?.[0]
+      || String(publicInfo.ino) !== marker.candidate?.identity?.[1]))) return;
   // A crash between exclusive link creation and unlink leaves two names for
   // the same candidate inode. Lock it before dropping the redundant private
   // name; the public name and every committed byte remain available.
@@ -321,8 +321,8 @@ function finishLinkedSource(filename, next, old, marker) {
   const oldInfo = fileInfo(old);
   if (!publicInfo || !oldInfo || !sameArchiveFile(filename, old, publicInfo, oldInfo)
     || publicInfo.nlink !== 2 || oldInfo.nlink !== 2 || !publicInfo.isFile() || !oldInfo.isFile()
-    || String(publicInfo.dev) !== marker.sourceSnapshot?.dev
-    || String(publicInfo.ino) !== marker.sourceSnapshot?.ino) return;
+    || (process.platform !== "win32" && (String(publicInfo.dev) !== marker.sourceSnapshot?.dev
+      || String(publicInfo.ino) !== marker.sourceSnapshot?.ino))) return;
   if (process.platform === "win32") {
     // Checkpoint the restored source before obtaining the helper's SQLite
     // lock. No SQLite connection may remain open across Windows unlink.

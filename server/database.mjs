@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { MAX_PENDING_RETENTION_CLEANUPS, pendingCleanupSql, trimAudit } from "./audit-retention.mjs";
+import { MAX_PENDING_RETENTION_CLEANUPS, pendingCleanupSql, trimAudit, trimAuditPage } from "./audit-retention.mjs";
 import { chmodSync, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, realpathSync, rmSync, statfsSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -109,6 +109,8 @@ export function createOutrightDatabase(options = {}) {
   let migrationTick;
   let migrationRetry;
   let terminalAuditTick;
+  let terminalAuditRetry;
+  let terminalAuditRetries = 0;
   let terminalAuditScan;
   let terminalReservationsCache;
   let terminalAuditCompletion = Promise.resolve();
@@ -359,7 +361,14 @@ export function createOutrightDatabase(options = {}) {
       : serialized;
     db.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
       .run(action, String(details.target ?? "").slice(0, 512), payload, now());
-    if (trim && !terminalAuditScan) trimAudit(db);
+    if (trim && !terminalAuditScan) {
+      // A small legacy overflow should be reclaimed by the write that first
+      // observes it. Four fixed pages keep an old protected prefix from
+      // turning every audit into an unbounded synchronous cleanup.
+      for (let page = 0; page < 4; page += 1) {
+        if (trimAuditPage(db).complete) break;
+      }
+    }
   }
 
   function writeCriticalAudit(action, details = {}) {
@@ -372,6 +381,7 @@ export function createOutrightDatabase(options = {}) {
 
   function beginTerminalAuditScan() {
     const lastId = db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM audit_log").get().id;
+    db.prepare("UPDATE audit_retention_cursor SET cursor = 0 WHERE id = 1").run();
     terminalAuditScan = { cursor: 0, lastId, requests: new Map(), owners: new Map(), outcomes: null, written: 0 };
     terminalAuditCompletion = new Promise((resolve, reject) => {
       completeTerminalAudit = resolve;
@@ -447,12 +457,13 @@ export function createOutrightDatabase(options = {}) {
       // Earlier live audit writes did not trim while the cursor was reading
       // that history. Reclaim it in bounded slices before releasing terminal
       // admission; unresolved owner evidence remains protected by trimAudit.
-      if (trimAudit(db, 256) > 0) {
+      if (!trimAuditPage(db, 32, scan.lastId).complete) {
         terminalAuditTick = setImmediate(advanceTerminalAuditScan);
         return;
       }
       terminalReservationsCache = [...scan.owners.values()];
       terminalAuditScan = null;
+      terminalAuditRetries = 0;
       completeTerminalAudit?.();
       try { options.onTerminalAuditReconciled?.(); }
       catch (error) { options.onTerminalAuditError?.(error); }
@@ -461,6 +472,16 @@ export function createOutrightDatabase(options = {}) {
       failTerminalAudit?.(error);
       options.onTerminalAuditError?.(error);
       // Keep terminal admission paused. A restart retries the bounded scan.
+      if (["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_IOERR", "SQLITE_FULL"].includes(error.code)) {
+        const delay = Math.min(30_000, 1000 * 2 ** Math.min(terminalAuditRetries++, 5));
+        terminalAuditRetry = setTimeout(() => {
+          terminalAuditRetry = undefined;
+          if (!closing && terminalAuditScan === scan) {
+            terminalAuditScan = null;
+            beginTerminalAuditScan();
+          }
+        }, delay);
+      }
     }
   }
 
@@ -481,6 +502,7 @@ export function createOutrightDatabase(options = {}) {
       if (migrationTick) clearImmediate(migrationTick);
       if (migrationRetry) clearTimeout(migrationRetry);
       if (terminalAuditTick) clearImmediate(terminalAuditTick);
+      if (terminalAuditRetry) clearTimeout(terminalAuditRetry);
       if (deletionTickKind === "timeout") clearTimeout(deletionTick);
       else if (deletionTickKind === "immediate") clearImmediate(deletionTick);
       const errors = [];
@@ -499,6 +521,7 @@ export function createOutrightDatabase(options = {}) {
       if (migrationTick) clearImmediate(migrationTick);
       if (migrationRetry) clearTimeout(migrationRetry);
       if (terminalAuditTick) clearImmediate(terminalAuditTick);
+      if (terminalAuditRetry) clearTimeout(terminalAuditRetry);
       if (deletionTickKind === "timeout") clearTimeout(deletionTick);
       else if (deletionTickKind === "immediate") clearImmediate(deletionTick);
       for (const worker of deletionWorkers) void worker.terminate().catch(() => {});
@@ -1613,7 +1636,13 @@ export function createOutrightDatabase(options = {}) {
       return pending.length;
     },
     reconcileTerminalAudit() {
-      if (terminalAuditScan || terminalReservationsCache) return 0;
+      if (terminalReservationsCache) return 0;
+      if (terminalAuditScan?.error && !terminalAuditRetry) {
+        terminalAuditScan = null;
+        beginTerminalAuditScan();
+        return 0;
+      }
+      if (terminalAuditScan) return 0;
       // A legacy audit table can predate bounded retention. Scanning it with
       // correlated outcome lookups before readiness would block every API.
       // The raw-id cursor below yields between fixed pages; terminal admission
@@ -2094,8 +2123,10 @@ function migrate(db) {
     CREATE TABLE IF NOT EXISTS run_event_usage (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, bytes INTEGER NOT NULL, last_seq INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS trusted_projects (project_id TEXT PRIMARY KEY, project_path TEXT NOT NULL, trusted_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, target TEXT, details TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS audit_retention_cursor (id INTEGER PRIMARY KEY CHECK (id = 1), cursor INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS prompt_templates (id TEXT PRIMARY KEY, title TEXT NOT NULL, prompt TEXT NOT NULL, created_at TEXT NOT NULL);
   `);
+  db.prepare("INSERT OR IGNORE INTO audit_retention_cursor (id) VALUES (1)").run();
   db.exec("DROP TRIGGER IF EXISTS retained_hard_limit");
   try { db.exec("ALTER TABLE run_event_usage ADD COLUMN last_seq INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   const version = db.pragma("user_version", { simple: true });

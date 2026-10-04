@@ -52,6 +52,22 @@ function archiveOwnerExited(pid, birth) {
   throw new Error("Windows archive lock owner exit is unknown");
 }
 
+function waitForArchiveRelease(ready, pid, birth, timeoutMs) {
+  let nextProbeAt = 0;
+  let exited = false;
+  return waitUntil(() => {
+    if (existsSync(ready)) return false;
+    // The helper removes its ready file after releasing every OS lock.
+    // Confirm process exit too, but do not spawn a native identity probe on
+    // every 10 ms filesystem poll while Windows completes that exit.
+    if (!exited && Date.now() >= nextProbeAt) {
+      nextProbeAt = Date.now() + 100;
+      exited = archiveOwnerExited(pid, birth);
+    }
+    return exited;
+  }, timeoutMs);
+}
+
 // Call only after closing this process's SQLite connections. The native owner
 // uses FILE_SHARE_DELETE and pins SQLite's lock bytes while synchronous JS
 // performs the rename/unlink sequence. A competing SQLite connection cannot
@@ -95,7 +111,7 @@ export function acquireWindowsArchiveLock(filenames) {
     // The helper removes ready only after releasing its file locks. Preserve
     // stop and ready if that proof has not arrived; killing the helper would
     // strand the ready marker while its OS lock had already disappeared.
-    if (!waitUntil(() => !existsSync(ready) && archiveOwnerExited(child.pid, ownerBirth), 5000)) {
+    if (!waitForArchiveRelease(ready, child.pid, ownerBirth, 5000)) {
       throw new AggregateError([error, new Error("Windows archive lock owner did not release")],
         "Windows archive lock startup and release failed");
     }
@@ -103,18 +119,21 @@ export function acquireWindowsArchiveLock(filenames) {
     throw error;
   }
   return () => {
+    let released = false;
     try {
       try { writeFileSync(stop, "stop", { mode: 0o600, flag: "wx" }); }
       catch (error) { if (error.code !== "EEXIST") throw error; }
-      if (!waitUntil(() => !existsSync(ready) && archiveOwnerExited(child.pid, ownerBirth), 5000)) {
+      released = waitForArchiveRelease(ready, child.pid, ownerBirth, 5000);
+      if (!released) {
         child.stdin.destroy();
-        if (!waitUntil(() => !existsSync(ready) && archiveOwnerExited(child.pid, ownerBirth), 5000)) {
+        released = waitForArchiveRelease(ready, child.pid, ownerBirth, 5000);
+        if (!released) {
           throw new Error("Windows archive lock did not release");
         }
       }
     } finally {
       child.stdin.destroy();
-      if (!existsSync(ready) && archiveOwnerExited(child.pid, ownerBirth)) rmSync(stop, { force: true });
+      if (released) rmSync(stop, { force: true });
     }
   };
 }

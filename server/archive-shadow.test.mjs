@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { existsSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -27,6 +28,31 @@ test("Windows archive lock reports readiness, protects the source, and removes i
     finally { writer.close(); }
     assert.equal(readdirSync(item.directory).some((name) => name.includes(".archive-lock-")), false);
   } finally { rmSync(item.directory, { recursive: true, force: true }); }
+});
+
+test("Windows archive lock bounds native owner probes while release is delayed", { skip: process.platform !== "win32" }, () => {
+  const item = fixture();
+  const originalSpawnSync = childProcess.spawnSync;
+  try {
+    const release = acquireWindowsArchiveLock([item.filename]);
+    let probes = 0;
+    const until = Date.now() + 1000;
+    childProcess.spawnSync = (command, args, options) => {
+      if (args?.[0] === "--probe") {
+        probes += 1;
+        if (Date.now() < until) return { status: 0, stdout: "alive\n" };
+      }
+      return originalSpawnSync(command, args, options);
+    };
+    syncBuiltinESMExports();
+    release();
+    assert.ok(probes > 0 && probes <= 20, `release spawned ${probes} native owner probes`);
+    assert.equal(readdirSync(item.directory).some((name) => name.includes(".archive-lock-")), false);
+  } finally {
+    childProcess.spawnSync = originalSpawnSync;
+    syncBuiltinESMExports();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
 });
 
 test("Windows archive lock collapses two hard-link names when Node reports zero inode", { skip: process.platform !== "win32" }, () => {
@@ -955,6 +981,7 @@ test("inaccessible rollback journal closes optional admission until measurement 
   const originalStat = fs.lstatSync;
   let database;
   let run;
+  let completed = false;
   const runtimeFilename = path.join(item.directory, "runtime.db");
   try {
     database = createOutrightDatabase({ filename: runtimeFilename });
@@ -977,18 +1004,26 @@ test("inaccessible rollback journal closes optional admission until measurement 
     assert.equal(database.updateConversation(archived.id, { archived: true }).archived, 1,
       "archive eligibility must remain available to cleanup during unknown usage");
     assert.equal(database.canLaunchRun(), false, "unknown physical usage admitted a new process");
+    completed = true;
   } finally {
     fs.lstatSync = originalStat;
     syncBuiltinESMExports();
-    assert.equal(database?.capacity().diskUsageStatus, process.platform === "win32" ? "estimated" : "measured");
-    assert.equal(database?.canLaunchRun(), true, "journal access recovery did not reopen admission");
-    assert.ok(database?.createConversation({ projectId: "p", worktreeId: "w", worktreePath: item.directory, title: "recovered", provider: "codex" }));
-    database?.close();
-    const reopened = createOutrightDatabase({ filename: runtimeFilename });
     try {
-      assert.equal(reopened.getRun(run.id).status, "failed", "required outcome did not survive reopen");
-      assert.ok(reopened.listAudit().some((entry) => entry.action === "agent.run.failed" && entry.target === run.id));
-    } finally { reopened.close(); }
-    rmSync(item.directory, { recursive: true, force: true });
+      if (completed) {
+        assert.equal(database.capacity().diskUsageStatus, process.platform === "win32" ? "estimated" : "measured");
+        assert.equal(database.canLaunchRun(), true, "journal access recovery did not reopen admission");
+        assert.ok(database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: item.directory, title: "recovered", provider: "codex" }));
+        database.close();
+        database = null;
+        const reopened = createOutrightDatabase({ filename: runtimeFilename });
+        try {
+          assert.equal(reopened.getRun(run.id).status, "failed", "required outcome did not survive reopen");
+          assert.ok(reopened.listAudit().some((entry) => entry.action === "agent.run.failed" && entry.target === run.id));
+        } finally { reopened.close(); }
+      }
+    } finally {
+      try { database?.close(); }
+      finally { rmSync(item.directory, { recursive: true, force: true }); }
+    }
   }
 });

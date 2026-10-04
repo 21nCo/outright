@@ -25,10 +25,19 @@ const server = net.createServer((socket) => {
   let omittedChars = 0;
   let outputPaused = false;
   let exitSent = false;
+  let shedTimer;
+  let exitTimer;
   const pauseOutput = () => {
     if (!outputPaused) {
       outputPaused = true;
-      if (!shellExited) terminal.pause();
+      if (!shellExited) {
+        terminal.pause();
+        // A peer that never reads must not hold the shell at a blocked PTY
+        // write forever. After a grace period, consume and count later output
+        // without adding more socket frames.
+        shedTimer = setTimeout(() => { if (outputPaused && !shellExited) terminal.resume(); }, 2000);
+        shedTimer.unref();
+      }
     }
   };
   const flushOutput = () => {
@@ -47,7 +56,7 @@ const server = net.createServer((socket) => {
       const count = omittedChars;
       omittedChars = 0;
       if (!socket.write(`${JSON.stringify({ type: "data",
-        data: `\r\n[Outright: ${count} terminal output characters omitted]\r\n` })}\n`)) {
+        data: `\u001b[0m\r\n[Outright: ${count} terminal output characters omitted]\r\n` })}\n`)) {
         pauseOutput();
         return;
       }
@@ -58,6 +67,7 @@ const server = net.createServer((socket) => {
       if (server.listening) server.close();
     } else if (outputPaused && !shellExited) {
       outputPaused = false;
+      clearTimeout(shedTimer);
       terminal.resume();
     }
   };
@@ -108,7 +118,16 @@ const server = net.createServer((socket) => {
           omittedChars = Math.min(Number.MAX_SAFE_INTEGER, omittedChars + data.length - end);
           flushOutput();
         });
-        terminal.onExit(() => { shellExited = true; if (!outputPaused) flushOutput(); });
+        terminal.onExit(() => {
+          shellExited = true;
+          clearTimeout(shedTimer);
+          // socket.end can itself wait forever for a silent peer. The owner
+          // has exited, so bound delivery of its final frames and release the
+          // broker even if the client never drains.
+          exitTimer = setTimeout(() => socket.destroy(), 5000);
+          exitTimer.unref();
+          if (!outputPaused) flushOutput();
+        });
       } else if (!shellExited && message.type === "write" && typeof message.data === "string"
         && Buffer.byteLength(message.data) <= 64 * 1024) terminal.write(message.data);
       else if (!shellExited && message.type === "resize" && Number.isInteger(message.cols) && message.cols >= 20 && message.cols <= 400
@@ -117,7 +136,7 @@ const server = net.createServer((socket) => {
       else socket.destroy();
     }
   });
-  socket.on("close", () => { if (server.listening) server.close(); });
+  socket.on("close", () => { clearTimeout(shedTimer); clearTimeout(exitTimer); if (server.listening) server.close(); });
 });
 server.listen(address, () => {
   if (process.platform !== "win32") chmodSync(address, 0o600);

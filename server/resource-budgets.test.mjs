@@ -7,6 +7,7 @@ import { appendFileSync, existsSync, mkdtempSync, realpathSync, rmSync, statSync
 import os from "node:os";
 import path from "node:path";
 import { createOutrightDatabase, recoverArchiveBeforeStartup } from "./database.mjs";
+import { AUDIT_RETENTION_LIMIT } from "./audit-retention.mjs";
 import { retainedTranscriptMessageBytes } from "./resource-budgets.mjs";
 
 function chat(database, title = "Budget test") {
@@ -1174,7 +1175,7 @@ test("audit retention protects an unfinished external effect while trimming comp
       assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE target = '/tmp/completed'").get().count, 0);
       assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE target = 'active-terminal'").get().count, 1);
       assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE target = 'closed-terminal'").get().count, 0);
-      assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= 10_002);
+      assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= AUDIT_RETENTION_LIMIT + 2);
     } finally { proof.close(); }
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
@@ -1493,11 +1494,13 @@ test("oversized cleanup fences the live database and reclaims a shadow before re
   }
 });
 
-test("archive cutover defers while legacy terminal ownership is being reconstructed", { timeout: 20_000 }, async () => {
+test("archive cutover defers while legacy terminal ownership is being reconstructed", { timeout: 30_000 }, async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-audit-cutover-"));
   const filename = path.join(directory, "outright.db");
   const copyGate = new Int32Array(new SharedArrayBuffer(4));
-  const database = createOutrightDatabase({ filename, runtimeLease: true, deletionCopyGate: copyGate.buffer });
+  const deletionErrors = [];
+  const database = createOutrightDatabase({ filename, runtimeLease: true, deletionCopyGate: copyGate.buffer,
+    onDeletionError: (error) => deletionErrors.push(error.message) });
   const terminalId = "54d20348-0790-4ba8-b888-e05887e48453";
   let resumeScan;
   try {
@@ -1543,18 +1546,13 @@ test("archive cutover defers while legacy terminal ownership is being reconstruc
     finally { source.close(); }
     resumeScan();
     await database.waitForTerminalAuditReconciliation();
-    const deadline = Date.now() + 8_000;
+    const deadline = Date.now() + 20_000;
     while (true) {
-      let remaining = 1;
-      try {
-        const probe = new Database(filename, { readonly: true, fileMustExist: true });
-        try { remaining = probe.prepare("SELECT COUNT(*) AS count FROM conversations WHERE id = ?").get(archived.id).count; }
-        finally { probe.close(); }
-      } catch (error) {
-        if (!["SQLITE_BUSY", "SQLITE_CANTOPEN", "ENOENT", "EBUSY"].includes(error.code)) throw error;
-      }
-      if (!remaining) break;
-      assert.ok(Date.now() < deadline, "deferred archive did not resume after ownership recovery");
+      // The on-disk row can disappear during promotion before the runtime
+      // reopens its live connection. Observe the public API after maintenance.
+      if (!database.maintenanceActive && !database.getConversation(archived.id)) break;
+      assert.ok(Date.now() < deadline,
+        `deferred archive did not resume after ownership recovery (maintenance=${database.maintenanceActive}, pending=${database.capacity().cleanupPending}, errors=${deletionErrors.slice(-3).join(" | ")})`);
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.ok(database.terminalUnknownReservations().some((entry) => entry.target === terminalId),

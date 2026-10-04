@@ -214,9 +214,10 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
   <p id="budget-settings-error" role="status" aria-live="polite" className={validBudgetSettings(draft) ? "sr-only" : undefined}>
     {validBudgetSettings(draft) ? "" : "Enter whole numbers within the shown ranges before saving."}
   </p>
-  <section className="template-settings">
-    <header><div><strong>Capacity and retention</strong><small>Cleanup removes unpinned archived chats older than the saved age. You can also select a recent archived chat to delete now. Active and recoverable runs stay protected.</small></div></header>
-    {capacity?.limits && <p className="capacity-status">{capacity.queued} of {capacity.limits.maxQueuedRuns} queued · {capacity.active} active · {capacity.recoverable} awaiting recovery · {capacity.utilityProcesses?.active ?? "unknown"} of {capacity.utilityProcesses?.limit ?? "unknown"} utility processes · {capacity.terminalProcesses?.active ?? "unknown"} of {capacity.terminalProcesses?.limit ?? "unknown"} terminals{capacity.terminalProcesses?.recoveryError ? " (terminal history scan stopped; restart after checking storage)" : capacity.terminalProcesses?.recoveryPending ? " (terminal history scan pending; new terminals paused)" : capacity.terminalProcesses?.unknown ? ` (${capacity.terminalProcesses.unknown} terminals unverified; inspect local terminal recovery)` : ""} · {capacityUsageText(capacity)} ({(capacity.limits.reservedRetainedBytes / 1048576).toFixed(0)} MiB reserved for active runs). CPU and memory use are unknown. {allocatedDiskUsageText(capacity)}</p>}
+  <section className="template-settings" aria-labelledby="capacity-retention-heading">
+    <header><div><h3 id="capacity-retention-heading">Capacity and retention</h3><small>Cleanup removes unpinned archived chats older than the saved age. You can also select a recent archived chat to delete now. Active and recoverable runs stay protected.</small></div></header>
+    {capacity?.limits && <p className="capacity-status">{capacity.queued} of {capacity.limits.maxQueuedRuns} queued · {capacity.active} active · {capacity.recoverable} awaiting recovery · {capacity.utilityProcesses?.active ?? "unknown"} of {capacity.utilityProcesses?.limit ?? "unknown"} utility processes · {capacity.terminalProcesses?.active ?? "unknown"} of {capacity.terminalProcesses?.limit ?? "unknown"} terminals{capacity.terminalProcesses?.recoveryError ? " (terminal history scan stopped; restart after checking storage)" : capacity.terminalProcesses?.recoveryPending ? " (terminal history scan pending; new terminals paused)" : capacity.terminalProcesses?.unknown ? ` (${capacity.terminalProcesses.unknown} terminal${capacity.terminalProcesses.unknown === 1 ? "" : "s"} unverified; inspect local terminal recovery)` : ""} · {capacityUsageText(capacity)} ({(capacity.limits.reservedRetainedBytes / 1048576).toFixed(0)} MiB reserved for active runs). CPU and memory use are unknown. {allocatedDiskUsageText(capacity)}</p>}
+    <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">{capacityStatusAnnouncement(capacity)}</p>
     <Button ref={cleanupButtonRef} variant="outline" onClick={cleanHistory}>Clean old archived history</Button>
     {cleanupResult && <output className="capacity-status">{cleanupResult}</output>}
     {archived.length > 0 && <div ref={archivedListRef} className="template-list archived-history-list" aria-label="Archived chats available to delete">{archived.map((item) => <div key={item.id}><span><strong>{item.title}</strong><small title={item.worktreePath}>{item.worktreePath} · Archived {new Date(item.updatedAt).toLocaleDateString()}</small></span><Button variant="outline" size="sm" disabled={deleting} aria-label={`Delete archived chat “${item.title}” in ${item.worktreePath} (${item.id})`} onClick={(event) => {
@@ -228,8 +229,8 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
     {archivedCursor && <Button variant="outline" onClick={loadMoreArchived} disabled={loadingArchived}>{loadingArchived ? "Loading archived chats…" : "Next archived page"}</Button>}
     {pendingDelete && <fieldset className="archive-delete-confirm"><legend className="sr-only">Confirm archived chat deletion</legend><p>Delete “{pendingDelete.title}” in {pendingDelete.worktreePath} and its messages and run history permanently?</p><div><Button ref={cancelDeleteRef} variant="outline" onClick={() => { restoreDeleteFocusRef.current = true; setPendingDelete(null); }} disabled={deleting}>Cancel</Button><Button variant="destructive" onClick={deleteSelectedArchive} disabled={deleting}>Delete archived chat</Button></div></fieldset>}
   </section>
-  <section className="template-settings">
-    <header><div><strong>Prompt templates</strong><small>Reusable instructions available from the composer.</small></div></header>
+  <section className="template-settings" aria-labelledby="prompt-templates-heading">
+    <header><div><h3 id="prompt-templates-heading">Prompt templates</h3><small>Reusable instructions available from the composer.</small></div></header>
     <div className="template-list">{templates.map((template) => <div key={template.id}><span><strong>{template.title}</strong><small>{template.prompt}</small></span><Button variant="ghost" size="icon-xs" aria-label={`Delete template ${template.title}`} onClick={() => deleteTemplate(template.id)}><Trash /></Button></div>)}</div>
     <div className="new-template"><Input aria-label="Template name" value={templateDraft.title} onChange={(event) => setTemplateDraft({ ...templateDraft, title: event.target.value })} placeholder="Template name" /><Input aria-label="Template prompt" value={templateDraft.prompt} onChange={(event) => setTemplateDraft({ ...templateDraft, prompt: event.target.value })} placeholder="Prompt" /><Button variant="outline" onClick={saveTemplate} disabled={!templateDraft.title.trim() || !templateDraft.prompt.trim()}>Add template</Button></div>
   </section>
@@ -257,6 +258,29 @@ function BudgetSetting({ name, label, min, max, value, setDraft }) {
 }
 
 function Setting({ icon: Icon, label, children }) { return <label className="setting-row"><span><Icon />{label}</span>{children}</label>; }
+
+function capacityStatusAnnouncement(capacity) {
+  if (!capacity?.limits) return "";
+  if (capacity.terminalProcesses?.recoveryError) return "Terminal history recovery stopped. New terminals are paused.";
+  if (capacity.terminalProcesses?.recoveryPending) return "Terminal history recovery is in progress. New terminals are paused.";
+  if (capacity.maintenanceError) return "Archived storage recovery needs a restart. New work is paused.";
+  if (capacity.migrationStatus === "maintenance") return "Archived storage cleanup is in progress. New work is paused.";
+  if (capacity.migrationStatus === "migrating") return "Retained history migration is in progress. New work is paused.";
+  if (capacity.migrationStatus === "error") return "Retained history migration stopped. New work is paused.";
+  if (capacity.cleanupPaused) return "Archived cleanup is paused after storage errors.";
+  if (capacity.cleanupPending) return "Archived cleanup is pending.";
+  if (capacity.queued >= capacity.limits.maxQueuedRuns) return "Run queue is full. Wait for capacity or stop queued work.";
+  if (capacity.diskUsageStatus === "unknown" || capacity.diskAllocatedBytes === null) return "Physical storage use is unknown. New work is paused.";
+  if (typeof capacity.availablePhysicalForNewWorkBytes === "number"
+    && capacity.availablePhysicalForNewWorkBytes < 64 * 1024) return "Physical storage is full. New work is paused.";
+  if (typeof capacity.availableForNewWorkBytes === "number"
+    && capacity.availableForNewWorkBytes < 64 * 1024) return "Retained history is full. New work is paused.";
+  if (capacity.terminalProcesses?.unknown) {
+    const count = capacity.terminalProcesses.unknown;
+    return `${count} terminal ownership ${count === 1 ? "record is" : "records are"} unverified. New terminals may be paused.`;
+  }
+  return "Capacity is available for new work.";
+}
 
 function capacityUsageText(capacity) {
   if (capacity.migrationStatus === "error") return "Retained history migration paused; retrying · new work paused";
