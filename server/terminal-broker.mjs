@@ -17,6 +17,51 @@ const server = net.createServer((socket) => {
   if (peer) { socket.destroy(); return; }
   peer = socket;
   socket.setEncoding("utf8");
+  // Keep the PTY behind the socket's writable high-water mark. Pausing the
+  // PTY also backpressures a shell that produces output faster than its owner
+  // can read it, without treating a slow reader as loss of ownership.
+  let pendingOutput = "";
+  let outputOffset = 0;
+  let omittedChars = 0;
+  let outputPaused = false;
+  let exitSent = false;
+  const pauseOutput = () => {
+    if (!outputPaused) {
+      outputPaused = true;
+      if (!shellExited) terminal.pause();
+    }
+  };
+  const flushOutput = () => {
+    if (socket.destroyed) return;
+    while (outputOffset < pendingOutput.length) {
+      let end = Math.min(pendingOutput.length, outputOffset + 8 * 1024);
+      if (end < pendingOutput.length && /[\uD800-\uDBFF]/.test(pendingOutput[end - 1])
+        && /[\uDC00-\uDFFF]/.test(pendingOutput[end])) end -= 1;
+      const frame = `${JSON.stringify({ type: "data", data: pendingOutput.slice(outputOffset, end) })}\n`;
+      outputOffset = end;
+      if (!socket.write(frame)) { pauseOutput(); return; }
+    }
+    pendingOutput = "";
+    outputOffset = 0;
+    if (omittedChars) {
+      const count = omittedChars;
+      omittedChars = 0;
+      if (!socket.write(`${JSON.stringify({ type: "data",
+        data: `\r\n[Outright: ${count} terminal output characters omitted]\r\n` })}\n`)) {
+        pauseOutput();
+        return;
+      }
+    }
+    if (shellExited && !exitSent) {
+      exitSent = true;
+      socket.end(`${JSON.stringify({ type: "shell-exited" })}\n`);
+      if (server.listening) server.close();
+    } else if (outputPaused && !shellExited) {
+      outputPaused = false;
+      terminal.resume();
+    }
+  };
+  socket.on("drain", flushOutput);
   socket.on("error", () => { socket.destroy(); });
   socket.on("data", (chunk) => {
     pending += chunk;
@@ -49,18 +94,21 @@ const server = net.createServer((socket) => {
         }
         socket.write(`${JSON.stringify({ type: "ready" })}\n`);
         terminal.onData((data) => {
-          for (let offset = 0; offset < data.length;) {
-            if (socket.destroyed || socket.writableLength > 256 * 1024) {
-              socket.destroy();
-              return;
-            }
-            let end = Math.min(data.length, offset + 16 * 1024);
-            if (end < data.length && /[\uD800-\uDBFF]/.test(data[end - 1]) && /[\uDC00-\uDFFF]/.test(data[end])) end -= 1;
-            socket.write(`${JSON.stringify({ type: "data", data: data.slice(offset, end) })}\n`);
-            offset = end;
+          if (socket.destroyed) return;
+          // node-pty normally supplies small reads. A larger callback or an
+          // already queued callback may shed output, but never grow a queue.
+          if (outputPaused || pendingOutput) {
+            omittedChars = Math.min(Number.MAX_SAFE_INTEGER, omittedChars + data.length);
+            return;
           }
+          let end = Math.min(data.length, 64 * 1024);
+          if (end < data.length && /[\uD800-\uDBFF]/.test(data[end - 1])
+            && /[\uDC00-\uDFFF]/.test(data[end])) end -= 1;
+          pendingOutput = data.slice(0, end);
+          omittedChars = Math.min(Number.MAX_SAFE_INTEGER, omittedChars + data.length - end);
+          flushOutput();
         });
-        terminal.onExit(() => { shellExited = true; socket.end(`${JSON.stringify({ type: "shell-exited" })}\n`); if (server.listening) server.close(); });
+        terminal.onExit(() => { shellExited = true; if (!outputPaused) flushOutput(); });
       } else if (!shellExited && message.type === "write" && typeof message.data === "string"
         && Buffer.byteLength(message.data) <= 64 * 1024) terminal.write(message.data);
       else if (!shellExited && message.type === "resize" && Number.isInteger(message.cols) && message.cols >= 20 && message.cols <= 400
