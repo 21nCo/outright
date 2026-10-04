@@ -719,6 +719,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       const shutdownErrors = [];
       const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown()]);
       for (const result of preliminaries) if (result.status === "rejected") shutdownErrors.push(result.reason);
+      // A failed agent shutdown may be the sole owner of an exited provider's
+      // result while both SQLite and its recovery sidecar are unavailable.
+      // Keep the database and its exclusive lease alive for its retry timer.
+      if (shutdownErrors.length) throw new AggregateError(shutdownErrors, "Runtime shutdown retains recovery ownership");
       await inFlightScan?.catch(() => {});
       await terminalAuditReconciliation;
       try { await terminals.shutdown(); }
@@ -727,7 +731,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       wss.close();
       await database.close();
       if (shutdownErrors.length) throw new AggregateError(shutdownErrors, "Runtime shutdown did not finish cleanly");
-    })();
+    })().catch((error) => {
+      shutdownPromise = null;
+      throw error;
+    });
     return shutdownPromise;
   }
 

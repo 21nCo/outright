@@ -1437,16 +1437,30 @@ export function createOutrightDatabase(options = {}) {
         // A legacy database may contain far more pending rows than the current
         // queue limit. Commit bounded batches so a crash preserves progress
         // and startup never materializes the entire backlog in JavaScript.
-        const pending = db.prepare("SELECT id, status, pid FROM runs WHERE status IN ('queued', 'running', 'launching') ORDER BY rowid LIMIT 500").all();
+        const pending = db.prepare("SELECT id, conversation_id AS conversationId, status, pid FROM runs WHERE status IN ('queued', 'running', 'launching') ORDER BY rowid LIMIT 500").all();
         for (const run of pending) {
           // The owner may have observed provider close while SQLite refused
           // its terminal transaction. Its fsynced bounded result is stronger
           // evidence than a dead-process probe or a later Stop request.
-          const outcome = run.status === "queued" ? null : readRunOutcome(launchDirectory, run.id);
+          const outcome = readRunOutcome(launchDirectory, run.id);
           if (outcome) {
-            const result = db.prepare(`UPDATE runs SET status = ?, pid = NULL, finished_at = ?, exit_code = ?, error = ?
-              WHERE id = ? AND status IN ('running', 'launching')`).run(
-              outcome.status, outcome.finishedAt, outcome.exitCode, outcome.message || null, run.id);
+            if (outcome.transcriptMessage?.conversationId !== undefined
+              && outcome.transcriptMessage.conversationId !== run.conversationId) {
+              throw new Error(`Invalid run outcome record: ${run.id}`);
+            }
+            let transcriptOmitted = Boolean(outcome.transcriptOmitted);
+            if (outcome.transcriptMessage) {
+              try {
+                if (!this.upsertMessage(outcome.transcriptMessage)) transcriptOmitted = true;
+              } catch (error) {
+                if (error.statusCode !== 507) throw error;
+                transcriptOmitted = true;
+              }
+            }
+            const result = db.prepare(`UPDATE runs SET status = ?, pid = NULL, finished_at = ?, exit_code = ?, error = ?,
+              transcript_omitted = CASE WHEN transcript_omitted = 1 OR ? THEN 1 ELSE 0 END
+              WHERE id = ? AND status IN ('queued', 'running', 'launching')`).run(
+              outcome.status, outcome.finishedAt, outcome.exitCode, outcome.message || null, transcriptOmitted ? 1 : 0, run.id);
             if (result.changes) {
               writeCriticalAudit(`agent.run.${outcome.status}`, {
                 target: run.id, exitCode: outcome.exitCode, error: outcome.message || undefined,
@@ -2786,7 +2800,7 @@ function sweepLaunchHandshakes(launchDirectory, db) {
   catch { return; }
   const keep = db.prepare(`SELECT 1 FROM runs WHERE id = ? AND status = 'interrupted'
     AND recovery_decision IS NULL AND recovery_class IN ('alive', 'unknown')`);
-  const pendingOutcome = db.prepare("SELECT 1 FROM runs WHERE id = ? AND status IN ('running', 'launching')");
+  const pendingOutcome = db.prepare("SELECT 1 FROM runs WHERE id = ? AND status IN ('queued', 'running', 'launching')");
   try {
     let entry;
     while ((entry = directory.readSync())) {

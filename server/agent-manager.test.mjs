@@ -600,6 +600,7 @@ test("shutdown reports a terminal outcome with neither SQLite nor journal durabi
     const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory,
       title: "No outcome storage", provider: "codex" });
     const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "finish" });
+    const durableFinish = database.finishRun;
     database.savePendingRunOutcome = () => { throw Object.assign(new Error("journal full"), { code: "ENOSPC" }); };
     database.finishRun = () => { throw Object.assign(new Error("SQLite busy"), { code: "SQLITE_BUSY" }); };
     let child;
@@ -610,9 +611,57 @@ test("shutdown reports a terminal outcome with neither SQLite nor journal durabi
     child.emit("close", 0, null);
     await assert.rejects(manager.shutdown(), /Run outcome could not be made durable before shutdown/);
     assert.equal(database.getRun(run.id).status, "running");
+    assert.equal(manager.activeRuns().includes(run.id), true);
+    // A later storage recovery must still have an owner even after shutdown
+    // rejected. Resume explicitly to avoid timing the backoff in this test.
+    database.finishRun = durableFinish;
+    manager.resumeQueued();
+    assert.equal(database.getRun(run.id).status, "completed");
+    await manager.shutdown();
   } finally {
     await database.close();
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("pre-spawn failure and final assistant tail survive a faulted terminal commit and restart", async () => {
+  for (const scenario of ["pre-spawn", "assistant-tail"]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-exit-evidence-"));
+    const filename = path.join(realpathSync(directory), "outright.db");
+    let database = createOutrightDatabase({ filename });
+    let manager;
+    try {
+      const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory,
+        title: scenario, provider: "claude" });
+      const run = database.createRun({ conversationId: conversation.id, provider: "claude", approvalPolicy: "read-only", prompt: scenario });
+      database.finishRun = () => { throw Object.assign(new Error("SQLite busy"), { code: "SQLITE_BUSY" }); };
+      let child;
+      manager = createAgentManager({ database, publish: () => {},
+        validateConversation: scenario === "pre-spawn" ? async () => { throw new Error("Trust revoked before spawn"); } : undefined,
+        launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+        spawnProcess: () => { child = fakeChild(); return child; } });
+      await manager.schedule({ conversation, run });
+      if (scenario === "assistant-tail") {
+        child.stdout.write(`${JSON.stringify({ type: "stream_event", event: { delta: { type: "text_delta", text: "uncommitted final tail" } } })}\n`);
+        child.emit("close", 0, null);
+      } else assert.equal(child, undefined, "a rejected pre-spawn run launched a process");
+      assert.equal(database.getRun(run.id).status, scenario === "pre-spawn" ? "queued" : "running");
+      await manager.shutdown();
+      await database.close();
+      database = createOutrightDatabase({ filename });
+      assert.equal(database.reconcileInterruptedRuns().count, 1);
+      const recovered = database.getRun(run.id);
+      const expected = scenario === "pre-spawn" ? "failed" : "completed";
+      assert.equal(recovered.status, expected);
+      assert.equal(recovered.transcriptOmitted, 0);
+      assert.equal(database.listAudit(100).filter((entry) => entry.target === run.id && entry.action === `agent.run.${expected}`).length, 1);
+      assert.equal(database.listAudit(100).filter((entry) => entry.target === run.id && entry.action === "agent.run.stopped").length, 0);
+      if (scenario === "assistant-tail") assert.deepEqual(database.listMessages(conversation.id).map((item) => item.body), ["uncommitted final tail"]);
+    } finally {
+      await manager?.shutdown();
+      await database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   }
 });
 

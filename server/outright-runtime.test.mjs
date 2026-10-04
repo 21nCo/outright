@@ -183,6 +183,34 @@ test("shutdown during archive cutover preserves a rejected queued cancellation a
   }
 });
 
+test("a failed agent shutdown retains the runtime lease until recovery can finish", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-shutdown-lease-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  let runtime;
+  let successor;
+  try {
+    process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    const originalShutdown = runtime.agents.shutdown;
+    let storageAvailable = false;
+    runtime.agents.shutdown = () => storageAvailable
+      ? originalShutdown()
+      : Promise.reject(Object.assign(new Error("outcome journal unavailable"), { code: "ENOSPC" }));
+    await assert.rejects(runtime.shutdown(), /Runtime shutdown retains recovery ownership/);
+    assert.throws(() => createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" }),
+      (error) => error.code === "OUTRIGHT_RUNTIME_LEASE_HELD");
+    storageAvailable = true;
+    await runtime.shutdown();
+    successor = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+  } finally {
+    await successor?.shutdown();
+    await runtime?.shutdown();
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR;
+    else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
 test("run detail pages a migrated oversized replay tail without returning pruned output", (() => {
   let runId;
   return withRuntime(async (runtime) => {

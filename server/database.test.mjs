@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
 import Database from "better-sqlite3";
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createOutrightDatabase, defaultProbeRun } from "./database.mjs";
@@ -900,6 +900,30 @@ test("malformed terminal recovery evidence cannot silently become an interrupted
     writeFileSync(path.join(database.launchDirectory, `${run.id}.outcome.json`), "{broken");
     assert.throws(() => database.reconcileInterruptedRuns({ probeAlive: () => false }), /Invalid run outcome record/);
     assert.equal(database.getRun(run.id).status, "running");
+  } finally {
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an escape-heavy final checkpoint stays within the recovery journal budget and records omission", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-bounded-outcome-"));
+  const database = createOutrightDatabase({ filename: path.join(root, "outright.db") });
+  try {
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: root,
+      title: "Recovery budget", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "run" });
+    database.savePendingRunOutcome(run.id, {
+      status: "completed", finishedAt: new Date().toISOString(), exitCode: 0, message: "", transcriptOmitted: false,
+      transcriptMessage: { id: `${run.id}:1`, conversationId: conversation.id, role: "assistant", kind: "text",
+        body: "\u0000".repeat(400_000), createdAt: new Date().toISOString(), payload: { runId: run.id } },
+    });
+    const marker = path.join(database.launchDirectory, `${run.id}.outcome.json`);
+    assert.ok(statSync(marker).size <= 2 * 1024 * 1024);
+    assert.equal(database.reconcileInterruptedRuns().counts.completed, 1);
+    assert.equal(database.getRun(run.id).transcriptOmitted, 1);
+    assert.deepEqual(database.listMessages(conversation.id), []);
+    assert.equal(database.listAudit(100).filter((entry) => entry.target === run.id && entry.action === "agent.run.completed").length, 1);
   } finally {
     database.close();
     rmSync(root, { recursive: true, force: true });

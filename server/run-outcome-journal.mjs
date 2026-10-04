@@ -3,7 +3,10 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 
 const RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const MAX_RECORD_BYTES = 8 * 1024;
+// At most eight exited runs can await their SQLite transaction. A final
+// assistant checkpoint is capped at 1 MiB, so these sidecars remain bounded
+// even when storage is unavailable during shutdown.
+const MAX_RECORD_BYTES = 2 * 1024 * 1024;
 
 function recordPath(directory, runId) {
   if (!RUN_ID.test(runId)) throw new Error("Invalid run outcome ID");
@@ -19,8 +22,16 @@ function syncDirectory(directory) {
 
 export function saveRunOutcome(directory, runId, outcome) {
   const destination = recordPath(directory, runId);
-  const record = JSON.stringify({ version: 1, runId, ...outcome,
-    message: Buffer.from(String(outcome.message ?? "")).subarray(0, 4000).toString("utf8") });
+  const base = { ...outcome, version: 2, runId,
+    message: Buffer.from(String(outcome.message ?? "")).subarray(0, 4000).toString("utf8") };
+  let record = JSON.stringify(base);
+  if (Buffer.byteLength(record) > MAX_RECORD_BYTES && base.transcriptMessage) {
+    // An unusually escape-heavy final body cannot expand the journal past
+    // its cap. Record the omission explicitly with the terminal result.
+    base.transcriptMessage = null;
+    base.transcriptOmitted = true;
+    record = JSON.stringify(base);
+  }
   if (Buffer.byteLength(record) > MAX_RECORD_BYTES) throw new Error("Run outcome exceeds its recovery budget");
   const temporary = `${destination}.${randomUUID()}.tmp`;
   let fd;
@@ -51,12 +62,23 @@ export function readRunOutcome(directory, runId) {
   let record;
   try { record = JSON.parse(readFileSync(filename, "utf8")); }
   catch { throw new Error(`Invalid run outcome record: ${runId}`); }
-  if (record?.version !== 1 || record.runId !== runId
+  if (![1, 2].includes(record?.version) || record.runId !== runId
     || !["completed", "failed", "stopped"].includes(record.status)
     || typeof record.finishedAt !== "string" || !Number.isFinite(Date.parse(record.finishedAt))
     || typeof record.message !== "string" || Buffer.byteLength(record.message) > 4096
     || !(record.exitCode === null || Number.isSafeInteger(record.exitCode))
-    || (record.status === "completed" && (record.exitCode !== 0 || record.message !== ""))) {
+    || (record.status === "completed" && (record.exitCode !== 0 || record.message !== ""))
+    || (record.version === 2 && (typeof record.transcriptOmitted !== "boolean"
+      || (record.transcriptMessage !== null && (typeof record.transcriptMessage !== "object"
+        || Array.isArray(record.transcriptMessage)
+        || typeof record.transcriptMessage.id !== "string"
+        || !record.transcriptMessage.id.startsWith(`${runId}:`)
+        || record.transcriptMessage.payload?.runId !== runId
+        || record.transcriptMessage.role !== "assistant"
+        || record.transcriptMessage.kind !== "text"
+        || typeof record.transcriptMessage.body !== "string"
+        || typeof record.transcriptMessage.conversationId !== "string"
+        || typeof record.transcriptMessage.createdAt !== "string"))))) {
     throw new Error(`Invalid run outcome record: ${runId}`);
   }
   return record;

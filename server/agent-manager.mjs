@@ -610,17 +610,28 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       // Persist the frozen provider result outside SQLite before its terminal
       // transaction. Shutdown may follow a BUSY/FULL refusal immediately;
       // restart must then recover the actual exit, not classify it unknown.
+      // The terminal checkpoint may itself exhaust the transcript budget.
+      // Defer its omission marker to finishRun's transaction: a SQLite fault
+      // here must not prevent the independent outcome journal from being
+      // written before shutdown or restart.
+      const pendingMessage = pendingAssistantMessage(state);
+      transcriptMessage = budgetTranscript(state, pendingMessage, { terminal: true });
       if (!state.outcomeJournaled && database.savePendingRunOutcome) {
         try {
-          database.savePendingRunOutcome(state.run.id, state.terminalOutcome);
+          database.savePendingRunOutcome(state.run.id, {
+            ...state.terminalOutcome, transcriptMessage,
+            transcriptOmitted: Boolean(state.transcriptOmitted || (pendingMessage && !transcriptMessage)),
+          });
           state.outcomeJournaled = true;
           state.outcomeJournalError = null;
         } catch (journalError) { state.outcomeJournalError = journalError; }
       }
-      transcriptMessage = budgetTranscript(state, pendingAssistantMessage(state), { terminal: true });
       // The last checkpoint and terminal state commit together. Until that
       // commit succeeds this state still owns its run slot and recovery data.
-      finished = database.finishRun(state.run.id, { status, finishedAt, exitCode: terminalExitCode, error: message || null, pid: null }, transcriptMessage);
+      finished = database.finishRun(state.run.id, {
+        status, finishedAt, exitCode: terminalExitCode, error: message || null, pid: null,
+        ...(state.transcriptOmitted ? { transcriptOmitted: true } : {}),
+      }, transcriptMessage);
     } catch (writeError) {
       state.finishing = false;
       if (storageAdmissionFailure(writeError) || (writeError.statusCode === 503 && database.maintenanceActive)) {
@@ -878,7 +889,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   }
 
   function retryUnknownDiskUsage(persistent = false) {
-    if (shuttingDown) return;
+    if (shuttingDown && ![...active.values(), ...pendingOutcomes.values()].some((state) => state.pendingFinish && !state.outcomeJournaled)) return;
     // Probe a newly observed hard fault once promptly; a continuing refusal
     // then backs off to a maintenance-rate probe instead of a busy loop.
     const delay = persistent ? (hardRetryProbed ? 30_000 : 100) : diskRetryDelayMs;
@@ -913,7 +924,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   }
 
   function retryPendingFinishes() {
-    if (shuttingDown || database.maintenanceActive) return;
+    if (database.maintenanceActive) return;
     for (const state of [...active.values(), ...pendingOutcomes.values()]) {
       if (!state.pendingFinish || (state.child && !state.closed)) continue;
       const { exitCode, error } = state.pendingFinish;
@@ -1119,28 +1130,32 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     const prior = state.transcriptSizes.get(message.id) ?? 0;
     // Leave room for both the omission notice and a final assistant segment.
     if (!prior && state.transcriptSizes.size >= MAX_RUN_TRANSCRIPT_ITEMS - (terminal ? 0 : 2)) {
-      markTranscriptOmitted(state);
+      markTranscriptOmitted(state, { terminal });
       return null;
     }
     const ceiling = MAX_RUN_TRANSCRIPT_BYTES - (terminal ? 512 : 4096);
     const metadataBytes = retainedTranscriptMessageBytes({ ...message, body: "" });
     const allowance = ceiling - state.transcriptBytes + prior - metadataBytes;
-    if (allowance <= 0) { markTranscriptOmitted(state); return null; }
+    if (allowance <= 0) { markTranscriptOmitted(state, { terminal }); return null; }
     const originalBytes = Buffer.byteLength(message.body ?? "");
     const body = originalBytes > allowance ? truncateUtf8(message.body, Math.max(0, allowance - 64)) : message.body;
     const bounded = originalBytes > allowance
       ? { ...message, body: `${body}\n[Further output omitted: transcript budget reached]`, payload: { ...message.payload, truncated: true } }
       : message;
     const size = retainedTranscriptMessageBytes(bounded);
-    if (state.transcriptBytes - prior + size > ceiling) { markTranscriptOmitted(state); return null; }
+    if (state.transcriptBytes - prior + size > ceiling) { markTranscriptOmitted(state, { terminal }); return null; }
     state.transcriptSizes.set(message.id, size);
     state.transcriptBytes += size - prior;
-    if (originalBytes > allowance) markTranscriptOmitted(state);
+    if (originalBytes > allowance) markTranscriptOmitted(state, { terminal });
     return bounded;
   }
 
-  function markTranscriptOmitted(state) {
+  function markTranscriptOmitted(state, { terminal = false } = {}) {
     if (state.transcriptOmitted) return;
+    if (terminal) {
+      state.transcriptOmitted = true;
+      return;
+    }
     // The optional message can itself be refused at the aggregate cap. The
     // run row uses reserved transition space, so it remains a durable marker
     // through cancellation, finalization and restart.
@@ -1191,6 +1206,13 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
           if (unjournaled) throw new Error(`Run outcome could not be made durable before shutdown: ${unjournaled.run.id}`,
             { cause: unjournaled.outcomeJournalError });
         }
+      }).catch((error) => {
+        // A failed shutdown still owns the SQLite lease. Keep one retry owner
+        // for an unjournaled exited result, and permit a later shutdown call
+        // to complete once storage is writable again.
+        shutdownPromise = null;
+        if ([...active.values(), ...pendingOutcomes.values()].some((state) => state.pendingFinish)) retryUnknownDiskUsage(true);
+        throw error;
       });
       return shutdownPromise;
     },
