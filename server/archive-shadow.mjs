@@ -425,28 +425,36 @@ function recoverPinnedInterruptedCutoverWindows(filename, next, old, marker) {
         renameSync(filename, next);
         durableDirectory(filename);
       }
-      linkSync(old, filename);
-      durableDirectory(filename);
-      durableFile(filename);
-      discardShadowCandidate(next);
-      rmSync(old);
-      durableDirectory(filename);
+      restoreArchiveSource(filename, next, old);
       return;
     }
-    if (candidatePath === next) {
-      linkSync(next, filename);
-      durableDirectory(filename);
-      rmSync(next);
-      durableDirectory(filename);
-      if (!matchesCandidate(filename, marker.candidate, false, true)) {
-        throw new Error("Archive candidate changed during recovery promotion");
-      }
-    }
-    durableFile(filename);
-    durableDirectory(filename);
-    rmSync(old);
-    durableDirectory(filename);
+    promoteArchiveCandidate(filename, next, old, marker, candidatePath);
   } finally { release(); }
+}
+
+function restoreArchiveSource(filename, next, old) {
+  linkSync(old, filename);
+  durableDirectory(filename);
+  durableFile(filename);
+  discardShadowCandidate(next);
+  rmSync(old);
+  durableDirectory(filename);
+}
+
+function promoteArchiveCandidate(filename, next, old, marker, candidatePath) {
+  if (candidatePath === next) {
+    linkSync(next, filename);
+    durableDirectory(filename);
+    rmSync(next);
+    durableDirectory(filename);
+    if (!matchesCandidate(filename, marker.candidate, false, true)) {
+      throw new Error("Archive candidate changed during recovery promotion");
+    }
+  }
+  durableFile(filename);
+  durableDirectory(filename);
+  rmSync(old);
+  durableDirectory(filename);
 }
 
 function recoverPinnedInterruptedCutover(filename, next, old, marker) {
@@ -485,27 +493,10 @@ function recoverPinnedInterruptedCutover(filename, next, old, marker) {
         rmSync(filename);
         durableDirectory(filename);
       }
-      linkSync(old, filename);
-      durableDirectory(filename);
-      durableFile(filename);
-      discardShadowCandidate(next);
-      rmSync(old);
-      durableDirectory(filename);
+      restoreArchiveSource(filename, next, old);
       return;
     }
-    if (candidatePath === next) {
-      linkSync(next, filename);
-      durableDirectory(filename);
-      rmSync(next);
-      durableDirectory(filename);
-      if (!matchesCandidate(filename, marker.candidate, false, true)) {
-        throw new Error("Archive candidate changed during recovery promotion");
-      }
-    }
-    durableFile(filename);
-    durableDirectory(filename);
-    rmSync(old);
-    durableDirectory(filename);
+    promoteArchiveCandidate(filename, next, old, marker, candidatePath);
   } finally {
     candidateDb?.close();
     oldDb?.close();

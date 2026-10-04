@@ -231,6 +231,55 @@ test("an audit fault keeps retry ownership even while measured launch capacity i
   } finally { await manager.shutdown(); }
 });
 
+test("a sibling admission cannot disarm a faulted queued run's retry", async () => {
+  for (const [name, fault] of [
+    ["busy", { code: "SQLITE_BUSY" }],
+    ["io-error", { code: "SQLITE_IOERR_WRITE" }],
+    ["quota", { statusCode: 507 }],
+    ["read-only", { code: "SQLITE_READONLY" }],
+    ["full", { code: "SQLITE_FULL" }],
+    ["no-space", { code: "ENOSPC" }],
+  ]) {
+    const database = fakeDatabase();
+    database.updateConversation("conv-2", { id: "conv-2", worktreePath: "/tmp/other-project" });
+    database.getSettings = () => ({ maxConcurrentRuns: 2 });
+    database.capacity = () => ({ diskUsageStatus: "measured", availableForNewWorkBytes: 1024 * 1024 });
+    const first = database.createRun({ ...codexRun(`faulted-sibling-${name}`), status: "queued" });
+    const second = database.createRun({ ...codexRun(`healthy-sibling-${name}`), conversationId: "conv-2", status: "queued" });
+    const admitted = [];
+    let faulted = false;
+    database.auditAdmission = (_, details) => {
+      if (details.target === first.id && !faulted) {
+        faulted = true;
+        throw Object.assign(new Error("storage admission fault"), fault);
+      }
+      admitted.push(details.target);
+    };
+    let releaseSibling;
+    const siblingReady = new Promise((resolve) => { releaseSibling = resolve; });
+    const children = [];
+    const manager = createAgentManager({ database, publish: () => {},
+      launchCommand: (_, run) => run.id === second.id ? siblingReady : { executable: process.execPath, args: [], display: "fixture" },
+      spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+    try {
+      const firstSchedule = manager.schedule({ conversation: database.getConversation("conv-1"), run: first });
+      const secondSchedule = manager.schedule({ conversation: database.getConversation("conv-2"), run: second });
+      await firstSchedule;
+      assert.equal(database.getRun(first.id).status, "queued");
+      releaseSibling({ executable: process.execPath, args: [], display: "fixture" });
+      await secondSchedule;
+      assert.deepEqual(admitted, [second.id]);
+      const deadline = Date.now() + 1200;
+      while (children.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(children.length, 2, "faulted run stayed queued despite an available slot and retry timer");
+      assert.deepEqual(admitted, [second.id, first.id]);
+    } finally {
+      children.forEach((child) => child.emit("close", 0, null));
+      await manager.shutdown();
+    }
+  }
+});
+
 test("persistent terminal storage refusal retains the slot until recovery", async () => {
   for (const [name, fault] of [["quota", { statusCode: 507 }], ["read-only", { code: "SQLITE_READONLY" }], ["no-space", { code: "ENOSPC" }]]) {
     const database = fakeDatabase();

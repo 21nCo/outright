@@ -335,7 +335,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   let shutdownPromise;
   let diskRetryTimer;
   let diskRetryDelayMs = 100;
-  let admissionStorageFault = false;
+  const admissionRetryRuns = new Set();
   const providerDiscovery = providerDiscoveryFactory({ onChange: onProvidersChanged });
 
   function storageAdmissionFailure(error) {
@@ -397,7 +397,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       if (error.statusCode === 503 && database.maintenanceActive) return "deferred";
       throw error;
     }
-    admissionStorageFault = false;
+    admissionRetryRuns.delete(run.id);
     clearDiskRetry();
     const startedAt = new Date().toISOString();
     // Crash-safe launch handshake, phase 1: this durable marker means "a spawn
@@ -616,6 +616,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     try { if (state.launchHandshakePath) unlinkSync(state.launchHandshakePath); } catch { /* Already gone. */ }
     if (finished.message) publish({ type: "message.created", conversationId: state.conversation.id, payload: finished.message });
     active.delete(state.run.id);
+    admissionRetryRuns.delete(state.run.id);
     clearAssistant(state);
     emit(state.run.id, `run.${status}`, { exitCode, error: message || null, finishedAt });
     drain();
@@ -636,6 +637,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         throw error;
       }
       queue.splice(index, 1);
+      admissionRetryRuns.delete(runId);
+      if (!queue.length) clearDiskRetry();
       emit(runId, "run.stopped", { queued: true });
       return true;
     }
@@ -783,7 +786,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         if (admission === "deferred" || admission === "retry-deferred") {
           active.delete(entry.run.id);
           queue.unshift(entry);
-          retryDeferredAdmission(admission === "retry-deferred");
+          retryDeferredAdmission(admission === "retry-deferred", entry.run.id);
           // The archive worker closes SQLite while promoting its snapshot.
           // Keep schedule's readback pending until the reopened connection is
           // available, even though this run is safely queued again.
@@ -823,7 +826,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // A sibling may free a slot and drain the queue while another completed
     // run still awaits its terminal commit. Keep that retry armed until every
     // such owner has durable outcome evidence.
-    if (!shuttingDown && (admissionStorageFault || [...active.values()].some((state) => state.pendingFinish))) return;
+    if (!shuttingDown && (admissionRetryRuns.size || [...active.values()].some((state) => state.pendingFinish))) return;
     if (diskRetryTimer) clearTimeout(diskRetryTimer);
     diskRetryTimer = null;
     diskRetryDelayMs = 100;
@@ -838,13 +841,13 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     }
   }
 
-  function retryDeferredAdmission(storageFault = false) {
+  function retryDeferredAdmission(storageFault = false, runId = null) {
     if (database.maintenanceActive) return;
-    if (storageFault) admissionStorageFault = true;
+    if (storageFault && runId) admissionRetryRuns.add(runId);
     // A failed SQLite write/read needs its own retry owner even if the last
     // measured capacity was below the ordinary launch threshold. Capacity
     // alone cannot tell whether the fault has cleared.
-    if (admissionStorageFault) { retryUnknownDiskUsage(); return; }
+    if (admissionRetryRuns.size) { retryUnknownDiskUsage(); return; }
     let observed;
     try { observed = database.capacity?.(); }
     catch (error) {
@@ -865,7 +868,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // connection. onDeletionWorkerExit calls resumeQueued after it reopens.
     if (shuttingDown || database.maintenanceActive) return;
     if (!queue.length) {
-      admissionStorageFault = false;
+      admissionRetryRuns.clear();
       clearDiskRetry();
       return;
     }
