@@ -336,6 +336,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   let diskRetryTimer;
   let diskRetryDelayMs = 100;
   const admissionRetryRuns = new Set();
+  let queueReadRetryPending = false;
   const providerDiscovery = providerDiscoveryFactory({ onChange: onProvidersChanged });
 
   function storageAdmissionFailure(error) {
@@ -638,7 +639,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       }
       queue.splice(index, 1);
       admissionRetryRuns.delete(runId);
-      if (!queue.length) clearDiskRetry();
+      if (!queue.length) {
+        queueReadRetryPending = false;
+        clearDiskRetry();
+      }
       emit(runId, "run.stopped", { queued: true });
       return true;
     }
@@ -826,7 +830,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // A sibling may free a slot and drain the queue while another completed
     // run still awaits its terminal commit. Keep that retry armed until every
     // such owner has durable outcome evidence.
-    if (!shuttingDown && (admissionRetryRuns.size || [...active.values()].some((state) => state.pendingFinish))) return;
+    if (!shuttingDown && (queueReadRetryPending || admissionRetryRuns.size || [...active.values()].some((state) => state.pendingFinish))) return;
     if (diskRetryTimer) clearTimeout(diskRetryTimer);
     diskRetryTimer = null;
     diskRetryDelayMs = 100;
@@ -868,6 +872,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // connection. onDeletionWorkerExit calls resumeQueued after it reopens.
     if (shuttingDown || database.maintenanceActive) return;
     if (!queue.length) {
+      queueReadRetryPending = false;
       admissionRetryRuns.clear();
       clearDiskRetry();
       return;
@@ -876,17 +881,28 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     try { max = database.getSettings().maxConcurrentRuns; }
     catch (error) {
       if (!storageAdmissionFailure(error)) throw error;
+      queueReadRetryPending = true;
       retryUnknownDiskUsage();
       return;
+    }
+    // A successful settings read resolves its fault. If every slot is already
+    // occupied, a finish/cancellation will re-enter drain when capacity frees.
+    if (active.size >= max) {
+      queueReadRetryPending = false;
+      clearDiskRetry();
     }
     while (active.size < max && queue.length) {
       let admissible;
       try { admissible = database.canLaunchRun?.(); }
       catch (error) {
         if (!storageAdmissionFailure(error)) throw error;
+        queueReadRetryPending = true;
         retryUnknownDiskUsage();
         return;
       }
+      // Queue reads own their retry separately from a run's pre-spawn audit.
+      // A sibling may finish its audit while this queue read is still faulted.
+      queueReadRetryPending = false;
       if (admissible === false) {
         retryDeferredAdmission();
         return;

@@ -280,6 +280,68 @@ test("a sibling admission cannot disarm a faulted queued run's retry", async () 
   }
 });
 
+test("queue read faults retain their retry while a preparing sibling starts", async () => {
+  for (const read of ["getSettings", "canLaunchRun"]) {
+    for (const [name, fault] of [
+      ["busy", { code: "SQLITE_BUSY" }],
+      ["io-error", { code: "SQLITE_IOERR_READ" }],
+      ["quota", { statusCode: 507 }],
+      ["read-only", { code: "SQLITE_READONLY" }],
+      ["full", { code: "SQLITE_FULL" }],
+      ["no-space", { code: "ENOSPC" }],
+    ]) {
+      const database = fakeDatabase();
+      database.updateConversation("conv-2", { id: "conv-2", worktreePath: "/tmp/other-project" });
+      const first = database.createRun({ ...codexRun(`queue-read-${read}-${name}`), status: "queued" });
+      const sibling = database.createRun({ ...codexRun(`preparing-${read}-${name}`), conversationId: "conv-2", status: "queued" });
+      database.getSettings = () => ({ maxConcurrentRuns: 2 });
+      database.canLaunchRun = () => true;
+      // A measured low-capacity snapshot must not erase retry ownership for
+      // a failed read; the next successful read is the admission authority.
+      database.capacity = () => ({ diskUsageStatus: "measured", availableForNewWorkBytes: 1024 });
+      const admitted = [];
+      database.auditAdmission = (_, details) => { admitted.push(details.target); };
+      let releaseSibling;
+      let siblingPreparing;
+      const preparing = new Promise((resolve) => { siblingPreparing = resolve; });
+      const heldLaunch = new Promise((resolve) => { releaseSibling = resolve; });
+      const children = [];
+      const manager = createAgentManager({ database, publish: () => {},
+        launchCommand: (_, run) => {
+          if (run.id === sibling.id) { siblingPreparing(); return heldLaunch; }
+          return { executable: process.execPath, args: [], display: "fixture" };
+        },
+        spawnProcess: () => { const child = fakeChild(); children.push(child); return child; },
+      });
+      try {
+        const siblingSchedule = manager.schedule({ conversation: database.getConversation("conv-2"), run: sibling });
+        await preparing;
+        const original = database[read];
+        let faulted = false;
+        database[read] = (...args) => {
+          if (!faulted) { faulted = true; throw Object.assign(new Error("queue read unavailable"), fault); }
+          return original(...args);
+        };
+        await manager.schedule({ conversation: database.getConversation("conv-1"), run: first });
+        assert.equal(database.getRun(first.id).status, "queued");
+        assert.equal(children.length, 0, "read failure crossed the pre-audit launch boundary");
+        releaseSibling({ executable: process.execPath, args: [], display: "fixture" });
+        await siblingSchedule;
+        assert.deepEqual(admitted, [sibling.id]);
+        const deadline = Date.now() + 1200;
+        while (children.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+        assert.equal(children.length, 2, `${read}/${name} lost its retry before the sibling exited`);
+        assert.deepEqual(admitted, [sibling.id, first.id], "a run spawned without its admission audit");
+        assert.equal(database.getRun(first.id).status, "running");
+      } finally {
+        releaseSibling({ executable: process.execPath, args: [], display: "fixture" });
+        children.forEach((child) => child.emit("close", 0, null));
+        await manager.shutdown();
+      }
+    }
+  }
+});
+
 test("persistent terminal storage refusal retains the slot until recovery", async () => {
   for (const [name, fault] of [["quota", { statusCode: 507 }], ["read-only", { code: "SQLITE_READONLY" }], ["no-space", { code: "ENOSPC" }]]) {
     const database = fakeDatabase();
