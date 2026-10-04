@@ -1,0 +1,16 @@
+src/components/SettingsDialog.jsx
+  h_a39f9495f9ec1d 264-274,276-311
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 650-651,663-664,667-668,671,688-752
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "49065d01f36d8bbb0dfe0c291a481a30a07ba9ab",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
