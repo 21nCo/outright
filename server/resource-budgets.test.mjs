@@ -1231,6 +1231,106 @@ test("cleanup request admission is bounded and restart records interrupted outco
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("cleanup admission and restart reconciliation stay bounded behind large direct audit history", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-cleanup-lookup-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  try {
+    const writer = new Database(filename);
+    try {
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, '', ?, '2026-01-01')");
+      writer.transaction(() => {
+        for (let index = 0; index < 16; index += 1) {
+          insert.run("retention.cleanup.requested", JSON.stringify({ operationId: `direct-${index}` }));
+        }
+        for (let index = 0; index < 100_000; index += 1) insert.run("telemetry", "{}");
+        insert.run("retention.cleanup.finished", '{"operationId":"direct-0"}');
+      }).immediate();
+      const plan = writer.prepare(`EXPLAIN QUERY PLAN SELECT request.id FROM audit_evidence AS request
+        WHERE request.action = 'retention.cleanup.requested' AND request.operation_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM audit_evidence AS outcome
+          WHERE outcome.operation_id = request.operation_id AND outcome.id > request.id)`).all()
+        .map((row) => row.detail).join(" ");
+      assert.match(plan, /audit_evidence_action/);
+      assert.match(plan, /audit_evidence_operation/);
+      const admissionStart = performance.now();
+      await database.auditRetentionCleanupRequested({ operationId: "direct-16" });
+      assert.ok(performance.now() - admissionStart < 150, "cleanup admission scanned unrelated telemetry");
+      await assert.rejects(database.auditRetentionCleanupRequested({ operationId: "overflow" }),
+        (error) => error.statusCode === 429);
+    } finally { writer.close(); }
+    await database.close();
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    const recoveryStart = performance.now();
+    assert.equal(database.reconcilePendingRetentionCleanup(), 16);
+    assert.ok(performance.now() - recoveryStart < 150, "restart recovery scanned unrelated telemetry");
+    assert.equal(database.reconcilePendingRetentionCleanup(), 0);
+    const proof = new Database(filename, { readonly: true });
+    try {
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleanup.unknown'").get().count, 16);
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleanup.requested'").get().count, 16);
+    } finally { proof.close(); }
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("legacy cleanup requests wait for paged evidence backfill before admission", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-cleanup-backfill-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  await database.close();
+  const writer = new Database(filename);
+  try {
+    writer.exec("DROP TRIGGER audit_evidence_insert; DROP TRIGGER audit_evidence_delete; DROP TRIGGER audit_evidence_update; DROP TABLE audit_evidence_state; DROP TABLE audit_evidence");
+    const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, '', ?, '2026-01-01')");
+    writer.transaction(() => {
+      insert.run("retention.cleanup.requested", '{"operationId":"legacy-cleanup"}');
+      for (let index = 0; index < 12_000; index += 1) insert.run("telemetry", "{}");
+    }).immediate();
+  } finally { writer.close(); }
+  try {
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    assert.equal(database.reconcilePendingRetentionCleanup(), 0);
+    await assert.rejects(database.auditRetentionCleanupRequested({ operationId: "new-cleanup" }),
+      (error) => error.statusCode === 503);
+    await database.waitForTerminalAuditReconciliation();
+    const proof = new Database(filename, { readonly: true });
+    try {
+      assert.equal(proof.prepare("SELECT complete FROM audit_evidence_state WHERE id = 1").get().complete, 1);
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleanup.unknown'").get().count, 1);
+    } finally { proof.close(); }
+    await database.auditRetentionCleanupRequested({ operationId: "new-cleanup" });
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("direct cleanup backlog reconciles in pages and holds new admission until settled", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-cleanup-pages-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  await database.close();
+  const writer = new Database(filename);
+  try {
+    const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES ('retention.cleanup.requested', '', ?, '2026-01-01')");
+    writer.transaction(() => {
+      for (let index = 0; index < 40; index += 1) insert.run(JSON.stringify({ operationId: `burst-${index}` }));
+    }).immediate();
+  } finally { writer.close(); }
+  try {
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    assert.equal(database.reconcilePendingRetentionCleanup(), 16);
+    await assert.rejects(database.auditRetentionCleanupRequested({ operationId: "early" }),
+      (error) => error.statusCode === 503);
+    const proof = new Database(filename, { readonly: true });
+    try {
+      for (let retry = 0; retry < 100; retry += 1) {
+        if (proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleanup.unknown'").get().count === 40) break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleanup.unknown'").get().count, 40);
+    } finally { proof.close(); }
+    await database.auditRetentionCleanupRequested({ operationId: "after-recovery" });
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("shadow cleanup preserves unresolved audit and live terminal evidence beyond the trim threshold", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-shadow-audit-"));
   const filename = path.join(directory, "outright.db");

@@ -119,6 +119,10 @@ export function createOutrightDatabase(options = {}) {
   let terminalAuditCompletion = Promise.resolve();
   let completeTerminalAudit;
   let failTerminalAudit;
+  let cleanupReconciliationTick;
+  let cleanupReconciliationTickKind;
+  let cleanupReconciliationPending = false;
+  let cleanupReconciliationRetries = 0;
   const scheduleTerminalAudit = options.terminalAuditSchedule ?? setImmediate;
   let deletionTick;
   let deletionTickKind;
@@ -192,6 +196,7 @@ export function createOutrightDatabase(options = {}) {
       maintenanceCapacity = undefined;
       maintenanceError = undefined;
       releaseLeaseIfIdle();
+      if (cleanupReconciliationPending) scheduleCleanupReconciliation();
       if (!closing) { continueMigrations(); scheduleDeletionResume(); }
     },
     onWorkerRecoveryFailure: (error) => {
@@ -398,6 +403,30 @@ export function createOutrightDatabase(options = {}) {
     terminalAuditTick = scheduleTerminalAudit(advanceTerminalAuditScan);
   }
 
+  function scheduleCleanupReconciliation(delay = 0) {
+    if (closing || cleanupReconciliationTick) return;
+    const resume = () => {
+      cleanupReconciliationTick = undefined;
+      cleanupReconciliationTickKind = undefined;
+      if (closing || !db) return;
+      try {
+        api.reconcilePendingRetentionCleanup();
+        cleanupReconciliationRetries = 0;
+      } catch (error) {
+        try { options.onCleanupReconciliationError?.(error); }
+        catch { /* Keep the durable reconciliation owner alive. */ }
+        // Leave admission closed after repeated storage failures. Restart or
+        // an explicit retry can resume from the durable audit evidence.
+        if (cleanupReconciliationRetries < 5) {
+          const wait = Math.min(30_000, 1000 * 2 ** cleanupReconciliationRetries++);
+          scheduleCleanupReconciliation(wait);
+        }
+      }
+    };
+    cleanupReconciliationTickKind = delay ? "timeout" : "immediate";
+    cleanupReconciliationTick = delay ? setTimeout(resume, delay) : setImmediate(resume);
+  }
+
   function advanceTerminalAuditScan() {
     terminalAuditTick = undefined;
     if (closing || !terminalAuditScan) return;
@@ -470,6 +499,10 @@ export function createOutrightDatabase(options = {}) {
         terminalAuditTick = scheduleTerminalAudit(advanceTerminalAuditScan);
         return;
       }
+      if (cleanupReconciliationPending && !scan.cleanupStarted) {
+        scan.cleanupStarted = true;
+        api.reconcilePendingRetentionCleanup();
+      }
       // Earlier live audit writes did not trim while the cursor was reading
       // that history. Reclaim it in bounded slices before releasing terminal
       // admission; unresolved owner evidence remains protected by trimAudit.
@@ -526,6 +559,8 @@ export function createOutrightDatabase(options = {}) {
       if (migrationRetry) clearTimeout(migrationRetry);
       if (terminalAuditTick) clearImmediate(terminalAuditTick);
       if (terminalAuditRetry) clearTimeout(terminalAuditRetry);
+      if (cleanupReconciliationTickKind === "timeout") clearTimeout(cleanupReconciliationTick);
+      else if (cleanupReconciliationTickKind === "immediate") clearImmediate(cleanupReconciliationTick);
       if (deletionTickKind === "timeout") clearTimeout(deletionTick);
       else if (deletionTickKind === "immediate") clearImmediate(deletionTick);
       const errors = [];
@@ -545,6 +580,8 @@ export function createOutrightDatabase(options = {}) {
       if (migrationRetry) clearTimeout(migrationRetry);
       if (terminalAuditTick) clearImmediate(terminalAuditTick);
       if (terminalAuditRetry) clearTimeout(terminalAuditRetry);
+      if (cleanupReconciliationTickKind === "timeout") clearTimeout(cleanupReconciliationTick);
+      else if (cleanupReconciliationTickKind === "immediate") clearImmediate(cleanupReconciliationTick);
       if (deletionTickKind === "timeout") clearTimeout(deletionTick);
       else if (deletionTickKind === "immediate") clearImmediate(deletionTick);
       for (const worker of deletionWorkers) void worker.terminate().catch(() => {});
@@ -1643,6 +1680,9 @@ export function createOutrightDatabase(options = {}) {
           await new Promise((resolve) => deletionIdleWaiters.add(resolve));
           continue;
         }
+        if (cleanupReconciliationPending || !db.prepare("SELECT complete FROM audit_evidence_state WHERE id = 1").get()?.complete) {
+          throw databaseError(503, "Retention cleanup recovery is still running; retry shortly");
+        }
         try {
           db.transaction(() => {
             if (db.prepare(`SELECT 1 FROM (${pendingCleanupSql}) LIMIT ?`).all(MAX_PENDING_RETENTION_CLEANUPS).length
@@ -1661,11 +1701,27 @@ export function createOutrightDatabase(options = {}) {
     reconcilePendingRetentionCleanup() {
       // This runtime owns the database lease. A request without an outcome
       // after restart may have partly deleted an archive, so report unknown.
-      const pending = db.prepare(pendingCleanupSql).all();
-      for (const row of pending) writeCriticalAudit("retention.cleanup.unknown", {
-        operationId: row.operationId, reason: "runtime restarted before cleanup outcome",
-      });
-      return pending.length;
+      cleanupReconciliationPending = true;
+      if (!db.prepare("SELECT complete FROM audit_evidence_state WHERE id = 1").get()?.complete) {
+        if (!terminalAuditScan) beginTerminalAuditScan();
+        return 0;
+      }
+      // Direct SQLite writers can bypass API admission. Resolve at most one
+      // page per event-loop turn and leave new cleanup requests closed until
+      // the entire inherited backlog has a durable outcome.
+      const { count, more } = db.transaction(() => {
+        const pending = db.prepare(`${pendingCleanupSql} ORDER BY request.id LIMIT ?`)
+          .all(MAX_PENDING_RETENTION_CLEANUPS);
+        for (const row of pending) writeCriticalAudit("retention.cleanup.unknown", {
+          operationId: row.operationId, reason: "runtime restarted before cleanup outcome",
+        });
+        // This second indexed lookup observes the page's outcomes and fences
+        // a direct writer with the same SQLite write transaction.
+        return { count: pending.length, more: Boolean(db.prepare(`${pendingCleanupSql} LIMIT 1`).get()) };
+      }).immediate();
+      if (more) scheduleCleanupReconciliation();
+      else cleanupReconciliationPending = false;
+      return count;
     },
     reconcileTerminalAudit() {
       if (terminalReservationsCache) return 0;

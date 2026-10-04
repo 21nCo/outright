@@ -10,6 +10,7 @@ export function prepareAuditEvidence(db, hadAudit) {
       id INTEGER PRIMARY KEY, action TEXT NOT NULL, target TEXT, operation_id TEXT);
     CREATE INDEX IF NOT EXISTS audit_evidence_target ON audit_evidence(target, id);
     CREATE INDEX IF NOT EXISTS audit_evidence_operation ON audit_evidence(operation_id, id);
+    CREATE INDEX IF NOT EXISTS audit_evidence_action ON audit_evidence(action, id);
     CREATE TABLE IF NOT EXISTS audit_evidence_state (
       id INTEGER PRIMARY KEY CHECK (id = 1), complete INTEGER NOT NULL);
     CREATE TRIGGER IF NOT EXISTS audit_evidence_insert AFTER INSERT ON audit_log
@@ -112,10 +113,11 @@ export function trimAuditPage(db, pageSize = 32, upperId = Number.MAX_SAFE_INTEG
   }).immediate();
 }
 
-export const pendingCleanupSql = `SELECT request.id, json_extract(request.details, '$.operationId') AS operationId
-  FROM audit_log AS request WHERE request.action = 'retention.cleanup.requested'
-  AND json_valid(request.details)
-  AND json_extract(request.details, '$.operationId') IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > request.id
-    AND json_valid(outcome.details)
-    AND json_extract(outcome.details, '$.operationId') = json_extract(request.details, '$.operationId'))`;
+// Both sides use the trigger-maintained projection. An action lookup visits
+// only cleanup requests, and the operation lookup cannot traverse telemetry.
+// Callers must wait for the legacy projection backfill before using this query.
+export const pendingCleanupSql = `SELECT request.id, request.operation_id AS operationId
+  FROM audit_evidence AS request WHERE request.action = 'retention.cleanup.requested'
+  AND request.operation_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM audit_evidence AS outcome
+    WHERE outcome.operation_id = request.operation_id AND outcome.id > request.id)`;
