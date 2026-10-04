@@ -402,6 +402,42 @@ test("automatic retention preserves pinned archives while confirmed deletion rem
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+for (const change of ["edit", "pin", "unarchive", "queue"]) {
+  test(`automatic retention rechecks a selected archive after a concurrent ${change}`, async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-retention-race-"));
+    const filename = path.join(directory, "outright.db");
+    const database = createOutrightDatabase({ filename });
+    try {
+      const first = chat(database, "first old archive");
+      const changed = chat(database, "selected old archive");
+      for (let index = 0; index < 65; index += 1) {
+        database.addMessage({ conversationId: first.id, role: "assistant", body: `history ${index}` });
+      }
+      for (const item of [first, changed]) database.updateConversation(item.id, { archived: true });
+      const writer = new Database(filename);
+      try {
+        const age = writer.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?");
+        age.run(new Date(Date.now() - 101 * 86_400_000).toISOString(), first.id);
+        age.run(new Date(Date.now() - 100 * 86_400_000).toISOString(), changed.id);
+      } finally { writer.close(); }
+      const cleanup = database.pruneHistory();
+      if (change === "edit") database.updateConversation(changed.id, { title: "new activity" });
+      if (change === "pin") database.updateConversation(changed.id, { pinned: true });
+      if (change === "unarchive") database.updateConversation(changed.id, { archived: false });
+      if (change === "queue") database.createRun(runInput(changed.id));
+      assert.deepEqual((await cleanup).ids, [first.id]);
+      assert.ok(database.getConversation(changed.id), "cleanup deleted an archive changed after selection");
+      const proof = new Database(filename, { readonly: true });
+      try { assert.equal(proof.prepare("SELECT deleting FROM conversations WHERE id = ?").get(changed.id).deleting, 0); }
+      finally { proof.close(); }
+      if (["edit", "pin"].includes(change)) {
+        assert.equal((await database.deleteArchivedConversation(changed.id, changed.id)).deleted, 1,
+          "explicit confirmed deletion should remain available");
+      }
+    } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+}
+
 test("retained counter is measured on upgrade and trusted on populated restart", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-retained-restart-"));
   const filename = path.join(directory, "outright.db");
@@ -1298,50 +1334,52 @@ test("legacy cleanup requests wait for paged evidence backfill before admission"
   } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("legacy cleanup reconciliation retries storage faults before releasing admission and audit trimming", async () => {
-  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-cleanup-retry-"));
-  const filename = path.join(directory, "outright.db");
-  let database = createOutrightDatabase({ filename, runtimeLease: true });
-  await database.close();
-  const writer = new Database(filename);
-  try {
-    writer.exec("DROP TRIGGER audit_evidence_insert; DROP TRIGGER audit_evidence_delete; DROP TRIGGER audit_evidence_update; DROP TABLE audit_evidence_state; DROP TABLE audit_evidence");
-    const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, '2026-01-01')");
-    writer.transaction(() => {
-      insert.run("retention.cleanup.requested", "", '{"operationId":"retry-cleanup"}');
-      insert.run("terminal.created", "retry-terminal", '{"cwd":"/tmp/retry"}');
-      for (let index = 0; index < 10_100; index += 1) insert.run("telemetry", "", "{}");
-    }).immediate();
-  } finally { writer.close(); }
-  let faults = 0;
-  try {
-    database = createOutrightDatabase({ filename, runtimeLease: true, terminalAuditRetryBaseMs: 1,
-      beforeCleanupReconciliation: () => {
-        if (faults++ < 2) throw Object.assign(new Error("injected cleanup write fault"), { code: "SQLITE_IOERR" });
-      } });
-    assert.equal(database.reconcilePendingRetentionCleanup(), 0);
-    await assert.rejects(database.auditRetentionCleanupRequested({ operationId: "too-early" }),
-      (error) => error.statusCode === 503);
-    await database.waitForTerminalAuditReconciliation();
-    assert.equal(faults, 3, "the successful scan skipped inherited cleanup after retry");
-    const proof = new Database(filename, { readonly: true });
-    try {
-      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleanup.unknown'").get().count, 1);
-      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.unknown'").get().count, 1);
-      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.created'").get().count, 1,
-        "trimming lost the recoverable terminal owner");
-      assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= AUDIT_RETENTION_LIMIT + 3);
-    } finally { proof.close(); }
-    await database.auditRetentionCleanupRequested({ operationId: "after-retry" });
+for (const [faultCode, faultLimit] of [["SQLITE_IOERR", 2], ["SQLITE_IOERR_WRITE", 2], ["SQLITE_BUSY_SNAPSHOT", 1]]) {
+  test(`legacy cleanup reconciliation retries ${faultCode} before releasing admission and audit trimming`, async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-cleanup-retry-"));
+    const filename = path.join(directory, "outright.db");
+    let database = createOutrightDatabase({ filename, runtimeLease: true });
     await database.close();
-    database = createOutrightDatabase({ filename, runtimeLease: true });
-    assert.equal(database.reconcilePendingRetentionCleanup(), 1, "restart lost the newly admitted request");
-    const readback = new Database(filename, { readonly: true });
+    const writer = new Database(filename);
     try {
-      assert.equal(readback.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleanup.unknown'").get().count, 2);
-    } finally { readback.close(); }
-  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
-});
+      writer.exec("DROP TRIGGER audit_evidence_insert; DROP TRIGGER audit_evidence_delete; DROP TRIGGER audit_evidence_update; DROP TABLE audit_evidence_state; DROP TABLE audit_evidence");
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, '2026-01-01')");
+      writer.transaction(() => {
+        insert.run("retention.cleanup.requested", "", '{"operationId":"retry-cleanup"}');
+        insert.run("terminal.created", "retry-terminal", '{"cwd":"/tmp/retry"}');
+        for (let index = 0; index < 10_100; index += 1) insert.run("telemetry", "", "{}");
+      }).immediate();
+    } finally { writer.close(); }
+    let faults = 0;
+    try {
+      database = createOutrightDatabase({ filename, runtimeLease: true, terminalAuditRetryBaseMs: 1,
+        beforeCleanupReconciliation: () => {
+          if (faults++ < faultLimit) throw Object.assign(new Error("injected cleanup write fault"), { code: faultCode });
+        } });
+      assert.equal(database.reconcilePendingRetentionCleanup(), 0);
+      await assert.rejects(database.auditRetentionCleanupRequested({ operationId: "too-early" }),
+        (error) => error.statusCode === 503);
+      await database.waitForTerminalAuditReconciliation();
+      assert.equal(faults, faultLimit + 1, "the successful scan skipped inherited cleanup after retry");
+      const proof = new Database(filename, { readonly: true });
+      try {
+        assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleanup.unknown'").get().count, 1);
+        assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.unknown'").get().count, 1);
+        assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.created'").get().count, 1,
+          "trimming lost the recoverable terminal owner");
+        assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= AUDIT_RETENTION_LIMIT + 3);
+      } finally { proof.close(); }
+      await database.auditRetentionCleanupRequested({ operationId: "after-retry" });
+      await database.close();
+      database = createOutrightDatabase({ filename, runtimeLease: true });
+      assert.equal(database.reconcilePendingRetentionCleanup(), 1, "restart lost the newly admitted request");
+      const readback = new Database(filename, { readonly: true });
+      try {
+        assert.equal(readback.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleanup.unknown'").get().count, 2);
+      } finally { readback.close(); }
+    } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+}
 
 test("direct cleanup backlog reconciles in pages and holds new admission until settled", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-cleanup-pages-"));

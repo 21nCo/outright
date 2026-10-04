@@ -523,7 +523,7 @@ export function createOutrightDatabase(options = {}) {
       try { options.onTerminalAuditError?.(error); } catch { /* Keep the scan owner alive. */ }
       // A transient read or write failure keeps the original waiter pending
       // across retries. Only an exhausted/fatal scan rejects it.
-      if (["SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_IOERR", "SQLITE_FULL"].includes(error.code)
+      if (typeof error?.code === "string" && /^SQLITE_(?:BUSY|LOCKED|IOERR|FULL)(?:_|$)/.test(error.code)
         && terminalAuditRetries < 5) {
         const delay = Math.min(30_000, terminalAuditRetryBaseMs * 2 ** Math.min(terminalAuditRetries++, 5));
         terminalAuditRetry = setTimeout(() => {
@@ -735,7 +735,7 @@ export function createOutrightDatabase(options = {}) {
         let deferred = 0;
         for (const id of ids) {
           try {
-            const result = await deleteArchivedInBatches(db, id, deletionsInFlight, { ...deletionContext, automatic: true });
+            const result = await deleteArchivedInBatches(db, id, deletionsInFlight, { ...deletionContext, automatic: true, cutoff });
             if (result.deleted) {
               deleted.push(id);
               pausedDeletions.delete(id);
@@ -2036,12 +2036,12 @@ function runPatchAssignments(patch) {
 // runtime connection; a giant legacy row is reclaimed in a shadow database
 // while the primary stays available for unrelated work. Only the final
 // cutover closes it behind the process lease.
-function deleteArchivedInBatches(db, id, inFlight, { automatic = false, isClosing, filename, workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase, currentDb, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure }) {
+function deleteArchivedInBatches(db, id, inFlight, { automatic = false, cutoff, isClosing, filename, workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase, currentDb, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure }) {
   if (inFlight.has(id)) throw databaseError(409, "Archived conversation deletion is in progress");
   inFlight.add(id);
   const run = async () => {
     try {
-      markArchivedForDeletion(db, id, automatic);
+      markArchivedForDeletion(db, id, automatic, cutoff);
       while (true) {
         if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
         db = currentDb();
@@ -2075,11 +2075,11 @@ async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, cut
   return { deleted: 1, id };
 }
 
-function markArchivedForDeletion(db, id, automatic) {
+function markArchivedForDeletion(db, id, automatic, cutoff) {
   db.transaction(() => {
-    const row = db.prepare("SELECT archived, pinned, deleting FROM conversations WHERE id = ?").get(id);
+    const row = db.prepare("SELECT archived, pinned, deleting, updated_at AS updatedAt FROM conversations WHERE id = ?").get(id);
     if (!row) throw databaseError(404, "Conversation not found");
-    if (!row.archived || (automatic && !row.deleting && row.pinned)
+    if (!row.archived || (automatic && !row.deleting && (row.pinned || (cutoff && row.updatedAt >= cutoff)))
       || db.prepare(`SELECT 1 FROM runs WHERE conversation_id = ? AND (status IN ('queued', 'launching', 'running')
         OR (status = 'interrupted' AND recovery_decision IS NULL)) LIMIT 1`).get(id)) {
       throw databaseError(409, "Only archived conversations without active or unresolved recovery work can be deleted");
