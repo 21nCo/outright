@@ -1,0 +1,28 @@
+server/archive-delete-worker.mjs
+  h_a39f9495f9ec1d 137-139
+server/audit-retention.mjs
+  h_a39f9495f9ec1d 15,18-29,38-43,45,47,51-53
+server/database.mjs
+  h_a39f9495f9ec1d 114-115,121,386-388,397,405-409,444,462,469,480-485,489-496,499,1666,2051-2055,2155-2156,2160-2162
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 127,1534-1535,1537-1545,1567,1585-1586
+server/terminal-broker.mjs
+  h_a39f9495f9ec1d 34-42,74
+server/terminal-broker.test.mjs
+  h_a39f9495f9ec1d 26,33,91,99-101
+server/terminal-manager.test.mjs
+  h_a39f9495f9ec1d 7,706-807,925-932
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 4749-4752,4757-4758
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c6e4308ab903c95fa66fcf326df27169ccd53dd8",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
