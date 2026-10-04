@@ -551,6 +551,71 @@ test("Stop cannot replace a provider's exit outcome while its terminal write is 
   }
 });
 
+test("shutdown preserves exited provider outcomes across a terminal storage fault and restart", async () => {
+  for (const [exitCode, fault] of [[0, "SQLITE_BUSY"], [7, "SQLITE_IOERR_WRITE"], [0, "ENOSPC"]]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-exit-restart-"));
+    const filename = path.join(realpathSync(directory), "outright.db");
+    let database = createOutrightDatabase({ filename });
+    let manager;
+    try {
+      const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory,
+        title: "Exit restart", provider: "codex" });
+      const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "finish" });
+      database.finishRun = () => { throw Object.assign(new Error("injected terminal fault"), { code: fault }); };
+      let child;
+      manager = createAgentManager({ database, publish: () => {},
+        launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+        spawnProcess: () => { child = fakeChild(); return child; } });
+      await manager.schedule({ conversation, run });
+      child.emit("close", exitCode, null);
+      assert.equal(database.getRun(run.id).status, "running");
+      await manager.shutdown();
+      assert.equal(manager.activeProcessCount(), fault === "ENOSPC" ? 0 : 1);
+      await database.close();
+      database = createOutrightDatabase({ filename });
+      assert.equal(database.reconcileInterruptedRuns().count, 1);
+      assert.equal(database.reconcileInterruptedRuns().count, 0, "reconciliation repeated the terminal audit");
+      const expected = exitCode === 0 ? "completed" : "failed";
+      const recovered = database.getRun(run.id);
+      assert.equal(recovered.status, expected);
+      assert.equal(recovered.exitCode, exitCode);
+      assert.equal(recovered.recoveryClass, null);
+      assert.equal(database.listAudit(100).filter((row) => row.target === run.id && row.action === `agent.run.${expected}`).length, 1);
+      assert.equal(database.listAudit(100).filter((row) => row.target === run.id && row.action === "agent.run.stopped").length, 0);
+      assert.equal(existsSync(path.join(database.launchDirectory, `${run.id}.outcome.json`)), false);
+    } finally {
+      await manager?.shutdown();
+      await database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("shutdown reports a terminal outcome with neither SQLite nor journal durability", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-exit-no-storage-"));
+  const filename = path.join(realpathSync(directory), "outright.db");
+  const database = createOutrightDatabase({ filename });
+  let manager;
+  try {
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory,
+      title: "No outcome storage", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "finish" });
+    database.savePendingRunOutcome = () => { throw Object.assign(new Error("journal full"), { code: "ENOSPC" }); };
+    database.finishRun = () => { throw Object.assign(new Error("SQLite busy"), { code: "SQLITE_BUSY" }); };
+    let child;
+    manager = createAgentManager({ database, publish: () => {},
+      launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+      spawnProcess: () => { child = fakeChild(); return child; } });
+    await manager.schedule({ conversation, run });
+    child.emit("close", 0, null);
+    await assert.rejects(manager.shutdown(), /Run outcome could not be made durable before shutdown/);
+    assert.equal(database.getRun(run.id).status, "running");
+  } finally {
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("repeated terminal storage faults retain the slot and retry the durable outcome", async () => {
   const database = fakeDatabase();
   database.getSettings = () => ({ maxConcurrentRuns: 1 });

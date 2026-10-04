@@ -9,6 +9,7 @@ import { Worker } from "node:worker_threads";
 import { foldFindText } from "../src/lib/find-text.js";
 import { RESOURCE_BUDGETS, RETAINED_MESSAGE_FIELDS, RETAINED_ROW_OVERHEAD_BYTES } from "./resource-budgets.mjs";
 import { allocatedDatabaseUsage, archiveShadowPaths, beginArchiveShadow, recoverArchiveShadow } from "./archive-shadow.mjs";
+import { readRunOutcome, removeRunOutcome, saveRunOutcome } from "./run-outcome-journal.mjs";
 
 const DEFAULT_SETTINGS = {
   provider: "codex",
@@ -1410,6 +1411,12 @@ export function createOutrightDatabase(options = {}) {
     getLaunchHandshake(runId) {
       return readLaunchHandshake(launchDirectory, runId);
     },
+    savePendingRunOutcome(runId, outcome) {
+      saveRunOutcome(launchDirectory, runId, outcome);
+    },
+    removePendingRunOutcome(runId) {
+      removeRunOutcome(launchDirectory, runId);
+    },
     // Crash-consistent restart reconciliation: queued/running rows belong to a
     // dead runtime, so none of them can ever finish under this process. Mark
     // them "interrupted" with a best-effort process classification instead of
@@ -1432,6 +1439,22 @@ export function createOutrightDatabase(options = {}) {
         // and startup never materializes the entire backlog in JavaScript.
         const pending = db.prepare("SELECT id, status, pid FROM runs WHERE status IN ('queued', 'running', 'launching') ORDER BY rowid LIMIT 500").all();
         for (const run of pending) {
+          // The owner may have observed provider close while SQLite refused
+          // its terminal transaction. Its fsynced bounded result is stronger
+          // evidence than a dead-process probe or a later Stop request.
+          const outcome = run.status === "queued" ? null : readRunOutcome(launchDirectory, run.id);
+          if (outcome) {
+            const result = db.prepare(`UPDATE runs SET status = ?, pid = NULL, finished_at = ?, exit_code = ?, error = ?
+              WHERE id = ? AND status IN ('running', 'launching')`).run(
+              outcome.status, outcome.finishedAt, outcome.exitCode, outcome.message || null, run.id);
+            if (result.changes) {
+              writeCriticalAudit(`agent.run.${outcome.status}`, {
+                target: run.id, exitCode: outcome.exitCode, error: outcome.message || undefined,
+              });
+              counts[outcome.status] = (counts[outcome.status] ?? 0) + 1;
+            }
+            continue;
+          }
           let classification = "unknown";
           let pid = run.pid ?? null;
           if (run.status === "queued") classification = "never-started";
@@ -2763,9 +2786,23 @@ function sweepLaunchHandshakes(launchDirectory, db) {
   catch { return; }
   const keep = db.prepare(`SELECT 1 FROM runs WHERE id = ? AND status = 'interrupted'
     AND recovery_decision IS NULL AND recovery_class IN ('alive', 'unknown')`);
+  const pendingOutcome = db.prepare("SELECT 1 FROM runs WHERE id = ? AND status IN ('running', 'launching')");
   try {
     let entry;
     while ((entry = directory.readSync())) {
+      if (/^[0-9a-f-]{36}\.outcome\.json\.[0-9a-f-]{36}\.tmp$/i.test(entry.name)) {
+        // A crash before atomic rename leaves no trustworthy outcome. The
+        // temporary write owns no active run and is safe to discard.
+        try { rmSync(path.join(launchDirectory, entry.name), { force: true }); } catch { /* Retry next startup. */ }
+        continue;
+      }
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.outcome\.json$/i.test(entry.name)) {
+        const runId = entry.name.slice(0, -".outcome.json".length);
+        if (!pendingOutcome.get(runId)) {
+          try { removeRunOutcome(launchDirectory, runId); } catch { /* Retain a stale marker for the next sweep. */ }
+        }
+        continue;
+      }
       // Run and terminal owners share this directory. Terminal markers are
       // consumed by terminal recovery, which must verify the native owner
       // before it can release capacity or settle the pending audit record.

@@ -1,0 +1,69 @@
+import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+
+const RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_RECORD_BYTES = 8 * 1024;
+
+function recordPath(directory, runId) {
+  if (!RUN_ID.test(runId)) throw new Error("Invalid run outcome ID");
+  return path.join(directory, `${runId}.outcome.json`);
+}
+
+function syncDirectory(directory) {
+  if (process.platform === "win32") return;
+  const fd = openSync(directory, "r");
+  try { fsyncSync(fd); }
+  finally { closeSync(fd); }
+}
+
+export function saveRunOutcome(directory, runId, outcome) {
+  const destination = recordPath(directory, runId);
+  const record = JSON.stringify({ version: 1, runId, ...outcome,
+    message: Buffer.from(String(outcome.message ?? "")).subarray(0, 4000).toString("utf8") });
+  if (Buffer.byteLength(record) > MAX_RECORD_BYTES) throw new Error("Run outcome exceeds its recovery budget");
+  const temporary = `${destination}.${randomUUID()}.tmp`;
+  let fd;
+  try {
+    fd = openSync(temporary, "wx", 0o600);
+    writeFileSync(fd, record);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(temporary, destination);
+    syncDirectory(directory);
+  } catch (error) {
+    if (fd !== undefined) closeSync(fd);
+    try { unlinkSync(temporary); } catch { /* The rename may have succeeded. */ }
+    throw error;
+  }
+}
+
+export function readRunOutcome(directory, runId) {
+  // Imported legacy rows may have arbitrary IDs. Only runs created with the
+  // current UUID namespace can own a sidecar in the private launch directory.
+  if (!RUN_ID.test(runId)) return null;
+  const filename = recordPath(directory, runId);
+  let stat;
+  try { stat = lstatSync(filename); }
+  catch (error) { if (error.code === "ENOENT") return null; throw error; }
+  if (!stat.isFile() || stat.size > MAX_RECORD_BYTES) throw new Error(`Invalid run outcome record: ${runId}`);
+  let record;
+  try { record = JSON.parse(readFileSync(filename, "utf8")); }
+  catch { throw new Error(`Invalid run outcome record: ${runId}`); }
+  if (record?.version !== 1 || record.runId !== runId
+    || !["completed", "failed", "stopped"].includes(record.status)
+    || typeof record.finishedAt !== "string" || !Number.isFinite(Date.parse(record.finishedAt))
+    || typeof record.message !== "string" || Buffer.byteLength(record.message) > 4096
+    || !(record.exitCode === null || Number.isSafeInteger(record.exitCode))
+    || (record.status === "completed" && (record.exitCode !== 0 || record.message !== ""))) {
+    throw new Error(`Invalid run outcome record: ${runId}`);
+  }
+  return record;
+}
+
+export function removeRunOutcome(directory, runId) {
+  if (!RUN_ID.test(runId)) return;
+  try { unlinkSync(recordPath(directory, runId)); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+}

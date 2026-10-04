@@ -889,6 +889,23 @@ test("reconciles queued and running work as interrupted after a runtime restart"
   }
 });
 
+test("malformed terminal recovery evidence cannot silently become an interrupted run", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-invalid-outcome-"));
+  const database = createOutrightDatabase({ filename: path.join(root, "outright.db") });
+  try {
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: root,
+      title: "Recovery", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "run" });
+    database.updateRun(run.id, { status: "running", pid: 4242 });
+    writeFileSync(path.join(database.launchDirectory, `${run.id}.outcome.json`), "{broken");
+    assert.throws(() => database.reconcileInterruptedRuns({ probeAlive: () => false }), /Invalid run outcome record/);
+    assert.equal(database.getRun(run.id).status, "running");
+  } finally {
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("uses a durable wrapper completion marker after the owned tree exits", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-completed-launch-"));
   const database = createOutrightDatabase({ filename: path.join(root, "outright.db") });

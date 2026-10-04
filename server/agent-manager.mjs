@@ -583,6 +583,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
 
   function finish(state, exitCode, error) {
     if ((!active.has(state.run.id) && !pendingOutcomes.has(state.run.id)) || state.finishing) return;
+    // A recovery marker proves an exited owner. A preparation error that
+    // races a still-live wrapper must wait for its close/teardown proof.
+    if (state.child && !state.closed) return false;
     state.finishing = true;
     clearCheckpointTimer(state);
     // Once the provider has exited, its terminal decision belongs to that
@@ -604,6 +607,16 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     let finished;
     let transcriptMessage;
     try {
+      // Persist the frozen provider result outside SQLite before its terminal
+      // transaction. Shutdown may follow a BUSY/FULL refusal immediately;
+      // restart must then recover the actual exit, not classify it unknown.
+      if (!state.outcomeJournaled && database.savePendingRunOutcome) {
+        try {
+          database.savePendingRunOutcome(state.run.id, state.terminalOutcome);
+          state.outcomeJournaled = true;
+          state.outcomeJournalError = null;
+        } catch (journalError) { state.outcomeJournalError = journalError; }
+      }
       transcriptMessage = budgetTranscript(state, pendingAssistantMessage(state), { terminal: true });
       // The last checkpoint and terminal state commit together. Until that
       // commit succeeds this state still owns its run slot and recovery data.
@@ -629,6 +642,11 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     }
     state.pendingFinish = null;
     state.terminalOutcome = null;
+    if (state.outcomeJournaled) {
+      try { database.removePendingRunOutcome(state.run.id); }
+      catch { /* The committed row makes a stale record safe to sweep on restart. */ }
+      state.outcomeJournaled = false;
+    }
     if (transcriptMessage && !finished.message) {
       // finishRun committed the terminal state, omission flag and audit in one
       // transaction. A failure to write the optional notice cannot retry that
@@ -1163,6 +1181,16 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       ]).then((results) => {
         const failure = results.find((result) => result.status === "rejected");
         if (failure) throw failure.reason;
+        // A database refusal may leave an exited owner in memory. Resolving
+        // shutdown is safe only when restart has an independently durable
+        // terminal result; otherwise report the hold instead of silently
+        // handing an unknown row to interruption reconciliation.
+        if (database.savePendingRunOutcome) {
+          const unjournaled = [...active.values(), ...pendingOutcomes.values()].find((state) =>
+            state.terminalOutcome && !state.outcomeJournaled && (!state.child || state.closed));
+          if (unjournaled) throw new Error(`Run outcome could not be made durable before shutdown: ${unjournaled.run.id}`,
+            { cause: unjournaled.outcomeJournalError });
+        }
       });
       return shutdownPromise;
     },
