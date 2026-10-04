@@ -1253,17 +1253,13 @@ test("cleanup admission and restart reconciliation stay bounded behind large dir
         .map((row) => row.detail).join(" ");
       assert.match(plan, /audit_evidence_action/);
       assert.match(plan, /audit_evidence_operation/);
-      const admissionStart = performance.now();
       await database.auditRetentionCleanupRequested({ operationId: "direct-16" });
-      assert.ok(performance.now() - admissionStart < 150, "cleanup admission scanned unrelated telemetry");
       await assert.rejects(database.auditRetentionCleanupRequested({ operationId: "overflow" }),
         (error) => error.statusCode === 429);
     } finally { writer.close(); }
     await database.close();
     database = createOutrightDatabase({ filename, runtimeLease: true });
-    const recoveryStart = performance.now();
     assert.equal(database.reconcilePendingRetentionCleanup(), 16);
-    assert.ok(performance.now() - recoveryStart < 150, "restart recovery scanned unrelated telemetry");
     assert.equal(database.reconcilePendingRetentionCleanup(), 0);
     const proof = new Database(filename, { readonly: true });
     try {
@@ -1299,6 +1295,51 @@ test("legacy cleanup requests wait for paged evidence backfill before admission"
       assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleanup.unknown'").get().count, 1);
     } finally { proof.close(); }
     await database.auditRetentionCleanupRequested({ operationId: "new-cleanup" });
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("legacy cleanup reconciliation retries storage faults before releasing admission and audit trimming", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-cleanup-retry-"));
+  const filename = path.join(directory, "outright.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  await database.close();
+  const writer = new Database(filename);
+  try {
+    writer.exec("DROP TRIGGER audit_evidence_insert; DROP TRIGGER audit_evidence_delete; DROP TRIGGER audit_evidence_update; DROP TABLE audit_evidence_state; DROP TABLE audit_evidence");
+    const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, '2026-01-01')");
+    writer.transaction(() => {
+      insert.run("retention.cleanup.requested", "", '{"operationId":"retry-cleanup"}');
+      insert.run("terminal.created", "retry-terminal", '{"cwd":"/tmp/retry"}');
+      for (let index = 0; index < 10_100; index += 1) insert.run("telemetry", "", "{}");
+    }).immediate();
+  } finally { writer.close(); }
+  let faults = 0;
+  try {
+    database = createOutrightDatabase({ filename, runtimeLease: true, terminalAuditRetryBaseMs: 1,
+      beforeCleanupReconciliation: () => {
+        if (faults++ < 2) throw Object.assign(new Error("injected cleanup write fault"), { code: "SQLITE_IOERR" });
+      } });
+    assert.equal(database.reconcilePendingRetentionCleanup(), 0);
+    await assert.rejects(database.auditRetentionCleanupRequested({ operationId: "too-early" }),
+      (error) => error.statusCode === 503);
+    await database.waitForTerminalAuditReconciliation();
+    assert.equal(faults, 3, "the successful scan skipped inherited cleanup after retry");
+    const proof = new Database(filename, { readonly: true });
+    try {
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleanup.unknown'").get().count, 1);
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.unknown'").get().count, 1);
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.created'").get().count, 1,
+        "trimming lost the recoverable terminal owner");
+      assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= AUDIT_RETENTION_LIMIT + 3);
+    } finally { proof.close(); }
+    await database.auditRetentionCleanupRequested({ operationId: "after-retry" });
+    await database.close();
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    assert.equal(database.reconcilePendingRetentionCleanup(), 1, "restart lost the newly admitted request");
+    const readback = new Database(filename, { readonly: true });
+    try {
+      assert.equal(readback.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleanup.unknown'").get().count, 2);
+    } finally { readback.close(); }
   } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 

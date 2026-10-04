@@ -4,7 +4,7 @@ import { createTerminalManager } from "./terminal-manager.mjs";
 import { recoverManagedTerminal } from "./managed-terminal.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { createOutrightDatabase } from "./database.mjs";
-import { AUDIT_RETENTION_LIMIT, trimAudit, trimAuditPage } from "./audit-retention.mjs";
+import { AUDIT_RETENTION_LIMIT, auditTrimSql, trimAudit, trimAuditPage } from "./audit-retention.mjs";
 import { createOutrightRuntime } from "./outright-runtime.mjs";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { execFile, spawn, spawnSync } from "node:child_process";
@@ -805,7 +805,7 @@ test("audit paging retains a late completion until its earlier owner is retired"
   } finally { writer.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("a retention page has bounded cost when old recovery rows precede a large telemetry history", async () => {
+test("a retention page examines bounded candidates when old recovery rows precede a large telemetry history", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-audit-page-cost-"));
   const filename = path.join(directory, "runtime.db");
   const database = createOutrightDatabase({ filename });
@@ -820,11 +820,12 @@ test("a retention page has bounded cost when old recovery rows precede a large t
       }
       for (let index = 0; index < 200_000; index += 1) insert.run("telemetry", "", "{}");
     }).immediate();
-    const start = performance.now();
+    const plan = writer.prepare(`EXPLAIN QUERY PLAN ${auditTrimSql}`).all(0, Number.MAX_SAFE_INTEGER, 32)
+      .map((row) => row.detail).join(" ");
+    assert.match(plan, /MATERIALIZE candidates/);
+    assert.match(plan, /SEARCH audit_log USING INTEGER PRIMARY KEY/);
     const page = trimAuditPage(writer, 32);
-    const elapsed = performance.now() - start;
     assert.deepEqual(page, { scanned: 32, deleted: 0, complete: false });
-    assert.ok(elapsed < 150, `32-row trim examined unrelated history for ${elapsed.toFixed(1)} ms`);
   } finally { writer.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 

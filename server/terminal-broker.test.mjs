@@ -173,6 +173,7 @@ test("disconnecting a live owner releases the broker and its PTY child", { timeo
   });
   let socket;
   let shellPid;
+  let pidOutput = "";
   let ready = false;
   let pending = "";
   try {
@@ -196,8 +197,10 @@ test("disconnecting a live owner releases the broker and its PTY child", { timeo
         pending = pending.slice(end + 1);
         if (frame.type === "ready") ready = true;
         if (frame.type === "data") {
-          const match = frame.data.match(/OUTRIGHT_CHILD_PID=(\d+)/);
+          pidOutput += frame.data;
+          const match = pidOutput.match(/OUTRIGHT_CHILD_PID=(\d+)\r?\n/);
           if (match) shellPid = Number(match[1]);
+          pidOutput = pidOutput.slice(-128);
         }
       }
     });

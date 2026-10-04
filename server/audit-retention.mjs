@@ -48,11 +48,9 @@ export function backfillAuditEvidencePage(db, afterId, throughId) {
       OR action LIKE '%.requested'
       OR (json_valid(details) AND json_extract(details, '$.operationId') IS NOT NULL))`).run(afterId, throughId);
 }
-export function trimAudit(db, limit = -1, afterId = 0, throughId = Number.MAX_SAFE_INTEGER) {
-  if (!db.prepare("SELECT complete FROM audit_evidence_state WHERE id = 1").get()?.complete) return 0;
-  // Materialize a raw-id page before testing dependencies. The old query
-  // examined an unbounded eligible prefix for each supposedly bounded page.
-  return db.prepare(`WITH candidates AS MATERIALIZED (
+// Expose the executed statement so its bounded candidate plan can be checked
+// without a wall-clock assertion that varies with host load.
+export const auditTrimSql = `WITH candidates AS MATERIALIZED (
       SELECT id, action, target,
         CASE WHEN json_valid(details) THEN json_extract(details, '$.operationId') END AS operation_id
       FROM audit_log WHERE id > ? AND id <= ?
@@ -82,7 +80,13 @@ export function trimAudit(db, limit = -1, afterId = 0, throughId = Number.MAX_SA
         OR (candidate.operation_id IS NOT NULL
           AND EXISTS (SELECT 1 FROM audit_evidence AS request
             WHERE request.operation_id = candidate.operation_id AND request.id < candidate.id
-              AND request.action LIKE '%.requested'))))`).run(afterId, throughId, limit).changes;
+              AND request.action LIKE '%.requested'))))`;
+
+export function trimAudit(db, limit = -1, afterId = 0, throughId = Number.MAX_SAFE_INTEGER) {
+  if (!db.prepare("SELECT complete FROM audit_evidence_state WHERE id = 1").get()?.complete) return 0;
+  // Materialize a raw-id page before testing dependencies. The old query
+  // examined an unbounded eligible prefix for each supposedly bounded page.
+  return db.prepare(auditTrimSql).run(afterId, throughId, limit).changes;
 }
 
 // A protected old row must not make every later write rescan the same prefix.

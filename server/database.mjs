@@ -499,9 +499,11 @@ export function createOutrightDatabase(options = {}) {
         terminalAuditTick = scheduleTerminalAudit(advanceTerminalAuditScan);
         return;
       }
-      if (cleanupReconciliationPending && !scan.cleanupStarted) {
-        scan.cleanupStarted = true;
+      if (cleanupReconciliationPending && !scan.cleanupReconciled) {
         api.reconcilePendingRetentionCleanup();
+        // Commit the scan transition only after the inherited requests have
+        // received durable outcomes. A failed SQLite write restarts this scan.
+        scan.cleanupReconciled = true;
       }
       // Earlier live audit writes did not trim while the cursor was reading
       // that history. Reclaim it in bounded slices before releasing terminal
@@ -533,6 +535,7 @@ export function createOutrightDatabase(options = {}) {
             scan.owners.clear();
             scan.outcomes = null;
             scan.written = 0;
+            scan.cleanupReconciled = false;
             scan.error = null;
             terminalAuditTick = scheduleTerminalAudit(advanceTerminalAuditScan);
           }
@@ -1706,6 +1709,7 @@ export function createOutrightDatabase(options = {}) {
         if (!terminalAuditScan) beginTerminalAuditScan();
         return 0;
       }
+      options.beforeCleanupReconciliation?.();
       // Direct SQLite writers can bypass API admission. Resolve at most one
       // page per event-loop turn and leave new cleanup requests closed until
       // the entire inherited backlog has a durable outcome.
