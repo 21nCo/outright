@@ -1,0 +1,24 @@
+server/archive-delete-worker.mjs
+  h_a39f9495f9ec1d 5,137-142
+server/audit-retention.mjs
+  h_a39f9495f9ec1d 5-49,51-84,91-93
+server/database.mjs
+  h_a39f9495f9ec1d 2-3,412,446-448,450-452,1683-1684,2130,2170
+server/terminal-broker.mjs
+  h_a39f9495f9ec1d 30,34-42,84,153-161,167-172
+server/terminal-broker.test.mjs
+  h_a39f9495f9ec1d 4,165-234
+server/terminal-manager.test.mjs
+  h_a39f9495f9ec1d 808-867
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "42cae8dd83b228cc6ea57a9b949ced28b70933b8",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
