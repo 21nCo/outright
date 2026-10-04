@@ -261,25 +261,54 @@ function Setting({ icon: Icon, label, children }) { return <label className="set
 
 function capacityStatusAnnouncement(capacity) {
   if (!capacity?.limits) return "";
-  if (capacity.terminalProcesses?.recoveryError) return "Terminal history recovery stopped. New terminals are paused.";
-  if (capacity.terminalProcesses?.recoveryPending) return "Terminal history recovery is in progress. New terminals are paused.";
-  if (capacity.maintenanceError) return "Archived storage recovery needs a restart. New work is paused.";
-  if (capacity.migrationStatus === "maintenance") return "Archived storage cleanup is in progress. New work is paused.";
-  if (capacity.migrationStatus === "migrating") return "Retained history migration is in progress. New work is paused.";
-  if (capacity.migrationStatus === "error") return "Retained history migration stopped. New work is paused.";
-  if (capacity.cleanupPaused) return "Archived cleanup is paused after storage errors.";
-  if (capacity.cleanupPending) return "Archived cleanup is pending.";
-  if (capacity.queued >= capacity.limits.maxQueuedRuns) return "Run queue is full. Wait for capacity or stop queued work.";
-  if (capacity.diskUsageStatus === "unknown" || capacity.diskAllocatedBytes === null) return "Physical storage use is unknown. New work is paused.";
-  if (typeof capacity.availablePhysicalForNewWorkBytes === "number"
-    && capacity.availablePhysicalForNewWorkBytes < 64 * 1024) return "Physical storage is full. New work is paused.";
-  if (typeof capacity.availableForNewWorkBytes === "number"
-    && capacity.availableForNewWorkBytes < 64 * 1024) return "Retained history is full. New work is paused.";
-  if (capacity.terminalProcesses?.unknown) {
-    const count = capacity.terminalProcesses.unknown;
-    return `${count} terminal ownership ${count === 1 ? "record is" : "records are"} unverified. New terminals may be paused.`;
+  const messages = [];
+  const validCount = (value) => Number.isSafeInteger(value) && value >= 0;
+  const atLimit = (active, limit) => validCount(active) && validCount(limit) && active >= limit;
+  const terminal = capacity.terminalProcesses;
+  if (terminal?.recoveryError) messages.push("Terminal history recovery stopped. New terminals are paused.");
+  else if (terminal?.recoveryPending) messages.push("Terminal history recovery is in progress. New terminals are paused.");
+  else if (!terminal || !validCount(terminal.active) || !validCount(terminal.limit) || !validCount(terminal.unknown)) {
+    messages.push("Terminal capacity is unknown.");
+  } else {
+    if (terminal.unknown) messages.push(`${terminal.unknown} terminal ownership ${terminal.unknown === 1 ? "record is" : "records are"} unverified. New terminals may be paused.`);
+    if (atLimit(terminal.active, terminal.limit)) messages.push("Terminal capacity is full. Close a terminal before opening another.");
   }
-  return "Capacity is available for new work.";
+  const utility = capacity.utilityProcesses;
+  if (!utility || !validCount(utility.active) || !validCount(utility.limit)) messages.push("Utility process capacity is unknown.");
+  else if (atLimit(utility.active, utility.limit)) messages.push("Utility process capacity is full. Retry when a process finishes.");
+  const queueFull = atLimit(capacity.queued, capacity.limits.maxQueuedRuns);
+  if (!validCount(capacity.queued) || !validCount(capacity.limits.maxQueuedRuns)) messages.push("Run queue capacity is unknown.");
+  else if (queueFull) messages.push("Run queue is full. Wait for capacity or stop queued work.");
+  if (!validCount(capacity.active) || !validCount(capacity.limits.maxConcurrentRuns)) messages.push("Concurrent run capacity is unknown.");
+  else if (atLimit(capacity.active, capacity.limits.maxConcurrentRuns)) messages.push(queueFull
+    ? "Concurrent run slots are full." : "Concurrent run slots are full. New runs will queue.");
+  if (!validCount(capacity.recoverable)) messages.push("Run recovery capacity is unknown.");
+  else if (capacity.recoverable) messages.push(`${capacity.recoverable === 1 ? "One run is" : `${capacity.recoverable} runs are`} awaiting recovery.`);
+  if (capacity.maintenanceError) messages.push("Archived storage recovery needs a restart. New work is paused.");
+  else if (capacity.migrationStatus === "maintenance") messages.push("Archived storage cleanup is in progress. New work is paused.");
+  else if (capacity.migrationStatus === "migrating") messages.push("Retained history migration is in progress. New work is paused.");
+  else if (capacity.migrationStatus === "error") messages.push("Retained history migration stopped. New work is paused.");
+  else if (capacity.migrationStatus !== "ready") messages.push("Retained history status is unknown. New work is paused.");
+  if (capacity.cleanupPaused) messages.push("Archived cleanup is paused after storage errors.");
+  else if (capacity.cleanupPending) messages.push("Archived cleanup is pending.");
+  if (!capacity.maintenanceError && capacity.migrationStatus === "ready") {
+    if (!["measured", "estimated", "partial"].includes(capacity.diskUsageStatus) || !Number.isFinite(capacity.diskAllocatedBytes)
+      || !Number.isFinite(capacity.availablePhysicalForNewWorkBytes)) {
+      messages.push("Physical storage use is unknown. New work is paused.");
+    } else if (capacity.availablePhysicalForNewWorkBytes < 64 * 1024) {
+      messages.push("Physical storage is full. New work is paused.");
+    }
+    if (!Number.isFinite(capacity.retainedBytes) || !Number.isFinite(capacity.availableForNewWorkBytes)) {
+      messages.push("Retained history use is unknown. New work is paused.");
+    } else if (capacity.availableForNewWorkBytes < 64 * 1024) {
+      messages.push("Retained history is full. New work is paused.");
+    }
+  }
+  const availability = messages.join(" ") || "Capacity is available for new work.";
+  if (capacity.migrationStatus !== "ready") return availability;
+  if (capacity.diskUsageStatus === "estimated") return `${availability} Physical storage use is estimated.`;
+  if (capacity.diskUsageStatus === "partial") return `${availability} Physical storage measurement is partial.`;
+  return availability;
 }
 
 function capacityUsageText(capacity) {

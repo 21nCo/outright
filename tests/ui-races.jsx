@@ -647,7 +647,8 @@ async function settingsCapacityWithoutEventRegression() {
     editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
   let reads = 0;
   let otherClientCapacity = { queued: 0, active: 0, recoverable: 0, retainedBytes: 0,
-    diskAllocatedBytes: 3 * 1048576, diskUsageStatus: "measured", availablePhysicalForNewWorkBytes: 5 * 1048576 };
+    diskAllocatedBytes: 3 * 1048576, diskUsageStatus: "measured", availablePhysicalForNewWorkBytes: 5 * 1048576,
+    utilityProcesses: { active: 0, limit: 8 }, terminalProcesses: { active: 0, unknown: 0, limit: 12 } };
   route = async (url) => {
     if (url.pathname === "/api/capacity") {
       reads += 1;
@@ -659,11 +660,15 @@ async function settingsCapacityWithoutEventRegression() {
     if (url.pathname === "/api/retention/archived") return response({ conversations: [] });
     return response({});
   };
+  let signalChange;
+  let eventSequence = 0;
   function Fixture() {
     const [open, setOpen] = React.useState(false);
+    const [event, setEvent] = React.useState(null);
+    signalChange = () => setEvent({ type: "capacity.changed", stamp: ++eventSequence });
     return <><button onClick={() => setOpen(true)}>Open live capacity</button><SettingsDialog open={open}
       onOpenChange={setOpen} settings={settings} providers={[{ id: "codex", label: "Codex", available: true }]}
-      templates={[]} runtimeEvent={null} onSaved={() => {}} onError={(error) => { throw error; }} /></>;
+      templates={[]} runtimeEvent={event} onSaved={() => {}} onError={(error) => { throw error; }} /></>;
   }
   root.render(<TooltipProvider><Fixture /></TooltipProvider>);
   await until(() => host.querySelector("button")?.textContent === "Open live capacity", "live capacity fixture");
@@ -680,6 +685,71 @@ async function settingsCapacityWithoutEventRegression() {
   assert(capacityAnnouncement() === "Capacity is available for new work.", "initial capacity state was not announced");
   assert(document.querySelector('[aria-labelledby="capacity-retention-heading"] h3')?.textContent === "Capacity and retention",
     "capacity controls lost their named heading");
+  otherClientCapacity = { ...otherClientCapacity, terminalProcesses: { active: 12, unknown: 0, limit: 12 } };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Terminal capacity is full. Close a terminal before opening another.",
+    "full terminal admission is announced instead of available capacity");
+  otherClientCapacity = { ...otherClientCapacity, terminalProcesses: { active: 0, unknown: 0, limit: 12 },
+    utilityProcesses: { active: 8, limit: 8 } };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Utility process capacity is full. Retry when a process finishes.",
+    "full utility admission is announced instead of available capacity");
+  otherClientCapacity = { ...otherClientCapacity, terminalProcesses: { active: 12, unknown: 0, limit: 12 },
+    queued: 32, active: 2, availablePhysicalForNewWorkBytes: 32 * 1024 };
+  signalChange();
+  await until(() => ["Terminal capacity is full", "Utility process capacity is full", "Run queue is full",
+    "Concurrent run slots are full", "Physical storage is full"].every((part) => capacityAnnouncement().includes(part))
+    && !capacityAnnouncement().includes("Capacity is available"),
+  "simultaneous process, queue and storage limits remain distinct in the live announcement");
+  otherClientCapacity = { ...otherClientCapacity, terminalProcesses: { active: 0, unknown: 0, limit: 12 },
+    utilityProcesses: { active: 0, limit: 8 }, queued: 2, active: 1, availablePhysicalForNewWorkBytes: 5 * 1048576 };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Capacity is available for new work.",
+    "combined limits clear without a stale warning");
+  otherClientCapacity = { ...otherClientCapacity, utilityProcesses: { active: 0, limit: 8 }, queued: 32 };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Run queue is full. Wait for capacity or stop queued work.",
+    "full run queue is announced");
+  otherClientCapacity = { ...otherClientCapacity, queued: 2, active: 2 };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Concurrent run slots are full. New runs will queue.",
+    "full active run slots are announced without claiming queue admission is closed");
+  otherClientCapacity = { ...otherClientCapacity, active: 1, recoverable: 1 };
+  signalChange();
+  await until(() => capacityAnnouncement() === "One run is awaiting recovery.", "run recovery is announced");
+  otherClientCapacity = { ...otherClientCapacity, recoverable: 0, cleanupPending: true };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Archived cleanup is pending.", "pending cleanup is announced");
+  otherClientCapacity = { ...otherClientCapacity, cleanupPending: false };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Capacity is available for new work.",
+    "status returns to available after process, queue, recovery and cleanup capacity clears");
+  otherClientCapacity = { ...otherClientCapacity, terminalProcesses: { active: 1, unknown: 1, limit: 12 } };
+  signalChange();
+  await until(() => capacityAnnouncement() === "1 terminal ownership record is unverified. New terminals may be paused.",
+    "unverified terminal ownership is announced");
+  otherClientCapacity = { ...otherClientCapacity, terminalProcesses: { active: 0, unknown: 0, limit: 12 } };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Capacity is available for new work.", "terminal recovery returns status to available");
+  otherClientCapacity = { ...otherClientCapacity, utilityProcesses: null, terminalProcesses: null };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Terminal capacity is unknown. Utility process capacity is unknown.",
+    "missing process measurements cannot announce available capacity");
+  otherClientCapacity = { ...otherClientCapacity, utilityProcesses: { active: 0, limit: 8 },
+    terminalProcesses: { active: 0, unknown: 0, limit: 12 }, diskUsageStatus: "estimated" };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Capacity is available for new work. Physical storage use is estimated.",
+    "Windows disk estimates remain distinct from an unknown storage measurement");
+  otherClientCapacity = { ...otherClientCapacity, diskUsageStatus: "measured" };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Capacity is available for new work.", "measured storage restores the available announcement");
+  otherClientCapacity = { ...otherClientCapacity, diskUsageStatus: "invalid" };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Physical storage use is unknown. New work is paused.",
+    "an unrecognized disk measurement cannot announce available capacity with stale byte values");
+  otherClientCapacity = { ...otherClientCapacity, diskUsageStatus: "measured" };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Capacity is available for new work.", "storage measurement recovery is announced");
   otherClientCapacity = { ...otherClientCapacity, availablePhysicalForNewWorkBytes: 32 * 1024 };
   await until(() => capacityText().includes("New work is paused at the physical storage threshold"),
     "32 KiB physical headroom announces the same pause as run admission");
