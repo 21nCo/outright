@@ -1,0 +1,20 @@
+server/agent-manager.mjs
+  h_a39f9495f9ec1d 340-344,383-388,807-813,825-832,834-841
+server/agent-manager.test.mjs
+  h_a39f9495f9ec1d 902-953,1061-1096
+server/archive-shadow.mjs
+  h_a39f9495f9ec1d 720-726
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 106-135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "362a3bf1ed1886b2c90028f15d875da4f2c8c82d",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
