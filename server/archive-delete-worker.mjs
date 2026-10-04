@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { closeSync, openSync, statSync } from "node:fs";
 import { parentPort, workerData } from "node:worker_threads";
 import { archiveShadowPaths, cutoverArchiveShadow, fenceArchiveSource, prepareArchiveShadowCutover } from "./archive-shadow.mjs";
-import { trimAudit } from "./audit-retention.mjs";
+import { trimAuditPage } from "./audit-retention.mjs";
 
 const { filename, conversationId, table, rowId, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase } = workerData;
 const ownership = {
@@ -134,10 +134,12 @@ try {
     shadow.prepare("UPDATE retained_usage SET legacy_ceiling = MAX(legacy_ceiling, bytes + 1048576) WHERE id = 1").run();
     shadow.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
       .run("retention.archived.deleted", conversationId, "{}", new Date().toISOString());
-    // The first pass may retire an owner and leave its dependent completion
-    // protected by the statement snapshot. The second pass can retire it.
-    trimAudit(shadow);
-    trimAudit(shadow);
+    // The shadow uses the same durable, fixed-size cursor as live writes.
+    // Further pages are resumed after cutover, without a full-history scan
+    // or a second scan when no owner was retired.
+    for (let page = 0; page < 4; page += 1) {
+      if (trimAuditPage(shadow).complete) break;
+    }
   }).immediate();
   if (beforeUsage.measured && shadow.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes >= beforeUsage.bytes) {
     throw new Error("Archive shadow did not debit the reclaimed row");

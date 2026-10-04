@@ -805,6 +805,66 @@ test("audit paging retains a late completion until its earlier owner is retired"
   } finally { writer.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("a retention page has bounded cost when old recovery rows precede a large telemetry history", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-audit-page-cost-"));
+  const filename = path.join(directory, "runtime.db");
+  const database = createOutrightDatabase({ filename });
+  await database.close();
+  const writer = new Database(filename);
+  try {
+    const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, '2026-09-01')");
+    writer.transaction(() => {
+      for (let index = 0; index < 32; index += 1) {
+        insert.run(index % 2 ? "terminal.created" : "retention.cleanup.requested",
+          `owner-${index}`, JSON.stringify({ operationId: `operation-${index}` }));
+      }
+      for (let index = 0; index < 200_000; index += 1) insert.run("telemetry", "", "{}");
+    }).immediate();
+    const start = performance.now();
+    const page = trimAuditPage(writer, 32);
+    const elapsed = performance.now() - start;
+    assert.deepEqual(page, { scanned: 32, deleted: 0, complete: false });
+    assert.ok(elapsed < 150, `32-row trim examined unrelated history for ${elapsed.toFixed(1)} ms`);
+  } finally { writer.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("legacy audit evidence backfills in startup pages before retention can retire a late outcome", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-audit-backfill-"));
+  const filename = path.join(directory, "runtime.db");
+  let database = createOutrightDatabase({ filename });
+  await database.close();
+  const writer = new Database(filename);
+  try {
+    // Simulate an existing database whose audit rows predate the projection.
+    writer.exec("DROP TRIGGER audit_evidence_insert; DROP TRIGGER audit_evidence_delete; DROP TRIGGER audit_evidence_update; DROP TABLE audit_evidence_state; DROP TABLE audit_evidence");
+    const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, '', ?, '2026-09-01')");
+    insert.run("retention.cleanup.requested", '{"operationId":"legacy-pending"}');
+    writer.transaction(() => { for (let index = 0; index < 12_000; index += 1) insert.run("telemetry", "{}"); }).immediate();
+  } finally { writer.close(); }
+  try {
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    const before = new Database(filename);
+    try {
+      assert.deepEqual(trimAuditPage(before), { scanned: 0, deleted: 0, complete: false },
+        "retention ran while its legacy dependency index was incomplete");
+    } finally { before.close(); }
+    assert.equal(database.reconcileTerminalAudit(), 0);
+    await database.waitForTerminalAuditReconciliation();
+    const after = new Database(filename);
+    try {
+      assert.equal(after.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleanup.requested'").get().count, 1);
+      const insert = after.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, '', ?, '2026-09-01')");
+      const outcomeId = insert.run("retention.cleanup.finished", '{"operationId":"other-operation"}').lastInsertRowid;
+      after.prepare("UPDATE audit_log SET details = ? WHERE id = ?")
+        .run('{"operationId":"legacy-pending"}', outcomeId);
+      after.transaction(() => { for (let index = 0; index < 10_050; index += 1) insert.run("telemetry", "{}"); }).immediate();
+      for (let page = 0; page < 800; page += 1) trimAuditPage(after);
+      assert.deepEqual(after.prepare("SELECT action FROM audit_log WHERE json_valid(details) AND json_extract(details, '$.operationId') = 'legacy-pending'").all(), [],
+        "completed legacy request and late outcome did not retire after the protected sweep");
+    } finally { after.close(); }
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("legacy unknown terminal ownership consumes each worktree limit", async () => {
   const reservation = { target: "56b5370b-7ff3-470c-bb68-469b01c96915", cwd: null };
   let launched = false;

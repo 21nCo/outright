@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -152,6 +152,76 @@ test("a silent owner releases a broker after the shell exits behind backpressure
       new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("silent peer stranded broker after shell exit")), 13_000); }),
     ]).finally(() => clearTimeout(timeout));
     assert.deepEqual(result, { code: 0, signal: null });
+  } finally {
+    socket?.destroy();
+    if (broker.exitCode === null) {
+      if (process.platform === "win32") spawnSync("taskkill", ["/T", "/F", "/PID", String(broker.pid)],
+        { windowsHide: true, stdio: "ignore", timeout: 5000 });
+      else try { process.kill(-broker.pid, "SIGKILL"); } catch {}
+    }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("disconnecting a live owner releases the broker and its PTY child", { timeout: 12_000 }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "pty-broker-disconnect-"));
+  const address = process.platform === "win32"
+    ? `\\\\.\\pipe\\outright-broker-test-${randomUUID()}` : path.join(directory, "broker.sock");
+  const token = randomUUID() + randomUUID();
+  const broker = spawn(process.execPath, [brokerScript, address, token], {
+    stdio: ["ignore", "ignore", "pipe"], detached: process.platform !== "win32", windowsHide: true,
+  });
+  let socket;
+  let shellPid;
+  let ready = false;
+  let pending = "";
+  try {
+    const deadline = Date.now() + 5000;
+    while (!socket && Date.now() < deadline && broker.exitCode === null) {
+      try {
+        socket = await new Promise((resolve, reject) => {
+          const candidate = net.createConnection(address);
+          candidate.once("connect", () => resolve(candidate));
+          candidate.once("error", reject);
+        });
+      } catch { await new Promise((resolve) => setTimeout(resolve, 25)); }
+    }
+    assert.ok(socket, "broker did not listen");
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      pending += chunk;
+      let end;
+      while ((end = pending.indexOf("\n")) !== -1) {
+        const frame = JSON.parse(pending.slice(0, end));
+        pending = pending.slice(end + 1);
+        if (frame.type === "ready") ready = true;
+        if (frame.type === "data") {
+          const match = frame.data.match(/OUTRIGHT_CHILD_PID=(\d+)/);
+          if (match) shellPid = Number(match[1]);
+        }
+      }
+    });
+    socket.write(`${JSON.stringify({ type: "start", token, shell: process.execPath,
+      cwd: directory, env: process.env, cols: 80, rows: 24 })}\n`);
+    while (!ready && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(ready, true);
+    socket.write(`${JSON.stringify({ type: "write", data: 'console.log("OUTRIGHT_CHILD_PID="+process.pid)\r' })}\n`);
+    while (!shellPid && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.ok(shellPid, "PTY child did not identify itself");
+    socket.destroy();
+    const released = () => {
+      if (broker.exitCode === null) return false;
+      try { process.kill(shellPid, 0); return false; } catch (error) { return error.code === "ESRCH"; }
+    };
+    const releaseDeadline = Date.now() + 5000;
+    while (!released() && Date.now() < releaseDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.ok(released(), "disconnected broker or PTY child remained alive");
+    await assert.rejects(new Promise((resolve, reject) => {
+      const candidate = net.createConnection(address);
+      candidate.once("connect", () => { candidate.destroy(); resolve(); });
+      candidate.once("error", reject);
+    }), "released broker still accepted a socket");
+    if (process.platform !== "win32") assert.equal(existsSync(address), false, "broker left its Unix socket behind");
   } finally {
     socket?.destroy();
     if (broker.exitCode === null) {

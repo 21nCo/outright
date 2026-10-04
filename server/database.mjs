@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
-import { MAX_PENDING_RETENTION_CLEANUPS, pendingCleanupSql, trimAudit, trimAuditPage } from "./audit-retention.mjs";
+import { MAX_PENDING_RETENTION_CLEANUPS, backfillAuditEvidencePage, pendingCleanupSql,
+  prepareAuditEvidence, trimAudit, trimAuditPage } from "./audit-retention.mjs";
 import { chmodSync, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, realpathSync, rmSync, statfsSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -408,6 +409,7 @@ export function createOutrightDatabase(options = {}) {
         db.prepare("UPDATE audit_retention_cursor SET cursor = 0, sweep_upper = 0 WHERE id = 1").run();
       }
       if (!scan.outcomes) {
+        const previousCursor = scan.cursor;
         const rows = db.prepare(`SELECT id, action, substr(target, 1, 512) AS target,
           CASE WHEN octet_length(details) <= 4096 THEN details END AS details FROM audit_log
           WHERE id > ? AND id <= ? ORDER BY id LIMIT 256`).all(scan.cursor, scan.lastId);
@@ -441,7 +443,13 @@ export function createOutrightDatabase(options = {}) {
             throw new Error("Terminal audit recovery exceeds the bounded owner index");
           }
         }
+        if (rows.length && !db.prepare("SELECT complete FROM audit_evidence_state WHERE id = 1").get().complete) {
+          backfillAuditEvidencePage(db, previousCursor, scan.cursor);
+        }
         if (rows.length) { terminalAuditTick = scheduleTerminalAudit(advanceTerminalAuditScan); return; }
+        // The read cursor reached the frozen high-water mark. Triggers have
+        // indexed every concurrent insert, including direct SQLite writers.
+        db.prepare("UPDATE audit_evidence_state SET complete = 1 WHERE id = 1").run();
         scan.outcomes = [
           ...Array.from(scan.requests.values(), (request) => ({ action: request.action === "terminal.create.requested"
             ? "terminal.create.unknown" : "terminal.close.unknown",
@@ -1672,7 +1680,8 @@ export function createOutrightDatabase(options = {}) {
       // correlated outcome lookups before readiness would block every API.
       // The raw-id cursor below yields between fixed pages; terminal admission
       // stays paused until it has reconstructed every prior owner.
-      if (db.prepare("SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET 2047").get()) {
+      if (!db.prepare("SELECT complete FROM audit_evidence_state WHERE id = 1").get().complete
+        || db.prepare("SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET 2047").get()) {
         beginTerminalAuditScan();
         return 0;
       }
@@ -2118,6 +2127,7 @@ function recoverArchiveOnWorker(filename, sourceUnmoved = false, runtimeLease = 
 }
 
 function migrate(db) {
+  const hadAudit = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'audit_log'").get());
   const hadRuns = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").get());
   const hadMessages = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'").get());
   db.exec(`
@@ -2157,6 +2167,7 @@ function migrate(db) {
     CREATE TABLE IF NOT EXISTS prompt_templates (id TEXT PRIMARY KEY, title TEXT NOT NULL, prompt TEXT NOT NULL, created_at TEXT NOT NULL);
   `);
   db.prepare("INSERT OR IGNORE INTO audit_retention_cursor (id) VALUES (1)").run();
+  prepareAuditEvidence(db, hadAudit);
   if (!db.pragma("table_info(audit_retention_cursor)").some((column) => column.name === "sweep_upper")) {
     db.exec("ALTER TABLE audit_retention_cursor ADD COLUMN sweep_upper INTEGER NOT NULL DEFAULT 0");
   }

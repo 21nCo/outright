@@ -27,9 +27,19 @@ const server = net.createServer((socket) => {
   let exitSent = false;
   let shedTimer;
   let exitTimer;
+  let stalledReaderTimer;
   const pauseOutput = () => {
     if (!outputPaused) {
       outputPaused = true;
+      // A peer that never drains cannot own an unbounded ConPTY stream.
+      // Give a temporarily slow reader time to resume, then tear down this
+      // broker's shell and let the supervisor verify the owned boundary.
+      stalledReaderTimer = setTimeout(() => {
+        if (!outputPaused || socket.destroyed) return;
+        try { terminal?.kill(); } catch { /* The shell may already be gone. */ }
+        socket.destroy();
+      }, 8000);
+      stalledReaderTimer.unref();
       if (!shellExited) {
         // Windows ConPTY can hold shell progress (and even its exit notice)
         // while paused. Drain and shed there immediately; the owner socket is
@@ -71,6 +81,7 @@ const server = net.createServer((socket) => {
     } else if (outputPaused && !shellExited) {
       outputPaused = false;
       clearTimeout(shedTimer);
+      clearTimeout(stalledReaderTimer);
       if (process.platform !== "win32") terminal.resume();
     }
   };
@@ -139,10 +150,23 @@ const server = net.createServer((socket) => {
       else socket.destroy();
     }
   });
-  socket.on("close", () => { clearTimeout(shedTimer); clearTimeout(exitTimer); if (server.listening) server.close(); });
+  socket.on("close", () => {
+    clearTimeout(shedTimer);
+    clearTimeout(exitTimer);
+    clearTimeout(stalledReaderTimer);
+    if (!shellExited) try { terminal?.kill(); } catch { /* Supervisor owns final cleanup. */ }
+    // node-pty can retain a Windows ConPTY handle after onExit and socket
+    // close. The listener's close event releases its address before exit.
+    if (server.listening) server.close();
+  });
 });
 server.listen(address, () => {
   if (process.platform !== "win32") chmodSync(address, 0o600);
   process.umask(inheritedUmask);
 });
-server.on("close", () => { if (process.platform !== "win32") try { unlinkSync(address); } catch {} });
+server.on("close", () => {
+  if (process.platform !== "win32") try { unlinkSync(address); } catch {}
+  // This broker accepts exactly one peer. Native PTY handles may outlive
+  // onExit on Windows, so do not wait for the event loop to drain itself.
+  process.exit(0);
+});
