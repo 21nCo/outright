@@ -1,0 +1,36 @@
+server/archive-shadow.mjs
+  h_a39f9495f9ec1d 288-289,324-325
+server/archive-shadow.test.mjs
+  h_a39f9495f9ec1d 4,33-57,984,1007,1012-1027
+server/archive-windows-lock.mjs
+  h_a39f9495f9ec1d 55-70,114,122,126-127,129-130,136
+server/audit-retention.mjs
+  h_a39f9495f9ec1d 4-5,7-8,19-39
+server/database.mjs
+  h_a39f9495f9ec1d 2,112-113,364-371,384,460,466,475-484,505,524,1639-1645,2126,2129
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 10,1178,1497,1501-1503,1549,1551-1555
+server/terminal-broker.mjs
+  h_a39f9495f9ec1d 28-29,33-40,59,70,121-130,139
+server/terminal-broker.test.mjs
+  h_a39f9495f9ec1d 2,27-28,54-57,84,87-93,95,102-157
+server/terminal-manager.test.mjs
+  h_a39f9495f9ec1d 7,658-659,669,676-705,777,828,891-892,904
+src/components/SettingsDialog.jsx
+  h_a39f9495f9ec1d 217-220,232-233,262-284
+src/styles.css
+  h_a39f9495f9ec1d 503
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 677,680-682,686,691-692,700-701,1587
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "be9f60a6b4a3f1288b88ca4982794bd1e93e2d83",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
