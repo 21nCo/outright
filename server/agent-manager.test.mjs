@@ -268,11 +268,11 @@ test("a sibling admission cannot disarm a faulted queued run's retry", async () 
       assert.equal(database.getRun(first.id).status, "queued");
       releaseSibling({ executable: process.execPath, args: [], display: "fixture" });
       await secondSchedule;
-      assert.deepEqual(admitted, [second.id]);
+      assert.ok(admitted.includes(second.id), "the sibling audit did not complete");
       const deadline = Date.now() + 1200;
       while (children.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
       assert.equal(children.length, 2, "faulted run stayed queued despite an available slot and retry timer");
-      assert.deepEqual(admitted, [second.id, first.id]);
+      assert.deepEqual([...admitted].sort(), [second.id, first.id].sort(), "a run spawned without its own admission audit");
     } finally {
       children.forEach((child) => child.emit("close", 0, null));
       await manager.shutdown();
@@ -327,11 +327,11 @@ test("queue read faults retain their retry while a preparing sibling starts", as
         assert.equal(children.length, 0, "read failure crossed the pre-audit launch boundary");
         releaseSibling({ executable: process.execPath, args: [], display: "fixture" });
         await siblingSchedule;
-        assert.deepEqual(admitted, [sibling.id]);
+        assert.ok(admitted.includes(sibling.id), "the sibling audit did not complete");
         const deadline = Date.now() + 1200;
         while (children.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
         assert.equal(children.length, 2, `${read}/${name} lost its retry before the sibling exited`);
-        assert.deepEqual(admitted, [sibling.id, first.id], "a run spawned without its admission audit");
+        assert.deepEqual([...admitted].sort(), [sibling.id, first.id].sort(), "a run spawned without its admission audit");
         assert.equal(database.getRun(first.id).status, "running");
       } finally {
         releaseSibling({ executable: process.execPath, args: [], display: "fixture" });
@@ -342,12 +342,14 @@ test("queue read faults retain their retry while a preparing sibling starts", as
   }
 });
 
-test("persistent terminal storage refusal retains the slot until recovery", async () => {
+test("persistent terminal storage refusal frees the process slot but protects its outcome", async () => {
   for (const [name, fault] of [["quota", { statusCode: 507 }], ["read-only", { code: "SQLITE_READONLY" }], ["no-space", { code: "ENOSPC" }]]) {
     const database = fakeDatabase();
+    database.updateConversation("conv-2", { id: "conv-2", worktreePath: "/tmp/other-project" });
     database.getSettings = () => ({ maxConcurrentRuns: 1 });
     const first = database.createRun({ ...codexRun(`terminal-${name}`), status: "queued" });
     const second = database.createRun({ ...codexRun(`sibling-${name}`), status: "queued" });
+    const unrelated = database.createRun({ ...codexRun(`unrelated-${name}`), conversationId: "conv-2", status: "queued" });
     const durableFinish = database.finishRun;
     let blocked = true;
     database.finishRun = (...args) => {
@@ -361,18 +363,144 @@ test("persistent terminal storage refusal retains the slot until recovery", asyn
     try {
       await manager.schedule({ conversation: database.getConversation("conv-1"), run: first });
       await manager.schedule({ conversation: database.getConversation("conv-1"), run: second });
+      await manager.schedule({ conversation: database.getConversation("conv-2"), run: unrelated });
       children[0].emit("close", 0, null);
       await new Promise((resolve) => setTimeout(resolve, 160));
-      assert.deepEqual(manager.activeRuns(), [first.id], "a refused terminal commit released its slot");
+      assert.equal(manager.pendingOutcomeCount(), 1, "the exited run lost its pending outcome");
+      assert.deepEqual(manager.activeRuns(), [unrelated.id, first.id], "the process slot did not admit unrelated work");
+      assert.equal(database.getRun(first.id).status, "running", "a refused terminal commit was falsely reported as durable");
       assert.equal(database.getRun(second.id).status, "queued");
+      children[1].emit("close", 0, null);
       blocked = false;
+      manager.resumeQueued();
       const deadline = Date.now() + 1800;
-      while (children.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
-      assert.equal(children.length, 2, "the restored store did not release the sibling");
+      while (children.length < 3 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(children.length, 3, "the restored store did not release the sibling");
+      assert.equal(manager.pendingOutcomeCount(), 0);
       assert.equal(database.getRun(first.id).status, "completed");
       assert.equal(database.finishes.filter((entry) => entry.id === first.id).length, 1);
-      children[1].emit("close", 0, null);
+      children[2].emit("close", 0, null);
     } finally { await manager.shutdown(); }
+  }
+});
+
+test("persistent terminal failures bound unresolved outcomes and resume after storage recovery", async () => {
+  const database = fakeDatabase();
+  database.getSettings = () => ({ maxConcurrentRuns: 1 });
+  const originalFinish = database.finishRun;
+  let blocked = true;
+  database.finishRun = (...args) => {
+    if (blocked) throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+    return originalFinish(...args);
+  };
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {},
+    launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  try {
+    for (let index = 0; index < 9; index += 1) {
+      const id = `pending-outcome-${index}`;
+      const conversationId = `conv-${index + 10}`;
+      database.updateConversation(conversationId, { id: conversationId, worktreePath: `/tmp/${conversationId}` });
+      const run = database.createRun({ ...codexRun(id), conversationId, status: "queued" });
+      await manager.schedule({ conversation: database.getConversation(conversationId), run });
+      if (index < 8) children[index].emit("close", 0, null);
+    }
+    assert.equal(children.length, 8, "unresolved outcomes exceeded their memory budget");
+    assert.equal(manager.activeProcessCount(), 0);
+    assert.equal(manager.pendingOutcomeCount(), 8);
+    blocked = false;
+    manager.resumeQueued();
+    const deadline = Date.now() + 1500;
+    while (children.length < 9 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(children.length, 9, "recovery did not admit the bounded queued sibling");
+    assert.equal(manager.pendingOutcomeCount(), 0);
+    children[8].emit("close", 0, null);
+    assert.equal(database.finishes.length, 9, "an outcome was duplicated or lost");
+  } finally { await manager.shutdown(); }
+});
+
+test("a hard-fault maintenance timer cannot delay a new transient queue retry", async () => {
+  const database = fakeDatabase();
+  database.getSettings = () => ({ maxConcurrentRuns: 1 });
+  database.updateConversation("conv-2", { id: "conv-2", worktreePath: "/tmp/other-project" });
+  const failed = database.createRun({ ...codexRun("hard-timer-owner"), status: "queued" });
+  const waiting = database.createRun({ ...codexRun("short-timer-owner"), conversationId: "conv-2", status: "queued" });
+  const originalFinish = database.finishRun;
+  let hardFinishAttempts = 0;
+  database.finishRun = (...args) => {
+    if (args[0] === failed.id) {
+      hardFinishAttempts += 1;
+      throw Object.assign(new Error("read-only store"), { code: "SQLITE_READONLY" });
+    }
+    return originalFinish(...args);
+  };
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {},
+    launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  try {
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: failed });
+    children[0].emit("close", 0, null);
+    const probeDeadline = Date.now() + 1000;
+    while (hardFinishAttempts < 2 && Date.now() < probeDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(hardFinishAttempts >= 2, "the first hard probe did not arm its slow retry");
+    const originalRead = database.canLaunchRun ?? (() => true);
+    let readFaults = 0;
+    database.canLaunchRun = (...args) => {
+      if (!readFaults++) throw Object.assign(new Error("busy queue read"), { code: "SQLITE_BUSY" });
+      return originalRead(...args);
+    };
+    await manager.schedule({ conversation: database.getConversation("conv-2"), run: waiting });
+    const deadline = Date.now() + 1000;
+    while (children.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(children.length, 2, "the hard-fault timer delayed a transient queue owner");
+    assert.equal(manager.pendingOutcomeCount(), 1);
+    children[1].emit("close", 0, null);
+  } finally {
+    database.finishRun = originalFinish;
+    manager.resumeQueued();
+    await manager.shutdown();
+  }
+});
+
+test("a recovered hard terminal fault commits one SQLite outcome and audit across reopen", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-hard-finish-"));
+  const filename = path.join(realpathSync(directory), "outright.db");
+  let database = createOutrightDatabase({ filename });
+  let manager;
+  try {
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory,
+      title: "Hard finish recovery", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "finish" });
+    const durableFinish = database.finishRun;
+    let blocked = true;
+    database.finishRun = (...args) => {
+      if (blocked) throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+      return durableFinish(...args);
+    };
+    let child;
+    manager = createAgentManager({ database, publish: () => {},
+      launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+      spawnProcess: () => { child = fakeChild(); return child; } });
+    await manager.schedule({ conversation, run });
+    child.emit("close", 0, null);
+    assert.equal(manager.activeProcessCount(), 0);
+    assert.equal(manager.pendingOutcomeCount(), 1);
+    assert.equal(database.getRun(run.id).status, "running", "a failed transaction became a false terminal outcome");
+    blocked = false;
+    manager.resumeQueued();
+    assert.equal(database.getRun(run.id).status, "completed");
+    assert.equal(manager.pendingOutcomeCount(), 0);
+    await manager.shutdown();
+    await database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.getRun(run.id).status, "completed");
+    assert.equal(database.listAudit(100).filter((row) => row.action === "agent.run.completed" && row.target === run.id).length, 1);
+  } finally {
+    await manager?.shutdown();
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 

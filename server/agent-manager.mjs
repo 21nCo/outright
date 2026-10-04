@@ -328,13 +328,18 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     ?? database.launchDirectory;
   assertPrivateLaunchDirectory(resolvedLaunchDirectory);
   const active = new Map();
+  // Exited providers no longer consume a process slot, but their uncommitted
+  // outcome and launch proof must remain owned until SQLite accepts it.
+  const pendingOutcomes = new Map();
   const queue = [];
   const launches = new Set();
   const maintenanceWaiters = new Set();
   let shuttingDown = false;
   let shutdownPromise;
   let diskRetryTimer;
+  let diskRetryDueAt = 0;
   let diskRetryDelayMs = 100;
+  let hardRetryProbed = false;
   const admissionRetryRuns = new Set();
   let queueReadRetryPending = false;
   const providerDiscovery = providerDiscoveryFactory({ onChange: onProvidersChanged });
@@ -342,6 +347,11 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   function storageAdmissionFailure(error) {
     return error?.statusCode === 507
       || /^(?:SQLITE_(?:FULL|IOERR|READONLY|BUSY|LOCKED)(?:_|$)|E(?:IO|PERM|ACCES|BUSY|NFILE|MFILE|STALE|NOSPC|ROFS)$)/.test(error?.code ?? "");
+  }
+
+  function persistentStorageFailure(error) {
+    return error?.statusCode === 507
+      || /^(?:SQLITE_(?:FULL|READONLY)(?:_|$)|E(?:PERM|ACCES|NOSPC|ROFS)$)/.test(error?.code ?? "");
   }
 
   function wakeMaintenanceWaiters() {
@@ -385,7 +395,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     try {
       if (database.canLaunchRun?.() === false) return "deferred";
     } catch (error) {
-      if (storageAdmissionFailure(error)) return "retry-deferred";
+      if (storageAdmissionFailure(error)) return persistentStorageFailure(error) ? "persistent-deferred" : "retry-deferred";
       throw error;
     }
     try {
@@ -394,7 +404,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       // No process has been spawned yet. A transient SQLite lock or I/O
       // failure must leave the run queued for a fresh admission attempt;
       // terminalizing it can itself fail under the same storage fault.
-      if (storageAdmissionFailure(error)) return "retry-deferred";
+      if (storageAdmissionFailure(error)) return persistentStorageFailure(error) ? "persistent-deferred" : "retry-deferred";
       if (error.statusCode === 503 && database.maintenanceActive) return "deferred";
       throw error;
     }
@@ -572,7 +582,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   }
 
   function finish(state, exitCode, error) {
-    if (!active.has(state.run.id) || state.finishing) return;
+    if ((!active.has(state.run.id) && !pendingOutcomes.has(state.run.id)) || state.finishing) return;
     state.finishing = true;
     clearCheckpointTimer(state);
     let status;
@@ -595,7 +605,17 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       state.finishing = false;
       if (storageAdmissionFailure(writeError) || (writeError.statusCode === 503 && database.maintenanceActive)) {
         state.pendingFinish = { exitCode, error };
-        if (!database.maintenanceActive) retryUnknownDiskUsage();
+        if (persistentStorageFailure(writeError) && (!state.child || state.closed)) {
+          // The process is gone. Retain its bounded outcome separately from
+          // live process capacity; restart still sees the protected run row
+          // and launch proof if storage never recovers in this process.
+          active.delete(state.run.id);
+          pendingOutcomes.set(state.run.id, state);
+          publish({ type: "run.outcome_pending", runId: state.run.id, conversationId: state.conversation.id, reason: "storage-unavailable" });
+          publish({ type: "capacity.changed" });
+          if (!database.maintenanceActive) drain();
+        }
+        if (!database.maintenanceActive) retryUnknownDiskUsage(persistentStorageFailure(writeError));
         return false;
       }
       throw writeError;
@@ -617,6 +637,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     try { if (state.launchHandshakePath) unlinkSync(state.launchHandshakePath); } catch { /* Already gone. */ }
     if (finished.message) publish({ type: "message.created", conversationId: state.conversation.id, payload: finished.message });
     active.delete(state.run.id);
+    pendingOutcomes.delete(state.run.id);
+    publish({ type: "capacity.changed" });
     admissionRetryRuns.delete(state.run.id);
     clearAssistant(state);
     emit(state.run.id, `run.${status}`, { exitCode, error: message || null, finishedAt });
@@ -625,6 +647,14 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   }
 
   async function stop(runId, preserveOnMaintenance = false) {
+    const pending = pendingOutcomes.get(runId);
+    if (pending) {
+      if (finish(pending, pending.pendingFinish.exitCode, pending.pendingFinish.error)) return true;
+      if (preserveOnMaintenance) return false;
+      const unavailable = new Error("Run outcome storage is unavailable; retry shortly");
+      unavailable.statusCode = 503;
+      throw unavailable;
+    }
     const state = active.get(runId);
     if (!state) {
       const index = queue.findIndex((entry) => entry.run.id === runId);
@@ -750,7 +780,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
 
 
   function conflictsWithActiveRun(entry) {
-    return [...active.values()].some((state) => {
+    return [...active.values(), ...pendingOutcomes.values()].some((state) => {
       const activeWorktree = state.run.worktreePath ?? state.conversation.worktreePath;
       const queuedWorktree = entry.run.worktreePath ?? entry.conversation.worktreePath;
       return state.conversation.id === entry.run.conversationId
@@ -787,10 +817,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         const prepared = await prepareQueuedLaunch(state, entry);
         if (!prepared) return;
         const admission = await start(state, prepared.authorize);
-        if (admission === "deferred" || admission === "retry-deferred") {
+        if (["deferred", "retry-deferred", "persistent-deferred"].includes(admission)) {
           active.delete(entry.run.id);
           queue.unshift(entry);
-          retryDeferredAdmission(admission === "retry-deferred", entry.run.id);
+          retryDeferredAdmission(admission !== "deferred", entry.run.id, admission === "persistent-deferred");
           // The archive worker closes SQLite while promoting its snapshot.
           // Keep schedule's readback pending until the reopened connection is
           // available, even though this run is safely queued again.
@@ -814,12 +844,23 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     }
   }
 
-  function retryUnknownDiskUsage() {
-    if (diskRetryTimer || shuttingDown) return;
-    const delay = diskRetryDelayMs;
-    diskRetryDelayMs = Math.min(30_000, diskRetryDelayMs * 2);
+  function retryUnknownDiskUsage(persistent = false) {
+    if (shuttingDown) return;
+    // Probe a newly observed hard fault once promptly; a continuing refusal
+    // then backs off to a maintenance-rate probe instead of a busy loop.
+    const delay = persistent ? (hardRetryProbed ? 30_000 : 100) : diskRetryDelayMs;
+    if (diskRetryTimer) {
+      // A hard refusal may own a slow probe. A newly faulted transient owner
+      // must be able to move that one timer forward without adding a timer.
+      if (persistent || diskRetryDueAt <= Date.now() + delay) return;
+      clearTimeout(diskRetryTimer);
+    }
+    if (persistent) hardRetryProbed = true;
+    else diskRetryDelayMs = Math.min(30_000, diskRetryDelayMs * 2);
+    diskRetryDueAt = Date.now() + delay;
     diskRetryTimer = setTimeout(() => {
       diskRetryTimer = null;
+      diskRetryDueAt = 0;
       retryPendingFinishes();
       drain();
     }, delay);
@@ -830,33 +871,35 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // A sibling may free a slot and drain the queue while another completed
     // run still awaits its terminal commit. Keep that retry armed until every
     // such owner has durable outcome evidence.
-    if (!shuttingDown && (queueReadRetryPending || admissionRetryRuns.size || [...active.values()].some((state) => state.pendingFinish))) return;
+    if (!shuttingDown && (queueReadRetryPending || admissionRetryRuns.size || [...active.values(), ...pendingOutcomes.values()].some((state) => state.pendingFinish))) return;
     if (diskRetryTimer) clearTimeout(diskRetryTimer);
     diskRetryTimer = null;
+    diskRetryDueAt = 0;
     diskRetryDelayMs = 100;
+    hardRetryProbed = false;
   }
 
   function retryPendingFinishes() {
     if (shuttingDown || database.maintenanceActive) return;
-    for (const state of active.values()) {
+    for (const state of [...active.values(), ...pendingOutcomes.values()]) {
       if (!state.pendingFinish || (state.child && !state.closed)) continue;
       const { exitCode, error } = state.pendingFinish;
       finish(state, exitCode, error);
     }
   }
 
-  function retryDeferredAdmission(storageFault = false, runId = null) {
+  function retryDeferredAdmission(storageFault = false, runId = null, persistent = false) {
     if (database.maintenanceActive) return;
     if (storageFault && runId) admissionRetryRuns.add(runId);
     // A failed SQLite write/read needs its own retry owner even if the last
     // measured capacity was below the ordinary launch threshold. Capacity
     // alone cannot tell whether the fault has cleared.
-    if (admissionRetryRuns.size) { retryUnknownDiskUsage(); return; }
+    if (admissionRetryRuns.size) { retryUnknownDiskUsage(persistent); return; }
     let observed;
     try { observed = database.capacity?.(); }
     catch (error) {
       if (!storageAdmissionFailure(error)) throw error;
-      retryUnknownDiskUsage();
+      retryUnknownDiskUsage(persistentStorageFailure(error));
       return;
     }
     // Unknown physical usage may recover without another capacity event. A
@@ -882,7 +925,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     catch (error) {
       if (!storageAdmissionFailure(error)) throw error;
       queueReadRetryPending = true;
-      retryUnknownDiskUsage();
+      retryUnknownDiskUsage(persistentStorageFailure(error));
       return;
     }
     // A successful settings read resolves its fault. If every slot is already
@@ -891,13 +934,16 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       queueReadRetryPending = false;
       clearDiskRetry();
     }
-    while (active.size < max && queue.length) {
+    // Bound unresolved outcomes by the same configured concurrency budget.
+    // This leaves room for independent work while preventing a failed store
+    // from accumulating an unlimited set of finished run snapshots in RAM.
+    while (active.size < max && pendingOutcomes.size < RESOURCE_BUDGETS.maxPendingRunOutcomes && queue.length) {
       let admissible;
       try { admissible = database.canLaunchRun?.(); }
       catch (error) {
         if (!storageAdmissionFailure(error)) throw error;
         queueReadRetryPending = true;
-        retryUnknownDiskUsage();
+        retryUnknownDiskUsage(persistentStorageFailure(error));
         return;
       }
       // Queue reads own their retry separately from a run's pre-spawn audit.
@@ -1086,13 +1132,15 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       drain();
     },
     stop,
-    activeRuns: () => [...active.keys()],
+    activeRuns: () => [...active.keys(), ...pendingOutcomes.keys()],
+    activeProcessCount: () => active.size,
+    pendingOutcomeCount: () => pendingOutcomes.size,
     shutdown() {
       if (shutdownPromise) return shutdownPromise;
       shuttingDown = true;
       clearDiskRetry();
       wakeMaintenanceWaiters();
-      const ids = [...queue.map((entry) => entry.run.id), ...active.keys()];
+      const ids = [...queue.map((entry) => entry.run.id), ...active.keys(), ...pendingOutcomes.keys()];
       shutdownPromise = Promise.allSettled([
         ...ids.map((id) => stop(id, true)),
         ...launches,

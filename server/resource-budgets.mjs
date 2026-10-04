@@ -2,6 +2,7 @@
 // diagnostic calls must debit their parent scope rather than start a new one.
 export const RESOURCE_BUDGETS = Object.freeze({
   maxConcurrentRuns: 3,
+  maxPendingRunOutcomes: 8,
   maxQueuedRuns: 32,
   maxRetainedMiB: 512,
   physicalDatabaseMultiplier: 4,

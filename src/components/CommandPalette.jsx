@@ -5,6 +5,16 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { Input } from "@/components/ui/input";
 import { api, query as buildQuery } from "@/lib/runtime-api";
 
+function searchAnnouncement(query, remote, resultCount, partial, error) {
+  if (!query) return "Type to search";
+  if (remote.loading) return "Searching";
+  if (error) return resultCount
+    ? "Conversation search failed. Local results are available. Retry search available."
+    : "Search failed. Retry search available.";
+  if (partial) return "Results available from recent conversations and short messages. Open a conversation to search older or larger text.";
+  return resultCount ? "Results available" : "No matching results";
+}
+
 export function CommandPalette({ open, onOpenChange, projects, onSelectProject, onSelectConversation }) {
   const [query, setQuery] = useState("");
   const [remote, setRemote] = useState({ query: "", conversations: [], partial: false, loading: false, error: null });
@@ -63,6 +73,6 @@ export function CommandPalette({ open, onOpenChange, projects, onSelectProject, 
     {normalizedQuery.length >= 2 && !remote.loading && remoteError && <div className="command-error"><span>{results.length ? "Conversation search failed. Showing local matches only." : "Search failed. Try again."}</span><Button size="sm" variant="outline" onClick={() => setSearchAttempt((current) => current + 1)}>Retry search</Button></div>}
     {normalizedQuery.length >= 2 && !remote.loading && !remoteError && !results.length && <p className="no-results">{remotePartial ? "No matches in recent conversations or short messages." : "No matching projects or conversations."}</p>}
     {normalizedQuery.length >= 2 && !remote.loading && !remoteError && remotePartial && <p className="command-search-scope">Search shows recent conversations and short messages. Open a conversation to find older or larger text.</p>}
-    <span className="sr-only" role="status" aria-live="polite">{!normalizedQuery ? "Type to search" : remote.loading ? "Searching" : remoteError ? (results.length ? `Conversation search failed. Showing ${results.length} local results. Retry search available.` : "Search failed. Retry search available.") : remotePartial ? `${results.length} results from recent conversations and short messages. Open a conversation to search older or larger text.` : `${results.length} results`}</span>
+    <span className="sr-only" role="status" aria-live="polite">{searchAnnouncement(normalizedQuery, remote, results.length, remotePartial, remoteError)}</span>
   </div></DialogContent></Dialog>;
 }

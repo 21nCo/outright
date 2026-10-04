@@ -12,6 +12,7 @@ import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { utilityProcesses } from "./subprocess-budget.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
+import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
 
 export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, databaseFactory = createOutrightDatabase, hardenLaunchDirectory = process.platform === "win32" ? hardenWindowsLaunchDirectory : () => {}, terminalManagerFactory = createTerminalManager } = {}) {
   // The database-backed lease is acquired before reconciliation so another
@@ -70,7 +71,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   terminals = terminalManagerFactory({ database, publish, subprocesses });
   const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl), subprocesses });
   runtimeCapacity = function runtimeCapacity() {
-    return { ...database.capacity(), utilityProcesses: subprocesses.capacity(), terminalProcesses: terminals.capacity() };
+    const capacity = database.capacity();
+    return { ...capacity, activeProcesses: agents?.activeProcessCount() ?? 0,
+      pendingRunOutcomes: agents?.pendingOutcomeCount() ?? 0,
+      limits: { ...capacity.limits, maxPendingRunOutcomes: RESOURCE_BUDGETS.maxPendingRunOutcomes },
+      utilityProcesses: subprocesses.capacity(), terminalProcesses: terminals.capacity() };
   };
   // Construct the agent manager after the remaining synchronous startup
   // checks. No provider discovery owner then needs asynchronous teardown on

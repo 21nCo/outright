@@ -2371,6 +2371,8 @@ async function commandPaletteRegression() {
   assert(document.querySelector(".command-search-scope")?.textContent.includes("recent conversations"), "bounded search was not explained");
   assert(document.querySelector('.command-results [role="status"]')?.textContent.includes("recent conversations and short messages"),
     "partial search scope was absent from the result announcement");
+  assert(!/\d+ results/.test(document.querySelector('.command-results [role="status"]')?.textContent ?? ""),
+    "typing a new query re-announced a result count instead of its material search state");
   await until(() => input.getAttribute("aria-activedescendant") === "command-result-0", "active remote command result");
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
   assert(selected?.id === "current", "Enter did not select the asynchronously loaded command result");
