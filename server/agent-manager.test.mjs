@@ -3,7 +3,7 @@ import test from "node:test";
 import Database from "better-sqlite3";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import fs, { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -834,6 +834,69 @@ test("queued siblings defer after output exhausts quota, then resume or cancel s
   manager.resumeQueued();
   assert.equal(children.length, 2, "cancelled queued run was launched after capacity returned");
   assert.equal(database.getRun("cancelled").status, "stopped");
+});
+
+test("a failed WAL checkpoint during child-close drainage defers the queued run until disk recovery", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-admission-checkpoint-"));
+  const filename = path.join(realpathSync(directory), "outright.db");
+  const database = createOutrightDatabase({ filename });
+  database.updateSettings({ maxConcurrentRuns: 1, maxRetainedMiB: 64 });
+  const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory,
+    title: "Checkpoint admission", provider: "codex" });
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {},
+    launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  const originalStat = fs.lstatSync;
+  const originalPragma = Database.prototype.pragma;
+  let checkpoints = 0;
+  let first;
+  let second;
+  try {
+    first = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "first" });
+    second = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "second" });
+    await manager.schedule({ conversation, run: first });
+    await manager.schedule({ conversation, run: second });
+    assert.equal(children.length, 1);
+
+    fs.lstatSync = (part, ...args) => {
+      const info = originalStat(part, ...args);
+      return part === filename ? new Proxy(info, { get(target, key) {
+        return key === "blocks" ? 1024 * 1024 : Reflect.get(target, key, target);
+      } }) : info;
+    };
+    Database.prototype.pragma = function (command, ...args) {
+      if (command === "wal_checkpoint(TRUNCATE)") {
+        checkpoints += 1;
+        throw Object.assign(new Error("injected WAL checkpoint failure"), { code: "SQLITE_FULL" });
+      }
+      return originalPragma.call(this, command, ...args);
+    };
+    children[0].emit("close", 0, null);
+    assert.equal(database.getRun(first.id).status, "completed");
+    assert.equal(database.getRun(second.id).status, "queued");
+    assert.equal(children.length, 1, "checkpoint failure launched the queued provider");
+    await new Promise((resolve) => setTimeout(resolve, 150)); // Exercise the armed disk retry.
+    assert.equal(checkpoints, 1, "checkpoint failure caused a synchronous retry storm");
+    assert.equal(database.getRun(second.id).status, "queued");
+
+    fs.lstatSync = originalStat;
+    Database.prototype.pragma = originalPragma;
+    const deadline = Date.now() + 1500;
+    while (children.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(children.length, 2, "timer wake did not retry the retained queued run after disk recovery");
+    assert.equal(database.getRun(second.id).status, "running");
+    children[1].emit("close", 0, null);
+    assert.equal(database.getRun(second.id).status, "completed");
+  } finally {
+    fs.lstatSync = originalStat;
+    Database.prototype.pragma = originalPragma;
+    if (manager.activeRuns().includes(first?.id)) children[0]?.emit("close", 0, null);
+    if (manager.activeRuns().includes(second?.id)) children[1]?.emit("close", 0, null);
+    await manager.shutdown();
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("unknown journal usage retries a queued launch and leaves cancellation terminal", async () => {

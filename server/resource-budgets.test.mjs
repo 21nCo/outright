@@ -182,6 +182,8 @@ test("checkpoint storage failures omit optional output and preserve the durable 
       };
       assert.ok(database.capacity().diskAllocatedBytes >= database.capacity().limits.maxPhysicalBytes,
         `the fixture must reach physical checkpoint admission: ${JSON.stringify(database.capacity())}`);
+      assert.equal(database.canLaunchRun(), false,
+        `${code} during a WAL checkpoint must defer a new run without throwing from queue drainage`);
       const result = database.appendRunEventWithMessage(run.id, "assistant.delta", { text: "partial" }, {
         id: `${run.id}:1`, conversationId: conversation.id, role: "assistant", kind: "text",
         body: "partial", payload: { runId: run.id },

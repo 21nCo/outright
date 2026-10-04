@@ -601,8 +601,17 @@ export function createOutrightDatabase(options = {}) {
       // and terminal transitions.
       const capacity = this.capacity();
       const physicalThreshold = capacity.limits.maxPhysicalBytes - capacity.limits.reservedPhysicalBytes;
-      const physical = capacity.availablePhysicalForNewWorkBytes < 64 * 1024
-        ? physicalUsageForAdmission(physicalThreshold) : { bytes: capacity.diskAllocatedBytes };
+      let physical;
+      try {
+        physical = capacity.availablePhysicalForNewWorkBytes < 64 * 1024
+          ? physicalUsageForAdmission(physicalThreshold) : { bytes: capacity.diskAllocatedBytes };
+      } catch (error) {
+        // An unreclaimable WAL is a refusal to admit new work, not a failure
+        // of the caller draining queued runs (including child close and timer
+        // callbacks). Optional writes still report the 507 to their caller.
+        if (error.statusCode === 507) return false;
+        throw error;
+      }
       // A durable deletion marker protects its own conversation, but does
       // not reserve every free agent slot. Only the short final cutover
       // pauses launches; a long unrelated run may keep an oversized delete
