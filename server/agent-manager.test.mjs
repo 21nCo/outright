@@ -899,6 +899,58 @@ test("a failed WAL checkpoint during child-close drainage defers the queued run 
   }
 });
 
+test("a failed storage stat during child-close and timer drainage preserves the queued run", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-admission-stat-"));
+  const filename = path.join(realpathSync(directory), "outright.db");
+  const database = createOutrightDatabase({ filename });
+  database.updateSettings({ maxConcurrentRuns: 1 });
+  const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory,
+    title: "Storage stat admission", provider: "codex" });
+  const children = [];
+  const manager = createAgentManager({ database, publish: () => {},
+    launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  const originalStat = fs.lstatSync;
+  let failedStats = 0;
+  let first;
+  let second;
+  try {
+    first = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "first" });
+    second = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "second" });
+    await manager.schedule({ conversation, run: first });
+    await manager.schedule({ conversation, run: second });
+    assert.equal(children.length, 1);
+    fs.lstatSync = (part, ...args) => {
+      if (part === filename) {
+        failedStats += 1;
+        throw Object.assign(new Error("injected storage read failure"), { code: "EIO" });
+      }
+      return originalStat(part, ...args);
+    };
+    children[0].emit("close", 0, null);
+    assert.equal(database.getRun(first.id).status, "completed", "storage measurement changed the exiting run's outcome");
+    assert.equal(database.getRun(second.id).status, "queued");
+    assert.equal(children.length, 1, "unknown storage usage launched the waiting provider");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.ok(failedStats >= 2, "the bounded timer did not retry the unknown measurement");
+    assert.equal(database.getRun(second.id).status, "queued", "timer wake lost the queued run");
+    fs.lstatSync = originalStat;
+    const deadline = Date.now() + 1500;
+    while (children.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(children.length, 2, "the bounded retry did not launch after storage recovery");
+    assert.equal(database.getRun(second.id).status, "running");
+    children[1].emit("close", 0, null);
+    assert.equal(database.getRun(second.id).status, "completed");
+  } finally {
+    fs.lstatSync = originalStat;
+    if (manager.activeRuns().includes(first?.id)) children[0]?.emit("close", 0, null);
+    if (manager.activeRuns().includes(second?.id)) children[1]?.emit("close", 0, null);
+    await manager.shutdown();
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("unknown journal usage retries a queued launch and leaves cancellation terminal", async () => {
   const database = fakeDatabase();
   let measurable = false;
@@ -1003,6 +1055,42 @@ test("unknown usage after async launch preparation retries without a new request
     assert.equal(database.getRun(cancelled.id).status, "stopped");
     assert.equal(validations, 2, "retry skipped authorization revalidation");
     assert.equal(launchPreparations, 2, "the deferred run was not prepared exactly twice");
+    children[0].emit("close", 0, null);
+  } finally { await manager.shutdown(); }
+});
+
+test("storage read failure after async launch preparation defers and revalidates on retry", async () => {
+  const database = fakeDatabase();
+  let fault = false;
+  let release;
+  let validations = 0;
+  const capability = new Promise((resolve) => { release = resolve; });
+  const failure = Object.assign(new Error("injected SQLite read failure"), { code: "SQLITE_IOERR_READ" });
+  database.canLaunchRun = () => { if (fault) throw failure; return true; };
+  database.capacity = () => { if (fault) throw failure; return { diskUsageStatus: "measured", availableForNewWorkBytes: 1024 * 1024 }; };
+  const run = database.createRun(codexRun("late-storage-read"));
+  const children = [];
+  let preparations = 0;
+  const command = { executable: process.execPath, args: [], display: "test", handshakePath: "", ownsDescendants: true };
+  const manager = createAgentManager({ database, publish: () => {},
+    validateConversation: async () => { validations += 1; return () => {}; },
+    launchCommand: () => (++preparations === 1 ? capability : command),
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  try {
+    const scheduled = manager.schedule({ conversation: database.getConversation("conv-1"), run });
+    await new Promise((resolve) => setImmediate(resolve));
+    fault = true;
+    release(command);
+    await scheduled;
+    assert.equal(database.getRun(run.id).status, undefined, "a failed storage read terminalized queued work");
+    assert.equal(children.length, 0, "a failed storage read launched a provider");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(children.length, 0, "a timer wake bypassed the storage failure");
+    fault = false;
+    const deadline = Date.now() + 1500;
+    while (!children.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(children.length, 1, "bounded retry did not resume after storage recovery");
+    assert.equal(validations, 2, "retry skipped authorization revalidation");
     children[0].emit("close", 0, null);
   } finally { await manager.shutdown(); }
 });

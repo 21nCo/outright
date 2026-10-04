@@ -103,6 +103,36 @@ test("missing SQLite pathname refuses optional retained rows and new queue work"
   }
 });
 
+test("storage stat failures report unknown capacity and fail closed until measurement recovers", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-stat-admission-"));
+  const filename = path.join(realpathSync(directory), "outright.db");
+  const database = createOutrightDatabase({ filename });
+  const originalStat = fs.lstatSync;
+  try {
+    const conversation = chat(database, "stat failure");
+    for (const code of ["EIO", "EPERM", "ENFILE"]) {
+      fs.lstatSync = (part, ...args) => {
+        if (part === filename) throw Object.assign(new Error("injected storage read failure"), { code });
+        return originalStat(part, ...args);
+      };
+      const capacity = database.capacity();
+      assert.equal(capacity.diskUsageStatus, "unknown", `${code} was reported as measured capacity`);
+      assert.equal(capacity.diskAllocatedBytes, null);
+      assert.equal(capacity.availablePhysicalForNewWorkBytes, 0);
+      assert.equal(database.canLaunchRun(), false, `${code} escaped or admitted a run`);
+      assert.throws(() => database.createRun(runInput(conversation.id)),
+        (error) => error.statusCode === 507, `${code} admitted optional work`);
+    }
+    fs.lstatSync = originalStat;
+    assert.equal(database.capacity().diskUsageStatus, "measured");
+    assert.equal(database.canLaunchRun(), true, "recovered measurement did not reopen admission");
+  } finally {
+    fs.lstatSync = originalStat;
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("a pinned SQLite reader cannot turn repeated checkpoints into unbounded physical admission", { timeout: 60_000 }, async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-physical-wal-"));
   const filename = path.join(directory, "outright.db");

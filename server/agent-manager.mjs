@@ -337,6 +337,11 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   let diskRetryDelayMs = 100;
   const providerDiscovery = providerDiscoveryFactory({ onChange: onProvidersChanged });
 
+  function storageAdmissionFailure(error) {
+    return error?.statusCode === 507
+      || /^(?:SQLITE_(?:FULL|IOERR|READONLY|BUSY|LOCKED)(?:_|$)|E(?:IO|PERM|ACCES|BUSY|NFILE|MFILE|STALE|NOSPC|ROFS)$)/.test(error?.code ?? "");
+  }
+
   function wakeMaintenanceWaiters() {
     for (const resolve of maintenanceWaiters) resolve();
     maintenanceWaiters.clear();
@@ -375,7 +380,12 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     authorize?.();
     // Validation and capability setup can yield while a sibling spends the
     // remaining retained budget. Defer before the durable launch transition.
-    if (database.canLaunchRun?.() === false) return "deferred";
+    try {
+      if (database.canLaunchRun?.() === false) return "deferred";
+    } catch (error) {
+      if (storageAdmissionFailure(error)) return "deferred";
+      throw error;
+    }
     try {
       database.auditAdmission("agent.run.start.requested", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath });
     } catch (error) {
@@ -794,7 +804,13 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
 
   function retryDeferredAdmission() {
     if (database.maintenanceActive) return;
-    const observed = database.capacity?.();
+    let observed;
+    try { observed = database.capacity?.(); }
+    catch (error) {
+      if (!storageAdmissionFailure(error)) throw error;
+      retryUnknownDiskUsage();
+      return;
+    }
     // Unknown physical usage may recover without another capacity event. A
     // measured budget with room can also race the admission check. A genuinely
     // full budget waits for an explicit release instead of polling forever.
@@ -806,10 +822,23 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // Every entry point, including the disk retry timer, reaches this guard.
     // During the archive cutover getSettings cannot read the closed SQLite
     // connection. onDeletionWorkerExit calls resumeQueued after it reopens.
-    if (shuttingDown || database.maintenanceActive) return;
-    const max = database.getSettings().maxConcurrentRuns;
+    if (shuttingDown || database.maintenanceActive || !queue.length) return;
+    let max;
+    try { max = database.getSettings().maxConcurrentRuns; }
+    catch (error) {
+      if (!storageAdmissionFailure(error)) throw error;
+      retryUnknownDiskUsage();
+      return;
+    }
     while (active.size < max && queue.length) {
-      if (database.canLaunchRun?.() === false) {
+      let admissible;
+      try { admissible = database.canLaunchRun?.(); }
+      catch (error) {
+        if (!storageAdmissionFailure(error)) throw error;
+        retryUnknownDiskUsage();
+        return;
+      }
+      if (admissible === false) {
         retryDeferredAdmission();
         return;
       }

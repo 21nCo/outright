@@ -717,9 +717,13 @@ export function allocatedDatabaseUsage(filename) {
     else if (process.platform === "win32") status = "estimated";
     return { bytes, status };
   } catch (error) {
-    // Windows can deny a stat while SQLite creates or removes a rollback
-    // journal. A missing measurement must never become a plausible zero.
-    if (["EPERM", "EACCES", "EBUSY"].includes(error.code)) return { bytes: null, status: "unknown" };
+    // Filesystem reads can also fail during an I/O fault, exhausted file
+    // descriptors, or a journal rename. No such failure proves free space:
+    // refuse new work and let the bounded queue retry measure it later.
+    // Keep malformed/unsafe storage paths and programming errors visible.
+    if (typeof error.code === "string" && /^E[A-Z0-9]+$/.test(error.code)) {
+      return { bytes: null, status: "unknown" };
+    }
     throw error;
   }
 }
