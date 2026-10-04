@@ -1,0 +1,22 @@
+server/audit-retention.mjs
+  h_a39f9495f9ec1d 51-53,83-89
+server/database.mjs
+  h_a39f9495f9ec1d 502,504-506,538,1712
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 1301-1345
+server/terminal-broker.test.mjs
+  h_a39f9495f9ec1d 176,200-201,203
+server/terminal-manager.test.mjs
+  h_a39f9495f9ec1d 7,808,823-826
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e04e35e7c76a5d328ff0cea3135f7eb33f1438d0",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
