@@ -585,22 +585,29 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if ((!active.has(state.run.id) && !pendingOutcomes.has(state.run.id)) || state.finishing) return;
     state.finishing = true;
     clearCheckpointTimer(state);
-    let status;
-    let message;
-    let finishedAt;
+    // Once the provider has exited, its terminal decision belongs to that
+    // exit. A failed SQLite transaction must not let a later Stop or shutdown
+    // turn a completed/failed provider result into a cancellation on retry.
+    if (!state.terminalOutcome) {
+      const successful = exitCode === 0 && !error && !state.stopped;
+      let status = "failed";
+      if (state.stopped) status = "stopped";
+      else if (successful) status = "completed";
+      state.terminalOutcome = {
+        status,
+        message: error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : ""),
+        finishedAt: new Date().toISOString(),
+        exitCode,
+      };
+    }
+    const { status, message, finishedAt, exitCode: terminalExitCode } = state.terminalOutcome;
     let finished;
     let transcriptMessage;
     try {
-      const successful = exitCode === 0 && !error && !state.stopped;
-      if (state.stopped) status = "stopped";
-      else if (successful) status = "completed";
-      else status = "failed";
-      message = error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : "");
-      finishedAt = new Date().toISOString();
       transcriptMessage = budgetTranscript(state, pendingAssistantMessage(state), { terminal: true });
       // The last checkpoint and terminal state commit together. Until that
       // commit succeeds this state still owns its run slot and recovery data.
-      finished = database.finishRun(state.run.id, { status, finishedAt, exitCode, error: message || null, pid: null }, transcriptMessage);
+      finished = database.finishRun(state.run.id, { status, finishedAt, exitCode: terminalExitCode, error: message || null, pid: null }, transcriptMessage);
     } catch (writeError) {
       state.finishing = false;
       if (storageAdmissionFailure(writeError) || (writeError.statusCode === 503 && database.maintenanceActive)) {
@@ -621,6 +628,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       throw writeError;
     }
     state.pendingFinish = null;
+    state.terminalOutcome = null;
     if (transcriptMessage && !finished.message) {
       // finishRun committed the terminal state, omission flag and audit in one
       // transaction. A failure to write the optional notice cannot retry that
@@ -641,7 +649,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     publish({ type: "capacity.changed" });
     admissionRetryRuns.delete(state.run.id);
     clearAssistant(state);
-    emit(state.run.id, `run.${status}`, { exitCode, error: message || null, finishedAt });
+    emit(state.run.id, `run.${status}`, { exitCode: terminalExitCode, error: message || null, finishedAt });
     drain();
     return true;
   }
@@ -675,6 +683,13 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       }
       emit(runId, "run.stopped", { queued: true });
       return true;
+    }
+    if (state.terminalOutcome && (!state.child || state.closed)) {
+      if (finish(state, state.terminalOutcome.exitCode, state.pendingFinish?.error)) return true;
+      if (preserveOnMaintenance) return false;
+      const unavailable = new Error("Run outcome storage is unavailable; retry shortly");
+      unavailable.statusCode = 503;
+      throw unavailable;
     }
     if (state.stopping) return state.stopping;
     state.stopped = true;

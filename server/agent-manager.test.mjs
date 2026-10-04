@@ -504,6 +504,53 @@ test("a recovered hard terminal fault commits one SQLite outcome and audit acros
   }
 });
 
+test("Stop cannot replace a provider's exit outcome while its terminal write is retrying", async () => {
+  for (const fault of [{ code: "SQLITE_BUSY" }, { code: "SQLITE_IOERR_WRITE" }, { statusCode: 507 },
+    { code: "SQLITE_READONLY" }, { code: "SQLITE_FULL" }, { code: "ENOSPC" }, { code: "SQLITE_BUSY", exitCode: 7 }]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-post-exit-stop-"));
+    const filename = path.join(realpathSync(directory), "outright.db");
+    let database = createOutrightDatabase({ filename });
+    let manager;
+    try {
+      const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory,
+        title: "Post-exit stop", provider: "codex" });
+      const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "finish" });
+      const durableFinish = database.finishRun;
+      let blocked = true;
+      database.finishRun = (...args) => {
+        if (blocked) throw Object.assign(new Error("injected terminal fault"), fault);
+        return durableFinish(...args);
+      };
+      let child;
+      manager = createAgentManager({ database, publish: () => {},
+        launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+        spawnProcess: () => { child = fakeChild(); return child; } });
+      await manager.schedule({ conversation, run });
+      const exitCode = fault.exitCode ?? 0;
+      const expectedStatus = exitCode === 0 ? "completed" : "failed";
+      child.emit("close", exitCode, null);
+      await assert.rejects(manager.stop(run.id), (error) => error.statusCode === 503,
+        `${JSON.stringify(fault)}: Stop claimed a terminal outcome while storage was unavailable`);
+      assert.equal(database.getRun(run.id).status, "running");
+      assert.equal(manager.activeRuns().includes(run.id), true);
+      blocked = false;
+      manager.resumeQueued();
+      assert.equal(database.getRun(run.id).status, expectedStatus, JSON.stringify(fault));
+      assert.equal(database.getRun(run.id).exitCode, exitCode);
+      await manager.shutdown();
+      await database.close();
+      database = createOutrightDatabase({ filename });
+      assert.equal(database.getRun(run.id).status, expectedStatus, JSON.stringify(fault));
+      assert.equal(database.listAudit(100).filter((row) => row.action === `agent.run.${expectedStatus}` && row.target === run.id).length, 1);
+      assert.equal(database.listAudit(100).filter((row) => row.action === "agent.run.stopped" && row.target === run.id).length, 0);
+    } finally {
+      await manager?.shutdown();
+      await database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
 test("repeated terminal storage faults retain the slot and retry the durable outcome", async () => {
   const database = fakeDatabase();
   database.getSettings = () => ({ maxConcurrentRuns: 1 });
