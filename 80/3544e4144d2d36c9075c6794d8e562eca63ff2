@@ -1,0 +1,20 @@
+server/outright-runtime.mjs
+  h_a39f9495f9ec1d 36,104,748-749
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 1495,1500-1501,1516-1519,1521-1523,1526,1529-1530
+server/terminal-manager.mjs
+  h_a39f9495f9ec1d 20,36,40-57,78-80,287
+server/terminal-manager.test.mjs
+  h_a39f9495f9ec1d 570,585,587-589,596-650
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "803544e4144d2d36c9075c6794d8e562eca63ff2",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
