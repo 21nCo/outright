@@ -1,0 +1,38 @@
+server/agent-manager.mjs
+  h_a39f9495f9ec1d 326,679,898-900,985-988,1190
+server/agent-manager.test.mjs
+  h_a39f9495f9ec1d 1211-1380
+server/outright-runtime.mjs
+  h_a39f9495f9ec1d 17,66-67,85-92,736-740,748,757-758
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 4,13,203-204,218-220,222-290
+server/outright-vite-plugin.mjs
+  h_a39f9495f9ec1d 50-56
+server/outright-vite-plugin.test.mjs
+  h_a39f9495f9ec1d 31-65
+server/run-outcome-journal.mjs
+  h_a39f9495f9ec1d 10-19,35-37,96
+server/run-outcome-journal.test.mjs
+  h_a39f9495f9ec1d 3,21-40
+server/standalone.mjs
+  h_a39f9495f9ec1d 68-72
+src/App.jsx
+  h_a39f9495f9ec1d 249
+src/components/CommandPalette.jsx
+  h_a39f9495f9ec1d 12,14-17
+src/components/SettingsDialog.jsx
+  h_a39f9495f9ec1d 287-291
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 657,720-726,2361-2364,2385-2386,2392-2398
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6915589c70b41a7bdbf1005835369a6c32dd870d",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
