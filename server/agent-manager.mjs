@@ -323,7 +323,7 @@ export async function defaultLaunchCommand(command, run, launchDirectory) {
   };
 }
 
-export function createAgentManager({ database, publish, onProvidersChanged = () => {}, providerDiscoveryFactory = createProviderDiscovery, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
+export function createAgentManager({ database, publish, onProvidersChanged = () => {}, onShutdownRecovery = () => {}, providerDiscoveryFactory = createProviderDiscovery, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
   const resolvedLaunchDirectory = launchDirectory
     ?? database.launchDirectory;
   assertPrivateLaunchDirectory(resolvedLaunchDirectory);
@@ -676,6 +676,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     active.delete(state.run.id);
     pendingOutcomes.delete(state.run.id);
     publish({ type: "capacity.changed" });
+    if (shuttingDown) setTimeout(onShutdownRecovery, 0);
     admissionRetryRuns.delete(state.run.id);
     clearAssistant(state);
     emit(state.run.id, `run.${status}`, { exitCode: terminalExitCode, error: message || null, finishedAt });
@@ -894,9 +895,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // then backs off to a maintenance-rate probe instead of a busy loop.
     const delay = persistent ? (hardRetryProbed ? 30_000 : 100) : diskRetryDelayMs;
     if (diskRetryTimer) {
-      // A hard refusal may own a slow probe. A newly faulted transient owner
-      // must be able to move that one timer forward without adding a timer.
-      if (persistent || diskRetryDueAt <= Date.now() + delay) return;
+      // The earliest owner wins. A newly exited result must never wait behind
+      // an unrelated admission's long backoff, regardless of fault class.
+      if (diskRetryDueAt <= Date.now() + delay) return;
       clearTimeout(diskRetryTimer);
     }
     if (persistent) hardRetryProbed = true;
@@ -981,7 +982,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // Bound unresolved outcomes by the same configured concurrency budget.
     // This leaves room for independent work while preventing a failed store
     // from accumulating an unlimited set of finished run snapshots in RAM.
-    while (active.size < max && pendingOutcomes.size < RESOURCE_BUDGETS.maxPendingRunOutcomes && queue.length) {
+    // Each preparing/running provider may become an exited pending outcome.
+    // Keep that reservation until its terminal row commits, even if it stops
+    // consuming a process slot before SQLite recovers.
+    while (active.size < max && active.size + pendingOutcomes.size < RESOURCE_BUDGETS.maxPendingRunOutcomes && queue.length) {
       let admissible;
       try { admissible = database.canLaunchRun?.(); }
       catch (error) {
@@ -1183,6 +1187,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     activeRuns: () => [...active.keys(), ...pendingOutcomes.keys()],
     activeProcessCount: () => active.size,
     pendingOutcomeCount: () => pendingOutcomes.size,
+    hasPendingFinishes: () => [...active.values(), ...pendingOutcomes.values()].some((state) => Boolean(state.pendingFinish)),
     isOutcomePending: (runId) => pendingOutcomes.has(runId),
     shutdown() {
       if (shutdownPromise) return shutdownPromise;

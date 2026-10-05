@@ -65,7 +65,11 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
     stopping = true;
     try {
       await recovery;
-      await runtime?.shutdown();
+      try { await runtime?.shutdown(); }
+      catch (error) {
+        if (error.code !== "OUTRIGHT_SHUTDOWN_RECOVERY_PENDING") throw error;
+        await runtime.whenShutdownComplete();
+      }
       httpServer.close(() => process.exit(0));
       httpServer.closeIdleConnections?.();
     } catch (error) {

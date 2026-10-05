@@ -246,7 +246,7 @@ export function App() {
       const loaded = await loadBootstrap();
       if (!stopped && (remaining === null ? loaded === "retry" : loaded !== true && remaining > 0)) {
         window.clearTimeout(retry);
-        retry = window.setTimeout(() => load(remaining === null ? null : remaining - 1), 1000);
+        retry = window.setTimeout(() => { void load(remaining === null ? null : remaining - 1); }, 1000);
       }
       return loaded;
     };

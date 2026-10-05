@@ -654,7 +654,7 @@ async function settingsCapacityWithoutEventRegression() {
       reads += 1;
       return response({ migrationStatus: "ready", ...otherClientCapacity,
         availableForNewWorkBytes: 63 * 1048576 - otherClientCapacity.retainedBytes,
-        limits: { maxQueuedRuns: 32, maxConcurrentRuns: 2, maxRetainedBytes: 64 * 1048576,
+        limits: { maxQueuedRuns: 32, maxConcurrentRuns: 2, maxPendingRunOutcomes: 8, maxRetainedBytes: 64 * 1048576,
           reservedRetainedBytes: 1048576, maxPhysicalBytes: 10 * 1048576 } });
     }
     if (url.pathname === "/api/retention/archived") return response({ conversations: [] });
@@ -717,6 +717,13 @@ async function settingsCapacityWithoutEventRegression() {
   otherClientCapacity = { ...otherClientCapacity, active: 1, recoverable: 1 };
   signalChange();
   await until(() => capacityAnnouncement() === "One run is awaiting recovery.", "run recovery is announced");
+  otherClientCapacity = { ...otherClientCapacity, recoverable: 0, pendingRunOutcomes: 7 };
+  signalChange();
+  await until(() => capacityAnnouncement().includes("Run starts are paused until an active run or pending outcome releases recovery capacity."),
+    "full pending-outcome reservation pauses run starts in the live announcement");
+  otherClientCapacity = { ...otherClientCapacity, pendingRunOutcomes: 0 };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Capacity is available for new work.", "pending-outcome capacity clearance is announced");
   otherClientCapacity = { ...otherClientCapacity, recoverable: 0, cleanupPending: true };
   signalChange();
   await until(() => capacityAnnouncement() === "Archived cleanup is pending.", "pending cleanup is announced");
@@ -2351,6 +2358,10 @@ async function commandPaletteRegression() {
       return retryResults.promise;
     }
     if (search === "stale-failure") return staleFailure.promise;
+    if (search === "none") return response({ conversations: [], partial: true });
+    if (search === "complete") return response({ conversations: [
+      { id: "first", title: "First", provider: "codex", worktreePath: "/first" },
+      { id: "second", title: "Second", provider: "codex", worktreePath: "/second" }], partial: false });
     return latestResults.promise;
   };
   root.render(<CommandPalette open onOpenChange={() => {}} projects={[]} onSelectProject={() => {}} onSelectConversation={(conversation) => { selected = conversation; }} />);
@@ -2371,12 +2382,19 @@ async function commandPaletteRegression() {
   assert(document.querySelector(".command-search-scope")?.textContent.includes("recent conversations"), "bounded search was not explained");
   assert(document.querySelector('.command-results [role="status"]')?.textContent.includes("recent conversations and short messages"),
     "partial search scope was absent from the result announcement");
-  assert(!/\d+ results/.test(document.querySelector('.command-results [role="status"]')?.textContent ?? ""),
-    "typing a new query re-announced a result count instead of its material search state");
+  assert(document.querySelector('.command-results [role="status"]')?.textContent.startsWith("1 result is available"),
+    "partial search did not announce its visible result count");
   await until(() => input.getAttribute("aria-activedescendant") === "command-result-0", "active remote command result");
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
   assert(selected?.id === "current", "Enter did not select the asynchronously loaded command result");
   assert([...document.querySelector('[role="listbox"]').children].every((element) => element.getAttribute("role") === "option"), "Command listbox contains non-option children");
+
+  setControlValue(input, "none");
+  await until(() => document.querySelector('.command-results [role="status"]')?.textContent.startsWith("No matches in recent conversations"),
+    "partial search with zero matches incorrectly announced available results");
+  setControlValue(input, "complete");
+  await until(() => document.querySelector('.command-results [role="status"]')?.textContent === "2 results are available",
+    "completed search omitted its visible result count");
 
   setControlValue(input, "failure");
   await until(() => failureRequests === 1, "failed command search");

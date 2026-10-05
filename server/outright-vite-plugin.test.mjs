@@ -28,6 +28,41 @@ test("Vite disposal awaits runtime process supervision before completing", async
   assert.equal(closed, true);
 });
 
+test("Vite disposal waits for storage recovery instead of caching a rejected close", async () => {
+  let releaseRecovery;
+  const recovered = new Promise((resolve) => { releaseRecovery = resolve; });
+  let held = false;
+  let attached = 0;
+  const options = { configUrl: new URL("file:///fixture/storage-recovery.json"), recoverArchive: async () => {},
+    createRuntime: () => {
+      if (held) throw Object.assign(new Error("runtime lease held"), { code: "OUTRIGHT_RUNTIME_LEASE_HELD" });
+      held = true;
+      return { attach() { attached += 1; },
+        shutdown: async () => { throw Object.assign(new Error("storage unavailable"), { code: "OUTRIGHT_SHUTDOWN_RECOVERY_PENDING" }); },
+        whenShutdownComplete: () => recovered };
+    } };
+  const first = outrightApiPlugin(options);
+  first.configureServer({ middlewares: { use() {} } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(attached, 1);
+  const closing = first.closeBundle();
+  let settled = false;
+  void closing.then(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "Vite dropped the old runtime while its recovery owner held the lease");
+  held = false;
+  releaseRecovery();
+  await closing;
+  assert.equal(settled, true);
+  const successor = outrightApiPlugin(options);
+  successor.configureServer({ middlewares: { use() {} } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(attached, 2);
+  held = false;
+  releaseRecovery();
+  await successor.closeBundle();
+});
+
 test("build-only plugin disposal does not start a runtime", () => {
   const plugin = outrightApiPlugin({ configUrl: new URL("file:///fixture/config.json"), createRuntime: () => { throw new Error("Unexpected runtime"); } });
   assert.equal(plugin.closeBundle(), undefined);

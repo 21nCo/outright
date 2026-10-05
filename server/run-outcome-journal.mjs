@@ -7,6 +7,16 @@ const RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 // assistant checkpoint is capped at 1 MiB, so these sidecars remain bounded
 // even when storage is unavailable during shutdown.
 const MAX_RECORD_BYTES = 2 * 1024 * 1024;
+const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+function validTranscriptTimestamp(createdAt, finishedAt) {
+  if (typeof createdAt !== "string") return false;
+  const created = Date.parse(createdAt);
+  const finished = Date.parse(finishedAt);
+  return Number.isFinite(created) && Number.isFinite(finished)
+    && created <= finished + MAX_CLOCK_SKEW_MS
+    && created <= Date.now() + MAX_CLOCK_SKEW_MS;
+}
 
 function recordPath(directory, runId) {
   if (!RUN_ID.test(runId)) throw new Error("Invalid run outcome ID");
@@ -22,6 +32,9 @@ function syncDirectory(directory) {
 
 export function saveRunOutcome(directory, runId, outcome) {
   const destination = recordPath(directory, runId);
+  if (outcome.transcriptMessage && !validTranscriptTimestamp(outcome.transcriptMessage.createdAt, outcome.finishedAt)) {
+    throw new Error("Invalid run outcome transcript timestamp");
+  }
   const base = { ...outcome, version: 2, runId,
     message: Buffer.from(String(outcome.message ?? "")).subarray(0, 4000).toString("utf8"),
     transcriptOmitted: Boolean(outcome.transcriptOmitted),
@@ -80,7 +93,7 @@ export function readRunOutcome(directory, runId) {
         || record.transcriptMessage.kind !== "text"
         || typeof record.transcriptMessage.body !== "string"
         || typeof record.transcriptMessage.conversationId !== "string"
-        || typeof record.transcriptMessage.createdAt !== "string"))))) {
+        || !validTranscriptTimestamp(record.transcriptMessage.createdAt, record.finishedAt)))))) {
     throw new Error(`Invalid run outcome record: ${runId}`);
   }
   return record;

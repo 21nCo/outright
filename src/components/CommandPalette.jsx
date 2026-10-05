@@ -9,10 +9,12 @@ function searchAnnouncement(query, remote, resultCount, partial, error) {
   if (!query) return "Type to search";
   if (remote.loading) return "Searching";
   if (error) return resultCount
-    ? "Conversation search failed. Local results are available. Retry search available."
+    ? `Conversation search failed. ${resultCount} local ${resultCount === 1 ? "result is" : "results are"} available. Retry search available.`
     : "Search failed. Retry search available.";
-  if (partial) return "Results available from recent conversations and short messages. Open a conversation to search older or larger text.";
-  return resultCount ? "Results available" : "No matching results";
+  if (partial) return resultCount
+    ? `${resultCount} ${resultCount === 1 ? "result is" : "results are"} available from recent conversations and short messages. Open a conversation to search older or larger text.`
+    : "No matches in recent conversations or short messages. Open a conversation to search older or larger text.";
+  return resultCount ? `${resultCount} ${resultCount === 1 ? "result is" : "results are"} available` : "No matching results";
 }
 
 export function CommandPalette({ open, onOpenChange, projects, onSelectProject, onSelectConversation }) {

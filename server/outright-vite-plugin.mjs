@@ -47,7 +47,13 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
     if (!recovery) return undefined;
     stopping = true;
     abort.abort();
-    closing ??= recovery.then(() => runtime?.shutdown());
+    closing ??= recovery.then(async () => {
+      try { await runtime?.shutdown(); }
+      catch (error) {
+        if (error.code !== "OUTRIGHT_SHUTDOWN_RECOVERY_PENDING") throw error;
+        await runtime.whenShutdownComplete();
+      }
+    });
     // Recovery itself can own the SQLite lease before a runtime exists.
     // Register its disposal too, so a successor does not apply the deadline
     // for an unknown external owner to a known local handoff.

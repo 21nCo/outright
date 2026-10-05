@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
-import { Readable } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -10,7 +10,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAlive, defaultRecoveryProcessIdentity, defaultTerminateRecoveryProcess, runtimeAllowedHosts } from "./outright-runtime.mjs";
 import { createOutrightDatabase } from "./database.mjs";
-import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
+import { AGENT_SUPERVISOR, createAgentManager, LAUNCH_AUTHORIZED_CONTROL } from "./agent-manager.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -200,11 +200,12 @@ test("a failed agent shutdown retains the runtime lease until recovery can finis
   const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
   let runtime;
   let successor;
+  let storageAvailable = false;
+  let assertionFailure;
   try {
     process.env.OUTRIGHT_DATA_DIR = dataDirectory;
     runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
     const originalShutdown = runtime.agents.shutdown;
-    let storageAvailable = false;
     runtime.agents.shutdown = () => storageAvailable
       ? originalShutdown()
       : Promise.reject(Object.assign(new Error("outcome journal unavailable"), { code: "ENOSPC" }));
@@ -214,9 +215,79 @@ test("a failed agent shutdown retains the runtime lease until recovery can finis
     storageAvailable = true;
     await runtime.shutdown();
     successor = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+  } catch (error) {
+    assertionFailure = error;
+    throw error;
   } finally {
-    await successor?.shutdown();
-    await runtime?.shutdown();
+    storageAvailable = true;
+    const cleanup = await Promise.allSettled([successor?.shutdown(), runtime?.shutdown()]);
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR;
+    else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    let cleanupError = cleanup.find((result) => result.status === "rejected")?.reason;
+    try { rmSync(dataDirectory, { recursive: true, force: true }); }
+    catch (error) { cleanupError ??= error; }
+    if (cleanupError && !assertionFailure) throw cleanupError;
+  }
+});
+
+test("a storage-faulted exited run releases the runtime lease automatically after durable recovery", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-shutdown-recover-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  let runtime;
+  let successor;
+  let child;
+  let durableFinish;
+  let durableJournal;
+  try {
+    process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json",
+      agentManagerFactory: (options) => createAgentManager({ ...options,
+        validateConversation: async () => () => {},
+        launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+        spawnProcess: () => {
+          child = new PassThrough();
+          child.stdin = new PassThrough();
+          child.stdout = new PassThrough();
+          child.stderr = new PassThrough();
+          child.stdio = [child.stdin, child.stdout, child.stderr, new PassThrough()];
+          const write = child.stdin.write.bind(child.stdin);
+          child.stdin.write = (chunk, ...args) => {
+            const result = write(chunk, ...args);
+            if (String(chunk).includes("go\n")) queueMicrotask(() => child.stdio[3].write(`${LAUNCH_AUTHORIZED_CONTROL}\n`));
+            return result;
+          };
+          child.kill = () => true;
+          return child;
+        },
+      }) });
+    const conversation = runtime.database.createConversation({ projectId: "p", worktreeId: "w",
+      worktreePath: dataDirectory, title: "Recovery", provider: "codex" });
+    const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex",
+      approvalPolicy: "read-only", prompt: "finish" });
+    await runtime.agents.schedule({ conversation, run });
+    durableFinish = runtime.database.finishRun;
+    durableJournal = runtime.database.savePendingRunOutcome;
+    runtime.database.finishRun = () => { throw Object.assign(new Error("SQLite full"), { code: "ENOSPC" }); };
+    runtime.database.savePendingRunOutcome = () => { throw Object.assign(new Error("journal full"), { code: "ENOSPC" }); };
+    child.emit("close", 0, null);
+    await assert.rejects(runtime.shutdown(), (error) => error.code === "OUTRIGHT_SHUTDOWN_RECOVERY_PENDING");
+    assert.throws(() => createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" }),
+      (error) => error.code === "OUTRIGHT_RUNTIME_LEASE_HELD");
+    runtime.database.finishRun = durableFinish;
+    runtime.database.savePendingRunOutcome = durableJournal;
+    runtime.agents.resumeQueued();
+    await Promise.race([runtime.whenShutdownComplete(), new Promise((_, reject) => setTimeout(() => reject(new Error("lease did not release after recovery")), 3000))]);
+    successor = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    assert.equal(successor.database.getRun(run.id).status, "completed");
+    assert.equal(successor.database.listAudit(100).filter((entry) => entry.action === "agent.run.completed" && entry.target === run.id).length, 1);
+  } finally {
+    // An assertion failure must not hide behind the deliberately faulted
+    // shutdown. Restore the writable methods before final cleanup.
+    if (runtime && durableFinish) runtime.database.finishRun = durableFinish;
+    if (runtime && durableJournal) runtime.database.savePendingRunOutcome = durableJournal;
+    runtime?.agents.resumeQueued();
+    try { await successor?.shutdown(); } catch { /* The assertion above owns the failure. */ }
+    try { await runtime?.shutdown(); } catch { /* The assertion above owns the failure. */ }
     if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR;
     else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
     rmSync(dataDirectory, { recursive: true, force: true });

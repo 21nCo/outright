@@ -14,7 +14,7 @@ import { utilityProcesses } from "./subprocess-budget.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, databaseFactory = createOutrightDatabase, hardenLaunchDirectory = process.platform === "win32" ? hardenWindowsLaunchDirectory : () => {}, terminalManagerFactory = createTerminalManager } = {}) {
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, databaseFactory = createOutrightDatabase, agentManagerFactory = createAgentManager, hardenLaunchDirectory = process.platform === "win32" ? hardenWindowsLaunchDirectory : () => {}, terminalManagerFactory = createTerminalManager } = {}) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
   let agents;
@@ -63,6 +63,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   let watcher = null;
   let watcherTimer = null;
   let shutdownPromise;
+  let resolveShutdownCompletion;
+  const shutdownCompletion = new Promise((resolve) => { resolveShutdownCompletion = resolve; });
 
   publish = function publish(event) {
     return eventHub.publish(event);
@@ -80,7 +82,14 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   // Construct the agent manager after the remaining synchronous startup
   // checks. No provider discovery owner then needs asynchronous teardown on
   // a failed synchronous constructor path.
-  agents = createAgentManager({ database, publish, onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }), validateConversation: async (conversation) => {
+  agents = agentManagerFactory({ database, publish,
+    onShutdownRecovery: () => {
+      // The first shutdown may have failed while both SQLite and its outcome
+      // journal refused writes. Once an exited result commits, resume the
+      // finalizer without asking Vite or a signal handler to call it again.
+      if (shuttingDown) void shutdown().catch((error) => console.error("Runtime shutdown recovery failed", error));
+    },
+    onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }), validateConversation: async (conversation) => {
     const target = await resolveWorktreeTarget(conversation);
     return () => {
       if (database.getConversation(conversation.id)?.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
@@ -724,7 +733,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       // A failed agent shutdown may be the sole owner of an exited provider's
       // result while both SQLite and its recovery sidecar are unavailable.
       // Keep the database and its exclusive lease alive for its retry timer.
-      if (shutdownErrors.length) throw new AggregateError(shutdownErrors, "Runtime shutdown retains recovery ownership");
+      if (shutdownErrors.length) {
+        const error = new AggregateError(shutdownErrors, "Runtime shutdown retains recovery ownership");
+        if (agents.hasPendingFinishes()) error.code = "OUTRIGHT_SHUTDOWN_RECOVERY_PENDING";
+        throw error;
+      }
       await inFlightScan?.catch(() => {});
       await terminalAuditReconciliation;
       try { await terminals.shutdown(); }
@@ -732,6 +745,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       eventHub.shutdown();
       wss.close();
       await database.close();
+      resolveShutdownCompletion();
       if (shutdownErrors.length) throw new AggregateError(shutdownErrors, "Runtime shutdown did not finish cleanly");
     })().catch((error) => {
       shutdownPromise = null;
@@ -740,7 +754,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     return shutdownPromise;
   }
 
-  return { attach, handleRequest, projects, publish, database, agents, terminals, git, shutdown };
+  return { attach, handleRequest, projects, publish, database, agents, terminals, git, shutdown,
+    whenShutdownComplete: () => shutdownCompletion };
   } catch (error) {
     // No runtime was returned, so neither Vite nor standalone can call its
     // shutdown. Stop startup-owned managers before releasing the physical

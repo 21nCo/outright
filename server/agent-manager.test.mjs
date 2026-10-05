@@ -1208,6 +1208,176 @@ function codexRun(id) {
   return { id, conversationId: "conv-1", provider: "codex", prompt: "prompt", approvalPolicy: "read-only" };
 }
 
+for (const concurrency of [3, 8]) {
+  test(`concurrent exits reserve the eight pending-outcome slots at concurrency ${concurrency}`, async () => {
+    const database = fakeDatabase();
+    database.getSettings = () => ({ maxConcurrentRuns: concurrency });
+    database.getConversation = (id) => ({ id, worktreePath: `/tmp/${id}` });
+    database.canLaunchRun = () => true;
+    const completed = database.finishRun;
+    const sidecars = new Map();
+    let unavailable = true;
+    database.savePendingRunOutcome = (id, outcome) => { sidecars.set(id, outcome); };
+    database.removePendingRunOutcome = (id) => { sidecars.delete(id); };
+    database.finishRun = (...args) => {
+      if (unavailable) throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+      return completed(...args);
+    };
+    const children = [];
+    const manager = createAgentManager({ database, publish: () => {},
+      launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+      spawnProcess: () => { const child = fakeChild(); children.push(child); return child; },
+    });
+    const runs = Array.from({ length: 16 }, (_, index) => database.createRun({ ...codexRun(`reserved-${concurrency}-${index}`),
+      conversationId: `conversation-${index}` }));
+    try {
+      await Promise.all(runs.map((run) => manager.schedule({ conversation: database.getConversation(run.conversationId), run })));
+      let exited = 0;
+      const deadline = Date.now() + 5000;
+      while (exited < RESOURCE_BUDGETS.maxPendingRunOutcomes && Date.now() < deadline) {
+        if (children[exited]) {
+          children[exited].emit("close", 0, null);
+          exited += 1;
+        } else await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(exited, 8, "burst did not fill the pending-outcome budget");
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(children.length, 8, "a queued sibling launched without reserving its possible outcome");
+      assert.equal(manager.pendingOutcomeCount(), 8);
+      assert.equal(sidecars.size, 8);
+      assert.equal(manager.activeProcessCount(), 0);
+      await assert.rejects(manager.stop(runs[15].id), (error) => error.code === "ENOSPC");
+      assert.equal(database.getRun(runs[15].id).status, undefined, "failed cancellation discarded a queued sibling");
+      unavailable = false;
+      assert.equal(await manager.stop(runs[15].id), true);
+      manager.resumeQueued();
+      let closed = 8;
+      const recoveryDeadline = Date.now() + 5000;
+      while (database.finishes.length < 16 && Date.now() < recoveryDeadline) {
+        if (children[closed]) {
+          children[closed].emit("close", 0, null);
+          closed += 1;
+        } else await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(database.finishes.length, 16, "queued work did not resume after durable clearance");
+      assert.equal(database.finishes.filter((entry) => entry.patch.status === "completed").length, 15);
+      assert.equal(sidecars.size, 0);
+      assert.equal(manager.pendingOutcomeCount(), 0);
+    } finally {
+      unavailable = false;
+      await manager.shutdown();
+    }
+  });
+}
+
+test("real SQLite ENOSPC burst keeps sidecars within the reserved outcome budget", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-outcome-burst-"));
+  const database = createOutrightDatabase({ filename: path.join(realpathSync(directory), "outright.db") });
+  let manager;
+  const children = [];
+  const durableFinish = database.finishRun;
+  let unavailable = true;
+  try {
+    database.updateSettings({ maxConcurrentRuns: 8 });
+    const runs = Array.from({ length: 16 }, (_, index) => {
+      const conversation = database.createConversation({ projectId: "p", worktreeId: `w-${index}`,
+        worktreePath: path.join(directory, `worktree-${index}`), title: `Burst ${index}`, provider: "codex" });
+      return { conversation, run: database.createRun({ conversationId: conversation.id, provider: "codex",
+        approvalPolicy: "read-only", prompt: `burst ${index}` }) };
+    });
+    database.finishRun = (...args) => {
+      if (unavailable) throw Object.assign(new Error("SQLite disk full"), { code: "ENOSPC" });
+      return durableFinish(...args);
+    };
+    manager = createAgentManager({ database, publish: () => {},
+      launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+      spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+    await Promise.all(runs.map(({ conversation, run }) => manager.schedule({ conversation, run })));
+    assert.equal(children.length, 8);
+    for (const child of children.slice(0, 8)) child.emit("close", 0, null);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const files = () => fs.readdirSync(database.launchDirectory).filter((name) => name.endsWith(".outcome.json"));
+    assert.equal(files().length, 8, "more than eight durable recovery sidecars were retained");
+    assert.equal(children.length, 8, "a ninth provider started without a recovery reservation");
+    assert.equal(manager.pendingOutcomeCount(), 8);
+    unavailable = false;
+    manager.resumeQueued();
+    const deadline = Date.now() + 5000;
+    let closed = 8;
+    while (closed < 16 && Date.now() < deadline) {
+      if (children[closed]) children[closed++].emit("close", 0, null);
+      else await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(closed, 16, "queued siblings did not resume after SQLite recovery");
+    assert.equal(runs.filter(({ run }) => database.getRun(run.id).status === "completed").length, 16);
+    assert.equal(files().length, 0);
+    const terminalAudit = database.listAudit(200).filter((entry) => entry.action === "agent.run.completed");
+    assert.equal(terminalAudit.length, 16, "a resumed terminal outcome lost or duplicated its audit");
+  } finally {
+    unavailable = false;
+    database.finishRun = durableFinish;
+    await manager?.shutdown();
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a newly exited hard fault advances an older transient admission backoff", async () => {
+  const database = fakeDatabase();
+  const getSettings = database.getSettings;
+  const finishRun = database.finishRun;
+  const children = [];
+  const first = database.createRun({ ...codexRun("timer-first"), worktreePath: "/tmp/conv-1" });
+  const second = database.createRun({ ...codexRun("timer-second"), conversationId: "conv-2", worktreePath: "/tmp/conv-2" });
+  database.getConversation = (id) => ({ id, worktreePath: `/tmp/${id}` });
+  let transient = false;
+  let reads = 0;
+  database.getSettings = () => {
+    if (transient) {
+      reads += 1;
+      throw Object.assign(new Error("SQLite busy"), { code: "SQLITE_BUSY" });
+    }
+    return getSettings();
+  };
+  let hardFault = true;
+  database.finishRun = (...args) => {
+    if (hardFault) {
+      hardFault = false;
+      throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+    }
+    return finishRun(...args);
+  };
+  const manager = createAgentManager({ database, publish: () => {},
+    launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  try {
+    await manager.schedule({ conversation: database.getConversation(first.conversationId), run: first });
+    assert.equal(children.length, 1);
+    transient = true;
+    await manager.schedule({ conversation: database.getConversation(second.conversationId), run: second });
+    const deadline = Date.now() + 2000;
+    while (reads < 4 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.ok(reads >= 4, "transient admission never reached its long backoff");
+    children[0].emit("close", 0, null);
+    const completionDeadline = Date.now() + 350;
+    while (database.getRun(first.id).status !== "completed" && Date.now() < completionDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(database.getRun(first.id).status, "completed",
+      "the exited outcome waited behind an unrelated transient admission timer");
+    transient = false;
+    manager.resumeQueued();
+    const launchDeadline = Date.now() + 1000;
+    while (children.length < 2 && Date.now() < launchDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(children.length, 2);
+    children[1].emit("close", 0, null);
+  } finally {
+    transient = false;
+    database.finishRun = finishRun;
+    await manager.shutdown();
+  }
+});
+
 test("builds sandboxed provider commands with model and reasoning settings", () => {
   const codex = buildProviderCommand(conversation, { provider: "codex", model: "gpt-5.4", reasoningEffort: "high", approvalPolicy: "read-only", prompt: "Review" });
   assert.deepEqual(codex.args.slice(0, 6), ["exec", "--json", "-C", "/tmp/project", "--sandbox", "read-only"]);
