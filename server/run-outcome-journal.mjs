@@ -83,9 +83,13 @@ export function readRunOutcome(directory, runId) {
     throw error;
   }
   if (!stat.isFile() || stat.size > MAX_RECORD_BYTES) throw invalidRunOutcome(runId);
+  const contents = readFileSync(filename, "utf8");
   let record;
-  try { record = JSON.parse(readFileSync(filename, "utf8")); }
-  catch { throw invalidRunOutcome(runId); }
+  try { record = JSON.parse(contents); }
+  catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    throw invalidRunOutcome(runId);
+  }
   if (![1, 2].includes(record?.version) || record.runId !== runId
     || !["completed", "failed", "stopped"].includes(record.status)
     || typeof record.finishedAt !== "string" || !Number.isFinite(Date.parse(record.finishedAt))

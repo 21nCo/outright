@@ -1444,6 +1444,7 @@ export function createOutrightDatabase(options = {}) {
           // evidence than a dead-process probe or a later Stop request.
           let outcome;
           let invalidOutcome = false;
+          let outcomeReadUnavailable = false;
           try {
             outcome = readRunOutcome(launchDirectory, run.id);
             if (outcome?.transcriptMessage?.conversationId !== undefined
@@ -1455,9 +1456,9 @@ export function createOutrightDatabase(options = {}) {
           } catch (error) {
             // One corrupt sidecar cannot prevent other runs from recovering.
             // Keep both the sidecar and the interrupted row for inspection.
-            if (error.code !== "OUTRIGHT_INVALID_RUN_OUTCOME") throw error;
+            if (error.code !== "OUTRIGHT_INVALID_RUN_OUTCOME") outcomeReadUnavailable = true;
+            else invalidOutcome = true;
             outcome = null;
-            invalidOutcome = true;
           }
           if (outcome) {
             let transcriptOmitted = Boolean(outcome.transcriptOmitted);
@@ -1483,16 +1484,25 @@ export function createOutrightDatabase(options = {}) {
           }
           let classification = "unknown";
           let pid = run.pid ?? null;
-          // An invalid sidecar retains unknown ownership even for a queued
-          // row or dead PID; neither can disprove that recovery evidence.
-          if (!invalidOutcome) {
-            if (run.status === "queued") classification = "never-started";
-            else if (run.status === "launching") {
-              // The wrapper cannot run before the row reaches 'running'.
-              classification = "never-started";
+          // A queued row was never authorized to launch. A launching row
+          // cannot authorize its wrapper until the running state commits.
+          // Corrupt terminal evidence must remain available for inspection,
+          // but it does not turn these durable pre-launch facts into a live
+          // process tree that no recovery policy can ever resolve.
+          if (outcomeReadUnavailable) {
+            classification = `outcome-unreadable-${run.status}`;
+            if (run.status === "launching") {
               const handshake = readLaunchHandshake(launchDirectory, run.id);
               if (handshake) pid = handshake.pid;
-            } else if (run.pid != null) {
+            }
+          }
+          else if (run.status === "queued") classification = "never-started";
+          else if (run.status === "launching") {
+            classification = "never-started";
+            const handshake = readLaunchHandshake(launchDirectory, run.id);
+            if (handshake) pid = handshake.pid;
+          } else if (!invalidOutcome) {
+            if (run.pid != null) {
               const handshake = readLaunchHandshake(launchDirectory, run.id);
               classification = handshake?.completed === true
                 && handshake.authorized === true
@@ -1505,6 +1515,7 @@ export function createOutrightDatabase(options = {}) {
             .run(pid, finishedAt, classification, run.id);
           if (!result.changes) continue;
           if (invalidOutcome) writeCriticalAudit("agent.run.outcome.invalid", { target: run.id });
+          if (outcomeReadUnavailable) writeCriticalAudit("agent.run.outcome.unreadable", { target: run.id });
           counts[classification] = (counts[classification] ?? 0) + 1;
         }
         return pending.length;
@@ -1516,6 +1527,56 @@ export function createOutrightDatabase(options = {}) {
       sweepLaunchHandshakes(launchDirectory, db);
       const count = Object.values(counts).reduce((sum, classified) => sum + classified, 0);
       return { count, counts };
+    },
+    retryUnreadableRunOutcome(id) {
+      const run = this.getRun(id);
+      if (!run || run.status !== "interrupted" || run.recoveryDecision
+        || !run.recoveryClass?.startsWith("outcome-unreadable-")) return null;
+      let outcome;
+      let invalid = false;
+      try {
+        outcome = readRunOutcome(launchDirectory, id);
+        if (outcome?.transcriptMessage?.conversationId !== undefined
+          && outcome.transcriptMessage.conversationId !== run.conversationId) invalid = true;
+      } catch (error) {
+        if (error.code === "OUTRIGHT_INVALID_RUN_OUTCOME") invalid = true;
+        else throw databaseError(503, "Run outcome evidence is temporarily unreadable; retry after storage recovers");
+      }
+      if (invalid || !outcome) {
+        const originalStatus = run.recoveryClass.slice("outcome-unreadable-".length);
+        const recoveryClass = originalStatus === "running" ? "unknown" : "never-started";
+        const classify = db.transaction(() => {
+          const updated = db.prepare("UPDATE runs SET recovery_class = ? WHERE id = ? AND status = 'interrupted' AND recovery_class = ?")
+            .run(recoveryClass, id, run.recoveryClass);
+          if (invalid && updated.changes) writeCriticalAudit("agent.run.outcome.invalid", { target: id });
+        });
+        classify.immediate();
+        return this.getRun(id);
+      }
+      const settle = db.transaction(() => {
+        let transcriptOmitted = Boolean(outcome.transcriptOmitted);
+        if (outcome.transcriptMessage) {
+          try {
+            if (!this.upsertMessage(outcome.transcriptMessage)) transcriptOmitted = true;
+          } catch (error) {
+            if (error.statusCode !== 507) throw error;
+            transcriptOmitted = true;
+          }
+        }
+        const updated = db.prepare(`UPDATE runs SET status = ?, pid = NULL, finished_at = ?, exit_code = ?, error = ?,
+          transcript_omitted = CASE WHEN transcript_omitted = 1 OR ? THEN 1 ELSE 0 END
+          WHERE id = ? AND status = 'interrupted' AND recovery_class = ? AND recovery_decision IS NULL`)
+          .run(outcome.status, outcome.finishedAt, outcome.exitCode, outcome.message || null,
+            transcriptOmitted ? 1 : 0, id, run.recoveryClass);
+        if (updated.changes) writeCriticalAudit(`agent.run.${outcome.status}`, {
+          target: id, exitCode: outcome.exitCode, error: outcome.message || undefined,
+        });
+        return updated.changes;
+      });
+      if (settle.immediate()) {
+        try { removeRunOutcome(launchDirectory, id); } catch { /* Retry at startup. */ }
+      }
+      return this.getRun(id);
     },
     // Records the operator's explicit continuation decision exactly once.
     // Discard fails the run; resume/retry keep it interrupted for the record
@@ -1540,6 +1601,9 @@ export function createOutrightDatabase(options = {}) {
         return true;
       });
       if (!resolve.immediate()) return null;
+      // The decision is durable before deleting its now-inapplicable sidecar.
+      // A failed unlink is retried by the startup sweep.
+      try { removeRunOutcome(launchDirectory, id); } catch { /* Retry at startup. */ }
       return this.getRun(id);
     },
     beginInterruptedRunRecovery(id, decision, { providerSessionId } = {}) {
@@ -1571,7 +1635,11 @@ export function createOutrightDatabase(options = {}) {
         writeCriticalAudit(`agent.run.recovery.${decision}`, { target: run.id, recoveredFrom: id, conversationId: interrupted.conversationId, recoveryClass: interrupted.recoveryClass });
         return { interrupted: this.getRun(id), run, conversation: this.getConversation(interrupted.conversationId) };
       });
-      return recover.immediate();
+      const result = recover.immediate();
+      if (result) {
+        try { removeRunOutcome(launchDirectory, id); } catch { /* Retry at startup. */ }
+      }
+      return result;
     },
     updateRun(id, patch) {
       const { criticalFields, criticalValues, optionalFields, optionalValues } = runPatchAssignments(patch);
@@ -1893,7 +1961,7 @@ export function createOutrightDatabase(options = {}) {
         throw databaseError(400, `Search query must contain 1 to ${SEARCH_QUERY_BYTES} UTF-8 bytes`);
       }
       const boundedLimit = Math.max(1, Math.min(40, Number.isInteger(limit) ? limit : 40));
-      const needle = `%${query.trim().replace(/[\\%_]/g, "\\$&")}%`;
+      const needle = `%${query.trim().replace(/[\\%_]/g, String.raw`\$&`)}%`;
       // The palette only consumes conversation identities. Scan a fixed recent
       // window and skip oversized bodies before LIKE can materialize them.
       // Conversation Find remains available for the complete retained text.
@@ -1909,12 +1977,12 @@ export function createOutrightDatabase(options = {}) {
       // bounded candidate window or force a scan through an archive backlog.
       const visible = db.prepare(`SELECT source_rowid AS rowid FROM search_visible_conversations
         ORDER BY source_rowid DESC LIMIT ${SEARCH_CANDIDATES}`).all();
-      const byTitle = db.prepare(`WITH recent AS MATERIALIZED
+      const byTitle = db.prepare(String.raw`WITH recent AS MATERIALIZED
         (SELECT source_rowid AS rowid FROM search_recent_titles
           ORDER BY updated_at DESC, source_rowid DESC LIMIT ${SEARCH_CANDIDATES})
         SELECT ${fields} FROM recent JOIN conversations AS c ON c.rowid = recent.rowid
         WHERE c.deleting = 0 AND ${safeIdentity}
-          AND c.title LIKE ? ESCAPE '\\'`).all(needle);
+          AND c.title LIKE ? ESCAPE '\'`).all(needle);
       // The 256 newest visible conversation heads cover the 256 newest
       // visible messages: an omitted head already has 256 newer heads ahead
       // of it. This keeps old, active chats eligible after many new chats.
@@ -1936,11 +2004,11 @@ export function createOutrightDatabase(options = {}) {
         ordinals.push(newest.ordinal);
         newest.ordinal = nextOrdinal.get(newest.id, newest.ordinal)?.ordinal ?? 0;
       }
-      const byMessage = ordinals.length ? db.prepare(`SELECT DISTINCT ${fields} FROM messages AS m
+      const byMessage = ordinals.length ? db.prepare(String.raw`SELECT DISTINCT ${fields} FROM messages AS m
         JOIN conversations AS c ON c.id = m.conversation_id
         WHERE m.rowid IN (${ordinals.map(() => "?").join(",")})
           AND c.deleting = 0 AND ${safeIdentity} AND octet_length(m.body) <= ${SEARCH_MESSAGE_BYTES}
-          AND m.body LIKE ? ESCAPE '\\'`).all(...ordinals, needle) : [];
+          AND m.body LIKE ? ESCAPE '\'`).all(...ordinals, needle) : [];
       const matched = [...new Map([...byTitle, ...byMessage].map((row) => [row.id, row])).values()];
       matched.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
       const conversations = [];
@@ -2810,10 +2878,11 @@ function sweepLaunchHandshakes(launchDirectory, db) {
   try { directory = opendirSync(launchDirectory); }
   catch { return; }
   const keep = db.prepare(`SELECT 1 FROM runs WHERE id = ? AND status = 'interrupted'
-    AND recovery_decision IS NULL AND recovery_class IN ('alive', 'unknown')`);
+    AND recovery_decision IS NULL AND (recovery_class IN ('alive', 'unknown')
+      OR recovery_class LIKE 'outcome-unreadable-%')`);
   const pendingOutcome = db.prepare(`SELECT 1 FROM runs WHERE id = ? AND
     (status IN ('queued', 'running', 'launching') OR
-      (status = 'interrupted' AND recovery_class = 'unknown' AND recovery_decision IS NULL))`);
+      (status = 'interrupted' AND recovery_decision IS NULL))`);
   try {
     let entry;
     while ((entry = directory.readSync())) {

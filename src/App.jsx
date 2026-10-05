@@ -223,28 +223,30 @@ export function App() {
     setSelectedConversationId(nextId);
   }
 
-  const loadBootstrap = useCallback(async (manual = false) => {
+  const loadBootstrap = useCallback(async (manual = false, isCurrent = () => true) => {
     setIsScanning(true);
     try {
       const next = await api(manual ? "/api/projects" : "/api/bootstrap", manual ? { method: "POST" } : undefined);
+      if (!isCurrent()) return false;
       if (manual) setBootstrap((current) => ({ ...current, ...next }));
       else setBootstrap(next);
       if (!manual) setBootstrapError("");
       if (manual) setToast(`Found ${next.projects.length} Git projects`);
       return true;
     } catch (nextError) {
+      if (!isCurrent()) return false;
       if (manual) setError(nextError.message);
       else if (nextError.status !== 503) setBootstrapError(nextError.message);
       return !manual && nextError.status === 503 ? "retry" : "error";
     }
-    finally { setIsScanning(false); }
+    finally { if (isCurrent()) setIsScanning(false); }
   }, []);
 
   useEffect(() => {
     let stopped = false;
     let retry;
     const load = async (remaining = null) => {
-      const loaded = await loadBootstrap();
+      const loaded = await loadBootstrap(false, () => !stopped && bootstrapLoadRef.current === load);
       if (!stopped && (remaining === null ? loaded === "retry" : loaded !== true && remaining > 0)) {
         window.clearTimeout(retry);
         retry = window.setTimeout(() => { void load(remaining === null ? null : remaining - 1); }, 1000);
@@ -1353,7 +1355,7 @@ export function App() {
     } catch (nextError) { setError(nextError.message); }
   }
 
-  async function chooseProject(nextProject, explicitWorktree) {
+  function chooseProject(nextProject, explicitWorktree) {
     const nextWorktree = explicitWorktree ?? preferredWorktree(nextProject);
     const changed = selectedProjectRef.current !== nextProject.id || selectedWorktreeRef.current !== nextWorktree.id;
     if (changed) {
@@ -1826,8 +1828,12 @@ export function App() {
 
   if (!bootstrap || !project || !worktree) return <LoadingScreen isScanning={isScanning} error={bootstrapError} onRetry={() => {
     setBootstrapError("");
-    void Promise.resolve().then(() => bootstrapLoadRef.current?.())
-      .catch((retryError) => setBootstrapError(retryError.message));
+    const retry = bootstrapLoadRef.current;
+    if (retry) {
+      retry().catch((retryError) => {
+        if (bootstrapLoadRef.current === retry) setBootstrapError(retryError.message);
+      });
+    }
   }} />;
 
   return <div className={`app-shell ${sidebarOpen ? "sidebar-is-open" : "sidebar-is-closed"}`}>
@@ -1846,10 +1852,10 @@ export function App() {
       <div className="work-area">
         <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
           <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} pendingRuns={pendingOutcomeRuns} onManage={openManageChat} />
-          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? <WindowedMessages key={conversation.id} messages={conversation.messages} messagePage={conversation.messagePage} viewportRef={messageViewportRef} restoreAnchorId={restoreMessageAnchorId} renderMessage={(message) => <Message message={message} conversationId={conversation.id} />} onFind={findConversationMessage} onCancelFind={() => { pendingFindRef.current?.abort(); pendingFindRef.current = null; activeFindMatchRef.current = null; findProgressRef.current = null; }} resetFindGeneration={findResetGeneration} /> : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{!conversation?.messagePage?.hasLater && (activeRun || pendingOutcomeRun) && !streamingText && <RunningMessage run={activeRun ?? pendingOutcomeRun} events={runEvents} outcomePending={!activeRun && outcomePending} />}</div></ScrollArea>
+          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? <WindowedMessages key={conversation.id} messages={conversation.messages} messagePage={conversation.messagePage} viewportRef={messageViewportRef} restoreAnchorId={restoreMessageAnchorId} renderMessage={(message) => <Message message={message} conversationId={conversation.id} />} onFind={findConversationMessage} onCancelFind={() => { pendingFindRef.current?.abort(); pendingFindRef.current = null; activeFindMatchRef.current = null; findProgressRef.current = null; }} resetFindGeneration={findResetGeneration} /> : waitingForConversation ? <output className="conversation-loading-status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</output> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{!conversation?.messagePage?.hasLater && (activeRun || pendingOutcomeRun) && !streamingText && <RunningMessage run={activeRun ?? pendingOutcomeRun} events={runEvents} outcomePending={!activeRun && outcomePending} />}</div></ScrollArea>
           {readingLiveText && <section className="history-live-tail" aria-label={activeRun ? "Live output while reading history" : "Recent output while reading history"} tabIndex={0}><strong>{activeRun ? "Live output" : "Recent output"}</strong><p>{readingLiveText}</p></section>}
           {conversation?.messagePage?.hasLater && <div className="history-forward"><button className="history-later" onClick={loadLaterMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading later messages…" : `Load later messages · ${conversation.messagePage.newerCount} remaining`}</button><button className="history-return" onClick={() => loadConversation({ returnToLatest: true })}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button></div>}
-          {outcomePending && <output className="recovery-notice" aria-live="polite"><WarningCircle weight="fill" /><div className="recovery-copy"><strong>Run outcome waiting for storage</strong><p>The agent process has exited. Outright is saving the final result for {pendingOutcomeRuns.length === 1 ? "run" : "runs"} {pendingOutcomeRuns.map((run, index) => <code key={run.id}>{run.id}{index < pendingOutcomeRuns.length - 1 ? ", " : ""}</code>)} and will update this chat when storage recovers.</p></div></output>}
+          {outcomePending && <output className="recovery-notice" aria-live="polite"><WarningCircle weight="fill" /><span className="recovery-copy"><strong>Run outcome waiting for storage</strong><span>The agent process has exited. Outright is saving the final result for {pendingOutcomeRuns.length === 1 ? "run" : "runs"} {pendingOutcomeRuns.map((run, index) => <code key={run.id}>{run.id}{index < pendingOutcomeRuns.length - 1 ? ", " : ""}</code>)} and will update this chat when storage recovers.</span></span></output>}
           {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}
           <form className="composer" onSubmit={sendPrompt}>{unsentCreatedChat && <div className="first-prompt-notice" role="status" aria-live="polite">Chat created, but your message was not sent. {unsentForOwner ? firstPromptAwaitingSelection ? "Open the created chat before sending again." : "Send again when the chat is ready." : "Return to its worktree before sending again."}{unsentForOwner && firstPromptAwaitingSelection && conversations.some((item) => item.id === unsentForOwner.id) && <Button type="button" variant="outline" size="sm" onClick={() => selectConversation(unsentForOwner.id)}>Open created chat</Button>}{!unsentForOwner && unsentProject && unsentWorktree && <Button type="button" variant="outline" size="sm" onClick={() => { pendingConversationRef.current = unsentCreatedChat.id; chooseProject(unsentProject, unsentWorktree); }}>Return to created chat</Button>}<Button type="button" variant="ghost" size="sm" onClick={() => { setUnsentCreatedChat(null); editDraft(""); }}>Discard unsent message</Button></div>}<textarea aria-label="Message the agent" disabled={Boolean(interruptedRun) || submissionUnavailable} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversationLoadFailed ? "Chat unavailable; retry loading…" : waitingForConversation ? "Loading selected chat…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={editDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running" role="status" aria-live="polite"><span className="status-dot demo" aria-hidden="true" />{`Agent is ${activeRun.status}`}</span> : outcomePending ? <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Saving final run outcome</span> : interruptedRun ? <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Recovery decision required</span> : waitingForConversation ? <span className="send-hint" role="status" aria-live="polite">{conversationLoadFailed ? "Chat unavailable; retry loading" : "Loading selected chat"}</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button> : outcomePending ? <Button size="icon" type="button" variant="destructive" disabled aria-label="Final run outcome pending"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun) || submissionUnavailable || firstPromptAwaitingSelection} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
         </section>
@@ -1912,6 +1918,7 @@ function RunningMessage({ run, events, outcomePending = false }) { return <artic
 // Interrupted runs surface here until the operator picks a continuation
 // policy; the preserved partial output stays visible above the notice.
 function RecoveryNotice({ run, conversation, recoveryConversation, onOpenRecovery, onResolve }) {
+  const evidenceUnreadable = run.recoveryClass?.startsWith("outcome-unreadable-");
   const classCopy = {
     "never-started": "it was still queued, so no provider process started and no side effects happened",
     exited: "its provider process exited during the restart; partial side effects may exist in the worktree",
@@ -1927,11 +1934,16 @@ function RecoveryNotice({ run, conversation, recoveryConversation, onOpenRecover
   const title = action === "discard-unverifiable"
     ? "Unverifiable legacy recovery requires cleanup"
     : ownsRecovery ? "Run interrupted by a runtime restart" : `Recovery required in ${owner?.title ?? "another chat"}`;
-  const copy = action === "discard-unverifiable"
-    ? "Outright cannot verify this legacy provider or its original worktree. After checking outside Outright that it is no longer running, discard only this recovery record to release its gate."
-    : ownsRecovery
-      ? `Reconciliation found ${classCopy}. Review the preserved partial output above, then choose how to continue before anything is retried.`
-      : "Another chat in this worktree owns an interrupted run. Open it to inspect the preserved output and choose an explicit continuation policy.";
+  let copy;
+  if (action === "discard-unverifiable") {
+    copy = "Outright cannot verify this legacy provider or its original worktree. After checking outside Outright that it is no longer running, discard only this recovery record to release its gate.";
+  } else if (ownsRecovery && evidenceUnreadable) {
+    copy = "The final result is temporarily unreadable. Outright is protecting its recovery record. Retry a decision after storage recovers; a valid result will be replayed before any new work starts.";
+  } else if (ownsRecovery) {
+    copy = `Reconciliation found ${classCopy}. Review the preserved partial output above, then choose how to continue before anything is retried.`;
+  } else {
+    copy = "Another chat in this worktree owns an interrupted run. Open it to inspect the preserved output and choose an explicit continuation policy.";
+  }
   return <div className="recovery-notice" role="alert"><WarningCircle weight="fill" /><div className="recovery-copy"><strong>{title}</strong><p>{copy}</p></div><div className="recovery-actions">{action === "discard-unverifiable" ? <Button size="sm" variant="destructive" onClick={() => onResolve(run, "discard-unverifiable")}>Discard legacy record</Button> : action === "owner" ? <><Button size="sm" disabled={!sessionId} onClick={() => onResolve(run, "resume-session")}><ArrowsClockwise />Resume session</Button><Button size="sm" variant="outline" onClick={() => onResolve(run, "retry")}>Retry from scratch</Button><Button size="sm" variant="ghost" onClick={() => onResolve(run, "discard")}>Discard</Button></> : <Button size="sm" onClick={onOpenRecovery}><ChatCircle />Open recovery chat</Button>}</div></div>;
 }
 function ToolActivity({ events }) { if (!events.length) return null; return <div className="tool-activity">{events.slice(-4).map((event) => <div key={event.id}><CheckCircle /><span>{toolLabel(event)}</span></div>)}</div>; }

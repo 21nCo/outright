@@ -227,12 +227,12 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   }
   function write(id, data) {
     const terminal = terminals.get(id);
-    if (!terminal || terminal.status !== "running" || typeof data !== "string" || Buffer.byteLength(data) > 64 * 1024) return false;
+    if (terminal?.status !== "running" || typeof data !== "string" || Buffer.byteLength(data) > 64 * 1024) return false;
     return terminal.process.write(data) !== false;
   }
   function resize(id, cols, rows) {
     const terminal = terminals.get(id);
-    if (!terminal || terminal.status !== "running") return false;
+    if (terminal?.status !== "running") return false;
     return terminal.process.resize(clamp(cols, 20, 400), clamp(rows, 5, 200)) !== false;
   }
   function startNaturalExit(terminal) {

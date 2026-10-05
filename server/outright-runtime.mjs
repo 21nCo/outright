@@ -457,6 +457,12 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         let interrupted = database.getRun(resumeRunMatch[1]);
         if (!interrupted) throw apiError(404, "Run not found");
         if (interrupted.status !== "interrupted" || interrupted.recoveryDecision) throw apiError(409, "Run is not waiting for a recovery decision");
+        const replayed = database.retryUnreadableRunOutcome(interrupted.id);
+        if (replayed?.status !== undefined && replayed.status !== "interrupted") {
+          publish({ type: "run.resolved", conversationId: replayed.conversationId, runId: replayed.id, payload: replayed });
+          return json(response, 200, replayed);
+        }
+        if (replayed) interrupted = replayed;
         const body = await readJson(request);
         const policy = body.policy;
         if (!["discard", "discard-unverifiable", "resume-session", "retry"].includes(policy)) throw apiError(400, "Recovery policy must be discard, discard-unverifiable, resume-session, or retry");
@@ -504,7 +510,13 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         // a recorded discard would clear the submission gate and let a new run
         // start while the original descendants may still mutate the same
         // worktree.
-        for (const pending of database.listUnresolvedInterruptedRunsForWorktree(interrupted.worktreePath)) {
+        for (let pending of database.listUnresolvedInterruptedRunsForWorktree(interrupted.worktreePath)) {
+          const siblingReplay = database.retryUnreadableRunOutcome(pending.id);
+          if (siblingReplay?.status !== undefined && siblingReplay.status !== "interrupted") {
+            publish({ type: "run.resolved", conversationId: siblingReplay.conversationId, runId: siblingReplay.id, payload: siblingReplay });
+            continue;
+          }
+          if (siblingReplay) pending = siblingReplay;
           // Both classes are durable proofs made during restart reconciliation.
           // Re-probing an exited row later would let an unrelated process that
           // reused the PID turn a settled fact back into an unknown/alive gate.

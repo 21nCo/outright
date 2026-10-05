@@ -80,8 +80,8 @@ test("Windows archive lock keeps two distinct zero-inode databases and their har
     });
     syncBuiltinESMExports();
     const release = acquireWindowsArchiveLock([item.filename, item.next, item.old]);
-    assert.ok(forcedStatReads >= 2, "zero-inode fallback was not exercised for both databases");
     try {
+      assert.ok(forcedStatReads >= 2, "zero-inode fallback was not exercised for both databases");
       for (const filename of [item.filename, item.old]) {
         const writer = new Database(filename);
         try {

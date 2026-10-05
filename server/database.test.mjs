@@ -74,6 +74,9 @@ test("global search bounds recent text and response bytes while keeping conversa
     assert.equal((await database.findMessagePage(current.id, "large-needle", null)).matchId, large.id);
     assert.equal(database.search("Current").conversations[0].id, current.id);
     assert.equal(database.search("recent%needle").conversations.length, 0, "LIKE wildcard was treated as query syntax");
+    database.addMessage({ conversationId: current.id, role: "assistant", body: "literal path\\needle and under_score" });
+    assert.deepEqual(database.search("path\\needle").conversations.map((item) => item.id), [current.id]);
+    assert.deepEqual(database.search("under_score").conversations.map((item) => item.id), [current.id]);
     assert.throws(() => database.search("x".repeat(257)), (error) => error.statusCode === 400);
   } finally { database.close(); }
 });
@@ -911,15 +914,43 @@ test("malformed terminal recovery evidence is isolated while valid siblings sett
     database.savePendingRunOutcome(sibling.id, { status: "completed", finishedAt: new Date().toISOString(), exitCode: 0, message: "" });
     writeFileSync(path.join(database.launchDirectory, `${run.id}.outcome.json`), "{broken");
     const result = database.reconcileInterruptedRuns({ probeAlive: () => false });
-    assert.equal(result.counts.unknown, 2);
+    assert.equal(result.counts.unknown, 1);
+    assert.equal(result.counts["never-started"], 1);
     assert.equal(result.counts.completed, 1);
     assert.equal(database.getRun(run.id).status, "interrupted");
     assert.equal(database.getRun(run.id).recoveryClass, "unknown");
-    assert.equal(database.getRun(misbound.id).recoveryClass, "unknown");
+    assert.equal(database.getRun(misbound.id).recoveryClass, "never-started");
     assert.equal(database.getRun(sibling.id).status, "completed");
     assert.ok(existsSync(path.join(database.launchDirectory, `${run.id}.outcome.json`)));
     assert.ok(existsSync(path.join(database.launchDirectory, `${misbound.id}.outcome.json`)));
     assert.equal(database.listAudit(100).filter((entry) => entry.action === "agent.run.outcome.invalid").length, 2);
+  } finally {
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a malformed queued outcome stays inspectable across restart and clears after a durable decision", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-invalid-restart-"));
+  const filename = path.join(root, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: root,
+      title: "Recovery", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "queued" });
+    const marker = path.join(database.launchDirectory, `${run.id}.outcome.json`);
+    writeFileSync(marker, "{broken");
+    assert.equal(database.reconcileInterruptedRuns().counts["never-started"], 1);
+    database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.getRun(run.id).recoveryClass, "never-started");
+    assert.equal(existsSync(marker), true);
+    assert.equal(database.resolveInterruptedRun(run.id, "discard")?.recoveryDecision, "discard");
+    assert.equal(existsSync(marker), false);
+    database.close();
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.findUnresolvedInterruptedRunForWorktree(root), undefined);
+    assert.equal(database.listAudit(100).filter((entry) => entry.action === "agent.run.outcome.invalid" && entry.target === run.id).length, 1);
   } finally {
     database.close();
     rmSync(root, { recursive: true, force: true });
