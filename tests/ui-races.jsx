@@ -5195,6 +5195,63 @@ async function pendingRunOutcomeRegression() {
   await until(() => !host.querySelector(".recovery-notice") && host.querySelector(".run-state")?.textContent.includes("completed"), "settled snapshot clears pending notice");
 }
 
+async function pendingRunWithQueuedSiblingRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  let olderStatus = "running";
+  let olderPending = false;
+  let siblingStatus = "queued";
+  const stopped = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, runs: [
+      { id: "run-queued-sibling", status: siblingStatus },
+      { id: "run-older-exited", status: olderStatus, outcomePending: olderPending },
+    ] });
+    if (url.pathname === "/api/runs/run-queued-sibling/stop" && options.method === "POST") {
+      stopped.push("run-queued-sibling");
+      siblingStatus = "stopped";
+      return response({ id: "run-queued-sibling", status: "stopped" });
+    }
+    if (url.pathname.startsWith("/api/runs/") && options.method === "POST") stopped.push(url.pathname);
+    return response({});
+  };
+  const socketsBefore = fixtureSockets.length;
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => fixtureSockets.length > socketsBefore && host.querySelector('[aria-label="Stop active agent run"]'), "queued sibling fixture");
+  const socket = fixtureSockets.at(-1);
+  socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.outcome_pending", runId: "run-older-exited", conversationId: "chat-A", reason: "storage-unavailable" }) }));
+  await until(() => host.querySelector(".recovery-notice")?.textContent.includes("run-older-exited"), "older pending run identified after live event");
+  assert(host.querySelector(".run-state")?.textContent.includes("outcome pending"), "newer queued run hid the older pending status");
+  assert(host.querySelector(".conversation-meta")?.textContent.includes("queued") && host.querySelector(".conversation-meta")?.textContent.includes("outcome pending"), "chat header did not show both run states");
+  assert(host.querySelector(".send-hint")?.textContent.includes("Agent is queued"), "composer mislabeled the queued sibling as exited");
+  assert(!host.querySelector('[aria-label="Stop active agent run"]')?.disabled, "older pending result disabled queued sibling cancellation");
+  host.querySelector('[aria-label="Stop active agent run"]').click();
+  await until(() => stopped.length, "queued sibling stop requested");
+  assert(stopped.length === 1 && stopped[0] === "run-queued-sibling", "Stop targeted the exited run instead of the queued sibling");
+  socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", runId: "run-queued-sibling", conversationId: "chat-A", payload: { type: "run.stopped" } }) }));
+  await until(() => host.querySelector('[aria-label="Final run outcome pending"]')?.disabled, "queued sibling stopped while older result remains pending");
+  assert(host.querySelector(".recovery-notice")?.textContent.includes("run-older-exited"), "sibling cancellation cleared the older result notice");
+  olderStatus = "completed";
+  socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", runId: "run-older-exited", conversationId: "chat-A", payload: { type: "run.completed" } }) }));
+  await until(() => !host.querySelector(".recovery-notice") && host.querySelector(".run-state")?.textContent.includes("stopped"), "older durable result clears only its notice");
+
+  root.render(null); await settle();
+  olderStatus = "running";
+  olderPending = true;
+  siblingStatus = "queued";
+  const nextSocketsBefore = fixtureSockets.length;
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => fixtureSockets.length > nextSocketsBefore
+    && host.querySelector(".recovery-notice")?.textContent.includes("run-older-exited"), "fresh snapshot identifies older pending result");
+  assert(host.querySelector(".run-state")?.textContent.includes("outcome pending") && host.querySelector('[aria-label="Stop active agent run"]'), "fresh snapshot did not retain pending and queued sibling states");
+  olderStatus = "completed";
+  olderPending = false;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await until(() => !host.querySelector(".recovery-notice") && host.querySelector(".run-state")?.textContent.includes("queued"), "durable snapshot clears only the older pending result");
+}
+
 try {
   const steps = [
     ["current conversation send", () => chatRace(false, false), "sending in the current conversation shows its run"],
@@ -5302,6 +5359,7 @@ try {
     ["find in-flight event", findInFlightEventRegression, "an event during find remains reachable when the returned page claims to be latest"],
     ["typing during prepend", typingDuringPrependRegression, "editing a find query does not silently cancel an earlier-page request"],
     ["pending run outcome", pendingRunOutcomeRegression, "a storage-pending final outcome is announced only in its chat and clears on terminal commit"],
+    ["pending run with queued sibling", pendingRunWithQueuedSiblingRegression, "an older exited run stays identifiable while its queued sibling can be canceled"],
     ["provider bootstrap convergence", providerBootstrapConvergenceRegression, "a checking bootstrap converges after an earlier provider event"],
     ["bootstrap maintenance retry", bootstrapMaintenanceRetryRegression, "a transient archive cutover resumes initial loading"],
     ["bootstrap hard failures", bootstrapHardFailureRegression, "authorization, server, and network failures surface once"],
