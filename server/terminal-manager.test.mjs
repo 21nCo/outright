@@ -567,7 +567,7 @@ test("restart reconciles an empty native owner but keeps legacy unknown reservat
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("a per-worktree recovery reservation retries native proof before rejecting a new terminal", async () => {
+test("a per-worktree recovery reservation retries native proof after prompt refusal", async () => {
   const cwd = "/tmp/outright-reservation-retry";
   const target = "54d20348-0790-4ba8-b888-e05887e4844c";
   let reservations = [{ target, cwd, pid: 123 }];
@@ -582,13 +582,70 @@ test("a per-worktree recovery reservation retries native proof before rejecting 
     recoverTerminal: async () => ++probes > 1,
     startManagedTerminal: async () => ({ pid: 456, onData() {}, onExit() {}, terminate: async () => {} }) });
   await assert.rejects(manager.create({ cwd }), (error) => error.statusCode === 429);
-  assert.equal(probes, 1, "the first full-worktree admission did not retry native verification");
+  await waitFor(() => probes === 1);
   assert.equal(manager.capacity().unknown, 1);
+  await assert.rejects(manager.create({ cwd }), (error) => error.statusCode === 429);
+  await waitFor(() => manager.capacity().unknown === 0);
+  assert.equal(probes, 2, "a later admission did not retry a transient helper failure");
   const created = await manager.create({ cwd });
-  assert.equal(probes, 2, "the next admission did not retry a transient helper failure");
   assert.equal(created.status, "running");
   assert.equal(manager.capacity().unknown, 0);
   await manager.shutdown();
+});
+
+test("full global and worktree capacity refuse repeated concurrent creates while native proof is slow", async () => {
+  for (const scope of ["global", "worktree"]) {
+    const cwd = "/tmp/outright-slow-owner";
+    const reservations = Array.from({ length: scope === "global" ? 12 : 4 }, (_, index) =>
+      ({ target: `slow-owner-${index}`, cwd: scope === "global" ? `${cwd}-${index % 3}` : cwd }));
+    let releaseProof;
+    const proof = new Promise((resolve) => { releaseProof = resolve; });
+    let probes = 0;
+    let admissions = 0;
+    const manager = createTerminalManager({ maxTerminals: 12, maxTerminalsPerCwd: 4,
+      database: { launchDirectory: "/tmp", terminalUnknownReservations: () => reservations,
+        auditAdmission: () => { admissions += 1; } }, publish: () => {},
+      recoverTerminal: async () => { probes += 1; await proof; return false; },
+      startManagedTerminal: async () => { throw new Error("full capacity reached spawn"); } });
+    try {
+      const requests = Array.from({ length: 8 }, () => manager.create({ cwd }));
+      const prompt = await Promise.race([
+        Promise.allSettled(requests).then(() => true),
+        new Promise((resolve) => setTimeout(() => resolve(false), 150)),
+      ]);
+      assert.equal(prompt, true, `${scope} admission waited for native ownership proof`);
+      for (const result of await Promise.allSettled(requests)) {
+        assert.equal(result.status, "rejected");
+        assert.equal(result.reason.statusCode, 429);
+      }
+      assert.equal(admissions, 0);
+      assert.equal(manager.capacity().unknown, reservations.length);
+      assert.ok(probes > 0 && probes <= 4, "recovery helpers exceeded the bounded parallel limit");
+      await manager.shutdown();
+      releaseProof();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(manager.capacity().unknown, reservations.length,
+        "late native proof released capacity after shutdown");
+    } finally { releaseProof(); await manager.shutdown(); }
+  }
+});
+
+test("verified native owner releases capacity without a new create request", async () => {
+  const cwd = "/tmp/outright-verified-owner";
+  const reservations = [{ target: "verified-owner", cwd }];
+  const events = [];
+  const manager = createTerminalManager({ maxTerminals: 1, maxTerminalsPerCwd: 1,
+    database: { launchDirectory: "/tmp", terminalUnknownReservations: () => reservations,
+      resolveTerminalUnknown: () => { reservations.length = 0; },
+      auditAdmission() {}, auditCritical() {}, auditRequired: async () => {} },
+    publish: (event) => events.push(event), recoverTerminal: async () => true,
+    startManagedTerminal: async () => ({ pid: 456, onData() {}, onExit() {}, terminate: async () => {} }) });
+  try {
+    await assert.rejects(manager.create({ cwd }), (error) => error.statusCode === 429);
+    await waitFor(() => manager.capacity().unknown === 0);
+    assert.ok(events.some((event) => event.type === "capacity.changed"));
+    assert.equal((await manager.create({ cwd })).status, "running");
+  } finally { await manager.shutdown(); }
 });
 
 test("partial recovery does not count a live terminal's audit reservation twice", async () => {

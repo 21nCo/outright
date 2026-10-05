@@ -22,7 +22,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   let publish;
   let runtimeCapacity;
   let shuttingDown = false;
-  let terminalAuditReconciliation = Promise.resolve();
   const database = databaseFactory({ runtimeLease: true, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, onMigrationComplete: () => {
     agents.resumeQueued();
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
@@ -34,7 +33,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   }, onTerminalAuditReconciled: () => {
     if (shuttingDown || !terminals) return;
     terminals.reloadUnknownReservations();
-    terminalAuditReconciliation = terminals.reconcileUnknown().then(() => {
+    void terminals.reconcileUnknown().then(() => {
       if (!shuttingDown) publish({ type: "capacity.changed", payload: runtimeCapacity() });
     })
       .catch((error) => { if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:terminal-recovery]", error); });
@@ -102,7 +101,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required");
     };
   } });
-  terminalAuditReconciliation = terminals.reconcileUnknown().then((resolved) => {
+  void terminals.reconcileUnknown().then((resolved) => {
     if (resolved && !shuttingDown) publish({ type: "capacity.changed", payload: runtimeCapacity() });
   }).catch(() => {});
 
@@ -746,7 +745,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         throw error;
       }
       await inFlightScan?.catch(() => {});
-      await terminalAuditReconciliation;
+      // Native-owner probes may remain slow or stuck. Terminal shutdown fences
+      // their late results before the database lease is released.
       try { await terminals.shutdown(); }
       catch (error) { shutdownErrors.push(error); }
       eventHub.shutdown();

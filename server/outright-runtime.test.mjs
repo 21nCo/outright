@@ -1492,11 +1492,13 @@ test("large terminal audit recovery refreshes runtime capacity after startup", a
   }
 });
 
-test("shutdown waits for a native terminal recovery started by the audit scan", async () => {
+test("shutdown fences a stuck native recovery and releases the lease for a successor", async () => {
   const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-runtime-audit-shutdown-"));
   const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
   process.env.OUTRIGHT_DATA_DIR = dataDirectory;
   let runtime;
+  let successor;
+  let finishRecovery;
   try {
     const target = "54d20348-0790-4ba8-b888-e05887e48452";
     const seed = createOutrightDatabase();
@@ -1504,7 +1506,6 @@ test("shutdown waits for a native terminal recovery started by the audit scan", 
     await seed.close();
     let markRecoveryStarted;
     const recoveryStarted = new Promise((resolve) => { markRecoveryStarted = resolve; });
-    let finishRecovery;
     const recoveryResult = new Promise((resolve) => { finishRecovery = resolve; });
     runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json",
       terminalManagerFactory: (options) => createTerminalManager({ ...options, recoverTerminal: () => {
@@ -1512,17 +1513,21 @@ test("shutdown waits for a native terminal recovery started by the audit scan", 
         return recoveryResult;
       } }) });
     await recoveryStarted;
-    let shutdownSettled = false;
-    const shutdown = runtime.shutdown().then(() => { shutdownSettled = true; });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(shutdownSettled, false, "shutdown cannot close SQLite while native recovery owns an audit outcome");
+    await Promise.race([runtime.shutdown(), new Promise((_, reject) => setTimeout(() => reject(new Error("shutdown waited for native proof")), 250))]);
+    successor = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json",
+      terminalManagerFactory: (options) => createTerminalManager({ ...options, recoverTerminal: async () => false }) });
+    assert.equal(successor.terminals.capacity().unknown, 1);
     finishRecovery(true);
-    await shutdown;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(successor.terminals.capacity().unknown, 1,
+      "the closed runtime released a reservation after its lease moved to a successor");
     const writer = new Database(path.join(dataDirectory, "outright.db"), { readonly: true });
     try {
-      assert.equal(writer.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.recovered' AND target = ?").get(target).count, 1);
+      assert.equal(writer.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.recovered' AND target = ?").get(target).count, 0);
     } finally { writer.close(); }
   } finally {
+    finishRecovery?.(false);
+    await successor?.shutdown();
     await runtime?.shutdown();
     if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR;
     else process.env.OUTRIGHT_DATA_DIR = previousDataDir;

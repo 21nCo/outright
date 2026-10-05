@@ -17,6 +17,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     .filter((entry) => !terminals.has(entry.target));
   let reservedUnknown = unresolvedReservations();
   let reconciliationPromise;
+  let shuttingDown = false;
   // Old audit records may lack a worktree path. Charge their unknown owner
   // against every worktree until native proof or operator recovery clears it.
   const reservedForCwd = (cwd) => reservedUnknown.filter((entry) => !entry.cwd || entry.cwd === cwd).length;
@@ -32,23 +33,28 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   }
 
   function reconcileUnknown() {
-    if (database.terminalAuditScanPending) return Promise.resolve(0);
+    if (shuttingDown || database.terminalAuditScanPending) return Promise.resolve(0);
     if (reconciliationPromise) return reconciliationPromise;
     reconciliationPromise = (async () => {
       let resolved = 0;
-      for (const entry of reservedUnknown) {
-        try {
-          const empty = await recoverTerminal({ ...entry, launchDirectory: database.launchDirectory, subprocesses });
-          if (!empty) continue;
-          cleanupTerminalSocket(entry.target);
-          database.resolveTerminalUnknown(entry.target, `Native ${process.platform} owner was verified empty after restart`);
-          resolved += 1;
-        } catch { /* A refused helper or unavailable audit keeps capacity unknown. */ }
-      }
-      if (resolved) {
-        reservedUnknown = unresolvedReservations();
-        publish({ type: "capacity.changed" });
-      }
+      const entries = [...reservedUnknown];
+      let next = 0;
+      // Native proof can take seconds. Limit simultaneous helpers while letting
+      // independent owners progress without serializing the entire inventory.
+      await Promise.all(Array.from({ length: Math.min(4, entries.length) }, async () => {
+        while (!shuttingDown && next < entries.length) {
+          const entry = entries[next++];
+          try {
+            const empty = await recoverTerminal({ ...entry, launchDirectory: database.launchDirectory, subprocesses });
+            if (!empty || shuttingDown) continue;
+            database.resolveTerminalUnknown(entry.target, `Native ${process.platform} owner was verified empty after restart`);
+            cleanupTerminalSocket(entry.target);
+            reservedUnknown = unresolvedReservations();
+            resolved += 1;
+            publish({ type: "capacity.changed" });
+          } catch { /* A refused helper or unavailable audit keeps capacity unknown. */ }
+        }
+      }));
       return resolved;
     })().finally(() => { reconciliationPromise = null; });
     return reconciliationPromise;
@@ -69,7 +75,9 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     if (reservedUnknown.length && (terminals.size + reservedUnknown.length >= maxTerminals
       || [...terminals.values()].filter((terminal) => terminal.cwd === input.cwd).length
         + reservedForCwd(input.cwd) >= maxTerminalsPerCwd)) {
-      await reconcileUnknown();
+      // Refuse promptly at capacity. The proof runs in the background and
+      // publishes capacity when a subsequent request can safely be admitted.
+      void reconcileUnknown().catch(() => {});
     }
     assertCapacity(input.cwd);
     const { cwd, name, cols = 100, rows = 30 } = input;
@@ -276,6 +284,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   // Reap every PTY even when storage is unavailable during archive maintenance.
   // A failed audit leaves terminal.created pending for lease-owned recovery.
   async function shutdown() {
+    shuttingDown = true;
     const results = await Promise.allSettled([...terminals.values()].map((terminal) => Promise.resolve().then(async () => {
       try { await close(terminal.id); }
       catch (error) {
