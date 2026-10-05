@@ -14,7 +14,7 @@ export function terminalOwnership(id, launchDirectory) {
   const token = randomUUID();
   const socketDirectory = process.platform === "win32" ? null : privateSocketDirectory();
   return { label: `com.21n.outright.terminal.${id}`, token,
-    address: process.platform === "win32" ? `\\\\.\\pipe\\outright-terminal-${id}` : path.join(socketDirectory, `${id}.sock`),
+    address: process.platform === "win32" ? String.raw`\\.\pipe\outright-terminal-${id}` : path.join(socketDirectory, `${id}.sock`),
     handshakePath: path.join(launchDirectory, `terminal-${id}.json`) };
 }
 
@@ -109,8 +109,16 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
     pid: child.pid,
     onData(callback) { onData = callback; if (earlyData) { callback(earlyData); earlyData = ""; } },
     onExit(callback) { onExit = callback; if (finalResult) callback(finalResult); },
-    write(data) { if (!socket || socket.destroyed || socket.writableLength > 256 * 1024) return false; socket.write(`${JSON.stringify({ type: "write", data })}\n`); return true; },
-    resize(nextCols, nextRows) { if (!socket || socket.destroyed || socket.writableLength > 256 * 1024) return false; socket.write(`${JSON.stringify({ type: "resize", cols: nextCols, rows: nextRows })}\n`); return true; },
+    write(data) {
+      if (!socket || socket.destroyed || socket.writableLength > 256 * 1024) return false;
+      socket.write(`${JSON.stringify({ type: "write", data })}\n`);
+      return true;
+    },
+    resize(nextCols, nextRows) {
+      if (!socket || socket.destroyed || socket.writableLength > 256 * 1024) return false;
+      socket.write(`${JSON.stringify({ type: "resize", cols: nextCols, rows: nextRows })}\n`);
+      return true;
+    },
     async terminate() {
       if (!closed) {
         child.stdin.write("stop\n");

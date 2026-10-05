@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createTerminalManager } from "./terminal-manager.mjs";
-import { recoverManagedTerminal } from "./managed-terminal.mjs";
+import { cleanupTerminalSocket, recoverManagedTerminal, terminalOwnership } from "./managed-terminal.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 import { AUDIT_RETENTION_LIMIT, auditTrimSql, trimAudit, trimAuditPage } from "./audit-retention.mjs";
@@ -12,6 +12,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
+import { createServer } from "node:net";
+import { randomUUID } from "node:crypto";
 
 test("creates a PTY, accepts input, and retains reconnectable output", async () => {
   const events = [];
@@ -181,15 +183,23 @@ test("a close that cannot record its outcome reports the pending operation", asy
     },
     auditRequired: async (action) => { if (action === "terminal.closed" && auditUnavailable) throw Object.assign(new Error("storage interrupted"), { code: "SQLITE_BUSY" }); },
   }, spawnTerminal: () => ({ pid: 42, onData() {}, onExit() {}, kill() { killed = true; } }), terminate: async (terminal) => { terminal.process.kill(); } });
-  const terminal = manager.create({ cwd: "/tmp/w" });
-  await assert.rejects(manager.close(terminal.id), (error) =>
-    error.statusCode === 503 && error.details?.outcomeUnknown === true && Boolean(error.details.operationId));
-  assert.equal(killed, true);
-  assert.equal(manager.get(terminal.id)?.status, "unknown");
-  assert.ok(actions.some((entry) => entry.action === "terminal.close.requested"));
-  auditUnavailable = false;
-  await manager.shutdown();
-  assert.equal(manager.capacity().active, 0);
+  let assertionFailure;
+  try {
+    const terminal = manager.create({ cwd: "/tmp/w" });
+    await assert.rejects(manager.close(terminal.id), (error) =>
+      error.statusCode === 503 && error.details?.outcomeUnknown === true && Boolean(error.details.operationId));
+    assert.equal(killed, true);
+    assert.equal(manager.get(terminal.id)?.status, "unknown");
+    assert.ok(actions.some((entry) => entry.action === "terminal.close.requested"));
+    auditUnavailable = false;
+    await manager.shutdown();
+    assert.equal(manager.capacity().active, 0);
+  } catch (error) { assertionFailure = error; throw error; }
+  finally {
+    auditUnavailable = false;
+    try { await manager.shutdown(); }
+    catch (cleanupError) { if (!assertionFailure) throw cleanupError; }
+  }
 });
 
 test("failed close admission still terminates and records a durable terminal outcome", async () => {
@@ -248,13 +258,16 @@ test("a rejected managed launch retains a retryable teardown owner through shutd
 test("closing keeps the process slot until termination is verified; unknown termination keeps it charged", async () => {
   let finishTermination;
   let failTermination = false;
+  let cleaningUp = false;
   const actions = [];
   const manager = createTerminalManager({ maxTerminals: 1, maxTerminalsPerCwd: 1,
     database: { auditAdmission: (action) => actions.push(action), auditCritical: (action) => actions.push(action), auditRequired: async () => {} },
     publish: () => {},
     spawnTerminal: () => ({ pid: 99999, onData() {}, onExit() {}, kill() {} }),
-    terminate: () => new Promise((resolve, reject) => { finishTermination = () => failTermination ? reject(new Error("still alive")) : resolve(); }),
+    terminate: () => cleaningUp ? Promise.resolve() : new Promise((resolve, reject) => { finishTermination = () => failTermination ? reject(new Error("still alive")) : resolve(); }),
   });
+  let assertionFailure;
+  try {
   const first = manager.create({ cwd: "/tmp/one" });
   const closing = manager.close(first.id);
   await Promise.resolve();
@@ -278,6 +291,14 @@ test("closing keeps the process slot until termination is verified; unknown term
   assert.equal(await retry, true);
   assert.equal(manager.list().length, 0);
   await manager.shutdown();
+  } catch (error) { assertionFailure = error; throw error; }
+  finally {
+    cleaningUp = true;
+    failTermination = false;
+    finishTermination?.();
+    try { await manager.shutdown(); }
+    catch (cleanupError) { if (!assertionFailure) throw cleanupError; }
+  }
 });
 
 test("failed created audit releases capacity after verified cleanup and durable failure", async () => {
@@ -605,7 +626,7 @@ test("full global and worktree capacity refuse repeated concurrent creates while
     const manager = createTerminalManager({ maxTerminals: 12, maxTerminalsPerCwd: 4,
       database: { launchDirectory: "/tmp", terminalUnknownReservations: () => reservations,
         auditAdmission: () => { admissions += 1; } }, publish: () => {},
-      recoverTerminal: async () => { probes += 1; await proof; return false; },
+      recoverTerminal: async () => { probes += 1; await proof; return true; },
       startManagedTerminal: async () => { throw new Error("full capacity reached spawn"); } });
     try {
       const requests = Array.from({ length: 8 }, () => manager.create({ cwd }));
@@ -646,6 +667,67 @@ test("verified native owner releases capacity without a new create request", asy
     assert.ok(events.some((event) => event.type === "capacity.changed"));
     assert.equal((await manager.create({ cwd })).status, "running");
   } finally { await manager.shutdown(); }
+});
+
+test("socket cleanup failure retains unknown capacity until a later verified retry", async () => {
+  const cwd = "/tmp/outright-socket-recovery";
+  const reservations = [{ target: "00000000-0000-4000-8000-000000000004", cwd }];
+  let unlinkFails = true;
+  let nativeProofs = 0;
+  const manager = createTerminalManager({ maxTerminals: 1, maxTerminalsPerCwd: 1,
+    database: { launchDirectory: "/tmp", terminalUnknownReservations: () => reservations,
+      resolveTerminalUnknown: () => { reservations.length = 0; },
+      auditAdmission() {}, auditCritical() {}, auditRequired: async () => {} },
+    publish: () => {}, recoverTerminal: async () => { nativeProofs += 1; return true; },
+    cleanupSocket: () => { if (unlinkFails) throw Object.assign(new Error("socket locked"), { code: "EPERM" }); },
+    startManagedTerminal: async () => ({ pid: 456, onData() {}, onExit() {}, terminate: async () => {} }) });
+  try {
+    assert.equal(await manager.reconcileUnknown(), 0);
+    assert.equal(manager.capacity().unknown, 1);
+    await assert.rejects(manager.create({ cwd }), (error) => error.statusCode === 429);
+    await manager.reconcileUnknown();
+    unlinkFails = false;
+    assert.equal(await manager.reconcileUnknown(), 1);
+    assert.equal(manager.capacity().unknown, 0);
+    assert.ok(nativeProofs >= 2);
+    assert.equal((await manager.create({ cwd })).status, "running");
+  } finally { await manager.shutdown(); }
+});
+
+test("a real stale Unix socket remains charged until unlink succeeds", { skip: process.platform === "win32" }, async () => {
+  const cwd = process.cwd();
+  const target = randomUUID();
+  const address = terminalOwnership(target, cwd).address;
+  const socket = createServer();
+  const reservations = [{ target, cwd }];
+  let unlinkFails = true;
+  let manager;
+  try {
+    await new Promise((resolve, reject) => {
+      socket.once("error", reject);
+      socket.listen(address, resolve);
+    });
+    manager = createTerminalManager({ maxTerminals: 1, maxTerminalsPerCwd: 1,
+      database: { launchDirectory: cwd, terminalUnknownReservations: () => reservations,
+        resolveTerminalUnknown: () => { reservations.length = 0; },
+        auditAdmission() {}, auditCritical() {}, auditRequired: async () => {} },
+      publish: () => {}, recoverTerminal: async () => true,
+      cleanupSocket: (id) => {
+        if (unlinkFails) throw Object.assign(new Error("socket unlink refused"), { code: "EPERM" });
+        cleanupTerminalSocket(id);
+      } });
+    assert.equal(await manager.reconcileUnknown(), 0);
+    assert.equal(manager.capacity().unknown, 1);
+    assert.equal(existsSync(address), true);
+    unlinkFails = false;
+    assert.equal(await manager.reconcileUnknown(), 1);
+    assert.equal(manager.capacity().unknown, 0);
+    assert.equal(existsSync(address), false);
+  } finally {
+    await manager?.shutdown();
+    await new Promise((resolve) => socket.close(resolve));
+    cleanupTerminalSocket(target);
+  }
 });
 
 test("partial recovery does not count a live terminal's audit reservation twice", async () => {

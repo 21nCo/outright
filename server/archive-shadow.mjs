@@ -1,7 +1,6 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import fs from "node:fs";
-import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import fs, { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { acquireWindowsArchiveLock, sameWindowsArchiveFile } from "./archive-windows-lock.mjs";
 
@@ -674,7 +673,10 @@ export function allocatedDatabaseUsage(filename) {
   const sqliteFiles = [filename, next, old].flatMap((name) => [name, `${name}-wal`, `${name}-shm`, `${name}-journal`]);
   const inspect = (part) => {
     try { return fs.lstatSync(part); }
-    catch (error) { if (error.code === "ENOENT") return null; throw error; }
+    catch (error) {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    }
   };
   try {
     const sourceBefore = inspect(filename);

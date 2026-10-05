@@ -7,7 +7,10 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
   const git = (cwd, args, overrides = {}) => runGit(subprocesses, cwd, args, overrides);
   const safeGit = async (cwd, args, overrides = {}) => {
     try { return await git(cwd, args, overrides); }
-    catch (error) { if (error.code === "SUBPROCESS_CAPACITY" || mutationOutcomeUncertain(error)) throw error; return ""; }
+    catch (error) {
+      if (error.code === "SUBPROCESS_CAPACITY" || mutationOutcomeUncertain(error)) throw error;
+      return "";
+    }
   };
   const optionalGit = async (cwd, args) => {
     try { return await git(cwd, args); }
@@ -15,7 +18,10 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
   };
   const gitOutputOnFailure = async (cwd, args) => {
     try { return await git(cwd, args, { maxBuffer: 12 * 1024 * 1024 }); }
-    catch (error) { if (error.code === "SUBPROCESS_CAPACITY" || mutationOutcomeUncertain(error)) throw error; return (error.stdout ?? "").trimEnd(); }
+    catch (error) {
+      if (error.code === "SUBPROCESS_CAPACITY" || mutationOutcomeUncertain(error)) throw error;
+      return (error.stdout ?? "").trimEnd();
+    }
   };
   const headIsUnborn = async (cwd) => {
     const headRef = await git(cwd, ["symbolic-ref", "--quiet", "HEAD"]);

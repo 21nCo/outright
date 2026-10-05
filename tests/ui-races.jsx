@@ -2359,6 +2359,7 @@ async function commandPaletteRegression() {
     }
     if (search === "stale-failure") return staleFailure.promise;
     if (search === "none") return response({ conversations: [], partial: true });
+    if (search === "mixed") return response({ conversations: [], partial: true });
     if (search === "complete") return response({ conversations: [
       { id: "first", title: "First", provider: "codex", worktreePath: "/first" },
       { id: "second", title: "Second", provider: "codex", worktreePath: "/second" }], partial: false });
@@ -2380,7 +2381,7 @@ async function commandPaletteRegression() {
   currentResults.resolve(response({ conversations: [{ id: "current", title: "Current result", provider: "codex", worktreePath: "/current" }], partial: true }));
   await until(() => document.querySelector('[role="option"]')?.textContent.includes("Current result"), "current command result");
   assert(document.querySelector(".command-search-scope")?.textContent.includes("recent conversations"), "bounded search was not explained");
-  assert(document.querySelector('.command-results [role="status"]')?.textContent.includes("recent conversations and short messages"),
+  assert(document.querySelector('.command-results [role="status"]')?.textContent.includes("Conversation text covers recent conversations and short messages"),
     "partial search scope was absent from the result announcement");
   assert(document.querySelector('.command-results [role="status"]')?.textContent.startsWith("1 result is available"),
     "partial search did not announce its visible result count");
@@ -2390,8 +2391,14 @@ async function commandPaletteRegression() {
   assert([...document.querySelector('[role="listbox"]').children].every((element) => element.getAttribute("role") === "option"), "Command listbox contains non-option children");
 
   setControlValue(input, "none");
-  await until(() => document.querySelector('.command-results [role="status"]')?.textContent.startsWith("No matches in recent conversations"),
+  await until(() => document.querySelector('.command-results [role="status"]')?.textContent.startsWith("No matching projects, worktrees"),
     "partial search with zero matches incorrectly announced available results");
+  root.render(<CommandPalette open onOpenChange={() => {}} projects={[{ id: "mixed-project", name: "Mixed", worktrees: [] }]} onSelectProject={() => {}} onSelectConversation={(conversation) => { selected = conversation; }} />);
+  setControlValue(document.querySelector('[role="combobox"]'), "mixed");
+  await until(() => document.querySelector('.command-results [role="status"]')?.textContent.includes("Conversation text covers recent conversations"),
+    "mixed-source partial search scope");
+  assert(document.querySelector('.command-results [role="status"]').textContent.startsWith("1 result is available."),
+    "local project result was attributed to partial conversation text");
   setControlValue(input, "complete");
   await until(() => document.querySelector('.command-results [role="status"]')?.textContent === "2 results are available",
     "completed search omitted its visible result count");

@@ -9,13 +9,19 @@ const RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const MAX_RECORD_BYTES = 2 * 1024 * 1024;
 const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
-function validTranscriptTimestamp(createdAt, finishedAt) {
+function invalidRunOutcome(runId) {
+  const error = new Error(`Invalid run outcome record: ${runId}`);
+  error.code = "OUTRIGHT_INVALID_RUN_OUTCOME";
+  return error;
+}
+
+function validTranscriptTimestamp(createdAt, finishedAt, checkCurrentClock = false) {
   if (typeof createdAt !== "string") return false;
   const created = Date.parse(createdAt);
   const finished = Date.parse(finishedAt);
   return Number.isFinite(created) && Number.isFinite(finished)
     && created <= finished + MAX_CLOCK_SKEW_MS
-    && created <= Date.now() + MAX_CLOCK_SKEW_MS;
+    && (!checkCurrentClock || created <= Date.now() + MAX_CLOCK_SKEW_MS);
 }
 
 function recordPath(directory, runId) {
@@ -32,7 +38,7 @@ function syncDirectory(directory) {
 
 export function saveRunOutcome(directory, runId, outcome) {
   const destination = recordPath(directory, runId);
-  if (outcome.transcriptMessage && !validTranscriptTimestamp(outcome.transcriptMessage.createdAt, outcome.finishedAt)) {
+  if (outcome.transcriptMessage && !validTranscriptTimestamp(outcome.transcriptMessage.createdAt, outcome.finishedAt, true)) {
     throw new Error("Invalid run outcome transcript timestamp");
   }
   const base = { ...outcome, version: 2, runId,
@@ -72,11 +78,14 @@ export function readRunOutcome(directory, runId) {
   const filename = recordPath(directory, runId);
   let stat;
   try { stat = lstatSync(filename); }
-  catch (error) { if (error.code === "ENOENT") return null; throw error; }
-  if (!stat.isFile() || stat.size > MAX_RECORD_BYTES) throw new Error(`Invalid run outcome record: ${runId}`);
+  catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!stat.isFile() || stat.size > MAX_RECORD_BYTES) throw invalidRunOutcome(runId);
   let record;
   try { record = JSON.parse(readFileSync(filename, "utf8")); }
-  catch { throw new Error(`Invalid run outcome record: ${runId}`); }
+  catch { throw invalidRunOutcome(runId); }
   if (![1, 2].includes(record?.version) || record.runId !== runId
     || !["completed", "failed", "stopped"].includes(record.status)
     || typeof record.finishedAt !== "string" || !Number.isFinite(Date.parse(record.finishedAt))
@@ -94,7 +103,7 @@ export function readRunOutcome(directory, runId) {
         || typeof record.transcriptMessage.body !== "string"
         || typeof record.transcriptMessage.conversationId !== "string"
         || !validTranscriptTimestamp(record.transcriptMessage.createdAt, record.finishedAt)))))) {
-    throw new Error(`Invalid run outcome record: ${runId}`);
+    throw invalidRunOutcome(runId);
   }
   return record;
 }

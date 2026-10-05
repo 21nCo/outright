@@ -8,13 +8,18 @@ import { api, query as buildQuery } from "@/lib/runtime-api";
 function searchAnnouncement(query, remote, resultCount, partial, error) {
   if (!query) return "Type to search";
   if (remote.loading) return "Searching";
-  if (error) return resultCount
-    ? `Conversation search failed. ${resultCount} local ${resultCount === 1 ? "result is" : "results are"} available. Retry search available.`
-    : "Search failed. Retry search available.";
-  if (partial) return resultCount
-    ? `${resultCount} ${resultCount === 1 ? "result is" : "results are"} available from recent conversations and short messages. Open a conversation to search older or larger text.`
-    : "No matches in recent conversations or short messages. Open a conversation to search older or larger text.";
-  return resultCount ? `${resultCount} ${resultCount === 1 ? "result is" : "results are"} available` : "No matching results";
+  let count = `${resultCount} results are available`;
+  if (resultCount === 1) count = "1 result is available";
+  if (error) {
+    if (!resultCount) return "Search failed. Retry search available.";
+    return `Conversation search failed. ${count} locally. Retry search available.`;
+  }
+  if (partial) {
+    if (!resultCount) return "No matching projects, worktrees, or recent conversation text. Open a conversation to search older or larger text.";
+    return `${count}. Conversation text covers recent conversations and short messages. Open a conversation to search older or larger text.`;
+  }
+  if (!resultCount) return "No matching results";
+  return count;
 }
 
 export function CommandPalette({ open, onOpenChange, projects, onSelectProject, onSelectConversation }) {

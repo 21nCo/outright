@@ -92,7 +92,12 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       // The first shutdown may have failed while both SQLite and its outcome
       // journal refused writes. Once an exited result commits, resume the
       // finalizer without asking Vite or a signal handler to call it again.
-      if (shuttingDown) void shutdown().catch((error) => console.error("Runtime shutdown recovery failed", error));
+      if (shuttingDown) {
+        // A recovery callback may arrive before the first shutdown promise
+        // rejects and releases its retry owner. Join it, then retry once.
+        void Promise.resolve(shutdownPromise).catch(() => {}).then(() => shutdown())
+          .catch((error) => console.error("Runtime shutdown recovery failed", error));
+      }
     },
     onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }), validateConversation: async (conversation) => {
     const target = await resolveWorktreeTarget(conversation);
@@ -777,10 +782,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     // shutdown. Stop startup-owned managers before releasing the physical
     // lease. The constructor is synchronous; no agent or PTY has been admitted.
     const cleanupErrors = [];
-    try { eventHub?.shutdown(); } catch (failure) { cleanupErrors.push(failure); }
-    try { wss?.close(); } catch (failure) { cleanupErrors.push(failure); }
+    try { eventHub?.shutdown(); } catch (error_) { cleanupErrors.push(error_); }
+    try { wss?.close(); } catch (error_) { cleanupErrors.push(error_); }
     try { database.closeFailedStartup(); }
-    catch (failure) { cleanupErrors.push(failure); }
+    catch (error_) { cleanupErrors.push(error_); }
     if (cleanupErrors.length) throw new AggregateError([error, ...cleanupErrors], "Runtime startup and cleanup failed");
     throw error;
   }

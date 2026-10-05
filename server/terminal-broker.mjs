@@ -68,8 +68,8 @@ const server = net.createServer((socket) => {
     if (omittedChars) {
       const count = omittedChars;
       omittedChars = 0;
-      if (!socket.write(`${JSON.stringify({ type: "data",
-        data: `\u001b[0m\r\n[Outright: ${count} terminal output characters omitted]\r\n` })}\n`)) {
+      const notice = `\u001b[0m\r\n[Outright: ${count} terminal output characters omitted]\r\n`;
+      if (!socket.write(`${JSON.stringify({ type: "data", data: notice })}\n`)) {
         pauseOutput();
         return;
       }

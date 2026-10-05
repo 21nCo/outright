@@ -36,17 +36,23 @@ test("Windows archive lock bounds native owner probes while release is delayed",
   try {
     const release = acquireWindowsArchiveLock([item.filename]);
     let probes = 0;
+    const probeTimes = [];
     const until = Date.now() + 1000;
     childProcess.spawnSync = (command, args, options) => {
       if (args?.[0] === "--probe") {
         probes += 1;
+        probeTimes.push(performance.now());
         if (Date.now() < until) return { status: 0, stdout: "alive\n" };
       }
       return originalSpawnSync(command, args, options);
     };
     syncBuiltinESMExports();
     release();
-    assert.ok(probes > 0 && probes <= 20, `release spawned ${probes} native owner probes`);
+    assert.ok(probes > 0, "release did not probe the native lock owner");
+    for (let index = 1; index < probeTimes.length; index += 1) {
+      assert.ok(probeTimes[index] - probeTimes[index - 1] >= 60,
+        `release retried native owner proof without bounded cadence: ${probeTimes[index] - probeTimes[index - 1]}ms`);
+    }
     assert.equal(readdirSync(item.directory).some((name) => name.includes(".archive-lock-")), false);
   } finally {
     childProcess.spawnSync = originalSpawnSync;
@@ -55,19 +61,26 @@ test("Windows archive lock bounds native owner probes while release is delayed",
   }
 });
 
-test("Windows archive lock collapses two hard-link names when Node reports zero inode", { skip: process.platform !== "win32" }, () => {
+test("Windows archive lock keeps two distinct zero-inode databases and their hard-link alias locked", { skip: process.platform !== "win32" }, () => {
   const item = fixture();
   const originalStat = fs.statSync;
+  let forcedStatReads = 0;
   try {
     const source = new Database(item.filename);
     try { source.prepare("VACUUM INTO ?").run(item.old); }
     finally { source.close(); }
     fs.linkSync(item.filename, item.next);
+    assert.notEqual(realpathSync(item.filename), realpathSync(item.old), "fixture must use distinct database files");
     fs.statSync = (...args) => new Proxy(originalStat(...args), {
-      get(info, key) { return key === "ino" ? 0n : Reflect.get(info, key, info); },
+      // Count only observations made through the substituted ESM binding.
+      get(info, key) {
+        if (key === "ino") { forcedStatReads += 1; return 0n; }
+        return Reflect.get(info, key, info);
+      },
     });
     syncBuiltinESMExports();
     const release = acquireWindowsArchiveLock([item.filename, item.next, item.old]);
+    assert.ok(forcedStatReads >= 2, "zero-inode fallback was not exercised for both databases");
     try {
       for (const filename of [item.filename, item.old]) {
         const writer = new Database(filename);

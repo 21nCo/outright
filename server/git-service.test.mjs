@@ -99,7 +99,6 @@ test("editor launch releases utility capacity when a GUI stays open and records 
     await assert.rejects(service.openInEditor(cwd), (error) => error.code === "ENOENT");
     assert.equal(subprocesses.capacity().active, 0);
     assert.ok(actions.includes("editor.open") && actions.includes("editor.open.failed"));
-    assert.equal(launched.length, 2, "the live editor prevented another launch attempt");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

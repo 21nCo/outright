@@ -33,7 +33,10 @@ export async function scanProjects(config, subprocesses = utilityProcesses) {
   const git = (directory, args) => runGit(subprocesses, directory, args);
   const safeGit = async (directory, args) => {
     try { return await git(directory, args); }
-    catch (error) { if (error.code === "SUBPROCESS_CAPACITY") throw error; return ""; }
+    catch (error) {
+      if (error.code === "SUBPROCESS_CAPACITY") throw error;
+      return "";
+    }
   };
   const request = observability.startRequest({ method: "SCAN", path: "/api/projects" });
 

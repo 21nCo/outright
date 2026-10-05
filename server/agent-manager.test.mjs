@@ -877,6 +877,8 @@ test("a prearmed disk retry and queue resume cannot drain a closed maintenance d
   let readable = true;
   let admissible = false;
   let settingsReadsDuringMaintenance = 0;
+  let observedRetry;
+  const diskRetryObserved = new Promise((resolve) => { observedRetry = resolve; });
   const getSettings = database.getSettings;
   const finishRun = database.finishRun;
   database.getSettings = () => {
@@ -892,14 +894,19 @@ test("a prearmed disk retry and queue resume cannot drain a closed maintenance d
     if (!readable) throw Object.assign(new Error("Archive maintenance is running"), { statusCode: 503 });
     return finishRun(id, patch);
   };
-  const manager = createAgentManager({ database, publish: () => {} });
+  const manager = createAgentManager({ database, publish: () => {}, onDiskRetry: observedRetry });
   try {
     const run = database.createRun({ ...codexRun("disk-retry-cutover"), status: "queued" });
     await manager.schedule({ conversation: database.getConversation("conv-1"), run });
     database.maintenanceActive = true;
     readable = false;
     manager.resumeQueued();
-    await new Promise((resolve) => setTimeout(resolve, 150)); // The prearmed retry fires at 100 ms.
+    let timeout;
+    try {
+      await Promise.race([diskRetryObserved, new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("prearmed disk retry did not fire")), 5_000);
+      })]);
+    } finally { clearTimeout(timeout); }
     assert.equal(settingsReadsDuringMaintenance, 0);
     await assert.rejects(manager.stop(run.id), (error) => error.statusCode === 503);
     assert.equal(database.getRun(run.id).status, "queued");

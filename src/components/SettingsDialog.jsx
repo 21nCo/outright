@@ -216,7 +216,7 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
   </p>
   <section className="template-settings" aria-labelledby="capacity-retention-heading">
     <header><div><h3 id="capacity-retention-heading">Capacity and retention</h3><small>Cleanup removes unpinned archived chats older than the saved age. You can also select a recent archived chat to delete now. Active and recoverable runs stay protected.</small></div></header>
-    {capacity?.limits && <p className="capacity-status">{capacity.queued} of {capacity.limits.maxQueuedRuns} queued · {capacity.activeProcesses ?? capacity.active} active · {capacity.pendingRunOutcomes ? `${capacity.pendingRunOutcomes} of ${capacity.limits.maxPendingRunOutcomes} exited runs awaiting storage recovery · ` : ""}{capacity.recoverable} awaiting recovery · {capacity.utilityProcesses?.active ?? "unknown"} of {capacity.utilityProcesses?.limit ?? "unknown"} utility processes · {capacity.terminalProcesses?.active ?? "unknown"} of {capacity.terminalProcesses?.limit ?? "unknown"} terminals{capacity.terminalProcesses?.recoveryError ? " (terminal history scan stopped; restart after checking storage)" : capacity.terminalProcesses?.recoveryPending ? " (terminal history scan pending; new terminals paused)" : capacity.terminalProcesses?.unknown ? ` (${capacity.terminalProcesses.unknown} terminal${capacity.terminalProcesses.unknown === 1 ? "" : "s"} unverified; inspect local terminal recovery)` : ""} · {capacityUsageText(capacity)} ({(capacity.limits.reservedRetainedBytes / 1048576).toFixed(0)} MiB reserved for active runs). CPU and memory use are unknown. {allocatedDiskUsageText(capacity)}</p>}
+    {capacity?.limits && <p className="capacity-status">{capacity.queued} of {capacity.limits.maxQueuedRuns} queued · {capacity.activeProcesses ?? capacity.active} active · {pendingOutcomeCapacityText(capacity)}{capacity.recoverable} awaiting recovery · {capacity.utilityProcesses?.active ?? "unknown"} of {capacity.utilityProcesses?.limit ?? "unknown"} utility processes · {capacity.terminalProcesses?.active ?? "unknown"} of {capacity.terminalProcesses?.limit ?? "unknown"} terminals{terminalRecoveryText(capacity.terminalProcesses)} · {capacityUsageText(capacity)} ({(capacity.limits.reservedRetainedBytes / 1048576).toFixed(0)} MiB reserved for active runs). CPU and memory use are unknown. {allocatedDiskUsageText(capacity)}</p>}
     <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">{capacityStatusAnnouncement(capacity)}</p>
     <Button ref={cleanupButtonRef} variant="outline" onClick={cleanHistory}>Clean old archived history</Button>
     {cleanupResult && <output className="capacity-status">{cleanupResult}</output>}
@@ -259,6 +259,21 @@ function BudgetSetting({ name, label, min, max, value, setDraft }) {
 
 function Setting({ icon: Icon, label, children }) { return <label className="setting-row"><span><Icon />{label}</span>{children}</label>; }
 
+function pendingOutcomeCapacityText(capacity) {
+  if (!capacity.pendingRunOutcomes) return "";
+  return `${capacity.pendingRunOutcomes} of ${capacity.limits.maxPendingRunOutcomes} exited runs awaiting storage recovery · `;
+}
+
+function terminalRecoveryText(terminal) {
+  if (terminal?.recoveryError) return " (terminal history scan stopped; restart after checking storage)";
+  if (terminal?.recoveryPending) return " (terminal history scan pending; new terminals paused)";
+  if (terminal?.unknown) {
+    const noun = terminal.unknown === 1 ? "terminal" : "terminals";
+    return ` (${terminal.unknown} ${noun} unverified; inspect local terminal recovery)`;
+  }
+  return "";
+}
+
 function capacityStatusAnnouncement(capacity) {
   if (!capacity?.limits) return "";
   const messages = [];
@@ -290,7 +305,10 @@ function capacityStatusAnnouncement(capacity) {
     messages.push("Run starts are paused until an active run or pending outcome releases recovery capacity.");
   }
   if (!validCount(capacity.recoverable)) messages.push("Run recovery capacity is unknown.");
-  else if (capacity.recoverable) messages.push(`${capacity.recoverable === 1 ? "One run is" : `${capacity.recoverable} runs are`} awaiting recovery.`);
+  else if (capacity.recoverable) {
+    const subject = capacity.recoverable === 1 ? "One run is" : `${capacity.recoverable} runs are`;
+    messages.push(`${subject} awaiting recovery.`);
+  }
   if (capacity.maintenanceError) messages.push("Archived storage recovery needs a restart. New work is paused.");
   else if (capacity.migrationStatus === "maintenance") messages.push("Archived storage cleanup is in progress. New work is paused.");
   else if (capacity.migrationStatus === "migrating") messages.push("Retained history migration is in progress. New work is paused.");

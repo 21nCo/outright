@@ -15,6 +15,15 @@ import { createTerminalManager } from "./terminal-manager.mjs";
 
 const execFileAsync = promisify(execFile);
 
+async function settledWithin(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
 if (process.env.CI && process.platform !== "win32") {
   const group = spawnSync("/bin/ps", ["-o", "pgid=", "-p", String(process.pid)], { encoding: "utf8", timeout: 1000 });
   const pgid = group.status === 0 ? group.stdout.trim() : "unavailable";
@@ -230,7 +239,7 @@ test("a failed agent shutdown retains the runtime lease until recovery can finis
   }
 });
 
-for (const terminalFailure of [false, true]) test(`a storage-faulted exited run ${terminalFailure ? "reports terminal disposal failure" : "releases the runtime lease"} after durable recovery`, async () => {
+for (const [terminalFailure, sqliteRecovers] of [[false, true], [false, false], [true, true]]) test(`a storage-faulted exited run ${terminalFailure ? "reports terminal disposal failure" : "releases the runtime lease"} after ${sqliteRecovers ? "SQLite" : "journal-only"} recovery`, async () => {
   const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-shutdown-recover-"));
   const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
   let runtime;
@@ -238,6 +247,7 @@ for (const terminalFailure of [false, true]) test(`a storage-faulted exited run 
   let child;
   let durableFinish;
   let durableJournal;
+  let released = false;
   try {
     process.env.OUTRIGHT_DATA_DIR = dataDirectory;
     runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json",
@@ -281,14 +291,15 @@ for (const terminalFailure of [false, true]) test(`a storage-faulted exited run 
     await assert.rejects(runtime.shutdown(), (error) => error.code === "OUTRIGHT_SHUTDOWN_RECOVERY_PENDING");
     assert.throws(() => createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" }),
       (error) => error.code === "OUTRIGHT_RUNTIME_LEASE_HELD");
-    runtime.database.finishRun = durableFinish;
+    if (sqliteRecovers) runtime.database.finishRun = durableFinish;
     runtime.database.savePendingRunOutcome = durableJournal;
     runtime.agents.resumeQueued();
-    const completed = Promise.race([runtime.whenShutdownComplete(), new Promise((_, reject) => setTimeout(() => reject(new Error("lease did not release after recovery")), 3000))]);
+    const completed = settledWithin(runtime.whenShutdownComplete(), 3000, "lease did not release after recovery");
     if (terminalFailure) {
       await assert.rejects(completed, /Runtime shutdown did not finish cleanly/);
       await assert.rejects(runtime.shutdown(), /Runtime shutdown did not finish cleanly/);
     } else await completed;
+    released = true;
     successor = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
     assert.equal(successor.database.getRun(run.id).status, "completed");
     assert.equal(successor.database.listAudit(100).filter((entry) => entry.action === "agent.run.completed" && entry.target === run.id).length, 1);
@@ -297,7 +308,7 @@ for (const terminalFailure of [false, true]) test(`a storage-faulted exited run 
     // shutdown. Restore the writable methods before final cleanup.
     if (runtime && durableFinish) runtime.database.finishRun = durableFinish;
     if (runtime && durableJournal) runtime.database.savePendingRunOutcome = durableJournal;
-    runtime?.agents.resumeQueued();
+    if (!released) runtime?.agents.resumeQueued();
     try { await successor?.shutdown(); } catch { /* The assertion above owns the failure. */ }
     try { await runtime?.shutdown(); } catch { /* The assertion above owns the failure. */ }
     if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR;
@@ -1513,14 +1524,27 @@ test("shutdown fences a stuck native recovery and releases the lease for a succe
         return recoveryResult;
       } }) });
     await recoveryStarted;
-    await Promise.race([runtime.shutdown(), new Promise((_, reject) => setTimeout(() => reject(new Error("shutdown waited for native proof")), 250))]);
+    await settledWithin(runtime.shutdown(), 250, "shutdown waited for native proof");
     successor = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json",
       terminalManagerFactory: (options) => createTerminalManager({ ...options, recoverTerminal: async () => false }) });
+    await settledWithin(new Promise((resolve) => {
+      const check = () => {
+        if (!successor.terminals.capacity().recoveryPending) resolve();
+        else setTimeout(check, 10);
+      };
+      check();
+    }), 10_000, "successor terminal audit scan did not settle");
     assert.equal(successor.terminals.capacity().unknown, 1);
     finishRecovery(true);
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(successor.terminals.capacity().unknown, 1,
-      "the closed runtime released a reservation after its lease moved to a successor");
+    const lateProofDeadline = Date.now() + 250;
+    let lateProofChecks = 0;
+    while (Date.now() < lateProofDeadline) {
+      lateProofChecks += 1;
+      assert.equal(successor.terminals.capacity().unknown, 1,
+        "the closed runtime released a reservation after its lease moved to a successor");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(lateProofChecks >= 2, "late native proof was not observed over a bounded interval");
     const writer = new Database(path.join(dataDirectory, "outright.db"), { readonly: true });
     try {
       assert.equal(writer.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.recovered' AND target = ?").get(target).count, 0);

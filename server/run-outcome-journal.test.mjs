@@ -38,3 +38,16 @@ test("invalid and future transcript timestamps cannot change recovered conversat
     assert.equal(readRunOutcome(directory, runId).transcriptMessage.body, "final");
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+test("a fsynced outcome replays after the wall clock moves backward", (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-outcome-clock-"));
+  const runId = "00000000-0000-4000-8000-000000000003";
+  const finishedAt = new Date().toISOString();
+  const transcriptMessage = { id: `${runId}:1`, conversationId: "conversation", role: "assistant",
+    kind: "text", body: "final", payload: { runId }, createdAt: finishedAt };
+  try {
+    saveRunOutcome(directory, runId, { status: "completed", finishedAt, exitCode: 0, message: "", transcriptMessage });
+    t.mock.method(Date, "now", () => Date.parse(finishedAt) - 60 * 60 * 1000);
+    assert.equal(readRunOutcome(directory, runId).transcriptMessage.body, "final");
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});

@@ -96,7 +96,10 @@ export function acquireWindowsArchiveLock(filenames) {
     let reported = "";
     if (!waitUntil(() => {
       try { reported = readFileSync(ready, "utf8"); return /^\d+$/.test(reported); }
-      catch (error) { if (["ENOENT", "EACCES", "EPERM", "EBUSY"].includes(error.code)) return false; throw error; }
+      catch (error) {
+        if (["ENOENT", "EACCES", "EPERM", "EBUSY"].includes(error.code)) return false;
+        throw error;
+      }
     }, 5000)) throw new Error("Windows archive lock did not start");
     const status = Number(reported);
     if (status !== 0) {

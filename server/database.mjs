@@ -1442,12 +1442,24 @@ export function createOutrightDatabase(options = {}) {
           // The owner may have observed provider close while SQLite refused
           // its terminal transaction. Its fsynced bounded result is stronger
           // evidence than a dead-process probe or a later Stop request.
-          const outcome = readRunOutcome(launchDirectory, run.id);
-          if (outcome) {
-            if (outcome.transcriptMessage?.conversationId !== undefined
+          let outcome;
+          let invalidOutcome = false;
+          try {
+            outcome = readRunOutcome(launchDirectory, run.id);
+            if (outcome?.transcriptMessage?.conversationId !== undefined
               && outcome.transcriptMessage.conversationId !== run.conversationId) {
-              throw new Error(`Invalid run outcome record: ${run.id}`);
+              const invalid = new Error(`Invalid run outcome record: ${run.id}`);
+              invalid.code = "OUTRIGHT_INVALID_RUN_OUTCOME";
+              throw invalid;
             }
+          } catch (error) {
+            // One corrupt sidecar cannot prevent other runs from recovering.
+            // Keep both the sidecar and the interrupted row for inspection.
+            if (error.code !== "OUTRIGHT_INVALID_RUN_OUTCOME") throw error;
+            outcome = null;
+            invalidOutcome = true;
+          }
+          if (outcome) {
             let transcriptOmitted = Boolean(outcome.transcriptOmitted);
             if (outcome.transcriptMessage) {
               try {
@@ -1471,34 +1483,28 @@ export function createOutrightDatabase(options = {}) {
           }
           let classification = "unknown";
           let pid = run.pid ?? null;
-          if (run.status === "queued") classification = "never-started";
-          else if (run.status === "launching") {
-            // Crash-safe launch handshake: the provider is only authorized to
-            // run AFTER the row durably reaches 'running' with a pid, so a row
-            // still in 'launching' provably never started side effects. The
-            // wrapper's self-recorded handshake pid is adopted for the record
-            // (the wrapper exits on its own once its stdin closes), so the run
-            // is resolvable by an explicit decision instead of being
-            // permanently gated as an unverifiable tree.
-            classification = "never-started";
-            const handshake = readLaunchHandshake(launchDirectory, run.id);
-            if (handshake) {
-              pid = handshake.pid;
-              // The identity is now durably adopted into the row. The sweep
-              // below removes its no-longer-needed marker after commit.
+          // An invalid sidecar retains unknown ownership even for a queued
+          // row or dead PID; neither can disprove that recovery evidence.
+          if (!invalidOutcome) {
+            if (run.status === "queued") classification = "never-started";
+            else if (run.status === "launching") {
+              // The wrapper cannot run before the row reaches 'running'.
+              classification = "never-started";
+              const handshake = readLaunchHandshake(launchDirectory, run.id);
+              if (handshake) pid = handshake.pid;
+            } else if (run.pid != null) {
+              const handshake = readLaunchHandshake(launchDirectory, run.id);
+              classification = handshake?.completed === true
+                && handshake.authorized === true
+                && handshake.pid === run.pid
+                ? "exited"
+                : normalizeProbeResult(probeAlive(run.pid, handshake, run));
             }
-          }
-          else if (run.pid != null) {
-            const handshake = readLaunchHandshake(launchDirectory, run.id);
-            classification = handshake?.completed === true
-              && handshake.authorized === true
-              && handshake.pid === run.pid
-              ? "exited"
-              : normalizeProbeResult(probeAlive(run.pid, handshake, run));
           }
           const result = db.prepare("UPDATE runs SET status = 'interrupted', pid = ?, finished_at = ?, recovery_class = ? WHERE id = ? AND status IN ('queued', 'running', 'launching')")
             .run(pid, finishedAt, classification, run.id);
           if (!result.changes) continue;
+          if (invalidOutcome) writeCriticalAudit("agent.run.outcome.invalid", { target: run.id });
           counts[classification] = (counts[classification] ?? 0) + 1;
         }
         return pending.length;
@@ -1936,9 +1942,10 @@ export function createOutrightDatabase(options = {}) {
           AND c.deleting = 0 AND ${safeIdentity} AND octet_length(m.body) <= ${SEARCH_MESSAGE_BYTES}
           AND m.body LIKE ? ESCAPE '\\'`).all(...ordinals, needle) : [];
       const matched = [...new Map([...byTitle, ...byMessage].map((row) => [row.id, row])).values()];
+      matched.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
       const conversations = [];
       let responseBytes = 64;
-      for (const { updatedAt, ...row } of matched.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))) {
+      for (const { updatedAt, ...row } of matched) {
         if (conversations.length === boundedLimit) break;
         const bytes = Buffer.byteLength(JSON.stringify(row)) + 1;
         if (responseBytes + bytes > SEARCH_RESPONSE_BYTES) break;
@@ -2804,7 +2811,9 @@ function sweepLaunchHandshakes(launchDirectory, db) {
   catch { return; }
   const keep = db.prepare(`SELECT 1 FROM runs WHERE id = ? AND status = 'interrupted'
     AND recovery_decision IS NULL AND recovery_class IN ('alive', 'unknown')`);
-  const pendingOutcome = db.prepare("SELECT 1 FROM runs WHERE id = ? AND status IN ('queued', 'running', 'launching')");
+  const pendingOutcome = db.prepare(`SELECT 1 FROM runs WHERE id = ? AND
+    (status IN ('queued', 'running', 'launching') OR
+      (status = 'interrupted' AND recovery_class = 'unknown' AND recovery_decision IS NULL))`);
   try {
     let entry;
     while ((entry = directory.readSync())) {

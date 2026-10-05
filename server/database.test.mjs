@@ -7,6 +7,11 @@ import os from "node:os";
 import path from "node:path";
 import { createOutrightDatabase, defaultProbeRun } from "./database.mjs";
 
+function cpuMilliseconds(since) {
+  const used = process.cpuUsage(since);
+  return (used.user + used.system) / 1000;
+}
+
 async function waitForSearchMigration(filename, kind) {
   const deadline = Date.now() + 5_000;
   while (true) {
@@ -134,13 +139,13 @@ test("global search includes the newest message in an older visible conversation
     const fresh = database.addMessage({ conversationId: oldest.id, role: "assistant", body: "fresh-active-needle" });
     const durations = [];
     for (let round = 0; round < 8; round += 1) {
-      const started = performance.now();
+      const started = process.cpuUsage();
       const result = database.search("fresh-active-needle");
-      durations.push(performance.now() - started);
+      durations.push(cpuMilliseconds(started));
       assert.deepEqual(result.conversations.map((row) => row.id), [oldest.id]);
       assert.ok(Buffer.byteLength(JSON.stringify(result)) < 4096);
     }
-    assert.ok(durations.sort((a, b) => a - b)[4] < 250, "repeated global searches blocked the runtime");
+    assert.ok(durations.sort((a, b) => a - b)[4] < 250, "repeated global searches consumed too much CPU");
     await database.close();
     // Model an upgrade from a store that predates the global head lookup.
     // The backfill must resume after an interrupted, bounded first page.
@@ -723,14 +728,14 @@ test("sparse conversation search stays responsive with a large sibling history",
     const last = database.addMessage({ conversationId: target.id, role: "assistant", body: "needle last" });
     const durations = [];
     for (let index = 0; index < 3; index += 1) {
-      const started = performance.now();
+      const started = process.cpuUsage();
       assert.equal((await database.findMessagePage(target.id, "absent", null)).matchId, null);
-      durations.push(performance.now() - started);
+      durations.push(cpuMilliseconds(started));
     }
-    assert.ok(durations.sort((a, b) => a - b)[1] < 250, `Sparse search blocked the runtime: ${durations.map((value) => value.toFixed(1)).join(", ")}ms`);
-    const pageStarted = performance.now();
+    assert.ok(durations.sort((a, b) => a - b)[1] < 250, `Sparse search consumed too much CPU: ${durations.map((value) => value.toFixed(1)).join(", ")}ms`);
+    const pageStarted = process.cpuUsage();
     assert.equal(database.listMessagePage(target.id, { beforeId: last.id, limit: 1 }).messages[0].id, first.id);
-    assert.ok(performance.now() - pageStarted < 250, "Sparse history pagination scanned sibling messages");
+    assert.ok(cpuMilliseconds(pageStarted) < 250, "Sparse history pagination scanned sibling messages");
     assert.equal((await database.findMessagePage(target.id, "needle", first.id)).matchId, last.id);
     assert.equal((await database.findMessagePage(target.id, "needle", last.id)).matchId, first.id, "wrapped search crossed sibling history");
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
@@ -889,17 +894,32 @@ test("reconciles queued and running work as interrupted after a runtime restart"
   }
 });
 
-test("malformed terminal recovery evidence cannot silently become an interrupted run", () => {
+test("malformed terminal recovery evidence is isolated while valid siblings settle", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-invalid-outcome-"));
   const database = createOutrightDatabase({ filename: path.join(root, "outright.db") });
   try {
     const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: root,
       title: "Recovery", provider: "codex" });
     const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "run" });
+    const misbound = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "misbound" });
+    const sibling = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "sibling" });
     database.updateRun(run.id, { status: "running", pid: 4242 });
+    const finishedAt = new Date().toISOString();
+    database.savePendingRunOutcome(misbound.id, { status: "completed", finishedAt, exitCode: 0, message: "",
+      transcriptMessage: { id: `${misbound.id}:1`, conversationId: "wrong-conversation", role: "assistant",
+        kind: "text", body: "not for this chat", payload: { runId: misbound.id }, createdAt: finishedAt } });
+    database.savePendingRunOutcome(sibling.id, { status: "completed", finishedAt: new Date().toISOString(), exitCode: 0, message: "" });
     writeFileSync(path.join(database.launchDirectory, `${run.id}.outcome.json`), "{broken");
-    assert.throws(() => database.reconcileInterruptedRuns({ probeAlive: () => false }), /Invalid run outcome record/);
-    assert.equal(database.getRun(run.id).status, "running");
+    const result = database.reconcileInterruptedRuns({ probeAlive: () => false });
+    assert.equal(result.counts.unknown, 2);
+    assert.equal(result.counts.completed, 1);
+    assert.equal(database.getRun(run.id).status, "interrupted");
+    assert.equal(database.getRun(run.id).recoveryClass, "unknown");
+    assert.equal(database.getRun(misbound.id).recoveryClass, "unknown");
+    assert.equal(database.getRun(sibling.id).status, "completed");
+    assert.ok(existsSync(path.join(database.launchDirectory, `${run.id}.outcome.json`)));
+    assert.ok(existsSync(path.join(database.launchDirectory, `${misbound.id}.outcome.json`)));
+    assert.equal(database.listAudit(100).filter((entry) => entry.action === "agent.run.outcome.invalid").length, 2);
   } finally {
     database.close();
     rmSync(root, { recursive: true, force: true });

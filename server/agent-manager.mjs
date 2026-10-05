@@ -323,7 +323,28 @@ export async function defaultLaunchCommand(command, run, launchDirectory) {
   };
 }
 
-export function createAgentManager({ database, publish, onProvidersChanged = () => {}, onShutdownRecovery = () => {}, providerDiscoveryFactory = createProviderDiscovery, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
+function storageAdmissionFailure(error) {
+  return error?.statusCode === 507
+    || /^(?:SQLITE_(?:FULL|IOERR|READONLY|BUSY|LOCKED)(?:_|$)|E(?:IO|PERM|ACCES|BUSY|NFILE|MFILE|STALE|NOSPC|ROFS)$)/.test(error?.code ?? "");
+}
+
+function persistentStorageFailure(error) {
+  return error?.statusCode === 507
+    || /^(?:SQLITE_(?:FULL|READONLY)(?:_|$)|E(?:PERM|ACCES|NOSPC|ROFS)$)/.test(error?.code ?? "");
+}
+
+function nativeOwnershipPending(state) {
+  if (!state.launchHandshakePath || !existsSync(state.launchHandshakePath)) return false;
+  // Only the Windows wrapper writes this marker after its supervisor exits
+  // with an empty Job Object. It remains until the terminal database commit.
+  if (process.platform !== "win32") return true;
+  try {
+    const record = JSON.parse(readFileSync(state.launchHandshakePath, "utf8"));
+    return record.completed !== true || record.pid !== state.child?.pid;
+  } catch { return true; }
+}
+
+export function createAgentManager({ database, publish, onProvidersChanged = () => {}, onShutdownRecovery = () => {}, onDiskRetry = () => {}, providerDiscoveryFactory = createProviderDiscovery, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
   const resolvedLaunchDirectory = launchDirectory
     ?? database.launchDirectory;
   assertPrivateLaunchDirectory(resolvedLaunchDirectory);
@@ -343,16 +364,6 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   const admissionRetryRuns = new Set();
   let queueReadRetryPending = false;
   const providerDiscovery = providerDiscoveryFactory({ onChange: onProvidersChanged });
-
-  function storageAdmissionFailure(error) {
-    return error?.statusCode === 507
-      || /^(?:SQLITE_(?:FULL|IOERR|READONLY|BUSY|LOCKED)(?:_|$)|E(?:IO|PERM|ACCES|BUSY|NFILE|MFILE|STALE|NOSPC|ROFS)$)/.test(error?.code ?? "");
-  }
-
-  function persistentStorageFailure(error) {
-    return error?.statusCode === 507
-      || /^(?:SQLITE_(?:FULL|READONLY)(?:_|$)|E(?:PERM|ACCES|NOSPC|ROFS)$)/.test(error?.code ?? "");
-  }
 
   function wakeMaintenanceWaiters() {
     for (const resolve of maintenanceWaiters) resolve();
@@ -606,6 +617,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     const { status, message, finishedAt, exitCode: terminalExitCode } = state.terminalOutcome;
     let finished;
     let transcriptMessage;
+    let journalBecameDurable = false;
     try {
       // Persist the frozen provider result outside SQLite before its terminal
       // transaction. Shutdown may follow a BUSY/FULL refusal immediately;
@@ -624,6 +636,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
           });
           state.outcomeJournaled = true;
           state.outcomeJournalError = null;
+          journalBecameDurable = true;
         } catch (journalError) { state.outcomeJournalError = journalError; }
       }
       // The last checkpoint and terminal state commit together. Until that
@@ -636,6 +649,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       state.finishing = false;
       if (storageAdmissionFailure(writeError) || (writeError.statusCode === 503 && database.maintenanceActive)) {
         state.pendingFinish = { exitCode, error };
+        if (shuttingDown && journalBecameDurable) setTimeout(onShutdownRecovery, 0);
         if (persistentStorageFailure(writeError) && (!state.child || state.closed)) {
           // The process is gone. Retain its bounded outcome separately from
           // live process capacity; restart still sees the protected run row
@@ -812,18 +826,6 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     try { state.child?.stdin?.write?.("stop\n"); } catch { /* The wrapper already exited. */ }
   }
 
-  function nativeOwnershipPending(state) {
-    if (!state.launchHandshakePath || !existsSync(state.launchHandshakePath)) return false;
-    // Only the Windows wrapper writes this marker after its supervisor exits
-    // with an empty Job Object. It remains until the terminal database commit.
-    if (process.platform !== "win32") return true;
-    try {
-      const record = JSON.parse(readFileSync(state.launchHandshakePath, "utf8"));
-      return record.completed !== true || record.pid !== state.child?.pid;
-    } catch { return true; }
-  }
-
-
   function conflictsWithActiveRun(entry) {
     return [...active.values(), ...pendingOutcomes.values()].some((state) => {
       const activeWorktree = state.run.worktreePath ?? state.conversation.worktreePath;
@@ -908,6 +910,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       diskRetryDueAt = 0;
       retryPendingFinishes();
       drain();
+      onDiskRetry();
     }, delay);
     diskRetryTimer.unref?.();
   }

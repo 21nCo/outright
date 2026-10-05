@@ -2,8 +2,13 @@ import { randomUUID } from "node:crypto";
 import { utilityProcesses } from "./subprocess-budget.mjs";
 import { cleanupTerminalSocket, recoverManagedTerminal, spawnManagedTerminal, terminalOwnership } from "./managed-terminal.mjs";
 
+function reservationTerminal(entry) {
+  return { id: entry.target, cwd: entry.cwd, name: "Terminal recovery required", pid: entry.pid,
+    status: "unknown", createdAt: null, recoveryReservation: true };
+}
+
 export function createTerminalManager({ publish, database, spawnTerminal = null, startManagedTerminal = spawnManagedTerminal,
-  recoverTerminal = recoverManagedTerminal,
+  recoverTerminal = recoverManagedTerminal, cleanupSocket = cleanupTerminalSocket,
   subprocesses = utilityProcesses, terminate = (terminal, options) => {
   if (typeof terminal.process?.terminate !== "function") throw new Error("PTY owner has no termination verifier");
   return terminal.process.terminate(options);
@@ -42,13 +47,16 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       // Native proof can take seconds. Limit simultaneous helpers while letting
       // independent owners progress without serializing the entire inventory.
       await Promise.all(Array.from({ length: Math.min(4, entries.length) }, async () => {
-        while (!shuttingDown && next < entries.length) {
+        while (next < entries.length) {
+          if (shuttingDown) break;
           const entry = entries[next++];
           try {
             const empty = await recoverTerminal({ ...entry, launchDirectory: database.launchDirectory, subprocesses });
             if (!empty || shuttingDown) continue;
+            // Socket removal belongs to the same proof as native emptiness.
+            // A failed unlink must leave the durable reservation charged.
+            cleanupSocket(entry.target);
             database.resolveTerminalUnknown(entry.target, `Native ${process.platform} owner was verified empty after restart`);
-            cleanupTerminalSocket(entry.target);
             reservedUnknown = unresolvedReservations();
             resolved += 1;
             publish({ type: "capacity.changed" });
@@ -203,10 +211,6 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     }
   }
 
-  function reservationTerminal(entry) {
-    return { id: entry.target, cwd: entry.cwd, name: "Terminal recovery required", pid: entry.pid,
-      status: "unknown", createdAt: null, recoveryReservation: true };
-  }
   function list() { return [...terminals.values()].map(publicTerminal).concat(reservedUnknown
     .filter((entry) => !terminals.has(entry.target)).map(reservationTerminal)); }
   function capacity() {
@@ -221,8 +225,16 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     const reservation = reservedUnknown.find((entry) => entry.target === id);
     return reservation ? { ...reservationTerminal(reservation), buffer: "", outputCursor: 0 } : null;
   }
-  function write(id, data) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running" || typeof data !== "string" || Buffer.byteLength(data) > 64 * 1024) return false; return terminal.process.write(data) !== false; }
-  function resize(id, cols, rows) { const terminal = terminals.get(id); if (!terminal || terminal.status !== "running") return false; return terminal.process.resize(clamp(cols, 20, 400), clamp(rows, 5, 200)) !== false; }
+  function write(id, data) {
+    const terminal = terminals.get(id);
+    if (!terminal || terminal.status !== "running" || typeof data !== "string" || Buffer.byteLength(data) > 64 * 1024) return false;
+    return terminal.process.write(data) !== false;
+  }
+  function resize(id, cols, rows) {
+    const terminal = terminals.get(id);
+    if (!terminal || terminal.status !== "running") return false;
+    return terminal.process.resize(clamp(cols, 20, 400), clamp(rows, 5, 200)) !== false;
+  }
   function startNaturalExit(terminal) {
     if (terminal.settlePromise) return;
     terminal.status = "settling";
@@ -233,7 +245,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     // empty. Keep the slot if that proof or its required audit is unavailable.
     try {
       await terminate(terminal, { alreadyExited: true });
-      if (!spawnTerminal) cleanupTerminalSocket(terminal.id);
+      if (!spawnTerminal) cleanupSocket(terminal.id);
       if (!terminals.has(terminal.id) || terminal.closePromise) return;
       await database.auditRequired("terminal.exited", { target: terminal.id, exitCode: terminal.exitCode, signal: terminal.signal });
       if (!terminals.has(terminal.id) || terminal.closePromise) return;
@@ -266,7 +278,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
         }
         try { await terminate(terminal); }
         catch (error) { error.terminationUnknown = true; throw error; }
-        if (!spawnTerminal) cleanupTerminalSocket(id);
+        if (!spawnTerminal) cleanupSocket(id);
         await database.auditRequired("terminal.closed", evidence);
         clearTimeout(terminal.cleanupTimer);
         terminals.delete(id);

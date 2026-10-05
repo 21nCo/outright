@@ -12,6 +12,12 @@ export function TerminalPane(props) {
   return <WorktreeTerminalPane key={JSON.stringify([props.worktree.id, props.worktree.path])} {...props} />;
 }
 
+function terminalTabLabel(terminal) {
+  if (terminal.status === "exited") return `${terminal.name}, process exited ${terminal.exitCode ?? "unknown"}`;
+  if (terminal.status === "unknown") return `${terminal.name}, ownership unverified`;
+  return terminal.name;
+}
+
 function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) {
   const hostRef = useRef(null);
   const xtermRef = useRef(null);
@@ -185,8 +191,10 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
         awaitingVisibleFitRef.current = false;
         stageTerminals(terminalsRef.current.map((item) => item.id === terminal.id ? { ...item, status } : item));
       }
-      setExitNotice(exited ? `${terminal.name} process exited ${exited.exitCode ?? "unknown"}`
-        : status === "unknown" ? `${terminal.name} ownership is unverified. Inspect local terminal recovery.` : "");
+      let notice = "";
+      if (exited) notice = `${terminal.name} process exited ${exited.exitCode ?? "unknown"}`;
+      else if (status === "unknown") notice = `${terminal.name} ownership is unverified. Inspect local terminal recovery.`;
+      setExitNotice(notice);
       activeIdRef.current = terminal.id;
       displayedCursorRef.current = displayedCursor;
       setActiveId(terminal.id);
@@ -412,7 +420,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   return <section className="terminal-pane" aria-label="Worktree terminals">
     <p className="sr-only" id="terminal-help">Terminal input and output. Use the left and right arrow keys on a terminal tab to switch sessions.</p>
     <header className="terminal-tabs" role="tablist" aria-label="Open terminals" aria-orientation="horizontal" aria-busy={loading} onKeyDown={navigateTerminalTabs}>
-      {terminals.map((terminal) => <div className={`terminal-tab ${terminal.id === activeId ? "is-active" : ""}`} key={terminal.id}><button className="terminal-tab-select" id={domId("terminal-tab", terminal.id)} data-tab-id={terminal.id} role="tab" aria-selected={terminal.id === activeId} aria-controls="terminal-panel" tabIndex={terminal.id === activeId || (!activeId && terminals[0]?.id === terminal.id) ? 0 : -1} aria-disabled={loading || undefined} aria-label={`${terminal.name}${terminal.status === "exited" ? `, process exited ${terminal.exitCode ?? "unknown"}` : terminal.status === "unknown" ? ", ownership unverified" : ""}`} onClick={() => selectTerminal(terminal)}><TerminalWindow /><span>{terminal.name}</span></button><button className="terminal-tab-close" aria-label={`Close terminal ${terminal.name}`} disabled={loading || terminal.recoveryReservation} onClick={() => closeTerminal(terminal.id)}><X /></button></div>)}
+      {terminals.map((terminal) => <div className={`terminal-tab ${terminal.id === activeId ? "is-active" : ""}`} key={terminal.id}><button className="terminal-tab-select" id={domId("terminal-tab", terminal.id)} data-tab-id={terminal.id} role="tab" aria-selected={terminal.id === activeId} aria-controls="terminal-panel" tabIndex={terminal.id === activeId || (!activeId && terminals[0]?.id === terminal.id) ? 0 : -1} aria-disabled={loading || undefined} aria-label={terminalTabLabel(terminal)} onClick={() => selectTerminal(terminal)}><TerminalWindow /><span>{terminal.name}</span></button><button className="terminal-tab-close" aria-label={`Close terminal ${terminal.name}`} disabled={loading || terminal.recoveryReservation} onClick={() => closeTerminal(terminal.id)}><X /></button></div>)}
       <Button variant="ghost" size="icon-xs" disabled={loading} onClick={createTerminal} aria-label="New terminal"><Plus /></Button>
       {loading && <span className="terminal-loading" role="status"><ArrowsClockwise className="spin" />Loading terminal</span>}
     </header>

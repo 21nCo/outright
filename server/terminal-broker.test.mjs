@@ -79,7 +79,15 @@ test("a slow broker reader backpressures sustained PTY output without losing its
     socket.pause();
     socket.write(`${JSON.stringify({ type: "write",
       data: 'process.stdout.write("x".repeat(8*1024*1024)); console.log("OUTRIGHT_"+"BURST_DONE")\r' })}\n`);
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    const backpressureDeadline = Date.now() + 500;
+    const pollDeadline = backpressureDeadline + 1_500;
+    let backpressureChecks = 0;
+    while (!closed && Date.now() < pollDeadline
+      && (Date.now() < backpressureDeadline || backpressureChecks < 10)) {
+      backpressureChecks += 1;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(backpressureChecks >= 10, "broker backpressure interval was not observed");
     assert.equal(closed, false, `slow reader disconnected its broker: ${stderr}`);
     socket.resume();
     await until(() => received.includes("OUTRIGHT_BURST_DONE"), "burst did not finish");
