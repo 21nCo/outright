@@ -1,0 +1,24 @@
+server/database.mjs
+  h_a39f9495f9ec1d 1727-1730
+server/outright-runtime.mjs
+  h_a39f9495f9ec1d 67-73,735,755-761,764-767
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 233,244-251,287-291
+server/outright-vite-plugin.test.mjs
+  h_a39f9495f9ec1d 66-90
+server/resource-budgets.test.mjs
+  h_a39f9495f9ec1d 144-145,167-175,195-203
+server/standalone.mjs
+  h_a39f9495f9ec1d 76,78-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "21c7aa3c4be7fcbf33594366fe412d24a19119b1",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
