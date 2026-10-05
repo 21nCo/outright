@@ -230,7 +230,7 @@ test("a failed agent shutdown retains the runtime lease until recovery can finis
   }
 });
 
-test("a storage-faulted exited run releases the runtime lease automatically after durable recovery", async () => {
+for (const terminalFailure of [false, true]) test(`a storage-faulted exited run ${terminalFailure ? "reports terminal disposal failure" : "releases the runtime lease"} after durable recovery`, async () => {
   const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-shutdown-recover-"));
   const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
   let runtime;
@@ -241,6 +241,14 @@ test("a storage-faulted exited run releases the runtime lease automatically afte
   try {
     process.env.OUTRIGHT_DATA_DIR = dataDirectory;
     runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json",
+      terminalManagerFactory: (options) => {
+        const manager = createTerminalManager(options);
+        if (terminalFailure) {
+          const dispose = manager.shutdown.bind(manager);
+          manager.shutdown = async () => { await dispose(); throw new Error("terminal disposal failed"); };
+        }
+        return manager;
+      },
       agentManagerFactory: (options) => createAgentManager({ ...options,
         validateConversation: async () => () => {},
         launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
@@ -276,7 +284,11 @@ test("a storage-faulted exited run releases the runtime lease automatically afte
     runtime.database.finishRun = durableFinish;
     runtime.database.savePendingRunOutcome = durableJournal;
     runtime.agents.resumeQueued();
-    await Promise.race([runtime.whenShutdownComplete(), new Promise((_, reject) => setTimeout(() => reject(new Error("lease did not release after recovery")), 3000))]);
+    const completed = Promise.race([runtime.whenShutdownComplete(), new Promise((_, reject) => setTimeout(() => reject(new Error("lease did not release after recovery")), 3000))]);
+    if (terminalFailure) {
+      await assert.rejects(completed, /Runtime shutdown did not finish cleanly/);
+      await assert.rejects(runtime.shutdown(), /Runtime shutdown did not finish cleanly/);
+    } else await completed;
     successor = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
     assert.equal(successor.database.getRun(run.id).status, "completed");
     assert.equal(successor.database.listAudit(100).filter((entry) => entry.action === "agent.run.completed" && entry.target === run.id).length, 1);

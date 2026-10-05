@@ -141,6 +141,8 @@ test("a pinned SQLite reader cannot turn repeated checkpoints into unbounded phy
   try {
     database.updateSettings({ maxRetainedMiB: 64 });
     const conversation = chat(database, "pinned physical WAL");
+    const reclaimable = chat(database, "small archived cleanup target");
+    database.updateConversation(reclaimable.id, { archived: true });
     const body = "w".repeat(1024 * 1024 - 8);
     const message = database.addMessage({ conversationId: conversation.id, role: "assistant", body: `${body}00000000` });
     reader = new Database(filename, { readonly: true });
@@ -162,6 +164,15 @@ test("a pinned SQLite reader cannot turn repeated checkpoints into unbounded phy
     assert.equal(capacity.availablePhysicalForNewWorkBytes, 0);
     assert.equal(database.canLaunchRun(), false, "a new run was admitted while WAL allocation exhausted its physical budget");
     assert.ok(capacity.diskAllocatedBytes >= capacity.limits.maxPhysicalBytes - capacity.limits.reservedPhysicalBytes);
+    const cleanupRequests = database.listAudit(1000).filter((entry) => entry.action === "retention.cleanup.requested").length;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await assert.rejects(database.auditRetentionCleanupRequested({ operationId: `full-wal-${attempt}`, before: "2020-01-01T00:00:00.000Z" }),
+        (error) => error.statusCode === 507);
+    }
+    assert.equal(database.listAudit(1000).filter((entry) => entry.action === "retention.cleanup.requested").length, cleanupRequests,
+      "refused no-op cleanup requests spent the outcome reserve");
+    assert.equal((await database.deleteArchivedConversation(reclaimable.id, reclaimable.id)).deleted, 1,
+      "a targeted archived deletion could not proceed while the WAL reader was pinned");
     database.auditCritical("storage.physical.limit", { target: conversation.id });
     assert.ok(database.listAudit().some((entry) => entry.action === "storage.physical.limit"),
       "physical refusal consumed the recovery audit reserve");
@@ -181,6 +192,15 @@ test("a pinned SQLite reader cannot turn repeated checkpoints into unbounded phy
       "archive cleanup did not reclaim the physical-budgeted conversation");
     assert.ok(database.capacity().availablePhysicalForNewWorkBytes > 64 * 1024);
     assert.equal(database.canLaunchRun(), true, "verified WAL reclamation did not reopen run admission");
+    await database.close();
+    const restarted = createOutrightDatabase({ filename });
+    try {
+      assert.equal(restarted.canLaunchRun(), true, "restart inherited a stale physical refusal");
+      await restarted.auditRetentionCleanupRequested({ operationId: "after-reclaim", before: "2020-01-01T00:00:00.000Z" });
+      await restarted.auditRequired("retention.cleaned", { operationId: "after-reclaim", deleted: 0 });
+      assert.equal(restarted.listAudit(100).filter((entry) => entry.action === "retention.cleanup.requested"
+        && entry.details.operationId === "after-reclaim").length, 1);
+    } finally { await restarted.close(); }
   } finally { reader?.close(); database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 

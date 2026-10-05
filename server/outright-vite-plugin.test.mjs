@@ -63,6 +63,31 @@ test("Vite disposal waits for storage recovery instead of caching a rejected clo
   await successor.closeBundle();
 });
 
+test("Vite reports a final disposal error after storage recovery releases the lease", async () => {
+  let rejectRecovery;
+  const completion = new Promise((_, reject) => { rejectRecovery = reject; });
+  let held = false;
+  const options = { configUrl: new URL("file:///fixture/final-disposal.json"), recoverArchive: async () => {},
+    createRuntime: () => {
+      if (held) throw Object.assign(new Error("lease held"), { code: "OUTRIGHT_RUNTIME_LEASE_HELD" });
+      held = true;
+      return { attach() {}, shutdown: async () => {
+        throw Object.assign(new Error("outcome pending"), { code: "OUTRIGHT_SHUTDOWN_RECOVERY_PENDING" });
+      }, whenShutdownComplete: () => completion };
+    } };
+  const first = outrightApiPlugin(options);
+  first.configureServer({ middlewares: { use() {} } });
+  await new Promise((resolve) => setImmediate(resolve));
+  const closing = first.closeBundle();
+  held = false;
+  rejectRecovery(Object.assign(new Error("terminal disposal failed"), { code: "OUTRIGHT_SHUTDOWN_DISPOSAL_FAILED" }));
+  await assert.rejects(closing, /terminal disposal failed/);
+  const successor = outrightApiPlugin(options);
+  successor.configureServer({ middlewares: { use() {} } });
+  await new Promise((resolve) => setImmediate(resolve));
+  await assert.rejects(successor.closeBundle(), /terminal disposal failed/);
+});
+
 test("build-only plugin disposal does not start a runtime", () => {
   const plugin = outrightApiPlugin({ configUrl: new URL("file:///fixture/config.json"), createRuntime: () => { throw new Error("Unexpected runtime"); } });
   assert.equal(plugin.closeBundle(), undefined);

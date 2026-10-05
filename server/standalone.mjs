@@ -73,8 +73,15 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
       httpServer.close(() => process.exit(0));
       httpServer.closeIdleConnections?.();
     } catch (error) {
-      console.error("Runtime shutdown failed; process ownership is retained", error);
+      console.error("Runtime shutdown failed", error);
       process.exitCode = 1;
+      // The runtime has released its database lease, but terminal disposal
+      // failed. End the HTTP host with a failing status instead of waiting
+      // forever on a server that can no longer serve work.
+      if (error.code === "OUTRIGHT_SHUTDOWN_DISPOSAL_FAILED") {
+        httpServer.close(() => process.exit(1));
+        httpServer.closeIdleConnections?.();
+      }
     }
   });
 }

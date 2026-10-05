@@ -1724,6 +1724,10 @@ export function createOutrightDatabase(options = {}) {
           throw databaseError(503, "Retention cleanup recovery is still running; retry shortly");
         }
         try {
+          // A cleanup request is a new effect, even if it finds nothing to
+          // delete. Keep its audit out of the physical recovery reserve so
+          // already admitted cleanups and terminal outcomes can still finish.
+          requireOptionalPhysicalCapacity();
           db.transaction(() => {
             if (db.prepare(`SELECT 1 FROM (${pendingCleanupSql}) LIMIT ?`).all(MAX_PENDING_RETENTION_CLEANUPS).length
               >= MAX_PENDING_RETENTION_CLEANUPS) {

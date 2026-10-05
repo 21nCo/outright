@@ -64,7 +64,13 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   let watcherTimer = null;
   let shutdownPromise;
   let resolveShutdownCompletion;
-  const shutdownCompletion = new Promise((resolve) => { resolveShutdownCompletion = resolve; });
+  let rejectShutdownCompletion;
+  const shutdownCompletion = new Promise((resolve, reject) => {
+    resolveShutdownCompletion = resolve;
+    rejectShutdownCompletion = reject;
+  });
+  // Shutdown can finish before a host asks for its completion signal.
+  void shutdownCompletion.catch(() => {});
 
   publish = function publish(event) {
     return eventHub.publish(event);
@@ -726,6 +732,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     if (shutdownPromise) return shutdownPromise;
     shuttingDown = true;
     clearTimeout(watcherTimer);
+    let disposed = false;
     shutdownPromise = (async () => {
       const shutdownErrors = [];
       const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown()]);
@@ -745,10 +752,19 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       eventHub.shutdown();
       wss.close();
       await database.close();
+      disposed = true;
+      if (shutdownErrors.length) {
+        const error = new AggregateError(shutdownErrors, "Runtime shutdown did not finish cleanly");
+        error.code = "OUTRIGHT_SHUTDOWN_DISPOSAL_FAILED";
+        rejectShutdownCompletion(error);
+        throw error;
+      }
       resolveShutdownCompletion();
-      if (shutdownErrors.length) throw new AggregateError(shutdownErrors, "Runtime shutdown did not finish cleanly");
     })().catch((error) => {
-      shutdownPromise = null;
+      // A pending run outcome or failed database close still owns the lease
+      // and may be retried. Once the lease is released, preserve the final
+      // result for every host awaiting the same shutdown.
+      if (!disposed) shutdownPromise = null;
       throw error;
     });
     return shutdownPromise;
