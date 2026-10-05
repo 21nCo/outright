@@ -60,6 +60,18 @@ test("malformed terminal requests refuse before discovery, audit admission, or n
   assert.equal(runtime.database.listAudit(100).some((entry) => entry.action === "terminal.create.requested"), false);
 }));
 
+test("conversation detail identifies the exited run awaiting its terminal storage commit", withRuntime(async (runtime) => {
+  const conversation = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Storage recovery", provider: "codex" });
+  const pending = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "finish" });
+  const sibling = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "wait" });
+  runtime.agents.isOutcomePending = (runId) => runId === pending.id;
+  const result = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `/api/conversations/${conversation.id}`), result);
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.runs.find((run) => run.id === pending.id).outcomePending, true);
+  assert.equal(result.body.runs.find((run) => run.id === sibling.id).outcomePending, false);
+}));
+
 function responseCapture() {
   return {
     statusCode: null,

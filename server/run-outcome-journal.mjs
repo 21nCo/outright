@@ -23,7 +23,9 @@ function syncDirectory(directory) {
 export function saveRunOutcome(directory, runId, outcome) {
   const destination = recordPath(directory, runId);
   const base = { ...outcome, version: 2, runId,
-    message: Buffer.from(String(outcome.message ?? "")).subarray(0, 4000).toString("utf8") };
+    message: Buffer.from(String(outcome.message ?? "")).subarray(0, 4000).toString("utf8"),
+    transcriptOmitted: Boolean(outcome.transcriptOmitted),
+    transcriptMessage: outcome.transcriptMessage ?? null };
   let record = JSON.stringify(base);
   if (Buffer.byteLength(record) > MAX_RECORD_BYTES && base.transcriptMessage) {
     // An unusually escape-heavy final body cannot expand the journal past

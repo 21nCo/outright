@@ -285,7 +285,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           ...conversation,
           messages: messagePage.messages,
           messagePage: messagePage.page,
-          runs: database.listRuns(conversation.id),
+          runs: database.listRuns(conversation.id).map((run) => ({
+            ...run, outcomePending: agents.isOutcomePending(run.id),
+          })),
           oldestInterruptedRun: database.findUnresolvedInterruptedRun(conversation.id) ?? null,
           worktreeInterruptedRun,
           recoveryConversation: recoveryConversation ? {

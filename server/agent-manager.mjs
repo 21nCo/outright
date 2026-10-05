@@ -1183,6 +1183,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     activeRuns: () => [...active.keys(), ...pendingOutcomes.keys()],
     activeProcessCount: () => active.size,
     pendingOutcomeCount: () => pendingOutcomes.size,
+    isOutcomePending: (runId) => pendingOutcomes.has(runId),
     shutdown() {
       if (shutdownPromise) return shutdownPromise;
       shuttingDown = true;

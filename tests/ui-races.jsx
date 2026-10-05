@@ -5152,6 +5152,49 @@ async function inlineArchiveFocusRegression(last = false, newerFocus = false, no
 }
 
 
+async function pendingRunOutcomeRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  let status = "running";
+  let pendingSnapshot = false;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response({ ...chats.A, runs: [{ id: "run-A", status, outcomePending: pendingSnapshot }] });
+    return response({});
+  };
+  const socketsBefore = fixtureSockets.length;
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => fixtureSockets.length > socketsBefore && host.querySelector('[aria-label="Stop active agent run"]'), "running outcome fixture");
+  const socket = fixtureSockets.at(-1);
+  const announce = (runId, conversationId) => socket.dispatchEvent(new MessageEvent("message", {
+    data: JSON.stringify({ type: "run.outcome_pending", runId, conversationId, reason: "storage-unavailable" }),
+  }));
+  announce("run-B", "chat-B");
+  await settle();
+  assert(!host.querySelector(".recovery-notice") && !host.querySelector(".run-state")?.textContent.includes("outcome pending"), "another chat's pending result appeared here");
+  announce("run-A", "chat-A");
+  await until(() => host.querySelector(".recovery-notice")?.textContent.includes("Run outcome waiting for storage"), "pending result announced");
+  assert(host.querySelector(".run-state")?.textContent.includes("outcome pending"), "run badge still claimed to be running");
+  assert(host.querySelector(".conversation-meta")?.textContent.includes("outcome pending"), "conversation summary still claimed to be running");
+  assert(host.querySelector('[aria-label="Final run outcome pending"]')?.disabled, "stop remained actionable after the provider exited");
+  assert(!host.querySelector(".thinking-copy")?.textContent.includes("Working in this worktree"), "streaming placeholder still claimed active work");
+  status = "completed";
+  socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", runId: "run-A", conversationId: "chat-A", payload: { type: "run.completed" } }) }));
+  await until(() => !host.querySelector(".recovery-notice") && host.querySelector(".run-state")?.textContent.includes("completed"), "durable result clears pending notice");
+  root.render(null); await settle();
+  status = "running";
+  pendingSnapshot = true;
+  const nextSocketsBefore = fixtureSockets.length;
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => fixtureSockets.length > nextSocketsBefore
+    && host.querySelector(".recovery-notice")?.textContent.includes("Run outcome waiting for storage"), "fresh client sees pending snapshot");
+  status = "completed";
+  pendingSnapshot = false;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { replay: { missed: true } } }) }));
+  await until(() => !host.querySelector(".recovery-notice") && host.querySelector(".run-state")?.textContent.includes("completed"), "settled snapshot clears pending notice");
+}
+
 try {
   const steps = [
     ["current conversation send", () => chatRace(false, false), "sending in the current conversation shows its run"],
@@ -5258,6 +5301,7 @@ try {
     ["checkpoint reading page", checkpointReadingPageRegression, "reconnect, completion and list updates retain a reading page and unique checkpoint counts"],
     ["find in-flight event", findInFlightEventRegression, "an event during find remains reachable when the returned page claims to be latest"],
     ["typing during prepend", typingDuringPrependRegression, "editing a find query does not silently cancel an earlier-page request"],
+    ["pending run outcome", pendingRunOutcomeRegression, "a storage-pending final outcome is announced only in its chat and clears on terminal commit"],
     ["provider bootstrap convergence", providerBootstrapConvergenceRegression, "a checking bootstrap converges after an earlier provider event"],
     ["bootstrap maintenance retry", bootstrapMaintenanceRetryRegression, "a transient archive cutover resumes initial loading"],
     ["bootstrap hard failures", bootstrapHardFailureRegression, "authorization, server, and network failures surface once"],
