@@ -1,0 +1,28 @@
+server/agent-manager.mjs
+  h_a39f9495f9ec1d 1186
+server/outright-runtime.mjs
+  h_a39f9495f9ec1d 288-290
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 63-74
+server/run-outcome-journal.mjs
+  h_a39f9495f9ec1d 26-28
+server/run-outcome-journal.test.mjs
+  h_a39f9495f9ec1d 1-20
+src/App.jsx
+  h_a39f9495f9ec1d 75,477-483,607-623,1301,1825,1829-1830,1833,1835,1861,1889,1918,1925,2020,2025
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 5155-5197,5304
+tests/ui-races.test.mjs
+  h_a39f9495f9ec1d 899
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "085fa1a12233026da73bd119b45178724fe86540",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
