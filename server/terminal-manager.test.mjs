@@ -67,7 +67,16 @@ test("Windows managed PTY preserves a full native exit code in event and audit",
   const events = [];
   const manager = createTerminalManager({ publish: (event) => events.push(event), database });
   try {
-    const terminal = await manager.create({ cwd: directory, shell: process.execPath });
+    // The manager takes its shell from the configured environment, not the
+    // create payload. Keep the override scoped to the launch itself.
+    const previousShell = process.env.SHELL;
+    process.env.SHELL = process.execPath;
+    let terminal;
+    try { terminal = await manager.create({ cwd: directory }); }
+    finally {
+      if (previousShell === undefined) delete process.env.SHELL;
+      else process.env.SHELL = previousShell;
+    }
     assert.equal(manager.write(terminal.id, "process.exit(300)\r"), true);
     await waitFor(() => manager.get(terminal.id)?.status === "exited", 12_000,
       () => ({ terminal: manager.get(terminal.id), events }));

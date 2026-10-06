@@ -26,7 +26,14 @@
 #define INPUT_CAPACITY 4096
 #define TEARDOWN_BUDGET_MS 750
 #define AUTHORIZED_CONTROL "__OUTRIGHT_LAUNCH_AUTHORIZED_V1__"
+#define UTILITY_TREE_EMPTY "__OUTRIGHT_UTILITY_TREE_EMPTY_V1__"
 #define CONTROL_FD 3
+
+static int utility_prelaunch_exit(int code) {
+  if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL)
+    dprintf(CONTROL_FD, "%s\n", UTILITY_TREE_EMPTY);
+  return code;
+}
 
 static volatile sig_atomic_t termination_requested = 0;
 
@@ -425,19 +432,19 @@ int main(int argc, char **argv) {
   int first = stop_on_owner_exit ? 2 : 1;
   if (argc < first + 2) {
     dprintf(STDERR_FILENO, "Usage: %s [--stop-on-owner-exit] HANDSHAKE_PATH EXECUTABLE [ARG...]\n", argv[0]);
-    return 64;
+    return utility_prelaunch_exit(64);
   }
   // Crash recovery signals a numeric PID only through a verified pidfd. Do
   // not admit a managed PTY on a kernel where its owner cannot later be
   // terminated safely after a runtime restart.
   if (stop_on_owner_exit && !supports_owned_termination()) {
     dprintf(STDERR_FILENO, "Managed terminals require Linux pidfd_open and pidfd_send_signal support\n");
-    return 69;
+    return utility_prelaunch_exit(69);
   }
   const char *handshake_path = argv[first];
   if (prctl(PR_SET_CHILD_SUBREAPER, 1) != 0) {
     dprintf(STDERR_FILENO, "Unable to claim provider descendants: %s\n", strerror(errno));
-    return 70;
+    return utility_prelaunch_exit(70);
   }
   struct sigaction action;
   memset(&action, 0, sizeof(action));
@@ -448,7 +455,7 @@ int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
   if (write_handshake(handshake_path, false, 0) != 0) {
     dprintf(STDERR_FILENO, "Unable to persist launch ownership: %s\n", strerror(errno));
-    return 73;
+    return utility_prelaunch_exit(73);
   }
 
   bool authorized = false;
@@ -485,6 +492,8 @@ int main(int argc, char **argv) {
       snapshot = inspect_owned_tree(getpid(), provider_pid, true);
       bool tree_empty = snapshot.complete ? snapshot.count == 0 : no_children_remaining();
       if (provider_reaped && tree_empty) {
+        if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL)
+          dprintf(CONTROL_FD, "%s\n", UTILITY_TREE_EMPTY);
         unlink(handshake_path);
         if (stop_requested || termination_requested) _exit(137);
         exit_like_provider(provider_status);
@@ -492,6 +501,8 @@ int main(int argc, char **argv) {
     }
 
     if (!authorized && (termination_requested || input_closed)) {
+      if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL)
+        dprintf(CONTROL_FD, "%s\n", UTILITY_TREE_EMPTY);
       unlink(handshake_path);
       return 0;
     }
@@ -523,7 +534,7 @@ int main(int argc, char **argv) {
           if (strcmp(line_start, "go") == 0 && !authorized) {
             if (authorize_provider(&argv[first + 1], handshake_path, &provider_pid) != 0) {
               unlink(handshake_path);
-              return 75;
+              return utility_prelaunch_exit(75);
             }
             authorized = true;
             // Acknowledge only after the provider identity is durable and the
@@ -538,6 +549,8 @@ int main(int argc, char **argv) {
             }
           } else if (strcmp(line_start, "stop") == 0) {
             if (!authorized) {
+              if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL)
+                dprintf(CONTROL_FD, "%s\n", UTILITY_TREE_EMPTY);
               unlink(handshake_path);
               return 0;
             }

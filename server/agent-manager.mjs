@@ -452,10 +452,26 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     const childClosed = new Promise((resolve) => { resolveChildClosed = resolve; });
     let resolveLaunchAuthorized;
     const launchAuthorized = new Promise((resolve) => { resolveLaunchAuthorized = resolve; });
+    // A SQLite fault in a provider's metadata or checkpoint callback must
+    // become this run's owned failure. An exception escaping EventEmitter's
+    // data listener would instead terminate supervision of every run.
+    const failProviderOutput = (error) => {
+      if (state.processError) return;
+      state.processError = error;
+      state.checkpointHalted = true;
+      terminateTree(child, "SIGTERM");
+    };
     consumeBoundedLines(child.stdout, {
       maxLineBytes: MAX_PROVIDER_LINE_BYTES,
-      onLine: (line) => handleProviderLine(state, line),
-      onOverflow: () => emit(run.id, "process.output_truncated", { stream: "stdout", maxBytes: MAX_PROVIDER_LINE_BYTES }),
+      onLine: (line) => {
+        if (state.processError) return;
+        try { handleProviderLine(state, line); }
+        catch (error) { failProviderOutput(error); }
+      },
+      onOverflow: () => {
+        try { emit(run.id, "process.output_truncated", { stream: "stdout", maxBytes: MAX_PROVIDER_LINE_BYTES }); }
+        catch (error) { failProviderOutput(error); }
+      },
     });
     const control = child.stdio?.[LAUNCH_CONTROL_FD];
     if (!control) {
@@ -475,7 +491,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     child.stderr.on("data", (chunk) => {
       const text = chunk.toString();
       state.stderr = `${state.stderr}${text}`.slice(-16_000);
-      emit(run.id, "process.stderr", { text: truncateUtf8(text, MAX_PROCESS_EVENT_BYTES), truncated: Buffer.byteLength(text) > MAX_PROCESS_EVENT_BYTES });
+      try { emit(run.id, "process.stderr", { text: truncateUtf8(text, MAX_PROCESS_EVENT_BYTES), truncated: Buffer.byteLength(text) > MAX_PROCESS_EVENT_BYTES }); }
+      catch (error) { failProviderOutput(error); }
     });
     child.on("error", (error) => {
       state.processError = error;
@@ -649,8 +666,13 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       state.finishing = false;
       if (storageAdmissionFailure(writeError) || (writeError.statusCode === 503 && database.maintenanceActive)) {
         state.pendingFinish = { exitCode, error };
+        state.finishFailureCount = (state.finishFailureCount ?? 0) + 1;
+        // A repeatedly refused transient write is now an unresolved outcome,
+        // not an active process. Keep its journal/row protected and let an
+        // unrelated run use the freed process slot.
+        const persistent = persistentStorageFailure(writeError) || state.finishFailureCount >= 2;
         if (shuttingDown && journalBecameDurable) setTimeout(onShutdownRecovery, 0);
-        if (persistentStorageFailure(writeError) && (!state.child || state.closed)) {
+        if (persistent && (!state.child || state.closed)) {
           // The process is gone. Retain its bounded outcome separately from
           // live process capacity; restart still sees the protected run row
           // and launch proof if storage never recovers in this process.
@@ -660,7 +682,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
           publish({ type: "capacity.changed" });
           if (!database.maintenanceActive) drain();
         }
-        if (!database.maintenanceActive) retryUnknownDiskUsage(persistentStorageFailure(writeError));
+        if (!database.maintenanceActive) retryUnknownDiskUsage(persistent);
         return false;
       }
       throw writeError;

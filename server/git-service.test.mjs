@@ -61,6 +61,24 @@ test("optional Git history failure leaves required status usable", async () => {
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("unknown native utility ownership preserves Git mutation admission for inspection", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-git-unknown-owner-"));
+  try {
+    const repository = await realpath(root);
+    await writeFile(path.join(repository, "tracked.txt"), "draft\n");
+    const actions = [];
+    const service = createGitService({
+      database: { auditAdmission: (action) => actions.push(action), auditCritical: (action) => actions.push(action) },
+      getProjects: () => [{ worktrees: [{ path: repository }] }],
+      getConfig: async () => ({ scanRoots: [repository] }),
+      subprocesses: { run: async () => { throw Object.assign(new Error("owner proof missing"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN" }); } },
+    });
+    await assert.rejects(service.stage(repository, ["tracked.txt"]), (error) =>
+      error.statusCode === 503 && error.details?.outcomeUnknown === true);
+    assert.deepEqual(actions, ["git.stage.requested"], "an uncertain native outcome was recorded as a failed mutation");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("editor launch releases utility capacity when a GUI stays open and records spawn failure", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "outright-editor-launch-"));
   try {

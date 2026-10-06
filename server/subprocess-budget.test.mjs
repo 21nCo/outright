@@ -5,9 +5,19 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync,
 import { realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createSubprocessBudget } from "./subprocess-budget.mjs";
+import { createSubprocessBudget, runOwned } from "./subprocess-budget.mjs";
 import { createGitService } from "./git-service.mjs";
 import { scanProjects } from "./project-scanner.mjs";
+import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
+
+function cleanupDescendant(root, pidFile) {
+  if (existsSync(pidFile)) {
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    if (Number.isSafeInteger(pid) && pid > 0) try { process.kill(pid, "SIGKILL"); }
+    catch (error) { if (error.code !== "ESRCH") throw error; }
+  }
+  rmSync(root, { recursive: true, force: true });
+}
 
 test("Git and scanner share admission, reject bursts before spawn, and recover after child close", async () => {
   const root = await realpath(mkdtempSync(path.join(os.tmpdir(), "outright-process-budget-")));
@@ -39,6 +49,81 @@ test("malformed utility caps fail closed before admitting work", () => {
   assert.equal(createSubprocessBudget({ limit: 0 }).capacity().limit, 0);
 });
 
+test("project discovery propagates an unknown native utility owner", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-scan-unknown-owner-"));
+  try {
+    mkdirSync(path.join(root, ".git"));
+    const unavailable = Object.assign(new Error("owner proof missing"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN" });
+    await assert.rejects(scanProjects({ scanRoots: [root], maxDepth: 0, maxProjects: 1, excludeDirectories: new Set() },
+      { run: () => Promise.reject(unavailable) }), (error) => error === unavailable);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("explicit null encoding preserves binary stdout and stderr", async () => {
+  const budget = createSubprocessBudget({ limit: 1 });
+  const { stdout, stderr } = await budget.run(process.execPath, ["-e",
+    "process.stdout.write(Buffer.from([0,255,10]));process.stderr.write(Buffer.from([255,0]))"],
+  { encoding: null, timeout: 5000 });
+  assert.deepEqual(stdout, Buffer.from([0, 255, 10]));
+  assert.deepEqual(stderr, Buffer.from([255, 0]));
+});
+
+test("an in-flight utility reservation survives runtime reconstruction", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-restart-"));
+  let complete;
+  try {
+    const budget = createSubprocessBudget({ limit: 1, unknownDirectory: root,
+      execute(_file, _args, _options, onClose) { complete = onClose; } });
+    const command = budget.run("git", ["status"]);
+    assert.equal(budget.capacity().active, 1);
+    const reopened = createSubprocessBudget({ limit: 1, unknownDirectory: root });
+    assert.equal(reopened.capacity().unknown, 1);
+    await assert.rejects(reopened.run("git", ["status"]), (error) => error.code === "SUBPROCESS_CAPACITY");
+    complete(null, "done", "", true);
+    assert.deepEqual(await command, { stdout: "done", stderr: "" });
+    assert.equal(createSubprocessBudget({ limit: 1, unknownDirectory: root }).capacity().unknown, 0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a failed native owner retains an unknown permit across budget restart", { timeout: 15_000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-fault-"));
+  const pidFile = path.join(root, "descendant.pid");
+  const unknownDirectory = path.join(root, "unknown");
+  let supervisor;
+  let owner;
+  const budget = createSubprocessBudget({ limit: 1, unknownDirectory,
+    execute(file, args, options, onClose) {
+      supervisor = runOwned(file, args, options, onClose);
+      return supervisor;
+    } });
+  const script = `const { spawn } = require('node:child_process');
+    const fs = require('node:fs');
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+      { detached: true, stdio: 'ignore' });
+    fs.writeFileSync(process.argv[1], String(child.pid));
+    child.unref(); setTimeout(() => process.exit(0), 800);`;
+  try {
+    const command = budget.run(process.execPath, ["-e", script, pidFile], { timeout: 8000 });
+    command.catch(() => {});
+    const deadline = Date.now() + 5000;
+    while (!existsSync(pidFile) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(existsSync(pidFile), "fault fixture did not start its detached child");
+    supervisor.kill("SIGKILL");
+    await assert.rejects(command, (error) => { owner = error.owner; return error.code === "SUBPROCESS_OWNERSHIP_UNKNOWN"; });
+    assert.equal(budget.capacity().active, 1);
+    assert.equal(budget.capacity().unknown, 1);
+    const restarted = createSubprocessBudget({ limit: 1, unknownDirectory });
+    assert.equal(restarted.capacity().unknown, 1);
+    await assert.rejects(restarted.run("git", ["--version"]), (error) => error.code === "SUBPROCESS_CAPACITY");
+  } finally {
+    if (process.platform === "darwin" && owner?.label) {
+      try { execFileSync(AGENT_SUPERVISOR, ["--terminate", owner.label], { timeout: 5000 }); }
+      catch { /* A missing job is already empty; the detached PID is checked below. */ }
+    }
+    cleanupDescendant(root, pidFile);
+  }
+});
+
 test("failed and timed-out utility children release admission", async () => {
   const budget = createSubprocessBudget({ limit: 1 });
   await assert.rejects(budget.run("missing-outright-executable", []));
@@ -67,15 +152,7 @@ test("timed-out utility commands keep the permit until a detached descendant is 
     assert.ok(pid > 0, "detached descendant was not launched");
     assert.throws(() => process.kill(pid, 0), { code: "ESRCH" },
       "capacity was released while a detached descendant still ran");
-  } finally {
-    if (existsSync(pidFile)) {
-      const pid = Number(readFileSync(pidFile, "utf8"));
-      if (Number.isSafeInteger(pid) && pid > 0) try { process.kill(pid, "SIGKILL"); } catch (error) {
-        if (error.code !== "ESRCH") throw error;
-      }
-    }
-    rmSync(root, { recursive: true, force: true });
-  }
+  } finally { cleanupDescendant(root, pidFile); }
 });
 
 test("aborting a utility command retains its permit through native descendant cleanup", { timeout: 15_000 }, async () => {
@@ -100,15 +177,7 @@ test("aborting a utility command retains its permit through native descendant cl
     assert.equal(budget.capacity().active, 0);
     assert.throws(() => process.kill(Number(readFileSync(pidFile, "utf8")), 0), { code: "ESRCH" },
       "permit was released while a cancelled descendant still ran");
-  } finally {
-    if (existsSync(pidFile)) {
-      const pid = Number(readFileSync(pidFile, "utf8"));
-      if (Number.isSafeInteger(pid) && pid > 0) try { process.kill(pid, "SIGKILL"); } catch (error) {
-        if (error.code !== "ESRCH") throw error;
-      }
-    }
-    rmSync(root, { recursive: true, force: true });
-  }
+  } finally { cleanupDescendant(root, pidFile); }
 });
 
 test("a utility leader exiting does not release its detached descendant's permit", { timeout: 15_000 }, async () => {
@@ -127,22 +196,17 @@ test("a utility leader exiting does not release its detached descendant's permit
     const deadline = Date.now() + 5000;
     while (!existsSync(pidFile) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
     assert.ok(existsSync(pidFile), "leader did not launch before the ownership probe");
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    assert.equal(budget.capacity().active, 1, "permit was released when the direct leader exited");
     const pid = Number(readFileSync(pidFile, "utf8"));
-    process.kill(pid, 0);
-    await assert.rejects(command, (error) => error.killed === true);
+    // Native supervisors may reap the descendant immediately after the
+    // leader exits. Observe the invariant, rather than requiring a delay.
+    if (budget.capacity().active === 0) {
+      assert.throws(() => process.kill(pid, 0), { code: "ESRCH" },
+        "permit was released while the descendant remained live");
+    }
+    await command;
     assert.equal(budget.capacity().active, 0);
     assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
-  } finally {
-    if (existsSync(pidFile)) {
-      const pid = Number(readFileSync(pidFile, "utf8"));
-      if (Number.isSafeInteger(pid) && pid > 0) try { process.kill(pid, "SIGKILL"); } catch (error) {
-        if (error.code !== "ESRCH") throw error;
-      }
-    }
-    rmSync(root, { recursive: true, force: true });
-  }
+  } finally { cleanupDescendant(root, pidFile); }
 });
 
 test("one large worktree scan stays within its own budget and returns every changed count", async () => {

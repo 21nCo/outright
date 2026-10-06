@@ -1,5 +1,6 @@
 import { createOutrightRuntime } from "./outright-runtime.mjs";
 import { recoverArchiveBeforeStartup } from "./database.mjs";
+import { writeStartupUnavailable } from "./startup-response.mjs";
 
 // Config reloads can create the successor plugin before Vite closes the old
 // server. A local shutdown is a known, finite lease owner, unlike an unrelated
@@ -72,8 +73,7 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
           runtime.handleRequest(request, response).then((handled) => { if (!handled && !response.writableEnded) next(); }).catch(next);
           return;
         }
-        response.writeHead(startupError ? 500 : 503, { "content-type": "application/json", ...(!startupError ? { "retry-after": "1" } : {}) });
-        response.end(JSON.stringify({ error: startupError ? "Runtime recovery failed; database requires inspection" : "Runtime recovery is in progress" }));
+        writeStartupUnavailable(response, startupError);
       });
       server.httpServer?.on("upgrade", (request, socket) => {
         // Vite owns its HMR upgrades on this shared server. Only the runtime

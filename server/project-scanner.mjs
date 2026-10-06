@@ -1,7 +1,7 @@
 import { access, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { createObservability } from "@superfunctions/observability";
-import { utilityProcesses } from "./subprocess-budget.mjs";
+import { utilityBudgetUnavailable, utilityProcesses } from "./subprocess-budget.mjs";
 
 const observability = createObservability({
   service: "outright",
@@ -34,7 +34,7 @@ export async function scanProjects(config, subprocesses = utilityProcesses) {
   const safeGit = async (directory, args) => {
     try { return await git(directory, args); }
     catch (error) {
-      if (error.code === "SUBPROCESS_CAPACITY") throw error;
+      if (utilityBudgetUnavailable(error)) throw error;
       return "";
     }
   };
@@ -54,7 +54,7 @@ export async function scanProjects(config, subprocesses = utilityProcesses) {
           repositories.set(commonPath, candidate);
         }
       } catch (error) {
-        if (error.code === "SUBPROCESS_CAPACITY") throw error;
+        if (utilityBudgetUnavailable(error)) throw error;
         // A stale or unsupported .git entry should not prevent the remaining projects from loading.
       }
     }
@@ -64,7 +64,7 @@ export async function scanProjects(config, subprocesses = utilityProcesses) {
       try {
         return await readProject(candidate, commonPath, git, safeGit);
       } catch (error) {
-        if (error.code === "SUBPROCESS_CAPACITY") throw error;
+        if (utilityBudgetUnavailable(error)) throw error;
         if (process.env.OUTRIGHT_DEBUG === "1") {
           console.warn(`[outright] skipped ${candidate}:`, error.message);
         }

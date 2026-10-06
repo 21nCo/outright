@@ -117,6 +117,7 @@ test("Vite serves a retryable API response while archive recovery is pending", a
   assert.equal(status, 503);
   assert.equal(headers["retry-after"], "1");
   assert.match(body.error, /recovery is in progress/);
+  assert.equal(body.code, "ARCHIVE_MAINTENANCE_TRANSIENT");
   const upgrade = { writes: [], destroyed: false, write(value) { this.writes.push(value); }, destroy() { this.destroyed = true; } };
   httpServer.emit("upgrade", { url: "/" }, upgrade);
   assert.equal(upgrade.destroyed, false, "Vite HMR upgrade was rejected during archive recovery");
@@ -157,6 +158,7 @@ test("failed Vite recovery reports a terminal API error without taking HMR owner
     assert.equal(status, 500);
     assert.equal(headers["retry-after"], undefined);
     assert.match(body.error, /requires inspection/);
+    assert.equal(body.code, "ARCHIVE_MAINTENANCE_FAILED");
     const socket = { writes: [], destroyed: false, write(value) { this.writes.push(value); }, destroy() { this.destroyed = true; } };
     httpServer.emit("upgrade", { url: "/" }, socket);
     assert.equal(socket.destroyed, false);

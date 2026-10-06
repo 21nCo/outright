@@ -4,6 +4,7 @@ import path from "node:path";
 import sirv from "sirv";
 import { recoverArchiveBeforeStartup } from "./database.mjs";
 import { createOutrightRuntime } from "./outright-runtime.mjs";
+import { writeStartupUnavailable } from "./startup-response.mjs";
 
 const port = Number(process.env.PORT || 4173);
 const host = process.env.HOST || "127.0.0.1";
@@ -19,8 +20,7 @@ app.use((request, response, next) => {
     runtime.handleRequest(request, response).then((handled) => { if (!handled && !response.writableEnded) next(); }).catch(next);
     return;
   }
-  response.writeHead(startupError ? 500 : 503, { "content-type": "application/json", ...(!startupError ? { "retry-after": "1" } : {}) });
-  response.end(JSON.stringify({ error: startupError ? "Runtime recovery failed; database requires inspection" : "Runtime recovery is in progress" }));
+  writeStartupUnavailable(response, startupError);
 });
 httpServer.on("upgrade", (_request, socket) => {
   if (!runtime) {

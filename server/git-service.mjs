@@ -1,25 +1,25 @@
 import { randomUUID } from "node:crypto";
 import { access, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
-import { utilityProcesses } from "./subprocess-budget.mjs";
+import { utilityBudgetUnavailable, utilityProcesses } from "./subprocess-budget.mjs";
 
 export function createGitService({ database, getProjects, getConfig, subprocesses = utilityProcesses }) {
   const git = (cwd, args, overrides = {}) => runGit(subprocesses, cwd, args, overrides);
   const safeGit = async (cwd, args, overrides = {}) => {
     try { return await git(cwd, args, overrides); }
     catch (error) {
-      if (error.code === "SUBPROCESS_CAPACITY" || mutationOutcomeUncertain(error)) throw error;
+      if (utilityBudgetUnavailable(error) || mutationOutcomeUncertain(error)) throw error;
       return "";
     }
   };
   const optionalGit = async (cwd, args) => {
     try { return await git(cwd, args); }
-    catch { return ""; }
+    catch (error) { if (utilityBudgetUnavailable(error)) throw error; return ""; }
   };
   const gitOutputOnFailure = async (cwd, args) => {
     try { return await git(cwd, args, { maxBuffer: 12 * 1024 * 1024 }); }
     catch (error) {
-      if (error.code === "SUBPROCESS_CAPACITY" || mutationOutcomeUncertain(error)) throw error;
+      if (utilityBudgetUnavailable(error) || mutationOutcomeUncertain(error)) throw error;
       return (error.stdout ?? "").trimEnd();
     }
   };
@@ -83,7 +83,7 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     await auditedMutation("git.unstage.requested", "git.unstage", { target: cwd, files: validated }, async () => {
       try { await git(cwd, ["restore", "--staged", "--", ...validated]); }
       catch (error) {
-        if (error.code === "SUBPROCESS_CAPACITY") throw error;
+        if (utilityBudgetUnavailable(error)) throw error;
         // Current Git also needs HEAD as restore's default staged source.
         // Before the first commit every index entry is an addition; remove
         // only those entries and leave the working files in place.
@@ -97,7 +97,7 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
         if (!/not a git command|unknown subcommand|unknown option/i.test(`${error.message}\n${error.stderr ?? ""}`)) throw error;
         try { await git(cwd, ["reset", "HEAD", "--", ...validated]); }
         catch (resetError) {
-          if (resetError.code === "SUBPROCESS_CAPACITY") throw resetError;
+          if (utilityBudgetUnavailable(resetError)) throw resetError;
           // An unborn branch has no HEAD to reset against. Its staged files
           // are all additions, so removing only the index entries is safe.
           if (!/ambiguous argument ['"]?HEAD|unknown revision.*HEAD|bad revision ['"]?HEAD|could not resolve ['"]?HEAD/i.test(`${resetError.message}\n${resetError.stderr ?? ""}`)) throw resetError;
@@ -183,7 +183,7 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     try {
       const { stdout } = await subprocesses.run("gh", ["pr", "view", "--json", "number,title,url,state,headRefName,baseRefName,statusCheckRollup"], { cwd, env: githubEnvironment(cwd), encoding: "utf8", timeout: 6000, maxBuffer: 2 * 1024 * 1024 });
       pullRequest = JSON.parse(stdout);
-    } catch (error) { if (error.code === "SUBPROCESS_CAPACITY") throw error; /* A worktree does not need an associated PR. */ }
+    } catch (error) { if (utilityBudgetUnavailable(error)) throw error; /* A worktree does not need an associated PR. */ }
     return { instructionFiles, skills, pullRequest };
   }
 
@@ -235,7 +235,7 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
 }
 
 function mutationOutcomeUncertain(error) {
-  return Boolean(error?.killed || error?.signal || ["ETIMEDOUT", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"].includes(error?.code));
+  return Boolean(error?.killed || error?.signal || ["ETIMEDOUT", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", "SUBPROCESS_OWNERSHIP_UNKNOWN"].includes(error?.code));
 }
 
 async function runGit(subprocesses, cwd, args, overrides = {}) {

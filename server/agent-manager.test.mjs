@@ -343,7 +343,8 @@ test("queue read faults retain their retry while a preparing sibling starts", as
 });
 
 test("persistent terminal storage refusal frees the process slot but protects its outcome", async () => {
-  for (const [name, fault] of [["quota", { statusCode: 507 }], ["read-only", { code: "SQLITE_READONLY" }], ["no-space", { code: "ENOSPC" }]]) {
+  for (const [name, fault] of [["quota", { statusCode: 507 }], ["read-only", { code: "SQLITE_READONLY" }],
+    ["no-space", { code: "ENOSPC" }], ["io-error", { code: "SQLITE_IOERR_WRITE" }], ["busy", { code: "SQLITE_BUSY" }]]) {
     const database = fakeDatabase();
     database.updateConversation("conv-2", { id: "conv-2", worktreePath: "/tmp/other-project" });
     database.getSettings = () => ({ maxConcurrentRuns: 1 });
@@ -365,7 +366,9 @@ test("persistent terminal storage refusal frees the process slot but protects it
       await manager.schedule({ conversation: database.getConversation("conv-1"), run: second });
       await manager.schedule({ conversation: database.getConversation("conv-2"), run: unrelated });
       children[0].emit("close", 0, null);
-      await new Promise((resolve) => setTimeout(resolve, 160));
+      const pendingDeadline = Date.now() + 1000;
+      while ((manager.pendingOutcomeCount() === 0 || children.length < 2) && Date.now() < pendingDeadline)
+        await new Promise((resolve) => setTimeout(resolve, 10));
       assert.equal(manager.pendingOutcomeCount(), 1, "the exited run lost its pending outcome");
       assert.deepEqual(manager.activeRuns(), [unrelated.id, first.id], "the process slot did not admit unrelated work");
       assert.equal(database.getRun(first.id).status, "running", "a refused terminal commit was falsely reported as durable");
@@ -570,7 +573,8 @@ test("shutdown preserves exited provider outcomes across a terminal storage faul
       child.emit("close", exitCode, null);
       assert.equal(database.getRun(run.id).status, "running");
       await manager.shutdown();
-      assert.equal(manager.activeProcessCount(), fault === "ENOSPC" ? 0 : 1);
+      assert.equal(manager.activeProcessCount(), 0, "an exited provider still occupied a process slot");
+      assert.equal(manager.pendingOutcomeCount(), 1, "the terminal result lost its bounded retry owner");
       await database.close();
       database = createOutrightDatabase({ filename });
       assert.equal(database.reconcileInterruptedRuns().count, 1);
@@ -1448,6 +1452,23 @@ test("a full conversation metadata budget does not fail a provider session event
   assert.equal(database.getRun(run.id).status, "completed");
 });
 
+test("a provider metadata storage fault remains owned until its failed outcome commits", async () => {
+  const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex" });
+  database.updateConversation = () => { throw Object.assign(new Error("metadata write failed"), { code: "SQLITE_IOERR_WRITE" }); };
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  const run = database.createRun(codexRun("metadata-fault"));
+  try {
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+    assert.doesNotThrow(() => child.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "session" }) + "\n"));
+    assert.deepEqual(child.signals, ["SIGTERM"], "storage fault did not stop the owned provider");
+    assert.deepEqual(manager.activeRuns(), [run.id], "the process slot was released before owner close");
+    child.emit("close", 1, null);
+    assert.equal(database.getRun(run.id).status, "failed");
+    assert.match(database.getRun(run.id).error, /metadata write failed/);
+  } finally { await manager.shutdown(); }
+});
+
 test("handles asynchronous authorization-pipe errors without an uncaught stream error", async () => {
   const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex" });
   const child = fakeChild();
@@ -1630,7 +1651,7 @@ for (const provider of ["codex", "claude"]) {
   });
 }
 
-test("unexpected usage persistence errors remain visible to the provider stream owner", async () => {
+test("unexpected usage persistence errors fail only the owned provider run", async () => {
   const database = fakeDatabase();
   const originalUpdate = database.updateRun.bind(database);
   database.updateRun = (id, patch) => {
@@ -1641,9 +1662,11 @@ test("unexpected usage persistence errors remain visible to the provider stream 
   const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
   const run = database.createRun(codexRun("usage-io-error"));
   await manager.schedule({ conversation: database.getConversation("conv-1"), run });
-  assert.throws(() => child.stdout.write(`${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } })}\n`),
-    /usage I\/O failed/);
+  assert.doesNotThrow(() => child.stdout.write(`${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } })}\n`));
+  assert.deepEqual(child.signals, ["SIGTERM"]);
   child.emit("close", 0, null);
+  assert.equal(database.getRun(run.id).status, "failed");
+  assert.match(database.getRun(run.id).error, /usage I\/O failed/);
 });
 
 test("quota-refused transcript writes mark omission while replay-only stdout loss does not", async () => {
@@ -2843,12 +2866,12 @@ test("the launch wrapper records durable identity before authorization and clean
   let detachedDescendantPid = null;
   // Fail fast with cleanup instead of hanging until the suite timeout leaks
   // processes and temp directories.
-  const withDeadline = async (promise, label, kill = () => {}) => {
+  const withDeadline = async (promise, label, kill = () => {}, timeoutMs = 5000) => {
     let timer;
     try {
       return await Promise.race([
         promise,
-        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out`)), 5000); }),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs); }),
       ]);
     } finally { clearTimeout(timer); kill(); }
   };
@@ -2910,7 +2933,7 @@ test("the launch wrapper records durable identity before authorization and clean
     } else {
       assert.equal(authorizedRecord?.providerProcessIdentity, undefined);
     }
-    const code = await withDeadline(child2Exited, "authorized wrapper exit", () => { try { child2.kill("SIGKILL"); } catch {} });
+    const code = await withDeadline(child2Exited, "authorized wrapper exit", () => { try { child2.kill("SIGKILL"); } catch {} }, 10_000);
     assert.equal(code, 0);
     assert.equal(existsSync(marker2), true, "the authorized wrapper starts the provider");
     if (process.platform === "win32") {

@@ -1,11 +1,15 @@
 #define _WIN32_WINNT 0x0602
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <io.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+
+#define UTILITY_TREE_EMPTY "__OUTRIGHT_UTILITY_TREE_EMPTY_V1__\n"
 
 // Windows volumes may report ino=0 to Node. Compare native file IDs before
 // treating two pathnames as a hard-link pair or skipping a second byte lock.
@@ -219,6 +223,16 @@ static int inspect_owner(int argc, wchar_t **argv) {
   CloseHandle(process); wprintf(L"alive\n"); return 0;
 }
 
+static int utility_prelaunch_exit(int code) {
+  if (GetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", NULL, 0) != 0) {
+    intptr_t descriptor = _get_osfhandle(3);
+    DWORD written = 0;
+    if (descriptor != -1)
+      WriteFile((HANDLE)descriptor, UTILITY_TREE_EMPTY, sizeof(UTILITY_TREE_EMPTY) - 1, &written, NULL);
+  }
+  return code;
+}
+
 int wmain(int argc, wchar_t **argv) {
   if (argc < 2) return 64;
   if (wcscmp(argv[1], L"--same-file") == 0) return same_file(argc, argv);
@@ -228,18 +242,52 @@ int wmain(int argc, wchar_t **argv) {
   bool test_mode = wcscmp(argv[1], L"--test-runner") == 0;
   if (test_mode && argc < 4) return 64;
   HANDLE job = CreateJobObjectW(NULL, NULL);
-  if (!job) return 70;
+  if (!job) return utility_prelaunch_exit(70);
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
   limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-  if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return 71;
+  if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return utility_prelaunch_exit(71);
 
   wchar_t *line = command_line(argc, argv, test_mode ? 3 : 1);
-  if (!line) return 72;
+  if (!line) return utility_prelaunch_exit(72);
+  // The native child owns no control input. Forward only output and error;
+  // sharing the supervisor's stdin would let Git or a helper consume Stop.
+  SECURITY_ATTRIBUTES inherited = {0};
+  inherited.nLength = sizeof(inherited);
+  inherited.bInheritHandle = TRUE;
+  HANDLE null_input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    &inherited, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (null_input == INVALID_HANDLE_VALUE) { free(line); return utility_prelaunch_exit(72); }
+  HANDLE output = NULL, error_output = NULL;
+  HANDLE own_process = GetCurrentProcess();
+  if (!DuplicateHandle(own_process, GetStdHandle(STD_OUTPUT_HANDLE), own_process, &output,
+        0, TRUE, DUPLICATE_SAME_ACCESS)
+      || !DuplicateHandle(own_process, GetStdHandle(STD_ERROR_HANDLE), own_process, &error_output,
+        0, TRUE, DUPLICATE_SAME_ACCESS)) {
+    if (output) CloseHandle(output);
+    CloseHandle(null_input);
+    free(line);
+    return utility_prelaunch_exit(72);
+  }
   STARTUPINFOW startup = {0};
   startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESTDHANDLES;
+  startup.hStdInput = null_input;
+  startup.hStdOutput = output;
+  startup.hStdError = error_output;
+  bool utility_owner = GetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", NULL, 0) != 0;
+  intptr_t proof_handle = _get_osfhandle(3);
+  if (utility_owner && (proof_handle == -1
+      || !SetHandleInformation((HANDLE)proof_handle, HANDLE_FLAG_INHERIT, 0))) {
+    CloseHandle(null_input); CloseHandle(output); CloseHandle(error_output); free(line);
+    return utility_prelaunch_exit(72);
+  }
   PROCESS_INFORMATION process = {0};
-  if (!CreateProcessW(NULL, line, NULL, NULL, TRUE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-      NULL, NULL, &startup, &process)) return 73;
+  BOOL launched = CreateProcessW(NULL, line, NULL, NULL, TRUE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+    NULL, NULL, &startup, &process);
+  CloseHandle(null_input);
+  CloseHandle(output);
+  CloseHandle(error_output);
+  if (!launched) { free(line); return utility_prelaunch_exit(73); }
   free(line);
   if (!AssignProcessToJobObject(job, process.hProcess)) {
     TerminateProcess(process.hProcess, 126);
@@ -276,11 +324,9 @@ int wmain(int argc, wchar_t **argv) {
   GetExitCodeProcess(process.hProcess, &exit_code);
   CloseHandle(process.hProcess);
 
-  // Test files must not carry helper processes into the next file. Provider
-  // runs retain the normal wait-for-descendants contract below.
-  if (test_mode) {
-    if (!TerminateJobObject(job, exit_code)) return 77;
-  }
+  // A finished direct command must not hold a utility permit indefinitely
+  // through an escaped helper. The Job Object owns and reaps that tree.
+  if ((utility_owner || test_mode) && !TerminateJobObject(job, exit_code)) return 77;
 
   // The job owns descendants even when they detach from the provider. Keep
   // this supervisor alive until the kernel reports that the job is empty.
@@ -289,6 +335,12 @@ int wmain(int argc, wchar_t **argv) {
     if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), NULL)) return 76;
     if (accounting.ActiveProcesses == 0) break;
     Sleep(25);
+  }
+  if (utility_owner) {
+    HANDLE proof = (HANDLE)proof_handle;
+    DWORD written = 0;
+    if (proof != INVALID_HANDLE_VALUE)
+      WriteFile(proof, UTILITY_TREE_EMPTY, sizeof(UTILITY_TREE_EMPTY) - 1, &written, NULL);
   }
   CloseHandle(job);
   return (int)exit_code;
