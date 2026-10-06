@@ -5247,29 +5247,40 @@ async function pendingRunOutcomeRegression() {
   const socketsBefore = fixtureSockets.length;
   root.render(<TooltipProvider><App /></TooltipProvider>);
   await until(() => fixtureSockets.length > socketsBefore && host.querySelector('[aria-label="Stop active agent run"]'), "running outcome fixture");
-  assert(host.querySelector('.send-hint[role="status"]')?.textContent.includes("Agent is running")
-    && host.querySelector('.message.is-streaming[aria-busy="true"]:not([role="status"])'),
-  "running state must have one live announcement while the activity card stays busy");
+  assert(host.querySelector('.run-announcement[role="status"]')?.textContent.includes("Run running")
+    && host.querySelector('.message.is-streaming[aria-busy="false"]:not([role="status"])'),
+  "running activity content must remain readable while its status is announced");
+  const statusRegion = host.querySelector('.run-announcement');
+  const statusMutations = [];
+  const statusObserver = new MutationObserver((records) => statusMutations.push(...records));
+  statusObserver.observe(statusRegion, { subtree: true, childList: true, characterData: true, characterDataOldValue: true });
   const socket = fixtureSockets.at(-1);
   const announce = (runId, conversationId) => socket.dispatchEvent(new MessageEvent("message", {
     data: JSON.stringify({ type: "run.outcome_pending", runId, conversationId, reason: "storage-unavailable" }),
   }));
   announce("run-B", "chat-B");
   await settle();
+  assert(statusMutations.length === 0, "another chat re-announced this run");
   assert(!host.querySelector(".recovery-notice") && !host.querySelector(".run-state")?.textContent.includes("outcome pending"), "another chat's pending result appeared here");
   announce("run-A", "chat-A");
   await until(() => host.querySelector(".recovery-notice")?.textContent.includes("Run outcome waiting for storage"), "pending result announced");
   assert(host.querySelector(".recovery-notice")?.tagName === "DIV"
     && !host.querySelector(".recovery-notice")?.hasAttribute("aria-live")
-    && host.querySelector('.send-hint[role="status"]')?.textContent.includes("Saving final run outcome"),
+    && host.querySelector('.run-announcement[role="status"]')?.textContent.includes("Saving final run outcome"),
   "Changing run IDs must not re-announce the verbose recovery notice; the stable status announces the transition");
   assert(host.querySelector(".run-state")?.textContent.includes("outcome pending"), "run badge still claimed to be running");
+  await settle();
+  assert(statusMutations.length === 1, "outcome pending must produce one material announcement");
   assert(host.querySelector(".conversation-meta")?.textContent.includes("outcome pending"), "conversation summary still claimed to be running");
   assert(host.querySelector('[aria-label="Final run outcome pending"]')?.disabled, "stop remained actionable after the provider exited");
   assert(!host.querySelector(".thinking-copy")?.textContent.includes("Working in this worktree"), "streaming placeholder still claimed active work");
   status = "completed";
   socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", runId: "run-A", conversationId: "chat-A", payload: { type: "run.completed" } }) }));
   await until(() => !host.querySelector(".recovery-notice") && host.querySelector(".run-state")?.textContent.includes("completed"), "durable result clears pending notice");
+  await settle();
+  assert(statusRegion.textContent === "Run completed", "completion announcement did not settle");
+  assert(statusMutations.length === 2, `completion must produce one further announcement; mutations=${statusMutations.length}, details=${JSON.stringify(statusMutations.map((record) => ({ type: record.type, oldValue: record.oldValue, target: record.target?.textContent })))}`);
+  statusObserver.disconnect();
   root.render(null); await settle();
   status = "running";
   pendingSnapshot = true;

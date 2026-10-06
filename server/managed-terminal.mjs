@@ -59,6 +59,11 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
   let verified = false;
   let readySeen = false;
   let shellExited = false;
+  let shellResult;
+  let settleFrame;
+  let settleSocket;
+  const frameSettled = new Promise((resolve) => { settleFrame = resolve; });
+  const socketSettled = new Promise((resolve) => { settleSocket = resolve; });
   let windowsProcessIdentity;
   const verifyEmpty = async (signal, exitCode) => {
     if (process.platform === "linux") return !existsSync(ownership.handshakePath);
@@ -97,9 +102,21 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
     child.on("error", (error) => { stderr = `${stderr}${error.message}`.slice(-2048); });
     child.on("close", async (exitCode, signal) => {
       closed = true;
+      // The native owner can close just before Node delivers the final socket
+      // frame. Give the independently bounded frame/close event its turn
+      // before deciding that the outcome is unknown.
+      if (socket && !socket.destroyed && !shellResult) {
+        let timeout;
+        await Promise.race([frameSettled, socketSettled, new Promise((resolve) => {
+          timeout = setTimeout(resolve, 1000);
+        })]).finally(() => clearTimeout(timeout));
+      }
       socket?.destroy();
       verified = await verifyEmpty(signal, exitCode);
-      finalResult = { exitCode, signal, verified };
+      const expectedCode = shellResult?.signal > 0 ? 128 + shellResult.signal : shellResult?.exitCode;
+      const outcomeKnown = Boolean(shellResult) && signal == null && expectedCode % 256 === exitCode;
+      finalResult = { exitCode: outcomeKnown ? shellResult.exitCode : exitCode,
+        signal: outcomeKnown ? shellResult.signal : signal, verified, outcomeKnown };
       onExit?.(finalResult);
       resolve(finalResult);
     });
@@ -156,9 +173,21 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
           pending = pending.slice(end + 1);
           let message;
           try { message = JSON.parse(line); } catch { reject(new Error("PTY broker returned malformed data")); socket.destroy(); return; }
+          if (!message || typeof message !== "object" || Array.isArray(message)) {
+            reject(new Error("PTY broker returned malformed data")); socket.destroy(); return;
+          }
           if (message.type === "ready") { readySeen = true; resolve(); }
           else if (message.type === "error") reject(new Error(message.message));
-          else if (message.type === "shell-exited") shellExited = true;
+          else if (message.type === "shell-exited") {
+            if (shellExited || !Number.isSafeInteger(message.exitCode) || message.exitCode < 0
+              || !Number.isSafeInteger(message.signal) || message.signal < 0) {
+              socket.destroy();
+              continue;
+            }
+            shellExited = true;
+            shellResult = { exitCode: message.exitCode, signal: message.signal };
+            settleFrame();
+          }
           else if (message.type === "data" && typeof message.data === "string") {
             if (onData) onData(message.data);
             else earlyData = `${earlyData}${message.data}`.slice(-150_000);
@@ -167,6 +196,7 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
       });
       socket.on("error", reject);
       socket.on("close", () => {
+        settleSocket();
         if (!readySeen) reject(new Error("PTY broker closed before launch"));
         else if (!shellExited && !closed) void adapter.terminate().catch(() => {});
       });

@@ -11,6 +11,62 @@ import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
 
 const brokerScript = fileURLToPath(new URL("./terminal-broker.mjs", import.meta.url));
 
+test("broker preserves a failing shell exit in its frame and process status", { timeout: 15_000 }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "pty-broker-exit-"));
+  const address = process.platform === "win32"
+    ? `\\\\.\\pipe\\outright-broker-test-${randomUUID()}` : path.join(directory, "broker.sock");
+  const token = randomUUID() + randomUUID();
+  const broker = spawn(process.execPath, [brokerScript, address, token], {
+    stdio: ["ignore", "ignore", "pipe"], detached: process.platform !== "win32", windowsHide: true,
+  });
+  let socket;
+  const frames = [];
+  let pending = "";
+  try {
+    const deadline = Date.now() + 8000;
+    while (!socket && Date.now() < deadline && broker.exitCode === null) {
+      try {
+        socket = await new Promise((resolve, reject) => {
+          const candidate = net.createConnection(address);
+          candidate.once("connect", () => resolve(candidate));
+          candidate.once("error", reject);
+        });
+      } catch { await new Promise((resolve) => setTimeout(resolve, 25)); }
+    }
+    assert.ok(socket, "broker did not listen");
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      pending += chunk;
+      let end;
+      while ((end = pending.indexOf("\n")) !== -1) {
+        frames.push(JSON.parse(pending.slice(0, end)));
+        pending = pending.slice(end + 1);
+      }
+    });
+    socket.write(`${JSON.stringify({ type: "start", token, shell: process.execPath,
+      cwd: directory, env: process.env, cols: 80, rows: 24 })}\n`);
+    while (!frames.some((frame) => frame.type === "ready") && Date.now() < deadline)
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.ok(frames.some((frame) => frame.type === "ready"), "PTY did not become ready");
+    socket.write(`${JSON.stringify({ type: "write", data: "process.exit(7)\r" })}\n`);
+    const result = await Promise.race([
+      new Promise((resolve) => broker.once("close", (code, signal) => resolve({ code, signal }))),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("broker did not exit")), 6000)),
+    ]);
+    assert.deepEqual(frames.filter((frame) => frame.type === "shell-exited"),
+      [{ type: "shell-exited", exitCode: 7, signal: 0 }]);
+    assert.deepEqual(result, { code: 7, signal: null });
+  } finally {
+    socket?.destroy();
+    if (broker.exitCode === null) {
+      if (process.platform === "win32") spawnSync("taskkill", ["/T", "/F", "/PID", String(broker.pid)],
+        { windowsHide: true, stdio: "ignore", timeout: 5000 });
+      else try { process.kill(-broker.pid, "SIGKILL"); } catch {}
+    }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("Windows terminal supervisor stop empties the owned Job Object when a PTY cannot exit", { skip: process.platform !== "win32", timeout: 15_000 }, async () => {
   // A broker whose terminal.kill fails still loses its owner socket. The
   // managed adapter sends stop on that path; exercise the native control pipe
@@ -44,6 +100,14 @@ test("Windows terminal supervisor stop empties the owned Job Object when a PTY c
     assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" }, "owned child survived native stop");
   } finally {
     owner.stdin.destroy();
+    // The Job Object owner can exit before an escaped or fault-injected child.
+    // Always inspect and clean up the fixture child independently.
+    const childPid = Number(output.match(/OWNED_CHILD=(\d+)/)?.[1]);
+    if (childPid) {
+      try { process.kill(childPid, 0); spawnSync("taskkill", ["/T", "/F", "/PID", String(childPid)],
+        { windowsHide: true, stdio: "ignore", timeout: 5000 }); }
+      catch (error) { if (error.code !== "ESRCH") throw error; }
+    }
     if (owner.exitCode === null) spawnSync("taskkill", ["/T", "/F", "/PID", String(owner.pid)],
       { windowsHide: true, stdio: "ignore", timeout: 5000 });
   }

@@ -171,11 +171,12 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
         terminal.outputCursor += 1;
         publish({ type: "terminal.output", terminalId: id, payload: { data: data.slice(-64 * 1024), cursor: terminal.outputCursor } });
       });
-      processInstance.onExit(({ exitCode, signal, verified }) => {
+      processInstance.onExit(({ exitCode, signal, verified, outcomeKnown }) => {
         if (!terminals.has(id)) return;
-        if (!verified) {
+        if (!verified || (!outcomeKnown && terminal.status !== "closing")) {
           terminal.status = "unknown";
-          publish({ type: "terminal.audit-failed", terminalId: id, payload: { error: "PTY ownership could not be verified empty" } });
+          publish({ type: "terminal.audit-failed", terminalId: id, payload: { error: verified
+            ? "PTY exit result could not be verified" : "PTY ownership could not be verified empty" } });
           return;
         }
         terminal.exitSeen = true;

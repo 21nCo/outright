@@ -13,10 +13,11 @@ let peer;
 let pending = "";
 let authenticated = false;
 let shellExited = false;
+let shellResult;
 let listenerClosed = false;
 let nativeExitTimer;
 const finishAfterNativeExit = () => {
-  if (listenerClosed && (!terminal || shellExited)) process.exit(0);
+  if (listenerClosed && (!terminal || shellExited)) process.exit(shellResult?.processCode ?? 0);
 };
 const server = net.createServer((socket) => {
   if (peer) { socket.destroy(); return; }
@@ -81,7 +82,7 @@ const server = net.createServer((socket) => {
     }
     if (shellExited && !exitSent) {
       exitSent = true;
-      socket.end(`${JSON.stringify({ type: "shell-exited" })}\n`);
+      socket.end(`${JSON.stringify({ type: "shell-exited", exitCode: shellResult.exitCode, signal: shellResult.signal })}\n`);
       if (server.listening) server.close();
     } else if (outputPaused && !shellExited) {
       outputPaused = false;
@@ -137,7 +138,16 @@ const server = net.createServer((socket) => {
           omittedChars = Math.min(Number.MAX_SAFE_INTEGER, omittedChars + data.length - end);
           flushOutput();
         });
-        terminal.onExit(() => {
+        terminal.onExit(({ exitCode, signal }) => {
+          // The broker is the supervisor's child. Its process status and the
+          // final frame must agree with the PTY rather than reporting a clean
+          // broker shutdown as a successful shell outcome.
+          const validCode = Number.isSafeInteger(exitCode) && exitCode >= 0;
+          const validSignal = Number.isSafeInteger(signal) && signal >= 0;
+          let processCode = validCode ? exitCode : 1;
+          if (validSignal && signal > 0) processCode = 128 + signal;
+          shellResult = { exitCode: validCode || (validSignal && signal > 0) ? processCode : null,
+            signal: validSignal ? signal : null, processCode };
           shellExited = true;
           clearTimeout(nativeExitTimer);
           clearTimeout(shedTimer);

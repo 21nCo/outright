@@ -35,7 +35,7 @@ test("core surfaces retain their semantic wiring and narrow-screen fallbacks", a
   assert.match(app, /id="main-workspace"[^\n]+inert=\{isNarrow && sidebarOpen \? true/);
   assert.match(app, /className="mobile-scrim"[^\n]+aria-hidden="true"/);
   assert.match(app, /worktree\.isLinked && <>/);
-  assert.match(app, /function StreamingMessage[^\n]+aria-busy="true"/);
+  assert.match(app, /function StreamingMessage[^\n]+aria-busy="false"/);
   assert.doesNotMatch(app.match(/function StreamingMessage[^\n]+/)?.[0] ?? "", /role="status"|aria-live/);
   assert.match(terminal, /screenReaderMode: true/);
   assert.match(terminal, /aria-describedby="terminal-help"/);

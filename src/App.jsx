@@ -623,14 +623,9 @@ export function App() {
         return next;
       });
     }
-    if (event.type === "run.event" && ["run.completed", "run.failed", "run.stopped"].includes(event.payload?.type)) {
-      setPendingOutcomeRunIds((current) => {
-        if (!current.has(event.runId)) return current;
-        const next = new Set(current);
-        next.delete(event.runId);
-        return next;
-      });
-    }
+    // A terminal event starts the durable detail refresh below. Keep the
+    // pending reservation until that snapshot shows the terminal run; clearing
+    // it here briefly announces the stale running state again.
     if (["projects.changed", "terminal.output", "terminal.exit", "terminal.audit-failed", "runtime.connected", "capacity.changed"].includes(event.type)
       || (event.type === "run.event" && ["run.completed", "run.failed", "run.stopped"].includes(event.payload?.type))) setRuntimeEvent(event);
     const pendingLoad = pendingConversationLoadRef.current;
@@ -1337,6 +1332,8 @@ export function App() {
   // Worktree-wide recovery metadata gates sibling chats before submission;
   // the conversation-local values remain fallbacks for older runtimes.
   const interruptedRun = recoveryGate(conversation);
+  const announcedRun = pendingOutcomeRun ?? activeRun ?? interruptedRun ?? latestRun;
+  const runAnnouncement = runAnnouncementText(announcedRun, outcomePending);
   const recoveryConversation = conversation?.recoveryConversation ?? null;
 
   async function resolveRecovery(run, policy) {
@@ -1866,9 +1863,9 @@ export function App() {
   if (interruptedRun) composerPlaceholder = "Choose how to recover the interrupted run first…";
   let composerHint = <span className="send-hint"><Command /> Enter to send</span>;
   if (waitingForConversation) composerHint = <span className="send-hint" role="status" aria-live="polite">{conversationLoadFailed ? "Chat unavailable; retry loading" : "Loading selected chat"}</span>;
-  if (interruptedRun) composerHint = <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Recovery decision required</span>;
-  if (outcomePending) composerHint = <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Saving final run outcome</span>;
-  if (activeRun) composerHint = <span className="send-hint running" role="status" aria-live="polite"><span className="status-dot demo" aria-hidden="true" />{`Agent is ${activeRun.status}`}</span>;
+  if (interruptedRun) composerHint = <span className="send-hint running"><WarningCircle aria-hidden="true" />Recovery decision required</span>;
+  if (outcomePending) composerHint = <span className="send-hint running"><WarningCircle aria-hidden="true" />Saving final run outcome</span>;
+  if (activeRun) composerHint = <span className="send-hint running"><span className="status-dot demo" aria-hidden="true" />{`Agent is ${activeRun.status}`}</span>;
   let composerAction = <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun) || submissionUnavailable || firstPromptAwaitingSelection} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>;
   if (outcomePending) composerAction = <Button size="icon" type="button" variant="destructive" disabled aria-label="Final run outcome pending"><Stop weight="fill" /></Button>;
   if (activeRun) composerAction = <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button>;
@@ -1888,6 +1885,7 @@ export function App() {
       <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll" role="tablist" aria-label="Open agent chats" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', selectConversation)}>{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={() => { dragConversationRef.current = item.id; }} onDragOver={(event) => event.preventDefault()} onDrop={() => reorderConversation(item.id)}><button className="tab-select" id={domId("chat-tab", item.id)} data-tab-id={item.id} role="tab" aria-selected={item.id === selectedConversationId} aria-controls="conversation-panel" tabIndex={item.id === selectedConversationId ? 0 : -1} onClick={() => selectConversation(item.id)} onDoubleClick={() => { selectConversation(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); archiveChat(item, event.currentTarget); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
       <div className="work-area">
         <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
+          <span className="sr-only run-announcement" role="status" aria-live="polite" aria-atomic="true">{runAnnouncement}</span>
           <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} pendingRuns={pendingOutcomeRuns} onManage={openManageChat} />
           <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversationContent}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{!conversation?.messagePage?.hasLater && (activeRun || pendingOutcomeRun) && !streamingText && <RunningMessage run={activeRun ?? pendingOutcomeRun} events={runEvents} outcomePending={!activeRun && outcomePending} />}</div></ScrollArea>
           {readingLiveText && <section className="history-live-tail" aria-label={activeRun ? "Live output while reading history" : "Recent output while reading history"} tabIndex={0}><strong>{activeRun ? "Live output" : "Recent output"}</strong><p>{readingLiveText}</p></section>}
@@ -1951,12 +1949,12 @@ function Message({ message, conversationId }) {
   if (message.kind === "tool") return <article className="message is-agent is-tool" data-message-id={message.id}><div className="avatar"><CheckCircle weight="fill" /></div><div className="message-body"><p className="message-text">{message.body}</p>{bodyReader}</div></article>;
   return <article className={`message ${user ? "is-user" : "is-agent"}`} data-message-id={message.id}><div className="avatar">{user ? "Y" : <Sparkle weight="fill" />}</div><div className="message-body"><div className="message-meta"><strong>{user ? "You" : "Outright"}</strong><time>{formatTime(message.createdAt)}</time></div><p className="message-text">{message.body}</p>{bodyReader}{message.payload?.runId && <small className="message-run">{message.payload.provider} · {message.payload.runId.slice(0, 8)}</small>}</div></article>;
 }
-function StreamingMessage({ text, events }) { return <article className="message is-agent is-streaming" aria-busy="true"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="message-text">{text}</p><ToolActivity events={events} /></div></article>; }
+function StreamingMessage({ text, events }) { return <article className="message is-agent is-streaming" aria-busy="false"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="message-text">{text}</p><ToolActivity events={events} /></div></article>; }
 function RunningMessage({ run, events, outcomePending = false }) {
   let activityText = "Working in this worktree…";
   if (run.status === "queued") activityText = "Waiting for an execution slot…";
   if (outcomePending) activityText = "Waiting for storage to save the final result…";
-  return <article className="message is-agent is-streaming" aria-busy="true"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="thinking-copy">{activityText}</p><ToolActivity events={events} /></div></article>;
+  return <article className="message is-agent is-streaming" aria-busy="false"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="thinking-copy">{activityText}</p><ToolActivity events={events} /></div></article>;
 }
 // Interrupted runs surface here until the operator picks a continuation
 // policy; the preserved partial output stays visible above the notice.
@@ -1992,6 +1990,12 @@ function RecoveryNotice({ run, conversation, recoveryConversation, onOpenRecover
 function ToolActivity({ events }) { if (!events.length) return null; return <div className="tool-activity">{events.slice(-4).map((event) => <div key={event.id}><CheckCircle /><span>{toolLabel(event)}</span></div>)}</div>; }
 function EmptyChat({ worktree, onCreate }) { return <div className="empty-chat"><ChatCircle size={29} /><h2>Start in {worktree.name}</h2><p>Create a durable conversation, then run Codex or Claude directly in this worktree.</p><Button onClick={onCreate}><Plus />New chat</Button></div>; }
 function WorktreeState({ worktree }) { if (worktree.isPrunable) return <span className="worktree-state warning"><WarningCircle />stale</span>; if (worktree.changedCount) return <span className="worktree-state warning"><GitDiff />{worktree.changedCount} changed</span>; return <span className="worktree-state clean"><Check />clean</span>; }
+function runAnnouncementText(run, outcomePending) {
+  if (!run) return "";
+  if (outcomePending) return "Saving final run outcome";
+  if (run.status === "interrupted") return "Run interrupted; recovery decision required";
+  return `Run ${run.status}`;
+}
 function RunState({ run, outcomePending = false }) {
   if (!run) return null;
   const running = ["queued", "launching", "running"].includes(run.status);
@@ -1999,7 +2003,7 @@ function RunState({ run, outcomePending = false }) {
   let dotState = "error";
   if (running || pendingDecision) dotState = "demo";
   else if (run.status === "completed") dotState = "live";
-  return <span className={`run-state ${run.status}`} role="status" aria-live="polite" title={pendingDecision ? "Restart interrupted this run; choose a continuation below" : undefined}><span className={`status-dot ${dotState}`} aria-hidden="true" />{outcomePending ? "outcome pending" : run.status}{run.transcriptOmitted ? " · output omitted" : ""}{run.costUsd != null && <small>${Number(run.costUsd).toFixed(3)}</small>}</span>;
+  return <span className={`run-state ${run.status}`} title={pendingDecision ? "Restart interrupted this run; choose a continuation below" : undefined}><span className={`status-dot ${dotState}`} aria-hidden="true" />{outcomePending ? "outcome pending" : run.status}{run.transcriptOmitted ? " · output omitted" : ""}{run.costUsd != null && <small>${Number(run.costUsd).toFixed(3)}</small>}</span>;
 }
 function GitHealth({ worktree }) { if (worktree.isPrunable) return <span className="git-health warning"><WarningCircle /></span>; if (worktree.changedCount) return <span className="git-health warning"><span className="status-dot demo" />{worktree.changedCount}</span>; return <span className="git-health clean"><Check /></span>; }
 function TemplateMenu({ templates, onSelect }) { if (!templates.length) return null; return <DropdownMenu><DropdownMenuTrigger render={<Button type="button" variant="ghost" size="icon-sm" aria-label="Prompt templates" />}><ClockCounterClockwise /></DropdownMenuTrigger><DropdownMenuContent align="start"><DropdownMenuGroup><DropdownMenuLabel>Prompt templates</DropdownMenuLabel>{templates.map((template) => <DropdownMenuItem key={template.id} onClick={() => onSelect(template.prompt)}>{template.title}</DropdownMenuItem>)}</DropdownMenuGroup></DropdownMenuContent></DropdownMenu>; }
