@@ -688,6 +688,7 @@ async function settingsCapacityWithoutEventRegression() {
   const liveChanges = [];
   const liveObserver = new MutationObserver(() => { liveChanges.push(liveStatus.textContent); });
   liveObserver.observe(liveStatus, { childList: true, characterData: true, subtree: true });
+  try {
   const unchangedReads = reads;
   await until(() => reads > unchangedReads, "unchanged capacity poll completed");
   await settle();
@@ -805,7 +806,7 @@ async function settingsCapacityWithoutEventRegression() {
   const readsAtClose = reads;
   await new Promise((resolve) => setTimeout(resolve, 2200));
   assert(reads === readsAtClose, "closed Settings kept polling capacity");
-  liveObserver.disconnect();
+  } finally { liveObserver.disconnect(); }
 }
 
 async function settingsCapacityAndDeletionOrderRegression() {
@@ -4683,7 +4684,7 @@ async function bootstrapMaintenanceRetryRegression() {
   route = async (url) => {
     if (url.pathname === "/api/bootstrap") {
       bootstrapReads += 1;
-      if (bootstrapReads === 1) return response({ error: "Archive maintenance is running; retry shortly" }, 503);
+      if (bootstrapReads === 1) return response({ error: "Archive maintenance is running; retry shortly", code: "ARCHIVE_MAINTENANCE_TRANSIENT" }, 503);
       return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} },
         settings: { provider: "codex" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
     }
@@ -4701,6 +4702,7 @@ async function bootstrapHardFailureRegression() {
   for (const failure of [
     { status: 401, message: "Sign in required" },
     { status: 500, message: "Runtime failed" },
+    { status: 503, message: "Archive maintenance recovery failed: corrupt retained marker", code: "ARCHIVE_MAINTENANCE_FAILED" },
     { message: "Network unavailable" },
   ]) {
     root.render(null); await settle();
@@ -4710,7 +4712,7 @@ async function bootstrapHardFailureRegression() {
       if (url.pathname === "/api/bootstrap") {
         bootstrapReads += 1;
         if (fail) {
-          if (failure.status) return response({ error: failure.message }, failure.status);
+          if (failure.status) return response({ error: failure.message, ...(failure.code ? { code: failure.code } : {}) }, failure.status);
           throw new Error(failure.message);
         }
         return response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} },
@@ -5254,6 +5256,7 @@ async function pendingRunOutcomeRegression() {
   const statusMutations = [];
   const statusObserver = new MutationObserver((records) => statusMutations.push(...records));
   statusObserver.observe(statusRegion, { subtree: true, childList: true, characterData: true, characterDataOldValue: true });
+  try {
   const socket = fixtureSockets.at(-1);
   const announce = (runId, conversationId) => socket.dispatchEvent(new MessageEvent("message", {
     data: JSON.stringify({ type: "run.outcome_pending", runId, conversationId, reason: "storage-unavailable" }),
@@ -5280,7 +5283,7 @@ async function pendingRunOutcomeRegression() {
   await settle();
   assert(statusRegion.textContent === "Run completed", "completion announcement did not settle");
   assert(statusMutations.length === 2, `completion must produce one further announcement; mutations=${statusMutations.length}, details=${JSON.stringify(statusMutations.map((record) => ({ type: record.type, oldValue: record.oldValue, target: record.target?.textContent })))}`);
-  statusObserver.disconnect();
+  } finally { statusObserver.disconnect(); }
   root.render(null); await settle();
   status = "running";
   pendingSnapshot = true;

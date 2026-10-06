@@ -119,6 +119,30 @@ function withRuntime(fn, options = {}) {
   };
 }
 
+test("bootstrap distinguishes transient archive maintenance from permanent recovery failure", (() => {
+  let failure;
+  return withRuntime(async (runtime) => {
+    for (const [expected, message] of [
+      ["ARCHIVE_MAINTENANCE_TRANSIENT", undefined],
+      ["ARCHIVE_MAINTENANCE_FAILED", "corrupt retained marker"],
+    ]) {
+      failure = message;
+      const response = responseCapture();
+      await runtime.handleRequest(requestStream("GET", "/api/bootstrap"), response);
+      assert.equal(response.statusCode, 503);
+      assert.equal(response.body.code, expected);
+      assert.match(response.body.error, message ? /recovery failed: corrupt retained marker/ : /retry shortly/);
+    }
+  }, { databaseFactory(options) {
+    const database = createOutrightDatabase(options);
+    return new Proxy(database, { get(target, key, receiver) {
+      if (key === "maintenanceActive") return true;
+      if (key === "capacity") return () => ({ ...target.capacity(), maintenanceError: failure });
+      return Reflect.get(target, key, receiver);
+    } });
+  } });
+})());
+
 test("runtime startup settles an orphan PTY before serving requests", withRuntime(async (runtime) => {
   const audit = runtime.database.listAudit(20);
   assert.ok(audit.some((entry) => entry.action === "terminal.unknown" && entry.target === "orphan-terminal"));

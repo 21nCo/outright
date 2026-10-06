@@ -240,8 +240,10 @@ export function App() {
     } catch (nextError) {
       if (!isCurrent()) return false;
       if (manual) setError(nextError.message);
-      else if (nextError.status !== 503) setBootstrapError(nextError.message);
-      return !manual && nextError.status === 503 ? "retry" : "error";
+      const transientMaintenance = nextError.status === 503
+        && (nextError.payload == null || nextError.payload.code === "ARCHIVE_MAINTENANCE_TRANSIENT");
+      if (!manual && !transientMaintenance) setBootstrapError(nextError.message);
+      return !manual && transientMaintenance ? "retry" : "error";
     }
     finally { if (isCurrent()) setIsScanning(false); }
   }, []);
@@ -249,14 +251,22 @@ export function App() {
   useEffect(() => {
     let stopped = false;
     let retry;
+    let bootstrapRetries = 0;
     const load = async (remaining = null) => {
       const loaded = await loadBootstrap(false, () => !stopped && bootstrapLoadRef.current === load);
-      if (!stopped && (remaining === null ? loaded === "retry" : loaded !== true && remaining > 0)) {
+      if (stopped) return loaded;
+      if (remaining === null && loaded === "retry" && ++bootstrapRetries > 12) {
+        setBootstrapError("Local runtime is still unavailable. Retry when recovery completes.");
+        return "error";
+      }
+      if (remaining === null && loaded === true) bootstrapRetries = 0;
+      if (remaining === null ? loaded === "retry" : loaded !== true && remaining > 0) {
         window.clearTimeout(retry);
         retry = window.setTimeout(() => { void load(remaining === null ? null : remaining - 1); }, 1000);
       }
       return loaded;
     };
+    load.reset = () => { bootstrapRetries = 0; window.clearTimeout(retry); };
     bootstrapLoadRef.current = load;
     void load();
     return () => { stopped = true; bootstrapLoadRef.current = null; window.clearTimeout(retry); };
@@ -1839,6 +1849,7 @@ export function App() {
     setBootstrapError("");
     const retry = bootstrapLoadRef.current;
     if (retry) {
+      retry.reset?.();
       retry().catch((retryError) => {
         if (bootstrapLoadRef.current === retry) setBootstrapError(retryError.message);
       });

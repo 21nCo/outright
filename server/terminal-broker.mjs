@@ -143,11 +143,14 @@ const server = net.createServer((socket) => {
           // final frame must agree with the PTY rather than reporting a clean
           // broker shutdown as a successful shell outcome.
           const validCode = Number.isSafeInteger(exitCode) && exitCode >= 0;
-          const validSignal = Number.isSafeInteger(signal) && signal >= 0;
+          // ConPTY reports an ordinary exit with signal:null; Unix node-pty
+          // uses zero. The wire format has one portable no-signal value.
+          const normalizedSignal = signal == null ? 0 : signal;
+          const validSignal = Number.isSafeInteger(normalizedSignal) && normalizedSignal >= 0;
           let processCode = validCode ? exitCode : 1;
-          if (validSignal && signal > 0) processCode = 128 + signal;
-          shellResult = { exitCode: validCode || (validSignal && signal > 0) ? processCode : null,
-            signal: validSignal ? signal : null, processCode };
+          if (validSignal && normalizedSignal > 0) processCode = 128 + normalizedSignal;
+          shellResult = { exitCode: validCode || (validSignal && normalizedSignal > 0) ? processCode : null,
+            signal: validSignal ? normalizedSignal : null, processCode };
           shellExited = true;
           clearTimeout(nativeExitTimer);
           clearTimeout(shedTimer);

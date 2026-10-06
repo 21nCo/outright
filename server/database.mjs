@@ -2064,13 +2064,15 @@ export function createOutrightDatabase(options = {}) {
     if (key === "canLaunchRun") return () => false;
     if (key === "audit") return () => false;
     if (key === "auditRequired") return async (...args) => {
-      if (maintenanceError) throw databaseError(503, `Archive maintenance recovery failed: ${maintenanceError}`);
+      if (maintenanceError) throw databaseError(503, `Archive maintenance recovery failed: ${maintenanceError}`, { code: "ARCHIVE_MAINTENANCE_FAILED" });
       await new Promise((resolve) => deletionIdleWaiters.add(resolve));
-      if (maintenanceError) throw databaseError(503, `Archive maintenance recovery failed: ${maintenanceError}`);
+      if (maintenanceError) throw databaseError(503, `Archive maintenance recovery failed: ${maintenanceError}`, { code: "ARCHIVE_MAINTENANCE_FAILED" });
       if (closing) throw databaseError(503, "Runtime closed during archive maintenance");
       return receiver.auditRequired(...args);
     };
-    return () => { throw databaseError(503, "Archive maintenance is running; retry shortly"); };
+    return () => { throw databaseError(503, maintenanceError
+      ? `Archive maintenance recovery failed: ${maintenanceError}` : "Archive maintenance is running; retry shortly",
+    { code: maintenanceError ? "ARCHIVE_MAINTENANCE_FAILED" : "ARCHIVE_MAINTENANCE_TRANSIENT" }); };
   } });
 }
 
@@ -2973,6 +2975,6 @@ function validateSettingsPatch(patch) {
   }
 }
 
-function databaseError(statusCode, message) { const error = new Error(message); error.statusCode = statusCode; return error; }
+function databaseError(statusCode, message, details) { const error = new Error(message); error.statusCode = statusCode; error.details = details; return error; }
 
 export { DEFAULT_SETTINGS };

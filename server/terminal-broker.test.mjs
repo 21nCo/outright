@@ -22,6 +22,8 @@ test("broker preserves a failing shell exit in its frame and process status", { 
   let socket;
   const frames = [];
   let pending = "";
+  let exitFrameReady;
+  const exitFrame = new Promise((resolve) => { exitFrameReady = resolve; });
   try {
     const deadline = Date.now() + 8000;
     while (!socket && Date.now() < deadline && broker.exitCode === null) {
@@ -39,7 +41,9 @@ test("broker preserves a failing shell exit in its frame and process status", { 
       pending += chunk;
       let end;
       while ((end = pending.indexOf("\n")) !== -1) {
-        frames.push(JSON.parse(pending.slice(0, end)));
+        const frame = JSON.parse(pending.slice(0, end));
+        frames.push(frame);
+        if (frame.type === "shell-exited") exitFrameReady(frame);
         pending = pending.slice(end + 1);
       }
     });
@@ -48,11 +52,16 @@ test("broker preserves a failing shell exit in its frame and process status", { 
     while (!frames.some((frame) => frame.type === "ready") && Date.now() < deadline)
       await new Promise((resolve) => setTimeout(resolve, 25));
     assert.ok(frames.some((frame) => frame.type === "ready"), "PTY did not become ready");
+    let timeout;
+    const closed = new Promise((resolve) => broker.once("close", (code, signal) => resolve({ code, signal })));
     socket.write(`${JSON.stringify({ type: "write", data: "process.exit(7)\r" })}\n`);
-    const result = await Promise.race([
-      new Promise((resolve) => broker.once("close", (code, signal) => resolve({ code, signal }))),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("broker did not exit")), 6000)),
-    ]);
+    let result;
+    try {
+      [result] = await Promise.race([
+        Promise.all([closed, exitFrame]),
+        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("broker exit or final frame was not delivered")), 6000); }),
+      ]);
+    } finally { clearTimeout(timeout); }
     assert.deepEqual(frames.filter((frame) => frame.type === "shell-exited"),
       [{ type: "shell-exited", exitCode: 7, signal: 0 }]);
     assert.deepEqual(result, { code: 7, signal: null });

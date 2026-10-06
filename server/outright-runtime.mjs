@@ -203,7 +203,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       assertRuntimeRequest(request, allowedHosts);
       if (shuttingDown) throw apiError(503, "Runtime is shutting down");
       if (database.maintenanceActive && url.pathname !== "/api/capacity") {
-        throw apiError(503, "Archive maintenance is running; retry shortly");
+        const failure = database.capacity().maintenanceError;
+        throw apiError(503, failure ? `Archive maintenance recovery failed: ${failure}`
+          : "Archive maintenance is running; retry shortly",
+        { code: failure ? "ARCHIVE_MAINTENANCE_FAILED" : "ARCHIVE_MAINTENANCE_TRANSIENT" });
       }
       if (url.pathname === "/api/bootstrap" && request.method === "GET") {
         const scan = await projects();

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -46,6 +46,103 @@ test("failed and timed-out utility children release admission", async () => {
   await assert.rejects(budget.run(process.execPath, ["-e", "setTimeout(() => {}, 1000)"], { timeout: 20 }));
   assert.equal(budget.capacity().active, 0);
   await budget.run(process.execPath, ["-e", "process.exit(0)"]);
+});
+
+test("timed-out utility commands keep the permit until a detached descendant is gone", { timeout: 15_000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-tree-"));
+  const pidFile = path.join(root, "descendant.pid");
+  const budget = createSubprocessBudget({ limit: 1 });
+  const script = `const { spawn } = require('node:child_process');
+    const fs = require('node:fs');
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+      { detached: true, stdio: 'ignore' });
+    fs.writeFileSync(process.argv[1], String(child.pid));
+    child.unref(); setInterval(() => {}, 1000);`;
+  try {
+    await assert.rejects(budget.run(process.execPath, ["-e", script, pidFile], { timeout: 3000 }),
+      (error) => error.killed === true);
+    assert.equal(budget.capacity().active, 0, "native tree owner retained the capacity permit after closing");
+    assert.ok(existsSync(pidFile), "descendant did not launch before the utility deadline");
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    assert.ok(pid > 0, "detached descendant was not launched");
+    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" },
+      "capacity was released while a detached descendant still ran");
+  } finally {
+    if (existsSync(pidFile)) {
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      if (Number.isSafeInteger(pid) && pid > 0) try { process.kill(pid, "SIGKILL"); } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("aborting a utility command retains its permit through native descendant cleanup", { timeout: 15_000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-abort-"));
+  const pidFile = path.join(root, "descendant.pid");
+  const controller = new AbortController();
+  const budget = createSubprocessBudget({ limit: 1 });
+  const script = `const { spawn } = require('node:child_process');
+    const fs = require('node:fs');
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+      { detached: true, stdio: 'ignore' });
+    fs.writeFileSync(process.argv[1], String(child.pid));
+    child.unref(); setInterval(() => {}, 1000);`;
+  try {
+    const command = budget.run(process.execPath, ["-e", script, pidFile], { signal: controller.signal });
+    command.catch(() => {});
+    const deadline = Date.now() + 5000;
+    while (!existsSync(pidFile) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(existsSync(pidFile), "descendant was not launched before cancellation");
+    controller.abort();
+    await assert.rejects(command, (error) => error.name === "AbortError" && error.code === "ABORT_ERR");
+    assert.equal(budget.capacity().active, 0);
+    assert.throws(() => process.kill(Number(readFileSync(pidFile, "utf8")), 0), { code: "ESRCH" },
+      "permit was released while a cancelled descendant still ran");
+  } finally {
+    if (existsSync(pidFile)) {
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      if (Number.isSafeInteger(pid) && pid > 0) try { process.kill(pid, "SIGKILL"); } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a utility leader exiting does not release its detached descendant's permit", { timeout: 15_000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-leader-"));
+  const pidFile = path.join(root, "descendant.pid");
+  const budget = createSubprocessBudget({ limit: 1 });
+  const script = `const { spawn } = require('node:child_process');
+    const fs = require('node:fs');
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+      { detached: true, stdio: 'ignore' });
+    fs.writeFileSync(process.argv[1], String(child.pid));
+    child.unref();`;
+  try {
+    const command = budget.run(process.execPath, ["-e", script, pidFile], { timeout: 8000 });
+    command.catch(() => {});
+    const deadline = Date.now() + 5000;
+    while (!existsSync(pidFile) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(existsSync(pidFile), "leader did not launch before the ownership probe");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(budget.capacity().active, 1, "permit was released when the direct leader exited");
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    process.kill(pid, 0);
+    await assert.rejects(command, (error) => error.killed === true);
+    assert.equal(budget.capacity().active, 0);
+    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  } finally {
+    if (existsSync(pidFile)) {
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      if (Number.isSafeInteger(pid) && pid > 0) try { process.kill(pid, "SIGKILL"); } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("one large worktree scan stays within its own budget and returns every changed count", async () => {

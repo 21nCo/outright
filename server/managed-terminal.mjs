@@ -114,7 +114,8 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
       socket?.destroy();
       verified = await verifyEmpty(signal, exitCode);
       const expectedCode = shellResult?.signal > 0 ? 128 + shellResult.signal : shellResult?.exitCode;
-      const outcomeKnown = Boolean(shellResult) && signal == null && expectedCode % 256 === exitCode;
+      const processCode = process.platform === "win32" ? expectedCode : expectedCode % 256;
+      const outcomeKnown = Boolean(shellResult) && signal == null && processCode === exitCode;
       finalResult = { exitCode: outcomeKnown ? shellResult.exitCode : exitCode,
         signal: outcomeKnown ? shellResult.signal : signal, verified, outcomeKnown };
       onExit?.(finalResult);

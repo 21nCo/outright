@@ -61,6 +61,27 @@ test("managed PTY failure reaches terminal event and durable audit", { timeout: 
   }
 });
 
+test("Windows managed PTY preserves a full native exit code in event and audit", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-managed-full-exit-"));
+  const database = createOutrightDatabase({ filename: path.join(directory, "runtime.db"), runtimeLease: true });
+  const events = [];
+  const manager = createTerminalManager({ publish: (event) => events.push(event), database });
+  try {
+    const terminal = await manager.create({ cwd: directory, shell: process.execPath });
+    assert.equal(manager.write(terminal.id, "process.exit(300)\r"), true);
+    await waitFor(() => manager.get(terminal.id)?.status === "exited", 12_000,
+      () => ({ terminal: manager.get(terminal.id), events }));
+    assert.equal(manager.get(terminal.id).exitCode, 300);
+    assert.deepEqual(events.filter((event) => event.type === "terminal.exit" && event.terminalId === terminal.id)
+      .map((event) => event.payload.exitCode), [300]);
+    assert.equal(database.listAudit(20).find((entry) => entry.action === "terminal.exited" && entry.target === terminal.id)?.details.exitCode, 300);
+  } finally {
+    await manager.shutdown();
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("enforces terminal limits, input bounds, and suppresses close-after-exit events", async () => {
   const events = [];
   const processes = [];
