@@ -928,6 +928,87 @@ test("malformed terminal recovery evidence is isolated while valid siblings sett
   }
 });
 
+test("restart quarantines legacy transcript fields and v2 message collisions without harming siblings", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-outcome-ownership-"));
+  const filename = path.join(root, "outright.db");
+  let database = createOutrightDatabase({ filename });
+  try {
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: root,
+      title: "Recovery", provider: "codex" });
+    const create = (prompt) => database.createRun({ conversationId: conversation.id, provider: "codex",
+      approvalPolicy: "read-only", prompt });
+    const legacy = create("legacy collision");
+    const current = create("v2 collision");
+    const validLegacy = create("legacy terminal");
+    const validCurrent = create("v2 checkpoint");
+    const finishedAt = new Date().toISOString();
+    const existing = database.addMessage({ id: `${current.id}:1`, conversationId: conversation.id,
+      role: "user", kind: "text", body: "original", payload: { runId: "other" }, createdAt: finishedAt });
+    const marker = (run) => path.join(database.launchDirectory, `${run.id}.outcome.json`);
+    const terminal = (run, version) => ({ version, runId: run.id, status: "completed", finishedAt,
+      exitCode: 0, message: "" });
+    writeFileSync(marker(legacy), JSON.stringify({ ...terminal(legacy, 1),
+      transcriptMessage: { ...existing, body: "replaced" } }));
+    database.savePendingRunOutcome(current.id, { ...terminal(current, 2),
+      transcriptMessage: { id: existing.id, conversationId: conversation.id, role: "assistant", kind: "text",
+        body: "replaced", payload: { runId: current.id }, createdAt: finishedAt } });
+    writeFileSync(marker(validLegacy), JSON.stringify(terminal(validLegacy, 1)));
+    database.savePendingRunOutcome(validCurrent.id, { ...terminal(validCurrent, 2),
+      transcriptMessage: { id: `${validCurrent.id}:1`, conversationId: conversation.id, role: "assistant",
+        kind: "text", body: "valid", payload: { runId: validCurrent.id }, createdAt: finishedAt } });
+    database.close();
+    database = createOutrightDatabase({ filename });
+    const result = database.reconcileInterruptedRuns();
+    assert.equal(result.counts.completed, 2);
+    assert.equal(result.counts["never-started"], 2);
+    assert.equal(database.listMessages(conversation.id).find((message) => message.id === existing.id).body, "original");
+    assert.equal(database.listMessages(conversation.id).find((message) => message.id === `${validCurrent.id}:1`).body, "valid");
+    assert.equal(database.getRun(validLegacy.id).status, "completed");
+    assert.equal(existsSync(marker(legacy)), true);
+    assert.equal(existsSync(marker(current)), true);
+    assert.equal(existsSync(marker(validLegacy)), false);
+    assert.equal(existsSync(marker(validCurrent)), false);
+    assert.equal(database.listAudit(100).filter((entry) => entry.action === "agent.run.outcome.invalid").length, 2);
+    for (const run of [legacy, current]) {
+      assert.equal(database.resolveInterruptedRun(run.id, "discard")?.recoveryDecision, "discard");
+      assert.equal(existsSync(marker(run)), false);
+    }
+  } finally {
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("retrying unreadable outcome evidence rechecks message ownership before replay", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-outcome-retry-owner-"));
+  const database = createOutrightDatabase({ filename: path.join(root, "outright.db") });
+  try {
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: root,
+      title: "Retry", provider: "codex" });
+    const run = database.createRun({ conversationId: conversation.id, provider: "codex",
+      approvalPolicy: "read-only", prompt: "retry" });
+    const createdAt = new Date().toISOString();
+    const existing = database.addMessage({ id: `${run.id}:1`, conversationId: conversation.id,
+      role: "user", kind: "text", body: "protected", payload: { runId: "other" }, createdAt });
+    database.updateRun(run.id, { status: "interrupted", recoveryClass: "outcome-unreadable-queued" });
+    const marker = path.join(database.launchDirectory, `${run.id}.outcome.json`);
+    database.savePendingRunOutcome(run.id, { status: "completed", finishedAt: createdAt, exitCode: 0,
+      message: "", transcriptMessage: { id: existing.id, conversationId: conversation.id, role: "assistant",
+        kind: "text", body: "replaced", payload: { runId: run.id }, createdAt } });
+    const retried = database.retryUnreadableRunOutcome(run.id);
+    assert.equal(retried.status, "interrupted");
+    assert.equal(retried.recoveryClass, "never-started");
+    assert.equal(database.listMessages(conversation.id).find((message) => message.id === existing.id).body, "protected");
+    assert.equal(existsSync(marker), true, "invalid evidence remains inspectable until a durable decision");
+    assert.equal(database.listAudit(100).filter((entry) => entry.action === "agent.run.outcome.invalid").length, 1);
+    database.resolveInterruptedRun(run.id, "discard");
+    assert.equal(existsSync(marker), false);
+  } finally {
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a malformed queued outcome stays inspectable across restart and clears after a durable decision", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-invalid-restart-"));
   const filename = path.join(root, "outright.db");

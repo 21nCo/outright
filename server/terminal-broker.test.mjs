@@ -213,10 +213,17 @@ test("disconnecting a live owner releases the broker and its PTY child", { timeo
       cwd: directory, env: process.env, cols: 80, rows: 24 })}\n`);
     while (!ready && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
     assert.equal(ready, true);
-    socket.write(`${JSON.stringify({ type: "write", data: 'process.stdout.write("OUTRIGHT_CHILD_PID="+process.pid+":END\\n")\r' })}\n`);
+    // Give Unix PTY hangup a short, observable child-exit delay. The broker
+    // must remain its reaper instead of reporting a released owner first.
+    socket.write(`${JSON.stringify({ type: "write", data: 'process.once("SIGHUP",()=>setTimeout(()=>process.exit(0),250)); process.stdout.write("OUTRIGHT_CHILD_PID="+process.pid+":END\\n")\r' })}\n`);
     const pidDeadline = Date.now() + 8000;
     while (!shellPid && Date.now() < pidDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
     assert.ok(shellPid, `PTY child did not identify itself; broker=${broker.pid}/${broker.exitCode}/${broker.signalCode}, runner=${process.pid}, frames=${JSON.stringify(pidOutput)}, stderr=${stderr}`);
+    let brokerClosedWithLiveChild = false;
+    broker.once("close", () => {
+      try { process.kill(shellPid, 0); brokerClosedWithLiveChild = true; }
+      catch (error) { if (error.code !== "ESRCH") throw error; }
+    });
     socket.destroy();
     const released = () => {
       if (broker.exitCode === null) return false;
@@ -225,6 +232,7 @@ test("disconnecting a live owner releases the broker and its PTY child", { timeo
     const releaseDeadline = Date.now() + 5000;
     while (!released() && Date.now() < releaseDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
     assert.ok(released(), "disconnected broker or PTY child remained alive");
+    assert.equal(brokerClosedWithLiveChild, false, "broker reported release while its PTY child was still alive");
     await assert.rejects(new Promise((resolve, reject) => {
       const candidate = net.createConnection(address);
       candidate.once("connect", () => { candidate.destroy(); resolve(); });

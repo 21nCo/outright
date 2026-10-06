@@ -203,8 +203,11 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
         if (!Number.isSafeInteger(detail.outputCursor) || !Number.isSafeInteger(cursor) || cursor > detail.outputCursor) xterm?.write(data);
         if (Number.isSafeInteger(cursor)) displayedCursor = Math.max(displayedCursor, cursor);
       }
-      const exited = status === "unknown" ? null
-        : pending.exit || (status === "exited" ? { exitCode: detail.exitCode } : null);
+      let exited = null;
+      if (status !== "unknown") {
+        if (pending.exit) exited = pending.exit;
+        else if (status === "exited") exited = { exitCode: detail.exitCode };
+      }
       if (exited) {
         exitedIdsRef.current.add(terminal.id);
         xterm?.writeln(`\r\n\x1b[90m[process exited ${exited.exitCode ?? "unknown"}]\x1b[0m`);

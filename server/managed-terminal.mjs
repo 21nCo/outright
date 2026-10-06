@@ -38,11 +38,10 @@ export function cleanupTerminalSocket(id) {
 
 export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, rows, env,
   subprocesses = utilityProcesses }) {
-  const nativeArgs = process.platform === "linux"
-    ? ["--stop-on-owner-exit", ownership.handshakePath, process.execPath, BROKER, ownership.address, ownership.token]
-    : process.platform === "darwin"
-      ? [ownership.label, process.execPath, BROKER, ownership.address, ownership.token]
-      : [process.execPath, BROKER, ownership.address, ownership.token];
+  const brokerArgs = [process.execPath, BROKER, ownership.address, ownership.token];
+  let nativeArgs = brokerArgs;
+  if (process.platform === "linux") nativeArgs = ["--stop-on-owner-exit", ownership.handshakePath, ...brokerArgs];
+  else if (process.platform === "darwin") nativeArgs = [ownership.label, ...brokerArgs];
   const child = spawn(AGENT_SUPERVISOR, nativeArgs, { cwd, env: { ...env,
     ...(process.platform === "darwin" ? { OUTRIGHT_LAUNCH_GATE_FD: "3", OUTRIGHT_TERMINAL_CONTROL: "1" } : {}) },
     stdio: ["pipe", "pipe", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true });

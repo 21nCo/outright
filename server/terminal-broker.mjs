@@ -13,6 +13,11 @@ let peer;
 let pending = "";
 let authenticated = false;
 let shellExited = false;
+let listenerClosed = false;
+let nativeExitTimer;
+const finishAfterNativeExit = () => {
+  if (listenerClosed && (!terminal || shellExited)) process.exit(0);
+};
 const server = net.createServer((socket) => {
   if (peer) { socket.destroy(); return; }
   peer = socket;
@@ -134,6 +139,7 @@ const server = net.createServer((socket) => {
         });
         terminal.onExit(() => {
           shellExited = true;
+          clearTimeout(nativeExitTimer);
           clearTimeout(shedTimer);
           // socket.end can itself wait forever for a silent peer. The owner
           // has exited, so bound delivery of its final frames and release the
@@ -144,6 +150,7 @@ const server = net.createServer((socket) => {
           // a later drain continues it in order if the socket still cannot
           // accept the frame. Waiting only for drain can strand a quiet peer.
           flushOutput();
+          finishAfterNativeExit();
         });
       } else if (!shellExited && message.type === "write" && typeof message.data === "string"
         && Buffer.byteLength(message.data) <= 64 * 1024) terminal.write(message.data);
@@ -157,7 +164,12 @@ const server = net.createServer((socket) => {
     clearTimeout(shedTimer);
     clearTimeout(exitTimer);
     clearTimeout(stalledReaderTimer);
-    if (!shellExited) try { terminal?.kill(); } catch { /* Supervisor owns final cleanup. */ }
+    if (!shellExited && terminal) {
+      try { terminal.kill(); } catch { /* Supervisor owns final cleanup. */ }
+      // Retain the broker as the PTY reaper until onExit. A close of the
+      // listener alone does not prove that the native child has exited.
+      nativeExitTimer = setTimeout(() => process.exit(1), 5000);
+    }
     // node-pty can retain a Windows ConPTY handle after onExit and socket
     // close. The listener's close event releases its address before exit.
     if (server.listening) server.close();
@@ -169,7 +181,9 @@ server.listen(address, () => {
 });
 server.on("close", () => {
   if (process.platform !== "win32") try { unlinkSync(address); } catch {}
-  // This broker accepts exactly one peer. Native PTY handles may outlive
-  // onExit on Windows, so do not wait for the event loop to drain itself.
-  process.exit(0);
+  // This broker accepts exactly one peer. Exit only after the native PTY has
+  // reported exit, or after the bounded failure timer asks its supervisor to
+  // clean up the owned process boundary.
+  listenerClosed = true;
+  finishAfterNativeExit();
 });

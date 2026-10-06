@@ -19,6 +19,23 @@ test("an outcome saved without optional transcript fields survives journal repla
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("legacy terminal evidence cannot smuggle an unvalidated transcript", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-outcome-legacy-"));
+  const runId = "00000000-0000-4000-8000-000000000004";
+  const marker = path.join(directory, `${runId}.outcome.json`);
+  const terminal = { version: 1, runId, status: "completed", finishedAt: new Date().toISOString(),
+    exitCode: 0, message: "" };
+  try {
+    writeFileSync(marker, JSON.stringify(terminal));
+    assert.deepEqual(readRunOutcome(directory, runId), terminal);
+    for (const field of [{ transcriptMessage: { id: "existing-message", body: "replacement" } },
+      { transcriptOmitted: true }]) {
+      writeFileSync(marker, JSON.stringify({ ...terminal, ...field }));
+      assert.throws(() => readRunOutcome(directory, runId), /Invalid run outcome record/);
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("invalid and future transcript timestamps cannot change recovered conversation recency", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-outcome-time-"));
   const runId = "00000000-0000-4000-8000-000000000002";

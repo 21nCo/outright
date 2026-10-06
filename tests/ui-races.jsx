@@ -718,9 +718,10 @@ async function settingsCapacityWithoutEventRegression() {
   otherClientCapacity = { ...otherClientCapacity, active: 1, recoverable: 1 };
   signalChange();
   await until(() => capacityAnnouncement() === "Runs are awaiting recovery.", "run recovery is announced");
+  const eventReads = reads;
   otherClientCapacity = { ...otherClientCapacity, recoverable: 2 };
-  signalChange();
-  await settle();
+  await until(() => reads > eventReads && capacityText().includes("2 awaiting recovery"),
+    "the next capacity poll returned the changed recovery count");
   assert(capacityAnnouncement() === "Runs are awaiting recovery.", "recovery count polling changed the spoken category");
   otherClientCapacity = { ...otherClientCapacity, recoverable: 0, pendingRunOutcomes: 7 };
   signalChange();
@@ -1655,6 +1656,7 @@ async function terminalUnknownRegression() {
   root.render(null);
   await settle();
   const sent = [];
+  const paneCallbacks = [];
   let created = 0;
   let unknown = false;
   const commandFence = createTerminalCommandFence();
@@ -1666,6 +1668,7 @@ async function terminalUnknownRegression() {
   const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]}
     runtimeEvent={event} unverifiedTerminalIds={commandFence.snapshot()}
     onError={(error) => { throw error; }} sendRuntime={(message) => {
+      paneCallbacks.push(message);
       if (commandFence.allows(message)) sent.push(message);
     }} />);
   show();
@@ -1673,6 +1676,10 @@ async function terminalUnknownRegression() {
   const before = sent.length;
   const auditFailed = { type: "terminal.audit-failed", terminalId: "term-A" };
   commandFence.observe(auditFailed);
+  assert(!commandFence.allows({ type: "terminal.input", terminalId: "term-A", data: "x" })
+    && !commandFence.allows({ type: "terminal.resize", terminalId: "term-A", cols: 80, rows: 24 }),
+  "App command fence allowed an unverified terminal command");
+  const paneBefore = paneCallbacks.length;
   show(auditFailed);
   // A later event can replace App's latest-event prop before React commits.
   // The separately retained ownership state must still commit the warning.
@@ -1684,8 +1691,10 @@ async function terminalUnknownRegression() {
   input.focus();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "x", code: "KeyX", keyCode: 88, which: 88, bubbles: true, cancelable: true }));
   await settle();
-  assert(!sent.slice(before).some((message) => message.type === "terminal.input" || message.type === "terminal.resize"),
+  assert(!paneCallbacks.slice(paneBefore).some((message) => message.type === "terminal.input" || message.type === "terminal.resize"),
     "Unverified terminal still accepted input or resize");
+  assert(!sent.slice(before).some((message) => message.type === "terminal.input" || message.type === "terminal.resize"),
+    "App command fence allowed an unverified terminal command");
   root.render(null);
   await settle();
   unknown = true;
@@ -1695,13 +1704,16 @@ async function terminalUnknownRegression() {
   assert(host.querySelector('[data-tab-id="term-A"]').getAttribute("aria-label").includes("ownership unverified"),
     "Unknown terminal restart lost its ownership warning");
   const afterRemount = sent.length;
+  const paneAfterRemount = paneCallbacks.length;
   const restoredInput = host.querySelector('.terminal-host .xterm-helper-textarea');
   restoredInput.focus();
   restoredInput.dispatchEvent(new KeyboardEvent("keydown", { key: "x", code: "KeyX", keyCode: 88, which: 88, bubbles: true, cancelable: true }));
   host.querySelector('.terminal-host').style.width = "600px";
   await settle();
-  assert(!sent.slice(afterRemount).some((message) => message.type === "terminal.input" || message.type === "terminal.resize"),
+  assert(!paneCallbacks.slice(paneAfterRemount).some((message) => message.type === "terminal.input" || message.type === "terminal.resize"),
     "Restored unknown terminal accepted input or resize");
+  assert(!sent.slice(afterRemount).some((message) => message.type === "terminal.input" || message.type === "terminal.resize"),
+    "App command fence allowed a restored unverified terminal command");
 }
 
 async function terminalUnknownDuringActivationRegression() {
@@ -3310,7 +3322,7 @@ async function manyWorktreeSessionRegression() {
   assert(slowestSwitchMs < 1500, `A 200-worktree navigation exceeded its 1.5s response budget: ${slowestSwitchMs.toFixed(0)}ms`);
   assert(inputFrameMs < 250, `Many-worktree input missed its frame budget after ${elapsedMs}ms of navigation: ${inputFrameMs}ms`);
   if (heapBefore !== null && heapAfter !== null) assert(heapAfter - heapBefore < 64 * 1024 * 1024, "Repeated worktree switches grew the heap without bound");
-  window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), worktrees: { count: 200, switches: 16, elapsedMs, slowestSwitchMs, inputFrameMs, heapBefore, heapAtHalf, heapAfter } };
+  window.__performanceEvidence = { ...window.__performanceEvidence, worktrees: { count: 200, switches: 16, elapsedMs, slowestSwitchMs, inputFrameMs, heapBefore, heapAtHalf, heapAfter } };
 }
 
 async function pagedTranscriptAnchorRegression() {

@@ -895,7 +895,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if (shuttingDown && ![...active.values(), ...pendingOutcomes.values()].some((state) => state.pendingFinish && !state.outcomeJournaled)) return;
     // Probe a newly observed hard fault once promptly; a continuing refusal
     // then backs off to a maintenance-rate probe instead of a busy loop.
-    const delay = persistent ? (hardRetryProbed ? 30_000 : 100) : diskRetryDelayMs;
+    let delay = diskRetryDelayMs;
+    if (persistent) delay = hardRetryProbed ? 30_000 : 100;
     if (diskRetryTimer) {
       // The earliest owner wins. A newly exited result must never wait behind
       // an unrelated admission's long backoff, regardless of fault class.

@@ -96,6 +96,10 @@ export function readRunOutcome(directory, runId) {
     || typeof record.message !== "string" || Buffer.byteLength(record.message) > 4096
     || !(record.exitCode === null || Number.isSafeInteger(record.exitCode))
     || (record.status === "completed" && (record.exitCode !== 0 || record.message !== ""))
+    // Version 1 stored only the terminal result. Transcript fields on that
+    // format have never had an ownership contract and must be quarantined.
+    || (record.version === 1 && (Object.hasOwn(record, "transcriptMessage")
+      || Object.hasOwn(record, "transcriptOmitted")))
     || (record.version === 2 && (typeof record.transcriptOmitted !== "boolean"
       || (record.transcriptMessage !== null && (typeof record.transcriptMessage !== "object"
         || Array.isArray(record.transcriptMessage)

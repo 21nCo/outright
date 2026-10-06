@@ -274,8 +274,10 @@ export function createOutrightDatabase(options = {}) {
         // Keep the deferred marker eligible on the next wrap, but visit
         // later markers first. Resetting to zero here starved every sibling
         // behind a giant row while an unrelated run remained active.
-        scheduleDeletionResume(result.sourceBusy ? Math.min(300_000, 1000 * 2 ** Math.min(busyCount, 9))
-          : result.deferred ? 250 : 0);
+        let resumeDelay = 0;
+        if (result.sourceBusy) resumeDelay = Math.min(300_000, 1000 * 2 ** Math.min(busyCount, 9));
+        else if (result.deferred) resumeDelay = 250;
+        scheduleDeletionResume(resumeDelay);
       })
       .catch((error) => {
         options.onDeletionError?.(error);
@@ -1417,6 +1419,20 @@ export function createOutrightDatabase(options = {}) {
     removePendingRunOutcome(runId) {
       removeRunOutcome(launchDirectory, runId);
     },
+    validateRecoveredRunOutcome(run, outcome) {
+      const message = outcome?.transcriptMessage;
+      if (!message) return;
+      const existing = db.prepare(`SELECT conversation_id AS conversationId, role, kind, payload,
+        created_at AS createdAt FROM messages WHERE id = ?`).get(message.id);
+      if (message.conversationId === run.conversationId
+        && (!existing || (existing.conversationId === run.conversationId
+          && existing.role === "assistant" && existing.kind === "text"
+          && parseJson(existing.payload, null)?.runId === run.id
+          && existing.createdAt === message.createdAt))) return;
+      const error = new Error(`Invalid run outcome record: ${run.id}`);
+      error.code = "OUTRIGHT_INVALID_RUN_OUTCOME";
+      throw error;
+    },
     // Crash-consistent restart reconciliation: queued/running rows belong to a
     // dead runtime, so none of them can ever finish under this process. Mark
     // them "interrupted" with a best-effort process classification instead of
@@ -1447,12 +1463,7 @@ export function createOutrightDatabase(options = {}) {
           let outcomeReadUnavailable = false;
           try {
             outcome = readRunOutcome(launchDirectory, run.id);
-            if (outcome?.transcriptMessage?.conversationId !== undefined
-              && outcome.transcriptMessage.conversationId !== run.conversationId) {
-              const invalid = new Error(`Invalid run outcome record: ${run.id}`);
-              invalid.code = "OUTRIGHT_INVALID_RUN_OUTCOME";
-              throw invalid;
-            }
+            this.validateRecoveredRunOutcome(run, outcome);
           } catch (error) {
             // One corrupt sidecar cannot prevent other runs from recovering.
             // Keep both the sidecar and the interrupted row for inspection.
@@ -1536,8 +1547,7 @@ export function createOutrightDatabase(options = {}) {
       let invalid = false;
       try {
         outcome = readRunOutcome(launchDirectory, id);
-        if (outcome?.transcriptMessage?.conversationId !== undefined
-          && outcome.transcriptMessage.conversationId !== run.conversationId) invalid = true;
+        this.validateRecoveredRunOutcome(run, outcome);
       } catch (error) {
         if (error.code === "OUTRIGHT_INVALID_RUN_OUTCOME") invalid = true;
         else throw databaseError(503, "Run outcome evidence is temporarily unreadable; retry after storage recovers");

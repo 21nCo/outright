@@ -1232,6 +1232,7 @@ for (const operation of ["send", "recovery"]) {
     assert.ok(existsSync(probeMarker), `${operation} did not run the replacement executable`);
     assert.equal(readFileSync(probeMarker, "utf8").trim(), "ran", `${operation} did not complete the replacement executable`);
     assert.ok(ticks >= 1, `${operation} blocked the event loop during its executable probe (${elapsed.toFixed(1)} ms)`);
+    assert.ok(elapsed < 5000, `${operation} exceeded the bounded provider-probe response budget (${elapsed.toFixed(1)} ms)`);
     assert.equal(response.statusCode, 202);
   }));
 }
