@@ -1956,7 +1956,7 @@ function RunningMessage({ run, events, outcomePending = false }) {
   let activityText = "Working in this worktree…";
   if (run.status === "queued") activityText = "Waiting for an execution slot…";
   if (outcomePending) activityText = "Waiting for storage to save the final result…";
-  return <article className="message is-agent is-streaming" role="status" aria-live="polite"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="thinking-copy">{activityText}</p><ToolActivity events={events} /></div></article>;
+  return <article className="message is-agent is-streaming" aria-busy="true"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="thinking-copy">{activityText}</p><ToolActivity events={events} /></div></article>;
 }
 // Interrupted runs surface here until the operator picks a continuation
 // policy; the preserved partial output stays visible above the notice.

@@ -274,37 +274,52 @@ function terminalRecoveryText(terminal) {
   return "";
 }
 
-function capacityStatusAnnouncement(capacity) {
-  if (!capacity?.limits) return "";
+const validCapacityCount = (value) => Number.isSafeInteger(value) && value >= 0;
+const atCapacityLimit = (active, limit) => validCapacityCount(active) && validCapacityCount(limit) && active >= limit;
+
+function terminalCapacityMessages(terminal) {
   const messages = [];
-  const validCount = (value) => Number.isSafeInteger(value) && value >= 0;
-  const atLimit = (active, limit) => validCount(active) && validCount(limit) && active >= limit;
-  const terminal = capacity.terminalProcesses;
   if (terminal?.recoveryError) messages.push("Terminal history recovery stopped. New terminals are paused.");
   else if (terminal?.recoveryPending) messages.push("Terminal history recovery is in progress. New terminals are paused.");
-  else if (!terminal || !validCount(terminal.active) || !validCount(terminal.limit) || !validCount(terminal.unknown)) {
+  else if (!terminal || !validCapacityCount(terminal.active) || !validCapacityCount(terminal.limit) || !validCapacityCount(terminal.unknown)) {
     messages.push("Terminal capacity is unknown.");
   } else {
     if (terminal.unknown) messages.push("Terminal ownership is unverified. New terminals may be paused.");
-    if (atLimit(terminal.active, terminal.limit)) messages.push("Terminal capacity is full. Close a terminal before opening another.");
+    if (atCapacityLimit(terminal.active, terminal.limit)) messages.push("Terminal capacity is full. Close a terminal before opening another.");
   }
+  return messages;
+}
+
+function processCapacityMessages(capacity) {
+  const messages = [];
   const utility = capacity.utilityProcesses;
-  if (!utility || !validCount(utility.active) || !validCount(utility.limit)) messages.push("Utility process capacity is unknown.");
-  else if (atLimit(utility.active, utility.limit)) messages.push("Utility process capacity is full. Retry when a process finishes.");
-  const queueFull = atLimit(capacity.queued, capacity.limits.maxQueuedRuns);
-  if (!validCount(capacity.queued) || !validCount(capacity.limits.maxQueuedRuns)) messages.push("Run queue capacity is unknown.");
+  if (!utility || !validCapacityCount(utility.active) || !validCapacityCount(utility.limit)) messages.push("Utility process capacity is unknown.");
+  else if (atCapacityLimit(utility.active, utility.limit)) messages.push("Utility process capacity is full. Retry when a process finishes.");
+  const queueFull = atCapacityLimit(capacity.queued, capacity.limits.maxQueuedRuns);
+  if (!validCapacityCount(capacity.queued) || !validCapacityCount(capacity.limits.maxQueuedRuns)) messages.push("Run queue capacity is unknown.");
   else if (queueFull) messages.push("Run queue is full. Wait for capacity or stop queued work.");
   const activeProcesses = capacity.activeProcesses ?? capacity.active;
-  if (!validCount(activeProcesses) || !validCount(capacity.limits.maxConcurrentRuns)) messages.push("Concurrent run capacity is unknown.");
-  else if (atLimit(activeProcesses, capacity.limits.maxConcurrentRuns)) messages.push(queueFull
+  if (!validCapacityCount(activeProcesses) || !validCapacityCount(capacity.limits.maxConcurrentRuns)) messages.push("Concurrent run capacity is unknown.");
+  else if (atCapacityLimit(activeProcesses, capacity.limits.maxConcurrentRuns)) messages.push(queueFull
     ? "Concurrent run slots are full." : "Concurrent run slots are full. New runs will queue.");
-  if (validCount(capacity.pendingRunOutcomes) && capacity.pendingRunOutcomes) messages.push("Exited runs await storage recovery before their outcomes can be saved.");
-  if (validCount(activeProcesses) && validCount(capacity.pendingRunOutcomes)
-    && validCount(capacity.limits.maxPendingRunOutcomes)
+  messages.push(...pendingOutcomeCapacityMessages(capacity, activeProcesses));
+  return messages;
+}
+
+function pendingOutcomeCapacityMessages(capacity, activeProcesses) {
+  const messages = [];
+  if (validCapacityCount(capacity.pendingRunOutcomes) && capacity.pendingRunOutcomes) messages.push("Exited runs await storage recovery before their outcomes can be saved.");
+  if (validCapacityCount(activeProcesses) && validCapacityCount(capacity.pendingRunOutcomes)
+    && validCapacityCount(capacity.limits.maxPendingRunOutcomes)
     && activeProcesses + capacity.pendingRunOutcomes >= capacity.limits.maxPendingRunOutcomes) {
     messages.push("Run starts are paused until an active run or pending outcome releases recovery capacity.");
   }
-  if (!validCount(capacity.recoverable)) messages.push("Run recovery capacity is unknown.");
+  return messages;
+}
+
+function recoveryCapacityMessages(capacity) {
+  const messages = [];
+  if (!validCapacityCount(capacity.recoverable)) messages.push("Run recovery capacity is unknown.");
   else if (capacity.recoverable) messages.push("Runs are awaiting recovery.");
   if (capacity.maintenanceError) messages.push("Archived storage recovery needs a restart. New work is paused.");
   else if (capacity.migrationStatus === "maintenance") messages.push("Archived storage cleanup is in progress. New work is paused.");
@@ -313,6 +328,11 @@ function capacityStatusAnnouncement(capacity) {
   else if (capacity.migrationStatus !== "ready") messages.push("Retained history status is unknown. New work is paused.");
   if (capacity.cleanupPaused) messages.push("Archived cleanup is paused after storage errors.");
   else if (capacity.cleanupPending) messages.push("Archived cleanup is pending.");
+  return messages;
+}
+
+function storageCapacityMessages(capacity) {
+  const messages = [];
   if (!capacity.maintenanceError && capacity.migrationStatus === "ready") {
     if (!["measured", "estimated", "partial"].includes(capacity.diskUsageStatus) || !Number.isFinite(capacity.diskAllocatedBytes)
       || !Number.isFinite(capacity.availablePhysicalForNewWorkBytes)) {
@@ -326,6 +346,17 @@ function capacityStatusAnnouncement(capacity) {
       messages.push("Retained history is full. New work is paused.");
     }
   }
+  return messages;
+}
+
+function capacityStatusAnnouncement(capacity) {
+  if (!capacity?.limits) return "";
+  const messages = [
+    ...terminalCapacityMessages(capacity.terminalProcesses),
+    ...processCapacityMessages(capacity),
+    ...recoveryCapacityMessages(capacity),
+    ...storageCapacityMessages(capacity),
+  ];
   const availability = messages.join(" ") || "Capacity is available for new work.";
   if (capacity.migrationStatus !== "ready") return availability;
   if (capacity.diskUsageStatus === "estimated") return `${availability} Physical storage use is estimated.`;

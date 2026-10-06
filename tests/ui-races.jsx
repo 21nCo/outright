@@ -684,12 +684,24 @@ async function settingsCapacityWithoutEventRegression() {
   assert(document.querySelector(".capacity-status")?.tagName === "P",
     "polled measurements should be readable without a live status announcement on every value change");
   assert(capacityAnnouncement() === "Capacity is available for new work.", "initial capacity state was not announced");
+  const liveStatus = document.querySelector('[aria-labelledby="capacity-retention-heading"] [role="status"]');
+  const liveChanges = [];
+  const liveObserver = new MutationObserver(() => { liveChanges.push(liveStatus.textContent); });
+  liveObserver.observe(liveStatus, { childList: true, characterData: true, subtree: true });
+  const unchangedReads = reads;
+  await until(() => reads > unchangedReads, "unchanged capacity poll completed");
+  await settle();
+  assert(liveChanges.length === 0, "unchanged capacity poll mutated the live announcement");
   assert(document.querySelector('[aria-labelledby="capacity-retention-heading"] h3')?.textContent === "Capacity and retention",
     "capacity controls lost their named heading");
+  const beforeTerminalLimit = liveChanges.length;
   otherClientCapacity = { ...otherClientCapacity, terminalProcesses: { active: 12, unknown: 0, limit: 12 } };
   signalChange();
   await until(() => capacityAnnouncement() === "Terminal capacity is full. Close a terminal before opening another.",
     "full terminal admission is announced instead of available capacity");
+  await settle();
+  assert(liveChanges.slice(beforeTerminalLimit).filter((value) => value === "Terminal capacity is full. Close a terminal before opening another.").length === 1,
+    "one terminal limit transition must mutate the live region once");
   otherClientCapacity = { ...otherClientCapacity, terminalProcesses: { active: 0, unknown: 0, limit: 12 },
     utilityProcesses: { active: 8, limit: 8 } };
   signalChange();
@@ -718,11 +730,16 @@ async function settingsCapacityWithoutEventRegression() {
   otherClientCapacity = { ...otherClientCapacity, active: 1, recoverable: 1 };
   signalChange();
   await until(() => capacityAnnouncement() === "Runs are awaiting recovery.", "run recovery is announced");
+  await settle();
+  const changesBeforeCountPoll = liveChanges.length;
   const eventReads = reads;
   otherClientCapacity = { ...otherClientCapacity, recoverable: 2 };
   await until(() => reads > eventReads && capacityText().includes("2 awaiting recovery"),
     "the next capacity poll returned the changed recovery count");
   assert(capacityAnnouncement() === "Runs are awaiting recovery.", "recovery count polling changed the spoken category");
+  await settle();
+  assert(liveChanges.length === changesBeforeCountPoll,
+    "a changed recovery count repeated the unchanged live category");
   otherClientCapacity = { ...otherClientCapacity, recoverable: 0, pendingRunOutcomes: 7 };
   signalChange();
   await until(() => capacityAnnouncement().includes("Run starts are paused until an active run or pending outcome releases recovery capacity."),
@@ -788,6 +805,7 @@ async function settingsCapacityWithoutEventRegression() {
   const readsAtClose = reads;
   await new Promise((resolve) => setTimeout(resolve, 2200));
   assert(reads === readsAtClose, "closed Settings kept polling capacity");
+  liveObserver.disconnect();
 }
 
 async function settingsCapacityAndDeletionOrderRegression() {
@@ -1679,19 +1697,23 @@ async function terminalUnknownRegression() {
   assert(!commandFence.allows({ type: "terminal.input", terminalId: "term-A", data: "x" })
     && !commandFence.allows({ type: "terminal.resize", terminalId: "term-A", cols: 80, rows: 24 }),
   "App command fence allowed an unverified terminal command");
-  const paneBefore = paneCallbacks.length;
   show(auditFailed);
   // A later event can replace App's latest-event prop before React commits.
   // The separately retained ownership state must still commit the warning.
   show({ type: "capacity.changed", payload: {} });
   await until(() => host.querySelector('[data-tab-id="term-A"]')?.getAttribute("aria-label").includes("ownership unverified"), "unknown ownership announcement");
   assert(host.querySelector('.terminal-pane [role="status"]')?.textContent.includes("ownership is unverified"), "Unknown terminal lacks a spoken status");
+  // The App fence starts at event receipt. React may run one previously
+  // scheduled pane callback before the unknown prop commits; only the fence
+  // can block that interval. Inspect raw pane callbacks after the warning is
+  // committed, when the pane itself owns the unknown state.
+  const paneAfterWarning = paneCallbacks.length;
   host.querySelector('.terminal-host').style.width = "540px";
   const input = host.querySelector('.terminal-host .xterm-helper-textarea');
   input.focus();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "x", code: "KeyX", keyCode: 88, which: 88, bubbles: true, cancelable: true }));
   await settle();
-  assert(!paneCallbacks.slice(paneBefore).some((message) => message.type === "terminal.input" || message.type === "terminal.resize"),
+  assert(!paneCallbacks.slice(paneAfterWarning).some((message) => message.type === "terminal.input" || message.type === "terminal.resize"),
     "Unverified terminal still accepted input or resize");
   assert(!sent.slice(before).some((message) => message.type === "terminal.input" || message.type === "terminal.resize"),
     "App command fence allowed an unverified terminal command");
@@ -5225,6 +5247,9 @@ async function pendingRunOutcomeRegression() {
   const socketsBefore = fixtureSockets.length;
   root.render(<TooltipProvider><App /></TooltipProvider>);
   await until(() => fixtureSockets.length > socketsBefore && host.querySelector('[aria-label="Stop active agent run"]'), "running outcome fixture");
+  assert(host.querySelector('.send-hint[role="status"]')?.textContent.includes("Agent is running")
+    && host.querySelector('.message.is-streaming[aria-busy="true"]:not([role="status"])'),
+  "running state must have one live announcement while the activity card stays busy");
   const socket = fixtureSockets.at(-1);
   const announce = (runId, conversationId) => socket.dispatchEvent(new MessageEvent("message", {
     data: JSON.stringify({ type: "run.outcome_pending", runId, conversationId, reason: "storage-unavailable" }),

@@ -7,8 +7,47 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
 
 const brokerScript = fileURLToPath(new URL("./terminal-broker.mjs", import.meta.url));
+
+test("Windows terminal supervisor stop empties the owned Job Object when a PTY cannot exit", { skip: process.platform !== "win32", timeout: 15_000 }, async () => {
+  // A broker whose terminal.kill fails still loses its owner socket. The
+  // managed adapter sends stop on that path; exercise the native control pipe
+  // with a child that will not exit on its own and inspect the OS process.
+  const owner = spawn(AGENT_SUPERVISOR, [process.execPath, "-e",
+    'console.log("OWNED_CHILD=" + process.pid); setInterval(() => {}, 1000)'],
+  { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+  let output = "";
+  let errorOutput = "";
+  owner.stdout.on("data", (chunk) => { output += chunk; });
+  owner.stderr.on("data", (chunk) => { errorOutput += chunk; });
+  try {
+    const deadline = Date.now() + 5000;
+    while (!/OWNED_CHILD=(\d+)/.test(output) && Date.now() < deadline && owner.exitCode === null) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const childPid = Number(output.match(/OWNED_CHILD=(\d+)/)?.[1]);
+    assert.ok(childPid, `owned child did not start: ${errorOutput}`);
+    const identity = spawnSync(AGENT_SUPERVISOR, ["--identity", String(owner.pid)],
+      { encoding: "utf8", windowsHide: true, timeout: 1500 });
+    assert.match(identity.stdout, /^\d+\s*$/);
+    owner.stdin.end("stop\n");
+    let timeout;
+    await Promise.race([
+      new Promise((resolve) => owner.once("close", resolve)),
+      new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("native owner retained a live Job Object after stop")), 5000); }),
+    ]).finally(() => clearTimeout(timeout));
+    const probe = spawnSync(AGENT_SUPERVISOR, ["--probe", String(owner.pid), identity.stdout.trim()],
+      { encoding: "utf8", windowsHide: true, timeout: 1500 });
+    assert.equal(probe.stdout.trim(), "absent", "native owner remained after Job Object stop");
+    assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" }, "owned child survived native stop");
+  } finally {
+    owner.stdin.destroy();
+    if (owner.exitCode === null) spawnSync("taskkill", ["/T", "/F", "/PID", String(owner.pid)],
+      { windowsHide: true, stdio: "ignore", timeout: 5000 });
+  }
+});
 
 test("a slow broker reader backpressures sustained PTY output without losing its shell", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "pty-broker-"));
@@ -220,10 +259,11 @@ test("disconnecting a live owner releases the broker and its PTY child", { timeo
     while (!shellPid && Date.now() < pidDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
     assert.ok(shellPid, `PTY child did not identify itself; broker=${broker.pid}/${broker.exitCode}/${broker.signalCode}, runner=${process.pid}, frames=${JSON.stringify(pidOutput)}, stderr=${stderr}`);
     let brokerClosedWithLiveChild = false;
-    broker.once("close", () => {
+    const brokerClosed = new Promise((resolve) => broker.once("close", () => {
       try { process.kill(shellPid, 0); brokerClosedWithLiveChild = true; }
       catch (error) { if (error.code !== "ESRCH") throw error; }
-    });
+      resolve();
+    }));
     socket.destroy();
     const released = () => {
       if (broker.exitCode === null) return false;
@@ -232,6 +272,7 @@ test("disconnecting a live owner releases the broker and its PTY child", { timeo
     const releaseDeadline = Date.now() + 5000;
     while (!released() && Date.now() < releaseDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
     assert.ok(released(), "disconnected broker or PTY child remained alive");
+    await brokerClosed;
     assert.equal(brokerClosedWithLiveChild, false, "broker reported release while its PTY child was still alive");
     await assert.rejects(new Promise((resolve, reject) => {
       const candidate = net.createConnection(address);
