@@ -1,0 +1,28 @@
+server/managed-terminal.mjs
+  h_a39f9495f9ec1d 62-66,105-113,116-119,176-178,181-190,199
+server/terminal-broker.mjs
+  h_a39f9495f9ec1d 16,20,85,141-150
+server/terminal-broker.test.mjs
+  h_a39f9495f9ec1d 14-69,103-110
+server/terminal-manager.mjs
+  h_a39f9495f9ec1d 174,176,178-179
+server/terminal-manager.test.mjs
+  h_a39f9495f9ec1d 43-63
+src/App.jsx
+  h_a39f9495f9ec1d 626-628,1335-1336,1866-1868,1888,1952,1957,1993-1998,2006
+tests/ui-accessibility.test.mjs
+  h_a39f9495f9ec1d 38
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 5250-5256,5263,5269,5272-5273,5280-5283
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6c1691b3cc976b15663643f3950d712fc4138494",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
