@@ -1,0 +1,36 @@
+server/agent-manager.mjs
+  h_a39f9495f9ec1d 898-899
+server/database.mjs
+  h_a39f9495f9ec1d 277-280,1422-1435,1466,1550
+server/database.test.mjs
+  h_a39f9495f9ec1d 931-1011
+server/managed-terminal.mjs
+  h_a39f9495f9ec1d 41-44
+server/outright-runtime.test.mjs
+  h_a39f9495f9ec1d 1235
+server/run-outcome-journal.mjs
+  h_a39f9495f9ec1d 99-102
+server/run-outcome-journal.test.mjs
+  h_a39f9495f9ec1d 22-38
+server/terminal-broker.mjs
+  h_a39f9495f9ec1d 16-20,142,153,167-172,184-188
+server/terminal-broker.test.mjs
+  h_a39f9495f9ec1d 216-218,222-226,235
+src/App.jsx
+  h_a39f9495f9ec1d 866-869,871-874,877-879,1851-1875,1892,1897,1925-1926,1955-1960
+src/components/TerminalPane.jsx
+  h_a39f9495f9ec1d 206-210
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 721,723-724,1659,1671,1679-1682,1694,1696-1697,1707,1713,1715-1716,3325
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2cd27e8e0f787e76176fed01e7f647f19af6e60e",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
