@@ -1,0 +1,23 @@
+server/database.mjs
+  s_28d4128c7417df::t_9dbbf793970f11 2067,2069,2073-2075,2978
+server/outright-runtime.test.mjs
+  s_28d4128c7417df::t_c17b783118a15f 122-145
+server/terminal-broker.test.mjs
+  s_28d4128c7417df::t_884710cf2cf548 25-26,44-46,55-56,58-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4d0deaeae0ccc009a77a064fd9abf2e4f0c558f7",
+  "prompts": {},
+  "sessions": {
+    "s_28d4128c7417df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1c1c580e-3b46-4699-b932-7f146605890c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
