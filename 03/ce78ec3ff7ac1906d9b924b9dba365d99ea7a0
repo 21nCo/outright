@@ -1,0 +1,20 @@
+server/terminal-broker.test.mjs
+  h_a39f9495f9ec1d 10,14-51,262,265-266,275
+src/App.jsx
+  h_a39f9495f9ec1d 1959
+src/components/SettingsDialog.jsx
+  h_a39f9495f9ec1d 277-280,284,288,290-294,296-299,302-303,305-313,317-322,331-335,349-359
+tests/ui-races.jsx
+  h_a39f9495f9ec1d 687-694,697,702-704,733-734,740-742,808,1706-1710,1716,5250-5252
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "03ce78ec3ff7ac1906d9b924b9dba365d99ea7a0",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
