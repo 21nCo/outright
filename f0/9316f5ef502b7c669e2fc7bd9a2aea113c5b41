@@ -1,0 +1,19 @@
+server/agent-manager.test.mjs
+  s_eea38c824fdcc4::t_5652ac0dda69f2 346-347,369-371,576-577,1455-1471,1654,1665-1666,1668-1669,2869,2874,2936
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f09316f5ef502b7c669e2fc7bd9a2aea113c5b41",
+  "prompts": {},
+  "sessions": {
+    "s_eea38c824fdcc4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1123c-d335-73e1-9b4a-9cdab00eb0c4",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
