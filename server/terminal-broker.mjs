@@ -140,7 +140,10 @@ const server = net.createServer((socket) => {
           // broker even if the client never drains.
           exitTimer = setTimeout(() => socket.destroy(), 5000);
           exitTimer.unref();
-          if (!outputPaused) flushOutput();
+          // Exit may race a backpressured write. Queue the final frame now;
+          // a later drain continues it in order if the socket still cannot
+          // accept the frame. Waiting only for drain can strand a quiet peer.
+          flushOutput();
         });
       } else if (!shellExited && message.type === "write" && typeof message.data === "string"
         && Buffer.byteLength(message.data) <= 64 * 1024) terminal.write(message.data);

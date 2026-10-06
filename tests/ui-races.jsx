@@ -11,6 +11,7 @@ import { SettingsDialog } from "../src/components/SettingsDialog.jsx";
 import { TerminalPane } from "../src/components/TerminalPane.jsx";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
 import { scheduleLayoutTick } from "../src/lib/windowing.js";
+import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
 import "../src/styles.css";
 
 const host = document.getElementById("root");
@@ -716,7 +717,11 @@ async function settingsCapacityWithoutEventRegression() {
     "full active run slots are announced without claiming queue admission is closed");
   otherClientCapacity = { ...otherClientCapacity, active: 1, recoverable: 1 };
   signalChange();
-  await until(() => capacityAnnouncement() === "One run is awaiting recovery.", "run recovery is announced");
+  await until(() => capacityAnnouncement() === "Runs are awaiting recovery.", "run recovery is announced");
+  otherClientCapacity = { ...otherClientCapacity, recoverable: 2 };
+  signalChange();
+  await settle();
+  assert(capacityAnnouncement() === "Runs are awaiting recovery.", "recovery count polling changed the spoken category");
   otherClientCapacity = { ...otherClientCapacity, recoverable: 0, pendingRunOutcomes: 7 };
   signalChange();
   await until(() => capacityAnnouncement().includes("Run starts are paused until an active run or pending outcome releases recovery capacity."),
@@ -733,7 +738,7 @@ async function settingsCapacityWithoutEventRegression() {
     "status returns to available after process, queue, recovery and cleanup capacity clears");
   otherClientCapacity = { ...otherClientCapacity, terminalProcesses: { active: 1, unknown: 1, limit: 12 } };
   signalChange();
-  await until(() => capacityAnnouncement() === "1 terminal ownership record is unverified. New terminals may be paused.",
+  await until(() => capacityAnnouncement() === "Terminal ownership is unverified. New terminals may be paused.",
     "unverified terminal ownership is announced");
   otherClientCapacity = { ...otherClientCapacity, terminalProcesses: { active: 0, unknown: 0, limit: 12 } };
   signalChange();
@@ -1652,17 +1657,26 @@ async function terminalUnknownRegression() {
   const sent = [];
   let created = 0;
   let unknown = false;
+  const commandFence = createTerminalCommandFence();
   route = async (url, options) => {
     if (url.pathname === "/api/terminals" && options.method === "POST") { created += 1; return response(terminal("A2")); }
     if (url.pathname === "/api/terminals") return response({ terminals: [{ ...terminal("A"), status: unknown ? "unknown" : "running" }] });
     return response({ buffer: "Retained output\r\n", status: unknown ? "unknown" : "running" });
   };
   const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]}
-    runtimeEvent={event} onError={(error) => { throw error; }} sendRuntime={(message) => sent.push(message)} />);
+    runtimeEvent={event} unverifiedTerminalIds={commandFence.snapshot()}
+    onError={(error) => { throw error; }} sendRuntime={(message) => {
+      if (commandFence.allows(message)) sent.push(message);
+    }} />);
   show();
   await until(() => terminalReady("Terminal A"), "running terminal before unknown ownership");
   const before = sent.length;
-  show({ type: "terminal.audit-failed", terminalId: "term-A" });
+  const auditFailed = { type: "terminal.audit-failed", terminalId: "term-A" };
+  commandFence.observe(auditFailed);
+  show(auditFailed);
+  // A later event can replace App's latest-event prop before React commits.
+  // The separately retained ownership state must still commit the warning.
+  show({ type: "capacity.changed", payload: {} });
   await until(() => host.querySelector('[data-tab-id="term-A"]')?.getAttribute("aria-label").includes("ownership unverified"), "unknown ownership announcement");
   assert(host.querySelector('.terminal-pane [role="status"]')?.textContent.includes("ownership is unverified"), "Unknown terminal lacks a spoken status");
   host.querySelector('.terminal-host').style.width = "540px";
@@ -3273,12 +3287,15 @@ async function manyWorktreeSessionRegression() {
   root.render(<TooltipProvider><App /></TooltipProvider>);
   await until(() => host.querySelector('#chat-tab-chat-W0[aria-selected="true"]'), "initial many-worktree chat");
   let heapAtHalf = null;
+  let slowestSwitchMs = 0;
   for (let index = 0; index < 16; index += 1) {
     const id = index % 2 ? "W0" : "W199";
     const target = [...host.querySelectorAll(".worktree-row")].find((row) => row.textContent.includes(`Tree ${Number(id.slice(1))}`));
     assert(target, `Missing ${id} in worktree navigation`);
+    const switchStarted = performance.now();
     target.click();
     await until(() => host.querySelector(`#chat-tab-chat-${id}[aria-selected="true"]`) && host.querySelector(`[data-message-id="message-${id}"]`), `selected ${id} chat`);
+    slowestSwitchMs = Math.max(slowestSwitchMs, performance.now() - switchStarted);
     assert(host.querySelectorAll(".message-scroll").length === 1 && host.querySelectorAll("[data-message-id]").length === 1, "Worktree navigation accumulated hidden conversations");
     if (index === 7) heapAtHalf = performance.memory?.usedJSHeapSize ?? null;
   }
@@ -3290,9 +3307,10 @@ async function manyWorktreeSessionRegression() {
   assert(host.querySelectorAll(".worktree-row").length === 200, "Fixture did not exercise all worktree rows");
   const elapsedMs = Math.round(performance.now() - started);
   const heapAfter = performance.memory?.usedJSHeapSize ?? null;
+  assert(slowestSwitchMs < 1500, `A 200-worktree navigation exceeded its 1.5s response budget: ${slowestSwitchMs.toFixed(0)}ms`);
   assert(inputFrameMs < 250, `Many-worktree input missed its frame budget after ${elapsedMs}ms of navigation: ${inputFrameMs}ms`);
   if (heapBefore !== null && heapAfter !== null) assert(heapAfter - heapBefore < 64 * 1024 * 1024, "Repeated worktree switches grew the heap without bound");
-  window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), worktrees: { count: 200, switches: 16, elapsedMs, inputFrameMs, heapBefore, heapAtHalf, heapAfter } };
+  window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), worktrees: { count: 200, switches: 16, elapsedMs, slowestSwitchMs, inputFrameMs, heapBefore, heapAtHalf, heapAfter } };
 }
 
 async function pagedTranscriptAnchorRegression() {
@@ -5204,6 +5222,10 @@ async function pendingRunOutcomeRegression() {
   assert(!host.querySelector(".recovery-notice") && !host.querySelector(".run-state")?.textContent.includes("outcome pending"), "another chat's pending result appeared here");
   announce("run-A", "chat-A");
   await until(() => host.querySelector(".recovery-notice")?.textContent.includes("Run outcome waiting for storage"), "pending result announced");
+  assert(host.querySelector(".recovery-notice")?.tagName === "DIV"
+    && !host.querySelector(".recovery-notice")?.hasAttribute("aria-live")
+    && host.querySelector('.send-hint[role="status"]')?.textContent.includes("Saving final run outcome"),
+  "Changing run IDs must not re-announce the verbose recovery notice; the stable status announces the transition");
   assert(host.querySelector(".run-state")?.textContent.includes("outcome pending"), "run badge still claimed to be running");
   assert(host.querySelector(".conversation-meta")?.textContent.includes("outcome pending"), "conversation summary still claimed to be running");
   assert(host.querySelector('[aria-label="Final run outcome pending"]')?.disabled, "stop remained actionable after the provider exited");

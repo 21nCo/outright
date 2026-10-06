@@ -29,6 +29,7 @@ import { api, connectRuntime, query } from "@/lib/runtime-api";
 import { scheduleLayoutTick } from "@/lib/windowing";
 import { foldFindText } from "@/lib/find-text";
 import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, messagePrecedesPage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "@/recovery-policy";
+import { createTerminalCommandFence } from "@/lib/terminal-command-fence";
 
 const MAX_RENDERED_MESSAGES = 1000;
 function moveMessageViewport(viewport, top) {
@@ -75,6 +76,7 @@ export function App() {
   const [pendingOutcomeRunIds, setPendingOutcomeRunIds] = useState(() => new Set());
   const [findResetGeneration, setFindResetGeneration] = useState(0);
   const [runtimeEvent, setRuntimeEvent] = useState(null);
+  const [unverifiedTerminalIds, setUnverifiedTerminalIds] = useState(() => new Set());
   const [connection, setConnection] = useState("connecting");
   const [isScanning, setIsScanning] = useState(true);
   const [isNarrow, setIsNarrow] = useState(() => typeof window !== "undefined" && window.matchMedia("(max-width: 760px)").matches);
@@ -98,6 +100,8 @@ export function App() {
   const [removeWorktreeOpen, setRemoveWorktreeOpen] = useState(false);
   const [removeConfirmation, setRemoveConfirmation] = useState("");
   const socketRef = useRef(null);
+  const terminalCommandFenceRef = useRef(null);
+  if (!terminalCommandFenceRef.current) terminalCommandFenceRef.current = createTerminalCommandFence();
   const selectedConversationRef = useRef("");
   const selectedProjectRef = useRef(selectedProjectId);
   const selectedWorktreeRef = useRef(selectedWorktreeId);
@@ -607,6 +611,9 @@ export function App() {
   const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
   const handleRuntimeEvent = useCallback((event) => {
+    if (terminalCommandFenceRef.current.observe(event)) {
+      setUnverifiedTerminalIds(terminalCommandFenceRef.current.snapshot());
+    }
     if (event.type === "run.outcome_pending" && typeof event.runId === "string") {
       setPendingOutcomeRunIds((current) => {
         const next = new Set(current);
@@ -793,7 +800,9 @@ export function App() {
     socketRef.current = connectionInstance;
     return () => connectionInstance.close();
   }, []);
-  const sendRuntime = useCallback((message) => socketRef.current?.send(message), []);
+  const sendRuntime = useCallback((message) => {
+    if (terminalCommandFenceRef.current.allows(message)) socketRef.current?.send(message);
+  }, []);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -1351,7 +1360,7 @@ export function App() {
       const ownerWorktree = ownerProject?.worktrees.find((item) => item.id === recoveryConversation.worktreeId);
       if (!ownerProject || !ownerWorktree) throw new Error("The recovery chat worktree is no longer available");
       pendingConversationRef.current = recoveryConversation.id;
-      await chooseProject(ownerProject, ownerWorktree);
+      chooseProject(ownerProject, ownerWorktree);
     } catch (nextError) { setError(nextError.message); }
   }
 
@@ -1791,7 +1800,7 @@ export function App() {
     try {
       const moved = await api(`/api/conversations/${conversation.id}/move`, { method: "POST", body: { projectId, worktreeId, worktreePath: nextWorktree.path } });
       await api(`/api/conversations/${conversation.id}`, { method: "PATCH", body: patch });
-      pendingConversationRef.current = moved.id; setManageChatOpen(false); await chooseProject(nextProject, nextWorktree); setToast("Conversation moved");
+      pendingConversationRef.current = moved.id; setManageChatOpen(false); chooseProject(nextProject, nextWorktree); setToast("Conversation moved");
     } catch (nextError) { setError(nextError.message); }
   }
 
@@ -1855,11 +1864,11 @@ export function App() {
           <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? <WindowedMessages key={conversation.id} messages={conversation.messages} messagePage={conversation.messagePage} viewportRef={messageViewportRef} restoreAnchorId={restoreMessageAnchorId} renderMessage={(message) => <Message message={message} conversationId={conversation.id} />} onFind={findConversationMessage} onCancelFind={() => { pendingFindRef.current?.abort(); pendingFindRef.current = null; activeFindMatchRef.current = null; findProgressRef.current = null; }} resetFindGeneration={findResetGeneration} /> : waitingForConversation ? <output className="conversation-loading-status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</output> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{!conversation?.messagePage?.hasLater && (activeRun || pendingOutcomeRun) && !streamingText && <RunningMessage run={activeRun ?? pendingOutcomeRun} events={runEvents} outcomePending={!activeRun && outcomePending} />}</div></ScrollArea>
           {readingLiveText && <section className="history-live-tail" aria-label={activeRun ? "Live output while reading history" : "Recent output while reading history"} tabIndex={0}><strong>{activeRun ? "Live output" : "Recent output"}</strong><p>{readingLiveText}</p></section>}
           {conversation?.messagePage?.hasLater && <div className="history-forward"><button className="history-later" onClick={loadLaterMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading later messages…" : `Load later messages · ${conversation.messagePage.newerCount} remaining`}</button><button className="history-return" onClick={() => loadConversation({ returnToLatest: true })}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button></div>}
-          {outcomePending && <output className="recovery-notice" aria-live="polite"><WarningCircle weight="fill" /><span className="recovery-copy"><strong>Run outcome waiting for storage</strong><span>The agent process has exited. Outright is saving the final result for {pendingOutcomeRuns.length === 1 ? "run" : "runs"} {pendingOutcomeRuns.map((run, index) => <code key={run.id}>{run.id}{index < pendingOutcomeRuns.length - 1 ? ", " : ""}</code>)} and will update this chat when storage recovers.</span></span></output>}
+          {outcomePending && <div className="recovery-notice"><WarningCircle weight="fill" /><span className="recovery-copy"><strong>Run outcome waiting for storage</strong><span>The agent process has exited. Outright is saving the final result for {pendingOutcomeRuns.length === 1 ? "run" : "runs"} {pendingOutcomeRuns.map((run, index) => <code key={run.id}>{run.id}{index < pendingOutcomeRuns.length - 1 ? ", " : ""}</code>)} and will update this chat when storage recovers.</span></span></div>}
           {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}
           <form className="composer" onSubmit={sendPrompt}>{unsentCreatedChat && <div className="first-prompt-notice" role="status" aria-live="polite">Chat created, but your message was not sent. {unsentForOwner ? firstPromptAwaitingSelection ? "Open the created chat before sending again." : "Send again when the chat is ready." : "Return to its worktree before sending again."}{unsentForOwner && firstPromptAwaitingSelection && conversations.some((item) => item.id === unsentForOwner.id) && <Button type="button" variant="outline" size="sm" onClick={() => selectConversation(unsentForOwner.id)}>Open created chat</Button>}{!unsentForOwner && unsentProject && unsentWorktree && <Button type="button" variant="outline" size="sm" onClick={() => { pendingConversationRef.current = unsentCreatedChat.id; chooseProject(unsentProject, unsentWorktree); }}>Return to created chat</Button>}<Button type="button" variant="ghost" size="sm" onClick={() => { setUnsentCreatedChat(null); editDraft(""); }}>Discard unsent message</Button></div>}<textarea aria-label="Message the agent" disabled={Boolean(interruptedRun) || submissionUnavailable} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversationLoadFailed ? "Chat unavailable; retry loading…" : waitingForConversation ? "Loading selected chat…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={editDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running" role="status" aria-live="polite"><span className="status-dot demo" aria-hidden="true" />{`Agent is ${activeRun.status}`}</span> : outcomePending ? <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Saving final run outcome</span> : interruptedRun ? <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Recovery decision required</span> : waitingForConversation ? <span className="send-hint" role="status" aria-live="polite">{conversationLoadFailed ? "Chat unavailable; retry loading" : "Loading selected chat"}</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button> : outcomePending ? <Button size="icon" type="button" variant="destructive" disabled aria-label="Final run outcome pending"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun) || submissionUnavailable || firstPromptAwaitingSelection} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
         </section>
-        {inspector && <aside className="inspector" id="workspace-inspector" aria-label="Workspace inspector" tabIndex={-1} ref={inspectorRef}><header><nav role="tablist" aria-label="Inspector panels" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', setInspector)}><button id="inspector-tab-changes" data-tab-id="changes" role="tab" className={inspector === "changes" ? "is-active" : ""} aria-selected={inspector === "changes"} aria-controls="inspector-content" tabIndex={inspector === "changes" ? 0 : -1} onClick={() => setInspector("changes")}><GitDiff />Changes</button><button id="inspector-tab-terminal" data-tab-id="terminal" role="tab" className={inspector === "terminal" ? "is-active" : ""} aria-selected={inspector === "terminal"} aria-controls="inspector-content" tabIndex={inspector === "terminal" ? 0 : -1} onClick={() => setInspector("terminal")}><TerminalWindow />Terminal</button><button id="inspector-tab-context" data-tab-id="context" role="tab" className={inspector === "context" ? "is-active" : ""} aria-selected={inspector === "context"} aria-controls="inspector-content" tabIndex={inspector === "context" ? 0 : -1} onClick={() => setInspector("context")}><TreeStructure />Context</button></nav><Button variant="ghost" size="icon-xs" onClick={closeInspector} aria-label="Close inspector"><X /></Button></header><div className="inspector-body" id="inspector-content" role="tabpanel" aria-labelledby={`inspector-tab-${inspector}`}>{inspector === "changes" && <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />}{inspector === "terminal" && <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} sendRuntime={sendRuntime} onError={handleError} />}{inspector === "context" && <ContextPane worktree={worktree} settings={settings} onError={handleError} />}</div></aside>}
+        {inspector && <aside className="inspector" id="workspace-inspector" aria-label="Workspace inspector" tabIndex={-1} ref={inspectorRef}><header><nav role="tablist" aria-label="Inspector panels" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', setInspector)}><button id="inspector-tab-changes" data-tab-id="changes" role="tab" className={inspector === "changes" ? "is-active" : ""} aria-selected={inspector === "changes"} aria-controls="inspector-content" tabIndex={inspector === "changes" ? 0 : -1} onClick={() => setInspector("changes")}><GitDiff />Changes</button><button id="inspector-tab-terminal" data-tab-id="terminal" role="tab" className={inspector === "terminal" ? "is-active" : ""} aria-selected={inspector === "terminal"} aria-controls="inspector-content" tabIndex={inspector === "terminal" ? 0 : -1} onClick={() => setInspector("terminal")}><TerminalWindow />Terminal</button><button id="inspector-tab-context" data-tab-id="context" role="tab" className={inspector === "context" ? "is-active" : ""} aria-selected={inspector === "context"} aria-controls="inspector-content" tabIndex={inspector === "context" ? 0 : -1} onClick={() => setInspector("context")}><TreeStructure />Context</button></nav><Button variant="ghost" size="icon-xs" onClick={closeInspector} aria-label="Close inspector"><X /></Button></header><div className="inspector-body" id="inspector-content" role="tabpanel" aria-labelledby={`inspector-tab-${inspector}`}>{inspector === "changes" && <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />}{inspector === "terminal" && <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} unverifiedTerminalIds={unverifiedTerminalIds} sendRuntime={sendRuntime} onError={handleError} />}{inspector === "context" && <ContextPane worktree={worktree} settings={settings} onError={handleError} />}</div></aside>}
       </div>
     </main>
 

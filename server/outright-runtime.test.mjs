@@ -3,6 +3,8 @@ import test from "node:test";
 import Database from "better-sqlite3";
 import { PassThrough, Readable } from "node:stream";
 import { execFile, spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -2000,43 +2002,64 @@ test("malformed prelaunch outcomes remain recoverable and are removed after a de
   } finally { database.close(); }
 } }));
 
-test("unreadable outcome evidence is quarantined until it can be replayed", { skip: process.platform === "win32" }, withRuntime(async (runtime) => {
-  const conversation = runtime.database.listConversations()[0];
-  const runs = runtime.database.listRuns(conversation.id);
-  const sibling = runs.find((run) => run.prompt === "valid sibling");
-  assert.equal(sibling.status, "completed", "a read fault is isolated to its run");
-  assert.equal(runtime.database.listAudit(100).filter((entry) => entry.action === "agent.run.outcome.invalid").length, 0);
-  for (const status of ["queued", "launching", "running"]) {
-    const blocked = runs.find((run) => run.prompt === `unreadable ${status}`);
-    assert.equal(blocked.recoveryClass, `outcome-unreadable-${status}`);
-    const marker = path.join(runtime.database.launchDirectory, `${blocked.id}.outcome.json`);
-    const unavailable = responseCapture();
-    await runtime.handleRequest(requestStream("POST", `/api/runs/${blocked.id}/resume`, { policy: "discard" }), unavailable);
-    assert.equal(unavailable.statusCode, 503);
-    assert.equal(runtime.database.getRun(blocked.id).recoveryDecision, null);
-    chmodSync(marker, 0o600);
-    const replayed = responseCapture();
-    await runtime.handleRequest(requestStream("POST", `/api/runs/${blocked.id}/resume`, { policy: "discard" }), replayed);
-    assert.equal(replayed.statusCode, 200, JSON.stringify(replayed.body));
-    assert.equal(replayed.body.status, "completed", "valid fsynced outcome wins over a discard request");
-    assert.equal(existsSync(marker), false);
-    assert.equal(runtime.database.listAudit(100).filter((entry) => entry.action === "agent.run.completed" && entry.target === blocked.id).length, 1);
-  }
-}, { seed(dataDirectory) {
-  const database = createOutrightDatabase({ filename: path.join(dataDirectory, "outright.db") });
-  try {
-    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/recovery-tree", title: "Recovery", provider: "codex" });
-    const sibling = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "valid sibling" });
-    const outcome = { status: "completed", finishedAt: new Date().toISOString(), exitCode: 0, message: "" };
-    database.savePendingRunOutcome(sibling.id, outcome);
-    for (const status of ["queued", "launching", "running"]) {
-      const blocked = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: `unreadable ${status}` });
-      if (status !== "queued") database.updateRun(blocked.id, status === "running" ? { status, pid: 424242 } : { status });
-      database.savePendingRunOutcome(blocked.id, outcome);
-      chmodSync(path.join(database.launchDirectory, `${blocked.id}.outcome.json`), 0o000);
+test("unreadable outcome evidence is quarantined until it can be replayed", async () => {
+  const unreadable = new Set();
+  const faulted = new Set();
+  const originalRead = fs.readFileSync;
+  fs.readFileSync = (filename, ...args) => {
+    if (unreadable.has(String(filename))) {
+      faulted.add(String(filename));
+      const error = new Error("injected outcome read failure");
+      error.code = "EIO";
+      throw error;
     }
-  } finally { database.close(); }
-} }));
+    return originalRead(filename, ...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    await withRuntime(async (runtime) => {
+      const conversation = runtime.database.listConversations()[0];
+      const runs = runtime.database.listRuns(conversation.id);
+      const sibling = runs.find((run) => run.prompt === "valid sibling");
+      assert.equal(sibling.status, "completed", "a read fault is isolated to its run");
+      assert.equal(runtime.database.listAudit(100).filter((entry) => entry.action === "agent.run.outcome.invalid").length, 0);
+      for (const status of ["queued", "launching", "running"]) {
+        const blocked = runs.find((run) => run.prompt === `unreadable ${status}`);
+        assert.equal(blocked.recoveryClass, `outcome-unreadable-${status}`);
+        const marker = path.join(runtime.database.launchDirectory, `${blocked.id}.outcome.json`);
+        assert.equal(faulted.has(marker), true, `${status} startup did not exercise the read fault`);
+        const unavailable = responseCapture();
+        await runtime.handleRequest(requestStream("POST", `/api/runs/${blocked.id}/resume`, { policy: "discard" }), unavailable);
+        assert.equal(unavailable.statusCode, 503);
+        assert.equal(runtime.database.getRun(blocked.id).recoveryDecision, null);
+        unreadable.delete(marker);
+        const replayed = responseCapture();
+        await runtime.handleRequest(requestStream("POST", `/api/runs/${blocked.id}/resume`, { policy: "discard" }), replayed);
+        assert.equal(replayed.statusCode, 200, JSON.stringify(replayed.body));
+        assert.equal(replayed.body.status, "completed", "valid fsynced outcome wins over a discard request");
+        assert.equal(existsSync(marker), false);
+        assert.equal(runtime.database.listAudit(100).filter((entry) => entry.action === "agent.run.completed" && entry.target === blocked.id).length, 1);
+      }
+    }, { seed(dataDirectory) {
+      const database = createOutrightDatabase({ filename: path.join(dataDirectory, "outright.db") });
+      try {
+        const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/recovery-tree", title: "Recovery", provider: "codex" });
+        const sibling = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "valid sibling" });
+        const outcome = { status: "completed", finishedAt: new Date().toISOString(), exitCode: 0, message: "" };
+        database.savePendingRunOutcome(sibling.id, outcome);
+        for (const status of ["queued", "launching", "running"]) {
+          const blocked = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: `unreadable ${status}` });
+          if (status !== "queued") database.updateRun(blocked.id, status === "running" ? { status, pid: 424242 } : { status });
+          database.savePendingRunOutcome(blocked.id, outcome);
+          unreadable.add(path.join(database.launchDirectory, `${blocked.id}.outcome.json`));
+        }
+      } finally { database.close(); }
+    } })();
+  } finally {
+    fs.readFileSync = originalRead;
+    syncBuiltinESMExports();
+  }
+});
 
 // Regression: the discard branch did not check the conditional update result,
 // so the loser of a concurrent decision race returned HTTP 200 with a null

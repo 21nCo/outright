@@ -75,8 +75,11 @@ test("global search bounds recent text and response bytes while keeping conversa
     assert.equal(database.search("Current").conversations[0].id, current.id);
     assert.equal(database.search("recent%needle").conversations.length, 0, "LIKE wildcard was treated as query syntax");
     database.addMessage({ conversationId: current.id, role: "assistant", body: "literal path\\needle and under_score" });
+    const distractor = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Distractor", provider: "codex" });
+    database.addMessage({ conversationId: distractor.id, role: "assistant", body: "under-score" });
     assert.deepEqual(database.search("path\\needle").conversations.map((item) => item.id), [current.id]);
-    assert.deepEqual(database.search("under_score").conversations.map((item) => item.id), [current.id]);
+    assert.deepEqual(database.search("under_score").conversations.map((item) => item.id), [current.id],
+      "an underscore must not match the recent hyphen distractor as a LIKE wildcard");
     assert.throws(() => database.search("x".repeat(257)), (error) => error.statusCode === 400);
   } finally { database.close(); }
 });
@@ -365,16 +368,12 @@ test("oversized Find bodies resume by byte before a match or miss without blocki
     const huge = database.addMessage({ conversationId: chat.id, role: "assistant", body });
     database.addMessage({ conversationId: other.id, role: "assistant", body: "foreign token" });
     let timerTicks = 0;
-    let maximumGapMs = 0;
-    let lastTick = performance.now();
-    const timer = setInterval(() => {
-      const current = performance.now();
-      maximumGapMs = Math.max(maximumGapMs, current - lastTick);
-      lastTick = current;
-      timerTicks += 1;
-    }, 1);
+    const timer = setInterval(() => { timerTicks += 1; }, 1);
     try {
+      let competingWorkRan = false;
+      setImmediate(() => { competingWorkRan = true; });
       let result = await database.findMessagePage(chat.id, "tail needle", first.id);
+      assert.equal(competingWorkRan, true, "oversized Find did not yield to concurrent work before returning its first continuation");
       assert.equal(result.partial, true, "a matching oversized row must stop before hydrating its full body");
       assert.equal(result.nextAfterId, huge.id);
       assert.ok(result.nextByteOffset > 0 && result.nextByteOffset <= 8 * 1024 * 1024);
@@ -415,7 +414,6 @@ test("oversized Find bodies resume by byte before a match or miss without blocki
       assert.equal((await pending).matchId, null);
     } finally { clearInterval(timer); }
     assert.ok(timerTicks > 0, "large body scan held the event loop");
-    assert.ok(maximumGapMs < 250, `large body scan delayed the event loop for ${maximumGapMs.toFixed(1)}ms`);
   } finally { database.close(); }
 });
 

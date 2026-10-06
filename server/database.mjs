@@ -1530,7 +1530,7 @@ export function createOutrightDatabase(options = {}) {
     },
     retryUnreadableRunOutcome(id) {
       const run = this.getRun(id);
-      if (!run || run.status !== "interrupted" || run.recoveryDecision
+      if (run?.status !== "interrupted" || run.recoveryDecision
         || !run.recoveryClass?.startsWith("outcome-unreadable-")) return null;
       let outcome;
       let invalid = false;
@@ -1961,7 +1961,8 @@ export function createOutrightDatabase(options = {}) {
         throw databaseError(400, `Search query must contain 1 to ${SEARCH_QUERY_BYTES} UTF-8 bytes`);
       }
       const boundedLimit = Math.max(1, Math.min(40, Number.isInteger(limit) ? limit : 40));
-      const needle = `%${query.trim().replace(/[\\%_]/g, String.raw`\$&`)}%`;
+      const escapedQuery = query.trim().replace(/[\\%_]/g, (character) => `\\${character}`);
+      const needle = `%${escapedQuery}%`;
       // The palette only consumes conversation identities. Scan a fixed recent
       // window and skip oversized bodies before LIKE can materialize them.
       // Conversation Find remains available for the complete retained text.

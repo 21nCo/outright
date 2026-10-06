@@ -95,7 +95,7 @@ test("a slow broker reader backpressures sustained PTY output without losing its
 
     socket.write(`${JSON.stringify({ type: "write", data: 'console.log("OUTRIGHT_"+"LATER")\r' })}\n`);
     await until(() => received.includes("OUTRIGHT_LATER"), "shell did not accept later input");
-    socket.write(`${JSON.stringify({ type: "write", data: ".exit\r" })}\n`);
+    socket.write(`${JSON.stringify({ type: "write", data: "process.exit(0)\r" })}\n`);
     await until(() => received.includes("shell-exited"), "shell exit was not delivered");
     const exitDeadline = Date.now() + 5000;
     while (!brokerExited && Date.now() < exitDeadline) await new Promise((resolve) => setTimeout(resolve, 25));

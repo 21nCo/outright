@@ -285,7 +285,7 @@ function capacityStatusAnnouncement(capacity) {
   else if (!terminal || !validCount(terminal.active) || !validCount(terminal.limit) || !validCount(terminal.unknown)) {
     messages.push("Terminal capacity is unknown.");
   } else {
-    if (terminal.unknown) messages.push(`${terminal.unknown} terminal ownership ${terminal.unknown === 1 ? "record is" : "records are"} unverified. New terminals may be paused.`);
+    if (terminal.unknown) messages.push("Terminal ownership is unverified. New terminals may be paused.");
     if (atLimit(terminal.active, terminal.limit)) messages.push("Terminal capacity is full. Close a terminal before opening another.");
   }
   const utility = capacity.utilityProcesses;
@@ -298,17 +298,14 @@ function capacityStatusAnnouncement(capacity) {
   if (!validCount(activeProcesses) || !validCount(capacity.limits.maxConcurrentRuns)) messages.push("Concurrent run capacity is unknown.");
   else if (atLimit(activeProcesses, capacity.limits.maxConcurrentRuns)) messages.push(queueFull
     ? "Concurrent run slots are full." : "Concurrent run slots are full. New runs will queue.");
-  if (validCount(capacity.pendingRunOutcomes) && capacity.pendingRunOutcomes) messages.push(`${capacity.pendingRunOutcomes} exited ${capacity.pendingRunOutcomes === 1 ? "run awaits" : "runs await"} storage recovery before its outcome can be saved.`);
+  if (validCount(capacity.pendingRunOutcomes) && capacity.pendingRunOutcomes) messages.push("Exited runs await storage recovery before their outcomes can be saved.");
   if (validCount(activeProcesses) && validCount(capacity.pendingRunOutcomes)
     && validCount(capacity.limits.maxPendingRunOutcomes)
     && activeProcesses + capacity.pendingRunOutcomes >= capacity.limits.maxPendingRunOutcomes) {
     messages.push("Run starts are paused until an active run or pending outcome releases recovery capacity.");
   }
   if (!validCount(capacity.recoverable)) messages.push("Run recovery capacity is unknown.");
-  else if (capacity.recoverable) {
-    const subject = capacity.recoverable === 1 ? "One run is" : `${capacity.recoverable} runs are`;
-    messages.push(`${subject} awaiting recovery.`);
-  }
+  else if (capacity.recoverable) messages.push("Runs are awaiting recovery.");
   if (capacity.maintenanceError) messages.push("Archived storage recovery needs a restart. New work is paused.");
   else if (capacity.migrationStatus === "maintenance") messages.push("Archived storage cleanup is in progress. New work is paused.");
   else if (capacity.migrationStatus === "migrating") messages.push("Retained history migration is in progress. New work is paused.");

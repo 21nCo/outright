@@ -8,6 +8,8 @@ import { domId, nextTabIndex } from "@/lib/accessibility";
 import { pruneExitedIds } from "@/lib/terminal-exit-state";
 import { api } from "@/lib/runtime-api";
 
+const EMPTY_UNVERIFIED_IDS = new Set();
+
 export function TerminalPane(props) {
   return <WorktreeTerminalPane key={JSON.stringify([props.worktree.id, props.worktree.path])} {...props} />;
 }
@@ -18,7 +20,7 @@ function terminalTabLabel(terminal) {
   return terminal.name;
 }
 
-function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) {
+function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = EMPTY_UNVERIFIED_IDS, sendRuntime, onError }) {
   const hostRef = useRef(null);
   const xtermRef = useRef(null);
   const fitSelectedRef = useRef(null);
@@ -37,6 +39,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   const queuedReconnectRef = useRef(null);
   const focusRequestRef = useRef(null);
   const terminalsRef = useRef([]);
+  const unverifiedTerminalIdsRef = useRef(unverifiedTerminalIds);
+  unverifiedTerminalIdsRef.current = unverifiedTerminalIds;
   const worktreeNameRef = useRef(worktree.name);
   const onErrorRef = useRef(onError);
   worktreeNameRef.current = worktree.name;
@@ -68,6 +72,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
         if (!dimensions) return;
         fit.fit();
         if (!loadingRef.current && activeIdRef.current && !exitedIdsRef.current.has(activeIdRef.current)
+          && !unverifiedTerminalIdsRef.current.has(activeIdRef.current)
           && terminalsRef.current.find((item) => item.id === activeIdRef.current)?.status === "running"
           && (inputReadyRef.current || awaitingVisibleFitRef.current)) {
           sendRuntime({ type: "terminal.resize", terminalId: activeIdRef.current, cols: xterm.cols, rows: xterm.rows });
@@ -81,7 +86,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     resize.observe(hostRef.current);
     document.addEventListener("visibilitychange", resizeTerminal);
     const disposable = xterm.onData((data) => {
-      if (inputReadyRef.current && !loadingRef.current && activeIdRef.current) sendRuntime({ type: "terminal.input", terminalId: activeIdRef.current, data });
+      if (inputReadyRef.current && !loadingRef.current && activeIdRef.current
+        && !unverifiedTerminalIdsRef.current.has(activeIdRef.current)) sendRuntime({ type: "terminal.input", terminalId: activeIdRef.current, data });
     });
     return () => { disposable.dispose(); document.removeEventListener("visibilitychange", resizeTerminal); resize.disconnect(); fitSelectedRef.current = null; xterm.dispose(); xtermRef.current = null; };
   }, [sendRuntime]);
@@ -92,6 +98,21 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   useLayoutEffect(() => {
     if (!loading && activeId) fitSelectedRef.current?.();
   }, [activeId, loading]);
+
+  // The socket callback has already fenced sends. Commit a durable warning
+  // even when a later output or capacity event replaced runtimeEvent.
+  useLayoutEffect(() => {
+    const pending = pendingOutputRef.current;
+    if (pending && unverifiedTerminalIds.has(pending.id)) pending.unknown = true;
+    if (!terminalsRef.current.some((item) => unverifiedTerminalIds.has(item.id) && item.status !== "unknown")) return;
+    stageTerminals(terminalsRef.current.map((item) => unverifiedTerminalIds.has(item.id)
+      ? { ...item, status: "unknown" } : item));
+    if (unverifiedTerminalIds.has(activeIdRef.current)) {
+      inputReadyRef.current = false;
+      awaitingVisibleFitRef.current = false;
+      setExitNotice("Terminal ownership is unverified. Inspect local terminal recovery.");
+    }
+  }, [unverifiedTerminalIds]);
 
   useLayoutEffect(() => {
     const request = focusRequestRef.current;
@@ -124,9 +145,11 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   }
 
   function stageTerminals(next) {
-    terminalsRef.current = next;
-    pruneExitedIds(exitedIdsRef.current, next, pendingOutputRef.current);
-    if (activeIdRef.current && !next.some((item) => item.id === activeIdRef.current)) {
+    const guarded = next.map((item) => unverifiedTerminalIdsRef.current.has(item.id)
+      ? { ...item, status: "unknown" } : item);
+    terminalsRef.current = guarded;
+    pruneExitedIds(exitedIdsRef.current, guarded, pendingOutputRef.current);
+    if (activeIdRef.current && !guarded.some((item) => item.id === activeIdRef.current)) {
       activeIdRef.current = "";
       displayedCursorRef.current = 0;
       inputReadyRef.current = false;
@@ -134,7 +157,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       xtermRef.current?.reset();
       setActiveId("");
     }
-    setTerminals(next);
+    setTerminals(guarded);
   }
 
   function recoverSelection(restoreInput = false, restoreFit = false) {
@@ -147,7 +170,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       xtermRef.current?.reset();
       setActiveId(activeIdRef.current);
     } else if (selected) {
-      const running = !exitedIdsRef.current.has(selected.id) && selected.status === "running";
+      const running = !exitedIdsRef.current.has(selected.id) && !unverifiedTerminalIdsRef.current.has(selected.id)
+        && selected.status === "running";
       inputReadyRef.current = restoreInput && running;
       awaitingVisibleFitRef.current = restoreFit && running;
     }
@@ -169,7 +193,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       });
       if (token !== reconcileTokenRef.current) return;
       if (pending.overflow) throw new Error("Terminal output exceeded the activation buffer; retry the tab");
-      const status = pending.unknown ? "unknown" : detail.status ?? terminal.status;
+      const status = pending.unknown || unverifiedTerminalIdsRef.current.has(terminal.id)
+        ? "unknown" : detail.status ?? terminal.status;
       const xterm = xtermRef.current;
       xterm?.reset();
       if (detail.buffer) xterm?.write(detail.buffer);
@@ -178,7 +203,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
         if (!Number.isSafeInteger(detail.outputCursor) || !Number.isSafeInteger(cursor) || cursor > detail.outputCursor) xterm?.write(data);
         if (Number.isSafeInteger(cursor)) displayedCursor = Math.max(displayedCursor, cursor);
       }
-      const exited = pending.exit || (status === "exited" ? { exitCode: detail.exitCode } : null);
+      const exited = status === "unknown" ? null
+        : pending.exit || (status === "exited" ? { exitCode: detail.exitCode } : null);
       if (exited) {
         exitedIdsRef.current.add(terminal.id);
         xterm?.writeln(`\r\n\x1b[90m[process exited ${exited.exitCode ?? "unknown"}]\x1b[0m`);
@@ -243,7 +269,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     if (runtimeEvent?.type === "terminal.exit") {
       const pending = pendingOutputRef.current;
       if (pending?.id === runtimeEvent.terminalId) pending.exit = runtimeEvent.payload;
-      if (terminalsRef.current.some((item) => item.id === runtimeEvent.terminalId)) {
+      if (!unverifiedTerminalIdsRef.current.has(runtimeEvent.terminalId)
+        && terminalsRef.current.some((item) => item.id === runtimeEvent.terminalId)) {
         const firstExit = !exitedIdsRef.current.has(runtimeEvent.terminalId);
         exitedIdsRef.current.add(runtimeEvent.terminalId);
         stageTerminals(terminalsRef.current.map((item) => item.id === runtimeEvent.terminalId
