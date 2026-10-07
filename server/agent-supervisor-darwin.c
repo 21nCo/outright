@@ -24,15 +24,75 @@ static int utility_prelaunch_exit(int code) {
   return code;
 }
 
+// launchd control and recovery must use the same OS-owned private directory.
+// Caller supplied TMPDIR is untrusted and can point at a public replacement.
+static bool private_temporary_root(char *root, size_t capacity) {
+  size_t needed = confstr(_CS_DARWIN_USER_TEMP_DIR, root, capacity);
+  if (needed == 0 || needed > capacity) return false;
+  char resolved[4096];
+  if (realpath(root, resolved) == NULL || strlen(resolved) >= capacity) return false;
+  struct stat info;
+  if (stat(resolved, &info) != 0 || !S_ISDIR(info.st_mode)
+      || info.st_uid != getuid() || (info.st_mode & 077) != 0) return false;
+  strcpy(root, resolved);
+  return true;
+}
+
+static bool coalition_marker_path(const char *label, char *filename, size_t capacity) {
+  char root[4096];
+  if (!private_temporary_root(root, sizeof(root))) return false;
+  return snprintf(filename, capacity, "%s/outright-env-%s/coalition", root, label) < (int)capacity;
+}
+
+static bool write_coalition_marker(const char *label, uint64_t coalition_id) {
+  if (coalition_id == 0) return false;
+  char filename[4096];
+  if (!coalition_marker_path(label, filename, sizeof(filename))) return false;
+  int descriptor = open(filename, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  if (descriptor < 0) return errno == EEXIST;
+  char value[32];
+  int length = snprintf(value, sizeof(value), "%llu\n", (unsigned long long)coalition_id);
+  bool written = length > 0 && length < (int)sizeof(value)
+    && write(descriptor, value, (size_t)length) == length && fsync(descriptor) == 0;
+  if (close(descriptor) != 0) written = false;
+  if (!written) unlink(filename);
+  return written;
+}
+
+// -1: no invocation directory; 0: directory exists without durable identity.
+static long long read_coalition_marker(const char *label) {
+  char filename[4096];
+  if (!coalition_marker_path(label, filename, sizeof(filename))) return 0;
+  int descriptor = open(filename, O_RDONLY | O_NOFOLLOW);
+  if (descriptor < 0) {
+    if (errno != ENOENT) return 0;
+    char *slash = strrchr(filename, '/');
+    if (slash == NULL) return 0;
+    *slash = '\0';
+    struct stat info;
+    return lstat(filename, &info) == 0 ? 0 : (errno == ENOENT ? -1 : 0);
+  }
+  struct stat info;
+  char value[32] = {0};
+  ssize_t length = read(descriptor, value, sizeof(value) - 1);
+  bool trusted = fstat(descriptor, &info) == 0 && S_ISREG(info.st_mode)
+    && info.st_uid == getuid() && info.st_nlink == 1 && (info.st_mode & 077) == 0;
+  close(descriptor);
+  if (length <= 1 || !trusted) return 0;
+  char *end = NULL;
+  unsigned long long id = strtoull(value, &end, 10);
+  return id > 0 && end == value + length - 1 && *end == '\n' ? (long long)id : 0;
+}
+
 // launchctl submit starts a service with launchd's environment, not the
 // caller's. Transfer the caller's bounded environment through a private file
 // that the submitted helper unlinks before executing the command. Arguments
 // and process listings never contain credential values.
 static bool write_launch_environment(const char *label, char *directory, size_t directory_size,
   char *filename, size_t filename_size) {
-  const char *root = getenv("TMPDIR");
-  if (root == NULL || root[0] != '/') root = "/tmp";
-  if (snprintf(directory, directory_size, "%s/outright-env-%s", root, label) >= (int)directory_size
+  char resolved_root[4096];
+  if (!private_temporary_root(resolved_root, sizeof(resolved_root))) return false;
+  if (snprintf(directory, directory_size, "%s/outright-env-%s", resolved_root, label) >= (int)directory_size
       || mkdir(directory, 0700) != 0) return false;
   if (snprintf(filename, filename_size, "%s/environment", directory) >= (int)filename_size) {
     rmdir(directory);
@@ -42,6 +102,7 @@ static bool write_launch_environment(const char *label, char *directory, size_t 
   bool complete = descriptor >= 0;
   size_t total = 0;
   for (char **entry = environ; complete && *entry != NULL; entry++) {
+    if (strncmp(*entry, "OUTRIGHT_UTILITY_OWNER=", 23) == 0) continue;
     size_t length = strlen(*entry) + 1;
     if (length > MAX_LAUNCH_ENVIRONMENT - total) { complete = false; break; }
     total += length;
@@ -60,6 +121,55 @@ static bool write_launch_environment(const char *label, char *directory, size_t 
   }
   if (!complete) { unlink(filename); rmdir(directory); }
   return complete;
+}
+
+// Recovery removes only this invocation's private entry after launchd has
+// been verified absent. Directory descriptors keep replacement of a pathname
+// under the public temporary root from redirecting cleanup elsewhere.
+static bool cleanup_launch_environment(const char *label) {
+  char resolved_root[4096];
+  if (!private_temporary_root(resolved_root, sizeof(resolved_root))) return false;
+  int root_fd = open(resolved_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  if (root_fd < 0) return false;
+  char name[160];
+  if (snprintf(name, sizeof(name), "outright-env-%s", label) >= (int)sizeof(name)) {
+    close(root_fd);
+    return false;
+  }
+  int directory_fd = openat(root_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  if (directory_fd < 0) {
+    bool missing = errno == ENOENT;
+    close(root_fd);
+    return missing;
+  }
+  struct stat directory_info;
+  bool safe = fstat(directory_fd, &directory_info) == 0 && S_ISDIR(directory_info.st_mode)
+    && directory_info.st_uid == getuid() && (directory_info.st_mode & 077) == 0;
+  if (safe) {
+    int file_fd = openat(directory_fd, "environment", O_RDONLY | O_NOFOLLOW);
+    if (file_fd >= 0) {
+      struct stat file_info;
+      safe = fstat(file_fd, &file_info) == 0 && S_ISREG(file_info.st_mode)
+        && file_info.st_uid == getuid() && file_info.st_nlink == 1
+        && (file_info.st_mode & 077) == 0;
+      close(file_fd);
+      if (safe && unlinkat(directory_fd, "environment", 0) != 0) safe = false;
+    } else if (errno != ENOENT) safe = false;
+  }
+  if (safe) {
+    int coalition_fd = openat(directory_fd, "coalition", O_RDONLY | O_NOFOLLOW);
+    if (coalition_fd >= 0) {
+      struct stat coalition_info;
+      safe = fstat(coalition_fd, &coalition_info) == 0 && S_ISREG(coalition_info.st_mode)
+        && coalition_info.st_uid == getuid() && coalition_info.st_nlink == 1;
+      close(coalition_fd);
+      if (safe && unlinkat(directory_fd, "coalition", 0) != 0) safe = false;
+    } else if (errno != ENOENT) safe = false;
+  }
+  close(directory_fd);
+  if (safe && unlinkat(root_fd, name, AT_REMOVEDIR) != 0 && errno != ENOENT) safe = false;
+  close(root_fd);
+  return safe;
 }
 
 static int exec_with_launch_environment(int argc, char **argv) {
@@ -98,13 +208,9 @@ static int exec_with_launch_environment(int argc, char **argv) {
     environment[count++] = data + offset;
     offset += entry_length + 1;
   }
+  // Keep the private directory until the owner proves the coalition empty.
+  // Recovery needs the durable coalition marker after a supervisor crash.
   unlink(argv[2]);
-  char *parent = strdup(argv[2]);
-  if (parent != NULL) {
-    char *slash = strrchr(parent, '/');
-    if (slash != NULL) { *slash = '\0'; rmdir(parent); }
-    free(parent);
-  }
   if (chdir(argv[3]) != 0) return 71;
   environ = environment;
   execvp(argv[4], &argv[4]);
@@ -120,6 +226,18 @@ typedef int (*coalition_pid_list_fn)(uint64_t coalition_id, void *buffer, size_t
 
 static volatile sig_atomic_t stop_requested = 0;
 static void request_stop(int signal_number) { (void)signal_number; stop_requested = 1; }
+
+static bool utility_start_authorized(pid_t owner_pid) {
+  char command[3];
+  size_t used = 0;
+  while (used < sizeof(command) && !stop_requested) {
+    ssize_t count = read(STDIN_FILENO, command + used, sizeof(command) - used);
+    if (count < 0 && errno == EINTR) continue;
+    if (count <= 0) return false;
+    used += (size_t)count;
+  }
+  return !stop_requested && getppid() == owner_pid && memcmp(command, "go\n", sizeof(command)) == 0;
+}
 
 static bool launch_authorized(void) {
   const char *raw_fd = getenv("OUTRIGHT_LAUNCH_GATE_FD");
@@ -262,8 +380,8 @@ static void relay(int fd, int destination) {
 }
 
 static void bootout(const char *target) {
-  if (getenv("CI") != NULL) dprintf(STDERR_FILENO, "Outright launchd bootout: sender=%ld/%ld parent=%ld target=%s\n",
-    (long)getpid(), (long)getpgrp(), (long)getppid(), target);
+  if (getenv("CI") != NULL && getenv("OUTRIGHT_UTILITY_OWNER") != NULL)
+    dprintf(3, "__OUTRIGHT_UTILITY_DIAGNOSTIC_V1__ bootout target=%s\n", target);
   char *arguments[] = { "launchctl", "bootout", (char *)target, NULL };
   run_launchctl(arguments, NULL, 0);
 }
@@ -337,9 +455,9 @@ static bool terminate_coalition(const char *target, uint64_t coalition_id) {
     if (count == 0) return bootout_checked(target);
     for (int index = 0; index < count; index++) {
       if (pids[index] > 0 && pids[index] != getpid()) {
-        if (getenv("CI") != NULL && attempt == 0 && index < 12) dprintf(STDERR_FILENO, "Outright coalition signal: sender=%ld/%ld parent=%ld coalition=%llu members=%d target=%ld/%ld signal=SIGKILL\n",
-          (long)getpid(), (long)getpgrp(), (long)getppid(), (unsigned long long)coalition_id,
-          count, (long)pids[index], (long)getpgid(pids[index]));
+        if (getenv("CI") != NULL && getenv("OUTRIGHT_UTILITY_OWNER") != NULL && attempt == 0 && index < 12)
+          dprintf(3, "__OUTRIGHT_UTILITY_DIAGNOSTIC_V1__ coalition=%llu member=%ld signal=SIGKILL\n",
+            (unsigned long long)coalition_id, (long)pids[index]);
         kill(pids[index], SIGKILL);
       }
     }
@@ -360,10 +478,17 @@ static int control_existing_job(const char *mode, const char *label) {
   }
   service_result state_result = read_state(target, &state);
   if (state_result == SERVICE_MISSING) {
-    cleanup_output_pipes(label);
+    long long coalition_id = read_coalition_marker(label);
+    bool empty = coalition_id < 0;
+    if (coalition_id > 0) {
+      pid_t pids[1024];
+      empty = coalition_members((uint64_t)coalition_id, pids, sizeof(pids) / sizeof(pids[0])) == 0;
+    }
+    if (empty) cleanup_output_pipes(label);
+    bool cleaned = empty && cleanup_launch_environment(label);
     free(target);
-    dprintf(STDOUT_FILENO, "%s\n", strcmp(mode, "--probe") == 0 ? "absent" : "exited");
-    return strcmp(mode, "--probe") == 0 ? 3 : 0;
+    dprintf(STDOUT_FILENO, "%s\n", cleaned ? (strcmp(mode, "--probe") == 0 ? "absent" : "exited") : "unknown");
+    return cleaned ? (strcmp(mode, "--probe") == 0 ? 3 : 0) : 4;
   }
   if (state_result != SERVICE_OK || state.resource_coalition_id == 0) {
     if (strcmp(mode, "--terminate") == 0) bootout_checked(target);
@@ -386,7 +511,10 @@ static int control_existing_job(const char *mode, const char *label) {
   }
   if (strcmp(mode, "--terminate") == 0) {
     bool terminated = count == 0 ? bootout_checked(target) : terminate_coalition(target, state.resource_coalition_id);
-    if (terminated) cleanup_output_pipes(label);
+    if (terminated) {
+      cleanup_output_pipes(label);
+      terminated = cleanup_launch_environment(label);
+    }
     free(target);
     return terminated ? 0 : 5;
   }
@@ -443,6 +571,9 @@ int main(int argc, char **argv) {
   sigaction(SIGTERM, &action, NULL);
   sigaction(SIGINT, &action, NULL);
   signal(SIGPIPE, SIG_IGN);
+  pid_t owner_pid = getppid();
+  if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL && !utility_start_authorized(owner_pid))
+    return utility_prelaunch_exit(0);
 
   // launchd writes provider output into kernel-bounded FIFOs. The supervisor
   // relays them to its inherited pipes; if downstream stops reading, normal
@@ -510,7 +641,11 @@ int main(int argc, char **argv) {
     close(stdout_fd); close(stderr_fd); unlink(stdout_path); unlink(stderr_path);
     return utility_prelaunch_exit(73);
   }
-  pid_t owner_pid = getppid();
+  if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL && (stop_requested || getppid() != owner_pid)) {
+    unlink(environment_file); rmdir(environment_directory);
+    close(stdout_fd); close(stderr_fd); unlink(stdout_path); unlink(stderr_path); free(target); free(submit);
+    return utility_prelaunch_exit(0);
+  }
   int submitted = run_launchctl(submit, NULL, 0);
   free(submit);
   if (submitted != 0) {
@@ -555,7 +690,10 @@ int main(int argc, char **argv) {
       continue;
     }
     state_failures = 0;
-    if (state.resource_coalition_id != 0) coalition_id = state.resource_coalition_id;
+    if (state.resource_coalition_id != 0) {
+      coalition_id = state.resource_coalition_id;
+      write_coalition_marker(argv[1], coalition_id);
+    }
     if (state.runs >= 1 && state.active == 0) provider_exit_code = state.exit_code;
     if (stopping) {
       if (coalition_id != 0 && terminate_coalition(target, coalition_id)) {
@@ -600,10 +738,15 @@ int main(int argc, char **argv) {
   close(stderr_fd);
   unlink(stdout_path);
   unlink(stderr_path);
+  // A failed coalition inspection or bootout has no empty-tree proof. Keep
+  // its durable identity so a later missing-service probe cannot mistake an
+  // escaped descendant for a never-submitted invocation.
+  if (tree_empty_proven && !cleanup_launch_environment(argv[1])) {
+    tree_empty_proven = false;
+    result = 70;
+  }
   if (tree_empty_proven && getenv("OUTRIGHT_UTILITY_OWNER") != NULL)
     dprintf(3, "%s", UTILITY_TREE_EMPTY);
-  unlink(environment_file);
-  rmdir(environment_directory);
   free(target);
   return result;
 }

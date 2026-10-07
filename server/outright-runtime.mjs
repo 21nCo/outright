@@ -106,9 +106,15 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required");
     };
   } });
-  void terminals.reconcileUnknown().then((resolved) => {
-    if (resolved && !shuttingDown) publish({ type: "capacity.changed", payload: runtimeCapacity() });
-  }).catch(() => {});
+  function startOwnershipRecovery() {
+    const onRecovered = (resolved) => {
+      if (resolved && !shuttingDown) publish({ type: "capacity.changed", payload: runtimeCapacity() });
+    };
+    void terminals.reconcileUnknown().then(onRecovered).catch(() => {});
+    const utilityRecovery = subprocesses.reconcileUnknown?.();
+    if (utilityRecovery) void Promise.resolve(utilityRecovery).then(onRecovered).catch(() => {});
+  }
+  startOwnershipRecovery();
 
   // Validates that a project/worktree/path triple names exactly one discovered
   // worktree belonging to that project. Trust and execution then bind to the

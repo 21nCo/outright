@@ -402,6 +402,7 @@ static int authorize_provider(char **provider_argv, const char *handshake_path, 
     int null_input = open("/dev/null", O_RDONLY);
     if (null_input < 0 || dup2(null_input, STDIN_FILENO) < 0) _exit(126);
     if (null_input != STDIN_FILENO) close(null_input);
+    unsetenv("OUTRIGHT_UTILITY_OWNER");
     execvp(provider_argv[0], provider_argv);
     dprintf(STDERR_FILENO, "Unable to start provider: %s\n", strerror(errno));
     _exit(127);
@@ -515,8 +516,9 @@ int main(int argc, char **argv) {
     struct pollfd descriptor = { .fd = STDIN_FILENO, .events = POLLIN | POLLHUP };
     int poll_result = poll(&descriptor, 1, 25);
     if (poll_result < 0 && errno != EINTR) {
-      if (!authorized) unlink(handshake_path);
-      return 74;
+      if (!authorized) { unlink(handshake_path); return utility_prelaunch_exit(74); }
+      termination_requested = 1;
+      continue;
     }
     if (poll_result <= 0) continue;
     if (descriptor.revents & POLLIN) {
@@ -566,8 +568,10 @@ int main(int argc, char **argv) {
         memmove(input, line_start, remaining);
         input_length = remaining;
         if (input_length == sizeof(input) - 1) {
-          if (!authorized) unlink(handshake_path);
-          return 65;
+          if (!authorized) { unlink(handshake_path); return utility_prelaunch_exit(65); }
+          termination_requested = 1;
+          input_length = 0;
+          continue;
         }
       } else if (read_count == 0) {
         input_closed = true;

@@ -59,18 +59,7 @@ const server = net.createServer((socket) => {
       }
     }
   };
-  const flushOutput = () => {
-    if (socket.destroyed) return;
-    while (outputOffset < pendingOutput.length) {
-      let end = Math.min(pendingOutput.length, outputOffset + 8 * 1024);
-      if (end < pendingOutput.length && /[\uD800-\uDBFF]/.test(pendingOutput[end - 1])
-        && /[\uDC00-\uDFFF]/.test(pendingOutput[end])) end -= 1;
-      const frame = `${JSON.stringify({ type: "data", data: pendingOutput.slice(outputOffset, end) })}\n`;
-      outputOffset = end;
-      if (!socket.write(frame)) { pauseOutput(); return; }
-    }
-    pendingOutput = "";
-    outputOffset = 0;
+  const flushOutputTail = () => {
     if (omittedChars) {
       const count = omittedChars;
       omittedChars = 0;
@@ -91,6 +80,82 @@ const server = net.createServer((socket) => {
       if (process.platform !== "win32") terminal.resume();
     }
   };
+  const flushOutput = () => {
+    if (socket.destroyed) return;
+    while (outputOffset < pendingOutput.length) {
+      let end = Math.min(pendingOutput.length, outputOffset + 8 * 1024);
+      if (end < pendingOutput.length && /[\uD800-\uDBFF]/.test(pendingOutput[end - 1])
+        && /[\uDC00-\uDFFF]/.test(pendingOutput[end])) end -= 1;
+      const frame = `${JSON.stringify({ type: "data", data: pendingOutput.slice(outputOffset, end) })}\n`;
+      outputOffset = end;
+      if (!socket.write(frame)) { pauseOutput(); return; }
+    }
+    pendingOutput = "";
+    outputOffset = 0;
+    flushOutputTail();
+  };
+  const onTerminalData = (data) => {
+    if (socket.destroyed) return;
+    // Already queued output has priority; shed any excess at this boundary.
+    if (outputPaused || pendingOutput) {
+      omittedChars = Math.min(Number.MAX_SAFE_INTEGER, omittedChars + data.length);
+      return;
+    }
+    let end = Math.min(data.length, 64 * 1024);
+    if (end < data.length && /[\uD800-\uDBFF]/.test(data[end - 1])
+      && /[\uDC00-\uDFFF]/.test(data[end])) end -= 1;
+    pendingOutput = data.slice(0, end);
+    omittedChars = Math.min(Number.MAX_SAFE_INTEGER, omittedChars + data.length - end);
+    flushOutput();
+  };
+  const onTerminalExit = ({ exitCode, signal }) => {
+    const validCode = Number.isSafeInteger(exitCode) && exitCode >= 0;
+    const normalizedSignal = signal == null ? 0 : signal;
+    const validSignal = Number.isSafeInteger(normalizedSignal) && normalizedSignal >= 0;
+    let processCode = validCode ? exitCode : 1;
+    if (validSignal && normalizedSignal > 0) processCode = 128 + normalizedSignal;
+    shellResult = { exitCode: validCode || (validSignal && normalizedSignal > 0) ? processCode : null,
+      signal: validSignal ? normalizedSignal : null, processCode };
+    shellExited = true;
+    clearTimeout(nativeExitTimer);
+    clearTimeout(shedTimer);
+    // A silent peer cannot retain the final frame or broker indefinitely.
+    exitTimer = setTimeout(() => socket.destroy(), 5000);
+    exitTimer.unref();
+    flushOutput();
+    finishAfterNativeExit();
+  };
+  const startTerminal = (message) => {
+    if (message.type !== "start" || message.token !== token || typeof message.shell !== "string"
+      || typeof message.cwd !== "string" || !message.env || typeof message.env !== "object"
+      || !Number.isInteger(message.cols) || message.cols < 20 || message.cols > 400
+      || !Number.isInteger(message.rows) || message.rows < 5 || message.rows > 200) {
+      socket.destroy(); return;
+    }
+    authenticated = true;
+    try { terminal = pty.spawn(message.shell, [], { name: "xterm-256color", cols: message.cols,
+      rows: message.rows, cwd: message.cwd, env: message.env }); }
+    catch (error) {
+      socket.write(`${JSON.stringify({ type: "error", message: String(error.message ?? error).slice(0, 512) })}\n`);
+      socket.end();
+      server.close();
+      return;
+    }
+    socket.write(`${JSON.stringify({ type: "ready" })}\n`);
+    terminal.onData(onTerminalData);
+    terminal.onExit(onTerminalExit);
+  };
+  const handleMessage = (message) => {
+    if (!authenticated) { startTerminal(message); return; }
+    if (!shellExited && message.type === "write" && typeof message.data === "string"
+      && Buffer.byteLength(message.data) <= 64 * 1024) { terminal.write(message.data); return; }
+    if (!shellExited && message.type === "resize" && Number.isInteger(message.cols) && message.cols >= 20 && message.cols <= 400
+      && Number.isInteger(message.rows) && message.rows >= 5 && message.rows <= 200) {
+      terminal.resize(message.cols, message.rows);
+      return;
+    }
+    socket.destroy();
+  };
   socket.on("drain", flushOutput);
   socket.on("error", () => { socket.destroy(); });
   socket.on("data", (chunk) => {
@@ -105,72 +170,8 @@ const server = net.createServer((socket) => {
       let message;
       try { message = JSON.parse(line); } catch { socket.destroy(); return; }
       if (!message || typeof message !== "object" || Array.isArray(message)) { socket.destroy(); return; }
-      if (!authenticated) {
-        if (message.type !== "start" || message.token !== token || typeof message.shell !== "string"
-          || typeof message.cwd !== "string" || !message.env || typeof message.env !== "object"
-          || !Number.isInteger(message.cols) || message.cols < 20 || message.cols > 400
-          || !Number.isInteger(message.rows) || message.rows < 5 || message.rows > 200) {
-          socket.destroy(); return;
-        }
-        authenticated = true;
-        try {
-          terminal = pty.spawn(message.shell, [], { name: "xterm-256color", cols: message.cols,
-            rows: message.rows, cwd: message.cwd, env: message.env });
-        } catch (error) {
-          socket.write(`${JSON.stringify({ type: "error", message: String(error.message ?? error).slice(0, 512) })}\n`);
-          socket.end();
-          server.close();
-          return;
-        }
-        socket.write(`${JSON.stringify({ type: "ready" })}\n`);
-        terminal.onData((data) => {
-          if (socket.destroyed) return;
-          // node-pty normally supplies small reads. A larger callback or an
-          // already queued callback may shed output, but never grow a queue.
-          if (outputPaused || pendingOutput) {
-            omittedChars = Math.min(Number.MAX_SAFE_INTEGER, omittedChars + data.length);
-            return;
-          }
-          let end = Math.min(data.length, 64 * 1024);
-          if (end < data.length && /[\uD800-\uDBFF]/.test(data[end - 1])
-            && /[\uDC00-\uDFFF]/.test(data[end])) end -= 1;
-          pendingOutput = data.slice(0, end);
-          omittedChars = Math.min(Number.MAX_SAFE_INTEGER, omittedChars + data.length - end);
-          flushOutput();
-        });
-        terminal.onExit(({ exitCode, signal }) => {
-          // The broker is the supervisor's child. Its process status and the
-          // final frame must agree with the PTY rather than reporting a clean
-          // broker shutdown as a successful shell outcome.
-          const validCode = Number.isSafeInteger(exitCode) && exitCode >= 0;
-          // ConPTY reports an ordinary exit with signal:null; Unix node-pty
-          // uses zero. The wire format has one portable no-signal value.
-          const normalizedSignal = signal == null ? 0 : signal;
-          const validSignal = Number.isSafeInteger(normalizedSignal) && normalizedSignal >= 0;
-          let processCode = validCode ? exitCode : 1;
-          if (validSignal && normalizedSignal > 0) processCode = 128 + normalizedSignal;
-          shellResult = { exitCode: validCode || (validSignal && normalizedSignal > 0) ? processCode : null,
-            signal: validSignal ? normalizedSignal : null, processCode };
-          shellExited = true;
-          clearTimeout(nativeExitTimer);
-          clearTimeout(shedTimer);
-          // socket.end can itself wait forever for a silent peer. The owner
-          // has exited, so bound delivery of its final frames and release the
-          // broker even if the client never drains.
-          exitTimer = setTimeout(() => socket.destroy(), 5000);
-          exitTimer.unref();
-          // Exit may race a backpressured write. Queue the final frame now;
-          // a later drain continues it in order if the socket still cannot
-          // accept the frame. Waiting only for drain can strand a quiet peer.
-          flushOutput();
-          finishAfterNativeExit();
-        });
-      } else if (!shellExited && message.type === "write" && typeof message.data === "string"
-        && Buffer.byteLength(message.data) <= 64 * 1024) terminal.write(message.data);
-      else if (!shellExited && message.type === "resize" && Number.isInteger(message.cols) && message.cols >= 20 && message.cols <= 400
-        && Number.isInteger(message.rows) && message.rows >= 5 && message.rows <= 200)
-        terminal.resize(message.cols, message.rows);
-      else socket.destroy();
+      handleMessage(message);
+      if (socket.destroyed || socket.writableEnded || !terminal) return;
     }
   });
   socket.on("close", () => {

@@ -8,18 +8,21 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
   const safeGit = async (cwd, args, overrides = {}) => {
     try { return await git(cwd, args, overrides); }
     catch (error) {
-      if (utilityBudgetUnavailable(error) || mutationOutcomeUncertain(error)) throw error;
+      if (utilityBudgetUnavailable(error) || mutationOutcomeUncertain(error)) { throw error; }
       return "";
     }
   };
   const optionalGit = async (cwd, args) => {
     try { return await git(cwd, args); }
-    catch (error) { if (utilityBudgetUnavailable(error)) throw error; return ""; }
+    catch (error) {
+      if (utilityBudgetUnavailable(error)) { throw error; }
+      return "";
+    }
   };
   const gitOutputOnFailure = async (cwd, args) => {
     try { return await git(cwd, args, { maxBuffer: 12 * 1024 * 1024 }); }
     catch (error) {
-      if (utilityBudgetUnavailable(error) || mutationOutcomeUncertain(error)) throw error;
+      if (utilityBudgetUnavailable(error) || mutationOutcomeUncertain(error)) { throw error; }
       return (error.stdout ?? "").trimEnd();
     }
   };
@@ -32,6 +35,33 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
       if (error.code === 1) return true;
       throw error;
     }
+  };
+  const clearUnbornIndex = async (cwd, files, failure) => {
+    if (!await headIsUnborn(cwd)) throw failure;
+    await git(cwd, ["rm", "-f", "--cached", "--ignore-unmatch", "--", ...files]);
+  };
+  const recoverResetFailure = async (cwd, files, failure) => {
+    if (utilityBudgetUnavailable(failure)) throw failure;
+    // An unborn branch has no HEAD to reset against. Only then are all
+    // staged entries additions that can be removed without touching files.
+    if (!/ambiguous argument ['"]?HEAD|unknown revision.*HEAD|bad revision ['"]?HEAD|could not resolve ['"]?HEAD/i
+      .test(`${failure.message}\n${failure.stderr ?? ""}`)) throw failure;
+    await clearUnbornIndex(cwd, files, failure);
+  };
+  const recoverRestoreFailure = async (cwd, files, failure) => {
+    if (utilityBudgetUnavailable(failure)) throw failure;
+    const detail = `${failure.message}\n${failure.stderr ?? ""}`;
+    if (/could not resolve ['"]?HEAD['"]?/i.test(detail)) {
+      await clearUnbornIndex(cwd, files, failure);
+      return;
+    }
+    if (!/not a git command|unknown subcommand|unknown option/i.test(detail)) throw failure;
+    try { await git(cwd, ["reset", "HEAD", "--", ...files]); }
+    catch (resetFailure) { await recoverResetFailure(cwd, files, resetFailure); }
+  };
+  const unstagePaths = async (cwd, files) => {
+    try { await git(cwd, ["restore", "--staged", "--", ...files]); }
+    catch (failure) { await recoverRestoreFailure(cwd, files, failure); }
   };
   async function status(worktreePath) {
     const cwd = await requireWorktree(worktreePath);
@@ -80,32 +110,8 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
   async function unstage(worktreePath, files) {
     const cwd = await requireWorktree(worktreePath);
     const validated = await validateFiles(cwd, files);
-    await auditedMutation("git.unstage.requested", "git.unstage", { target: cwd, files: validated }, async () => {
-      try { await git(cwd, ["restore", "--staged", "--", ...validated]); }
-      catch (error) {
-        if (utilityBudgetUnavailable(error)) throw error;
-        // Current Git also needs HEAD as restore's default staged source.
-        // Before the first commit every index entry is an addition; remove
-        // only those entries and leave the working files in place.
-        if (/could not resolve ['"]?HEAD['"]?/i.test(`${error.message}\n${error.stderr ?? ""}`)) {
-          if (!await headIsUnborn(cwd)) throw error;
-          await git(cwd, ["rm", "-f", "--cached", "--ignore-unmatch", "--", ...validated]);
-          return;
-        }
-        // Older Git versions may lack restore. A failed restore for any other
-        // reason must not turn a tracked modification into a staged deletion.
-        if (!/not a git command|unknown subcommand|unknown option/i.test(`${error.message}\n${error.stderr ?? ""}`)) throw error;
-        try { await git(cwd, ["reset", "HEAD", "--", ...validated]); }
-        catch (resetError) {
-          if (utilityBudgetUnavailable(resetError)) throw resetError;
-          // An unborn branch has no HEAD to reset against. Its staged files
-          // are all additions, so removing only the index entries is safe.
-          if (!/ambiguous argument ['"]?HEAD|unknown revision.*HEAD|bad revision ['"]?HEAD|could not resolve ['"]?HEAD/i.test(`${resetError.message}\n${resetError.stderr ?? ""}`)) throw resetError;
-          if (!await headIsUnborn(cwd)) throw resetError;
-          await git(cwd, ["rm", "-f", "--cached", "--ignore-unmatch", "--", ...validated]);
-        }
-      }
-    });
+    await auditedMutation("git.unstage.requested", "git.unstage", { target: cwd, files: validated },
+      () => unstagePaths(cwd, validated));
     return statusAfterMutation(cwd);
   }
 

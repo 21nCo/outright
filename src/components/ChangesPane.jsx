@@ -54,6 +54,20 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
     }
   }, [worktree.path, onError]);
 
+  const applyStatusSelection = useCallback(async (next) => {
+    const selection = selectionRef.current;
+    const current = next.files.find((file) => file.path === selection.file);
+    const nextFile = current?.path ?? next.files[0]?.path ?? "";
+    const entry = current ?? next.files[0];
+    const mode = hasStaged(entry) ? selection.mode : "unstaged";
+    if (nextFile !== selection.file || mode !== selection.mode) setDiff("");
+    selectionRef.current = { file: nextFile, mode };
+    setSelectedFile(nextFile);
+    setViewMode(mode);
+    if (!nextFile) { ++diffRequestRef.current; setDiff(""); return { kind: "ok" }; }
+    return loadDiff(nextFile, mode, false);
+  }, [loadDiff]);
+
   const refresh = useCallback(async (afterMutation = false) => {
     const owner = ownerRef.current;
     if (owner.path !== worktree.path) return { kind: "stale" };
@@ -63,20 +77,9 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
       const next = await api(query("/api/git/status", { path: worktree.path }));
       if (ownerRef.current !== owner || request !== statusRequestRef.current) return { kind: "stale" };
       setStatus(next);
-      const selection = selectionRef.current;
-      const current = next.files.find((file) => file.path === selection.file);
-      const nextFile = current?.path ?? next.files[0]?.path ?? "";
-      const entry = current ?? next.files[0];
-      const mode = hasStaged(entry) ? selection.mode : "unstaged";
-      if (nextFile !== selection.file || mode !== selection.mode) setDiff("");
-      selectionRef.current = { file: nextFile, mode };
-      setSelectedFile(nextFile);
-      setViewMode(mode);
-      if (nextFile) {
-        const diffResult = await loadDiff(nextFile, mode, false);
-        if (diffResult.kind === "stale") return diffResult;
-        if (diffResult.kind === "error") throw diffResult.error;
-      } else { ++diffRequestRef.current; setDiff(""); }
+      const diffResult = await applyStatusSelection(next);
+      if (diffResult.kind === "stale") return diffResult;
+      if (diffResult.kind === "error") throw diffResult.error;
       return { kind: "ok" };
     } catch (error) {
       if (ownerRef.current !== owner || request !== statusRequestRef.current) return { kind: "stale" };
@@ -85,7 +88,7 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
       return { kind: "error" };
     }
     finally { if (ownerRef.current === owner && request === statusRequestRef.current) setLoading(false); }
-  }, [worktree.path, loadDiff, onError]);
+  }, [worktree.path, applyStatusSelection, onError]);
 
   useLayoutEffect(() => { refreshRef.current = refresh; }, [refresh]);
   useEffect(() => { refreshRef.current(); }, [worktree.path]);

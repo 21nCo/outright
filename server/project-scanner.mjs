@@ -45,18 +45,23 @@ export async function scanProjects(config, subprocesses = utilityProcesses) {
     const candidates = await discoverGitDirectories(config);
     discoverSpan.end({ ok: true, labels: { candidates: String(candidates.length) } });
 
-    const repositories = new Map();
-    for (const candidate of candidates) {
+    // Native Git ownership setup has a measurable per-call cost. Resolve a
+    // bounded pair at a time, then deduplicate in discovery order so the
+    // first path still wins when multiple worktrees share one repository.
+    const resolvedCandidates = await mapWithConcurrency(candidates, 2, async (candidate) => {
       try {
         const commonDirectory = await git(candidate, ["rev-parse", "--git-common-dir"]);
         const commonPath = await canonicalPath(path.resolve(candidate, commonDirectory));
-        if (!repositories.has(commonPath)) {
-          repositories.set(commonPath, candidate);
-        }
+        return { commonPath, candidate };
       } catch (error) {
         if (utilityBudgetUnavailable(error)) throw error;
         // A stale or unsupported .git entry should not prevent the remaining projects from loading.
+        return null;
       }
+    });
+    const repositories = new Map();
+    for (const resolved of resolvedCandidates) {
+      if (resolved && !repositories.has(resolved.commonPath)) repositories.set(resolved.commonPath, resolved.candidate);
     }
 
     const repositoryEntries = [...repositories.entries()].slice(0, config.maxProjects);
@@ -146,9 +151,11 @@ async function readProject(candidate, commonPath, git, safeGit) {
 }
 
 async function readWorktree(record, isLinked, safeGit) {
-  const statusOutput = record.bare ? "" : await safeGit(record.path, ["status", "--porcelain=v1"]);
-  const changedFiles = parseStatus(statusOutput);
-  const divergence = record.bare ? null : await readDivergence(record.path, safeGit);
+  // Porcelain's branch header carries the same upstream counts as rev-list.
+  // One owned Git invocation per worktree keeps large default-root scans
+  // responsive without weakening native process ownership.
+  const statusOutput = record.bare ? "" : await safeGit(record.path, ["status", "--porcelain=v1", "--branch"]);
+  const { changedFiles, divergence } = parseStatus(statusOutput);
 
   return {
     id: slug(record.path),
@@ -165,12 +172,6 @@ async function readWorktree(record, isLinked, safeGit) {
     ahead: divergence?.ahead ?? 0,
     behind: divergence?.behind ?? 0,
   };
-}
-
-async function readDivergence(directory, safeGit) {
-  const output = await safeGit(directory, ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"]);
-  const [behind, ahead] = output.trim().split(/\s+/).map(Number);
-  return Number.isFinite(ahead) && Number.isFinite(behind) ? { ahead, behind } : null;
 }
 
 export function parseWorktreePorcelain(output) {
@@ -197,14 +198,16 @@ export function parseWorktreePorcelain(output) {
   return records;
 }
 
-function parseStatus(output) {
-  return output
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => ({
+export function parseStatus(output) {
+  const lines = output.split("\n").filter(Boolean);
+  const branch = lines[0]?.startsWith("## ") ? lines.shift() : "";
+  const counts = /\[([^\]]+)\]/.exec(branch)?.[1] ?? "";
+  const ahead = Number(/\bahead (\d+)\b/.exec(counts)?.[1] ?? 0);
+  const behind = Number(/\bbehind (\d+)\b/.exec(counts)?.[1] ?? 0);
+  return { divergence: { ahead, behind }, changedFiles: lines.map((line) => ({
       status: line.slice(0, 2).trim() || "M",
       path: line.slice(3).trim().replace(/^.* -> /, ""),
-    }));
+    })) };
 }
 
 async function runGit(subprocesses, directory, args) {

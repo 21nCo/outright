@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +36,81 @@ export function cleanupTerminalSocket(id) {
   catch (error) { if (error.code !== "ENOENT") throw error; }
 }
 
+function emptyProofPath(id, launchDirectory) {
+  if (typeof id !== "string" || !/^[0-9a-f-]{36}$/i.test(id)) throw new Error("Invalid terminal owner id");
+  const directory = lstatSync(launchDirectory);
+  if (!directory.isDirectory() || directory.isSymbolicLink()
+    || (process.platform !== "win32" && (directory.uid !== process.getuid() || (directory.mode & 0o077) !== 0))) {
+    throw new Error("Terminal proof directory is not private");
+  }
+  return path.join(launchDirectory, `terminal-${id}.empty`);
+}
+
+// A creation audit may fail after the native owner has been verified empty.
+// Keep that proof outside the unavailable SQLite writer so a successor can
+// settle the pending request without guessing from a missing created event.
+export function recordTerminalEmpty(id, launchDirectory) {
+  const filename = emptyProofPath(id, launchDirectory);
+  let descriptor;
+  try { descriptor = openSync(filename, "wx", 0o600); }
+  catch (error) {
+    if (error.code === "EEXIST" && hasTerminalEmpty(id, launchDirectory)) return;
+    throw error;
+  }
+  try {
+    writeFileSync(descriptor, `${id}\n`);
+    fsyncSync(descriptor);
+  } finally { closeSync(descriptor); }
+  if (process.platform !== "win32") {
+    const directory = openSync(launchDirectory, "r");
+    try { fsyncSync(directory); } finally { closeSync(directory); }
+  }
+}
+
+export function removeTerminalEmpty(id, launchDirectory) {
+  const filename = emptyProofPath(id, launchDirectory);
+  try { unlinkSync(filename); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+}
+
+function hasTerminalEmpty(id, launchDirectory) {
+  try {
+    const filename = emptyProofPath(id, launchDirectory);
+    const info = lstatSync(filename);
+    return info.isFile() && !info.isSymbolicLink() && info.nlink === 1 && info.size === id.length + 1
+      && (process.platform === "win32" || (info.uid === process.getuid() && (info.mode & 0o077) === 0))
+      && readFileSync(filename, "utf8") === `${id}\n`;
+  } catch { return false; }
+}
+
+async function probeDarwinTerminal(subprocesses, label) {
+  try { return (await subprocesses.run(AGENT_SUPERVISOR, ["--probe", label],
+    { encoding: "utf8", timeout: 1500, maxBuffer: 4096 })).stdout.trim(); }
+  catch (error) { return error.stdout?.trim() ?? "unknown"; }
+}
+
+async function verifyDarwinTerminalEmpty(subprocesses, label) {
+  const status = await probeDarwinTerminal(subprocesses, label);
+  if (status === "absent") return true;
+  if (status !== "exited") return false;
+  try { await subprocesses.run(AGENT_SUPERVISOR, ["--terminate", label],
+    { encoding: "utf8", timeout: 5000, maxBuffer: 4096 }); }
+  catch { return false; }
+  return await probeDarwinTerminal(subprocesses, label) === "absent";
+}
+
+async function verifyWindowsTerminalEmpty(subprocesses, childPid, processIdentity, signal, exitCode) {
+  if (signal != null || !Number.isInteger(exitCode)) return false;
+  if (exitCode < 70 || exitCode > 79) return true;
+  // Reserved native-startup codes can also be legitimate shell exits. In that
+  // case prove this exact owner has exited instead of guessing from the code.
+  if (!processIdentity) return false;
+  try { return (await subprocesses.run(AGENT_SUPERVISOR,
+    ["--probe", String(childPid), processIdentity],
+    { encoding: "utf8", timeout: 1500, maxBuffer: 4096 })).stdout.trim() === "absent"; }
+  catch (error) { return error.stdout?.trim() === "absent"; }
+}
+
 export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, rows, env,
   subprocesses = utilityProcesses }) {
   const brokerArgs = [process.execPath, BROKER, ownership.address, ownership.token];
@@ -65,38 +140,12 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
   const frameSettled = new Promise((resolve) => { settleFrame = resolve; });
   const socketSettled = new Promise((resolve) => { settleSocket = resolve; });
   let windowsProcessIdentity;
-  const verifyEmpty = async (signal, exitCode) => {
-    if (process.platform === "linux") return !existsSync(ownership.handshakePath);
-    if (process.platform === "darwin") {
-      let status;
-      try {
-        const probe = await subprocesses.run(AGENT_SUPERVISOR, ["--probe", ownership.label],
-          { encoding: "utf8", timeout: 1500, maxBuffer: 4096 });
-        status = probe.stdout.trim();
-      } catch (error) {
-        status = error.stdout?.trim();
-      }
-      if (status === "absent") return true;
-      if (status !== "exited") return false;
-      try { await subprocesses.run(AGENT_SUPERVISOR, ["--terminate", ownership.label],
-        { encoding: "utf8", timeout: 5000, maxBuffer: 4096 }); }
-      catch { return false; }
-      try { return (await subprocesses.run(AGENT_SUPERVISOR, ["--probe", ownership.label],
-        { encoding: "utf8", timeout: 1500, maxBuffer: 4096 })).stdout.trim() === "absent"; }
-      catch (error) { return error.stdout?.trim() === "absent"; }
-    }
-    if (process.platform !== "win32" || signal != null || !Number.isInteger(exitCode)) return false;
-    if (exitCode < 70 || exitCode > 79) return true;
-    // A shell may legitimately exit with a code reserved for native startup
-    // failures. Once launch identity was observed, prove this exact Job Object
-    // owner has exited instead of classifying the shell code as unknown.
-    if (!windowsProcessIdentity) return false;
-    try {
-      const probe = await subprocesses.run(AGENT_SUPERVISOR,
-        ["--probe", String(child.pid), windowsProcessIdentity],
-        { encoding: "utf8", timeout: 1500, maxBuffer: 4096 });
-      return probe.stdout.trim() === "absent";
-    } catch (error) { return error.stdout?.trim() === "absent"; }
+  const verifyEmpty = (signal, exitCode) => {
+    if (process.platform === "linux") return Promise.resolve(!existsSync(ownership.handshakePath));
+    if (process.platform === "darwin") return verifyDarwinTerminalEmpty(subprocesses, ownership.label);
+    if (process.platform === "win32") return verifyWindowsTerminalEmpty(subprocesses, child.pid,
+      windowsProcessIdentity, signal, exitCode);
+    return Promise.resolve(false);
   };
   const closeResult = new Promise((resolve) => {
     child.on("error", (error) => { stderr = `${stderr}${error.message}`.slice(-2048); });
@@ -147,6 +196,25 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
       if (!result.verified && !await verifyEmpty(result.signal, result.exitCode)) throw new Error("PTY owned process boundary could not be verified empty");
     },
   };
+  const handleBrokerMessage = (message, resolve, reject) => {
+    if (message.type === "ready") { readySeen = true; resolve(); return; }
+    if (message.type === "error") { reject(new Error(message.message)); return; }
+    if (message.type === "shell-exited") {
+      if (shellExited || !Number.isSafeInteger(message.exitCode) || message.exitCode < 0
+        || !Number.isSafeInteger(message.signal) || message.signal < 0) {
+        socket.destroy();
+        return;
+      }
+      shellExited = true;
+      shellResult = { exitCode: message.exitCode, signal: message.signal };
+      settleFrame();
+      return;
+    }
+    if (message.type === "data" && typeof message.data === "string") {
+      if (onData) onData(message.data);
+      else earlyData = `${earlyData}${message.data}`.slice(-150_000);
+    }
+  };
   try {
     if (process.platform === "linux") child.stdin.write("go\n");
     else if (process.platform === "darwin") child.stdio[3].end("go\n");
@@ -177,22 +245,7 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
           if (!message || typeof message !== "object" || Array.isArray(message)) {
             reject(new Error("PTY broker returned malformed data")); socket.destroy(); return;
           }
-          if (message.type === "ready") { readySeen = true; resolve(); }
-          else if (message.type === "error") reject(new Error(message.message));
-          else if (message.type === "shell-exited") {
-            if (shellExited || !Number.isSafeInteger(message.exitCode) || message.exitCode < 0
-              || !Number.isSafeInteger(message.signal) || message.signal < 0) {
-              socket.destroy();
-              continue;
-            }
-            shellExited = true;
-            shellResult = { exitCode: message.exitCode, signal: message.signal };
-            settleFrame();
-          }
-          else if (message.type === "data" && typeof message.data === "string") {
-            if (onData) onData(message.data);
-            else earlyData = `${earlyData}${message.data}`.slice(-150_000);
-          }
+          handleBrokerMessage(message, resolve, reject);
         }
       });
       socket.on("error", reject);
@@ -216,75 +269,82 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
     }
     return adapter;
   } catch (error) {
-    try { await adapter.terminate(); }
+    try {
+      await adapter.terminate();
+      error.terminationVerified = true;
+      try { recordTerminalEmpty(id, path.dirname(ownership.handshakePath)); }
+      catch (proofError) { error.emptyProofError = proofError; }
+    }
     catch { error.terminationUnknown = true; }
-    if (error.terminationUnknown) error.terminalTeardown = adapter;
+    if (error.terminationUnknown || error.terminationVerified) error.terminalTeardown = adapter;
     if (!error.terminationUnknown) try { cleanupTerminalSocket(id); } catch {}
     throw error;
   }
+}
+
+async function recoverDarwinTerminal(label, subprocesses) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const status = await probeDarwinTerminal(subprocesses, label);
+    if (status === "absent") return true;
+    if (status === "alive" || status === "exited") {
+      try { await subprocesses.run(AGENT_SUPERVISOR, ["--terminate", label],
+        { encoding: "utf8", timeout: 5000, maxBuffer: 4096 }); }
+      catch { /* The owner may be finishing concurrently; probe again. */ }
+      if (await probeDarwinTerminal(subprocesses, label) === "absent") return true;
+    }
+    if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 75));
+  }
+  return false;
+}
+
+async function recoverLinuxTerminal(target, launchDirectory, subprocesses) {
+  const handshakePath = path.join(launchDirectory, `terminal-${target}.json`);
+  if (!existsSync(handshakePath)) return true;
+  let handshake;
+  try { handshake = JSON.parse(readFileSync(handshakePath, "utf8")); } catch { return false; }
+  const pid = Number(handshake.pid);
+  if (!Number.isSafeInteger(pid) || pid <= 0 || !handshake.processIdentity
+    || linuxProcessIdentity(pid) !== handshake.processIdentity) return false;
+  try { await subprocesses.run(AGENT_SUPERVISOR, ["--terminate-owned", String(pid), handshake.processIdentity, handshakePath],
+    { encoding: "utf8", timeout: 1500, maxBuffer: 4096 }); }
+  catch { return false; }
+  for (let retry = 0; retry < 100; retry += 1) {
+    if (!existsSync(handshakePath)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return !existsSync(handshakePath);
+}
+
+async function recoverWindowsTerminal(pid, processIdentity, subprocesses) {
+  if (!Number.isSafeInteger(pid) || pid <= 0
+    || typeof processIdentity !== "string" || !/^\d+$/.test(processIdentity)) return false;
+  const args = [String(pid), processIdentity];
+  const probe = async () => {
+    try { return (await subprocesses.run(AGENT_SUPERVISOR, ["--probe", ...args],
+      { encoding: "utf8", timeout: 1500, maxBuffer: 4096 })).stdout.trim(); }
+    catch (error) { return error.stdout?.trim() ?? "unknown"; }
+  };
+  let state = await probe();
+  if (state === "alive") {
+    try { await subprocesses.run(AGENT_SUPERVISOR, ["--terminate", ...args],
+      { encoding: "utf8", timeout: 5000, maxBuffer: 4096 }); }
+    catch { return false; }
+    state = await probe();
+  }
+  return state === "absent";
 }
 
 // Only a fully launched PTY has a recoverable native owner. A request that
 // crashed before launch acknowledgment stays unknown for operator inspection.
 export async function recoverManagedTerminal({ target, created, ownershipLabel, launchDirectory, pid, processIdentity,
   subprocesses = utilityProcesses }) {
-  if (created !== 1 || typeof target !== "string" || !/^[0-9a-f-]{36}$/i.test(target)
+  if (typeof target !== "string" || !/^[0-9a-f-]{36}$/i.test(target)
     || ownershipLabel !== `com.21n.outright.terminal.${target}`) return false;
-  if (process.platform === "darwin") {
-    const label = `com.21n.outright.terminal.${target}`;
-    const probe = async () => {
-      try { return (await subprocesses.run(AGENT_SUPERVISOR, ["--probe", label],
-        { encoding: "utf8", timeout: 1500, maxBuffer: 4096 })).stdout.trim(); }
-      catch (error) { return error.stdout?.trim() ?? "unknown"; }
-    };
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      let status = await probe();
-      if (status === "absent") return true;
-      if (status === "alive" || status === "exited") {
-        try { await subprocesses.run(AGENT_SUPERVISOR, ["--terminate", label],
-          { encoding: "utf8", timeout: 5000, maxBuffer: 4096 }); }
-        catch { /* The owner may be finishing concurrently; probe again. */ }
-        status = await probe();
-        if (status === "absent") return true;
-      }
-      if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 75));
-    }
-    return false;
-  }
-  if (process.platform === "linux") {
-    const handshakePath = path.join(launchDirectory, `terminal-${target}.json`);
-    if (!existsSync(handshakePath)) return true;
-    let handshake;
-    try { handshake = JSON.parse(readFileSync(handshakePath, "utf8")); } catch { return false; }
-    const pid = Number(handshake.pid);
-    if (!Number.isSafeInteger(pid) || pid <= 0 || !handshake.processIdentity
-      || linuxProcessIdentity(pid) !== handshake.processIdentity) return false;
-    try { await subprocesses.run(AGENT_SUPERVISOR, ["--terminate-owned", String(pid), handshake.processIdentity, handshakePath],
-      { encoding: "utf8", timeout: 1500, maxBuffer: 4096 }); }
-    catch { return false; }
-    for (let retry = 0; retry < 100; retry += 1) {
-      if (!existsSync(handshakePath)) return true;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    return !existsSync(handshakePath);
-  }
-  if (process.platform === "win32" && Number.isSafeInteger(pid) && pid > 0
-    && typeof processIdentity === "string" && /^\d+$/.test(processIdentity)) {
-    const status = async () => {
-      try { return (await subprocesses.run(AGENT_SUPERVISOR, ["--probe", String(pid), processIdentity],
-        { encoding: "utf8", timeout: 1500, maxBuffer: 4096 })).stdout.trim(); }
-      catch (error) { return error.stdout?.trim() ?? "unknown"; }
-    };
-    let state = await status();
-    if (state === "alive") {
-      try { await subprocesses.run(AGENT_SUPERVISOR, ["--terminate", String(pid), processIdentity],
-        { encoding: "utf8", timeout: 5000, maxBuffer: 4096 }); }
-      catch { return false; }
-      state = await status();
-    }
-    return state === "absent";
-  }
-  // A request without an acknowledged native owner remains unknown.
+  if (hasTerminalEmpty(target, launchDirectory)) return true;
+  if (created !== 1) return false;
+  if (process.platform === "darwin") return recoverDarwinTerminal(ownershipLabel, subprocesses);
+  if (process.platform === "linux") return recoverLinuxTerminal(target, launchDirectory, subprocesses);
+  if (process.platform === "win32") return recoverWindowsTerminal(pid, processIdentity, subprocesses);
   return false;
 }
 

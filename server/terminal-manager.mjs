@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { lstatSync, opendirSync } from "node:fs";
 import { utilityProcesses } from "./subprocess-budget.mjs";
-import { cleanupTerminalSocket, recoverManagedTerminal, spawnManagedTerminal, terminalOwnership } from "./managed-terminal.mjs";
+import { cleanupTerminalSocket, recoverManagedTerminal, removeTerminalEmpty, recordTerminalEmpty, spawnManagedTerminal, terminalOwnership } from "./managed-terminal.mjs";
 
 function reservationTerminal(entry) {
   return { id: entry.target, cwd: entry.cwd, name: "Terminal recovery required", pid: entry.pid,
@@ -21,11 +22,44 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   const unresolvedReservations = () => (database.terminalUnknownReservations?.() ?? [])
     .filter((entry) => !terminals.has(entry.target));
   let reservedUnknown = unresolvedReservations();
+  const verifiedCreateFailures = new Map();
   let reconciliationPromise;
   let shuttingDown = false;
+  let sweepingProofs = false;
   // Old audit records may lack a worktree path. Charge their unknown owner
   // against every worktree until native proof or operator recovery clears it.
   const reservedForCwd = (cwd) => reservedUnknown.filter((entry) => !entry.cwd || entry.cwd === cwd).length;
+
+  function sweepStaleEmptyProofs() {
+    if (sweepingProofs || shuttingDown || database.terminalAuditScanPending
+      || reservedUnknown.length > 256 || !database.launchDirectory) return;
+    let directory;
+    try {
+      const info = lstatSync(database.launchDirectory);
+      if (!info.isDirectory() || info.isSymbolicLink()
+        || (process.platform !== "win32" && (info.uid !== process.getuid() || (info.mode & 0o077) !== 0))) return;
+      directory = opendirSync(database.launchDirectory);
+    } catch { return; }
+    sweepingProofs = true;
+    const step = () => {
+      let more = false;
+      try {
+        let entry;
+        for (let examined = 0; examined < 64 && !shuttingDown; examined += 1) {
+          entry = directory.readSync();
+          if (!entry) break;
+          const match = /^terminal-([0-9a-f-]{36})\.empty$/.exec(entry.name);
+          if (!match || terminals.has(match[1]) || reservedUnknown.some((owner) => owner.target === match[1])) continue;
+          try { removeTerminalEmpty(match[1], database.launchDirectory); } catch { /* A later sweep can retry. */ }
+        }
+        more = Boolean(entry && !shuttingDown);
+      } catch { /* Keep any unexamined marker for a later bounded sweep. */ }
+      if (more) { setImmediate(step); return; }
+      try { directory.closeSync(); } catch {}
+      sweepingProofs = false;
+    };
+    setImmediate(step);
+  }
 
   function assertCapacity(cwd) {
     if (database.terminalAuditScanPending) throw terminalError(503,
@@ -51,12 +85,24 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
           if (shuttingDown) break;
           const entry = entries[next++];
           try {
+            const verified = verifiedCreateFailures.get(entry.target);
+            if (verified) {
+              try { recordTerminalEmpty(entry.target, database.launchDirectory); } catch { /* Retry the audit below. */ }
+              database.auditCritical("terminal.create.failed", verified);
+              verifiedCreateFailures.delete(entry.target);
+              reservedUnknown = unresolvedReservations();
+              try { removeTerminalEmpty(entry.target, database.launchDirectory); } catch {}
+              resolved += 1;
+              publish({ type: "capacity.changed" });
+              continue;
+            }
             const empty = await recoverTerminal({ ...entry, launchDirectory: database.launchDirectory, subprocesses });
             if (!empty || shuttingDown) continue;
             // Socket removal belongs to the same proof as native emptiness.
             // A failed unlink must leave the durable reservation charged.
             cleanupSocket(entry.target);
             database.resolveTerminalUnknown(entry.target, `Native ${process.platform} owner was verified empty after restart`);
+            try { removeTerminalEmpty(entry.target, database.launchDirectory); } catch { /* The verified owner remains absent; retry cleanup later. */ }
             reservedUnknown = unresolvedReservations();
             resolved += 1;
             publish({ type: "capacity.changed" });
@@ -71,6 +117,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   function reloadUnknownReservations() {
     if (database.terminalAuditScanPending) return;
     reservedUnknown = unresolvedReservations();
+    sweepStaleEmptyProofs();
     publish({ type: "capacity.changed" });
   }
 
@@ -146,6 +193,37 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     return publicTerminal(terminal);
   }
 
+  async function failManagedCreate(terminal, error, evidence, ownership) {
+    const id = terminal.id;
+    terminal.status = "closing";
+    if (error.terminalTeardown) {
+      terminal.process = error.terminalTeardown;
+      terminal.pid = terminal.process.pid;
+    }
+    if (error.terminationUnknown) {
+      terminal.status = "unknown";
+      throw outcomeUnknown(error, evidence.operationId);
+    }
+    let verifiedEmpty = Boolean(error.terminationVerified);
+    if (terminal.process && !verifiedEmpty) {
+      try { await terminal.process.terminate(); verifiedEmpty = true; }
+      catch { terminal.status = "unknown"; throw outcomeUnknown(error, evidence.operationId); }
+    }
+    if (verifiedEmpty) try { recordTerminalEmpty(id, database.launchDirectory); }
+    catch { /* A durable failed-create audit can independently settle this verified owner. */ }
+    try { database.auditCritical("terminal.create.failed", { ...evidence, error: String(error.message ?? error).slice(0, 1024) }); }
+    catch {
+      terminals.delete(id);
+      if (verifiedEmpty) verifiedCreateFailures.set(id, { ...evidence, error: String(error.message ?? error).slice(0, 1024) });
+      reservedUnknown = [...reservedUnknown, { ...evidence, ownershipLabel: ownership.label,
+        handshakePath: ownership.handshakePath, created: 0 }];
+      throw outcomeUnknown(error, evidence.operationId);
+    }
+    try { removeTerminalEmpty(id, database.launchDirectory); } catch { /* A stale proof is harmless for this unique id. */ }
+    terminals.delete(id);
+    throw error;
+  }
+
   async function createManaged({ id, cwd, name, cols, rows, shell, evidence }) {
     if (!database.launchDirectory) throw new Error("Managed PTYs require a private launch directory");
     const env = { ...terminalEnvironment(process.env), TERM: "xterm-256color", COLORTERM: "truecolor" };
@@ -192,24 +270,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       if (terminal.status === "launching") terminal.status = "running";
       if (terminal.exitSeen && !terminal.closePromise && terminal.status !== "closing") startNaturalExit(terminal);
       return publicTerminal(terminal);
-    } catch (error) {
-      terminal.status = "closing";
-      if (error.terminalTeardown) {
-        terminal.process = error.terminalTeardown;
-        terminal.pid = terminal.process.pid;
-      }
-      if (error.terminationUnknown) {
-        terminal.status = "unknown";
-        throw outcomeUnknown(error, evidence.operationId);
-      }
-      if (terminal.process) {
-        try { await terminal.process.terminate(); } catch { terminal.status = "unknown"; throw outcomeUnknown(error, evidence.operationId); }
-      }
-      try { database.auditCritical("terminal.create.failed", { ...evidence, error: String(error.message ?? error).slice(0, 1024) }); }
-      catch { terminal.status = "unknown"; throw outcomeUnknown(error, evidence.operationId); }
-      terminals.delete(id);
-      throw error;
-    }
+    } catch (error) { return failManagedCreate(terminal, error, evidence, ownership); }
   }
 
   function list() { return [...terminals.values()].map(publicTerminal).concat(reservedUnknown
@@ -329,6 +390,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     }
   }
 
+  queueMicrotask(sweepStaleEmptyProofs);
   return { create, list, capacity, get, write, resize, close, shutdown, reconcileUnknown, reloadUnknownReservations };
 }
 

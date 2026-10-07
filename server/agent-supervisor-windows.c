@@ -10,6 +10,12 @@
 #include <wchar.h>
 
 #define UTILITY_TREE_EMPTY "__OUTRIGHT_UTILITY_TREE_EMPTY_V1__\n"
+static bool utility_proof_enabled = false;
+
+static void ignore_invalid_descriptor(const wchar_t *expression, const wchar_t *function,
+    const wchar_t *file, unsigned int line, uintptr_t reserved) {
+  (void)expression; (void)function; (void)file; (void)line; (void)reserved;
+}
 
 // Windows volumes may report ino=0 to Node. Compare native file IDs before
 // treating two pathnames as a hard-link pair or skipping a second byte lock.
@@ -223,8 +229,59 @@ static int inspect_owner(int argc, wchar_t **argv) {
   CloseHandle(process); wprintf(L"alive\n"); return 0;
 }
 
+static bool valid_utility_job(const wchar_t *name) {
+  const wchar_t *prefix = L"Local\\OutrightUtility-";
+  size_t start = wcslen(prefix);
+  if (wcsncmp(name, prefix, start) != 0 || wcslen(name + start) != 36) return false;
+  for (size_t index = 0; index < 36; index++) {
+    wchar_t value = name[start + index];
+    if (index == 8 || index == 13 || index == 18 || index == 23) {
+      if (value != L'-') return false;
+    } else if (!((value >= L'0' && value <= L'9') || (value >= L'a' && value <= L'f'))) return false;
+  }
+  return true;
+}
+
+static int inspect_utility_job(int argc, wchar_t **argv) {
+  if (argc != 3 || !valid_utility_job(argv[2])) return 64;
+  bool terminate = wcscmp(argv[1], L"--utility-terminate") == 0;
+  HANDLE job = OpenJobObjectW(JOB_OBJECT_QUERY | (terminate ? JOB_OBJECT_TERMINATE : 0), FALSE, argv[2]);
+  if (!job) {
+    if (GetLastError() == ERROR_FILE_NOT_FOUND) { wprintf(L"absent\n"); return 3; }
+    wprintf(L"unknown\n"); return 4;
+  }
+  if (terminate && !TerminateJobObject(job, 137)) {
+    CloseHandle(job); wprintf(L"unknown\n"); return 4;
+  }
+  JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting = {0};
+  bool empty = false;
+  for (int attempt = 0; attempt < (terminate ? 200 : 1); attempt++) {
+    if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+        &accounting, sizeof(accounting), NULL)) break;
+    if (accounting.ActiveProcesses == 0) { empty = true; break; }
+    if (terminate) Sleep(25);
+  }
+  CloseHandle(job);
+  if (!empty && terminate) { wprintf(L"unknown\n"); return 4; }
+  wprintf(L"%ls\n", empty ? L"exited" : L"alive");
+  return empty ? 3 : 0;
+}
+
+static bool utility_start_authorized(void) {
+  HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+  if (input == NULL || input == INVALID_HANDLE_VALUE) return false;
+  char command[3];
+  DWORD used = 0;
+  while (used < sizeof(command)) {
+    DWORD count = 0;
+    if (!ReadFile(input, command + used, (DWORD)sizeof(command) - used, &count, NULL) || count == 0) return false;
+    used += count;
+  }
+  return memcmp(command, "go\n", sizeof(command)) == 0;
+}
+
 static int utility_prelaunch_exit(int code) {
-  if (GetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", NULL, 0) != 0) {
+  if (utility_proof_enabled) {
     intptr_t descriptor = _get_osfhandle(3);
     DWORD written = 0;
     if (descriptor != -1)
@@ -234,20 +291,28 @@ static int utility_prelaunch_exit(int code) {
 }
 
 int wmain(int argc, wchar_t **argv) {
+  _set_invalid_parameter_handler(ignore_invalid_descriptor);
   if (argc < 2) return 64;
   if (wcscmp(argv[1], L"--same-file") == 0) return same_file(argc, argv);
   if (wcscmp(argv[1], L"--archive-lock") == 0) return archive_lock(argc, argv);
   if (wcscmp(argv[1], L"--identity") == 0 || wcscmp(argv[1], L"--probe") == 0
       || wcscmp(argv[1], L"--terminate") == 0) return inspect_owner(argc, argv);
+  if (wcscmp(argv[1], L"--utility-probe") == 0 || wcscmp(argv[1], L"--utility-terminate") == 0)
+    return inspect_utility_job(argc, argv);
   bool test_mode = wcscmp(argv[1], L"--test-runner") == 0;
+  bool utility_mode = wcscmp(argv[1], L"--utility-owner") == 0;
+  utility_proof_enabled = utility_mode;
   if (test_mode && argc < 4) return 64;
-  HANDLE job = CreateJobObjectW(NULL, NULL);
+  if (utility_mode && (argc < 4 || !valid_utility_job(argv[2])
+      || GetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", NULL, 0) == 0)) return 64;
+  HANDLE job = CreateJobObjectW(NULL, utility_mode ? argv[2] : NULL);
   if (!job) return utility_prelaunch_exit(70);
+  if (utility_mode && GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(job); return utility_prelaunch_exit(70); }
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
   limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
   if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return utility_prelaunch_exit(71);
 
-  wchar_t *line = command_line(argc, argv, test_mode ? 3 : 1);
+  wchar_t *line = command_line(argc, argv, test_mode || utility_mode ? 3 : 1);
   if (!line) return utility_prelaunch_exit(72);
   // The native child owns no control input. Forward only output and error;
   // sharing the supervisor's stdin would let Git or a helper consume Stop.
@@ -274,16 +339,30 @@ int wmain(int argc, wchar_t **argv) {
   startup.hStdInput = null_input;
   startup.hStdOutput = output;
   startup.hStdError = error_output;
-  bool utility_owner = GetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", NULL, 0) != 0;
-  intptr_t proof_handle = _get_osfhandle(3);
+  bool utility_owner = utility_mode;
+  // Most supervisor clients have only the three standard descriptors. The
+  // CRT treats an out-of-range descriptor as an invalid-parameter failure.
+  intptr_t proof_handle = utility_owner ? _get_osfhandle(3) : -1;
   if (utility_owner && (proof_handle == -1
       || !SetHandleInformation((HANDLE)proof_handle, HANDLE_FLAG_INHERIT, 0))) {
     CloseHandle(null_input); CloseHandle(output); CloseHandle(error_output); free(line);
     return utility_prelaunch_exit(72);
   }
+  if (utility_mode && !utility_start_authorized()) {
+    CloseHandle(null_input); CloseHandle(output); CloseHandle(error_output); free(line); CloseHandle(job);
+    return utility_prelaunch_exit(0);
+  }
+  // The utility flag belongs to this supervisor, never to Git hooks or
+  // provider grandchildren that may launch an ordinary three-fd supervisor.
+  bool inherited_utility_flag = GetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", NULL, 0) != 0;
+  if (inherited_utility_flag && !SetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", NULL)) {
+    CloseHandle(null_input); CloseHandle(output); CloseHandle(error_output); free(line); CloseHandle(job);
+    return utility_prelaunch_exit(72);
+  }
   PROCESS_INFORMATION process = {0};
   BOOL launched = CreateProcessW(NULL, line, NULL, NULL, TRUE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
     NULL, NULL, &startup, &process);
+  if (inherited_utility_flag) SetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", L"1");
   CloseHandle(null_input);
   CloseHandle(output);
   CloseHandle(error_output);

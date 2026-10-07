@@ -430,6 +430,57 @@ export function createOutrightDatabase(options = {}) {
     cleanupReconciliationTick = delay ? setTimeout(resume, delay) : setImmediate(resume);
   }
 
+  function recordTerminalAuditRequest(scan, row, details, operationId) {
+    if (["terminal.create.requested", "terminal.close.requested"].includes(row.action) && operationId) {
+      const evidence = {};
+      for (const key of ["cwd", "ownershipLabel", "handshakePath", "pid", "processIdentity"]) {
+        if (details?.[key] != null) evidence[key] = details[key];
+      }
+      scan.requests.set(operationId, { action: row.action, target: row.target, operationId, details: evidence });
+    }
+  }
+
+  function recordTerminalAuditOwner(scan, row, details) {
+    if (["terminal.create.requested", "terminal.created", "terminal.create.unknown", "terminal.unknown"].includes(row.action)
+      && row.target) {
+      const current = scan.owners.get(row.target) ?? { target: row.target, created: 0 };
+      for (const key of ["cwd", "ownershipLabel", "handshakePath", "pid", "processIdentity"]) {
+        if (details?.[key] != null) current[key] = details[key];
+      }
+      if (row.action === "terminal.created") current.created = 1;
+      if (row.action === "terminal.unknown") current.unknownRecorded = true;
+      scan.owners.set(row.target, current);
+    }
+  }
+
+  function applyTerminalAuditRow(scan, row) {
+    scan.cursor = row.id;
+    const details = parseJson(row.details, {});
+    const operationId = typeof details?.operationId === "string" && details.operationId.length <= 128
+      ? details.operationId : null;
+    if (operationId) scan.requests.delete(operationId);
+    recordTerminalAuditRequest(scan, row, details, operationId);
+    recordTerminalAuditOwner(scan, row, details);
+    if (["terminal.create.failed", "terminal.exited", "terminal.closed", "terminal.recovered"].includes(row.action)) {
+      scan.owners.delete(row.target);
+    }
+    if (scan.requests.size > 10_000 || scan.owners.size > 10_000) {
+      throw new Error("Terminal audit recovery exceeds the bounded owner index");
+    }
+  }
+
+  function readTerminalAuditPage(scan) {
+    const previousCursor = scan.cursor;
+    const rows = db.prepare(`SELECT id, action, substr(target, 1, 512) AS target,
+      CASE WHEN octet_length(details) <= 4096 THEN details END AS details FROM audit_log
+      WHERE id > ? AND id <= ? ORDER BY id LIMIT 256`).all(scan.cursor, scan.lastId);
+    for (const row of rows) applyTerminalAuditRow(scan, row);
+    if (rows.length && !db.prepare("SELECT complete FROM audit_evidence_state WHERE id = 1").get().complete) {
+      backfillAuditEvidencePage(db, previousCursor, scan.cursor);
+    }
+    return rows.length;
+  }
+
   function advanceTerminalAuditScan() {
     terminalAuditTick = undefined;
     if (closing || !terminalAuditScan) return;
@@ -441,44 +492,7 @@ export function createOutrightDatabase(options = {}) {
         db.prepare("UPDATE audit_retention_cursor SET cursor = 0, sweep_upper = 0 WHERE id = 1").run();
       }
       if (!scan.outcomes) {
-        const previousCursor = scan.cursor;
-        const rows = db.prepare(`SELECT id, action, substr(target, 1, 512) AS target,
-          CASE WHEN octet_length(details) <= 4096 THEN details END AS details FROM audit_log
-          WHERE id > ? AND id <= ? ORDER BY id LIMIT 256`).all(scan.cursor, scan.lastId);
-        for (const row of rows) {
-          scan.cursor = row.id;
-          const details = parseJson(row.details, {});
-          const operationId = typeof details?.operationId === "string" && details.operationId.length <= 128
-            ? details.operationId : null;
-          if (operationId) scan.requests.delete(operationId);
-          if (["terminal.create.requested", "terminal.close.requested"].includes(row.action) && operationId) {
-            const evidence = {};
-            for (const key of ["cwd", "ownershipLabel", "handshakePath", "pid", "processIdentity"]) {
-              if (details?.[key] != null) evidence[key] = details[key];
-            }
-            scan.requests.set(operationId, { action: row.action, target: row.target, operationId, details: evidence });
-          }
-          if (["terminal.create.requested", "terminal.created", "terminal.create.unknown", "terminal.unknown"].includes(row.action)
-            && row.target) {
-            const current = scan.owners.get(row.target) ?? { target: row.target, created: 0 };
-            for (const key of ["cwd", "ownershipLabel", "handshakePath", "pid", "processIdentity"]) {
-              if (details?.[key] != null) current[key] = details[key];
-            }
-            if (row.action === "terminal.created") current.created = 1;
-            if (row.action === "terminal.unknown") current.unknownRecorded = true;
-            scan.owners.set(row.target, current);
-          }
-          if (["terminal.create.failed", "terminal.exited", "terminal.closed", "terminal.recovered"].includes(row.action)) {
-            scan.owners.delete(row.target);
-          }
-          if (scan.requests.size > 10_000 || scan.owners.size > 10_000) {
-            throw new Error("Terminal audit recovery exceeds the bounded owner index");
-          }
-        }
-        if (rows.length && !db.prepare("SELECT complete FROM audit_evidence_state WHERE id = 1").get().complete) {
-          backfillAuditEvidencePage(db, previousCursor, scan.cursor);
-        }
-        if (rows.length) { terminalAuditTick = scheduleTerminalAudit(advanceTerminalAuditScan); return; }
+        if (readTerminalAuditPage(scan)) { terminalAuditTick = scheduleTerminalAudit(advanceTerminalAuditScan); return; }
         // The read cursor reached the frozen high-water mark. Triggers have
         // indexed every concurrent insert, including direct SQLite writers.
         db.prepare("UPDATE audit_evidence_state SET complete = 1 WHERE id = 1").run();
@@ -837,20 +851,7 @@ export function createOutrightDatabase(options = {}) {
       return this.getConversation(id);
     },
     updateConversation(id, patch) {
-      const current = db.prepare("SELECT archived, deleting FROM conversations WHERE id = ?").get(id);
-      if (current?.deleting) {
-        throw databaseError(409, "Archived conversation deletion is in progress");
-      }
-      if (patch.archived !== undefined && typeof patch.archived !== "boolean") {
-        throw databaseError(400, "Conversation archived state must be a boolean");
-      }
-      if (patch.providerSessionId != null && (typeof patch.providerSessionId !== "string" || Buffer.byteLength(patch.providerSessionId) > 4096)) {
-        throw databaseError(400, "Provider session id is invalid");
-      }
-      if (patch.archived === true && this.findUnresolvedInterruptedRun(id)) {
-        throw databaseError(409, "Resolve the interrupted run before archiving this conversation");
-      }
-      const archiveOnly = patch.archived === true && Object.keys(patch).length === 1;
+      const { current, archiveOnly } = validateConversationPatch(db, this, id, patch);
       if (archiveOnly && current?.archived) return this.getConversation(id);
       const fields = [];
       const values = [];
@@ -2004,17 +2005,7 @@ export function createOutrightDatabase(options = {}) {
         JOIN conversations AS c ON c.rowid = heads.source_rowid
         WHERE c.deleting = 0 AND octet_length(c.id) <= 256
         LIMIT ${SEARCH_CANDIDATES}`).all();
-      const nextOrdinal = db.prepare(`SELECT ordinal FROM message_order WHERE scope = ? AND ordinal < ?
-        ORDER BY ordinal DESC LIMIT 1`);
-      const heads = scopes.map(({ id }) => ({ id, ordinal: nextOrdinal.get(id, Number.MAX_SAFE_INTEGER)?.ordinal ?? 0 }));
-      const ordinals = [];
-      while (ordinals.length < SEARCH_CANDIDATES) {
-        let newest;
-        for (const head of heads) if (head.ordinal && (!newest || head.ordinal > newest.ordinal)) newest = head;
-        if (!newest) break;
-        ordinals.push(newest.ordinal);
-        newest.ordinal = nextOrdinal.get(newest.id, newest.ordinal)?.ordinal ?? 0;
-      }
+      const { heads, ordinals } = recentSearchOrdinals(db, scopes);
       const byMessage = ordinals.length ? db.prepare(String.raw`SELECT DISTINCT ${fields} FROM messages AS m
         JOIN conversations AS c ON c.id = m.conversation_id
         WHERE m.rowid IN (${ordinals.map(() => "?").join(",")})
@@ -2022,15 +2013,7 @@ export function createOutrightDatabase(options = {}) {
           AND m.body LIKE ? ESCAPE '\'`).all(...ordinals, needle) : [];
       const matched = [...new Map([...byTitle, ...byMessage].map((row) => [row.id, row])).values()];
       matched.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-      const conversations = [];
-      let responseBytes = 64;
-      for (const { updatedAt, ...row } of matched) {
-        if (conversations.length === boundedLimit) break;
-        const bytes = Buffer.byteLength(JSON.stringify(row)) + 1;
-        if (responseBytes + bytes > SEARCH_RESPONSE_BYTES) break;
-        conversations.push(row);
-        responseBytes += bytes;
-      }
+      const conversations = boundedSearchResults(matched, boundedLimit);
       const partial = matched.length > conversations.length || Boolean(migrationJob(db, "search-visible")
         || migrationJob(db, "search-titles")
         || migrationJob(db, "search-heads")
@@ -2217,6 +2200,77 @@ function markArchivedForDeletion(db, id, automatic, cutoff) {
   }).immediate();
 }
 
+function validateConversationPatch(db, api, id, patch) {
+  const current = db.prepare("SELECT archived, deleting FROM conversations WHERE id = ?").get(id);
+  if (current?.deleting) throw databaseError(409, "Archived conversation deletion is in progress");
+  if (patch.archived !== undefined && typeof patch.archived !== "boolean") {
+    throw databaseError(400, "Conversation archived state must be a boolean");
+  }
+  if (patch.providerSessionId != null
+    && (typeof patch.providerSessionId !== "string" || Buffer.byteLength(patch.providerSessionId) > 4096)) {
+    throw databaseError(400, "Provider session id is invalid");
+  }
+  if (patch.archived === true && api.findUnresolvedInterruptedRun(id)) {
+    throw databaseError(409, "Resolve the interrupted run before archiving this conversation");
+  }
+  return { current, archiveOnly: patch.archived === true && Object.keys(patch).length === 1 };
+}
+
+function recentSearchOrdinals(db, scopes) {
+  const nextOrdinal = db.prepare(`SELECT ordinal FROM message_order WHERE scope = ? AND ordinal < ?
+    ORDER BY ordinal DESC LIMIT 1`);
+  const heads = scopes.map(({ id }) => ({ id, ordinal: nextOrdinal.get(id, Number.MAX_SAFE_INTEGER)?.ordinal ?? 0 }));
+  const ordinals = [];
+  while (ordinals.length < SEARCH_CANDIDATES) {
+    let newest;
+    for (const head of heads) if (head.ordinal && (!newest || head.ordinal > newest.ordinal)) newest = head;
+    if (!newest) break;
+    ordinals.push(newest.ordinal);
+    newest.ordinal = nextOrdinal.get(newest.id, newest.ordinal)?.ordinal ?? 0;
+  }
+  return { heads, ordinals };
+}
+
+function boundedSearchResults(matched, limit) {
+  const conversations = [];
+  let responseBytes = 64;
+  for (const { updatedAt, ...row } of matched) {
+    if (conversations.length === limit) break;
+    const bytes = Buffer.byteLength(JSON.stringify(row)) + 1;
+    if (responseBytes + bytes > SEARCH_RESPONSE_BYTES) break;
+    conversations.push(row);
+    responseBytes += bytes;
+  }
+  return conversations;
+}
+
+function deleteArchivedRows(db, id, filename, query, table) {
+  const rows = db.prepare(query).all(id);
+  if (!rows.length) return null;
+  const remove = db.prepare(`DELETE FROM ${table} WHERE id = ?`);
+  let bytes = 0;
+  for (const row of rows) {
+    if (!bytes && row.bytes > 256 * 1024 && filename !== ":memory:") {
+      return { oversized: { table, rowId: row.id } };
+    }
+    if (bytes && bytes + row.bytes > 256 * 1024) break;
+    remove.run(row.id);
+    bytes += row.bytes;
+  }
+  return { done: false };
+}
+
+function auditArchivedDeletion(db, id) {
+  reserveRecoveryHeadroom(db, undefined, true);
+  db.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
+    .run("retention.archived.deleted", id, "{}", now());
+  // Keep a live archive delete independent of a legacy audit table's size.
+  for (let page = 0; page < 4; page += 1) {
+    if (trimAuditPage(db).complete) break;
+  }
+  reserveRecoveryHeadroom(db);
+}
+
 function deleteArchivedBatch(db, id, filename) {
   const sources = [
     [`SELECT events.id, COALESCE(octet_length(events.payload), 0) + ${RETAINED_ROW_OVERHEAD_BYTES} AS bytes FROM run_events AS events
@@ -2227,32 +2281,11 @@ function deleteArchivedBatch(db, id, filename) {
       FROM runs WHERE conversation_id = ? LIMIT 64`, "runs"],
   ];
   for (const [query, table] of sources) {
-    const rows = db.prepare(query).all(id);
-    if (!rows.length) continue;
-    const remove = db.prepare(`DELETE FROM ${table} WHERE id = ?`);
-    let bytes = 0;
-    for (const row of rows) {
-      if (!bytes && row.bytes > 256 * 1024 && filename !== ":memory:") {
-        return { oversized: { table, rowId: row.id } };
-      }
-      if (bytes && bytes + row.bytes > 256 * 1024) break;
-      remove.run(row.id);
-      bytes += row.bytes;
-    }
-    return { done: false };
+    const result = deleteArchivedRows(db, id, filename, query, table);
+    if (result) return result;
   }
   const deleted = db.prepare("DELETE FROM conversations WHERE id = ? AND deleting = 1").run(id).changes;
-  if (deleted) {
-    reserveRecoveryHeadroom(db, undefined, true);
-    db.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
-      .run("retention.archived.deleted", id, "{}", now());
-    // Keep a live archive delete independent of a legacy audit table's size.
-    // Subsequent writes continue the durable sweep from this same cursor.
-    for (let page = 0; page < 4; page += 1) {
-      if (trimAuditPage(db).complete) break;
-    }
-    reserveRecoveryHeadroom(db);
-  }
+  if (deleted) auditArchivedDeletion(db, id);
   return { done: true };
 }
 
@@ -2886,6 +2919,27 @@ function readLaunchHandshake(launchDirectory, runId) {
 // runtime hard-killed after authorization cannot leak one stale file per
 // crash. Records for rows that were actually running are kept: their wrapper
 // may still be alive and removes its own record when it exits.
+function sweepLaunchEntry(launchDirectory, entry, keep, pendingOutcome) {
+  if (/^[0-9a-f-]{36}\.outcome\.json\.[0-9a-f-]{36}\.tmp$/i.test(entry.name)) {
+    // A crash before atomic rename leaves no trustworthy outcome.
+    try { rmSync(path.join(launchDirectory, entry.name), { force: true }); } catch { /* Retry next startup. */ }
+    return;
+  }
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.outcome\.json$/i.test(entry.name)) {
+    const runId = entry.name.slice(0, -".outcome.json".length);
+    if (!pendingOutcome.get(runId)) {
+      try { removeRunOutcome(launchDirectory, runId); } catch { /* Retain the marker for the next sweep. */ }
+    }
+    return;
+  }
+  // Terminal markers belong to terminal recovery. Only a run UUID is in
+  // this sweep's ownership namespace.
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i.test(entry.name)) return;
+  const runId = entry.name.slice(0, -".json".length);
+  if (keep.get(runId)) return;
+  try { rmSync(path.join(launchDirectory, entry.name), { force: true }); } catch { /* Already gone. */ }
+}
+
 function sweepLaunchHandshakes(launchDirectory, db) {
   let directory;
   try { directory = opendirSync(launchDirectory); }
@@ -2899,27 +2953,7 @@ function sweepLaunchHandshakes(launchDirectory, db) {
   try {
     let entry;
     while ((entry = directory.readSync())) {
-      if (/^[0-9a-f-]{36}\.outcome\.json\.[0-9a-f-]{36}\.tmp$/i.test(entry.name)) {
-        // A crash before atomic rename leaves no trustworthy outcome. The
-        // temporary write owns no active run and is safe to discard.
-        try { rmSync(path.join(launchDirectory, entry.name), { force: true }); } catch { /* Retry next startup. */ }
-        continue;
-      }
-      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.outcome\.json$/i.test(entry.name)) {
-        const runId = entry.name.slice(0, -".outcome.json".length);
-        if (!pendingOutcome.get(runId)) {
-          try { removeRunOutcome(launchDirectory, runId); } catch { /* Retain a stale marker for the next sweep. */ }
-        }
-        continue;
-      }
-      // Run and terminal owners share this directory. Terminal markers are
-      // consumed by terminal recovery, which must verify the native owner
-      // before it can release capacity or settle the pending audit record.
-      // Only a run UUID is in this sweep's ownership namespace.
-      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i.test(entry.name)) continue;
-      const runId = entry.name.slice(0, -".json".length);
-      if (keep.get(runId)) continue;
-      try { rmSync(path.join(launchDirectory, entry.name), { force: true }); } catch { /* Already gone. */ }
+      sweepLaunchEntry(launchDirectory, entry, keep, pendingOutcome);
     }
   } finally { directory.closeSync(); }
 }

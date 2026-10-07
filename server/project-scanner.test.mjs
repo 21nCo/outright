@@ -1,6 +1,36 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mapWithConcurrency, parseWorktreePorcelain } from "./project-scanner.mjs";
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { mapWithConcurrency, parseStatus, parseWorktreePorcelain, scanProjects } from "./project-scanner.mjs";
+
+test("default-root candidate resolution is bounded and preserves first discovered worktree", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-scan-order-"));
+  for (const name of ["a", "b", "c"]) mkdirSync(path.join(root, name, ".git"), { recursive: true });
+  let active = 0;
+  let maximum = 0;
+  const budget = { async run(_file, args) {
+    const cwd = args[1];
+    if (args[2] === "rev-parse") {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      await new Promise((resolve) => setTimeout(resolve, path.basename(cwd) === "a" ? 30 : 5));
+      active -= 1;
+      return { stdout: path.basename(cwd) === "c" ? "../other\n" : "../shared\n" };
+    }
+    if (args[2] === "worktree") return { stdout: `worktree ${cwd}\nHEAD abcdef123456\nbranch refs/heads/main\n\n` };
+    return { stdout: "" };
+  } };
+  try {
+    const result = await scanProjects({ scanRoots: [root], maxDepth: 1, maxProjects: 1,
+      excludeDirectories: new Set() }, budget);
+    assert.equal(result.candidateCount, 3);
+    assert.equal(result.repositoryCount, 2);
+    assert.equal(maximum, 2);
+    assert.equal(result.projects[0].path, path.join(root, "a"));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test("a falsy mapper rejection fails the whole scan after active workers settle", async () => {
   let rejectFirst;
@@ -45,4 +75,16 @@ prunable gitdir file points to non-existent location
       prunable: "gitdir file points to non-existent location",
     },
   ]);
+});
+
+test("one branch-status result carries changed paths and upstream counts", () => {
+  assert.deepEqual(parseStatus("## feature...origin/feature [ahead 2, behind 3]\n M src/app.js\n?? new.txt\n"), {
+    divergence: { ahead: 2, behind: 3 },
+    changedFiles: [{ status: "M", path: "src/app.js" }, { status: "??", path: "new.txt" }],
+  });
+  assert.deepEqual(parseStatus("## No commits yet on main\nA  first.txt\n"), {
+    divergence: { ahead: 0, behind: 0 },
+    changedFiles: [{ status: "A", path: "first.txt" }],
+  });
+  assert.deepEqual(parseStatus(""), { divergence: { ahead: 0, behind: 0 }, changedFiles: [] });
 });

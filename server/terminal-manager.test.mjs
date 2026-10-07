@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createTerminalManager } from "./terminal-manager.mjs";
-import { cleanupTerminalSocket, recoverManagedTerminal, terminalOwnership } from "./managed-terminal.mjs";
+import { cleanupTerminalSocket, recordTerminalEmpty, recoverManagedTerminal, terminalOwnership } from "./managed-terminal.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 import { AUDIT_RETENTION_LIMIT, auditTrimSql, trimAudit, trimAuditPage } from "./audit-retention.mjs";
@@ -375,6 +375,83 @@ test("failed created audit releases capacity after verified cleanup and durable 
     database.reconcileTerminalAudit();
     assert.deepEqual(database.terminalUnknownReservations(), []);
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("verified empty terminal creation survives two failed audit writes and restart", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-empty-proof-"));
+  const filename = path.join(directory, "runtime.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  let terminated = 0;
+  const failedAudit = {
+    launchDirectory: database.launchDirectory,
+    auditAdmission: (...args) => database.auditAdmission(...args),
+    auditCritical: (action, details) => {
+      if (action === "terminal.created" || action === "terminal.create.failed") throw new Error("storage refused outcome");
+      return database.auditCritical(action, details);
+    },
+    terminalUnknownReservations: () => database.terminalUnknownReservations(),
+  };
+  const manager = createTerminalManager({ publish: () => {}, database: failedAudit,
+    startManagedTerminal: async () => ({ pid: 42, onData() {}, onExit() {},
+      async terminate() { terminated += 1; } }), maxTerminals: 1, maxTerminalsPerCwd: 1 });
+  try {
+    await assert.rejects(manager.create({ cwd: directory }), (error) => error.statusCode === 503);
+    assert.equal(terminated, 1);
+    assert.equal(manager.capacity().active, 1, "the failed audit still charges capacity");
+    assert.ok(database.terminalUnknownReservations().some((entry) => entry.created === 0));
+    database.close();
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    database.reconcileTerminalAudit();
+    const restarted = createTerminalManager({ publish: () => {}, database,
+      cleanupSocket: () => {}, maxTerminals: 1, maxTerminalsPerCwd: 1 });
+    assert.equal(restarted.capacity().active, 1);
+    assert.equal(await restarted.reconcileUnknown(), 1);
+    assert.equal(restarted.capacity().active, 0);
+    assert.deepEqual(database.terminalUnknownReservations(), []);
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("verified native teardown retries a failed marker and failed create audit in process", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-proof-retry-"));
+  const database = createOutrightDatabase({ filename: path.join(directory, "runtime.db"), runtimeLease: true });
+  let refuseOutcome = true;
+  let terminations = 0;
+  const manager = createTerminalManager({ publish: () => {}, database: {
+    launchDirectory: path.join(directory, "missing-launch-directory"),
+    auditAdmission: (...args) => database.auditAdmission(...args),
+    auditCritical: (action, details) => {
+      if (action === "terminal.create.failed" && refuseOutcome) throw new Error("audit unavailable");
+      return database.auditCritical(action, details);
+    },
+    terminalUnknownReservations: () => database.terminalUnknownReservations(),
+  }, startManagedTerminal: async () => {
+    terminations += 1; // The injected adapter has already proved its tree empty.
+    const error = new Error("launch acknowledgment failed");
+    error.terminationVerified = true;
+    error.terminalTeardown = { pid: 42, async terminate() { throw new Error("must not terminate twice"); } };
+    throw error;
+  }, maxTerminals: 1, maxTerminalsPerCwd: 1 });
+  try {
+    await assert.rejects(manager.create({ cwd: directory }), (error) => error.statusCode === 503);
+    assert.equal(terminations, 1);
+    assert.equal(manager.capacity().active, 1);
+    refuseOutcome = false;
+    assert.equal(await manager.reconcileUnknown(), 1);
+    assert.equal(manager.capacity().active, 0);
+    assert.deepEqual(database.terminalUnknownReservations(), []);
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("terminal recovery removes a stale verified-empty marker after its audit has settled", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-stale-proof-"));
+  const id = randomUUID();
+  try {
+    recordTerminalEmpty(id, directory);
+    const manager = createTerminalManager({ publish: () => {},
+      database: { launchDirectory: directory, terminalUnknownReservations: () => [] } });
+    await waitFor(() => !existsSync(path.join(directory, `terminal-${id}.empty`)));
+    await manager.shutdown();
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("real PTY close reaps a foreground child that ignores hangup", { skip: process.platform === "win32" }, async () => {

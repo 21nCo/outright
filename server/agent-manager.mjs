@@ -389,11 +389,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     return database.getRun(run.id);
   }
 
-  async function start(state, authorize) {
+  function preflightAgentAdmission(state, authorize) {
     const { conversation, run } = state;
-    const command = buildProviderCommand(conversation, run);
-    const launch = await launchCommand(command, run, resolvedLaunchDirectory);
-    if (state.stopped || shuttingDown) return;
     // The asynchronous capability check is a retry boundary: trust and the
     // selected durable target may have changed while it was in flight.
     const current = database.getConversation(run.conversationId);
@@ -421,6 +418,16 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     }
     admissionRetryRuns.delete(run.id);
     clearDiskRetry();
+    return null;
+  }
+
+  async function start(state, authorize) {
+    const { conversation, run } = state;
+    const command = buildProviderCommand(conversation, run);
+    const launch = await launchCommand(command, run, resolvedLaunchDirectory);
+    if (state.stopped || shuttingDown) return;
+    const admission = preflightAgentAdmission(state, authorize);
+    if (admission) return admission;
     const startedAt = new Date().toISOString();
     // Crash-safe launch handshake, phase 1: this durable marker means "a spawn
     // may have been issued, but the provider was never authorized to run". A
@@ -609,16 +616,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     }
   }
 
-  function finish(state, exitCode, error) {
-    if ((!active.has(state.run.id) && !pendingOutcomes.has(state.run.id)) || state.finishing) return;
-    // A recovery marker proves an exited owner. A preparation error that
-    // races a still-live wrapper must wait for its close/teardown proof.
-    if (state.child && !state.closed) return false;
-    state.finishing = true;
-    clearCheckpointTimer(state);
-    // Once the provider has exited, its terminal decision belongs to that
-    // exit. A failed SQLite transaction must not let a later Stop or shutdown
-    // turn a completed/failed provider result into a cancellation on retry.
+  function freezeTerminalOutcome(state, exitCode, error) {
     if (!state.terminalOutcome) {
       const successful = exitCode === 0 && !error && !state.stopped;
       let status = "failed";
@@ -631,62 +629,52 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         exitCode,
       };
     }
+  }
+
+  function persistTerminalOutcome(state, result) {
     const { status, message, finishedAt, exitCode: terminalExitCode } = state.terminalOutcome;
-    let finished;
-    let transcriptMessage;
-    let journalBecameDurable = false;
-    try {
-      // Persist the frozen provider result outside SQLite before its terminal
-      // transaction. Shutdown may follow a BUSY/FULL refusal immediately;
-      // restart must then recover the actual exit, not classify it unknown.
-      // The terminal checkpoint may itself exhaust the transcript budget.
-      // Defer its omission marker to finishRun's transaction: a SQLite fault
-      // here must not prevent the independent outcome journal from being
-      // written before shutdown or restart.
-      const pendingMessage = pendingAssistantMessage(state);
-      transcriptMessage = budgetTranscript(state, pendingMessage, { terminal: true });
-      if (!state.outcomeJournaled && database.savePendingRunOutcome) {
-        try {
-          database.savePendingRunOutcome(state.run.id, {
-            ...state.terminalOutcome, transcriptMessage,
-            transcriptOmitted: Boolean(state.transcriptOmitted || (pendingMessage && !transcriptMessage)),
-          });
-          state.outcomeJournaled = true;
-          state.outcomeJournalError = null;
-          journalBecameDurable = true;
-        } catch (journalError) { state.outcomeJournalError = journalError; }
-      }
-      // The last checkpoint and terminal state commit together. Until that
-      // commit succeeds this state still owns its run slot and recovery data.
-      finished = database.finishRun(state.run.id, {
-        status, finishedAt, exitCode: terminalExitCode, error: message || null, pid: null,
-        ...(state.transcriptOmitted ? { transcriptOmitted: true } : {}),
-      }, transcriptMessage);
-    } catch (writeError) {
-      state.finishing = false;
-      if (storageAdmissionFailure(writeError) || (writeError.statusCode === 503 && database.maintenanceActive)) {
-        state.pendingFinish = { exitCode, error };
-        state.finishFailureCount = (state.finishFailureCount ?? 0) + 1;
-        // A repeatedly refused transient write is now an unresolved outcome,
-        // not an active process. Keep its journal/row protected and let an
-        // unrelated run use the freed process slot.
-        const persistent = persistentStorageFailure(writeError) || state.finishFailureCount >= 2;
-        if (shuttingDown && journalBecameDurable) setTimeout(onShutdownRecovery, 0);
-        if (persistent && (!state.child || state.closed)) {
-          // The process is gone. Retain its bounded outcome separately from
-          // live process capacity; restart still sees the protected run row
-          // and launch proof if storage never recovers in this process.
-          active.delete(state.run.id);
-          pendingOutcomes.set(state.run.id, state);
-          publish({ type: "run.outcome_pending", runId: state.run.id, conversationId: state.conversation.id, reason: "storage-unavailable" });
-          publish({ type: "capacity.changed" });
-          if (!database.maintenanceActive) drain();
-        }
-        if (!database.maintenanceActive) retryUnknownDiskUsage(persistent);
-        return false;
-      }
-      throw writeError;
+    // Journal the frozen provider exit before SQLite so a BUSY/FULL failure
+    // during shutdown can still recover its true outcome after restart.
+    const pendingMessage = pendingAssistantMessage(state);
+    result.transcriptMessage = budgetTranscript(state, pendingMessage, { terminal: true });
+    if (!state.outcomeJournaled && database.savePendingRunOutcome) {
+      try {
+        database.savePendingRunOutcome(state.run.id, {
+          ...state.terminalOutcome, transcriptMessage: result.transcriptMessage,
+          transcriptOmitted: Boolean(state.transcriptOmitted || (pendingMessage && !result.transcriptMessage)),
+        });
+        state.outcomeJournaled = true;
+        state.outcomeJournalError = null;
+        result.journalBecameDurable = true;
+      } catch (journalError) { state.outcomeJournalError = journalError; }
     }
+    // The final checkpoint and terminal row commit together.
+    result.finished = database.finishRun(state.run.id, {
+      status, finishedAt, exitCode: terminalExitCode, error: message || null, pid: null,
+      ...(state.transcriptOmitted ? { transcriptOmitted: true } : {}),
+    }, result.transcriptMessage);
+  }
+
+  function deferFailedTerminalOutcome(state, exitCode, error, writeError, journalBecameDurable) {
+    state.finishing = false;
+    if (!storageAdmissionFailure(writeError) && !(writeError.statusCode === 503 && database.maintenanceActive)) throw writeError;
+    state.pendingFinish = { exitCode, error };
+    state.finishFailureCount = (state.finishFailureCount ?? 0) + 1;
+    const persistent = persistentStorageFailure(writeError) || state.finishFailureCount >= 2;
+    if (shuttingDown && journalBecameDurable) setTimeout(onShutdownRecovery, 0);
+    if (persistent && (!state.child || state.closed)) {
+      active.delete(state.run.id);
+      pendingOutcomes.set(state.run.id, state);
+      publish({ type: "run.outcome_pending", runId: state.run.id, conversationId: state.conversation.id, reason: "storage-unavailable" });
+      publish({ type: "capacity.changed" });
+      if (!database.maintenanceActive) drain();
+    }
+    if (!database.maintenanceActive) retryUnknownDiskUsage(persistent);
+    return false;
+  }
+
+  function completeTerminalOutcome(state, { finished, transcriptMessage }) {
+    const { status, message, finishedAt, exitCode: terminalExitCode } = state.terminalOutcome;
     state.pendingFinish = null;
     state.terminalOutcome = null;
     if (state.outcomeJournaled) {
@@ -717,6 +705,87 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     clearAssistant(state);
     emit(state.run.id, `run.${status}`, { exitCode: terminalExitCode, error: message || null, finishedAt });
     drain();
+  }
+
+  function finish(state, exitCode, error) {
+    if ((!active.has(state.run.id) && !pendingOutcomes.has(state.run.id)) || state.finishing) return;
+    if (state.child && !state.closed) return false;
+    state.finishing = true;
+    clearCheckpointTimer(state);
+    freezeTerminalOutcome(state, exitCode, error);
+    const result = { finished: null, transcriptMessage: null, journalBecameDurable: false };
+    try { persistTerminalOutcome(state, result); }
+    catch (writeError) { return deferFailedTerminalOutcome(state, exitCode, error, writeError, result.journalBecameDurable); }
+    completeTerminalOutcome(state, result);
+    return true;
+  }
+
+  function unresolvedOutcomeUnavailable() {
+    const unavailable = new Error("Run outcome storage is unavailable; retry shortly");
+    unavailable.statusCode = 503;
+    return unavailable;
+  }
+
+  function stopQueuedRun(runId, preserveOnMaintenance) {
+    const index = queue.findIndex((entry) => entry.run.id === runId);
+    if (index < 0) return false;
+    try { database.finishRun(runId, { status: "stopped", finishedAt: new Date().toISOString() }); }
+    catch (error) {
+      if (preserveOnMaintenance && database.maintenanceActive && error.statusCode === 503) return false;
+      throw error;
+    }
+    queue.splice(index, 1);
+    admissionRetryRuns.delete(runId);
+    if (!queue.length) { queueReadRetryPending = false; clearDiskRetry(); }
+    emit(runId, "run.stopped", { queued: true });
+    return true;
+  }
+
+  function settleFrozenOutcome(state, preserveOnMaintenance) {
+    if (finish(state, state.terminalOutcome.exitCode, state.pendingFinish?.error)) return true;
+    if (preserveOnMaintenance) return false;
+    throw unresolvedOutcomeUnavailable();
+  }
+
+  async function waitForOwnedAgentTree(state, runId) {
+    if (!state.child) return;
+    const started = Date.now();
+    let teardownRequested = Boolean(state.ownsDescendants);
+    let escalated = false;
+    let groupEscalated = false;
+    while (state.ownsDescendants
+      ? !state.closed || nativeOwnershipPending(state)
+      : !state.closed || processGroupAlive(state.child)) {
+      const elapsed = Date.now() - started;
+      if (!teardownRequested && elapsed >= terminationGraceMs) {
+        requestWrapperTeardown(state);
+        teardownRequested = true;
+      } else if (!state.ownsDescendants && teardownRequested && !escalated && elapsed >= terminationGraceMs + escalationGraceMs) {
+        escalateTree(state.child, state.launchHandshakePath);
+        escalated = true;
+      } else if (!state.ownsDescendants && escalated && !groupEscalated && elapsed >= terminationGraceMs + 2 * escalationGraceMs) {
+        terminateTree(state.child, "SIGKILL");
+        groupEscalated = true;
+      }
+      // Killing a native subreaper would escape its descendants. Keep its
+      // durable owner charged and report the timeout instead.
+      if (elapsed >= terminationTimeoutMs) throw new Error(`Agent process tree did not terminate: ${runId}`);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  function finishStoppedAgentState(state, preserveOnMaintenance) {
+    try {
+      if (finish(state, state.exitCode ?? null, null) === false) {
+        if (preserveOnMaintenance && !state.child) return false;
+        throw unresolvedOutcomeUnavailable();
+      }
+    } catch (error) {
+      // A childless validation can race archive cutover; its queued row then
+      // remains protected for the successor instead of claiming cancellation.
+      if (preserveOnMaintenance && !state.child && database.maintenanceActive && error.statusCode === 503) return false;
+      throw error;
+    }
     return true;
   }
 
@@ -725,37 +794,12 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if (pending) {
       if (finish(pending, pending.pendingFinish.exitCode, pending.pendingFinish.error)) return true;
       if (preserveOnMaintenance) return false;
-      const unavailable = new Error("Run outcome storage is unavailable; retry shortly");
-      unavailable.statusCode = 503;
-      throw unavailable;
+      throw unresolvedOutcomeUnavailable();
     }
     const state = active.get(runId);
-    if (!state) {
-      const index = queue.findIndex((entry) => entry.run.id === runId);
-      if (index < 0) return false;
-      try { database.finishRun(runId, { status: "stopped", finishedAt: new Date().toISOString() }); }
-      catch (error) {
-        // During archive cutover the database is closed. Shutdown can leave
-        // this never-started row for the successor to reconcile, but an API
-        // cancellation must report failure without losing its queue entry.
-        if (preserveOnMaintenance && database.maintenanceActive && error.statusCode === 503) return false;
-        throw error;
-      }
-      queue.splice(index, 1);
-      admissionRetryRuns.delete(runId);
-      if (!queue.length) {
-        queueReadRetryPending = false;
-        clearDiskRetry();
-      }
-      emit(runId, "run.stopped", { queued: true });
-      return true;
-    }
+    if (!state) return stopQueuedRun(runId, preserveOnMaintenance);
     if (state.terminalOutcome && (!state.child || state.closed)) {
-      if (finish(state, state.terminalOutcome.exitCode, state.pendingFinish?.error)) return true;
-      if (preserveOnMaintenance) return false;
-      const unavailable = new Error("Run outcome storage is unavailable; retry shortly");
-      unavailable.statusCode = 503;
-      throw unavailable;
+      return settleFrozenOutcome(state, preserveOnMaintenance);
     }
     if (state.stopping) return state.stopping;
     state.stopped = true;
@@ -770,66 +814,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // an unauthorized owner treats stop/end as abandonment.
     if (state.child && (state.ownsDescendants || process.platform === "win32")) requestWrapperTeardown(state);
     state.stopping = (async () => {
-      if (state.child) {
-        const started = Date.now();
-        // Do not depend on the first process-group SIGTERM winning the spawn /
-        // setsid race. The supervisor command is the authoritative teardown
-        // request and is safe when cancellation kept it unauthorized. Generic
-        // wrappers retain the configured graceful window below.
-        let teardownRequested = Boolean(state.ownsDescendants);
-        let escalated = false;
-        let groupEscalated = false;
-        while (state.ownsDescendants
-          ? !state.closed || nativeOwnershipPending(state)
-          : !state.closed || processGroupAlive(state.child)) {
-          const elapsed = Date.now() - started;
-          if (!teardownRequested && elapsed >= terminationGraceMs) {
-            // The platform supervisor owns teardown. Linux adopts escaped
-            // descendants as a subreaper and does not remove its handshake
-            // until the whole tree is gone; the non-Linux wrapper uses its
-            // ordered descendant/provider fallback.
-            requestWrapperTeardown(state);
-            teardownRequested = true;
-          } else if (!state.ownsDescendants && teardownRequested && !escalated && elapsed >= terminationGraceMs + escalationGraceMs) {
-            // The wrapper never managed (or was never the launch wrapper):
-            // fall back to killing the provider alone, so the wrapper — if
-            // alive — still reaps it.
-            escalateTree(state.child, state.launchHandshakePath);
-            escalated = true;
-          } else if (!state.ownsDescendants && escalated && !groupEscalated && elapsed >= terminationGraceMs + 2 * escalationGraceMs) {
-            // Last resort: the wrapper had its chance to reap; anything still
-            // executing in the group is killed outright. Liveness below
-            // recognizes the resulting non-executing zombie members as gone.
-            terminateTree(state.child, "SIGKILL");
-            groupEscalated = true;
-          }
-          if (elapsed >= terminationTimeoutMs) {
-            // A native supervisor is the only process that can adopt and reap
-            // escaped descendants. If it hangs or is hard-killed, falling back
-            // to a group kill would orphan zombies to PID 1 and recreate the
-            // leak this ownership boundary prevents. Fail closed, retain the
-            // durable handshake, and never claim the tree stopped.
-            throw new Error(`Agent process tree did not terminate: ${runId}`);
-          }
-          await new Promise((resolve) => setTimeout(resolve, 25));
-        }
-      }
-      try {
-        if (finish(state, state.exitCode ?? null, null) === false) {
-          if (preserveOnMaintenance && !state.child) return false;
-          const unavailable = new Error("Run outcome storage is unavailable; retry shortly");
-          unavailable.statusCode = 503;
-          throw unavailable;
-        }
-      }
-      catch (error) {
-        // A childless run may still be awaiting validation when cutover
-        // starts. Its queued row is recovery evidence; there is no process
-        // owner to wait for after the validation promise settles.
-        if (preserveOnMaintenance && !state.child && database.maintenanceActive && error.statusCode === 503) return false;
-        throw error;
-      }
-      return true;
+      await waitForOwnedAgentTree(state, runId);
+      return finishStoppedAgentState(state, preserveOnMaintenance);
     })();
     const stopping = state.stopping;
     try { return await stopping; }
@@ -880,6 +866,19 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     return { authorize };
   }
 
+  async function handleQueuedLaunchError(state, error) {
+    if (error.statusCode === 503 && database.maintenanceActive && !state.child && !state.stopped) {
+      // Revalidate the target after the archive worker reopens SQLite.
+      await waitForMaintenance();
+      return "retry";
+    }
+    if (!state.stopped && !error?.preserveActiveRun) {
+      // A refused terminal transaction keeps its slot and a bounded retry.
+      if (finish(state, null, error) === false && database.maintenanceActive) await waitForMaintenance();
+    }
+    return "finished";
+  }
+
   async function launchQueued(state, entry) {
     while (!state.stopped && !shuttingDown) {
       try {
@@ -897,17 +896,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         }
         return;
       } catch (error) {
-        if (error.statusCode === 503 && database.maintenanceActive && !state.child && !state.stopped) {
-          // Validation may have succeeded just as the database closed.
-          // Revalidate the target after reopening before any launch effect.
-          await waitForMaintenance();
-          continue;
-        }
-        if (!state.stopped && !error?.preserveActiveRun) {
-          // finish retains the active slot and schedules a bounded retry when
-          // its durable transaction is temporarily unavailable.
-          if (finish(state, null, error) === false && database.maintenanceActive) await waitForMaintenance();
-        }
+        if (await handleQueuedLaunchError(state, error) === "retry") continue;
         return;
       }
     }
@@ -980,6 +969,32 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       || observed?.availableForNewWorkBytes >= 64 * 1024) retryUnknownDiskUsage();
   }
 
+  function launchNextQueuedRun() {
+    let admissible;
+    try { admissible = database.canLaunchRun?.(); }
+    catch (error) {
+      if (!storageAdmissionFailure(error)) throw error;
+      queueReadRetryPending = true;
+      retryUnknownDiskUsage(persistentStorageFailure(error));
+      return false;
+    }
+    queueReadRetryPending = false;
+    if (admissible === false) { retryDeferredAdmission(); return false; }
+    clearDiskRetry();
+    const index = queue.findIndex((entry) => !conflictsWithActiveRun(entry));
+    if (index < 0) return false;
+    const entry = queue.splice(index, 1)[0];
+    const state = { ...entry, assistantSegments: [], assistantBytes: 0, assistantTruncated: false,
+      assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, transcriptSizes: new Map(),
+      transcriptBytes: 0, transcriptOmitted: false, stderr: "", stopped: false,
+      checkpointPendingBytes: 0, lastCheckpointAt: 0, checkpointTimer: null, checkpointHalted: false };
+    active.set(entry.run.id, state);
+    state.launch = entry.launch = launchQueued(state, entry);
+    launches.add(state.launch);
+    state.launch.then(() => launches.delete(state.launch), () => launches.delete(state.launch));
+    return true;
+  }
+
   function drain() {
     // Every entry point, including the disk retry timer, reaches this guard.
     // During the archive cutover getSettings cannot read the closed SQLite
@@ -1012,30 +1027,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // Keep that reservation until its terminal row commits, even if it stops
     // consuming a process slot before SQLite recovers.
     while (active.size < max && active.size + pendingOutcomes.size < RESOURCE_BUDGETS.maxPendingRunOutcomes && queue.length) {
-      let admissible;
-      try { admissible = database.canLaunchRun?.(); }
-      catch (error) {
-        if (!storageAdmissionFailure(error)) throw error;
-        queueReadRetryPending = true;
-        retryUnknownDiskUsage(persistentStorageFailure(error));
-        return;
-      }
-      // Queue reads own their retry separately from a run's pre-spawn audit.
-      // A sibling may finish its audit while this queue read is still faulted.
-      queueReadRetryPending = false;
-      if (admissible === false) {
-        retryDeferredAdmission();
-        return;
-      }
-      clearDiskRetry();
-      const index = queue.findIndex((entry) => !conflictsWithActiveRun(entry));
-      if (index < 0) return;
-      const entry = queue.splice(index, 1)[0];
-      const state = { ...entry, assistantSegments: [], assistantBytes: 0, assistantTruncated: false, assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, transcriptSizes: new Map(), transcriptBytes: 0, transcriptOmitted: false, stderr: "", stopped: false, checkpointPendingBytes: 0, lastCheckpointAt: 0, checkpointTimer: null, checkpointHalted: false };
-      active.set(entry.run.id, state);
-      state.launch = entry.launch = launchQueued(state, entry);
-      launches.add(state.launch);
-      state.launch.then(() => launches.delete(state.launch), () => launches.delete(state.launch));
+      if (!launchNextQueuedRun()) return;
     }
   }
 

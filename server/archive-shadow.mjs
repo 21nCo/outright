@@ -315,27 +315,24 @@ function finishLinkedCandidate(filename, next, old, marker) {
   }
 }
 
-function finishLinkedSource(filename, next, old, marker) {
-  const publicInfo = fileInfo(filename);
-  const oldInfo = fileInfo(old);
-  if (!publicInfo || !oldInfo || !sameArchiveFile(filename, old, publicInfo, oldInfo)
-    || publicInfo.nlink !== 2 || oldInfo.nlink !== 2 || !publicInfo.isFile() || !oldInfo.isFile()
-    || (process.platform !== "win32" && (String(publicInfo.dev) !== marker.sourceSnapshot?.dev
-      || String(publicInfo.ino) !== marker.sourceSnapshot?.ino))) return;
-  if (process.platform === "win32") {
+function checkpointArchiveSource(old, message) {
+  const source = lockArchiveDatabase(old);
+  try {
+    const checkpoint = source.pragma("wal_checkpoint(TRUNCATE)")[0];
+    if (checkpoint?.busy || source.pragma("journal_mode = DELETE", { simple: true }).toLowerCase() !== "delete") {
+      throw new Error(message);
+    }
+  } finally { source.close(); }
+  removeCheckpointedSidecars(old);
+}
+
+function finishLinkedSourceWindows(filename, next, old, marker) {
     // Checkpoint the restored source before obtaining the helper's SQLite
     // lock. No SQLite connection may remain open across Windows unlink.
     if (hasNonemptyWal(old)) {
       // WAL sidecars are named after the private fallback path. Opening the
       // public hard link would checkpoint a different WAL namespace.
-      const source = lockArchiveDatabase(old);
-      try {
-        const checkpoint = source.pragma("wal_checkpoint(TRUNCATE)")[0];
-        if (checkpoint?.busy || source.pragma("journal_mode = DELETE", { simple: true }).toLowerCase() !== "delete") {
-          throw new Error("Restored archive source WAL could not be checkpointed");
-        }
-      } finally { source.close(); }
-      removeCheckpointedSidecars(old);
+      checkpointArchiveSource(old, "Restored archive source WAL could not be checkpointed");
     }
     const candidateBefore = fileInfo(next) ? candidateIdentity(next, true) : null;
     if (candidateBefore && (!candidateMatchesIdentity(candidateBefore, marker.candidate, true, true)
@@ -354,8 +351,9 @@ function finishLinkedSource(filename, next, old, marker) {
       rmSync(old);
       durableDirectory(filename);
     } finally { release(); }
-    return;
-  }
+}
+
+function finishLinkedSourceUnix(filename, next, old, marker) {
   let sourceDb;
   let candidateDb;
   try {
@@ -382,19 +380,23 @@ function finishLinkedSource(filename, next, old, marker) {
   }
 }
 
+function finishLinkedSource(filename, next, old, marker) {
+  const publicInfo = fileInfo(filename);
+  const oldInfo = fileInfo(old);
+  if (!publicInfo || !oldInfo || !sameArchiveFile(filename, old, publicInfo, oldInfo)
+    || publicInfo.nlink !== 2 || oldInfo.nlink !== 2 || !publicInfo.isFile() || !oldInfo.isFile()
+    || (process.platform !== "win32" && (String(publicInfo.dev) !== marker.sourceSnapshot?.dev
+      || String(publicInfo.ino) !== marker.sourceSnapshot?.ino))) return;
+  if (process.platform === "win32") finishLinkedSourceWindows(filename, next, old, marker);
+  else finishLinkedSourceUnix(filename, next, old, marker);
+}
+
 function recoverPinnedInterruptedCutoverWindows(filename, next, old, marker) {
   const candidatePath = fileInfo(filename) ? filename : next;
   const candidateExists = Boolean(fileInfo(candidatePath));
   const sourceHadWal = hasNonemptyWal(old);
   if (sourceHadWal) {
-    const source = lockArchiveDatabase(old);
-    try {
-      const checkpoint = source.pragma("wal_checkpoint(TRUNCATE)")[0];
-      if (checkpoint?.busy || source.pragma("journal_mode = DELETE", { simple: true }).toLowerCase() !== "delete") {
-        throw new Error("Changed archive source WAL could not be checkpointed");
-      }
-    } finally { source.close(); }
-    removeCheckpointedSidecars(old);
+    checkpointArchiveSource(old, "Changed archive source WAL could not be checkpointed");
   }
   // Validate with SQLite before the OS lock, then pin and recheck the exact
   // bytes under that lock. Validation and file promotion never overlap an
@@ -502,6 +504,15 @@ function recoverPinnedInterruptedCutover(filename, next, old, marker) {
   }
 }
 
+function discardUnmovedArchiveCandidate(filename, next, state) {
+  if (!privateRegularFile(filename)) throw new Error("Archive maintenance source is missing or invalid");
+  releaseArchiveSourceFence(filename);
+  discardShadowCandidate(next);
+  durableDirectory(filename);
+  rmSync(state);
+  durableDirectory(filename);
+}
+
 export function recoverArchiveShadow(filename, { sourceUnmoved = false } = {}) {
   const { next, old, state } = archiveShadowPaths(filename);
   const temporary = `${state}.tmp`;
@@ -520,12 +531,7 @@ export function recoverArchiveShadow(filename, { sourceUnmoved = false } = {}) {
   // runtime still has its original connection, so discarding this candidate
   // does not need a whole-database integrity scan on every normal deferral.
   if (sourceUnmoved && !fileInfo(old)) {
-    if (!privateRegularFile(filename)) throw new Error("Archive maintenance source is missing or invalid");
-    releaseArchiveSourceFence(filename);
-    discardShadowCandidate(next);
-    durableDirectory(filename);
-    rmSync(state);
-    durableDirectory(filename);
+    discardUnmovedArchiveCandidate(filename, next, state);
     return;
   }
   if (fileInfo(old)) {
@@ -667,38 +673,44 @@ function cutoverArchiveShadowLocked(filename, { sourceInfo, cutoverStatGate, sta
   durableDirectory(filename);
 }
 
+function inspectAllocatedPart(part) {
+  try { return fs.lstatSync(part); }
+  catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function sumAllocatedParts(parts, state) {
+  let bytes = 0;
+  let transition = false;
+  const chargedLinks = new Set();
+  for (const part of parts) {
+    const info = inspectAllocatedPart(part);
+    if (!info) continue;
+    if (!info.isFile()) throw new Error(`Unsafe database storage file: ${part}`);
+    if (part === state || part === `${state}.tmp`) transition = true;
+    if (info.nlink > 1 && info.ino > 0) {
+      const identity = `${info.dev}:${info.ino}`;
+      if (chargedLinks.has(identity)) continue;
+      chargedLinks.add(identity);
+    }
+    const allocated = typeof info.blocks === "number" ? info.blocks * 512 : 0;
+    bytes += allocated > 0 ? allocated : info.size;
+  }
+  return { bytes, transition };
+}
+
 export function allocatedDatabaseUsage(filename) {
   if (filename === ":memory:") return { bytes: 0, status: "measured" };
   const { next, old, state } = archiveShadowPaths(filename);
   const sqliteFiles = [filename, next, old].flatMap((name) => [name, `${name}-wal`, `${name}-shm`, `${name}-journal`]);
-  const inspect = (part) => {
-    try { return fs.lstatSync(part); }
-    catch (error) {
-      if (error.code === "ENOENT") return null;
-      throw error;
-    }
-  };
   try {
-    const sourceBefore = inspect(filename);
-    const markerBefore = inspect(state);
-    let bytes = 0;
-    let transition = false;
-    const chargedLinks = new Set();
-    for (const part of [...sqliteFiles, state, `${state}.tmp`]) {
-      const info = inspect(part);
-      if (!info) continue;
-      if (!info.isFile()) throw new Error(`Unsafe database storage file: ${part}`);
-      if (part === state || part === `${state}.tmp`) transition = true;
-      if (info.nlink > 1 && info.ino > 0) {
-        const identity = `${info.dev}:${info.ino}`;
-        if (chargedLinks.has(identity)) continue;
-        chargedLinks.add(identity);
-      }
-      const allocated = typeof info.blocks === "number" ? info.blocks * 512 : 0;
-      bytes += allocated > 0 ? allocated : info.size;
-    }
-    const sourceAfter = inspect(filename);
-    const markerAfter = inspect(state);
+    const sourceBefore = inspectAllocatedPart(filename);
+    const markerBefore = inspectAllocatedPart(state);
+    let { bytes, transition } = sumAllocatedParts([...sqliteFiles, state, `${state}.tmp`], state);
+    const sourceAfter = inspectAllocatedPart(filename);
+    const markerAfter = inspectAllocatedPart(state);
     if (!sourceBefore && !markerBefore && !markerAfter) return { bytes: null, status: "unknown" };
     // A cutover can rename the source during this scan. Compare both ends so
     // a transiently absent marker cannot make a moving sum look measured.

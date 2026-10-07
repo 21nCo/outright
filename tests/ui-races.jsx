@@ -5250,8 +5250,8 @@ async function pendingRunOutcomeRegression() {
   root.render(<TooltipProvider><App /></TooltipProvider>);
   await until(() => fixtureSockets.length > socketsBefore && host.querySelector('[aria-label="Stop active agent run"]'), "running outcome fixture");
   assert(host.querySelector('.run-announcement[role="status"]')?.textContent.includes("Run running")
-    && host.querySelector('.message.is-streaming[aria-busy="false"]:not([role="status"])'),
-  "running activity content must remain readable while its status is announced");
+    && host.querySelector('.message.is-streaming[aria-busy="true"]:not([role="status"])'),
+  "running activity must report its busy state while its status is announced");
   const statusRegion = host.querySelector('.run-announcement');
   const statusMutations = [];
   const statusObserver = new MutationObserver((records) => statusMutations.push(...records));
@@ -5267,6 +5267,8 @@ async function pendingRunOutcomeRegression() {
   assert(!host.querySelector(".recovery-notice") && !host.querySelector(".run-state")?.textContent.includes("outcome pending"), "another chat's pending result appeared here");
   announce("run-A", "chat-A");
   await until(() => host.querySelector(".recovery-notice")?.textContent.includes("Run outcome waiting for storage"), "pending result announced");
+  assert(host.querySelector('.message.is-streaming[aria-busy="false"]'),
+    "the displayed run stops claiming active streaming when only outcome storage is pending");
   assert(host.querySelector(".recovery-notice")?.tagName === "DIV"
     && !host.querySelector(".recovery-notice")?.hasAttribute("aria-live")
     && host.querySelector('.run-announcement[role="status"]')?.textContent.includes("Saving final run outcome"),
@@ -5280,6 +5282,8 @@ async function pendingRunOutcomeRegression() {
   status = "completed";
   socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", runId: "run-A", conversationId: "chat-A", payload: { type: "run.completed" } }) }));
   await until(() => !host.querySelector(".recovery-notice") && host.querySelector(".run-state")?.textContent.includes("completed"), "durable result clears pending notice");
+  assert(!host.querySelector('.message.is-streaming[aria-busy="true"]'),
+    "settled output must no longer expose an active busy message");
   await settle();
   assert(statusRegion.textContent === "Run completed", "completion announcement did not settle");
   assert(statusMutations.length === 2, `completion must produce one further announcement; mutations=${statusMutations.length}, details=${JSON.stringify(statusMutations.map((record) => ({ type: record.type, oldValue: record.oldValue, target: record.target?.textContent })))}`);

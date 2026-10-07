@@ -112,6 +112,7 @@ async function runFile(file) {
   currentFileStartedAt = Date.now();
   if (process.env.CI) console.error(`CI test runner starting: file=${path.basename(file)} launcher=${process.pid}`);
   const cancelDirectory = windowsSupervisor ? mkdtempSync(path.join(os.tmpdir(), "outright-test-cancel-")) : null;
+  const testDataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-data-"));
   cancelFile = cancelDirectory ? path.join(cancelDirectory, "cancel") : null;
   child = spawn(windowsSupervisor ?? process.execPath, [
     ...(windowsSupervisor ? ["--test-runner", cancelFile, process.execPath] : []),
@@ -119,6 +120,7 @@ async function runFile(file) {
   ], {
     stdio: "inherit",
     detached: process.platform !== "win32",
+    env: { ...process.env, OUTRIGHT_DATA_DIR: testDataDirectory },
   });
   const runner = child;
   const closed = await new Promise((resolve) => {
@@ -135,6 +137,8 @@ async function runFile(file) {
   child = null;
   cancelFile = null;
   if (cancelDirectory) rmSync(cancelDirectory, { recursive: true, force: true });
+  if (groupGone) rmSync(testDataDirectory, { recursive: true, force: true });
+  else console.error(`Preserved test data for unverified runner group: ${testDataDirectory}`);
   currentFile = null;
   return { groupGone, passed: groupGone && closed.status === 0 && !closed.signal };
 }

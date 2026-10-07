@@ -50,6 +50,13 @@ const MAX_PENDING_RUNTIME_EVENT_BYTES = 2 * 1024 * 1024;
 const LIVE_TRUNCATION_MARKER = "\n\n[Live output truncated]";
 const LIVE_OMITTED_PREFIX = "[Earlier live output omitted]\n";
 
+function bootstrapFailureOutcome(error, manual) {
+  if (manual) return "error";
+  if (error.status !== 503) return "error";
+  if (error.payload != null && error.payload.code !== "ARCHIVE_MAINTENANCE_TRANSIENT") return "error";
+  return "retry";
+}
+
 export function App() {
   const [bootstrap, setBootstrap] = useState(null);
   const [bootstrapError, setBootstrapError] = useState("");
@@ -230,7 +237,7 @@ export function App() {
   const loadBootstrap = useCallback(async (manual = false, isCurrent = () => true) => {
     setIsScanning(true);
     try {
-      const next = await api(manual ? "/api/projects" : "/api/bootstrap", manual ? { method: "POST" } : undefined);
+      const next = manual ? await api("/api/projects", { method: "POST" }) : await api("/api/bootstrap");
       if (!isCurrent()) return false;
       if (manual) setBootstrap((current) => ({ ...current, ...next }));
       else setBootstrap(next);
@@ -240,10 +247,9 @@ export function App() {
     } catch (nextError) {
       if (!isCurrent()) return false;
       if (manual) setError(nextError.message);
-      const transientMaintenance = nextError.status === 503
-        && (nextError.payload == null || nextError.payload.code === "ARCHIVE_MAINTENANCE_TRANSIENT");
-      if (!manual && !transientMaintenance) setBootstrapError(nextError.message);
-      return !manual && transientMaintenance ? "retry" : "error";
+      const outcome = bootstrapFailureOutcome(nextError, manual);
+      if (!manual && outcome !== "retry") setBootstrapError(nextError.message);
+      return outcome;
     }
     finally { if (isCurrent()) setIsScanning(false); }
   }, []);
@@ -1898,7 +1904,7 @@ export function App() {
         <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
           <span className="sr-only run-announcement" role="status" aria-live="polite" aria-atomic="true">{runAnnouncement}</span>
           <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} pendingRuns={pendingOutcomeRuns} onManage={openManageChat} />
-          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversationContent}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{!conversation?.messagePage?.hasLater && (activeRun || pendingOutcomeRun) && !streamingText && <RunningMessage run={activeRun ?? pendingOutcomeRun} events={runEvents} outcomePending={!activeRun && outcomePending} />}</div></ScrollArea>
+          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversationContent}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} busy={activeRun?.status === "running"} />}{!conversation?.messagePage?.hasLater && (activeRun || pendingOutcomeRun) && !streamingText && <RunningMessage run={activeRun ?? pendingOutcomeRun} events={runEvents} outcomePending={!activeRun && outcomePending} busy={activeRun?.status === "running"} />}</div></ScrollArea>
           {readingLiveText && <section className="history-live-tail" aria-label={activeRun ? "Live output while reading history" : "Recent output while reading history"} tabIndex={0}><strong>{activeRun ? "Live output" : "Recent output"}</strong><p>{readingLiveText}</p></section>}
           {conversation?.messagePage?.hasLater && <div className="history-forward"><button className="history-later" onClick={loadLaterMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading later messages…" : `Load later messages · ${conversation.messagePage.newerCount} remaining`}</button><button className="history-return" onClick={() => loadConversation({ returnToLatest: true })}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button></div>}
           {outcomePending && <div className="recovery-notice"><WarningCircle weight="fill" /><span className="recovery-copy"><strong>Run outcome waiting for storage</strong><span>The agent process has exited. Outright is saving the final result for {pendingOutcomeRuns.length === 1 ? "run" : "runs"} {pendingOutcomeRuns.map((run, index) => <code key={run.id}>{run.id}{index < pendingOutcomeRuns.length - 1 ? ", " : ""}</code>)} and will update this chat when storage recovers.</span></span></div>}
@@ -1960,12 +1966,12 @@ function Message({ message, conversationId }) {
   if (message.kind === "tool") return <article className="message is-agent is-tool" data-message-id={message.id}><div className="avatar"><CheckCircle weight="fill" /></div><div className="message-body"><p className="message-text">{message.body}</p>{bodyReader}</div></article>;
   return <article className={`message ${user ? "is-user" : "is-agent"}`} data-message-id={message.id}><div className="avatar">{user ? "Y" : <Sparkle weight="fill" />}</div><div className="message-body"><div className="message-meta"><strong>{user ? "You" : "Outright"}</strong><time>{formatTime(message.createdAt)}</time></div><p className="message-text">{message.body}</p>{bodyReader}{message.payload?.runId && <small className="message-run">{message.payload.provider} · {message.payload.runId.slice(0, 8)}</small>}</div></article>;
 }
-function StreamingMessage({ text, events }) { return <article className="message is-agent is-streaming" aria-busy="false"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="message-text">{text}</p><ToolActivity events={events} /></div></article>; }
-function RunningMessage({ run, events, outcomePending = false }) {
+function StreamingMessage({ text, events, busy }) { return <article className="message is-agent is-streaming" aria-busy={busy}><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="message-text">{text}</p><ToolActivity events={events} /></div></article>; }
+function RunningMessage({ run, events, outcomePending = false, busy }) {
   let activityText = "Working in this worktree…";
   if (run.status === "queued") activityText = "Waiting for an execution slot…";
   if (outcomePending) activityText = "Waiting for storage to save the final result…";
-  return <article className="message is-agent is-streaming" aria-busy="false"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="thinking-copy">{activityText}</p><ToolActivity events={events} /></div></article>;
+  return <article className="message is-agent is-streaming" aria-busy={busy}><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="thinking-copy">{activityText}</p><ToolActivity events={events} /></div></article>;
 }
 // Interrupted runs surface here until the operator picks a continuation
 // policy; the preserved partial output stays visible above the notice.
