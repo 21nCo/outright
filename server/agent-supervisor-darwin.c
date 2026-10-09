@@ -17,7 +17,12 @@
 
 #define UTILITY_TREE_EMPTY "__OUTRIGHT_UTILITY_TREE_EMPTY_V1__\n"
 #define MAX_LAUNCH_ENVIRONMENT (1024 * 1024)
+#define LAUNCH_ENVIRONMENT "environment"
+#define LAUNCH_DEFINITION "launch.plist"
+#define LAUNCH_STATUS "status"
 extern char **environ;
+
+static int run_launchctl(char *const arguments[], char *output, size_t output_capacity);
 
 static int utility_prelaunch_exit(int code) {
   if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL) dprintf(3, "%s", UTILITY_TREE_EMPTY);
@@ -104,36 +109,52 @@ static int read_coalition_marker(const char *label, uint64_t *coalition_id) {
   return 1;
 }
 
-// launchctl submit starts a service with launchd's environment, not the
-// caller's. Transfer the caller's bounded environment through a private file
-// that the submitted helper unlinks before executing the command. Arguments
-// and process listings never contain credential values.
-static bool write_launch_environment(const char *label, char *directory, size_t directory_size,
-  char *filename, size_t filename_size) {
+static bool write_all(int descriptor, const char *cursor, size_t length) {
+  while (length > 0) {
+    ssize_t written = write(descriptor, cursor, length);
+    if (written < 0 && errno == EINTR) continue;
+    if (written <= 0) return false;
+    cursor += written;
+    length -= (size_t)written;
+  }
+  return true;
+}
+
+static bool write_launch_entry(int descriptor, const char *entry, size_t *total) {
+  size_t length = strlen(entry) + 1;
+  if (length > MAX_LAUNCH_ENVIRONMENT - *total) return false;
+  *total += length;
+  return write_all(descriptor, entry, length);
+}
+
+// A launchd job starts with launchd's environment, not the caller's. Transfer
+// the caller's working directory, command and bounded environment through a
+// private file that the launched helper claims exactly once. The job
+// definition, arguments and process listings never contain credential values.
+// Layout: NUL-terminated cwd, argument count, arguments, then environment.
+static bool write_launch_environment(const char *label, const char *current_directory,
+  int command_count, char **command, char *directory, size_t directory_size) {
   char resolved_root[4096];
+  char filename[4096];
   if (!private_temporary_root(resolved_root, sizeof(resolved_root))) return false;
   if (snprintf(directory, directory_size, "%s/outright-env-%s", resolved_root, label) >= (int)directory_size
       || mkdir(directory, 0700) != 0) return false;
-  if (snprintf(filename, filename_size, "%s/environment", directory) >= (int)filename_size) {
+  if (snprintf(filename, sizeof(filename), "%s/" LAUNCH_ENVIRONMENT, directory) >= (int)sizeof(filename)) {
     rmdir(directory);
     return false;
   }
-  int descriptor = open(filename, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  int descriptor = open(filename, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
   bool complete = descriptor >= 0;
   size_t total = 0;
+  char count[16];
+  snprintf(count, sizeof(count), "%d", command_count);
+  if (complete) complete = write_launch_entry(descriptor, current_directory, &total)
+    && write_launch_entry(descriptor, count, &total);
+  for (int index = 0; complete && index < command_count; index++)
+    complete = write_launch_entry(descriptor, command[index], &total);
   for (char **entry = environ; complete && *entry != NULL; entry++) {
     if (strncmp(*entry, "OUTRIGHT_UTILITY_OWNER=", 23) == 0) continue;
-    size_t length = strlen(*entry) + 1;
-    if (length > MAX_LAUNCH_ENVIRONMENT - total) { complete = false; break; }
-    total += length;
-    const char *cursor = *entry;
-    while (length > 0) {
-      ssize_t written = write(descriptor, cursor, length);
-      if (written < 0 && errno == EINTR) continue;
-      if (written <= 0) { complete = false; break; }
-      cursor += written;
-      length -= (size_t)written;
-    }
+    complete = write_launch_entry(descriptor, *entry, &total);
   }
   if (descriptor >= 0) {
     if (complete && fsync(descriptor) != 0) complete = false;
@@ -143,20 +164,88 @@ static bool write_launch_environment(const char *label, char *directory, size_t 
   return complete;
 }
 
+static bool write_plist_string(FILE *file, const char *value) {
+  fputs("<string>", file);
+  for (const unsigned char *cursor = (const unsigned char *)value; *cursor; cursor++) {
+    // XML 1.0 cannot carry other C0 controls; refuse instead of altering a path.
+    if (*cursor < 0x20 && *cursor != '\t' && *cursor != '\n' && *cursor != '\r') return false;
+    if (*cursor == '&') fputs("&amp;", file);
+    else if (*cursor == '<') fputs("&lt;", file);
+    else if (*cursor == '>') fputs("&gt;", file);
+    else fputc(*cursor, file);
+  }
+  fputs("</string>", file);
+  return true;
+}
+
+// launchctl submit registers a KeepAlive job: launchd starts it again after
+// every exit, so a finished provider would run twice and its first exit
+// would be replaced by the relaunch's. A bootstrapped job definition with
+// KeepAlive false runs once at load. launchd parses it during bootstrap, so
+// the file is removed immediately afterwards.
+static int bootstrap_job(const char *plist, const char *label, char *const arguments[],
+  const char *stdout_path, const char *stderr_path) {
+  int descriptor = open(plist, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (descriptor < 0) return -1;
+  FILE *file = fdopen(descriptor, "w");
+  if (file == NULL) { close(descriptor); unlink(plist); return -1; }
+  fputs("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+    "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key>", file);
+  bool valid = write_plist_string(file, label);
+  fputs("\n<key>ProgramArguments</key><array>", file);
+  for (char *const *argument = arguments; valid && *argument != NULL; argument++)
+    valid = write_plist_string(file, *argument);
+  fputs("</array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><false/>\n", file);
+  if (valid && stdout_path != NULL) {
+    fputs("<key>StandardOutPath</key>", file);
+    valid = write_plist_string(file, stdout_path);
+  }
+  if (valid && stderr_path != NULL) {
+    fputs("<key>StandardErrorPath</key>", file);
+    valid = write_plist_string(file, stderr_path);
+  }
+  fputs("\n</dict></plist>\n", file);
+  if (fflush(file) != 0 || fsync(descriptor) != 0) valid = false;
+  if (fclose(file) != 0) valid = false;
+  int status = -1;
+  if (valid) {
+    char domain[32];
+    snprintf(domain, sizeof(domain), "gui/%u", getuid());
+    char *bootstrap[] = { "launchctl", "bootstrap", domain, (char *)plist, NULL };
+    status = run_launchctl(bootstrap, NULL, 0);
+  }
+  unlink(plist);
+  return status;
+}
+
+// Removes one regular file this user created in the invocation directory.
+// Absence is success; anything else there keeps the directory for review.
+static bool remove_private_entry(int directory_fd, const char *name, bool private_mode) {
+  int descriptor = openat(directory_fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  if (descriptor < 0) return errno == ENOENT;
+  struct stat info;
+  bool safe = fstat(descriptor, &info) == 0 && S_ISREG(info.st_mode)
+    && info.st_uid == getuid() && info.st_nlink == 1
+    && (!private_mode || (info.st_mode & 077) == 0);
+  close(descriptor);
+  return safe && unlinkat(directory_fd, name, 0) == 0;
+}
+
 // Recovery removes only this invocation's private entry after launchd has
 // been verified absent. Directory descriptors keep replacement of a pathname
-// under the public temporary root from redirecting cleanup elsewhere.
+// under the public temporary root from redirecting cleanup elsewhere. The
+// coalition marker goes last: it is the durable identity if cleanup stops.
 static bool cleanup_launch_environment(const char *label) {
   char resolved_root[4096];
   if (!private_temporary_root(resolved_root, sizeof(resolved_root))) return false;
-  int root_fd = open(resolved_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  int root_fd = open(resolved_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (root_fd < 0) return false;
   char name[160];
   if (snprintf(name, sizeof(name), "outright-env-%s", label) >= (int)sizeof(name)) {
     close(root_fd);
     return false;
   }
-  int directory_fd = openat(root_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  int directory_fd = openat(root_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (directory_fd < 0) {
     bool missing = errno == ENOENT;
     close(root_fd);
@@ -164,78 +253,173 @@ static bool cleanup_launch_environment(const char *label) {
   }
   struct stat directory_info;
   bool safe = fstat(directory_fd, &directory_info) == 0 && S_ISDIR(directory_info.st_mode)
-    && directory_info.st_uid == getuid() && (directory_info.st_mode & 077) == 0;
-  if (safe) {
-    int file_fd = openat(directory_fd, "environment", O_RDONLY | O_NOFOLLOW);
-    if (file_fd >= 0) {
-      struct stat file_info;
-      safe = fstat(file_fd, &file_info) == 0 && S_ISREG(file_info.st_mode)
-        && file_info.st_uid == getuid() && file_info.st_nlink == 1
-        && (file_info.st_mode & 077) == 0;
-      close(file_fd);
-      if (safe && unlinkat(directory_fd, "environment", 0) != 0) safe = false;
-    } else if (errno != ENOENT) safe = false;
-  }
-  if (safe) {
-    int coalition_fd = openat(directory_fd, "coalition", O_RDONLY | O_NOFOLLOW);
-    if (coalition_fd >= 0) {
-      struct stat coalition_info;
-      safe = fstat(coalition_fd, &coalition_info) == 0 && S_ISREG(coalition_info.st_mode)
-        && coalition_info.st_uid == getuid() && coalition_info.st_nlink == 1;
-      close(coalition_fd);
-      if (safe && unlinkat(directory_fd, "coalition", 0) != 0) safe = false;
-    } else if (errno != ENOENT) safe = false;
-  }
+    && directory_info.st_uid == getuid() && (directory_info.st_mode & 077) == 0
+    && remove_private_entry(directory_fd, LAUNCH_ENVIRONMENT, true)
+    && remove_private_entry(directory_fd, LAUNCH_DEFINITION, true)
+    && remove_private_entry(directory_fd, LAUNCH_STATUS, true)
+    && remove_private_entry(directory_fd, "coalition", false);
   close(directory_fd);
   if (safe && unlinkat(root_fd, name, AT_REMOVEDIR) != 0 && errno != ENOENT) safe = false;
   close(root_fd);
   return safe;
 }
 
-static int exec_with_launch_environment(int argc, char **argv) {
-  if (argc < 5) return 64;
-  int descriptor = open(argv[2], O_RDONLY | O_NOFOLLOW);
-  if (descriptor < 0) return 73;
+static bool record_first_exit(int directory_fd, int code) {
+  int descriptor = openat(directory_fd, LAUNCH_STATUS, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (descriptor < 0) return false;
+  char value[16];
+  int length = snprintf(value, sizeof(value), "%d\n", code);
+  bool written = write_all(descriptor, value, (size_t)length) && fsync(descriptor) == 0;
+  if (close(descriptor) != 0) written = false;
+  return written && fsync(directory_fd) == 0;
+}
+
+// 1: the helper recorded the provider's first exit; 0: no trusted record.
+static int read_first_exit(const char *label, int *code) {
+  char root[4096];
+  char filename[4096];
+  if (!private_temporary_root(root, sizeof(root))
+      || snprintf(filename, sizeof(filename), "%s/outright-env-%s/" LAUNCH_STATUS, root, label) >= (int)sizeof(filename))
+    return 0;
+  int descriptor = open(filename, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  if (descriptor < 0) return 0;
   struct stat info;
-  if (fstat(descriptor, &info) != 0 || !S_ISREG(info.st_mode)
-      || info.st_uid != getuid() || (info.st_mode & 077) != 0
-      || info.st_size < 0 || info.st_size > MAX_LAUNCH_ENVIRONMENT) {
-    close(descriptor);
-    return 73;
-  }
-  size_t length = (size_t)info.st_size;
-  char *data = malloc(length + 1);
-  if (data == NULL) { close(descriptor); return 72; }
+  char value[16] = {0};
+  ssize_t length = read(descriptor, value, sizeof(value) - 1);
+  bool trusted = fstat(descriptor, &info) == 0 && S_ISREG(info.st_mode)
+    && info.st_uid == getuid() && info.st_nlink == 1 && (info.st_mode & 077) == 0;
+  close(descriptor);
+  if (length <= 1 || !trusted) return 0;
+  char *end = NULL;
+  errno = 0;
+  long recorded = strtol(value, &end, 10);
+  if (errno != 0 || recorded < 0 || recorded > 255 || end != value + length - 1 || *end != '\n') return 0;
+  *code = (int)recorded;
+  return 1;
+}
+
+static volatile sig_atomic_t provider_pid = 0;
+static void forward_signal(int signal_number) {
+  if (provider_pid > 0) kill((pid_t)provider_pid, signal_number);
+}
+
+// Reads the private launch file and removes it. Only the invocation whose
+// unlink succeeds may start the provider; every other start gets NULL.
+static char *claim_launch_file(int directory_fd, size_t *length) {
+  struct stat info;
+  if (fstatat(directory_fd, LAUNCH_STATUS, &info, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT) return NULL;
+  int descriptor = openat(directory_fd, LAUNCH_ENVIRONMENT, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  if (descriptor < 0) return NULL;
+  char *data = NULL;
+  if (fstat(descriptor, &info) == 0 && S_ISREG(info.st_mode) && info.st_uid == getuid()
+      && info.st_nlink == 1 && (info.st_mode & 077) == 0
+      && info.st_size > 0 && info.st_size <= MAX_LAUNCH_ENVIRONMENT) data = malloc((size_t)info.st_size + 1);
   size_t used = 0;
-  while (used < length) {
-    ssize_t received = read(descriptor, data + used, length - used);
+  while (data != NULL && used < (size_t)info.st_size) {
+    ssize_t received = read(descriptor, data + used, (size_t)info.st_size - used);
     if (received < 0 && errno == EINTR) continue;
-    if (received <= 0) { close(descriptor); free(data); return 73; }
+    if (received <= 0) break;
     used += (size_t)received;
   }
   close(descriptor);
-  if (length > 0 && data[length - 1] != '\0') { free(data); return 73; }
-  data[length] = '\0';
-  char **environment = calloc(length + 1, sizeof(char *));
-  if (environment == NULL) { free(data); return 72; }
-  size_t count = 0;
-  for (size_t offset = 0; offset < length;) {
-    size_t entry_length = strnlen(data + offset, length - offset);
-    if (entry_length == 0 || entry_length == length - offset
-        || memchr(data + offset, '=', entry_length) == NULL) {
-      free(environment); free(data); return 73;
-    }
-    environment[count++] = data + offset;
-    offset += entry_length + 1;
+  if (data == NULL || used != (size_t)info.st_size || unlinkat(directory_fd, LAUNCH_ENVIRONMENT, 0) != 0) {
+    free(data);
+    return NULL;
   }
-  // Keep the private directory until the owner proves the coalition empty.
-  // Recovery needs the durable coalition marker after a supervisor crash.
-  unlink(argv[2]);
-  if (chdir(argv[3]) != 0) return 71;
-  environ = environment;
-  execvp(argv[4], &argv[4]);
-  dprintf(STDERR_FILENO, "Unable to start owned command: %s\n", strerror(errno));
-  return 127;
+  data[used] = '\0';
+  *length = used;
+  return data;
+}
+
+// Splits the claimed file into cwd, command and environment. The returned
+// array owns the command pointers; environment points into the token list.
+static char **parse_launch_file(char *data, size_t length, char ***tokens, char ***environment) {
+  size_t token_count = 0;
+  for (size_t offset = 0; offset < length; offset++) if (data[offset] == '\0') token_count++;
+  if (token_count < 3 || data[length - 1] != '\0') return NULL;
+  *tokens = calloc(token_count + 1, sizeof(char *));
+  if (*tokens == NULL) return NULL;
+  for (size_t offset = 0, index = 0; offset < length; index++) {
+    (*tokens)[index] = data + offset;
+    offset += strlen(data + offset) + 1;
+  }
+  char *end = NULL;
+  long command_count = strtol((*tokens)[1], &end, 10);
+  if ((*tokens)[0][0] == '\0' || end == (*tokens)[1] || *end != '\0' || command_count < 1
+      || (size_t)command_count > token_count - 2 || (*tokens)[2][0] == '\0') return NULL;
+  *environment = *tokens + 2 + command_count;
+  for (char **entry = *environment; *entry != NULL; entry++)
+    if ((*entry)[0] == '\0' || strchr(*entry, '=') == NULL) return NULL;
+  char **command = calloc((size_t)command_count + 1, sizeof(char *));
+  if (command != NULL) memcpy(command, *tokens + 2, (size_t)command_count * sizeof(char *));
+  return command;
+}
+
+// Runs the provider as a child so its exit can be recorded. Termination
+// requests sent to the job's main process are forwarded to the provider.
+static int run_provider(char **command, char **environment) {
+  sigset_t forwarded;
+  sigset_t previous;
+  sigemptyset(&forwarded);
+  sigaddset(&forwarded, SIGTERM);
+  sigaddset(&forwarded, SIGINT);
+  sigaddset(&forwarded, SIGHUP);
+  sigprocmask(SIG_BLOCK, &forwarded, &previous);
+  pid_t child = fork();
+  if (child == 0) {
+    sigprocmask(SIG_SETMASK, &previous, NULL);
+    environ = environment;
+    execvp(command[0], command);
+    dprintf(STDERR_FILENO, "Unable to start owned command: %s\n", strerror(errno));
+    _exit(127);
+  }
+  if (child < 0) {
+    sigprocmask(SIG_SETMASK, &previous, NULL);
+    return 72;
+  }
+  provider_pid = child;
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = forward_signal;
+  sigemptyset(&action.sa_mask);
+  sigaction(SIGTERM, &action, NULL);
+  sigaction(SIGINT, &action, NULL);
+  sigaction(SIGHUP, &action, NULL);
+  sigprocmask(SIG_SETMASK, &previous, NULL);
+  int status = 0;
+  pid_t waited;
+  while ((waited = waitpid(child, &status, 0)) < 0 && errno == EINTR) {}
+  if (waited != child) return 70;
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  return WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 70;
+}
+
+// The launchd job's main process. It claims the launch file exactly once,
+// runs the provider and durably records the provider's exit before exiting
+// with it. Any later start of the same job (kickstart or a relaunch) finds
+// the claim taken and runs nothing, so the recorded first exit stays the
+// job's only provider status.
+static int run_launch_command(int argc, char **argv) {
+  if (argc != 3) return 64;
+  int directory_fd = open(argv[2], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (directory_fd < 0) return 73;
+  struct stat info;
+  size_t length = 0;
+  char *data = fstat(directory_fd, &info) == 0 && S_ISDIR(info.st_mode)
+    && info.st_uid == getuid() && (info.st_mode & 077) == 0 ? claim_launch_file(directory_fd, &length) : NULL;
+  if (data == NULL) {
+    close(directory_fd);
+    return 73;
+  }
+  char **tokens = NULL;
+  char **environment = NULL;
+  char **command = parse_launch_file(data, length, &tokens, &environment);
+  int code = 73;
+  if (command != NULL) code = chdir(tokens[0]) == 0 ? run_provider(command, environment) : 71;
+  record_first_exit(directory_fd, code);
+  close(directory_fd);
+  free(command); free(tokens); free(data);
+  return code;
 }
 
 // Exported by libsystem_kernel on macOS. A launchd job receives a resource
@@ -442,7 +626,7 @@ static service_result read_state(const char *target, service_state *state) {
 }
 
 // An empty coalition is not a release proof while launchd still owns a
-// submitted service: it may start the command again. Confirm that bootout
+// registered service: a kickstart may start the command again. Confirm that bootout
 // removed the registration before reporting an empty utility tree.
 static bool bootout_checked(const char *target) {
   for (int attempt = 0; attempt < 10; attempt++) {
@@ -566,7 +750,7 @@ static int control_existing_job(const char *mode, const char *label) {
   if (strcmp(mode, "--probe") == 0) {
     free(target);
     if (count < 0) { dprintf(STDOUT_FILENO, "unknown\n"); return 4; }
-    // A newly submitted job can have an allocated coalition before its first
+    // A newly registered job can have an allocated coalition before its first
     // process starts. An empty coalition is an exit proof only after launchd
     // has recorded at least one run.
     if (count == 0 && state.runs < 1) { dprintf(STDOUT_FILENO, "unknown\n"); return 4; }
@@ -591,8 +775,17 @@ static int self_test(const char *label) {
   if (!valid_label(label)) return 64;
   char *target = service_target(label);
   if (target == NULL) return 70;
-  char *arguments[] = { "launchctl", "submit", "-l", (char *)label, "--", "/bin/sleep", "5", NULL };
-  if (run_launchctl(arguments, NULL, 0) != 0) { free(target); return 71; }
+  // Verify the registration production uses: a run-once bootstrapped job.
+  char directory[4096];
+  char definition[4096];
+  if (!private_temporary_root(directory, sizeof(directory))
+      || strlcat(directory, "/outright-self-test-XXXXXX", sizeof(directory)) >= sizeof(directory)
+      || mkdtemp(directory) == NULL) { free(target); return 71; }
+  snprintf(definition, sizeof(definition), "%s/" LAUNCH_DEFINITION, directory);
+  char *arguments[] = { "/bin/sleep", "5", NULL };
+  int registered = bootstrap_job(definition, label, arguments, NULL, NULL);
+  rmdir(directory);
+  if (registered != 0) { free(target); return 71; }
   int result = 72;
   for (int attempt = 0; attempt < 100; attempt++) {
     service_state state;
@@ -614,7 +807,7 @@ static int self_test(const char *label) {
 
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "--utility-exec") == 0)
-    return exec_with_launch_environment(argc, argv);
+    return run_launch_command(argc, argv);
   if (argc == 3 && strcmp(argv[1], "--self-test") == 0) return self_test(argv[2]);
   if (argc == 3 && (strcmp(argv[1], "--probe") == 0 || strcmp(argv[1], "--terminate") == 0)) {
     return control_existing_job(argv[1], argv[2]);
@@ -666,55 +859,32 @@ int main(int argc, char **argv) {
   // launchd assigns this provider a unique resource coalition. Kernel
   // coalition membership survives setsid() and reparenting, so it is the
   // durable ownership boundary. A native helper restores the launcher's
-  // working directory and environment without putting
-  // either environment values or provider arguments in shell source.
+  // working directory and environment without putting either environment
+  // values or provider arguments in shell source or the job definition.
   char environment_directory[4096] = "";
-  char environment_file[4096] = "";
-  if (!write_launch_environment(argv[1], environment_directory, sizeof(environment_directory),
-      environment_file, sizeof(environment_file))) {
+  char definition[4096] = "";
+  if (!write_launch_environment(argv[1], current_directory, argc - 2, argv + 2,
+      environment_directory, sizeof(environment_directory))) {
     close(stdout_fd); close(stderr_fd); unlink(stdout_path); unlink(stderr_path);
     return utility_prelaunch_exit(72);
   }
-  size_t argument_count = (size_t)argc + 13;
-  char **submit = calloc(argument_count, sizeof(*submit));
-  if (submit == NULL) {
-    unlink(environment_file); rmdir(environment_directory);
-    close(stdout_fd); close(stderr_fd); unlink(stdout_path); unlink(stderr_path);
-    return utility_prelaunch_exit(72);
-  }
-  size_t index = 0;
-  submit[index++] = "launchctl";
-  submit[index++] = "submit";
-  submit[index++] = "-l";
-  submit[index++] = argv[1];
-  submit[index++] = "-o";
-  submit[index++] = stdout_path;
-  submit[index++] = "-e";
-  submit[index++] = stderr_path;
-  submit[index++] = "--";
-  submit[index++] = argv[0];
-  submit[index++] = "--utility-exec";
-  submit[index++] = environment_file;
-  submit[index++] = current_directory;
-  for (int source = 2; source < argc; source++) submit[index++] = argv[source];
-  submit[index] = NULL;
-
   char *target = service_target(argv[1]);
-  if (target == NULL) {
-    unlink(environment_file); rmdir(environment_directory);
-    free(submit);
+  if (target == NULL || snprintf(definition, sizeof(definition), "%s/" LAUNCH_DEFINITION,
+      environment_directory) >= (int)sizeof(definition)) {
+    cleanup_launch_environment(argv[1]);
+    free(target);
     close(stdout_fd); close(stderr_fd); unlink(stdout_path); unlink(stderr_path);
     return utility_prelaunch_exit(73);
   }
   if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL && (stop_requested || getppid() != owner_pid)) {
-    unlink(environment_file); rmdir(environment_directory);
-    close(stdout_fd); close(stderr_fd); unlink(stdout_path); unlink(stderr_path); free(target); free(submit);
+    cleanup_launch_environment(argv[1]);
+    close(stdout_fd); close(stderr_fd); unlink(stdout_path); unlink(stderr_path); free(target);
     return utility_prelaunch_exit(0);
   }
-  int submitted = run_launchctl(submit, NULL, 0);
-  free(submit);
+  char *job[] = { argv[0], "--utility-exec", environment_directory, NULL };
+  int submitted = bootstrap_job(definition, argv[1], job, stdout_path, stderr_path);
   if (submitted != 0) {
-    unlink(environment_file); rmdir(environment_directory);
+    cleanup_launch_environment(argv[1]);
     close(stdout_fd); close(stderr_fd); unlink(stdout_path); unlink(stderr_path); free(target);
     return 73;
   }
@@ -765,7 +935,11 @@ int main(int argc, char **argv) {
         stop_requested = 1;
       }
     }
-    if (state.runs >= 1 && state.active == 0) provider_exit_code = state.exit_code;
+    // The helper's record is the provider's first exit. launchd's last exit
+    // code describes the provider only when the job has run exactly once and
+    // the helper stopped before it could record a status.
+    if (state.runs >= 1 && state.active == 0 && read_first_exit(argv[1], &provider_exit_code) != 1)
+      provider_exit_code = state.runs == 1 ? state.exit_code : 70;
     if (stopping) {
       if (coalition_id != 0 && terminate_coalition(target, coalition_id)) {
         tree_empty_proven = true;
@@ -811,7 +985,7 @@ int main(int argc, char **argv) {
   unlink(stderr_path);
   // A failed coalition inspection or bootout has no empty-tree proof. Keep
   // its durable identity so a later missing-service probe cannot mistake an
-  // escaped descendant for a never-submitted invocation.
+  // escaped descendant for a never-registered invocation.
   if (tree_empty_proven && !cleanup_launch_environment(argv[1])) {
     tree_empty_proven = false;
     result = 70;

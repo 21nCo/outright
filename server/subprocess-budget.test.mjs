@@ -753,6 +753,82 @@ test("a crashed macOS owner settles after launchd drops its service and coalitio
   }
 });
 
+// launchd restarts a KeepAlive job that exits after its 10 s minimum runtime.
+// Every supervisor mode must report the provider's own first exit, start it
+// once, and leave no job, private directory or FIFO behind.
+test("macOS supervisor reports the first provider exit after launchd's minimum runtime", { skip: process.platform !== "darwin", timeout: 60_000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-darwin-first-exit-"));
+  const temporaryRoot = realpathSync(execFileSync("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"], { encoding: "utf8" }).trim());
+  const provider = path.join(root, "provider.sh");
+  writeFileSync(provider, "#!/bin/sh\necho start >> \"$1\"\nsleep \"$2\"\nexit \"$3\"\n", { mode: 0o700 });
+  const labels = [];
+  const supervise = (name, seconds, code, environment = {}, stdio = ["ignore", "ignore", "ignore"]) => {
+    const label = `com.21n.outright.first-exit-${name}-${randomUUID()}`;
+    labels.push(label);
+    const starts = path.join(root, `${name}.starts`);
+    const child = spawn(AGENT_SUPERVISOR, [label, "/bin/sh", provider, starts, String(seconds), String(code)],
+      { cwd: root, stdio, env: { ...process.env, ...environment } });
+    const exited = new Promise((resolve) => child.once("exit", (status) => resolve(status)));
+    return { label, starts, child, exited, invocation: path.join(temporaryRoot, `outright-env-${label}`) };
+  };
+  const startCount = (run) => existsSync(run.starts) ? readFileSync(run.starts, "utf8").split("\n").filter(Boolean).length : 0;
+  try {
+    const clean = supervise("clean", 12, 0);
+    const failed = supervise("failed", 12, 5);
+    const terminal = supervise("terminal", 12, 3, { OUTRIGHT_TERMINAL_CONTROL: "1" }, ["pipe", "ignore", "ignore"]);
+    const utility = supervise("utility", 12, 4, { OUTRIGHT_UTILITY_OWNER: "1" }, ["pipe", "ignore", "ignore", "pipe"]);
+    const frames = [];
+    utility.child.stdio[3].on("data", (chunk) => frames.push(chunk.toString()));
+    utility.child.stdin.write("go\n");
+    const short = supervise("short", 1, 6);
+    const deadline = Date.now() + 15_000;
+    while (startCount(clean) === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(startCount(clean), 1, "the provider did not start");
+    // A second start of the job's helper, as a kickstart or relaunch would
+    // run it, finds the launch claimed and must not run the provider again.
+    const relaunch = spawnSync(AGENT_SUPERVISOR, ["--utility-exec", clean.invocation], { encoding: "utf8", timeout: 10_000 });
+    assert.equal(relaunch.status, 73);
+    assert.deepEqual(await Promise.all([clean.exited, failed.exited, terminal.exited, utility.exited, short.exited]), [0, 5, 3, 4, 6],
+      "a launchd relaunch replaced the provider's first exit");
+    assert.deepEqual([clean, failed, terminal, utility, short].map(startCount), [1, 1, 1, 1, 1], "launchd ran a provider twice");
+    assert.ok(frames.join("").includes("__OUTRIGHT_UTILITY_TREE_EMPTY_V1__\n"), "the utility owner did not prove its tree empty");
+    for (const run of [clean, failed, terminal, utility, short]) {
+      assert.equal(existsSync(run.invocation), false, `${run.label} kept its private launch directory`);
+      assert.equal(existsSync(`/tmp/outright-agent-${run.label}-stdout.fifo`), false, `${run.label} kept its output FIFO`);
+      const service = spawnSync("/bin/launchctl", ["print", `gui/${process.getuid()}/${run.label}`], { stdio: "ignore" });
+      assert.notEqual(service.status, 0, `${run.label} left a launchd job behind`);
+    }
+  } finally {
+    for (const label of labels) spawnSync(AGENT_SUPERVISOR, ["--terminate", label], { stdio: "ignore", timeout: 10_000 });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("macOS launch helper runs its provider once and records only the first exit", { skip: process.platform !== "darwin", timeout: 20_000 }, () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-darwin-helper-"));
+  const invocation = path.join(root, "invocation");
+  const starts = path.join(root, "starts");
+  // Private launch file: NUL-terminated cwd, argument count, arguments, environment.
+  const launchFile = (code) => writeFileSync(path.join(invocation, "environment"),
+    [root, "3", "/bin/sh", "-c", `echo "$MARKER" >> ${JSON.stringify(starts)}; exit ${code}`, "MARKER=ran"].map((entry) => `${entry}\0`).join(""),
+    { mode: 0o600 });
+  try {
+    mkdirSync(invocation, { mode: 0o700 });
+    launchFile(7);
+    const first = spawnSync(AGENT_SUPERVISOR, ["--utility-exec", invocation], { encoding: "utf8" });
+    assert.equal(first.status, 7);
+    assert.equal(readFileSync(path.join(invocation, "status"), "utf8"), "7\n", "the helper did not record the provider's exit");
+    assert.equal(existsSync(path.join(invocation, "environment")), false, "the launch file was not claimed");
+    // Consumed launch: nothing runs again.
+    assert.equal(spawnSync(AGENT_SUPERVISOR, ["--utility-exec", invocation]).status, 73);
+    // A recorded first exit is final even if a launch file reappears.
+    launchFile(9);
+    assert.equal(spawnSync(AGENT_SUPERVISOR, ["--utility-exec", invocation]).status, 73);
+    assert.equal(readFileSync(path.join(invocation, "status"), "utf8"), "7\n");
+    assert.equal(readFileSync(starts, "utf8"), "ran\n", "the provider ran more than once");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("a failed native owner releases capacity only after its detached child is gone", { timeout: 15_000 }, async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-fault-"));
   const pidFile = path.join(root, "descendant.pid");

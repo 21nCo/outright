@@ -1053,7 +1053,7 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
       if (["alive", "exited"].includes(verdict)) return verdict;
       if (verdict === "absent") {
         // A unique launchd label can be absent briefly after the authorized
-        // wrapper has spawned its supervisor but before launchctl submit has
+        // wrapper has spawned its supervisor but before launchctl bootstrap has
         // completed. The matching wrapper proves that launch is still in
         // progress, but there is not yet a kernel boundary that recovery can
         // terminate, so keep the run unresolved until the job appears or the
@@ -1080,7 +1080,7 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
           }
         }
         if (liveSupervisorIdentity === supervisorIdentity) return "unknown";
-        // launchctl submit is forked by the supervisor and inherits the
+        // launchctl bootstrap is forked by the supervisor and inherits the
         // wrapper-owned process group. If the supervisor dies while submit is
         // in flight, that child can still create the job, so the whole group
         // must be empty before an absent label is accepted as exited.
