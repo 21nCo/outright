@@ -758,7 +758,7 @@ export function createOutrightDatabase(options = {}) {
         let deferred = 0;
         for (const id of ids) {
           try {
-            const result = await deleteArchivedInBatches(db, id, deletionsInFlight, { ...deletionContext, automatic: true, cutoff });
+            const result = await deleteArchivedInBatches(db, id, deletionsInFlight, { ...deletionContext, automatic: true, cutoff }); // NOSONAR S9382: one archive deletion at a time bounds writer occupancy
             if (result.deleted) {
               deleted.push(id);
               pausedDeletions.delete(id);
@@ -1445,7 +1445,10 @@ export function createOutrightDatabase(options = {}) {
     // them "interrupted" with a best-effort process classification instead of
     // failing them outright, and leave the continuation decision to the
     // operator so uncertain side effects are never silently retried.
-    reconcileInterruptedRuns({ probeAlive = defaultProbeRun, yieldBetweenBatches = false, signal } = {}) {
+    // A caller-owned progress accumulator receives each batch's counts only
+    // after that batch commits, so a later failed batch cannot erase rows an
+    // earlier batch already reconciled.
+    reconcileInterruptedRuns({ probeAlive = defaultProbeRun, yieldBetweenBatches = false, signal, progress } = {}) {
       const finishedAt = now();
       const counts = {};
       // Pending rows are selected inside the transaction and each update is
@@ -1461,6 +1464,7 @@ export function createOutrightDatabase(options = {}) {
         // queue limit. Commit bounded batches so a crash preserves progress
         // and startup never materializes the entire backlog in JavaScript.
         const pending = db.prepare("SELECT id, conversation_id AS conversationId, status, pid FROM runs WHERE status IN ('queued', 'running', 'launching') ORDER BY rowid LIMIT 64").all();
+        const batch = {};
         for (const run of pending) {
           // The owner may have observed provider close while SQLite refused
           // its terminal transaction. Its fsynced bounded result is stronger
@@ -1496,7 +1500,7 @@ export function createOutrightDatabase(options = {}) {
               writeCriticalAudit(`agent.run.${outcome.status}`, {
                 target: run.id, exitCode: outcome.exitCode, error: outcome.message || undefined,
               });
-              counts[outcome.status] = (counts[outcome.status] ?? 0) + 1;
+              batch[outcome.status] = (batch[outcome.status] ?? 0) + 1;
             }
             continue;
           }
@@ -1534,10 +1538,21 @@ export function createOutrightDatabase(options = {}) {
           if (!result.changes) continue;
           if (invalidOutcome) writeCriticalAudit("agent.run.outcome.invalid", { target: run.id });
           if (outcomeReadUnavailable) writeCriticalAudit("agent.run.outcome.unreadable", { target: run.id });
-          counts[classification] = (counts[classification] ?? 0) + 1;
+          batch[classification] = (batch[classification] ?? 0) + 1;
         }
-        return pending.length;
+        return { selected: pending.length, batch };
       });
+      const reconcileBatch = () => {
+        const { selected, batch } = reconcile.immediate();
+        for (const [classification, classified] of Object.entries(batch)) {
+          counts[classification] = (counts[classification] ?? 0) + classified;
+          if (progress) {
+            progress.counts[classification] = (progress.counts[classification] ?? 0) + classified;
+            progress.count += classified;
+          }
+        }
+        return selected > 0;
+      };
       const finish = () => {
         // Preserve unresolved live/unknown ownership evidence across repeated
         // restarts; sweep adopted and stale records without retaining every run
@@ -1547,7 +1562,7 @@ export function createOutrightDatabase(options = {}) {
         return { count, counts };
       };
       if (!yieldBetweenBatches) {
-        while (reconcile.immediate()) { /* Each committed batch is recoverable after interruption. */ }
+        while (reconcileBatch()) { /* Each committed batch is recoverable after interruption. */ }
         return finish();
       }
       runReconciliationPending = true;
@@ -1555,8 +1570,8 @@ export function createOutrightDatabase(options = {}) {
         try {
           while (true) {
             if (signal?.aborted || closing) throw databaseError(503, "Run reconciliation was interrupted");
-            if (!reconcile.immediate()) break;
-            await new Promise((resolve) => setImmediate(resolve));
+            if (!reconcileBatch()) break;
+            await new Promise((resolve) => setImmediate(resolve)); // NOSONAR S9382: yields after each committed reconciliation batch
           }
           return finish();
         } finally { runReconciliationPending = false; }
@@ -1829,7 +1844,7 @@ export function createOutrightDatabase(options = {}) {
           return;
         } catch (error) {
           if (!deletionWorkers.size || !["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code)) throw error;
-          await new Promise((resolve) => deletionIdleWaiters.add(resolve));
+          await new Promise((resolve) => deletionIdleWaiters.add(resolve)); // NOSONAR S9382: the audit retry waits for the active deletion worker
         }
       }
     },
@@ -1859,7 +1874,7 @@ export function createOutrightDatabase(options = {}) {
           return;
         } catch (error) {
           if (!deletionWorkers.size || !["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code)) throw error;
-          await new Promise((resolve) => deletionIdleWaiters.add(resolve));
+          await new Promise((resolve) => deletionIdleWaiters.add(resolve)); // NOSONAR S9382: the cleanup audit retry waits for the active deletion worker
         }
       }
     },
@@ -2149,7 +2164,7 @@ function deleteArchivedInBatches(db, id, inFlight, { automatic = false, cutoff, 
         const result = await advanceArchiveDeletion(db, id,
           { filename, workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing });
         if (result) return result;
-        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve)); // NOSONAR S9382: yields between dependent archive deletion steps
       }
     } finally { inFlight.delete(id); }
   };

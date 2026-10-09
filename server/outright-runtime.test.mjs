@@ -14,8 +14,19 @@ import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAliv
 import { createOutrightDatabase } from "./database.mjs";
 import { AGENT_SUPERVISOR, createAgentManager, LAUNCH_AUTHORIZED_CONTROL } from "./agent-manager.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
+import { createSubprocessBudget } from "./subprocess-budget.mjs";
+import { randomUUID } from "node:crypto";
 
 const execFileAsync = promisify(execFile);
+
+// Polls a condition until a deadline, then fails instead of hanging the run.
+async function waitFor(condition, timeoutMs, message) {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) assert.fail(message);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 async function settledWithin(promise, timeoutMs, message) {
   let timer;
@@ -150,10 +161,16 @@ test("the API maintenance gate distinguishes transient archive maintenance from 
   } });
 })());
 
-function withRunRecoveryFaults(faults, fn, { auditRefusal = null } = {}) {
+// The real reconciliation commits its first batch, then is interrupted. The
+// attempt rejects with the injected error, or with the database's own 503.
+function afterFirstBatch(error = null) {
+  return { afterFirstBatch: true, error };
+}
+
+function withRunRecoveryFaults(faults, fn, { auditRefusal = null, runs = 1 } = {}) {
   // Each fault rejects one reconciliation attempt. Database callbacks and
   // queued-run wakeups are captured at the real runtime boundary.
-  const state = { reconcileCalls: 0, resumes: 0, audits: 0, callbacks: {}, runId: null };
+  const state = { reconcileCalls: 0, resumes: 0, audits: 0, auditDetails: [], callbacks: {}, runId: null };
   return withRuntime(async (runtime) => fn(runtime, state), {
     databaseFactory(options) {
       state.callbacks = options;
@@ -162,12 +179,19 @@ function withRunRecoveryFaults(faults, fn, { auditRefusal = null } = {}) {
       database.reconcileInterruptedRuns = (settings) => {
         const fault = faults[state.reconcileCalls];
         state.reconcileCalls += 1;
+        if (fault?.afterFirstBatch) {
+          let checks = 0;
+          const signal = { get aborted() { checks += 1; return checks > 1 || settings.signal.aborted; } };
+          return reconcile({ ...settings, signal }).then(() => assert.fail("the fixture reconciliation was not interrupted"),
+            (error) => { throw fault.error ?? error; });
+        }
         return fault ? Promise.reject(fault) : reconcile(settings);
       };
       const audit = database.audit.bind(database);
       database.audit = (action, details) => {
         if (action === "runtime.runs.reconciled") {
           state.audits += 1;
+          state.auditDetails.push(details);
           if (auditRefusal) throw auditRefusal;
         }
         return audit(action, details);
@@ -184,7 +208,19 @@ function withRunRecoveryFaults(faults, fn, { auditRefusal = null } = {}) {
       const seed = createOutrightDatabase();
       const conversation = seed.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Interrupted", provider: "codex" });
       state.runId = seed.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "pending" }).id;
-      return seed.close();
+      const filename = seed.filename;
+      seed.close();
+      if (runs <= 1) return;
+      // A legacy backlog larger than one reconciliation batch.
+      const db = new Database(filename);
+      try {
+        const row = db.prepare("SELECT * FROM runs WHERE id = ?").get(state.runId);
+        const columns = Object.keys(row);
+        const insert = db.prepare(`INSERT INTO runs (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`);
+        db.transaction(() => {
+          for (let index = 1; index < runs; index += 1) insert.run(...columns.map((column) => (column === "id" ? `${row.id}-${index}` : row[column])));
+        })();
+      } finally { db.close(); }
     },
   });
 }
@@ -249,7 +285,7 @@ test("a refused post-recovery summary audit leaves the runtime serving", withRun
 }, { auditRefusal: storageFault("SQLITE_FULL") }));
 
 test("shutdown during a run recovery retry backoff settles without another attempt", withRunRecoveryFaults(Array.from({ length: 8 }, () => storageFault("SQLITE_BUSY")), async (runtime, state) => {
-  while (state.reconcileCalls < 3) await new Promise((resolve) => setTimeout(resolve, 10));
+  await waitFor(() => state.reconcileCalls >= 3, 5000, "bounded retry did not reach the third attempt");
   const started = Date.now();
   await settledWithin(runtime.shutdown(), 2000, "shutdown waited for the retry schedule");
   const calls = state.reconcileCalls;
@@ -258,6 +294,74 @@ test("shutdown during a run recovery retry backoff settles without another attem
   assert.ok(Date.now() - started < 2000);
   assert.equal(state.resumes, 0);
 }));
+
+function interruptedRunCount(runtime) {
+  return runtime.database.capacity().recoverable;
+}
+
+test("a retry after a committed partial batch audits every reconciled run and resumes once", withRunRecoveryFaults([afterFirstBatch()], async (runtime, state) => {
+  await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "recovery did not settle");
+  assert.equal(state.reconcileCalls, 2);
+  assert.equal(interruptedRunCount(runtime), 64, "the fixture backlog was not reconciled");
+  assert.deepEqual(state.auditDetails, [{ target: "runtime", count: 64, counts: { "never-started": 64 } }],
+    "the first attempt's committed batch is part of the recovery outcome");
+  assert.equal(state.resumes, 1, "queued work resumes exactly once although the final attempt found no rows");
+}, { runs: 64 }));
+
+test("reconciliation progress accumulates across attempts and an operator-restarted cycle", withRunRecoveryFaults([afterFirstBatch(), afterFirstBatch(new Error("corrupt recovery row"))], async (runtime, state) => {
+  await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "failed recovery did not settle");
+  assert.equal((await getRoute(runtime, "/api/capacity")).body.runRecoveryPhase, "failed");
+  assert.deepEqual(state.auditDetails, []);
+  assert.equal(state.resumes, 0);
+  await new Promise((resolve) => setTimeout(resolve, 1050));
+  assert.equal((await getRoute(runtime, "/api/bootstrap")).body.code, "RUN_RECOVERY_TRANSIENT");
+  await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "restarted recovery did not settle");
+  assert.equal(state.reconcileCalls, 3);
+  assert.equal(interruptedRunCount(runtime), 150);
+  assert.deepEqual(state.auditDetails, [{ target: "runtime", count: 150, counts: { "never-started": 150 } }]);
+  assert.equal(state.resumes, 1);
+}, { runs: 150 }));
+
+test("an operator releases an unproven utility owner only through the audited capacity route", async () => {
+  const unknownDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-runtime-utility-owner-"));
+  const unproven = randomUUID();
+  const running = randomUUID();
+  for (const id of [unproven, running]) {
+    writeFileSync(path.join(unknownDirectory, `${id}.json`), JSON.stringify({ state: "unknown", platform: process.platform,
+      authorized: true, pid: 2147483647, recordedAt: "2026-10-09T10:00:00.000Z" }), { mode: 0o600 });
+  }
+  const reasons = { [unproven]: "job-absent-without-marker", [running]: "owner-alive" };
+  const subprocesses = createSubprocessBudget({ limit: 2, unknownDirectory,
+    proveOwner: async (_record, id) => ({ empty: false, reason: reasons[id] }) });
+  const post = async (runtime, id) => {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/capacity/utility-owners/${id}/release`), response);
+    return response;
+  };
+  try {
+    await withRuntime(async (runtime) => {
+      await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "recovery did not settle");
+      const reported = async () => (await getRoute(runtime, "/api/capacity")).body.utilityOwners;
+      await waitFor(() => subprocesses.unknownOwnerStatus().every((owner) => owner.reason !== "awaiting-reconciliation"), 5000,
+        "startup reconciliation did not classify the unknown owners");
+      assert.deepEqual(new Set((await reported()).map((owner) => `${owner.id}:${owner.reason}:${owner.releasable}`)),
+        new Set([`${unproven}:job-absent-without-marker:true`, `${running}:owner-alive:false`]));
+      const refused = await post(runtime, running);
+      assert.equal(refused.statusCode, 409);
+      assert.equal(refused.body.code, "UTILITY_OWNER_ALIVE");
+      const released = await post(runtime, unproven);
+      assert.equal(released.statusCode, 200);
+      assert.deepEqual(released.body.released, { id: unproven, proven: false, reason: "job-absent-without-marker",
+        platform: process.platform, recordedAt: "2026-10-09T10:00:00.000Z" });
+      assert.deepEqual(released.body.capacity.utilityProcesses, { active: 1, unknown: 1, limit: 2 });
+      const audit = runtime.database.listAudit(20).filter((entry) => entry.action === "utility.owner.released");
+      assert.deepEqual(audit.map((entry) => [entry.target, entry.details.reason, entry.details.proven]),
+        [[unproven, "job-absent-without-marker", false]]);
+      assert.equal((await post(runtime, unproven)).statusCode, 404);
+      assert.equal((await post(runtime, "not-an-owner")).statusCode, 404);
+    }, { subprocesses })();
+  } finally { rmSync(unknownDirectory, { recursive: true, force: true }); }
+});
 
 test("runtime startup settles an orphan PTY before serving requests", withRuntime(async (runtime) => {
   await runtime.database.waitForTerminalAuditReconciliation();

@@ -260,7 +260,7 @@ export async function mapWithConcurrency(items, concurrency, mapper) {
   async function worker() {
     while (!failed && cursor < items.length) {
       const index = cursor++;
-      try { results[index] = await mapper(items[index], index); }
+      try { results[index] = await mapper(items[index], index); } // NOSONAR S9382: one worker of a bounded scan pool
       catch (error) { if (!failed) { failed = true; failure = error; } }
     }
   }

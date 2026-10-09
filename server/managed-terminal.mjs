@@ -132,12 +132,12 @@ async function connectBroker(address, isClosed, failureDetails) {
   const deadline = Date.now() + START_TIMEOUT_MS;
   while (Date.now() < deadline && !isClosed()) {
     try {
-      return await new Promise((resolve, reject) => {
+      return await new Promise((resolve, reject) => { // NOSONAR S9382: connect retries until the broker start deadline
         const client = net.createConnection(address);
         client.once("connect", () => resolve(client));
         client.once("error", reject);
       });
-    } catch { await new Promise((resolve) => setTimeout(resolve, 25)); }
+    } catch { await new Promise((resolve) => setTimeout(resolve, 25)); } // NOSONAR S9382: backoff between broker connect retries
   }
   throw new Error(`PTY broker did not start: ${failureDetails() || "native supervisor unavailable"}`);
 }
@@ -329,7 +329,7 @@ async function recoverDarwinTerminal(label, subprocesses) {
       catch { /* The owner may be finishing concurrently; probe again. */ }
       if (await probeDarwinTerminal(subprocesses, label) === "absent") return true;
     }
-    if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 75));
+    if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 75)); // NOSONAR S9382: bounded retries wait between native probes
   }
   return false;
 }
@@ -347,7 +347,7 @@ async function recoverLinuxTerminal(target, launchDirectory, subprocesses) {
   catch { return false; }
   for (let retry = 0; retry < 100; retry += 1) {
     if (!existsSync(handshakePath)) return true;
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, 50)); // NOSONAR S9382: polls handshake removal within bounded retries
   }
   return !existsSync(handshakePath);
 }

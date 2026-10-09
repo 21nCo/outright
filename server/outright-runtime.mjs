@@ -56,7 +56,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   let shuttingDown = false;
   // One owner for interrupted-run recovery. Queued work resumes only after a
   // reconciliation completes; every other phase defers the wakeup until then.
-  const runRecovery = { phase: "pending", error: null, failedAt: 0, resumeDeferred: false, cycle: Promise.resolve() };
+  // Progress accumulates every committed batch across the initial cycle,
+  // transient retries and operator-restarted cycles.
+  const runRecovery = { phase: "pending", error: null, failedAt: 0, resumeDeferred: false, cycle: Promise.resolve(),
+    progress: { count: 0, counts: {} } };
   const runRecoveryController = new AbortController();
   function resumeQueuedAfterRecovery() {
     if (runRecovery.phase !== "complete") { runRecovery.resumeDeferred = true; return; }
@@ -90,7 +93,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   database.reconcilePendingRetentionCleanup();
   database.reconcileTerminalAudit();
   const reconcileInterruptedRuns = () => database.reconcileInterruptedRuns({ yieldBetweenBatches: true,
-    signal: runRecoveryController.signal,
+    signal: runRecoveryController.signal, progress: runRecovery.progress,
     probeAlive: (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync),
   });
   // The first bounded batch commits during construction, before any request
@@ -128,7 +131,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       runRecoveryPhase: runRecovery.phase, runRecoveryError: runRecovery.error?.message ?? null,
       pendingRunOutcomes: agents?.pendingOutcomeCount() ?? 0,
       limits: { ...capacity.limits, maxPendingRunOutcomes: RESOURCE_BUDGETS.maxPendingRunOutcomes },
-      utilityProcesses: subprocesses.capacity(), terminalProcesses: terminals.capacity() };
+      utilityProcesses: subprocesses.capacity(), utilityOwners: subprocesses.unknownOwnerStatus?.() ?? [],
+      terminalProcesses: terminals.capacity() };
   };
   // Construct the agent manager after the remaining synchronous startup
   // checks. No provider discovery owner then needs asynchronous teardown on
@@ -152,17 +156,19 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required");
     };
   } });
-  function completeRunRecovery(result) {
+  function completeRunRecovery() {
     runRecovery.phase = "complete";
     runRecovery.error = null;
     if (shuttingDown) return;
-    // The reconciled rows have committed. Their summary audit is telemetry
-    // and cannot turn that durable recovery into a failed runtime.
-    if (result.count) {
-      try { database.audit("runtime.runs.reconciled", { target: "runtime", ...result }); }
+    // Every attempt's committed rows belong to this one recovery, even when
+    // the final attempt found none. The summary audit is telemetry and cannot
+    // turn that durable recovery into a failed runtime.
+    const { count, counts } = runRecovery.progress;
+    if (count) {
+      try { database.audit("runtime.runs.reconciled", { target: "runtime", count, counts: { ...counts } }); }
       catch (error) { if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:run-recovery-audit]", error); }
     }
-    if (result.count || runRecovery.resumeDeferred) {
+    if (count || runRecovery.resumeDeferred) {
       runRecovery.resumeDeferred = false;
       agents.resumeQueued();
     }
@@ -186,16 +192,16 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   async function recoverInterruptedRuns(firstAttempt) {
     const { signal } = runRecoveryController;
     for (let attempt = 0; ; attempt += 1) {
-      let result;
       try {
-        result = await (attempt === 0 ? firstAttempt : reconcileInterruptedRuns());
+        // Each retry depends on the previous attempt's committed batches.
+        await (attempt === 0 ? firstAttempt : reconcileInterruptedRuns());
       } catch (error) {
         if (shuttingDown || signal.aborted) return;
         const delay = recordRunRecoveryFailure(error, attempt);
         if (delay === undefined || !await abortableDelay(delay, signal)) return;
         continue;
       }
-      completeRunRecovery(result);
+      completeRunRecovery();
       return;
     }
   }
@@ -330,6 +336,20 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     return result;
   }
 
+  // The operator's decision is durably audited before the reservation is
+  // released; a refused audit keeps the capacity charged.
+  async function releaseUtilityOwner(id) {
+    if (typeof subprocesses.releaseUnknownOwner !== "function") throw apiError(404, "Unknown utility owner was not found");
+    const released = await subprocesses.releaseUnknownOwner(id, {
+      audit: (outcome) => database.auditRequired("utility.owner.released", { target: outcome.id, proven: outcome.proven,
+        reason: outcome.reason, platform: outcome.platform, recordedAt: outcome.recordedAt }),
+    });
+    publish({ type: "capacity.changed", payload: runtimeCapacity() });
+    // A terminal proof may have waited only for this helper slot.
+    if (!shuttingDown) void terminals.reconcileUnknown().catch(() => {});
+    return { released, capacity: runtimeCapacity() };
+  }
+
   async function handleRequest(request, response) {
     const url = new URL(request.url, "http://localhost");
     if (!url.pathname.startsWith("/api/")) return false;
@@ -370,6 +390,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         return json(response, 200, settings);
       }
       if (url.pathname === "/api/capacity" && request.method === "GET") return json(response, 200, runtimeCapacity());
+      const utilityOwnerMatch = url.pathname.match(/^\/api\/capacity\/utility-owners\/([0-9a-f-]{36})\/release$/);
+      if (utilityOwnerMatch && request.method === "POST") return json(response, 200, await releaseUtilityOwner(utilityOwnerMatch[1]));
       if (url.pathname === "/api/retention/archived" && request.method === "GET") {
         const limitText = url.searchParams.get("limit");
         const limit = limitText === null ? 100 : Number(limitText);

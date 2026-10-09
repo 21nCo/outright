@@ -106,7 +106,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
           if (shuttingDown) break;
           const entry = entries[next++];
           try {
-            if (!await reconcileReservedTerminal(entry)) continue;
+            if (!await reconcileReservedTerminal(entry)) continue; // NOSONAR S9382: one worker of a bounded reconciliation pool
             resolved += 1;
             publish({ type: "capacity.changed" });
           } catch { /* A refused helper or unavailable audit keeps capacity unknown. */ }

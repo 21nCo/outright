@@ -39,7 +39,7 @@ async function remainsTrue(check, durationMs, label) {
   const deadline = performance.now() + durationMs;
   while (performance.now() < deadline) {
     assert(check(), label);
-    await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - performance.now()))));
+    await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - performance.now())))); // NOSONAR S9382: polls one condition until its deadline
   }
   assert(check(), label);
 }
@@ -390,20 +390,20 @@ async function settingsSaveSessionFenceRegression() {
           templates={[]} onSaved={(_, refresh) => { if (!refresh) saved += 1; }} onError={() => { errors += 1; }} /></>;
       }
       root.render(<TooltipProvider><Fixture /></TooltipProvider>);
-      await until(() => host.querySelector("button"), "save fixture mounted");
+      await until(() => host.querySelector("button"), "save fixture mounted"); // NOSONAR S9382: Settings session steps observe the previous step
       const open = () => host.querySelector("button").click();
       const age = () => document.querySelector('[role="dialog"] label:last-of-type input');
       const action = (label) => [...document.querySelectorAll('[role="dialog"] button')]
         .find((button) => button.textContent.includes(label)).click();
       open();
-      await until(() => age()?.value === "90", "save fixture opened");
+      await until(() => age()?.value === "90", "save fixture opened"); // NOSONAR S9382: Settings session steps observe the previous step
       if (method === "PATCH") setControlValue(age(), "60");
       action("Save settings");
-      await until(() => started, "old Settings save held");
+      await until(() => started, "old Settings save held"); // NOSONAR S9382: Settings session steps observe the previous step
       action("Cancel");
-      await until(() => !document.querySelector('[role="dialog"]'), "old Settings closed");
+      await until(() => !document.querySelector('[role="dialog"]'), "old Settings closed"); // NOSONAR S9382: Settings session steps observe the previous step
       open();
-      await until(() => age()?.value === "90", "new Settings session opened");
+      await until(() => age()?.value === "90", "new Settings session opened"); // NOSONAR S9382: Settings session steps observe the previous step
       setControlValue(age(), "70");
       age().focus();
       if (outcome === "success") held.resolve(response({ ...settings, retentionDays: 60 }));
@@ -412,7 +412,7 @@ async function settingsSaveSessionFenceRegression() {
       assert(age()?.value === "70" && document.activeElement === age(), `${method} ${outcome} changed new Settings draft or focus`);
       assert(saved === 0 && errors === 0, `${method} ${outcome} published an old Settings completion`);
       action("Save settings");
-      await until(() => !document.querySelector('[role="dialog"]') && saved === 1,
+      await until(() => !document.querySelector('[role="dialog"]') && saved === 1, // NOSONAR S9382: Settings session steps observe the previous step
         `current Settings save after stale ${method} ${outcome}`);
     }
   }
@@ -1924,13 +1924,13 @@ async function terminalRejectedSwitchRegression() {
     `Retried terminal did not fit the current pane: narrow=${JSON.stringify(narrowSize)}, retry=${JSON.stringify(retrySnapshot)}`);
   for (const width of [320, 540, 320, 540]) {
     paneFrame.style.width = `${width}px`;
-    await until(() => Math.abs(host.querySelector('.terminal-host')?.getBoundingClientRect().width - width) < 2,
+    await until(() => Math.abs(host.querySelector('.terminal-host')?.getBoundingClientRect().width - width) < 2, // NOSONAR S9382: each width settles before its terminals are checked
       `terminal host width ${width}`);
     host.querySelector('[data-tab-id="term-A"]').click();
-    await until(() => terminalReady("Terminal A"), `terminal A at ${width}`);
+    await until(() => terminalReady("Terminal A"), `terminal A at ${width}`); // NOSONAR S9382: each width settles before its terminals are checked
     const before = sent.length;
     host.querySelector('[data-tab-id="term-A2"]').click();
-    await until(() => terminalReady("Terminal A2") && sent.slice(before).some((message) => message.type === "terminal.resize" && message.terminalId === "term-A2"),
+    await until(() => terminalReady("Terminal A2") && sent.slice(before).some((message) => message.type === "terminal.resize" && message.terminalId === "term-A2"), // NOSONAR S9382: each width settles before its terminals are checked
       `terminal A2 fitted at ${width}`);
     const fitted = sent.findLast((message) => message.type === "terminal.resize" && message.terminalId === "term-A2");
     assert(width === 540 ? fitted.cols > narrowSize.cols : fitted.cols <= narrowSize.cols,
@@ -2365,20 +2365,20 @@ async function terminalDeleteFocusOwnershipRegression() {
       return response({ buffer: "ready", status: "running" });
     };
     root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null} onError={(error) => { throw error; }} sendRuntime={() => {}} />);
-    await until(() => terminalReady("Terminal A"), "terminal focus fixture ready");
+    await until(() => terminalReady("Terminal A"), "terminal focus fixture ready"); // NOSONAR S9382: deletion focus steps depend on the prior commit
     const close = host.querySelector('[aria-label="Close terminal Terminal A"]');
     close.focus();
     close.click();
-    await until(() => deleting, "terminal deletion held");
+    await until(() => deleting, "terminal deletion held"); // NOSONAR S9382: deletion focus steps depend on the prior commit
     const other = chooseOther ? document.createElement("button") : null;
     if (other) { document.body.append(other); other.focus(); }
     try {
       deletion.resolve(response({}));
-      await until(() => terminalReady("Terminal A2"), "replacement terminal selected");
+      await until(() => terminalReady("Terminal A2"), "replacement terminal selected"); // NOSONAR S9382: deletion focus steps depend on the prior commit
       if (other) {
         assert(document.activeElement === other, "Delayed terminal deletion stole a newer focus choice");
       } else {
-        await until(() => document.activeElement === host.querySelector('[role="tab"][aria-selected="true"]'), "replacement tab receives focus after commit");
+        await until(() => document.activeElement === host.querySelector('[role="tab"][aria-selected="true"]'), "replacement tab receives focus after commit"); // NOSONAR S9382: deletion focus steps depend on the prior commit
       }
     } finally { other?.remove(); }
   }
@@ -3025,7 +3025,7 @@ async function variableHeightFindAnchorRegression() {
   await settle();
   assert(viewport.current.scrollTop < 50, "Live append snapped back to an old find target after user scrolling");
   for (const index of [0, 200]) {
-    await assertVariableHeightEdgeScrollOwnership(index, input, viewport.current);
+    await assertVariableHeightEdgeScrollOwnership(index, input, viewport.current); // NOSONAR S9382: edge checks share one scrolled viewport
   }
   setControlValue(input, "100"); await settle();
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
@@ -3061,7 +3061,7 @@ async function largeDiffWindowRegression() {
   setControlValue(find, "line 35000"); await settle();
   find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("line 35000"), "ordinary diff Find match");
-  for (let tick = 0; tick < 16; tick += 1) await frame();
+  for (let tick = 0; tick < 16; tick += 1) await frame(); // NOSONAR S9382: waits for successive animation frames
   const ordinaryHeight = viewport.clientHeight;
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 300 }}><WindowedDiff diff={diff} label="Large diff fixture" /></div>);
   await until(() => viewport.clientHeight < ordinaryHeight - 40, "ordinary diff resized after Find settled");
@@ -3150,7 +3150,7 @@ async function extremeDiffHeightRegression() {
   await awaitPhysicalCompressedMatch(viewport, "TAIL MATCH", "compressed tail Find alignment");
   const bounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
   assert(bounds.top < viewport.getBoundingClientRect().bottom && bounds.bottom > viewport.getBoundingClientRect().top, `Tall diff find mark is outside the viewport: mark=${bounds.top}/${bounds.bottom}, viewport=${viewport.getBoundingClientRect().top}/${viewport.getBoundingClientRect().bottom}, scroll=${viewport.scrollTop}/${viewport.scrollHeight}`);
-  for (let tick = 0; tick < 16; tick += 1) await frame();
+  for (let tick = 0; tick < 16; tick += 1) await frame(); // NOSONAR S9382: waits for successive animation frames
   const compressedHeight = viewport.clientHeight;
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 300 }}><WindowedDiff diff={"+\n".repeat(10_000) + diff} label="Tall diff" /></div>);
   await until(() => viewport.clientHeight < compressedHeight - 40 && viewport.querySelector('[data-find-match="true"]')?.textContent.includes("TAIL MATCH"), "tail Find survives compressed resize");
@@ -3943,7 +3943,7 @@ async function fullPageLiveAnchorRegression() {
   let readerIntentEvaluations = 0;
   while (Date.now() < readerIntentDeadline) {
     readerIntentEvaluations += 1;
-    await settle();
+    await settle(); // NOSONAR S9382: each scroll evaluation observes the previous settle
   }
   assert(readerIntentEvaluations >= 2, "upward reader intent was not observed over multiple updates");
   viewport.scrollTop = maximum - 48; viewport.dispatchEvent(new Event("scroll")); await settle();
@@ -4142,7 +4142,7 @@ async function transcriptObserverStabilityRegression() {
       // same mounted tail and its row observers while output is streaming.
       viewport.scrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight - (index % 2 ? 120 : 80));
       viewport.dispatchEvent(new Event("scroll"));
-      await settle();
+      await settle(); // NOSONAR S9382: each scroll evaluation observes the previous settle
     }
     assert(rowObservations - nearBottomBaseline <= 40,
       `near-bottom reader movement reobserved ${rowObservations - nearBottomBaseline} unchanged rows`);
@@ -4721,14 +4721,14 @@ async function bootstrapHardFailureRegression() {
       return response({});
     };
     root.render(<TooltipProvider><App /></TooltipProvider>);
-    await until(() => host.querySelector('.loading-screen [role="alert"]')?.textContent === failure.message,
+    await until(() => host.querySelector('.loading-screen [role="alert"]')?.textContent === failure.message, // NOSONAR S9382: bootstrap retry steps follow the previous failure
       `bootstrap ${failure.status ?? "network"} failure is surfaced`);
-    await remainsTrue(() => bootstrapReads === 1, 1150, `bootstrap ${failure.status ?? "network"} failure was polled indefinitely`);
+    await remainsTrue(() => bootstrapReads === 1, 1150, `bootstrap ${failure.status ?? "network"} failure was polled indefinitely`); // NOSONAR S9382: bootstrap retry steps follow the previous failure
     assert(host.querySelector('.loading-screen button')?.textContent.includes("Retry"), "hard failure has no explicit retry");
     if (failure.status === 401) {
       fail = false;
       host.querySelector('.loading-screen button').click();
-      await until(() => host.querySelector('[aria-label="Settings"]'), "explicit retry loads after authorization recovers");
+      await until(() => host.querySelector('[aria-label="Settings"]'), "explicit retry loads after authorization recovers"); // NOSONAR S9382: bootstrap retry steps follow the previous failure
       assert(bootstrapReads === 2, "explicit retry made an unexpected number of bootstrap requests");
     }
   }
@@ -4826,13 +4826,13 @@ async function responsiveSidebarBreakpointCycles(setWidth) {
   try {
     for (let round = 0; round < 3; round += 1) {
       const desktopSidebarControl = host.querySelector('[aria-label="Close projects sidebar"]');
-      await until(() => {
+      await until(() => { // NOSONAR S9382: each sidebar round observes the previous focus transition
         desktopSidebarControl?.focus({ preventScroll: true });
         return visibleFocus(desktopSidebarControl);
       }, `focused desktop sidebar precondition ${round + 1}`);
       await setWidth(640);
       await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), `sidebar closed from focused desktop control ${round + 1}`);
-      await expectResponsiveFocus(`visible focus restored after hiding desktop sidebar ${round + 1}`,
+      await expectResponsiveFocus(`visible focus restored after hiding desktop sidebar ${round + 1}`, // NOSONAR S9382: each sidebar round observes the previous focus transition
         () => host.querySelector('[aria-label="Open projects sidebar"]'));
       assert(visibleFocus(host.querySelector('[aria-label="Open projects sidebar"]')),
         "narrow opener was not focused before the wide transition");
@@ -4842,7 +4842,7 @@ async function responsiveSidebarBreakpointCycles(setWidth) {
         document.activeElement.blur();
         const pauseUntil = performance.now() + 3_100;
         while (performance.now() < pauseUntil) { /* Hold browser task delivery. */ }
-        await expectResponsiveFocus("sidebar opener focus after a delayed browser task",
+        await expectResponsiveFocus("sidebar opener focus after a delayed browser task", // NOSONAR S9382: each sidebar round observes the previous focus transition
           () => host.querySelector('[aria-label="Open projects sidebar"]'));
       }
       if (round === 1) {
@@ -4859,7 +4859,7 @@ async function responsiveSidebarBreakpointCycles(setWidth) {
         const focused = document.activeElement;
         if (host.querySelector("#project-sidebar").contains(focused)) focused.blur();
       }
-      await expectResponsiveFocus(`visible sidebar focus after wide transition ${round + 1}`,
+      await expectResponsiveFocus(`visible sidebar focus after wide transition ${round + 1}`, // NOSONAR S9382: each sidebar round observes the previous focus transition
         () => host.querySelector("#project-sidebar").contains(document.activeElement) ? document.activeElement : null);
     }
     await setWidth(640);
@@ -5040,7 +5040,7 @@ async function recoveryActionsRegression() {
   for (const width of [390, 640, 760]) {
     await window.__fixtureSetViewport(width);
     await until(() => window.innerWidth === width, `recovery viewport ${width}`);
-    await settle();
+    await settle(); // NOSONAR S9382: each viewport width settles before the next
     const noticeRect = host.querySelector(".recovery-notice").getBoundingClientRect();
     const buttons = [...host.querySelectorAll(".recovery-actions button")];
     for (const button of buttons) {
@@ -5164,7 +5164,7 @@ async function dialogCreateSuccessorRegression(failSuccessor = false, failPrivat
 async function archivePagingLoadingRegression() {
   for (const direction of ["earlier", "later"]) {
     for (const failed of [false, true]) {
-      root.render(null); await settle();
+      root.render(null); await settle(); // NOSONAR S9382: each page response settles before the next render
       keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
       const sibling = { ...chats.B, projectId: "A", worktreeId: "A", worktreePath: projects[0].worktrees[0].path };
       const page = { hasMore: true, olderCount: 50, hasLater: true, newerCount: 50, total: 101, beforeId: "page-50" };
@@ -5191,7 +5191,7 @@ async function archivePagingLoadingRegression() {
       assert(!host.querySelector('.history-loader').disabled && !host.querySelector('.history-later').disabled,
         `Archiving during ${direction} left sibling paging disabled`);
       held.resolve(failed ? response({ error: "Old page failed" }, 503) : response({ messages, messagePage: page }));
-      await settle();
+      await settle(); // NOSONAR S9382: each page response settles before the next render
       assert(!host.querySelector('.history-loader').disabled && !host.querySelector('.history-later').disabled,
         `Stale ${direction} ${failed ? "failure" : "success"} disabled sibling paging`);
     }

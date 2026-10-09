@@ -9,9 +9,13 @@
 #include <string.h>
 #include <wchar.h>
 
+#pragma comment(lib, "advapi32.lib")
+
 #define UTILITY_TREE_EMPTY "__OUTRIGHT_UTILITY_TREE_EMPTY_V1__\n"
-#define UTILITY_MEMBERS "__OUTRIGHT_UTILITY_MEMBERS_V1__"
+#define UTILITY_JOB_PREFIX L"Local\\OutrightUtility-"
 static bool utility_proof_enabled = false;
+static const wchar_t *utility_job_name = NULL;
+static const wchar_t *utility_empty_marker = NULL;
 
 static void ignore_invalid_descriptor(const wchar_t *expression, const wchar_t *function,
     const wchar_t *file, unsigned int line, uintptr_t reserved) {
@@ -231,7 +235,7 @@ static int inspect_owner(int argc, wchar_t **argv) {
 }
 
 static bool valid_utility_job(const wchar_t *name) {
-  const wchar_t *prefix = L"Local\\OutrightUtility-";
+  const wchar_t *prefix = UTILITY_JOB_PREFIX;
   size_t start = wcslen(prefix);
   if (wcsncmp(name, prefix, start) != 0 || wcslen(name + start) != 36) return false;
   for (size_t index = 0; index < 36; index++) {
@@ -268,6 +272,64 @@ static int inspect_utility_job(int argc, wchar_t **argv) {
   return empty ? 3 : 0;
 }
 
+// The prefetcher's boot counter changes on every boot. Recovery compares it
+// before any PID check because PIDs are reused across boots.
+static bool boot_identity(char *identity, size_t size) {
+  DWORD boot = 0;
+  DWORD length = sizeof(boot);
+  if (RegGetValueW(HKEY_LOCAL_MACHINE,
+      L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters",
+      L"BootId", RRF_RT_REG_DWORD, NULL, &boot, &length) != ERROR_SUCCESS) return false;
+  int written = snprintf(identity, size, "windows-boot:%lu", (unsigned long)boot);
+  return written > 0 && (size_t)written < size;
+}
+
+static int print_boot_identity(int argc) {
+  if (argc != 2) return 64;
+  char identity[64];
+  if (!boot_identity(identity, sizeof(identity))) { wprintf(L"unknown\n"); return 4; }
+  printf("%s\n", identity);
+  return 0;
+}
+
+// The marker lives beside the runtime's owner record and is named for the
+// same owner UUID as the job. "-" means the caller keeps no durable record.
+static bool valid_empty_marker(const wchar_t *marker, const wchar_t *job) {
+  if (wcscmp(marker, L"-") == 0) return true;
+  size_t length = wcslen(marker);
+  const wchar_t *owner = job + wcslen(UTILITY_JOB_PREFIX);
+  bool drive = length > 3 && marker[1] == L':' && (marker[2] == L'\\' || marker[2] == L'/');
+  bool unc = length > 2 && marker[0] == L'\\' && marker[1] == L'\\';
+  if (!drive && !unc) return false;
+  const wchar_t *name = marker + length;
+  while (name > marker && name[-1] != L'\\' && name[-1] != L'/') name--;
+  return wcslen(name) == 42 && wcsncmp(name, owner, 36) == 0 && wcscmp(name + 36, L".empty") == 0;
+}
+
+// Written only after the kernel reported zero job members (or before any
+// launch), and before the live proof frame, so a restarted runtime that can
+// no longer open the Local\ job name still has identity-bound evidence.
+static void write_empty_marker(void) {
+  if (!utility_job_name || !utility_empty_marker || wcscmp(utility_empty_marker, L"-") == 0) return;
+  char boot[64];
+  if (!boot_identity(boot, sizeof(boot))) strcpy_s(boot, sizeof(boot), "unknown");
+  char content[192];
+  int length = snprintf(content, sizeof(content), "%.*s ", (int)(sizeof(UTILITY_TREE_EMPTY) - 2), UTILITY_TREE_EMPTY);
+  for (const wchar_t *cursor = utility_job_name; *cursor && length < (int)sizeof(content) - 1; cursor++) content[length++] = (char)*cursor;
+  int tail = snprintf(content + length, sizeof(content) - (size_t)length, " %s\n", boot);
+  if (length <= 0 || tail <= 0 || (size_t)(length + tail) >= sizeof(content)) return;
+  length += tail;
+  HANDLE marker = CreateFileW(utility_empty_marker, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
+  if (marker == INVALID_HANDLE_VALUE) return;
+  DWORD written = 0;
+  bool durable = WriteFile(marker, content, (DWORD)length, &written, NULL)
+    && written == (DWORD)length && FlushFileBuffers(marker);
+  CloseHandle(marker);
+  // A partial marker is not evidence; the reservation stays charged.
+  if (!durable) DeleteFileW(utility_empty_marker);
+}
+
 static bool utility_start_authorized(void) {
   HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
   if (input == NULL || input == INVALID_HANDLE_VALUE) return false;
@@ -283,6 +345,7 @@ static bool utility_start_authorized(void) {
 
 static int utility_prelaunch_exit(int code) {
   if (utility_proof_enabled) {
+    write_empty_marker();
     intptr_t descriptor = _get_osfhandle(3);
     DWORD written = 0;
     if (descriptor != -1)
@@ -300,12 +363,17 @@ int wmain(int argc, wchar_t **argv) {
       || wcscmp(argv[1], L"--terminate") == 0) return inspect_owner(argc, argv);
   if (wcscmp(argv[1], L"--utility-probe") == 0 || wcscmp(argv[1], L"--utility-terminate") == 0)
     return inspect_utility_job(argc, argv);
+  if (wcscmp(argv[1], L"--boot-identity") == 0) return print_boot_identity(argc);
   bool test_mode = wcscmp(argv[1], L"--test-runner") == 0;
   bool utility_mode = wcscmp(argv[1], L"--utility-owner") == 0;
   utility_proof_enabled = utility_mode;
   if (test_mode && argc < 4) return 64;
-  if (utility_mode && (argc < 4 || !valid_utility_job(argv[2])
+  if (utility_mode && (argc < 5 || !valid_utility_job(argv[2]) || !valid_empty_marker(argv[3], argv[2])
       || GetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", NULL, 0) == 0)) return 64;
+  if (utility_mode) {
+    utility_job_name = argv[2];
+    utility_empty_marker = argv[3];
+  }
   HANDLE job = CreateJobObjectW(NULL, utility_mode ? argv[2] : NULL);
   if (!job) return utility_prelaunch_exit(70);
   if (utility_mode && GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(job); return utility_prelaunch_exit(70); }
@@ -313,7 +381,10 @@ int wmain(int argc, wchar_t **argv) {
   limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
   if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return utility_prelaunch_exit(71);
 
-  wchar_t *line = command_line(argc, argv, test_mode || utility_mode ? 3 : 1);
+  int first_argument = 1;
+  if (utility_mode) first_argument = 4;
+  else if (test_mode) first_argument = 3;
+  wchar_t *line = command_line(argc, argv, first_argument);
   if (!line) return utility_prelaunch_exit(72);
   // The native child owns no control input. Forward only output and error;
   // sharing the supervisor's stdin would let Git or a helper consume Stop.
@@ -378,19 +449,6 @@ int wmain(int argc, wchar_t **argv) {
     return 75;
   }
   CloseHandle(process.hThread);
-  if (utility_owner) {
-    // A vanished Local\ job name is not empty-tree proof after a crash. Report
-    // this supervisor and its direct child with creation times so recovery
-    // can verify those exact processes are gone.
-    unsigned long long own_birth = process_birth(GetCurrentProcess());
-    unsigned long long child_birth = process_birth(process.hProcess);
-    char members[128];
-    int length = snprintf(members, sizeof(members), "%s %lu:%llu %lu:%llu\n", UTILITY_MEMBERS,
-      (unsigned long)GetCurrentProcessId(), own_birth, (unsigned long)process.dwProcessId, child_birth);
-    DWORD written = 0;
-    if (own_birth && child_birth && length > 0 && length < (int)sizeof(members))
-      WriteFile((HANDLE)proof_handle, members, (DWORD)length, &written, NULL);
-  }
 
   if (!test_mode) {
     HANDLE owner_thread = CreateThread(NULL, 0, watch_owner, job, 0, NULL);
@@ -430,6 +488,7 @@ int wmain(int argc, wchar_t **argv) {
     Sleep(25);
   }
   if (utility_owner) {
+    write_empty_marker();
     HANDLE proof = (HANDLE)proof_handle;
     DWORD written = 0;
     if (proof != INVALID_HANDLE_VALUE)

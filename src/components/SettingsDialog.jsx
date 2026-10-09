@@ -294,7 +294,10 @@ function processCapacityMessages(capacity) {
   const messages = [];
   const utility = capacity.utilityProcesses;
   if (!utility || !validCapacityCount(utility.active) || !validCapacityCount(utility.limit)) messages.push("Utility process capacity is unknown.");
-  else if (atCapacityLimit(utility.active, utility.limit)) messages.push("Utility process capacity is full. Retry when a process finishes.");
+  else {
+    if (validCapacityCount(utility.unknown) && utility.unknown) messages.push("Utility process ownership is unverified. Its capacity stays reserved until recovery.");
+    if (atCapacityLimit(utility.active, utility.limit)) messages.push("Utility process capacity is full. Retry when a process finishes.");
+  }
   const queueFull = atCapacityLimit(capacity.queued, capacity.limits.maxQueuedRuns);
   if (!validCapacityCount(capacity.queued) || !validCapacityCount(capacity.limits.maxQueuedRuns)) messages.push("Run queue capacity is unknown.");
   else if (queueFull) messages.push("Run queue is full. Wait for capacity or stop queued work.");

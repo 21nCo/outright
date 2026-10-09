@@ -28,7 +28,7 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
   const retryLease = async (operation, retryCodes) => {
     const deadline = Date.now() + 15_000;
     while (!stopping) {
-      try { return await operation(); }
+      try { return await operation(); } // NOSONAR S9382: lease acquisition retries until its deadline
       catch (error) {
         if (!retryCodes.includes(error.code)) throw error;
         const predecessor = shuttingDownRuntimes.get(leaseKey);
@@ -36,11 +36,11 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
           // A failed predecessor disposal is not evidence that this lease is
           // still held. Recheck the physical lease before classifying our own
           // startup; a failed shutdown may already have released it.
-          await wait(predecessor.catch(() => {}));
+          await wait(predecessor.catch(() => {})); // NOSONAR S9382: waits for the predecessor before rechecking the lease
           continue;
         }
         if (Date.now() >= deadline) throw error;
-        await wait(new Promise((resolve) => setTimeout(resolve, 100)));
+        await wait(new Promise((resolve) => setTimeout(resolve, 100))); // NOSONAR S9382: backoff between lease retries
       }
     }
   };
