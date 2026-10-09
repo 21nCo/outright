@@ -1,0 +1,23 @@
+server/agent-supervisor-darwin.c
+  s_ce12272281eb3b::t_616906dc20fe76 20-22,25-26,112-136,138,142,146,149-154,157,167-233,236-237,241,248,256-260,267-285,287-316,318-319,321,325-412,414-422,629,753,778-788,810,862-863,865-867,872-875,880-881,884-885,887,938-942,988
+server/outright-runtime.mjs
+  s_ce12272281eb3b::t_71c9cad94ced3a 1056,1083
+server/subprocess-budget.test.mjs
+  s_ce12272281eb3b::t_ea3e7fc38b621f 756-831
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6195958feee25a391e0a7886758864c13f947326",
+  "prompts": {},
+  "sessions": {
+    "s_ce12272281eb3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d2376f8-4af3-4920-96da-dff6a042ab4c",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
