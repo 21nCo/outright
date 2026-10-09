@@ -1455,6 +1455,32 @@ test("a full conversation metadata budget does not fail a provider session event
   assert.equal(database.getRun(run.id).status, "completed");
 });
 
+test("a retained-budget session refusal is final and arms no storage retry for the live run", async () => {
+  const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex", providerSessionId: null });
+  let conversationWrites = 0;
+  database.updateConversation = () => {
+    conversationWrites += 1;
+    throw Object.assign(new Error("Retained history is full"), { statusCode: 507 });
+  };
+  const child = fakeChild();
+  let diskRetries = 0;
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child, onDiskRetry: () => { diskRetries += 1; } });
+  const run = database.createRun(codexRun("quota-final"));
+  try {
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+    child.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "session-at-quota" }) + "\n");
+    assert.equal(conversationWrites, 1);
+    // A transient fault would be probed after 100 ms. A policy refusal is not.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(diskRetries, 0, "a 507 session refusal re-armed the disk retry timer");
+    assert.equal(conversationWrites, 1, "the refused copy was retried while the run stayed live");
+    assert.deepEqual(child.signals, []);
+    assert.equal(database.getRun(run.id).providerSessionId, "session-at-quota");
+    child.emit("close", 0, null);
+    assert.equal(database.getRun(run.id).status, "completed");
+  } finally { await manager.shutdown(); }
+});
+
 test("a provider metadata storage fault retries without ending its live provider", async () => {
   const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex" });
   const updateConversation = database.updateConversation;

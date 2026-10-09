@@ -8,7 +8,7 @@ import { realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { createSubprocessBudget, runOwned } from "./subprocess-budget.mjs";
+import { createSubprocessBudget, nativeOwnerTreeEmpty, runOwned } from "./subprocess-budget.mjs";
 import { createGitService } from "./git-service.mjs";
 import { scanProjects } from "./project-scanner.mjs";
 import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
@@ -213,12 +213,13 @@ test("an unlaunched utility reservation reconciles only after its runtime owner 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("a prior-format native owner uses its deterministic identity after its supervisor is gone", async () => {
+test("a prior-format native owner releases only on positive evidence after its supervisor is gone", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-prior-owner-"));
-  const id = "7c538332-3e62-491e-9231-e90d34d687a7";
+  const id = randomUUID();
   const identityKey = process.platform === "darwin" ? "label"
     : process.platform === "linux" ? "handshakePath" : "jobName";
   const filename = path.join(root, `${id}.json`);
+  const ownerDirectory = path.join(os.tmpdir(), `outright-utility-${id}`);
   try {
     writeFileSync(filename, JSON.stringify({ state: "unknown", platform: process.platform,
       authorized: true, pid: 2147483647, [identityKey]: "conflicting-owner" }), { mode: 0o600 });
@@ -227,7 +228,112 @@ test("a prior-format native owner uses its deterministic identity after its supe
     assert.equal(await budget.reconcileUnknown(), 0, "a conflicting recorded native identity cannot release capacity");
     writeFileSync(filename, JSON.stringify({ state: "unknown", platform: process.platform,
       authorized: true, pid: 2147483647 }), { mode: 0o600 });
-    assert.equal(await budget.reconcileUnknown(), 1);
+    if (process.platform === "darwin") {
+      // launchd's coalition proof is bound to the deterministic label.
+      assert.equal(await budget.reconcileUnknown(), 1);
+      assert.deepEqual(budget.capacity(), { active: 0, unknown: 0, limit: 1 });
+      return;
+    }
+    assert.equal(await budget.reconcileUnknown(), 0,
+      "a missing handshake directory or job name is not evidence that the tree is empty");
+    assert.deepEqual(budget.capacity(), { active: 1, unknown: 1, limit: 1 });
+    if (process.platform === "linux") {
+      // The supervisor removes only its handshake. The private directory it
+      // leaves behind is the positive evidence for this exact owner.
+      mkdirSync(ownerDirectory, { mode: 0o700 });
+      assert.equal(await budget.reconcileUnknown(), 1);
+      assert.deepEqual(budget.capacity(), { active: 0, unknown: 0, limit: 1 });
+      assert.equal(existsSync(ownerDirectory), false, "the released owner directory was not removed");
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(ownerDirectory, { recursive: true, force: true });
+  }
+});
+
+function nativeStatusStub(responses) {
+  const calls = [];
+  return { calls, status: async (args) => {
+    calls.push(args);
+    const response = responses[args[0]];
+    return typeof response === "function" ? response(args) : (response ?? { status: "unknown", failed: true });
+  } };
+}
+
+test("Linux utility proof binds to the recorded handshake, never the current TMPDIR", async () => {
+  const id = randomUUID();
+  const recordedRoot = mkdtempSync(path.join(os.tmpdir(), "outright-recorded-tmp-"));
+  const handshakePath = path.join(recordedRoot, `outright-utility-${id}`, "owner.json");
+  const record = { state: "unknown", platform: "linux", authorized: true, pid: 2147483647 };
+  const proof = (overrides, stub = nativeStatusStub({}), bootId = "boot-current") =>
+    nativeOwnerTreeEmpty({ ...record, ...overrides }, id, "linux", stub.status, bootId);
+  try {
+    // A prior-format record from a runtime with another TMPDIR: the derived
+    // current-TMPDIR candidate is absent, which proves nothing.
+    assert.equal(await proof({}), false);
+    // The recorded owner directory is gone too: its evidence was lost.
+    assert.equal(await proof({ handshakePath }), false);
+    mkdirSync(path.dirname(handshakePath), { mode: 0o700 });
+    writeFileSync(handshakePath, JSON.stringify({ pid: 4242, processIdentity: "linux:boot-current:1" }), { mode: 0o600 });
+    const live = nativeStatusStub({ "--terminate-owned": { status: "signaled", failed: false } });
+    assert.equal(await proof({ handshakePath }, live), false, "a live handshake stays charged until its supervisor removes it");
+    assert.deepEqual(live.calls, [["--terminate-owned", "4242", "linux:boot-current:1", handshakePath]]);
+    const settled = nativeStatusStub({ "--terminate-owned": () => { rmSync(handshakePath); return { status: "signaled", failed: false }; } });
+    assert.equal(await proof({ handshakePath }, settled), true, "the supervisor's removal under its private directory is the proof");
+    assert.equal(await proof({ handshakePath }), true, "a restarted runtime with another TMPDIR still finds the recorded owner");
+    assert.equal(await proof({ handshakePath: path.join(recordedRoot, "outright-utility-other", "owner.json") }), false);
+    assert.equal(await proof({ handshakePath: "relative/owner.json" }), false);
+    rmSync(path.dirname(handshakePath), { recursive: true });
+    assert.equal(await proof({ handshakePath, bootId: "boot-current" }), false);
+    assert.equal(await proof({ handshakePath, bootId: "boot-before-restart" }), true, "an earlier boot has no surviving processes");
+    assert.equal(await proof({ handshakePath, bootId: "boot-before-restart" }, nativeStatusStub({}), null), false,
+      "an unreadable current boot identity is not proof");
+  } finally { rmSync(recordedRoot, { recursive: true, force: true }); }
+});
+
+test("Windows utility proof requires an empty job or every recorded member gone", async () => {
+  const id = randomUUID();
+  const record = { state: "unknown", platform: "win32", authorized: true, pid: 2147483647, jobName: `Local\\OutrightUtility-${id}` };
+  const members = [{ pid: 4100, birth: "133000000000000001" }, { pid: 4101, birth: "133000000000000002" }];
+  const proof = (overrides, responses) => {
+    const stub = nativeStatusStub(responses);
+    return nativeOwnerTreeEmpty({ ...record, ...overrides }, id, "win32", stub.status).then((empty) => ({ empty, calls: stub.calls }));
+  };
+  const absent = { status: "absent", failed: false };
+  assert.equal((await proof({}, { "--utility-probe": { status: "exited", failed: false } })).empty, true, "an opened job with zero active processes");
+  assert.equal((await proof({ members }, { "--utility-probe": { status: "unknown", failed: true } })).empty, false);
+  assert.equal((await proof({}, { "--utility-probe": absent })).empty, false, "an absent name without member identities");
+  const alive = await proof({ members }, { "--utility-probe": absent,
+    "--probe": (args) => (args[1] === "4101" ? { status: "alive", failed: false } : absent) });
+  assert.equal(alive.empty, false, "a recorded member is still running");
+  assert.deepEqual(alive.calls.filter((call) => call[0] === "--probe"), [["--probe", "4100", members[0].birth], ["--probe", "4101", members[1].birth]]);
+  assert.equal((await proof({ members }, { "--utility-probe": absent, "--probe": { status: "unknown", failed: true } })).empty, false,
+    "an inaccessible member is not verifiably gone");
+  assert.equal((await proof({ members: [{ pid: 4100, birth: "0" }] }, { "--utility-probe": absent, "--probe": absent })).empty, false);
+  assert.equal((await proof({ members }, { "--utility-probe": absent, "--probe": absent })).empty, true,
+    "every reported member identity has terminated or been replaced");
+  assert.equal((await proof({ members, jobName: "Local\\OutrightUtility-other" }, { "--utility-probe": absent, "--probe": absent })).empty, false);
+});
+
+test("a Windows utility owner durably records its supervisor and child identities", { skip: process.platform !== "win32", timeout: 15_000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-members-"));
+  let observed = null;
+  const budget = createSubprocessBudget({ limit: 1, unknownDirectory: root,
+    execute(file, args, options, onClose) {
+      return runOwned(file, args, { ...options, __onOwnerMembers(members) {
+        options.__onOwnerMembers(members);
+        const name = readdirSync(root).find((entry) => entry.endsWith(".json"));
+        observed = JSON.parse(readFileSync(path.join(root, name), "utf8"));
+      } }, onClose);
+    } });
+  try {
+    await budget.run(process.execPath, ["-e", "setTimeout(() => {}, 200)"]);
+    assert.equal(observed?.members?.length, 2, "the owner record lacks native member identities");
+    for (const member of observed.members) {
+      assert.match(member.birth, /^[1-9]\d*$/);
+      const probe = spawnSync(AGENT_SUPERVISOR, ["--probe", String(member.pid), member.birth], { encoding: "utf8", timeout: 5000 });
+      assert.equal(probe.stdout.trim(), "absent", "a finished utility member is still reported alive");
+    }
     assert.deepEqual(budget.capacity(), { active: 0, unknown: 0, limit: 1 });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

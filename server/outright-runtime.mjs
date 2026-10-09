@@ -18,12 +18,32 @@ function throwFailedRuntimeStartup(error, { eventHub, wss, database }) {
   // The constructor has not admitted an agent or PTY. Stop startup-owned
   // managers and release the physical lease before reporting its failure.
   const cleanupErrors = [];
-  try { eventHub?.shutdown(); } catch (failure) { cleanupErrors.push(failure); }
-  try { wss?.close(); } catch (failure) { cleanupErrors.push(failure); }
+  try { eventHub?.shutdown(); } catch (error_) { cleanupErrors.push(error_); }
+  try { wss?.close(); } catch (error_) { cleanupErrors.push(error_); }
   try { database.closeFailedStartup(); }
-  catch (failure) { cleanupErrors.push(failure); }
+  catch (error_) { cleanupErrors.push(error_); }
   if (cleanupErrors.length) throw new AggregateError([error, ...cleanupErrors], "Runtime startup and cleanup failed");
   throw error;
+}
+
+// Interrupted-run reconciliation retries busy, locked, I/O and capacity
+// faults on a bounded schedule. Anything else, or an exhausted schedule, is a
+// failed recovery that a later bootstrap request may explicitly restart.
+const RUN_RECOVERY_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000];
+const RUN_RECOVERY_RESTART_COOLDOWN_MS = 1000;
+
+function transientRunRecoveryFailure(error) {
+  return error?.statusCode === 503 || error?.statusCode === 507
+    || /^(?:SQLITE_(?:BUSY|LOCKED|IOERR|FULL)(?:_|$)|E(?:IO|AGAIN|BUSY|NFILE|MFILE|STALE|NOSPC)$)/.test(error?.code ?? "");
+}
+
+function abortableDelay(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal.aborted) { resolve(false); return; }
+    const done = () => { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(!signal.aborted); };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+  });
 }
 
 export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, databaseFactory = createOutrightDatabase, agentManagerFactory = createAgentManager, hardenLaunchDirectory = process.platform === "win32" ? hardenWindowsLaunchDirectory : () => {}, terminalManagerFactory = createTerminalManager } = {}) {
@@ -34,16 +54,21 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   let publish;
   let runtimeCapacity;
   let shuttingDown = false;
-  let runRecoveryPending = true;
-  let runRecoveryError = null;
+  // One owner for interrupted-run recovery. Queued work resumes only after a
+  // reconciliation completes; every other phase defers the wakeup until then.
+  const runRecovery = { phase: "pending", error: null, failedAt: 0, resumeDeferred: false, cycle: Promise.resolve() };
   const runRecoveryController = new AbortController();
+  function resumeQueuedAfterRecovery() {
+    if (runRecovery.phase !== "complete") { runRecovery.resumeDeferred = true; return; }
+    if (!shuttingDown) agents.resumeQueued();
+  }
   const database = databaseFactory({ runtimeLease: true, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, onMigrationComplete: () => {
-    if (!runRecoveryPending) agents.resumeQueued();
+    resumeQueuedAfterRecovery();
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
   }, onDeletionWorkerStart: () => {
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
   }, onDeletionWorkerExit: () => {
-    if (!runRecoveryPending) agents.resumeQueued();
+    resumeQueuedAfterRecovery();
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
   }, onTerminalAuditReconciled: () => {
     if (shuttingDown || !terminals) return;
@@ -64,10 +89,13 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   hardenLaunchDirectory(database.launchDirectory);
   database.reconcilePendingRetentionCleanup();
   database.reconcileTerminalAudit();
-  const reconciliation = database.reconcileInterruptedRuns({ yieldBetweenBatches: true,
+  const reconcileInterruptedRuns = () => database.reconcileInterruptedRuns({ yieldBetweenBatches: true,
     signal: runRecoveryController.signal,
     probeAlive: (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync),
   });
+  // The first bounded batch commits during construction, before any request
+  // or terminal recovery can observe the previous runtime's pending rows.
+  const reconciliation = reconcileInterruptedRuns();
   void Promise.resolve(reconciliation).catch(() => {});
   eventHub = createRuntimeEventHub();
   const runtimeInstanceId = randomUUID();
@@ -96,7 +124,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   runtimeCapacity = function runtimeCapacity() {
     const capacity = database.capacity();
     return { ...capacity, activeProcesses: agents?.activeProcessCount() ?? 0,
-      runRecoveryPending, runRecoveryError: runRecoveryError?.message ?? null,
+      runRecoveryPending: runRecovery.phase === "pending" || runRecovery.phase === "retrying",
+      runRecoveryPhase: runRecovery.phase, runRecoveryError: runRecovery.error?.message ?? null,
       pendingRunOutcomes: agents?.pendingOutcomeCount() ?? 0,
       limits: { ...capacity.limits, maxPendingRunOutcomes: RESOURCE_BUDGETS.maxPendingRunOutcomes },
       utilityProcesses: subprocesses.capacity(), terminalProcesses: terminals.capacity() };
@@ -123,18 +152,82 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required");
     };
   } });
-  const runRecovery = Promise.resolve(reconciliation).then((result) => {
-    if (result.count) database.audit("runtime.runs.reconciled", { target: "runtime", ...result });
-    runRecoveryPending = false;
-    if (!shuttingDown) {
-      if (result.count) agents.resumeQueued();
-      publish({ type: "capacity.changed", payload: runtimeCapacity() });
+  function completeRunRecovery(result) {
+    runRecovery.phase = "complete";
+    runRecovery.error = null;
+    if (shuttingDown) return;
+    // The reconciled rows have committed. Their summary audit is telemetry
+    // and cannot turn that durable recovery into a failed runtime.
+    if (result.count) {
+      try { database.audit("runtime.runs.reconciled", { target: "runtime", ...result }); }
+      catch (error) { if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:run-recovery-audit]", error); }
     }
-  }).catch((error) => {
-    runRecoveryPending = false;
-    runRecoveryError = error;
+    if (result.count || runRecovery.resumeDeferred) {
+      runRecovery.resumeDeferred = false;
+      agents.resumeQueued();
+    }
+    publish({ type: "capacity.changed", payload: runtimeCapacity() });
+  }
+
+  // Returns the retry delay, or undefined once recovery has failed.
+  function recordRunRecoveryFailure(error, attempt) {
+    runRecovery.error = error;
     if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:run-recovery]", error);
-  });
+    const delay = transientRunRecoveryFailure(error) ? RUN_RECOVERY_RETRY_DELAYS_MS[attempt] : undefined;
+    runRecovery.phase = delay === undefined ? "failed" : "retrying";
+    if (delay === undefined) runRecovery.failedAt = Date.now();
+    // The same storage fault may refuse the capacity read. It cannot cancel
+    // the scheduled retry that owns this recovery.
+    try { publish({ type: "capacity.changed", payload: runtimeCapacity() }); }
+    catch (error_) { if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:run-recovery-capacity]", error_); }
+    return delay;
+  }
+
+  async function recoverInterruptedRuns(firstAttempt) {
+    const { signal } = runRecoveryController;
+    for (let attempt = 0; ; attempt += 1) {
+      let result;
+      try {
+        result = await (attempt === 0 ? firstAttempt : reconcileInterruptedRuns());
+      } catch (error) {
+        if (shuttingDown || signal.aborted) return;
+        const delay = recordRunRecoveryFailure(error, attempt);
+        if (delay === undefined || !await abortableDelay(delay, signal)) return;
+        continue;
+      }
+      completeRunRecovery(result);
+      return;
+    }
+  }
+
+  function startRunRecoveryCycle(firstAttempt) {
+    // A queued-run wakeup failure after completion belongs to the agent
+    // manager; it cannot reopen recovery or reject shutdown's join.
+    runRecovery.cycle = recoverInterruptedRuns(firstAttempt).catch((error) => {
+      if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:run-recovery-resume]", error);
+    });
+  }
+
+  // A failed recovery keeps refusing work. An operator bootstrap retry starts
+  // one new bounded cycle instead of requiring a runtime restart.
+  function restartFailedRunRecovery() {
+    if (runRecovery.phase !== "failed" || shuttingDown
+      || Date.now() - runRecovery.failedAt < RUN_RECOVERY_RESTART_COOLDOWN_MS) return false;
+    runRecovery.phase = "retrying";
+    startRunRecoveryCycle(Promise.resolve().then(reconcileInterruptedRuns));
+    return true;
+  }
+
+  startRunRecoveryCycle(reconciliation);
+
+  function assertRunRecoveryComplete(url, request) {
+    if (runRecovery.phase === "complete") return;
+    const restarted = url.pathname === "/api/bootstrap" && request.method === "GET" && restartFailedRunRecovery();
+    const failed = runRecovery.phase === "failed" && !restarted;
+    throw apiError(503, failed ? `Run recovery failed: ${runRecovery.error?.message ?? runRecovery.error}`
+      : "Run recovery is reconciling interrupted work; retry shortly",
+    { code: failed ? "RUN_RECOVERY_FAILED" : "RUN_RECOVERY_TRANSIENT" });
+  }
   function startOwnershipRecovery() {
     const onRecovered = (resolved) => {
       if (resolved && !shuttingDown) publish({ type: "capacity.changed", payload: runtimeCapacity() });
@@ -245,12 +338,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (shuttingDown) throw apiError(503, "Runtime is shutting down");
       // A zero-row reconciliation resolves in the constructor's next
       // microtask. Let that settle before classifying a new request as busy.
-      if (runRecoveryPending) await Promise.resolve();
-      if ((runRecoveryPending || runRecoveryError) && url.pathname !== "/api/capacity") {
-        throw apiError(503, runRecoveryError ? `Run recovery failed: ${runRecoveryError.message}`
-          : "Run recovery is reconciling interrupted work; retry shortly",
-        { code: runRecoveryError ? "RUN_RECOVERY_FAILED" : "RUN_RECOVERY_TRANSIENT" });
-      }
+      if (runRecovery.phase === "pending") await Promise.resolve();
+      if (url.pathname !== "/api/capacity") assertRunRecoveryComplete(url, request);
       if (database.maintenanceActive && url.pathname !== "/api/capacity") {
         const failure = database.capacity().maintenanceError;
         throw apiError(503, failure ? `Archive maintenance recovery failed: ${failure}`
@@ -815,7 +904,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         throw error;
       }
       await inFlightScan?.catch(() => {});
-      await runRecovery;
+      await runRecovery.cycle;
       // Native-owner probes may remain slow or stuck. Terminal shutdown fences
       // their late results before the database lease is released.
       try { await terminals.shutdown(); }
@@ -842,7 +931,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   }
 
   return { attach, handleRequest, projects, publish, database, agents, terminals, git, shutdown,
-    whenShutdownComplete: () => shutdownCompletion, whenRunRecoveryComplete: () => runRecovery };
+    whenShutdownComplete: () => shutdownCompletion, whenRunRecoveryComplete: () => runRecovery.cycle };
   } catch (error) {
     runRecoveryController.abort();
     throwFailedRuntimeStartup(error, { eventHub, wss, database });

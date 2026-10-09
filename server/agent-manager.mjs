@@ -599,6 +599,13 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     } catch (error) {
       if (!storageAdmissionFailure(error) && !(error.statusCode === 503 && database.maintenanceActive)) throw error;
       state.sessionStorageError = error;
+      // A retained-budget refusal is a policy outcome, not a storage fault.
+      // The run row keeps its token and finishRun makes one budgeted copy;
+      // never re-arm a disk probe for the rest of the run.
+      if (error.statusCode === 507) {
+        if (state.pendingSessionId === sessionId) state.pendingSessionId = null;
+        return false;
+      }
       if (!database.maintenanceActive) retryUnknownDiskUsage(persistentStorageFailure(error));
       return false;
     }

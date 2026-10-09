@@ -76,6 +76,66 @@ test("broker preserves a failing shell exit in its frame and process status", { 
   }
 });
 
+test("broker diagnostics keep lifecycle events after sustained terminal input", { timeout: 20_000 }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "pty-broker-diagnostics-"));
+  const address = process.platform === "win32"
+    ? `\\\\.\\pipe\\outright-broker-diagnostics-${randomUUID()}` : path.join(directory, "broker.sock");
+  const token = randomUUID() + randomUUID();
+  const broker = spawn(process.execPath, [brokerScript, address, token], {
+    stdio: ["ignore", "ignore", "pipe"], detached: process.platform !== "win32", windowsHide: true,
+    env: { ...process.env, OUTRIGHT_BROKER_DIAGNOSTICS: "1" },
+  });
+  const closed = new Promise((resolve) => broker.once("close", resolve));
+  let stderr = "";
+  broker.stderr.setEncoding("utf8");
+  broker.stderr.on("data", (chunk) => { stderr += chunk; });
+  let socket;
+  let frames = "";
+  try {
+    const deadline = Date.now() + 10_000;
+    while (!socket && Date.now() < deadline && broker.exitCode === null) {
+      try {
+        socket = await new Promise((resolve, reject) => {
+          const candidate = net.createConnection(address);
+          candidate.once("connect", () => resolve(candidate));
+          candidate.once("error", reject);
+        });
+      } catch { await new Promise((resolve) => setTimeout(resolve, 25)); }
+    }
+    assert.ok(socket, "broker did not listen");
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => { frames += chunk; });
+    socket.write(`${JSON.stringify({ type: "start", token, shell: process.execPath,
+      cwd: directory, env: process.env, cols: 80, rows: 24 })}\n`);
+    while (!frames.includes('"type":"ready"') && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.ok(frames.includes('"type":"ready"'), "PTY did not become ready");
+    // More separate input writes than the whole lifecycle event budget.
+    for (let index = 0; index < 100; index += 1) {
+      socket.write(`${JSON.stringify({ type: "write", data: `${index};\r` })}\n`);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    socket.write(`${JSON.stringify({ type: "write", data: "process.exit(0)\r" })}\n`);
+    while (!frames.includes('"type":"shell-exited"') && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.ok(frames.includes('"type":"shell-exited"'), "the shell exit frame was not delivered");
+    socket.destroy();
+    await closed;
+    const events = stderr.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    const names = events.map((event) => event.broker);
+    assert.ok(names.includes("shell-exit"), `shell-exit missing from ${names.join(",")}`);
+    assert.ok(names.includes("peer-closed"), `peer-closed missing from ${names.join(",")}`);
+    assert.ok(events.length < 64, "interaction consumed the lifecycle event budget");
+    assert.ok(events.at(-1).inputWrites >= 1 && events.at(-1).inputBytes > 0, "input activity was not aggregated");
+  } finally {
+    socket?.destroy();
+    if (broker.exitCode === null) {
+      if (process.platform === "win32") spawnSync("taskkill", ["/T", "/F", "/PID", String(broker.pid)],
+        { windowsHide: true, stdio: "ignore", timeout: 5000 });
+      else try { process.kill(-broker.pid, "SIGKILL"); } catch {}
+    }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("Windows terminal supervisor stop empties the owned Job Object when a PTY cannot exit", { skip: process.platform !== "win32", timeout: 15_000 }, async () => {
   // A broker whose terminal.kill fails still loses its owner socket. The
   // managed adapter sends stop on that path; exercise the native control pipe

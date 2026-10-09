@@ -119,7 +119,7 @@ function withRuntime(fn, options = {}) {
   };
 }
 
-test("bootstrap distinguishes transient archive maintenance from permanent recovery failure", (() => {
+test("the API maintenance gate distinguishes transient archive maintenance from permanent recovery failure on every route", (() => {
   let failure;
   return withRuntime(async (runtime) => {
     for (const [expected, message] of [
@@ -127,11 +127,18 @@ test("bootstrap distinguishes transient archive maintenance from permanent recov
       ["ARCHIVE_MAINTENANCE_FAILED", "corrupt retained marker"],
     ]) {
       failure = message;
-      const response = responseCapture();
-      await runtime.handleRequest(requestStream("GET", "/api/bootstrap"), response);
-      assert.equal(response.statusCode, 503);
-      assert.equal(response.body.code, expected);
-      assert.match(response.body.error, message ? /recovery failed: corrupt retained marker/ : /retry shortly/);
+      // The gate runs before routing, so bootstrap and an unrelated route
+      // report the same classification while capacity stays readable.
+      for (const route of ["/api/bootstrap", "/api/settings"]) {
+        const response = responseCapture();
+        await runtime.handleRequest(requestStream("GET", route), response);
+        assert.equal(response.statusCode, 503, route);
+        assert.equal(response.body.code, expected, route);
+        assert.match(response.body.error, message ? /recovery failed: corrupt retained marker/ : /retry shortly/);
+      }
+      const capacity = responseCapture();
+      await runtime.handleRequest(requestStream("GET", "/api/capacity"), capacity);
+      assert.equal(capacity.statusCode, 200);
     }
   }, { databaseFactory(options) {
     const database = createOutrightDatabase(options);
@@ -142,6 +149,115 @@ test("bootstrap distinguishes transient archive maintenance from permanent recov
     } });
   } });
 })());
+
+function withRunRecoveryFaults(faults, fn, { auditRefusal = null } = {}) {
+  // Each fault rejects one reconciliation attempt. Database callbacks and
+  // queued-run wakeups are captured at the real runtime boundary.
+  const state = { reconcileCalls: 0, resumes: 0, audits: 0, callbacks: {}, runId: null };
+  return withRuntime(async (runtime) => fn(runtime, state), {
+    databaseFactory(options) {
+      state.callbacks = options;
+      const database = createOutrightDatabase(options);
+      const reconcile = database.reconcileInterruptedRuns.bind(database);
+      database.reconcileInterruptedRuns = (settings) => {
+        const fault = faults[state.reconcileCalls];
+        state.reconcileCalls += 1;
+        return fault ? Promise.reject(fault) : reconcile(settings);
+      };
+      const audit = database.audit.bind(database);
+      database.audit = (action, details) => {
+        if (action === "runtime.runs.reconciled") {
+          state.audits += 1;
+          if (auditRefusal) throw auditRefusal;
+        }
+        return audit(action, details);
+      };
+      return database;
+    },
+    agentManagerFactory(options) {
+      const manager = createAgentManager(options);
+      const resume = manager.resumeQueued;
+      manager.resumeQueued = () => { state.resumes += 1; return resume(); };
+      return manager;
+    },
+    seed() {
+      const seed = createOutrightDatabase();
+      const conversation = seed.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Interrupted", provider: "codex" });
+      state.runId = seed.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "pending" }).id;
+      return seed.close();
+    },
+  });
+}
+
+function storageFault(code) {
+  return Object.assign(new Error(`injected ${code}`), { code });
+}
+
+async function getRoute(runtime, route) {
+  const response = responseCapture();
+  await runtime.handleRequest(requestStream("GET", route), response);
+  return response;
+}
+
+test("a transient run reconciliation failure retries without resuming queued work early", withRunRecoveryFaults([storageFault("SQLITE_BUSY"), storageFault("SQLITE_IOERR_WRITE")], async (runtime, state) => {
+  await Promise.resolve();
+  const pending = await getRoute(runtime, "/api/settings");
+  assert.equal(pending.statusCode, 503);
+  assert.equal(pending.body.code, "RUN_RECOVERY_TRANSIENT");
+  // Migration and deletion callbacks cannot bypass an unfinished recovery.
+  state.callbacks.onMigrationComplete();
+  state.callbacks.onDeletionWorkerExit();
+  assert.equal(state.resumes, 0);
+  await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "bounded retry did not recover");
+  assert.equal(state.reconcileCalls, 3);
+  assert.equal(state.resumes, 1, "queued work resumes exactly once after recovery completes");
+  assert.equal((await getRoute(runtime, "/api/settings")).statusCode, 200);
+  const capacity = (await getRoute(runtime, "/api/capacity")).body;
+  assert.equal(capacity.runRecoveryPhase, "complete");
+  assert.equal(capacity.runRecoveryError, null);
+  assert.equal(runtime.database.getRun(state.runId).status, "interrupted");
+}));
+
+test("a persistent run reconciliation failure stays closed until an explicit bootstrap retry recovers it", withRunRecoveryFaults([new Error("corrupt recovery row")], async (runtime, state) => {
+  await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "failed recovery did not settle");
+  state.callbacks.onMigrationComplete();
+  state.callbacks.onDeletionWorkerExit();
+  assert.equal(state.resumes, 0, "callbacks never launch queued work after a failed recovery");
+  for (const route of ["/api/settings", "/api/bootstrap"]) {
+    const failed = await getRoute(runtime, route);
+    assert.equal(failed.statusCode, 503);
+    assert.equal(failed.body.code, "RUN_RECOVERY_FAILED", route);
+  }
+  assert.equal(state.reconcileCalls, 1, "a permanent failure is not retried on a timer");
+  assert.equal((await getRoute(runtime, "/api/capacity")).body.runRecoveryPhase, "failed");
+  await new Promise((resolve) => setTimeout(resolve, 1050));
+  const restarted = await getRoute(runtime, "/api/bootstrap");
+  assert.equal(restarted.body.code, "RUN_RECOVERY_TRANSIENT", "the operator retry starts one new recovery cycle");
+  await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "restarted recovery did not settle");
+  assert.equal(state.reconcileCalls, 2);
+  assert.equal(state.resumes, 1, "deferred callbacks resume queued work once after recovery");
+  assert.equal((await getRoute(runtime, "/api/settings")).statusCode, 200);
+}));
+
+test("a refused post-recovery summary audit leaves the runtime serving", withRunRecoveryFaults([], async (runtime, state) => {
+  await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "recovery did not settle");
+  assert.equal(state.audits, 1, "the summary audit was attempted and refused");
+  assert.equal(runtime.database.getRun(state.runId).status, "interrupted");
+  assert.equal((await getRoute(runtime, "/api/settings")).statusCode, 200);
+  assert.equal(state.resumes, 1, "queued work resumes despite the refused audit");
+  assert.equal((await getRoute(runtime, "/api/capacity")).body.runRecoveryPhase, "complete");
+}, { auditRefusal: storageFault("SQLITE_FULL") }));
+
+test("shutdown during a run recovery retry backoff settles without another attempt", withRunRecoveryFaults(Array.from({ length: 8 }, () => storageFault("SQLITE_BUSY")), async (runtime, state) => {
+  while (state.reconcileCalls < 3) await new Promise((resolve) => setTimeout(resolve, 10));
+  const started = Date.now();
+  await settledWithin(runtime.shutdown(), 2000, "shutdown waited for the retry schedule");
+  const calls = state.reconcileCalls;
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.equal(state.reconcileCalls, calls, "an aborted backoff timer never retries after shutdown");
+  assert.ok(Date.now() - started < 2000);
+  assert.equal(state.resumes, 0);
+}));
 
 test("runtime startup settles an orphan PTY before serving requests", withRuntime(async (runtime) => {
   await runtime.database.waitForTerminalAuditReconciliation();

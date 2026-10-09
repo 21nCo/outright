@@ -3,7 +3,7 @@
 // submitted job to its submitter's stdin.
 import * as pty from "node-pty";
 import net from "node:net";
-import { chmodSync, unlinkSync } from "node:fs";
+import { chmodSync, unlinkSync, writeSync } from "node:fs";
 
 const [address, token] = process.argv.slice(2);
 if (!address || !token || token.length < 32) process.exit(64);
@@ -18,15 +18,21 @@ let listenerClosed = false;
 let nativeExitTimer;
 // Opt-in lifecycle evidence for platform CI. Events carry counts and states,
 // never terminal output, input text or environment values, and are bounded.
+// Interaction is only counted, so it cannot spend the lifecycle event budget.
 const diagnosticsEnabled = process.env.OUTRIGHT_BROKER_DIAGNOSTICS === "1";
-const diagnosticCounts = { pauses: 0, resumes: 0, shedChars: 0, queuedInputs: 0 };
+const diagnosticCounts = { pauses: 0, resumes: 0, shedChars: 0, queuedInputs: 0, inputWrites: 0, inputBytes: 0 };
 let diagnosticEvents = 0;
 const diagnostic = (event, details = {}) => {
   if (!diagnosticsEnabled || diagnosticEvents >= 64) return;
   diagnosticEvents += 1;
-  try { process.stderr.write(`${JSON.stringify({ broker: event, ...details, ...diagnosticCounts })}\n`); }
+  // A bounded synchronous line survives the process.exit that follows the
+  // final lifecycle events; an asynchronous pipe write may not.
+  try { writeSync(2, `${JSON.stringify({ broker: event, ...details, ...diagnosticCounts })}\n`); }
   catch { /* Diagnostics never affect terminal ownership. */ }
 };
+// Node emits the listener's close before the socket's own close event after
+// the final frame. Either path records the closed peer, exactly once.
+let recordPeerClosed = () => {};
 const finishAfterNativeExit = () => {
   if (listenerClosed && (!terminal || shellExited)) process.exit(shellResult?.processCode ?? 0);
 };
@@ -46,12 +52,19 @@ const server = net.createServer((socket) => {
   let shedTimer;
   let exitTimer;
   let stalledReaderTimer;
+  let peerClosedRecorded = false;
+  recordPeerClosed = () => {
+    if (peerClosedRecorded) return;
+    peerClosedRecorded = true;
+    diagnostic("peer-closed", { shellExited, exitSent });
+  };
   const flushInput = () => {
     if (outputPaused || pendingOutput || !pendingInput || shellExited || !terminal) return;
     const input = pendingInput;
     pendingInput = "";
     terminal.write(input);
-    diagnostic("input-written", { bytes: Buffer.byteLength(input) });
+    diagnosticCounts.inputWrites += 1;
+    diagnosticCounts.inputBytes = Math.min(Number.MAX_SAFE_INTEGER, diagnosticCounts.inputBytes + Buffer.byteLength(input));
   };
   const pauseOutput = () => {
     if (!outputPaused) {
@@ -213,7 +226,7 @@ const server = net.createServer((socket) => {
     }
   });
   socket.on("close", () => {
-    diagnostic("peer-closed", { shellExited, exitSent });
+    recordPeerClosed();
     clearTimeout(shedTimer);
     clearTimeout(exitTimer);
     clearTimeout(stalledReaderTimer);
@@ -238,5 +251,6 @@ server.on("close", () => {
   // reported exit, or after the bounded failure timer asks its supervisor to
   // clean up the owned process boundary.
   listenerClosed = true;
+  recordPeerClosed();
   finishAfterNativeExit();
 });

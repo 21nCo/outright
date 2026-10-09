@@ -7,6 +7,7 @@ import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
 
 const TREE_EMPTY_PROOF = "__OUTRIGHT_UTILITY_TREE_EMPTY_V1__\n";
 const UTILITY_DIAGNOSTIC_PREFIX = "__OUTRIGHT_UTILITY_DIAGNOSTIC_V1__ ";
+const UTILITY_MEMBERS_PREFIX = "__OUTRIGHT_UTILITY_MEMBERS_V1__ ";
 
 export function utilityBudgetUnavailable(error) {
   return ["SUBPROCESS_CAPACITY", "SUBPROCESS_OWNERSHIP_UNKNOWN", "SUBPROCESS_OWNERSHIP_RECORD_FAILED"].includes(error?.code);
@@ -91,10 +92,25 @@ function releaseOwnerRecord(directory, id) {
   syncDirectory(directory);
 }
 
-function nativeOwner(id) {
-  if (process.platform === "darwin") return { label: `com.21n.outright.utility.${id}` };
-  if (process.platform === "linux") return { handshakePath: path.join(os.tmpdir(), `outright-utility-${id}`, "owner.json") };
+function nativeOwner(id, platform = process.platform) {
+  if (platform === "darwin") return { label: `com.21n.outright.utility.${id}` };
+  if (platform === "linux") return { handshakePath: path.join(os.tmpdir(), `outright-utility-${id}`, "owner.json") };
   return { jobName: String.raw`Local\OutrightUtility-${id}` };
+}
+
+function linuxBootId() {
+  try { return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || null; }
+  catch { return null; }
+}
+
+// Windows reports the supervisor and its direct child with creation times so
+// recovery can verify those exact processes, not a reusable PID or job name.
+function parseOwnerMembers(text) {
+  const members = text.trim().split(" ").map((entry) => {
+    const match = /^([1-9]\d{0,9}):([1-9]\d{0,19})$/.exec(entry);
+    return match ? { pid: Number(match[1]), birth: match[2] } : null;
+  });
+  return members.length > 0 && members.length <= 2 && members.every(Boolean) ? members : null;
 }
 
 function nativeOwnerCommand(owner, file, args) {
@@ -104,14 +120,24 @@ function nativeOwnerCommand(owner, file, args) {
   return [file, ...args];
 }
 
-function removeOwnedHandshake(handshakePath) {
-  const directory = path.dirname(handshakePath);
+function privateHandshakeDirectory(directory) {
   const info = lstatSync(directory);
-  if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid()
-    || (info.mode & 0o077) !== 0) throw new Error("Utility handshake directory is not private");
+  return info.isDirectory() && !info.isSymbolicLink() && info.uid === process.getuid() && (info.mode & 0o077) === 0;
+}
+
+// The private owner directory outlives its handshake until the durable owner
+// record is released. A present directory without a handshake is therefore
+// the supervisor's own empty-tree evidence; a missing directory is not.
+function removeOwnedHandshake(handshakePath) {
+  if (!privateHandshakeDirectory(path.dirname(handshakePath))) throw new Error("Utility handshake directory is not private");
   try { unlinkSync(handshakePath); }
   catch (error) { if (error.code !== "ENOENT") throw error; }
-  rmdirSync(directory);
+}
+
+function removeOwnerDirectory(handshakePath) {
+  if (!handshakePath) return;
+  try { rmdirSync(path.dirname(handshakePath)); }
+  catch { /* A later reconciliation or sweep can remove an empty directory. */ }
 }
 
 // The supervisor owns the entire native tree. Only its explicit empty-tree
@@ -136,7 +162,7 @@ export function runOwned(file, args, options, onClose) {
       windowsHide: true, stdio: ["pipe", "pipe", "pipe", "pipe"] });
   } catch (error) {
     if (directory) rmdirSync(directory);
-    queueMicrotask(() => onClose(error, undefined, undefined, true));
+    queueMicrotask(() => onClose(error, undefined, undefined, true, {}));
     return;
   }
   let encoding = options.encoding;
@@ -191,6 +217,26 @@ export function runOwned(file, args, options, onClose) {
   capture(child.stdout, stdout, (size) => (stdoutBytes += size));
   capture(child.stderr, stderr, (size) => (stderrBytes += size));
   child.once("error", (failure) => { error ??= failure; });
+  // Returns false for a frame outside the supervisor's control protocol.
+  const readControlLine = (line) => {
+    if (line === TREE_EMPTY_PROOF) {
+      if (treeEmpty) return false;
+      treeEmpty = true;
+      return true;
+    }
+    if (line.startsWith(UTILITY_MEMBERS_PREFIX)) {
+      const members = parseOwnerMembers(line.slice(UTILITY_MEMBERS_PREFIX.length));
+      if (!members) return false;
+      // Without this durable evidence a crash leaves the owner unknown.
+      try { options.__onOwnerMembers?.(members); } catch { /* The permit stays charged on restart. */ }
+      return true;
+    }
+    if (line.startsWith(UTILITY_DIAGNOSTIC_PREFIX)) {
+      if (diagnostics.length < 12) diagnostics.push(line.slice(UTILITY_DIAGNOSTIC_PREFIX.length).trimEnd());
+      return true;
+    }
+    return line === "__OUTRIGHT_LAUNCH_AUTHORIZED_V1__\n";
+  };
   child.stdio[3]?.on("data", (chunk) => {
     proof += chunk.toString("utf8");
     if (proof.length > 4096) invalidProof = true;
@@ -198,10 +244,7 @@ export function runOwned(file, args, options, onClose) {
       const end = proof.indexOf("\n") + 1;
       const line = proof.slice(0, end);
       proof = proof.slice(end);
-      if (line === TREE_EMPTY_PROOF && !treeEmpty) treeEmpty = true;
-      else if (line.startsWith(UTILITY_DIAGNOSTIC_PREFIX)) {
-        if (diagnostics.length < 12) diagnostics.push(line.slice(UTILITY_DIAGNOSTIC_PREFIX.length).trimEnd());
-      } else if (line !== "__OUTRIGHT_LAUNCH_AUTHORIZED_V1__\n") invalidProof = true;
+      if (!readControlLine(line)) invalidProof = true;
     }
     if (invalidProof) treeEmpty = false;
   });
@@ -229,9 +272,8 @@ export function runOwned(file, args, options, onClose) {
       finalized = true;
       clearTimeout(stopGraceTimer);
       try {
-        if (directory && (treeEmpty || !spawned)) {
-          removeOwnedHandshake(owner.handshakePath);
-        }
+        // The owner directory stays until the durable record is released.
+        if (directory && (treeEmpty || !spawned)) removeOwnedHandshake(owner.handshakePath);
       } catch (error_) {
         treeEmpty = false;
         error ??= error_;
@@ -269,9 +311,9 @@ function nativeStatus(args, env = process.env) {
   });
 }
 
-function ownerProcessGone(pid) {
+function ownerProcessGone(pid, platform = process.platform) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  if (process.platform === "linux") {
+  if (platform === "linux") {
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
       const close = stat.lastIndexOf(")");
@@ -282,50 +324,89 @@ function ownerProcessGone(pid) {
   catch (error) { return error.code === "ESRCH"; }
 }
 
-async function reconcileNativeOwner(record, id) {
-  if (!record || record.platform !== process.platform || !["active", "unknown"].includes(record.state)) return false;
-  const expected = nativeOwner(id);
-  // Older durable records predate the native identity fields. The UUID still
-  // derives their exact owner path/name; reject conflicting recorded values
-  // while allowing recovery to use that deterministic identity.
-  if (Object.keys(expected).some((key) => record[key] !== undefined && record[key] !== expected[key])) return false;
-  if (record.authorized === false) return ownerProcessGone(record.runtimePid);
-  if (!ownerProcessGone(record.pid)) return false;
-  if (process.platform === "linux") {
-    let handshake;
-    try { handshake = JSON.parse(readFileSync(expected.handshakePath, "utf8")); }
-    catch (error) { return error.code === "ENOENT"; }
-    if (!Number.isSafeInteger(handshake.pid) || handshake.pid <= 0 || typeof handshake.processIdentity !== "string") return false;
-    await nativeStatus(["--terminate-owned", String(handshake.pid), handshake.processIdentity, expected.handshakePath]);
-    try { lstatSync(expected.handshakePath); return false; }
-    catch (error) { return error.code === "ENOENT"; }
-  }
-  if (process.platform === "darwin") {
-    const first = await nativeStatus(["--probe", expected.label]);
-    if (first.status === "alive" || first.status === "exited") await nativeStatus(["--terminate", expected.label]);
-    const last = await nativeStatus(["--probe", expected.label]);
-    return last.status === "absent";
-  }
-  const first = await nativeStatus(["--utility-probe", expected.jobName]);
-  if (first.status === "alive") await nativeStatus(["--utility-terminate", expected.jobName]);
-  const last = await nativeStatus(["--utility-probe", expected.jobName]);
-  // The named Job Object uses KILL_ON_JOB_CLOSE. Once its supervisor is gone,
-  // an absent object means the kernel has terminated its associated processes
-  // and destroyed that object; an existing object still needs zero members.
-  return last.status === "exited" || last.status === "absent";
+function recordedLinuxHandshake(record, id) {
+  // Older records predate a durable handshake path. The current TMPDIR then
+  // names only a lookup candidate; its absence proves nothing.
+  if (record.handshakePath === undefined) return nativeOwner(id, "linux").handshakePath;
+  const recorded = record.handshakePath;
+  if (typeof recorded !== "string" || !path.posix.isAbsolute(recorded)
+    || path.posix.basename(recorded) !== "owner.json"
+    || path.posix.basename(path.posix.dirname(recorded)) !== `outright-utility-${id}`) return null;
+  return recorded;
+}
+
+function recordedIdentityMatches(record, id, platform) {
+  if (platform === "linux") return Boolean(recordedLinuxHandshake(record, id));
+  const expected = nativeOwner(id, platform);
+  return Object.keys(expected).every((key) => record[key] === undefined || record[key] === expected[key]);
+}
+
+function handshakeRemovedBySupervisor(handshakePath) {
+  try { if (!privateHandshakeDirectory(path.dirname(handshakePath))) return false; }
+  catch { return false; }
+  try { lstatSync(handshakePath); return false; }
+  catch (error) { return error.code === "ENOENT"; }
+}
+
+async function linuxTreeEmpty(record, id, status, bootId) {
+  // Every process from an earlier boot is gone.
+  if (typeof record.bootId === "string" && record.bootId && bootId && record.bootId !== bootId) return true;
+  const handshakePath = recordedLinuxHandshake(record, id);
+  let handshake;
+  try { handshake = JSON.parse(readFileSync(handshakePath, "utf8")); }
+  catch (error) { return error.code === "ENOENT" && handshakeRemovedBySupervisor(handshakePath); }
+  if (!Number.isSafeInteger(handshake.pid) || handshake.pid <= 0 || typeof handshake.processIdentity !== "string") return false;
+  await status(["--terminate-owned", String(handshake.pid), handshake.processIdentity, handshakePath]);
+  return handshakeRemovedBySupervisor(handshakePath);
+}
+
+async function darwinTreeEmpty(id, status) {
+  // launchd reports absent only after the recorded coalition is reaped.
+  const { label } = nativeOwner(id, "darwin");
+  const first = await status(["--probe", label]);
+  if (first.status === "alive" || first.status === "exited") await status(["--terminate", label]);
+  const last = await status(["--probe", label]);
+  return last.status === "absent";
+}
+
+async function windowsTreeEmpty(record, id, status) {
+  const { jobName } = nativeOwner(id, "win32");
+  const first = await status(["--utility-probe", jobName]);
+  if (first.status === "alive") await status(["--utility-terminate", jobName]);
+  const last = await status(["--utility-probe", jobName]);
+  // An opened Job Object with zero active processes is the kernel's proof.
+  if (last.status === "exited") return true;
+  if (last.status !== "absent") return false;
+  // A vanished name is not: KILL_ON_JOB_CLOSE teardown is asynchronous, and a
+  // Local\ name is invisible from another logon session. Every member the
+  // supervisor reported must be verifiably terminated or replaced.
+  const members = Array.isArray(record.members) ? parseOwnerMembers(record.members.map((member) => `${member?.pid}:${member?.birth}`).join(" ")) : null;
+  if (!members) return false;
+  const verdicts = await Promise.all(members.map((member) => status(["--probe", String(member.pid), member.birth])));
+  return verdicts.every((verdict) => verdict.status === "absent" && !verdict.failed);
+}
+
+// Only positive platform evidence that the recorded tree is empty releases a
+// utility permit. Missing, unreadable, foreign or ambiguous evidence keeps the
+// reservation charged as recoverable unknown capacity.
+export async function nativeOwnerTreeEmpty(record, id, platform = process.platform, status = nativeStatus, bootId = platform === "linux" ? linuxBootId() : null) {
+  if (!record || record.platform !== platform || !["active", "unknown"].includes(record.state)) return false;
+  if (!recordedIdentityMatches(record, id, platform)) return false;
+  // Sound only because the authorized record is fsynced before "go".
+  if (record.authorized === false) return ownerProcessGone(record.runtimePid, platform);
+  if (!ownerProcessGone(record.pid, platform)) return false;
+  if (platform === "linux") return linuxTreeEmpty(record, id, status, bootId);
+  if (platform === "darwin") return darwinTreeEmpty(id, status);
+  return windowsTreeEmpty(record, id, status);
 }
 
 async function releaseReconciledOwner(directory, id, record) {
-  if (!await reconcileNativeOwner(record, id)) return false;
+  if (!await nativeOwnerTreeEmpty(record, id)) return false;
   try { unlinkSync(path.join(directory, `${id}.tmp`)); }
   catch (error) { if (error.code !== "ENOENT") return false; }
   try { releaseOwnerRecord(directory, id); }
   catch { return false; }
-  const handshakePath = process.platform === "linux" ? nativeOwner(id).handshakePath : null;
-  if (handshakePath) {
-    try { rmdirSync(path.dirname(handshakePath)); }
-    catch { /* A later sweep can remove an empty directory. */ }
-  }
+  if (process.platform === "linux") removeOwnerDirectory(recordedLinuxHandshake(record, id));
   return true;
 }
 
@@ -354,7 +435,10 @@ export function createSubprocessBudget({ limit = 8, execute = runOwned, launch =
   function run(file, args, options = {}) {
     try { admit(); } catch (error) { return Promise.reject(error); }
     const ownerId = randomUUID();
-    const identity = nativeOwner(ownerId);
+    // The absolute handshake path and boot identity are recorded at spawn;
+    // recovery never re-derives them from a later runtime environment.
+    const identity = { ...nativeOwner(ownerId), ...(process.platform === "linux" ? { bootId: linuxBootId() } : {}) };
+    let authorizedOwner = null;
     try { ownerRecord(unknownDirectory, ownerId, { state: "active", authorized: false,
       runtimePid: process.pid, ...identity }); }
     catch (error) {
@@ -376,6 +460,7 @@ export function createSubprocessBudget({ limit = 8, execute = runOwned, launch =
               accountedOwners.delete(ownerId);
               active -= 1;
               unknown -= 1;
+              removeOwnerDirectory(owner.handshakePath);
             } catch { /* Recovery retains the charged record. */ }
           }
           return;
@@ -383,8 +468,11 @@ export function createSubprocessBudget({ limit = 8, execute = runOwned, launch =
         settled = true;
         inFlightOwners.delete(ownerId);
         if (ownerProven) {
-          try { releaseOwnerRecord(unknownDirectory, ownerId); active -= 1; }
-          catch (releaseError) {
+          try {
+            releaseOwnerRecord(unknownDirectory, ownerId);
+            active -= 1;
+            removeOwnerDirectory(owner.handshakePath);
+          } catch (releaseError) {
             ownerProven = false;
             error = new Error("Utility ownership reservation could not be cleared", { cause: releaseError });
           }
@@ -405,8 +493,13 @@ export function createSubprocessBudget({ limit = 8, execute = runOwned, launch =
       };
       try { execute(file, args, { ...options, __ownerId: ownerId,
         __onOwnerSpawn(pid, observedOwner) {
-          ownerRecord(unknownDirectory, ownerId, { state: "active", authorized: true,
-            pid, runtimePid: process.pid, ...observedOwner }, true);
+          const owner = { state: "active", authorized: true, pid, runtimePid: process.pid, ...identity, ...observedOwner };
+          ownerRecord(unknownDirectory, ownerId, owner, true);
+          authorizedOwner = owner;
+        },
+        __onOwnerMembers(members) {
+          if (!authorizedOwner || settled) return;
+          ownerRecord(unknownDirectory, ownerId, { ...authorizedOwner, members }, true);
         } }, finish); }
       catch (error) { finish(error); }
     });

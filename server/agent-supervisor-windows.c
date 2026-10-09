@@ -10,6 +10,7 @@
 #include <wchar.h>
 
 #define UTILITY_TREE_EMPTY "__OUTRIGHT_UTILITY_TREE_EMPTY_V1__\n"
+#define UTILITY_MEMBERS "__OUTRIGHT_UTILITY_MEMBERS_V1__"
 static bool utility_proof_enabled = false;
 
 static void ignore_invalid_descriptor(const wchar_t *expression, const wchar_t *function,
@@ -377,6 +378,19 @@ int wmain(int argc, wchar_t **argv) {
     return 75;
   }
   CloseHandle(process.hThread);
+  if (utility_owner) {
+    // A vanished Local\ job name is not empty-tree proof after a crash. Report
+    // this supervisor and its direct child with creation times so recovery
+    // can verify those exact processes are gone.
+    unsigned long long own_birth = process_birth(GetCurrentProcess());
+    unsigned long long child_birth = process_birth(process.hProcess);
+    char members[128];
+    int length = snprintf(members, sizeof(members), "%s %lu:%llu %lu:%llu\n", UTILITY_MEMBERS,
+      (unsigned long)GetCurrentProcessId(), own_birth, (unsigned long)process.dwProcessId, child_birth);
+    DWORD written = 0;
+    if (own_birth && child_birth && length > 0 && length < (int)sizeof(members))
+      WriteFile((HANDLE)proof_handle, members, (DWORD)length, &written, NULL);
+  }
 
   if (!test_mode) {
     HANDLE owner_thread = CreateThread(NULL, 0, watch_owner, job, 0, NULL);

@@ -68,9 +68,9 @@ export function recordTerminalEmpty(id, launchDirectory) {
       if (opened.ino !== before.ino || opened.dev !== before.dev) {
         throw new Error("Terminal empty proof changed during repair");
       }
-    } catch (failure) {
+    } catch (error_) {
       closeSync(descriptor);
-      throw failure;
+      throw error_;
     }
   }
   try {

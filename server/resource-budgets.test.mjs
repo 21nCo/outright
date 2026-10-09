@@ -777,6 +777,39 @@ test("aggregate retained history denies new work until eligible history is clean
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("finishRun keeps the chat resume token within the retained budget while the terminal state commits", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-finish-session-"));
+  const filename = path.join(directory, "outright.db");
+  const database = createOutrightDatabase({ filename });
+  try {
+    database.updateSettings({ maxRetainedMiB: 64 });
+    const roomy = chat(database, "roomy");
+    const control = database.createRun(runInput(roomy.id));
+    const copied = database.finishRun(control.id, { status: "completed", finishedAt: new Date().toISOString(), providerSessionId: "session-with-room" });
+    assert.equal(copied.sessionMetadataRefused, false);
+    assert.equal(database.getConversation(roomy.id).providerSessionId, "session-with-room", "control: an available budget copies the token");
+
+    const current = chat(database, "current");
+    const admitted = database.createRun(runInput(current.id));
+    const filler = database.addMessage({ conversationId: roomy.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+    const remaining = 63 * 1024 * 1024 - database.capacity().retainedBytes;
+    database.upsertMessage({ ...filler, body: `${filler.body}${"x".repeat(remaining - 8)}` });
+    assert.throws(() => database.updateConversation(current.id, { providerSessionId: "s".repeat(64) }), (error) => error.statusCode === 507);
+    const conversationBytes = (db) => db.prepare("SELECT LENGTH(COALESCE(provider_session_id, '')) AS bytes FROM conversations WHERE id = ?").get(current.id).bytes;
+    const finished = database.finishRun(admitted.id, { status: "completed", finishedAt: new Date().toISOString(), providerSessionId: "s".repeat(64) });
+    assert.equal(finished.run.status, "completed", "the terminal state commits despite the refused optional copy");
+    assert.equal(finished.run.providerSessionId, "s".repeat(64), "the run keeps its own resume evidence");
+    assert.equal(finished.sessionMetadataRefused, true);
+    assert.equal(database.getConversation(current.id).providerSessionId, null, "a full budget never overwrites the chat token");
+    const proof = new Database(filename, { readonly: true });
+    try {
+      assert.equal(conversationBytes(proof), 0);
+      assert.equal(proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'agent.run.completed' AND target = ?").get(admitted.id).count, 1);
+      assert.equal(proof.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes, retainedReadback(proof));
+    } finally { proof.close(); }
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("quota refusal commits transcript omission with delta, timed checkpoint and tool writes", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-atomic-omission-"));
   const filename = path.join(directory, "outright.db");

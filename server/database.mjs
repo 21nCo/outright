@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { MAX_PENDING_RETENTION_CLEANUPS, backfillAuditEvidencePage, pendingCleanupSql,
-  prepareAuditEvidence, trimAudit, trimAuditPage } from "./audit-retention.mjs";
+  prepareAuditEvidence, trimAuditPage } from "./audit-retention.mjs";
 import { chmodSync, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, realpathSync, rmSync, statfsSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -100,6 +100,22 @@ export async function recoverArchiveBeforeStartup(options = {}) {
   mkdirSync(path.dirname(path.resolve(requestedFilename)), { recursive: true, mode: 0o700 });
   const filename = path.join(realpathSync(path.dirname(path.resolve(requestedFilename))), path.basename(requestedFilename));
   if (existsSync(archiveShadowPaths(filename).state)) await recoverArchiveOnWorker(filename, false, true);
+}
+
+function applyTerminalAuditRow(scan, row) {
+  scan.cursor = row.id;
+  const details = parseJson(row.details, {});
+  const operationId = typeof details?.operationId === "string" && details.operationId.length <= 128
+    ? details.operationId : null;
+  if (operationId) scan.requests.delete(operationId);
+  recordTerminalAuditRequest(scan, row, details, operationId);
+  recordTerminalAuditOwner(scan, row, details);
+  if (["terminal.create.failed", "terminal.exited", "terminal.closed", "terminal.recovered"].includes(row.action)) {
+    scan.owners.delete(row.target);
+  }
+  if (scan.requests.size > 10_000 || scan.owners.size > 10_000) {
+    throw new Error("Terminal audit recovery exceeds the bounded owner index");
+  }
 }
 
 export function createOutrightDatabase(options = {}) {
@@ -452,22 +468,6 @@ export function createOutrightDatabase(options = {}) {
     };
     cleanupReconciliationTickKind = delay ? "timeout" : "immediate";
     cleanupReconciliationTick = delay ? setTimeout(resume, delay) : setImmediate(resume);
-  }
-
-  function applyTerminalAuditRow(scan, row) {
-    scan.cursor = row.id;
-    const details = parseJson(row.details, {});
-    const operationId = typeof details?.operationId === "string" && details.operationId.length <= 128
-      ? details.operationId : null;
-    if (operationId) scan.requests.delete(operationId);
-    recordTerminalAuditRequest(scan, row, details, operationId);
-    recordTerminalAuditOwner(scan, row, details);
-    if (["terminal.create.failed", "terminal.exited", "terminal.closed", "terminal.recovered"].includes(row.action)) {
-      scan.owners.delete(row.target);
-    }
-    if (scan.requests.size > 10_000 || scan.owners.size > 10_000) {
-      throw new Error("Terminal audit recovery exceeds the bounded owner index");
-    }
   }
 
   function readTerminalAuditPage(scan) {
@@ -1702,13 +1702,22 @@ export function createOutrightDatabase(options = {}) {
         // The terminal state and the evidence of its omitted final checkpoint
         // must survive the same commit, including a crash immediately after it.
         const run = this.updateRun(id, message || !transcriptMessage ? patch : { ...patch, transcriptOmitted: true });
+        // The chat's resume token is optional metadata. It obeys the retained
+        // budget in a savepoint, so a refusal leaves the terminal commit and
+        // the run's own session evidence intact.
+        let sessionMetadataRefused = false;
         if (patch.providerSessionId) {
-          db.prepare(`UPDATE conversations SET provider_session_id = ?, updated_at = ?
-            WHERE id = (SELECT conversation_id FROM runs WHERE id = ?)
-              AND provider = (SELECT provider FROM runs WHERE id = ?)`).run(patch.providerSessionId, now(), id, id);
+          try {
+            withinRetainedBudget(() => db.prepare(`UPDATE conversations SET provider_session_id = ?, updated_at = ?
+              WHERE id = (SELECT conversation_id FROM runs WHERE id = ?)
+                AND provider = (SELECT provider FROM runs WHERE id = ?)`).run(patch.providerSessionId, now(), id, id));
+          } catch (error) {
+            if (error.statusCode !== 507) throw error;
+            sessionMetadataRefused = true;
+          }
         }
         writeCriticalAudit(`agent.run.${patch.status}`, { target: id, exitCode: patch.exitCode, error: patch.error || undefined });
-        return { run, message };
+        return { run, message, sessionMetadataRefused };
       });
       return finish.immediate();
     },
