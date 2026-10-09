@@ -1,0 +1,59 @@
+server/agent-manager.mjs
+  s_fd2012bf034554::t_a62515c57c10eb 336-340,352-371,431-432,441-442,586-606,621-622,680,707,945,957-958,966-980
+server/agent-manager.test.mjs
+  s_fd2012bf034554::t_9a7fd47512b2c6 5,19-21,1458,1460-1465,1472-1481,3061-3063
+server/agent-supervisor-darwin.c
+  s_fd2012bf034554::t_0a9910a621f8aa 47-50,56-59,65-75,80,100,102-104,466-468,472-495,516-540,551-554,557,760-766
+server/agent-supervisor.c
+  s_fd2012bf034554::t_dbcb09edf2f120 494-498
+server/archive-shadow.mjs
+  s_fd2012bf034554::t_dad1c18de8ce86 684-697,707,712-721,729,735-737
+server/database.mjs
+  s_fd2012bf034554::t_5f607cf21233fc 69-91,134,195,485-505,565,684,1448,1463,1541-1563,1705-1709,1892-1896
+server/database.test.mjs
+  s_fd2012bf034554::t_1d3d3f913fd894 898-922
+server/git-service.mjs
+  s_fd2012bf034554::t_35b0748de53312 60,64
+server/managed-terminal.mjs
+  s_fd2012bf034554::t_d4372335eee3f1 3,58-74,77,131-195,198,299-303,318
+server/outright-runtime.mjs
+  s_fd2012bf034554::t_8741a3c13dc486 17-28,37-39,41,46,67-68,71,99,126-137,143-150,246-253,802,818,845,847-848
+server/outright-runtime.test.mjs
+  s_fd2012bf034554::t_67610a90017b5e 147,158,446,1381,2005,2051,2429
+server/project-scanner.mjs
+  s_fd2012bf034554::t_1711babad5f6aa 121,157,204-206
+server/project-scanner.test.mjs
+  s_fd2012bf034554::t_fd9a48f7bc83dc 3-4,92-124
+server/resource-budgets.test.mjs
+  s_fd2012bf034554::t_4e9a17167f7e0d 967,970,1001-1003
+server/subprocess-budget.mjs
+  s_fd2012bf034554::t_8724d13ee85a34 30-49,55-61,97-104,131,215,274-280,288-291,296,299-300,304-306,309-329,448
+server/subprocess-budget.test.mjs
+  s_fd2012bf034554::t_e6b8a3a4ca1614 3-4,216-257,372,390-397
+server/terminal-broker.mjs
+  s_fd2012bf034554::t_a2b62038de13c7 19-29,41,49-55,59,94,99,103,125,144-145,171,178-189,216
+server/terminal-broker.test.mjs
+  s_fd2012bf034554::t_38273d44a13dd6 130-131,134,137-143,194,214-216
+server/terminal-manager.mjs
+  s_fd2012bf034554::t_6e92e50d4bbf24 74-94,109,215-221,223
+server/terminal-manager.test.mjs
+  s_fd2012bf034554::t_dbd1faa6cdbfd8 9,405,415-450,476-478,493,729,1333-1334,1351-1352,1361-1362
+src/App.jsx
+  s_fd2012bf034554::t_8e8a36e3b4a533 56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d225d7cf2e44ce8dc49bd92bae4994607d77bf97",
+  "prompts": {},
+  "sessions": {
+    "s_fd2012bf034554": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bba569bd-afce-4b37-bbb1-2a85837124dd",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
