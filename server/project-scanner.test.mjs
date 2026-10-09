@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { mapWithConcurrency, parseStatus, parseWorktreePorcelain, scanProjects } from "./project-scanner.mjs";
@@ -87,4 +88,37 @@ test("one branch-status result carries changed paths and upstream counts", () =>
     changedFiles: [{ status: "A", path: "first.txt" }],
   });
   assert.deepEqual(parseStatus(""), { divergence: { ahead: 0, behind: 0 }, changedFiles: [] });
+});
+
+test("scanner reports divergence when Git disables ahead/behind by default", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-divergence-"));
+  const bare = path.join(root, "remote.git");
+  const local = path.join(root, "local");
+  const peer = path.join(root, "peer");
+  const git = (...args) => execFileSync("git", args, { stdio: "ignore" });
+  try {
+    git("init", "--bare", bare);
+    git("clone", bare, local);
+    git("-C", local, "config", "user.email", "test@example.invalid");
+    git("-C", local, "config", "user.name", "Test");
+    writeFileSync(path.join(local, "first.txt"), "first\n");
+    git("-C", local, "add", ".");
+    git("-C", local, "commit", "-m", "first");
+    git("-C", local, "push", "-u", "origin", "HEAD");
+    git("clone", bare, peer);
+    git("-C", peer, "config", "user.email", "test@example.invalid");
+    git("-C", peer, "config", "user.name", "Test");
+    writeFileSync(path.join(peer, "peer.txt"), "peer\n");
+    git("-C", peer, "add", ".");
+    git("-C", peer, "commit", "-m", "peer");
+    git("-C", peer, "push");
+    writeFileSync(path.join(local, "local.txt"), "local\n");
+    git("-C", local, "add", ".");
+    git("-C", local, "commit", "-m", "local");
+    git("-C", local, "fetch", "origin");
+    git("-C", local, "config", "status.aheadBehind", "false");
+    const result = await scanProjects({ scanRoots: [local], maxDepth: 0, maxProjects: 1,
+      excludeDirectories: new Set() });
+    assert.deepEqual([result.projects[0].worktrees[0].ahead, result.projects[0].worktrees[0].behind], [1, 1]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -53,7 +53,7 @@ const LIVE_OMITTED_PREFIX = "[Earlier live output omitted]\n";
 function bootstrapFailureOutcome(error, manual) {
   if (manual) return "error";
   if (error.status !== 503) return "error";
-  if (error.payload != null && error.payload.code !== "ARCHIVE_MAINTENANCE_TRANSIENT") return "error";
+  if (error.payload != null && !["ARCHIVE_MAINTENANCE_TRANSIENT", "RUN_RECOVERY_TRANSIENT"].includes(error.payload.code)) return "error";
   return "retry";
 }
 

@@ -44,23 +44,40 @@ static bool coalition_marker_path(const char *label, char *filename, size_t capa
   return snprintf(filename, capacity, "%s/outright-env-%s/coalition", root, label) < (int)capacity;
 }
 
+// -1: no invocation directory; 0: directory exists without trusted identity;
+// 1: a full unsigned coalition identifier was read.
+static int read_coalition_marker(const char *label, uint64_t *coalition_id);
+
 static bool write_coalition_marker(const char *label, uint64_t coalition_id) {
   if (coalition_id == 0) return false;
   char filename[4096];
   if (!coalition_marker_path(label, filename, sizeof(filename))) return false;
   int descriptor = open(filename, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
-  if (descriptor < 0) return errno == EEXIST;
+  if (descriptor < 0) {
+    uint64_t existing = 0;
+    return errno == EEXIST && read_coalition_marker(label, &existing) == 1 && existing == coalition_id;
+  }
   char value[32];
   int length = snprintf(value, sizeof(value), "%llu\n", (unsigned long long)coalition_id);
   bool written = length > 0 && length < (int)sizeof(value)
     && write(descriptor, value, (size_t)length) == length && fsync(descriptor) == 0;
   if (close(descriptor) != 0) written = false;
+  if (written) {
+    char *slash = strrchr(filename, '/');
+    if (slash == NULL) written = false;
+    else {
+      *slash = '\0';
+      int directory_fd = open(filename, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+      if (directory_fd < 0) written = false;
+      else { if (fsync(directory_fd) != 0) written = false; close(directory_fd); }
+      *slash = '/';
+    }
+  }
   if (!written) unlink(filename);
   return written;
 }
 
-// -1: no invocation directory; 0: directory exists without durable identity.
-static long long read_coalition_marker(const char *label) {
+static int read_coalition_marker(const char *label, uint64_t *coalition_id) {
   char filename[4096];
   if (!coalition_marker_path(label, filename, sizeof(filename))) return 0;
   int descriptor = open(filename, O_RDONLY | O_NOFOLLOW);
@@ -80,8 +97,11 @@ static long long read_coalition_marker(const char *label) {
   close(descriptor);
   if (length <= 1 || !trusted) return 0;
   char *end = NULL;
+  errno = 0;
   unsigned long long id = strtoull(value, &end, 10);
-  return id > 0 && end == value + length - 1 && *end == '\n' ? (long long)id : 0;
+  if (errno != 0 || id == 0 || end != value + length - 1 || *end != '\n') return 0;
+  *coalition_id = (uint64_t)id;
+  return 1;
 }
 
 // launchctl submit starts a service with launchd's environment, not the
@@ -443,8 +463,34 @@ static int coalition_members(uint64_t coalition_id, pid_t *pids, size_t capacity
     resolved = true;
   }
   size_t size = capacity * sizeof(*pids);
-  if (coalition_id == 0 || list_pids == NULL || list_pids(coalition_id, pids, &size) != 0) return -1;
+  if (coalition_id == 0 || list_pids == NULL) { errno = ENOSYS; return -1; }
+  errno = 0;
+  if (list_pids(coalition_id, pids, &size) != 0) return -1;
   return (int)(size / sizeof(*pids));
+}
+
+// The kernel reaps a resource coalition only after its last member exits and
+// never reuses its 64-bit identifier. Once launchd no longer owns the service,
+// ESRCH for a durably recorded identifier proves that the tree is empty.
+static int recorded_coalition_members(uint64_t coalition_id, pid_t *pids, size_t capacity) {
+  int count = coalition_members(coalition_id, pids, capacity);
+  return count < 0 && errno == ESRCH ? 0 : count;
+}
+
+// A missing service cannot be relaunched, but escaped members may remain in
+// its recorded coalition. Kill them until the kernel reports it empty.
+static bool kill_recorded_coalition(uint64_t coalition_id) {
+  for (int attempt = 0; attempt < 100; attempt++) {
+    pid_t pids[1024];
+    int count = recorded_coalition_members(coalition_id, pids, sizeof(pids) / sizeof(pids[0]));
+    if (count <= 0) return count == 0;
+    for (int index = 0; index < count; index++) {
+      if (pids[index] > 0 && pids[index] != getpid()) kill(pids[index], SIGKILL);
+    }
+    struct timespec delay = { .tv_sec = 0, .tv_nsec = 20 * 1000 * 1000 };
+    nanosleep(&delay, NULL);
+  }
+  return false;
 }
 
 static bool terminate_coalition(const char *target, uint64_t coalition_id) {
@@ -467,6 +513,31 @@ static bool terminate_coalition(const char *target, uint64_t coalition_id) {
   return false;
 }
 
+// launchd no longer owns this label. Its durable coalition marker is the only
+// membership proof; a missing invocation directory means none was recorded.
+static int settle_missing_service(const char *mode, const char *label) {
+  bool terminate = strcmp(mode, "--terminate") == 0;
+  uint64_t coalition_id = 0;
+  int marker = read_coalition_marker(label, &coalition_id);
+  bool empty = marker < 0;
+  if (marker > 0) {
+    pid_t pids[1024];
+    int count = recorded_coalition_members(coalition_id, pids, sizeof(pids) / sizeof(pids[0]));
+    // Live members are reported as alive so recovery callers request the
+    // teardown below instead of retaining an unresolvable unknown owner.
+    if (count > 0 && !terminate) {
+      dprintf(STDOUT_FILENO, "alive\n");
+      return 0;
+    }
+    empty = count == 0 || (count > 0 && kill_recorded_coalition(coalition_id));
+  }
+  if (empty) cleanup_output_pipes(label);
+  bool cleaned = empty && cleanup_launch_environment(label);
+  dprintf(STDOUT_FILENO, "%s\n", cleaned ? (terminate ? "exited" : "absent") : "unknown");
+  if (!cleaned) return 4;
+  return terminate ? 0 : 3;
+}
+
 static int control_existing_job(const char *mode, const char *label) {
   if (!valid_label(label)) return 64;
   char *target = service_target(label);
@@ -477,21 +548,15 @@ static int control_existing_job(const char *mode, const char *label) {
     return 4;
   }
   service_result state_result = read_state(target, &state);
+  // An unreadable or coalition-less service has no membership to inspect.
+  // Terminate mode removes the registration, then settles it as missing.
+  if ((state_result == SERVICE_ERROR || (state_result == SERVICE_OK && state.resource_coalition_id == 0))
+      && strcmp(mode, "--terminate") == 0 && bootout_checked(target)) state_result = SERVICE_MISSING;
   if (state_result == SERVICE_MISSING) {
-    long long coalition_id = read_coalition_marker(label);
-    bool empty = coalition_id < 0;
-    if (coalition_id > 0) {
-      pid_t pids[1024];
-      empty = coalition_members((uint64_t)coalition_id, pids, sizeof(pids) / sizeof(pids[0])) == 0;
-    }
-    if (empty) cleanup_output_pipes(label);
-    bool cleaned = empty && cleanup_launch_environment(label);
     free(target);
-    dprintf(STDOUT_FILENO, "%s\n", cleaned ? (strcmp(mode, "--probe") == 0 ? "absent" : "exited") : "unknown");
-    return cleaned ? (strcmp(mode, "--probe") == 0 ? 3 : 0) : 4;
+    return settle_missing_service(mode, label);
   }
   if (state_result != SERVICE_OK || state.resource_coalition_id == 0) {
-    if (strcmp(mode, "--terminate") == 0) bootout_checked(target);
     free(target);
     dprintf(STDOUT_FILENO, "unknown\n");
     return 4;
@@ -692,7 +757,13 @@ int main(int argc, char **argv) {
     state_failures = 0;
     if (state.resource_coalition_id != 0) {
       coalition_id = state.resource_coalition_id;
-      write_coalition_marker(argv[1], coalition_id);
+      if (!write_coalition_marker(argv[1], coalition_id)) {
+        // Without durable identity a later owner crash cannot distinguish an
+        // escaped descendant from an absent service. Stop this job now; keep
+        // its capacity unknown if native teardown cannot prove emptiness.
+        stopping = true;
+        stop_requested = 1;
+      }
     }
     if (state.runs >= 1 && state.active == 0) provider_exit_code = state.exit_code;
     if (stopping) {

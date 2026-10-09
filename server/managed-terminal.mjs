@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,9 +55,26 @@ export function recordTerminalEmpty(id, launchDirectory) {
   try { descriptor = openSync(filename, "wx", 0o600); }
   catch (error) {
     if (error.code === "EEXIST" && hasTerminalEmpty(id, launchDirectory)) return;
-    throw error;
+    if (error.code !== "EEXIST") throw error;
+    // An interrupted write may leave a partial marker. Repair only a regular
+    // single-link file in the private launch directory; never follow a link
+    // or replace another owner's evidence.
+    const before = lstatSync(filename);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
+      || (process.platform !== "win32" && (before.uid !== process.getuid() || (before.mode & 0o077) !== 0))) throw error;
+    descriptor = openSync(filename, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0));
+    try {
+      const opened = fstatSync(descriptor);
+      if (opened.ino !== before.ino || opened.dev !== before.dev) {
+        throw new Error("Terminal empty proof changed during repair");
+      }
+    } catch (failure) {
+      closeSync(descriptor);
+      throw failure;
+    }
   }
   try {
+    ftruncateSync(descriptor, 0);
     writeFileSync(descriptor, `${id}\n`);
     fsyncSync(descriptor);
   } finally { closeSync(descriptor); }
@@ -111,13 +128,74 @@ async function verifyWindowsTerminalEmpty(subprocesses, childPid, processIdentit
   catch (error) { return error.stdout?.trim() === "absent"; }
 }
 
+async function connectBroker(address, isClosed, failureDetails) {
+  const deadline = Date.now() + START_TIMEOUT_MS;
+  while (Date.now() < deadline && !isClosed()) {
+    try {
+      return await new Promise((resolve, reject) => {
+        const client = net.createConnection(address);
+        client.once("connect", () => resolve(client));
+        client.once("error", reject);
+      });
+    } catch { await new Promise((resolve) => setTimeout(resolve, 25)); }
+  }
+  throw new Error(`PTY broker did not start: ${failureDetails() || "native supervisor unavailable"}`);
+}
+
+function waitForBrokerReady(socket, handleMessage, onClose, wasReady) {
+  return new Promise((resolve, reject) => {
+    let pending = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      pending += chunk;
+      if (pending.length > 256 * 1024) { reject(new Error("PTY broker response exceeded its limit")); socket.destroy(); return; }
+      let end;
+      while ((end = pending.indexOf("\n")) !== -1) {
+        const line = pending.slice(0, end);
+        pending = pending.slice(end + 1);
+        let message;
+        try { message = JSON.parse(line); }
+        catch { reject(new Error("PTY broker returned malformed data")); socket.destroy(); return; }
+        if (!message || typeof message !== "object" || Array.isArray(message)) {
+          reject(new Error("PTY broker returned malformed data")); socket.destroy(); return;
+        }
+        handleMessage(message, resolve, reject);
+      }
+    });
+    socket.on("error", reject);
+    socket.on("close", () => {
+      onClose();
+      if (!wasReady()) reject(new Error("PTY broker closed before launch"));
+    });
+  });
+}
+
+function terminalSupervisorArgs(ownership) {
+  const brokerArgs = [process.execPath, BROKER, ownership.address, ownership.token];
+  if (process.platform === "linux") return ["--stop-on-owner-exit", ownership.handshakePath, ...brokerArgs];
+  if (process.platform === "darwin") return [ownership.label, ...brokerArgs];
+  return brokerArgs;
+}
+
+// A launch that failed after the native owner started must prove that owner
+// empty before its durable marker and socket are settled. An unverified
+// teardown keeps both, so restart recovery still has the evidence.
+async function teardownFailedLaunch(error, adapter, id, ownership) {
+  try {
+    await adapter.terminate();
+    error.terminationVerified = true;
+    try { recordTerminalEmpty(id, path.dirname(ownership.handshakePath)); }
+    catch (proofError) { error.emptyProofError = proofError; }
+  }
+  catch { error.terminationUnknown = true; }
+  error.terminalTeardown = adapter;
+  if (!error.terminationUnknown) try { cleanupTerminalSocket(id); } catch {}
+  return error;
+}
+
 export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, rows, env,
   subprocesses = utilityProcesses }) {
-  const brokerArgs = [process.execPath, BROKER, ownership.address, ownership.token];
-  let nativeArgs = brokerArgs;
-  if (process.platform === "linux") nativeArgs = ["--stop-on-owner-exit", ownership.handshakePath, ...brokerArgs];
-  else if (process.platform === "darwin") nativeArgs = [ownership.label, ...brokerArgs];
-  const child = spawn(AGENT_SUPERVISOR, nativeArgs, { cwd, env: { ...env,
+  const child = spawn(AGENT_SUPERVISOR, terminalSupervisorArgs(ownership), { cwd, env: { ...env,
     ...(process.platform === "darwin" ? { OUTRIGHT_LAUNCH_GATE_FD: "3", OUTRIGHT_TERMINAL_CONTROL: "1" } : {}) },
     stdio: ["pipe", "pipe", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true });
   child.stdout.resume();
@@ -218,43 +296,11 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
   try {
     if (process.platform === "linux") child.stdin.write("go\n");
     else if (process.platform === "darwin") child.stdio[3].end("go\n");
-    const deadline = Date.now() + START_TIMEOUT_MS;
-    while (Date.now() < deadline && !closed) {
-      try {
-        socket = await new Promise((resolve, reject) => {
-          const client = net.createConnection(ownership.address);
-          client.once("connect", () => resolve(client));
-          client.once("error", reject);
-        });
-        break;
-      } catch { await new Promise((resolve) => setTimeout(resolve, 25)); }
-    }
-    if (!socket) throw new Error(`PTY broker did not start: ${stderr || "native supervisor unavailable"}`);
-    const ready = new Promise((resolve, reject) => {
-      let pending = "";
-      socket.setEncoding("utf8");
-      socket.on("data", (chunk) => {
-        pending += chunk;
-        if (pending.length > 256 * 1024) { reject(new Error("PTY broker response exceeded its limit")); socket.destroy(); return; }
-        let end;
-        while ((end = pending.indexOf("\n")) !== -1) {
-          const line = pending.slice(0, end);
-          pending = pending.slice(end + 1);
-          let message;
-          try { message = JSON.parse(line); } catch { reject(new Error("PTY broker returned malformed data")); socket.destroy(); return; }
-          if (!message || typeof message !== "object" || Array.isArray(message)) {
-            reject(new Error("PTY broker returned malformed data")); socket.destroy(); return;
-          }
-          handleBrokerMessage(message, resolve, reject);
-        }
-      });
-      socket.on("error", reject);
-      socket.on("close", () => {
-        settleSocket();
-        if (!readySeen) reject(new Error("PTY broker closed before launch"));
-        else if (!shellExited && !closed) void adapter.terminate().catch(() => {});
-      });
-    });
+    socket = await connectBroker(ownership.address, () => closed, () => stderr);
+    const ready = waitForBrokerReady(socket, handleBrokerMessage, () => {
+      settleSocket();
+      if (readySeen && !shellExited && !closed) void adapter.terminate().catch(() => {});
+    }, () => readySeen);
     socket.write(`${JSON.stringify({ type: "start", token: ownership.token, shell, cwd, cols, rows, env })}\n`);
     let timeout;
     await Promise.race([ready, new Promise((_, reject) => {
@@ -269,16 +315,7 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
     }
     return adapter;
   } catch (error) {
-    try {
-      await adapter.terminate();
-      error.terminationVerified = true;
-      try { recordTerminalEmpty(id, path.dirname(ownership.handshakePath)); }
-      catch (proofError) { error.emptyProofError = proofError; }
-    }
-    catch { error.terminationUnknown = true; }
-    if (error.terminationUnknown || error.terminationVerified) error.terminalTeardown = adapter;
-    if (!error.terminationUnknown) try { cleanupTerminalSocket(id); } catch {}
-    throw error;
+    throw await teardownFailedLaunch(error, adapter, id, ownership);
   }
 }
 

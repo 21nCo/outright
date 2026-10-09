@@ -14,6 +14,18 @@ import { utilityProcesses } from "./subprocess-budget.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
 
+function throwFailedRuntimeStartup(error, { eventHub, wss, database }) {
+  // The constructor has not admitted an agent or PTY. Stop startup-owned
+  // managers and release the physical lease before reporting its failure.
+  const cleanupErrors = [];
+  try { eventHub?.shutdown(); } catch (failure) { cleanupErrors.push(failure); }
+  try { wss?.close(); } catch (failure) { cleanupErrors.push(failure); }
+  try { database.closeFailedStartup(); }
+  catch (failure) { cleanupErrors.push(failure); }
+  if (cleanupErrors.length) throw new AggregateError([error, ...cleanupErrors], "Runtime startup and cleanup failed");
+  throw error;
+}
+
 export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, databaseFactory = createOutrightDatabase, agentManagerFactory = createAgentManager, hardenLaunchDirectory = process.platform === "win32" ? hardenWindowsLaunchDirectory : () => {}, terminalManagerFactory = createTerminalManager } = {}) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
@@ -22,13 +34,16 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   let publish;
   let runtimeCapacity;
   let shuttingDown = false;
+  let runRecoveryPending = true;
+  let runRecoveryError = null;
+  const runRecoveryController = new AbortController();
   const database = databaseFactory({ runtimeLease: true, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, onMigrationComplete: () => {
-    agents.resumeQueued();
+    if (!runRecoveryPending) agents.resumeQueued();
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
   }, onDeletionWorkerStart: () => {
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
   }, onDeletionWorkerExit: () => {
-    agents.resumeQueued();
+    if (!runRecoveryPending) agents.resumeQueued();
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
   }, onTerminalAuditReconciled: () => {
     if (shuttingDown || !terminals) return;
@@ -49,10 +64,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   hardenLaunchDirectory(database.launchDirectory);
   database.reconcilePendingRetentionCleanup();
   database.reconcileTerminalAudit();
-  const reconciliation = database.reconcileInterruptedRuns({
+  const reconciliation = database.reconcileInterruptedRuns({ yieldBetweenBatches: true,
+    signal: runRecoveryController.signal,
     probeAlive: (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync),
   });
-  if (reconciliation.count) database.audit("runtime.runs.reconciled", { target: "runtime", ...reconciliation });
+  void Promise.resolve(reconciliation).catch(() => {});
   eventHub = createRuntimeEventHub();
   const runtimeInstanceId = randomUUID();
   wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024 });
@@ -80,6 +96,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   runtimeCapacity = function runtimeCapacity() {
     const capacity = database.capacity();
     return { ...capacity, activeProcesses: agents?.activeProcessCount() ?? 0,
+      runRecoveryPending, runRecoveryError: runRecoveryError?.message ?? null,
       pendingRunOutcomes: agents?.pendingOutcomeCount() ?? 0,
       limits: { ...capacity.limits, maxPendingRunOutcomes: RESOURCE_BUDGETS.maxPendingRunOutcomes },
       utilityProcesses: subprocesses.capacity(), terminalProcesses: terminals.capacity() };
@@ -106,13 +123,31 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required");
     };
   } });
+  const runRecovery = Promise.resolve(reconciliation).then((result) => {
+    if (result.count) database.audit("runtime.runs.reconciled", { target: "runtime", ...result });
+    runRecoveryPending = false;
+    if (!shuttingDown) {
+      if (result.count) agents.resumeQueued();
+      publish({ type: "capacity.changed", payload: runtimeCapacity() });
+    }
+  }).catch((error) => {
+    runRecoveryPending = false;
+    runRecoveryError = error;
+    if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:run-recovery]", error);
+  });
   function startOwnershipRecovery() {
     const onRecovered = (resolved) => {
       if (resolved && !shuttingDown) publish({ type: "capacity.changed", payload: runtimeCapacity() });
     };
     void terminals.reconcileUnknown().then(onRecovered).catch(() => {});
-    const utilityRecovery = subprocesses.reconcileUnknown?.();
-    if (utilityRecovery) void Promise.resolve(utilityRecovery).then(onRecovered).catch(() => {});
+    if (typeof subprocesses.reconcileUnknown === "function") {
+      void Promise.resolve().then(() => subprocesses.reconcileUnknown()).then(async (resolved) => {
+        onRecovered(resolved);
+        // A terminal proof may have been refused only because utility owners
+        // occupied every helper slot. Retry it after capacity is reclaimed.
+        if (resolved && !shuttingDown) await terminals.reconcileUnknown();
+      }).catch(() => {});
+    }
   }
   startOwnershipRecovery();
 
@@ -208,6 +243,14 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     try {
       assertRuntimeRequest(request, allowedHosts);
       if (shuttingDown) throw apiError(503, "Runtime is shutting down");
+      // A zero-row reconciliation resolves in the constructor's next
+      // microtask. Let that settle before classifying a new request as busy.
+      if (runRecoveryPending) await Promise.resolve();
+      if ((runRecoveryPending || runRecoveryError) && url.pathname !== "/api/capacity") {
+        throw apiError(503, runRecoveryError ? `Run recovery failed: ${runRecoveryError.message}`
+          : "Run recovery is reconciling interrupted work; retry shortly",
+        { code: runRecoveryError ? "RUN_RECOVERY_FAILED" : "RUN_RECOVERY_TRANSIENT" });
+      }
       if (database.maintenanceActive && url.pathname !== "/api/capacity") {
         const failure = database.capacity().maintenanceError;
         throw apiError(503, failure ? `Archive maintenance recovery failed: ${failure}`
@@ -756,6 +799,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   function shutdown() {
     if (shutdownPromise) return shutdownPromise;
     shuttingDown = true;
+    runRecoveryController.abort();
     clearTimeout(watcherTimer);
     let disposed = false;
     shutdownPromise = (async () => {
@@ -771,6 +815,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         throw error;
       }
       await inFlightScan?.catch(() => {});
+      await runRecovery;
       // Native-owner probes may remain slow or stuck. Terminal shutdown fences
       // their late results before the database lease is released.
       try { await terminals.shutdown(); }
@@ -797,18 +842,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   }
 
   return { attach, handleRequest, projects, publish, database, agents, terminals, git, shutdown,
-    whenShutdownComplete: () => shutdownCompletion };
+    whenShutdownComplete: () => shutdownCompletion, whenRunRecoveryComplete: () => runRecovery };
   } catch (error) {
-    // No runtime was returned, so neither Vite nor standalone can call its
-    // shutdown. Stop startup-owned managers before releasing the physical
-    // lease. The constructor is synchronous; no agent or PTY has been admitted.
-    const cleanupErrors = [];
-    try { eventHub?.shutdown(); } catch (error_) { cleanupErrors.push(error_); }
-    try { wss?.close(); } catch (error_) { cleanupErrors.push(error_); }
-    try { database.closeFailedStartup(); }
-    catch (error_) { cleanupErrors.push(error_); }
-    if (cleanupErrors.length) throw new AggregateError([error, ...cleanupErrors], "Runtime startup and cleanup failed");
-    throw error;
+    runRecoveryController.abort();
+    throwFailedRuntimeStartup(error, { eventHub, wss, database });
   }
 }
 

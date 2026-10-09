@@ -71,6 +71,27 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     if ([...terminals.values()].filter((terminal) => terminal.cwd === cwd).length + reservedForCwd(cwd) >= maxTerminalsPerCwd) throw terminalError(429, `At most ${maxTerminalsPerCwd} terminals can run for one worktree`);
   }
 
+  async function reconcileReservedTerminal(entry) {
+    const verified = verifiedCreateFailures.get(entry.target);
+    if (verified) {
+      recordTerminalEmpty(entry.target, database.launchDirectory);
+      cleanupSocket(entry.target);
+      database.auditCritical("terminal.create.failed", verified);
+      verifiedCreateFailures.delete(entry.target);
+    } else {
+      const empty = await recoverTerminal({ ...entry, launchDirectory: database.launchDirectory, subprocesses });
+      if (!empty || shuttingDown) return false;
+      // Socket removal belongs to the same proof as native emptiness.
+      // A failed unlink must leave the durable reservation charged.
+      cleanupSocket(entry.target);
+      database.resolveTerminalUnknown(entry.target, `Native ${process.platform} owner was verified empty after restart`);
+    }
+    try { removeTerminalEmpty(entry.target, database.launchDirectory); }
+    catch { /* The verified owner remains absent; retry cleanup later. */ }
+    reservedUnknown = unresolvedReservations();
+    return true;
+  }
+
   function reconcileUnknown() {
     if (shuttingDown || database.terminalAuditScanPending) return Promise.resolve(0);
     if (reconciliationPromise) return reconciliationPromise;
@@ -85,25 +106,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
           if (shuttingDown) break;
           const entry = entries[next++];
           try {
-            const verified = verifiedCreateFailures.get(entry.target);
-            if (verified) {
-              try { recordTerminalEmpty(entry.target, database.launchDirectory); } catch { /* Retry the audit below. */ }
-              database.auditCritical("terminal.create.failed", verified);
-              verifiedCreateFailures.delete(entry.target);
-              reservedUnknown = unresolvedReservations();
-              try { removeTerminalEmpty(entry.target, database.launchDirectory); } catch {}
-              resolved += 1;
-              publish({ type: "capacity.changed" });
-              continue;
-            }
-            const empty = await recoverTerminal({ ...entry, launchDirectory: database.launchDirectory, subprocesses });
-            if (!empty || shuttingDown) continue;
-            // Socket removal belongs to the same proof as native emptiness.
-            // A failed unlink must leave the durable reservation charged.
-            cleanupSocket(entry.target);
-            database.resolveTerminalUnknown(entry.target, `Native ${process.platform} owner was verified empty after restart`);
-            try { removeTerminalEmpty(entry.target, database.launchDirectory); } catch { /* The verified owner remains absent; retry cleanup later. */ }
-            reservedUnknown = unresolvedReservations();
+            if (!await reconcileReservedTerminal(entry)) continue;
             resolved += 1;
             publish({ type: "capacity.changed" });
           } catch { /* A refused helper or unavailable audit keeps capacity unknown. */ }
@@ -209,12 +212,15 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       try { await terminal.process.terminate(); verifiedEmpty = true; }
       catch { terminal.status = "unknown"; throw outcomeUnknown(error, evidence.operationId); }
     }
-    if (verifiedEmpty) try { recordTerminalEmpty(id, database.launchDirectory); }
-    catch { /* A durable failed-create audit can independently settle this verified owner. */ }
-    try { database.auditCritical("terminal.create.failed", { ...evidence, error: String(error.message ?? error).slice(0, 1024) }); }
-    catch {
+    const failureEvidence = { ...evidence, error: String(error.message ?? error).slice(0, 1024) };
+    try {
+      if (!verifiedEmpty) throw new Error("PTY owner has no empty-tree proof");
+      recordTerminalEmpty(id, database.launchDirectory);
+      cleanupSocket(id);
+      database.auditCritical("terminal.create.failed", failureEvidence);
+    } catch {
       terminals.delete(id);
-      if (verifiedEmpty) verifiedCreateFailures.set(id, { ...evidence, error: String(error.message ?? error).slice(0, 1024) });
+      if (verifiedEmpty) verifiedCreateFailures.set(id, failureEvidence);
       reservedUnknown = [...reservedUnknown, { ...evidence, ownershipLabel: ownership.label,
         handshakePath: ownership.handshakePath, created: 0 }];
       throw outcomeUnknown(error, evidence.operationId);

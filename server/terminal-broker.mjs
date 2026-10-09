@@ -16,6 +16,17 @@ let shellExited = false;
 let shellResult;
 let listenerClosed = false;
 let nativeExitTimer;
+// Opt-in lifecycle evidence for platform CI. Events carry counts and states,
+// never terminal output, input text or environment values, and are bounded.
+const diagnosticsEnabled = process.env.OUTRIGHT_BROKER_DIAGNOSTICS === "1";
+const diagnosticCounts = { pauses: 0, resumes: 0, shedChars: 0, queuedInputs: 0 };
+let diagnosticEvents = 0;
+const diagnostic = (event, details = {}) => {
+  if (!diagnosticsEnabled || diagnosticEvents >= 64) return;
+  diagnosticEvents += 1;
+  try { process.stderr.write(`${JSON.stringify({ broker: event, ...details, ...diagnosticCounts })}\n`); }
+  catch { /* Diagnostics never affect terminal ownership. */ }
+};
 const finishAfterNativeExit = () => {
   if (listenerClosed && (!terminal || shellExited)) process.exit(shellResult?.processCode ?? 0);
 };
@@ -27,6 +38,7 @@ const server = net.createServer((socket) => {
   // PTY also backpressures a shell that produces output faster than its owner
   // can read it, without treating a slow reader as loss of ownership.
   let pendingOutput = "";
+  let pendingInput = "";
   let outputOffset = 0;
   let omittedChars = 0;
   let outputPaused = false;
@@ -34,9 +46,17 @@ const server = net.createServer((socket) => {
   let shedTimer;
   let exitTimer;
   let stalledReaderTimer;
+  const flushInput = () => {
+    if (outputPaused || pendingOutput || !pendingInput || shellExited || !terminal) return;
+    const input = pendingInput;
+    pendingInput = "";
+    terminal.write(input);
+    diagnostic("input-written", { bytes: Buffer.byteLength(input) });
+  };
   const pauseOutput = () => {
     if (!outputPaused) {
       outputPaused = true;
+      diagnosticCounts.pauses += 1;
       // A peer that never drains cannot own an unbounded ConPTY stream.
       // Give a temporarily slow reader time to resume, then tear down this
       // broker's shell and let the supervisor verify the owned boundary.
@@ -71,13 +91,16 @@ const server = net.createServer((socket) => {
     }
     if (shellExited && !exitSent) {
       exitSent = true;
+      diagnostic("exit-frame-sent");
       socket.end(`${JSON.stringify({ type: "shell-exited", exitCode: shellResult.exitCode, signal: shellResult.signal })}\n`);
       if (server.listening) server.close();
     } else if (outputPaused && !shellExited) {
       outputPaused = false;
+      diagnosticCounts.resumes += 1;
       clearTimeout(shedTimer);
       clearTimeout(stalledReaderTimer);
       if (process.platform !== "win32") terminal.resume();
+      flushInput();
     }
   };
   const flushOutput = () => {
@@ -99,6 +122,7 @@ const server = net.createServer((socket) => {
     // Already queued output has priority; shed any excess at this boundary.
     if (outputPaused || pendingOutput) {
       omittedChars = Math.min(Number.MAX_SAFE_INTEGER, omittedChars + data.length);
+      diagnosticCounts.shedChars = Math.min(Number.MAX_SAFE_INTEGER, diagnosticCounts.shedChars + data.length);
       return;
     }
     let end = Math.min(data.length, 64 * 1024);
@@ -117,6 +141,8 @@ const server = net.createServer((socket) => {
     shellResult = { exitCode: validCode || (validSignal && normalizedSignal > 0) ? processCode : null,
       signal: validSignal ? normalizedSignal : null, processCode };
     shellExited = true;
+    diagnostic("shell-exit", { exitCode: shellResult.exitCode, signal: shellResult.signal, outputPaused,
+      pendingOutputChars: pendingOutput.length - outputOffset, pendingInputBytes: Buffer.byteLength(pendingInput) });
     clearTimeout(nativeExitTimer);
     clearTimeout(shedTimer);
     // A silent peer cannot retain the final frame or broker indefinitely.
@@ -142,13 +168,25 @@ const server = net.createServer((socket) => {
       return;
     }
     socket.write(`${JSON.stringify({ type: "ready" })}\n`);
+    diagnostic("shell-spawned", { shellPid: terminal.pid });
     terminal.onData(onTerminalData);
     terminal.onExit(onTerminalExit);
   };
   const handleMessage = (message) => {
     if (!authenticated) { startTerminal(message); return; }
     if (!shellExited && message.type === "write" && typeof message.data === "string"
-      && Buffer.byteLength(message.data) <= 64 * 1024) { terminal.write(message.data); return; }
+      && Buffer.byteLength(message.data) <= 64 * 1024) {
+      // ConPTY can still be draining a large synchronous write after the
+      // client resumes. Preserve input order at the same backpressure
+      // boundary instead of racing later commands with that drain.
+      if (Buffer.byteLength(pendingInput) + Buffer.byteLength(message.data) > 256 * 1024) {
+        socket.destroy(); return;
+      }
+      pendingInput += message.data;
+      if (outputPaused || pendingOutput) diagnosticCounts.queuedInputs += 1;
+      flushInput();
+      return;
+    }
     if (!shellExited && message.type === "resize" && Number.isInteger(message.cols) && message.cols >= 20 && message.cols <= 400
       && Number.isInteger(message.rows) && message.rows >= 5 && message.rows <= 200) {
       terminal.resize(message.cols, message.rows);
@@ -175,6 +213,7 @@ const server = net.createServer((socket) => {
     }
   });
   socket.on("close", () => {
+    diagnostic("peer-closed", { shellExited, exitSent });
     clearTimeout(shedTimer);
     clearTimeout(exitTimer);
     clearTimeout(stalledReaderTimer);

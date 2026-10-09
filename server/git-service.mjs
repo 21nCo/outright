@@ -57,11 +57,11 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     }
     if (!/not a git command|unknown subcommand|unknown option/i.test(detail)) throw failure;
     try { await git(cwd, ["reset", "HEAD", "--", ...files]); }
-    catch (resetFailure) { await recoverResetFailure(cwd, files, resetFailure); }
+    catch (error_) { await recoverResetFailure(cwd, files, error_); }
   };
   const unstagePaths = async (cwd, files) => {
     try { await git(cwd, ["restore", "--staged", "--", ...files]); }
-    catch (failure) { await recoverRestoreFailure(cwd, files, failure); }
+    catch (error_) { await recoverRestoreFailure(cwd, files, error_); }
   };
   async function status(worktreePath) {
     const cwd = await requireWorktree(worktreePath);

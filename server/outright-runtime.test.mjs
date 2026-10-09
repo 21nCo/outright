@@ -144,6 +144,7 @@ test("bootstrap distinguishes transient archive maintenance from permanent recov
 })());
 
 test("runtime startup settles an orphan PTY before serving requests", withRuntime(async (runtime) => {
+  await runtime.database.waitForTerminalAuditReconciliation();
   const audit = runtime.database.listAudit(20);
   assert.ok(audit.some((entry) => entry.action === "terminal.unknown" && entry.target === "orphan-terminal"));
   assert.equal(runtime.database.reconcileTerminalAudit(), 0);
@@ -154,6 +155,7 @@ test("runtime startup settles an orphan PTY before serving requests", withRuntim
 } }));
 
 test("runtime startup preserves terminal ownership evidence across run reconciliation", withRuntime(async (runtime) => {
+  await runtime.database.waitForTerminalAuditReconciliation();
   const target = "379634b7-8989-47c5-9174-c09529b206a1";
   const marker = path.join(runtime.database.launchDirectory, `terminal-${target}.json`);
   assert.equal(existsSync(marker), true, "run-handshake sweeping must not erase the terminal owner's marker");
@@ -441,6 +443,7 @@ test("runtime startup classifies an interrupted cleanup request before serving w
 } }));
 
 test("retention HTTP normalizes timezone cutoffs and keeps unfinished archived runs", withRuntime(async (runtime) => {
+  await runtime.whenRunRecoveryComplete();
   const database = runtime.database;
   const rows = Object.fromEntries(database.listConversations({ archived: true }).map((item) => [item.title, item]));
   const requestCleanup = async (before) => {
@@ -1375,6 +1378,7 @@ test("legacy running rows without process ownership require explicit bounded cle
     seedLegacyRunningUnknownTargetDatabase(path.join(dataDirectory, "outright.db"), { secondRun: true });
     process.env.OUTRIGHT_DATA_DIR = dataDirectory;
     runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    await runtime.whenRunRecoveryComplete();
     const legacy = runtime.database.getRun("legacy-interrupted");
     assert.equal(legacy.status, "interrupted");
     assert.equal(legacy.recoveryClass, "unknown");
@@ -1998,6 +2002,7 @@ test("blocks recovery of a newer run while an older interrupted run is unresolve
 })());
 
 test("malformed prelaunch outcomes remain recoverable and are removed after a decision", withRuntime(async (runtime) => {
+  await runtime.whenRunRecoveryComplete();
   const conversation = runtime.database.listConversations()[0];
   const runs = runtime.database.listRuns(conversation.id);
   const queued = runs.find((run) => run.prompt === "queued");
@@ -2043,6 +2048,7 @@ test("unreadable outcome evidence is quarantined until it can be replayed", asyn
   syncBuiltinESMExports();
   try {
     await withRuntime(async (runtime) => {
+      await runtime.whenRunRecoveryComplete();
       const conversation = runtime.database.listConversations()[0];
       const runs = runtime.database.listRuns(conversation.id);
       const sibling = runs.find((run) => run.prompt === "valid sibling");
@@ -2420,6 +2426,7 @@ async function withLaunchCrash({ status, handshake }, fn) {
     }
     seeded.close();
     runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    await runtime.whenRunRecoveryComplete();
     await fn({ runtime, conversation, run, pid });
   } finally {
     await runtime?.shutdown();

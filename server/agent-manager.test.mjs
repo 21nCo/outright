@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import fs, { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import os from "node:os";
@@ -15,7 +16,9 @@ import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
 
 const conversation = { worktreePath: "/tmp/project", providerSessionId: null };
 const fakeLaunchDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-agent-test-"));
-const WRAPPER_OWNERSHIP_TOKEN = "00000000-0000-4000-8000-000000000001";
+// A per-process token keeps one interrupted run's launchd label and private
+// environment directory from wedging every later run of these fixtures.
+const WRAPPER_OWNERSHIP_TOKEN = randomUUID();
 const platformSupervisor = AGENT_SUPERVISOR;
 // These manager fixtures exercise launch and shutdown ownership. Provider
 // discovery has its own OS-visible tests; spawning two unrelated CLI probes
@@ -1452,20 +1455,30 @@ test("a full conversation metadata budget does not fail a provider session event
   assert.equal(database.getRun(run.id).status, "completed");
 });
 
-test("a provider metadata storage fault remains owned until its failed outcome commits", async () => {
+test("a provider metadata storage fault retries without ending its live provider", async () => {
   const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex" });
-  database.updateConversation = () => { throw Object.assign(new Error("metadata write failed"), { code: "SQLITE_IOERR_WRITE" }); };
+  const updateConversation = database.updateConversation;
+  let refused = true;
+  database.updateConversation = (...args) => {
+    if (refused) throw Object.assign(new Error("metadata write failed"), { code: "SQLITE_IOERR_WRITE" });
+    return updateConversation(...args);
+  };
   const child = fakeChild();
   const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
   const run = database.createRun(codexRun("metadata-fault"));
   try {
     await manager.schedule({ conversation: database.getConversation("conv-1"), run });
     assert.doesNotThrow(() => child.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "session" }) + "\n"));
-    assert.deepEqual(child.signals, ["SIGTERM"], "storage fault did not stop the owned provider");
-    assert.deepEqual(manager.activeRuns(), [run.id], "the process slot was released before owner close");
-    child.emit("close", 1, null);
-    assert.equal(database.getRun(run.id).status, "failed");
-    assert.match(database.getRun(run.id).error, /metadata write failed/);
+    assert.deepEqual(child.signals, [], "optional session metadata killed the provider");
+    assert.deepEqual(manager.activeRuns(), [run.id]);
+    refused = false;
+    const deadline = Date.now() + 2000;
+    while (database.getConversation("conv-1").providerSessionId !== "session" && Date.now() < deadline)
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(database.getConversation("conv-1").providerSessionId, "session");
+    child.emit("close", 0, null);
+    assert.equal(database.getRun(run.id).status, "completed");
+    assert.equal(database.getRun(run.id).providerSessionId, "session");
   } finally { await manager.shutdown(); }
 });
 
@@ -3045,7 +3058,9 @@ test("the launch wrapper records durable identity before authorization and clean
   } finally {
     if (detachedDescendantPid) { try { process.kill(detachedDescendantPid, "SIGKILL"); } catch { /* Already gone. */ } }
     for (const child of children) { try { child.kill("SIGKILL"); } catch { /* Already gone. */ } }
-    if (process.platform === "darwin") spawnSync("/bin/launchctl", ["bootout", `gui/${process.getuid()}/com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}`], { stdio: "ignore" });
+    // The native terminate path boots the job out, empties its coalition, and
+    // removes its FIFOs and private environment directory.
+    if (process.platform === "darwin") spawnSync(platformSupervisor, ["--terminate", `com.21n.outright.${WRAPPER_OWNERSHIP_TOKEN}`], { stdio: "ignore", timeout: 10_000 });
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -66,6 +66,29 @@ const SETTING_RULES = {
   theme: (value) => ["system", "light", "dark"].includes(value),
 };
 
+function recordTerminalAuditRequest(scan, row, details, operationId) {
+  if (["terminal.create.requested", "terminal.close.requested"].includes(row.action) && operationId) {
+    const evidence = {};
+    for (const key of ["cwd", "ownershipLabel", "handshakePath", "pid", "processIdentity"]) {
+      if (details?.[key] != null) evidence[key] = details[key];
+    }
+    scan.requests.set(operationId, { action: row.action, target: row.target, operationId, details: evidence });
+  }
+}
+
+function recordTerminalAuditOwner(scan, row, details) {
+  if (["terminal.create.requested", "terminal.created", "terminal.create.unknown", "terminal.unknown"].includes(row.action)
+    && row.target) {
+    const current = scan.owners.get(row.target) ?? { target: row.target, created: 0 };
+    for (const key of ["cwd", "ownershipLabel", "handshakePath", "pid", "processIdentity"]) {
+      if (details?.[key] != null) current[key] = details[key];
+    }
+    if (row.action === "terminal.created") current.created = 1;
+    if (row.action === "terminal.unknown") current.unknownRecorded = true;
+    scan.owners.set(row.target, current);
+  }
+}
+
 // An interrupted cutover may need to authenticate a multi-gigabyte file.
 // Do that on a worker while holding the runtime lease before opening SQLite.
 export async function recoverArchiveBeforeStartup(options = {}) {
@@ -108,6 +131,7 @@ export function createOutrightDatabase(options = {}) {
   let maintenanceError;
   let activeMessageFinds = 0;
   let closing = false;
+  let runReconciliationPending = false;
   let migrationTick;
   let migrationRetry;
   let terminalAuditTick;
@@ -168,7 +192,7 @@ export function createOutrightDatabase(options = {}) {
       return { changes: db.prepare("SELECT total_changes() AS count").get().count, dataVersion: db.pragma("data_version", { simple: true }) };
     },
     onWorkerReady: (snapshot) => {
-      if (activeMessageFinds || terminalAuditScan || deletionsInFlight.size !== 1
+      if (activeMessageFinds || terminalAuditScan || runReconciliationPending || deletionsInFlight.size !== 1
         || db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
         const error = databaseError(503, "Archive maintenance must wait for other work");
         error.code = "ARCHIVE_DEFERRED";
@@ -430,29 +454,6 @@ export function createOutrightDatabase(options = {}) {
     cleanupReconciliationTick = delay ? setTimeout(resume, delay) : setImmediate(resume);
   }
 
-  function recordTerminalAuditRequest(scan, row, details, operationId) {
-    if (["terminal.create.requested", "terminal.close.requested"].includes(row.action) && operationId) {
-      const evidence = {};
-      for (const key of ["cwd", "ownershipLabel", "handshakePath", "pid", "processIdentity"]) {
-        if (details?.[key] != null) evidence[key] = details[key];
-      }
-      scan.requests.set(operationId, { action: row.action, target: row.target, operationId, details: evidence });
-    }
-  }
-
-  function recordTerminalAuditOwner(scan, row, details) {
-    if (["terminal.create.requested", "terminal.created", "terminal.create.unknown", "terminal.unknown"].includes(row.action)
-      && row.target) {
-      const current = scan.owners.get(row.target) ?? { target: row.target, created: 0 };
-      for (const key of ["cwd", "ownershipLabel", "handshakePath", "pid", "processIdentity"]) {
-        if (details?.[key] != null) current[key] = details[key];
-      }
-      if (row.action === "terminal.created") current.created = 1;
-      if (row.action === "terminal.unknown") current.unknownRecorded = true;
-      scan.owners.set(row.target, current);
-    }
-  }
-
   function applyTerminalAuditRow(scan, row) {
     scan.cursor = row.id;
     const details = parseJson(row.details, {});
@@ -479,6 +480,27 @@ export function createOutrightDatabase(options = {}) {
       backfillAuditEvidencePage(db, previousCursor, scan.cursor);
     }
     return rows.length;
+  }
+
+  function retryTerminalAuditScan(scan, error) {
+    if (typeof error?.code !== "string" || !/^SQLITE_(?:BUSY|LOCKED|IOERR|FULL)(?:_|$)/.test(error.code)
+      || terminalAuditRetries >= 5) return false;
+    const delay = Math.min(30_000, terminalAuditRetryBaseMs * 2 ** Math.min(terminalAuditRetries++, 5));
+    terminalAuditRetry = setTimeout(() => {
+      terminalAuditRetry = undefined;
+      if (!closing && terminalAuditScan === scan) {
+        scan.cursor = 0;
+        scan.lastId = null;
+        scan.requests.clear();
+        scan.owners.clear();
+        scan.outcomes = null;
+        scan.written = 0;
+        scan.cleanupReconciled = false;
+        scan.error = null;
+        terminalAuditTick = scheduleTerminalAudit(advanceTerminalAuditScan);
+      }
+    }, delay);
+    return true;
   }
 
   function advanceTerminalAuditScan() {
@@ -540,24 +562,7 @@ export function createOutrightDatabase(options = {}) {
       try { options.onTerminalAuditError?.(error); } catch { /* Keep the scan owner alive. */ }
       // A transient read or write failure keeps the original waiter pending
       // across retries. Only an exhausted/fatal scan rejects it.
-      if (typeof error?.code === "string" && /^SQLITE_(?:BUSY|LOCKED|IOERR|FULL)(?:_|$)/.test(error.code)
-        && terminalAuditRetries < 5) {
-        const delay = Math.min(30_000, terminalAuditRetryBaseMs * 2 ** Math.min(terminalAuditRetries++, 5));
-        terminalAuditRetry = setTimeout(() => {
-          terminalAuditRetry = undefined;
-          if (!closing && terminalAuditScan === scan) {
-            scan.cursor = 0;
-            scan.lastId = null;
-            scan.requests.clear();
-            scan.owners.clear();
-            scan.outcomes = null;
-            scan.written = 0;
-            scan.cleanupReconciled = false;
-            scan.error = null;
-            terminalAuditTick = scheduleTerminalAudit(advanceTerminalAuditScan);
-          }
-        }, delay);
-      } else failTerminalAudit?.(error);
+      if (!retryTerminalAuditScan(scan, error)) failTerminalAudit?.(error);
     }
   }
 
@@ -676,6 +681,7 @@ export function createOutrightDatabase(options = {}) {
       diskUsageStatus: disk.status };
     },
     canLaunchRun() {
+      if (runReconciliationPending) return false;
       // Keep enough ordinary retained space for a newly launched run to
       // record its first output. The separate reserve remains for recovery
       // and terminal transitions.
@@ -1439,7 +1445,7 @@ export function createOutrightDatabase(options = {}) {
     // them "interrupted" with a best-effort process classification instead of
     // failing them outright, and leave the continuation decision to the
     // operator so uncertain side effects are never silently retried.
-    reconcileInterruptedRuns({ probeAlive = defaultProbeRun } = {}) {
+    reconcileInterruptedRuns({ probeAlive = defaultProbeRun, yieldBetweenBatches = false, signal } = {}) {
       const finishedAt = now();
       const counts = {};
       // Pending rows are selected inside the transaction and each update is
@@ -1454,7 +1460,7 @@ export function createOutrightDatabase(options = {}) {
         // A legacy database may contain far more pending rows than the current
         // queue limit. Commit bounded batches so a crash preserves progress
         // and startup never materializes the entire backlog in JavaScript.
-        const pending = db.prepare("SELECT id, conversation_id AS conversationId, status, pid FROM runs WHERE status IN ('queued', 'running', 'launching') ORDER BY rowid LIMIT 500").all();
+        const pending = db.prepare("SELECT id, conversation_id AS conversationId, status, pid FROM runs WHERE status IN ('queued', 'running', 'launching') ORDER BY rowid LIMIT 64").all();
         for (const run of pending) {
           // The owner may have observed provider close while SQLite refused
           // its terminal transaction. Its fsynced bounded result is stronger
@@ -1532,13 +1538,29 @@ export function createOutrightDatabase(options = {}) {
         }
         return pending.length;
       });
-      while (reconcile.immediate()) { /* Each committed batch is recoverable after interruption. */ }
-      // Preserve unresolved live/unknown ownership evidence across repeated
-      // restarts; sweep adopted and stale records without retaining every run
-      // ID or directory entry in memory.
-      sweepLaunchHandshakes(launchDirectory, db);
-      const count = Object.values(counts).reduce((sum, classified) => sum + classified, 0);
-      return { count, counts };
+      const finish = () => {
+        // Preserve unresolved live/unknown ownership evidence across repeated
+        // restarts; sweep adopted and stale records without retaining every run
+        // ID or directory entry in memory.
+        sweepLaunchHandshakes(launchDirectory, db);
+        const count = Object.values(counts).reduce((sum, classified) => sum + classified, 0);
+        return { count, counts };
+      };
+      if (!yieldBetweenBatches) {
+        while (reconcile.immediate()) { /* Each committed batch is recoverable after interruption. */ }
+        return finish();
+      }
+      runReconciliationPending = true;
+      return (async () => {
+        try {
+          while (true) {
+            if (signal?.aborted || closing) throw databaseError(503, "Run reconciliation was interrupted");
+            if (!reconcile.immediate()) break;
+            await new Promise((resolve) => setImmediate(resolve));
+          }
+          return finish();
+        } finally { runReconciliationPending = false; }
+      })();
     },
     retryUnreadableRunOutcome(id) {
       const run = this.getRun(id);
@@ -1680,6 +1702,11 @@ export function createOutrightDatabase(options = {}) {
         // The terminal state and the evidence of its omitted final checkpoint
         // must survive the same commit, including a crash immediately after it.
         const run = this.updateRun(id, message || !transcriptMessage ? patch : { ...patch, transcriptOmitted: true });
+        if (patch.providerSessionId) {
+          db.prepare(`UPDATE conversations SET provider_session_id = ?, updated_at = ?
+            WHERE id = (SELECT conversation_id FROM runs WHERE id = ?)
+              AND provider = (SELECT provider FROM runs WHERE id = ?)`).run(patch.providerSessionId, now(), id, id);
+        }
         writeCriticalAudit(`agent.run.${patch.status}`, { target: id, exitCode: patch.exitCode, error: patch.error || undefined });
         return { run, message };
       });
@@ -1862,58 +1889,11 @@ export function createOutrightDatabase(options = {}) {
         return 0;
       }
       if (terminalAuditScan) return 0;
-      // A legacy audit table can predate bounded retention. Scanning it with
-      // correlated outcome lookups before readiness would block every API.
-      // The raw-id cursor below yields between fixed pages; terminal admission
-      // stays paused until it has reconstructed every prior owner.
-      if (!db.prepare("SELECT complete FROM audit_evidence_state WHERE id = 1").get().complete
-        || db.prepare("SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET 2047").get()) {
-        beginTerminalAuditScan();
-        return 0;
-      }
-      // The runtime lease guarantees that no prior owner can still create or
-      // close a PTY. A crash may have left either a request or a created PTY
-      // without a durable outcome. Settle a bounded page at a time so old
-      // databases do not require an unbounded in-memory recovery set.
-      let reconciled = 0;
-      while (true) {
-        const pending = db.prepare(`SELECT id, action, target,
-            CASE WHEN json_valid(details) THEN json_extract(details, '$.operationId') END AS operationId
-          FROM audit_log AS request
-          WHERE action IN ('terminal.create.requested', 'terminal.close.requested')
-            AND CASE WHEN json_valid(details) THEN json_extract(details, '$.operationId') END IS NOT NULL
-            AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > request.id
-              AND CASE WHEN json_valid(outcome.details) THEN json_extract(outcome.details, '$.operationId') END
-                = json_extract(request.details, '$.operationId'))
-          ORDER BY id LIMIT 64`).all();
-        if (!pending.length) break;
-        db.transaction(() => {
-          reserveRecoveryHeadroom(db, undefined, true);
-          for (const row of pending) writeAudit(row.action === "terminal.create.requested" ? "terminal.create.unknown" : "terminal.close.unknown",
-            { target: row.target, operationId: row.operationId, reason: "runtime restarted before terminal outcome" }, false);
-          trimAudit(db);
-          reserveRecoveryHeadroom(db);
-        }).immediate();
-        reconciled += pending.length;
-      }
-      while (true) {
-        const pending = db.prepare(`SELECT id, target FROM audit_log AS created
-          WHERE action = 'terminal.created'
-            AND NOT EXISTS (SELECT 1 FROM audit_log AS outcome WHERE outcome.id > created.id
-              AND outcome.target = created.target
-              AND outcome.action IN ('terminal.exited', 'terminal.closed', 'terminal.unknown', 'terminal.recovered'))
-          ORDER BY id LIMIT 64`).all();
-        if (!pending.length) break;
-        db.transaction(() => {
-          reserveRecoveryHeadroom(db, undefined, true);
-          for (const row of pending) writeAudit("terminal.unknown",
-            { target: row.target, reason: "runtime restarted before terminal exit was recorded" }, false);
-          trimAudit(db);
-          reserveRecoveryHeadroom(db);
-        }).immediate();
-        reconciled += pending.length;
-      }
-      return reconciled;
+      // Reconstruct every inherited owner through the same indexed cursor,
+      // including histories below the old 2,048-row threshold. Correlated
+      // synchronous lookups could monopolize startup at that boundary.
+      beginTerminalAuditScan();
+      return 0;
     },
     terminalUnknownReservations() {
       if (terminalAuditScan) return [];

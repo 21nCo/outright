@@ -491,7 +491,11 @@ int main(int argc, char **argv) {
       }
       reap_children(provider_pid, &provider_reaped, &provider_status);
       snapshot = inspect_owned_tree(getpid(), provider_pid, true);
-      bool tree_empty = snapshot.complete ? snapshot.count == 0 : no_children_remaining();
+      // An adopted child can be a zombie while PID 1 is still reaping it.
+      // It cannot execute or retain a resource, but we must also know that
+      // no direct child remains before reporting native tree emptiness.
+      bool tree_empty = no_children_remaining()
+        && (snapshot.complete ? snapshot.live_count == 0 : true);
       if (provider_reaped && tree_empty) {
         if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL)
           dprintf(CONTROL_FD, "%s\n", UTILITY_TREE_EMPTY);

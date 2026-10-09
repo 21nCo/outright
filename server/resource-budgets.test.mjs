@@ -964,10 +964,10 @@ test("near-cap legacy backlog reserves recovery space through interrupted restar
       if (++probes === 200) throw new Error("probe interrupted");
       return false;
     } }), /probe interrupted/);
-    assert.equal(database.capacity().recoverable, 500, "one bounded batch survived the interruption");
+    assert.equal(database.capacity().recoverable, 576, "nine bounded batches survived the interruption");
     database.close();
     database = createOutrightDatabase({ filename });
-    assert.equal(database.reconcileInterruptedRuns({ probeAlive: () => false }).count, 8500);
+    assert.equal(database.reconcileInterruptedRuns({ probeAlive: () => false }).count, 8424);
     assert.equal(database.capacity().queued, 0);
     assert.equal(database.capacity().active, 0);
     assert.equal(database.capacity().recoverable, 9000);
@@ -998,9 +998,9 @@ test("startup recovery commits bounded batches before an interrupted probe", () 
       if (++probed === 501) throw new Error("probe interrupted");
       return false;
     } }), /probe interrupted/);
-    assert.equal(database.capacity().recoverable, 500);
-    assert.equal(database.capacity().active, 1);
-    assert.equal(database.reconcileInterruptedRuns({ probeAlive: () => false }).count, 1);
+    assert.equal(database.capacity().recoverable, 448);
+    assert.equal(database.capacity().active, 53);
+    assert.equal(database.reconcileInterruptedRuns({ probeAlive: () => false }).count, 53);
     assert.equal(database.capacity().recoverable, 501);
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });

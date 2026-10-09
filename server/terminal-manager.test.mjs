@@ -6,7 +6,7 @@ import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 import { AUDIT_RETENTION_LIMIT, auditTrimSql, trimAudit, trimAuditPage } from "./audit-retention.mjs";
 import { createOutrightRuntime } from "./outright-runtime.mjs";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -402,6 +402,7 @@ test("verified empty terminal creation survives two failed audit writes and rest
     database.close();
     database = createOutrightDatabase({ filename, runtimeLease: true });
     database.reconcileTerminalAudit();
+    await database.waitForTerminalAuditReconciliation();
     const restarted = createTerminalManager({ publish: () => {}, database,
       cleanupSocket: () => {}, maxTerminals: 1, maxTerminalsPerCwd: 1 });
     assert.equal(restarted.capacity().active, 1);
@@ -409,6 +410,42 @@ test("verified empty terminal creation survives two failed audit writes and rest
     assert.equal(restarted.capacity().active, 0);
     assert.deepEqual(database.terminalUnknownReservations(), []);
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("a verified failed create unlinks its broker socket before releasing capacity", { skip: process.platform === "win32" }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-failed-socket-"));
+  const database = createOutrightDatabase({ filename: path.join(directory, "runtime.db"), runtimeLease: true });
+  const broker = createServer();
+  let address;
+  const manager = createTerminalManager({ publish: () => {}, database, maxTerminals: 1, maxTerminalsPerCwd: 1,
+    startManagedTerminal: async ({ ownership }) => {
+      address = ownership.address;
+      await new Promise((resolve, reject) => { broker.once("error", reject); broker.listen(address, resolve); });
+      const error = new Error("launch acknowledgment failed");
+      error.terminationVerified = true;
+      throw error;
+    } });
+  try {
+    await assert.rejects(manager.create({ cwd: directory }), /launch acknowledgment failed/);
+    assert.equal(existsSync(address), false, "verified failed create left a reachable broker socket");
+    assert.equal(manager.capacity().active, 0);
+    assert.ok(database.listAudit(10).some((entry) => entry.action === "terminal.create.failed"));
+  } finally {
+    await new Promise((resolve) => broker.close(resolve));
+    await manager.shutdown();
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a partial verified-empty marker is repairable after interrupted storage", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-partial-proof-"));
+  const id = randomUUID();
+  try {
+    writeFileSync(path.join(directory, `terminal-${id}.empty`), id.slice(0, 12), { mode: 0o600 });
+    recordTerminalEmpty(id, directory);
+    assert.equal(readFileSync(path.join(directory, `terminal-${id}.empty`), "utf8"), `${id}\n`);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("verified native teardown retries a failed marker and failed create audit in process", async () => {
@@ -436,6 +473,9 @@ test("verified native teardown retries a failed marker and failed create audit i
     assert.equal(terminations, 1);
     assert.equal(manager.capacity().active, 1);
     refuseOutcome = false;
+    // The missing private proof directory is still a recovery boundary.
+    // Restore it before claiming that the verified owner can be released.
+    mkdirSync(path.join(directory, "missing-launch-directory"), { mode: 0o700 });
     assert.equal(await manager.reconcileUnknown(), 1);
     assert.equal(manager.capacity().active, 0);
     assert.deepEqual(database.terminalUnknownReservations(), []);
@@ -450,6 +490,7 @@ test("terminal recovery removes a stale verified-empty marker after its audit ha
     const manager = createTerminalManager({ publish: () => {},
       database: { launchDirectory: directory, terminalUnknownReservations: () => [] } });
     await waitFor(() => !existsSync(path.join(directory, `terminal-${id}.empty`)));
+    assert.equal(existsSync(path.join(directory, `terminal-${id}.empty`)), false);
     await manager.shutdown();
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
@@ -685,6 +726,7 @@ test("restart reconciles an empty native owner but keeps legacy unknown reservat
     database.close();
     database = createOutrightDatabase({ filename, runtimeLease: true });
     database.reconcileTerminalAudit();
+    await database.waitForTerminalAuditReconciliation();
     const manager = createTerminalManager({ database, publish: () => {}, maxTerminals: 1 });
     assert.equal(manager.capacity().active, 2);
     assert.deepEqual(manager.list().map((entry) => entry.id).sort(), [legacyId, nativeId].sort());
@@ -1288,7 +1330,8 @@ test("restart settles crash and maintenance-interrupted PTY evidence before rete
     assert.equal(killed.length, 1);
     database.close();
     database = createOutrightDatabase({ filename, runtimeLease: true });
-    assert.equal(database.reconcileTerminalAudit(), 1);
+    assert.equal(database.reconcileTerminalAudit(), 0);
+    await database.waitForTerminalAuditReconciliation();
     assert.ok(database.terminalUnknownReservations().some((entry) => entry.target === interrupted.id));
     const reserved = createTerminalManager({ database, publish: () => {}, maxTerminals: 1,
       spawnTerminal: () => { throw new Error("unverified capacity must reject before spawning"); } });
@@ -1305,7 +1348,8 @@ test("restart settles crash and maintenance-interrupted PTY evidence before rete
     database.auditCritical("terminal.close.requested", { target: interrupted.id, operationId: "close-crash" });
     database.close();
     database = createOutrightDatabase({ filename, runtimeLease: true });
-    assert.equal(database.reconcileTerminalAudit(), 2);
+    assert.equal(database.reconcileTerminalAudit(), 0);
+    await database.waitForTerminalAuditReconciliation();
     const actions = database.listAudit(20).map((entry) => entry.action);
     assert.ok(actions.includes("terminal.create.unknown"));
     assert.ok(actions.includes("terminal.close.unknown"));
@@ -1314,7 +1358,8 @@ test("restart settles crash and maintenance-interrupted PTY evidence before rete
       database.auditCritical("terminal.created", { target: `restart-${index}` });
       database.close();
       database = createOutrightDatabase({ filename, runtimeLease: true });
-      assert.equal(database.reconcileTerminalAudit(), 1);
+      assert.equal(database.reconcileTerminalAudit(), 0);
+      await database.waitForTerminalAuditReconciliation();
     }
 
     const writer = new Database(filename);

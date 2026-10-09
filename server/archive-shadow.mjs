@@ -681,6 +681,20 @@ function inspectAllocatedPart(part) {
   }
 }
 
+// A hard-linked inode is charged once, however many storage names refer to it.
+function chargeInodeOnce(info, chargedLinks) {
+  if (info.nlink <= 1 || info.ino <= 0) return true;
+  const identity = `${info.dev}:${info.ino}`;
+  if (chargedLinks.has(identity)) return false;
+  chargedLinks.add(identity);
+  return true;
+}
+
+function allocatedBytes(info) {
+  const allocated = typeof info.blocks === "number" ? info.blocks * 512 : 0;
+  return allocated > 0 ? allocated : info.size;
+}
+
 function sumAllocatedParts(parts, state) {
   let bytes = 0;
   let transition = false;
@@ -690,15 +704,19 @@ function sumAllocatedParts(parts, state) {
     if (!info) continue;
     if (!info.isFile()) throw new Error(`Unsafe database storage file: ${part}`);
     if (part === state || part === `${state}.tmp`) transition = true;
-    if (info.nlink > 1 && info.ino > 0) {
-      const identity = `${info.dev}:${info.ino}`;
-      if (chargedLinks.has(identity)) continue;
-      chargedLinks.add(identity);
-    }
-    const allocated = typeof info.blocks === "number" ? info.blocks * 512 : 0;
-    bytes += allocated > 0 ? allocated : info.size;
+    if (chargeInodeOnce(info, chargedLinks)) bytes += allocatedBytes(info);
   }
   return { bytes, transition };
+}
+
+function storageIdentityChanged(before, after) {
+  return before?.dev !== after?.dev || before?.ino !== after?.ino
+    || before?.size !== after?.size || before?.mtimeMs !== after?.mtimeMs;
+}
+
+function allocatedUsageStatus(transition) {
+  if (transition) return "partial";
+  return process.platform === "win32" ? "estimated" : "measured";
 }
 
 export function allocatedDatabaseUsage(filename) {
@@ -708,19 +726,15 @@ export function allocatedDatabaseUsage(filename) {
   try {
     const sourceBefore = inspectAllocatedPart(filename);
     const markerBefore = inspectAllocatedPart(state);
-    let { bytes, transition } = sumAllocatedParts([...sqliteFiles, state, `${state}.tmp`], state);
+    const scanned = sumAllocatedParts([...sqliteFiles, state, `${state}.tmp`], state);
     const sourceAfter = inspectAllocatedPart(filename);
     const markerAfter = inspectAllocatedPart(state);
     if (!sourceBefore && !markerBefore && !markerAfter) return { bytes: null, status: "unknown" };
     // A cutover can rename the source during this scan. Compare both ends so
     // a transiently absent marker cannot make a moving sum look measured.
-    if (sourceBefore?.dev !== sourceAfter?.dev || sourceBefore?.ino !== sourceAfter?.ino
-      || sourceBefore?.size !== sourceAfter?.size || sourceBefore?.mtimeMs !== sourceAfter?.mtimeMs) transition = true;
-    if (markerBefore || markerAfter) transition = true;
-    let status = "measured";
-    if (transition) status = "partial";
-    else if (process.platform === "win32") status = "estimated";
-    return { bytes, status };
+    const transition = scanned.transition || storageIdentityChanged(sourceBefore, sourceAfter)
+      || Boolean(markerBefore || markerAfter);
+    return { bytes: scanned.bytes, status: allocatedUsageStatus(transition) };
   } catch (error) {
     // Filesystem reads can also fail during an I/O fault, exhausted file
     // descriptors, or a journal rename. No such failure proves free space:

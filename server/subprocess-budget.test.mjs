@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { realpath } from "node:fs/promises";
@@ -212,6 +213,48 @@ test("an unlaunched utility reservation reconciles only after its runtime owner 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("a prior-format native owner uses its deterministic identity after its supervisor is gone", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-prior-owner-"));
+  const id = "7c538332-3e62-491e-9231-e90d34d687a7";
+  const identityKey = process.platform === "darwin" ? "label"
+    : process.platform === "linux" ? "handshakePath" : "jobName";
+  const filename = path.join(root, `${id}.json`);
+  try {
+    writeFileSync(filename, JSON.stringify({ state: "unknown", platform: process.platform,
+      authorized: true, pid: 2147483647, [identityKey]: "conflicting-owner" }), { mode: 0o600 });
+    const budget = createSubprocessBudget({ limit: 1, unknownDirectory: root });
+    assert.deepEqual(budget.capacity(), { active: 1, unknown: 1, limit: 1 });
+    assert.equal(await budget.reconcileUnknown(), 0, "a conflicting recorded native identity cannot release capacity");
+    writeFileSync(filename, JSON.stringify({ state: "unknown", platform: process.platform,
+      authorized: true, pid: 2147483647 }), { mode: 0o600 });
+    assert.equal(await budget.reconcileUnknown(), 1);
+    assert.deepEqual(budget.capacity(), { active: 0, unknown: 0, limit: 1 });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a crashed macOS owner settles after launchd drops its service and coalition", { skip: process.platform !== "darwin", timeout: 20_000 }, async () => {
+  // Real launchd boundary: the supervisor dies after recording its coalition,
+  // then launchd removes the job. The reaped coalition is the empty proof.
+  const label = `com.21n.outright.utility.${randomUUID()}`;
+  const temporaryRoot = realpathSync(execFileSync("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"], { encoding: "utf8" }).trim());
+  const invocation = path.join(temporaryRoot, `outright-env-${label}`);
+  const owner = spawn(AGENT_SUPERVISOR, [label, "/bin/sleep", "30"], { stdio: "ignore" });
+  try {
+    const deadline = Date.now() + 10_000;
+    while (!existsSync(path.join(invocation, "coalition")) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.ok(existsSync(path.join(invocation, "coalition")), "the owner did not record its coalition");
+    owner.kill("SIGKILL");
+    spawnSync("/bin/launchctl", ["bootout", `gui/${process.getuid()}/${label}`], { stdio: "ignore", timeout: 10_000 });
+    const probe = spawnSync(AGENT_SUPERVISOR, ["--probe", label], { encoding: "utf8", timeout: 10_000 });
+    assert.equal(probe.stdout.trim(), "absent", "a reaped coalition must not stay an unknown owner");
+    assert.equal(probe.status, 3);
+    assert.equal(existsSync(invocation), false, "the private launch environment outlived its proven-empty owner");
+  } finally {
+    owner.kill("SIGKILL");
+    spawnSync(AGENT_SUPERVISOR, ["--terminate", label], { stdio: "ignore", timeout: 10_000 });
+  }
+});
+
 test("a failed native owner releases capacity only after its detached child is gone", { timeout: 15_000 }, async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-fault-"));
   const pidFile = path.join(root, "descendant.pid");
@@ -326,7 +369,7 @@ test("aborting a utility command retains its permit through native descendant cl
   } finally { cleanupDescendant(root, pidFile); }
 });
 
-test("a utility leader exiting does not release its detached descendant's permit", { timeout: 15_000 }, async () => {
+test("a utility leader exiting keeps its permit until the native owner reaps its detached descendant", { timeout: 15_000 }, async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-leader-"));
   const pidFile = path.join(root, "descendant.pid");
   const budget = createSubprocessBudget({ limit: 1 });
@@ -344,11 +387,14 @@ test("a utility leader exiting does not release its detached descendant's permit
     assert.ok(existsSync(pidFile), "leader did not launch before the ownership probe");
     const pid = Number(readFileSync(pidFile, "utf8"));
     // Native supervisors may reap the descendant immediately after the
-    // leader exits. Observe the invariant, rather than requiring a delay.
-    if (budget.capacity().active === 0) {
-      assert.throws(() => process.kill(pid, 0), { code: "ESRCH" },
-        "permit was released while the descendant remained live");
-    }
+    // leader exits, so either state is valid here: a charged permit, or a
+    // released permit with no live descendant. A live unowned descendant is not.
+    const descendantAlive = () => {
+      try { process.kill(pid, 0); return true; }
+      catch (error) { if (error.code === "ESRCH") return false; throw error; }
+    };
+    const released = budget.capacity().active === 0;
+    assert.equal(released && descendantAlive(), false, "permit was released while the descendant remained live");
     await command;
     assert.equal(budget.capacity().active, 0);
     assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });

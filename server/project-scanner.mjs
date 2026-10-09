@@ -118,7 +118,7 @@ async function discoverGitDirectories(config) {
       continue;
     }
 
-    for (const entry of entries) {
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
       if (config.excludeDirectories.has(entry.name) || entry.name.startsWith(".")) continue;
       queue.push({ directory: path.join(current.directory, entry.name), depth: current.depth + 1 });
@@ -154,7 +154,7 @@ async function readWorktree(record, isLinked, safeGit) {
   // Porcelain's branch header carries the same upstream counts as rev-list.
   // One owned Git invocation per worktree keeps large default-root scans
   // responsive without weakening native process ownership.
-  const statusOutput = record.bare ? "" : await safeGit(record.path, ["status", "--porcelain=v1", "--branch"]);
+  const statusOutput = record.bare ? "" : await safeGit(record.path, ["status", "--porcelain=v1", "--branch", "--ahead-behind"]);
   const { changedFiles, divergence } = parseStatus(statusOutput);
 
   return {
@@ -201,7 +201,9 @@ export function parseWorktreePorcelain(output) {
 export function parseStatus(output) {
   const lines = output.split("\n").filter(Boolean);
   const branch = lines[0]?.startsWith("## ") ? lines.shift() : "";
-  const counts = /\[([^\]]+)\]/.exec(branch)?.[1] ?? "";
+  const open = branch.indexOf("[");
+  const close = open < 0 ? -1 : branch.indexOf("]", open + 1);
+  const counts = close < 0 ? "" : branch.slice(open + 1, close);
   const ahead = Number(/\bahead (\d+)\b/.exec(counts)?.[1] ?? 0);
   const behind = Number(/\bbehind (\d+)\b/.exec(counts)?.[1] ?? 0);
   return { divergence: { ahead, behind }, changedFiles: lines.map((line) => ({

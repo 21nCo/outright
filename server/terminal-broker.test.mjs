@@ -127,11 +127,20 @@ test("a slow broker reader backpressures sustained PTY output without losing its
   const address = process.platform === "win32"
     ? `\\\\.\\pipe\\outright-broker-test-${randomUUID()}` : path.join(directory, "broker.sock");
   const token = randomUUID() + randomUUID();
+  // Bounded broker lifecycle events identify which boundary held a missing
+  // exit: queued input, PTY exit notification, or final frame delivery.
   const broker = spawn(process.execPath, [brokerScript, address, token], {
     stdio: ["ignore", "ignore", "pipe"], detached: process.platform !== "win32", windowsHide: true,
+    env: { ...process.env, OUTRIGHT_BROKER_DIAGNOSTICS: "1" },
   });
   let stderr = "";
-  broker.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-2048); });
+  broker.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-8192); });
+  const shellState = () => {
+    const pid = Number(/"shellPid":(\d+)/.exec(stderr)?.[1]);
+    if (!Number.isSafeInteger(pid) || pid <= 0) return "shell pid unknown";
+    try { process.kill(pid, 0); return `shell ${pid} alive`; }
+    catch (error) { return `shell ${pid} ${error.code === "ESRCH" ? "gone" : error.code}`; }
+  };
   let socket;
   let pending = "";
   let closed = false;
@@ -182,7 +191,7 @@ test("a slow broker reader backpressures sustained PTY output without losing its
           waiters.add(wake);
         });
       }
-      assert.ok(condition(), `${label}; broker closed=${closed}, output=${dataBytes}, stderr=${stderr}`);
+      assert.ok(condition(), `${label}; broker closed=${closed}, output=${dataBytes}, ${shellState()}, stderr=${stderr}`);
     };
     socket.write(`${JSON.stringify({ type: "start", token, shell: process.execPath,
       cwd: directory, env: process.env, cols: 80, rows: 24 })}\n`);
@@ -202,10 +211,11 @@ test("a slow broker reader backpressures sustained PTY output without losing its
     socket.write(`${JSON.stringify({ type: "write",
       data: 'process.stdout.write("\\u001b[31m"+"c".repeat(8*1024*1024))\r' })}\n`);
     await new Promise((resolve) => setTimeout(resolve, 4000));
+    // This input arrives while the client is still silent. It must wait for
+    // the same drain boundary as the output, then reach the live shell once.
+    socket.write(`${JSON.stringify({ type: "write", data: 'console.log("OUTRIGHT_"+"LATER")\r' })}\n`);
     socket.resume();
     await until(() => omissionReset, "shed colored output did not reset styling before its notice");
-
-    socket.write(`${JSON.stringify({ type: "write", data: 'console.log("OUTRIGHT_"+"LATER")\r' })}\n`);
     await until(() => received.includes("OUTRIGHT_LATER"), "shell did not accept later input");
     socket.write(`${JSON.stringify({ type: "write", data: "process.exit(0)\r" })}\n`);
     await until(() => received.includes("shell-exited"), "shell exit was not delivered");

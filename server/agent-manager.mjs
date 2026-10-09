@@ -333,6 +333,11 @@ function persistentStorageFailure(error) {
     || /^(?:SQLITE_(?:FULL|READONLY)(?:_|$)|E(?:PERM|ACCES|NOSPC|ROFS)$)/.test(error?.code ?? "");
 }
 
+function deferredAdmissionForStorage(error) {
+  if (!storageAdmissionFailure(error)) return null;
+  return persistentStorageFailure(error) ? "persistent-deferred" : "retry-deferred";
+}
+
 function nativeOwnershipPending(state) {
   if (!state.launchHandshakePath || !existsSync(state.launchHandshakePath)) return false;
   // Only the Windows wrapper writes this marker after its supervisor exits
@@ -342,6 +347,26 @@ function nativeOwnershipPending(state) {
     const record = JSON.parse(readFileSync(state.launchHandshakePath, "utf8"));
     return record.completed !== true || record.pid !== state.child?.pid;
   } catch { return true; }
+}
+
+function freezeTerminalOutcome(state, exitCode, error) {
+  if (state.terminalOutcome) return;
+  const successful = exitCode === 0 && !error && !state.stopped;
+  let status = "failed";
+  if (state.stopped) status = "stopped";
+  else if (successful) status = "completed";
+  state.terminalOutcome = {
+    status,
+    message: error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : ""),
+    finishedAt: new Date().toISOString(),
+    exitCode,
+  };
+}
+
+function unresolvedOutcomeUnavailable() {
+  const unavailable = new Error("Run outcome storage is unavailable; retry shortly");
+  unavailable.statusCode = 503;
+  return unavailable;
 }
 
 export function createAgentManager({ database, publish, onProvidersChanged = () => {}, onShutdownRecovery = () => {}, onDiskRetry = () => {}, providerDiscoveryFactory = createProviderDiscovery, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
@@ -403,7 +428,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     try {
       if (database.canLaunchRun?.() === false) return "deferred";
     } catch (error) {
-      if (storageAdmissionFailure(error)) return persistentStorageFailure(error) ? "persistent-deferred" : "retry-deferred";
+      const deferred = deferredAdmissionForStorage(error);
+      if (deferred) return deferred;
       throw error;
     }
     try {
@@ -412,7 +438,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       // No process has been spawned yet. A transient SQLite lock or I/O
       // failure must leave the run queued for a fresh admission attempt;
       // terminalizing it can itself fail under the same storage fault.
-      if (storageAdmissionFailure(error)) return persistentStorageFailure(error) ? "persistent-deferred" : "retry-deferred";
+      const deferred = deferredAdmissionForStorage(error);
+      if (deferred) return deferred;
       if (error.statusCode === 503 && database.maintenanceActive) return "deferred";
       throw error;
     }
@@ -556,6 +583,27 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     try { child?.stdin?.write?.("go\n"); } catch { /* The wrapper already exited; its close event finishes the run. */ }
   }
 
+  function persistSessionMetadata(state) {
+    const sessionId = state.pendingSessionId;
+    if (!sessionId) return true;
+    try {
+      database.updateRun(state.run.id, { providerSessionId: sessionId });
+      // A recovered run retains its immutable provider even when its chat
+      // changes providers; never replace another provider's resume token.
+      const current = database.getConversation(state.conversation.id);
+      if (current?.provider === state.run.provider) {
+        database.updateConversation(state.conversation.id, { providerSessionId: sessionId });
+      }
+      if (state.pendingSessionId === sessionId) state.pendingSessionId = null;
+      return true;
+    } catch (error) {
+      if (!storageAdmissionFailure(error) && !(error.statusCode === 503 && database.maintenanceActive)) throw error;
+      state.sessionStorageError = error;
+      if (!database.maintenanceActive) retryUnknownDiskUsage(persistentStorageFailure(error));
+      return false;
+    }
+  }
+
   function handleProviderLine(state, line) {
     if (!line.trim()) return;
     let raw;
@@ -570,15 +618,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       if (event.type === "session") {
         if (typeof event.payload.sessionId !== "string" || Buffer.byteLength(event.payload.sessionId) > 4096) continue;
         state.run.providerSessionId = event.payload.sessionId;
-        database.updateRun(state.run.id, { providerSessionId: event.payload.sessionId });
-        // A recovered run keeps its immutable provider, while the conversation
-        // may have since switched providers. Preserve the run-local session but
-        // never replace another provider's conversation-level resume token.
-        const currentConversation = database.getConversation(state.conversation.id);
-        if (currentConversation?.provider === state.run.provider) {
-          try { database.updateConversation(state.conversation.id, { providerSessionId: event.payload.sessionId }); }
-          catch (error) { if (error.statusCode !== 507) throw error; }
-        }
+        state.pendingSessionId = event.payload.sessionId;
+        persistSessionMetadata(state);
       }
       if (event.type === "assistant.delta") {
         appendAssistantText(state, event.payload.text, emit);
@@ -616,21 +657,6 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     }
   }
 
-  function freezeTerminalOutcome(state, exitCode, error) {
-    if (!state.terminalOutcome) {
-      const successful = exitCode === 0 && !error && !state.stopped;
-      let status = "failed";
-      if (state.stopped) status = "stopped";
-      else if (successful) status = "completed";
-      state.terminalOutcome = {
-        status,
-        message: error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : ""),
-        finishedAt: new Date().toISOString(),
-        exitCode,
-      };
-    }
-  }
-
   function persistTerminalOutcome(state, result) {
     const { status, message, finishedAt, exitCode: terminalExitCode } = state.terminalOutcome;
     // Journal the frozen provider exit before SQLite so a BUSY/FULL failure
@@ -651,6 +677,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // The final checkpoint and terminal row commit together.
     result.finished = database.finishRun(state.run.id, {
       status, finishedAt, exitCode: terminalExitCode, error: message || null, pid: null,
+      ...(state.run.providerSessionId ? { providerSessionId: state.run.providerSessionId } : {}),
       ...(state.transcriptOmitted ? { transcriptOmitted: true } : {}),
     }, result.transcriptMessage);
   }
@@ -677,6 +704,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     const { status, message, finishedAt, exitCode: terminalExitCode } = state.terminalOutcome;
     state.pendingFinish = null;
     state.terminalOutcome = null;
+    state.pendingSessionId = null;
     if (state.outcomeJournaled) {
       try { database.removePendingRunOutcome(state.run.id); }
       catch { /* The committed row makes a stale record safe to sweep on restart. */ }
@@ -718,12 +746,6 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     catch (writeError) { return deferFailedTerminalOutcome(state, exitCode, error, writeError, result.journalBecameDurable); }
     completeTerminalOutcome(state, result);
     return true;
-  }
-
-  function unresolvedOutcomeUnavailable() {
-    const unavailable = new Error("Run outcome storage is unavailable; retry shortly");
-    unavailable.statusCode = 503;
-    return unavailable;
   }
 
   function stopQueuedRun(runId, preserveOnMaintenance) {
@@ -920,6 +942,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     diskRetryTimer = setTimeout(() => {
       diskRetryTimer = null;
       diskRetryDueAt = 0;
+      retryPendingSessionMetadata();
       retryPendingFinishes();
       drain();
       onDiskRetry();
@@ -931,12 +954,28 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // A sibling may free a slot and drain the queue while another completed
     // run still awaits its terminal commit. Keep that retry armed until every
     // such owner has durable outcome evidence.
-    if (!shuttingDown && (queueReadRetryPending || admissionRetryRuns.size || [...active.values(), ...pendingOutcomes.values()].some((state) => state.pendingFinish))) return;
+    if (!shuttingDown && (queueReadRetryPending || admissionRetryRuns.size
+      || [...active.values(), ...pendingOutcomes.values()].some((state) => state.pendingFinish || state.pendingSessionId))) return;
     if (diskRetryTimer) clearTimeout(diskRetryTimer);
     diskRetryTimer = null;
     diskRetryDueAt = 0;
     diskRetryDelayMs = 100;
     hardRetryProbed = false;
+  }
+
+  function retryPendingSessionMetadata() {
+    if (database.maintenanceActive) return;
+    for (const state of [...active.values(), ...pendingOutcomes.values()]) {
+      if (!state.pendingSessionId) continue;
+      try { persistSessionMetadata(state); }
+      catch (error) {
+        // A non-storage contract failure still belongs to this run. Do not
+        // let a timer callback terminate the runtime's event loop.
+        state.processError ??= error;
+        state.checkpointHalted = true;
+        if (state.child && !state.closed) terminateTree(state.child, "SIGTERM");
+      }
+    }
   }
 
   function retryPendingFinishes() {

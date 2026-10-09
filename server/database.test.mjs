@@ -895,6 +895,31 @@ test("reconciles queued and running work as interrupted after a runtime restart"
   }
 });
 
+test("legacy interrupted runs reconcile in yielding batches while admission stays fenced", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-run-batches-"));
+  const filename = path.join(root, "runtime.db");
+  const database = createOutrightDatabase({ filename, runtimeLease: true });
+  const raw = new Database(filename);
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1",
+      worktreePath: root, title: "Legacy backlog", provider: "codex" });
+    const insert = raw.prepare(`INSERT INTO runs (id, conversation_id, worktree_path, provider, approval_policy,
+      prompt, status, created_at) VALUES (?, ?, ?, 'codex', 'read-only', '', 'queued', ?)`);
+    raw.transaction(() => {
+      for (let index = 0; index < 130; index += 1) insert.run(`legacy-${index}`, conversation.id, root, new Date().toISOString());
+    })();
+    const recovery = database.reconcileInterruptedRuns({ yieldBetweenBatches: true });
+    assert.equal(database.canLaunchRun(), false);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(raw.prepare("SELECT 1 FROM runs WHERE status = 'queued' LIMIT 1").get(),
+      "the event loop did not get a turn between committed recovery batches");
+    const result = await recovery;
+    assert.equal(result.count, 130);
+    assert.equal(raw.prepare("SELECT COUNT(*) AS count FROM runs WHERE status = 'queued'").get().count, 0);
+    assert.equal(database.getRun("legacy-129").recoveryClass, "never-started");
+  } finally { raw.close(); await database.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
 test("malformed terminal recovery evidence is isolated while valid siblings settle", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-invalid-outcome-"));
   const database = createOutrightDatabase({ filename: path.join(root, "outright.db") });
