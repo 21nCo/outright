@@ -1,0 +1,31 @@
+server/outright-runtime.test.mjs
+  s_ce12272281eb3b::t_3805b312585d1d 325,331,333-335,347-348,352-360,363,366
+server/subprocess-budget.test.mjs
+  s_ce12272281eb3b::t_90ba9a94588933 324,326,328-329,331-347,352-391,405-407,409-410,448-460,464-465,467-468,470,472-478,480-488,490-515,552-590,668-670,672-675
+src/components/SettingsDialog.jsx
+  s_ce12272281eb3b::t_1d3bbf8b2b39af 293-302,308
+tests/ui-races.jsx
+  s_ce12272281eb3b::t_a6f3009ededc01 765-777
+server/agent-supervisor-windows.c
+  s_ce12272281eb3b::t_404c3ccecd4ab9 309-311,346-367,392-395,398,404,412,422,437,440-441,447-448,457,506
+server/outright-runtime.mjs
+  s_ce12272281eb3b::t_0a574467ccbebd 34,340-342,395
+server/subprocess-budget.mjs
+  s_ce12272281eb3b::t_ed580c4452d70d 11-25,105-106,442-448,454-457,459,462-463,485-486,494-495,497-499,516,527-530,534,542,564,619,625,631-655,665-669,675-676,679-681,684-687,689,692,695-700,702
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c6291383e36ea124e075c096a2be2ae4e9da2e28",
+  "prompts": {},
+  "sessions": {
+    "s_ce12272281eb3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d2376f8-4af3-4920-96da-dff6a042ab4c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
