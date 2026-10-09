@@ -1,0 +1,27 @@
+server/agent-manager.mjs
+  s_ce12272281eb3b::t_9c6368f617bfb3 738-744,768,771,1185-1200,1205
+server/agent-manager.test.mjs
+  s_ce12272281eb3b::t_e7f65cf7c11ca9 813-866
+server/agent-supervisor-windows.c
+  s_ce12272281eb3b::t_8b3c0eb0d66b78 352-357,365-368,375-382,404-412,478-481,483,488
+server/subprocess-budget.mjs
+  s_ce12272281eb3b::t_78d0cc5cac5a4d 11-12,19-20,152-154,157-159,161-166,464-478,488-489,525-526,592-593,654,682-685,711-712,731
+server/subprocess-budget.test.mjs
+  s_ce12272281eb3b::t_16ae703f6ed6d8 10,392-491,575-577,580,694-732
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bdcf800422e658665b862cc77c3b92af70f9609c",
+  "prompts": {},
+  "sessions": {
+    "s_ce12272281eb3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d2376f8-4af3-4920-96da-dff6a042ab4c",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
