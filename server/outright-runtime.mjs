@@ -31,6 +31,7 @@ function throwFailedRuntimeStartup(error, { eventHub, wss, database }) {
 // failed recovery that a later bootstrap request may explicitly restart.
 const RUN_RECOVERY_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000];
 const RUN_RECOVERY_RESTART_COOLDOWN_MS = 1000;
+const UTILITY_OWNER_RELEASE_ROUTE = /^\/api\/capacity\/utility-owners\/([0-9a-f-]{36})\/release$/;
 
 function transientRunRecoveryFailure(error) {
   return error?.statusCode === 503 || error?.statusCode === 507
@@ -336,8 +337,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     return result;
   }
 
-  // The operator's decision is durably audited before the reservation is
-  // released; a refused audit keeps the capacity charged.
+  // An operator release re-proves the owner and frees it only on positive
+  // whole-tree evidence, durably audited first; a refused audit or missing
+  // evidence keeps the capacity charged.
   async function releaseUtilityOwner(id) {
     if (typeof subprocesses.releaseUnknownOwner !== "function") throw apiError(404, "Unknown utility owner was not found");
     const released = await subprocesses.releaseUnknownOwner(id, {
@@ -390,7 +392,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         return json(response, 200, settings);
       }
       if (url.pathname === "/api/capacity" && request.method === "GET") return json(response, 200, runtimeCapacity());
-      const utilityOwnerMatch = url.pathname.match(/^\/api\/capacity\/utility-owners\/([0-9a-f-]{36})\/release$/);
+      const utilityOwnerMatch = UTILITY_OWNER_RELEASE_ROUTE.exec(url.pathname);
       if (utilityOwnerMatch && request.method === "POST") return json(response, 200, await releaseUtilityOwner(utilityOwnerMatch[1]));
       if (url.pathname === "/api/retention/archived" && request.method === "GET") {
         const limitText = url.searchParams.get("limit");

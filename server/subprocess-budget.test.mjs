@@ -321,30 +321,74 @@ test("an earlier recorded boot proves an owner empty before any reused PID or na
   }
 });
 
-test("a prior-format owner without a boot identity is bounded by its age before this boot", async () => {
+test("wall-clock age and a missing boot identity never prove an owner empty", async () => {
   const id = randomUUID();
-  const now = Date.parse("2026-10-09T12:00:00Z");
-  const uptimeSeconds = 3600;
+  const alive = { status: "alive", failed: false };
   for (const platform of ["linux", "darwin", "win32"]) {
+    // Recorded long before any plausible boot of this host, with its direct
+    // owner gone: neither age nor a dead PID says anything about its tree.
     const record = { state: "unknown", platform, authorized: true, pid: 2147483647, ...ownerIdentity(platform, id),
-      recordedAt: "2026-10-09T10:00:00Z" };
-    const alive = { status: "alive", failed: false };
-    const stub = nativeStatusStub({ "--probe": alive, "--utility-probe": alive, "--terminate-owned": alive });
-    const proof = (overrides) => nativeOwnerProof({ ...record, ...overrides }, id, { platform, status: stub.status,
-      bootId: "boot-current", now, uptimeSeconds, directory: os.tmpdir() });
-    assert.deepEqual(await proof({}), { empty: true, reason: "predates-boot" }, platform);
-    assert.deepEqual(stub.calls, []);
-    assert.equal((await proof({ recordedAt: "2026-10-09T10:55:00Z" })).empty, false, "a record inside the boot margin is not proof");
-    assert.equal((await proof({ recordedAt: "not a time" })).empty, false);
-    assert.equal((await proof({ bootId: "boot-current", recordedAt: "2026-10-09T10:00:00Z" })).empty, false,
-      "a comparable same-boot identity overrides wall-clock age");
-    if (platform === process.platform) {
-      assert.deepEqual(await proof({ pid: process.pid }), { empty: false, reason: "owner-alive" }, "age never releases a live owner");
+      recordedAt: "2000-01-01T00:00:00.000Z" };
+    for (const [overrides, bootId] of [[{}, "boot-current"], [{}, null], [{ bootId: "boot-current" }, null], [{ bootId: null }, null]]) {
+      const stub = nativeStatusStub({ "--probe": alive, "--utility-probe": alive, "--terminate-owned": alive });
+      // A forward-stepped clock and short uptime, which an earlier age rule
+      // read as a prior boot, are not inputs to the proof at all.
+      const proof = await nativeOwnerProof({ ...record, ...overrides }, id, { platform, status: stub.status, bootId,
+        directory: os.tmpdir(), now: Date.now() + 86_400_000, uptimeSeconds: 1 });
+      const label = `${platform} ${JSON.stringify(overrides)} current=${bootId}`;
+      assert.equal(proof.empty, false, label);
+      // Only the platform's own tree proof decides; nothing short-circuits it.
+      if (platform !== "linux") assert.notEqual(stub.calls.length, 0, `${label} skipped the native tree proof`);
+    }
+    if (platform !== "linux") {
+      // Positive whole-tree evidence needs no boot identity.
+      const empty = platform === "darwin" ? { "--probe": { status: "absent", failed: false } } : { "--utility-probe": { status: "exited", failed: false } };
+      assert.deepEqual(await nativeOwnerProof(record, id, { platform, status: nativeStatusStub(empty).status, bootId: null }),
+        { empty: true, reason: "proven" }, platform);
     }
   }
 });
 
-test("restarted utility budgets release earlier-boot and pre-boot owners through the real platform proof", async (t) => {
+test("a record without a boot identity is bounded by the boot recovery first observed it in", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-adopt-"));
+  const legacy = randomUUID();
+  const blocked = randomUUID();
+  const write = (id, record) => writeFileSync(path.join(root, `${id}.json`), JSON.stringify({ state: "unknown", platform: process.platform,
+    authorized: true, pid: 2147483647, recordedAt: "2026-10-09T10:00:00.000Z", ...ownerIdentity(process.platform, id), ...record }), { mode: 0o600 });
+  const read = (id) => JSON.parse(readFileSync(path.join(root, `${id}.json`), "utf8"));
+  write(legacy, {});
+  write(blocked, { bootId: null });
+  // The real proof order, with native evidence that never proves the tree empty.
+  const budgetAt = (bootId) => createSubprocessBudget({ limit: 2, unknownDirectory: root, bootIdentity: () => bootId,
+    proveOwner: (record, id, options) => nativeOwnerProof(record, id, { ...options, status: async () => ({ status: "unknown", failed: true }) }) });
+  const states = (budget) => Object.fromEntries(budget.unknownOwnerStatus().map((owner) => [owner.id, [owner.reason, owner.releasable, owner.clearsAfterRestart]]));
+  try {
+    const unreadable = budgetAt(null);
+    assert.equal(await unreadable.reconcileUnknown(), 0);
+    assert.equal(read(legacy).observedBootId, undefined, "an unreadable boot identity was stamped");
+    assert.deepEqual(Object.values(states(unreadable)).map((state) => state[2]), [false, false]);
+    const first = budgetAt("boot-a");
+    // A directory where the replacement file must go makes the stamp fail.
+    mkdirSync(path.join(root, `${blocked}.tmp`));
+    assert.equal(await first.reconcileUnknown(), 0);
+    assert.deepEqual([read(legacy).observedBootId, read(legacy).recordedAt], ["boot-a", "2026-10-09T10:00:00.000Z"]);
+    assert.equal(read(blocked).observedBootId, undefined);
+    assert.equal(states(first)[legacy][2], true);
+    assert.equal(states(first)[legacy][1], false);
+    assert.deepEqual(states(first)[blocked], ["boot-adoption-failed", false, false]);
+    assert.deepEqual(first.capacity(), { active: 2, unknown: 2, limit: 2 });
+    rmSync(path.join(root, `${blocked}.tmp`), { recursive: true });
+    const same = budgetAt("boot-a");
+    assert.equal(await same.reconcileUnknown(), 0, "the boot an owner was observed in cannot prove it gone");
+    assert.equal(read(blocked).observedBootId, "boot-a");
+    const later = budgetAt("boot-b");
+    assert.equal(await later.reconcileUnknown(), 2);
+    assert.deepEqual(later.capacity(), { active: 0, unknown: 0, limit: 2 });
+    assert.deepEqual(readdirSync(root), []);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("restarted utility budgets release earlier-boot owners through the real platform proof", async (t) => {
   const current = currentBootIdentity();
   t.diagnostic(`boot identity: ${current}`);
   if (process.platform !== "win32") assert.match(current ?? "", /^[\w:.-]{1,128}$/, "this platform has no readable boot identity");
@@ -357,15 +401,13 @@ test("restarted utility budgets release earlier-boot and pre-boot owners through
       write(randomUUID(), { authorized: true, pid: process.pid, runtimePid: process.pid, bootId: `${current}-earlier` });
       write(randomUUID(), { authorized: false, runtimePid: process.pid, bootId: `${current}-earlier` });
     }
-    write(randomUUID(), { authorized: true, pid: 2147483647,
-      recordedAt: new Date(Date.now() - os.uptime() * 1000 - 3_600_000).toISOString() });
     write(live, { authorized: true, pid: process.pid, runtimePid: process.pid, bootId: current });
-    const budget = createSubprocessBudget({ limit: 4, unknownDirectory: root });
-    const charged = current ? 4 : 2;
-    assert.deepEqual(budget.capacity(), { active: charged, unknown: charged, limit: 4 });
+    const budget = createSubprocessBudget({ limit: 3, unknownDirectory: root });
+    const charged = current ? 3 : 1;
+    assert.deepEqual(budget.capacity(), { active: charged, unknown: charged, limit: 3 });
     assert.equal(await budget.reconcileUnknown(), charged - 1);
-    assert.deepEqual(budget.capacity(), { active: 1, unknown: 1, limit: 4 });
-    assert.deepEqual(budget.unknownOwnerStatus(), [{ id: live, reason: "owner-alive", releasable: false }]);
+    assert.deepEqual(budget.capacity(), { active: 1, unknown: 1, limit: 3 });
+    assert.deepEqual(budget.unknownOwnerStatus(), [{ id: live, reason: "owner-alive", releasable: false, clearsAfterRestart: Boolean(current) }]);
     assert.deepEqual(readdirSync(root), [`${live}.json`]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -403,38 +445,74 @@ test("Windows utility proof requires an empty job or the supervisor's emptiness 
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("an operator release bounds an unproven utility owner and is refused while its owner runs", async () => {
-  const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-operator-"));
-  const unproven = randomUUID();
-  const running = randomUUID();
-  for (const id of [unproven, running]) {
-    writeFileSync(path.join(root, `${id}.json`), JSON.stringify({ state: "unknown", platform: process.platform,
-      authorized: true, pid: 2147483647, recordedAt: "2026-10-09T10:00:00.000Z", ...ownerIdentity(process.platform, id) }), { mode: 0o600 });
+test("reconciliation, operator re-check and the reported flag share one release predicate", async () => {
+  const live = ["owner-alive", "runtime-alive", "job-alive", "service-retained", "handshake-retained"];
+  const missing = ["handshake-invalid", "handshake-unreadable", "probe-failed", "owner-directory-missing",
+    "job-absent-without-marker", "identity-mismatch", "record-unreadable"];
+  // A prover's claim of emptiness without whole-tree evidence is no release either.
+  const verdicts = [...live, ...missing].map((reason) => ({ empty: false, reason }))
+    .concat([{ empty: true, reason: "predates-boot" }, { empty: true, reason: "owner-alive" }]);
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-predicate-"));
+  const ids = verdicts.map(() => randomUUID());
+  const verdictFor = new Map(ids.map((id, index) => [id, verdicts[index]]));
+  for (const id of ids) {
+    writeFileSync(path.join(root, `${id}.json`), JSON.stringify({ state: "unknown", platform: process.platform, authorized: true,
+      pid: 2147483647, recordedAt: "2026-10-09T10:00:00.000Z", bootId: "boot-a", ...ownerIdentity(process.platform, id) }), { mode: 0o600 });
   }
   writeFileSync(path.join(root, `${randomUUID()}.empty`), "stale marker");
-  const reasons = { [unproven]: "job-absent-without-marker", [running]: "owner-alive" };
   const audits = [];
+  const audit = async (outcome) => audits.push(outcome);
+  const count = ids.length;
   try {
-    const budget = createSubprocessBudget({ limit: 2, unknownDirectory: root,
-      proveOwner: async (_record, id) => ({ empty: false, reason: reasons[id] }) });
+    const budget = createSubprocessBudget({ limit: count, unknownDirectory: root, bootIdentity: () => "boot-a",
+      proveOwner: async (_record, id) => verdictFor.get(id) });
     assert.equal(readdirSync(root).filter((name) => name.endsWith(".empty")).length, 0, "a stale marker without its owner record was not swept");
-    assert.deepEqual(budget.capacity(), { active: 2, unknown: 2, limit: 2 });
+    assert.ok(budget.unknownOwnerStatus().every((owner) => owner.reason === "awaiting-reconciliation" && owner.releasable));
     assert.equal(await budget.reconcileUnknown(), 0);
-    assert.deepEqual(new Set(budget.unknownOwnerStatus().map((owner) => `${owner.reason}:${owner.releasable}`)),
-      new Set(["job-absent-without-marker:true", "owner-alive:false"]));
-    await assert.rejects(budget.releaseUnknownOwner(running, { audit: async (outcome) => audits.push(outcome) }),
-      (error) => error.statusCode === 409 && error.details.code === "UTILITY_OWNER_ALIVE");
-    await assert.rejects(budget.releaseUnknownOwner(unproven, { audit: async () => { throw new Error("audit refused"); } }), /audit refused/);
-    assert.deepEqual(budget.capacity(), { active: 2, unknown: 2, limit: 2 }, "a refused audit keeps the reservation");
+    for (const owner of budget.unknownOwnerStatus()) {
+      const { reason } = verdictFor.get(owner.id);
+      assert.deepEqual(owner, { id: owner.id, reason, releasable: false, clearsAfterRestart: true });
+      const code = live.includes(reason) ? "UTILITY_OWNER_ALIVE" : "UTILITY_OWNER_UNPROVEN";
+      await assert.rejects(budget.releaseUnknownOwner(owner.id, { audit }), (error) => error.statusCode === 409
+        && error.details.code === code && error.details.reason === reason && error.details.clearsAfterRestart === true, reason);
+    }
     assert.deepEqual(audits, []);
-    const released = await budget.releaseUnknownOwner(unproven, { audit: async (outcome) => audits.push(outcome) });
-    assert.deepEqual(released, { id: unproven, proven: false, reason: "job-absent-without-marker", platform: process.platform,
-      recordedAt: "2026-10-09T10:00:00.000Z" });
+    assert.deepEqual(budget.capacity(), { active: count, unknown: count, limit: count });
+    assert.equal(readdirSync(root).length, count, "an unproven owner lost its durable record");
+    // Positive evidence releases through either path, and only after its audit.
+    verdictFor.set(ids[0], { empty: true, reason: "proven" });
+    verdictFor.set(ids[1], { empty: true, reason: "earlier-boot" });
+    await assert.rejects(budget.releaseUnknownOwner(ids[0], { audit: async () => { throw new Error("audit refused"); } }), /audit refused/);
+    assert.deepEqual(budget.capacity(), { active: count, unknown: count, limit: count }, "a refused audit keeps the reservation");
+    const released = await budget.releaseUnknownOwner(ids[0], { audit });
+    assert.deepEqual(released, { id: ids[0], proven: true, reason: "proven", platform: process.platform, recordedAt: "2026-10-09T10:00:00.000Z" });
     assert.deepEqual(audits, [released]);
-    assert.deepEqual(budget.capacity(), { active: 1, unknown: 1, limit: 2 });
-    assert.equal(existsSync(path.join(root, `${unproven}.json`)), false);
-    await assert.rejects(budget.releaseUnknownOwner(unproven, { audit: async () => {} }), (error) => error.statusCode === 404);
-    await budget.run(process.execPath, ["-e", "process.exit(0)"], { timeout: 10_000 });
+    assert.equal(await budget.reconcileUnknown(), 1);
+    assert.deepEqual(budget.capacity(), { active: count - 2, unknown: count - 2, limit: count });
+    assert.deepEqual(new Set([ids[0], ids[1]].filter((id) => existsSync(path.join(root, `${id}.json`)))), new Set());
+    await assert.rejects(budget.releaseUnknownOwner(ids[0], { audit }), (error) => error.statusCode === 404);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("an operator re-check is refused while a reconciliation proves the same owner", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-busy-"));
+  const id = randomUUID();
+  writeFileSync(path.join(root, `${id}.json`), JSON.stringify({ state: "unknown", platform: process.platform, authorized: true,
+    pid: 2147483647, bootId: "boot-a", ...ownerIdentity(process.platform, id) }), { mode: 0o600 });
+  let finishProof;
+  const proofs = [];
+  try {
+    const budget = createSubprocessBudget({ limit: 1, unknownDirectory: root, bootIdentity: () => "boot-a",
+      proveOwner: () => new Promise((resolve) => { proofs.push(id); finishProof = resolve; }) });
+    const reconciling = budget.reconcileUnknown();
+    assert.deepEqual(proofs, [id], "reconciliation did not start its proof");
+    assert.deepEqual(budget.unknownOwnerStatus().map((owner) => owner.releasable), [false]);
+    await assert.rejects(budget.releaseUnknownOwner(id, { audit: async () => {} }),
+      (error) => error.statusCode === 409 && error.details.code === "UTILITY_OWNER_BUSY");
+    finishProof({ empty: true, reason: "proven" });
+    assert.equal(await reconciling, 1);
+    assert.deepEqual(proofs, [id], "a refused re-check ran a second concurrent proof");
+    assert.deepEqual(budget.capacity(), { active: 0, unknown: 0, limit: 1 });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -469,6 +547,45 @@ test("a Windows utility owner writes its emptiness marker only after its job is 
     assert.deepEqual(budget.capacity(), { active: 0, unknown: 0, limit: 1 });
     assert.deepEqual(readdirSync(unknownDirectory), [], "the released owner left its record or marker behind");
   } finally { cleanupDescendant(root, pidFile); }
+});
+
+test("a Windows supervisor that finds its job name already in use writes no marker or frame", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-win-existing-"));
+  const unknownDirectory = path.join(root, "unknown");
+  let jobName;
+  let marker;
+  let squatter;
+  const probe = () => spawnSync(AGENT_SUPERVISOR, ["--utility-probe", jobName], { encoding: "utf8", timeout: 5000 }).stdout.trim();
+  const budget = createSubprocessBudget({ limit: 1, unknownDirectory,
+    execute(file, args, options, onClose) {
+      jobName = `Local\\OutrightUtility-${options.__ownerId}`;
+      marker = options.__emptyMarker;
+      // Another owner already holds this job name with a live member.
+      squatter = spawn(AGENT_SUPERVISOR, ["--utility-owner", jobName, "-", process.execPath, "-e", "setInterval(() => {}, 1000)"],
+        { env: { ...process.env, OUTRIGHT_UTILITY_OWNER: "1" }, stdio: ["pipe", "ignore", "ignore", "pipe"], windowsHide: true });
+      squatter.stdin.write("go\n");
+      const deadline = Date.now() + 10_000;
+      const launchWhenOccupied = () => {
+        if (probe() === "alive") runOwned(file, args, options, onClose);
+        else if (Date.now() > deadline) onClose(new Error("the existing job did not start"), "", "", false, {});
+        else setTimeout(launchWhenOccupied, 25);
+      };
+      launchWhenOccupied();
+    } });
+  try {
+    await assert.rejects(budget.run(process.execPath, ["-e", "process.exit(0)"], { timeout: 10_000 }),
+      (error) => error.code === "SUBPROCESS_OWNERSHIP_UNKNOWN" && error.cause?.code === 69);
+    assert.equal(existsSync(marker), false, "an emptiness marker was written for a job this supervisor did not create");
+    assert.deepEqual(budget.capacity(), { active: 1, unknown: 1, limit: 1 }, "an existing job's frame released capacity");
+    assert.equal(probe(), "alive", "the existing job's member did not survive");
+  } finally {
+    if (squatter && squatter.exitCode === null) {
+      const closed = new Promise((resolve) => squatter.once("close", resolve));
+      squatter.stdin.end("stop\n");
+      await closed;
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("a crashed macOS owner settles after launchd drops its service and coalition", { skip: process.platform !== "darwin", timeout: 20_000 }, async () => {
@@ -548,11 +665,14 @@ test("a failed native owner releases capacity only after its detached child is g
       // gone while KILL_ON_JOB_CLOSE teardown runs, and no marker was written.
       assert.equal(await restarted.reconcileUnknown(), 0, "a vanished job without a marker released capacity");
       const [unproven] = restarted.unknownOwnerStatus();
-      assert.deepEqual([unproven?.reason, unproven?.releasable], ["job-absent-without-marker", true]);
+      assert.deepEqual([unproven?.reason, unproven?.releasable, unproven?.clearsAfterRestart],
+        ["job-absent-without-marker", false, Boolean(currentBootIdentity())]);
+      // An operator cannot override missing evidence; a later boot clears it.
       const audits = [];
-      await restarted.releaseUnknownOwner(unproven.id, { audit: async (outcome) => audits.push(outcome) });
-      assert.deepEqual(audits.map((outcome) => [outcome.proven, outcome.reason]), [[false, "job-absent-without-marker"]]);
-      assert.deepEqual(restarted.capacity(), { active: 0, unknown: 0, limit: 1 });
+      await assert.rejects(restarted.releaseUnknownOwner(unproven.id, { audit: async (outcome) => audits.push(outcome) }),
+        (error) => error.statusCode === 409 && error.details.code === "UTILITY_OWNER_UNPROVEN");
+      assert.deepEqual(audits, []);
+      assert.deepEqual(restarted.capacity(), { active: 1, unknown: 1, limit: 1 });
     }
   } finally {
     if (process.platform === "darwin" && owner?.label) {

@@ -322,17 +322,17 @@ test("reconciliation progress accumulates across attempts and an operator-restar
   assert.equal(state.resumes, 1);
 }, { runs: 150 }));
 
-test("an operator releases an unproven utility owner only through the audited capacity route", async () => {
+test("the capacity route re-checks a utility owner and releases it only on audited positive proof", async () => {
   const unknownDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-runtime-utility-owner-"));
   const unproven = randomUUID();
   const running = randomUUID();
   for (const id of [unproven, running]) {
     writeFileSync(path.join(unknownDirectory, `${id}.json`), JSON.stringify({ state: "unknown", platform: process.platform,
-      authorized: true, pid: 2147483647, recordedAt: "2026-10-09T10:00:00.000Z" }), { mode: 0o600 });
+      authorized: true, pid: 2147483647, recordedAt: "2026-10-09T10:00:00.000Z", bootId: "boot-a" }), { mode: 0o600 });
   }
-  const reasons = { [unproven]: "job-absent-without-marker", [running]: "owner-alive" };
-  const subprocesses = createSubprocessBudget({ limit: 2, unknownDirectory,
-    proveOwner: async (_record, id) => ({ empty: false, reason: reasons[id] }) });
+  const verdicts = { [unproven]: { empty: false, reason: "job-absent-without-marker" }, [running]: { empty: false, reason: "owner-alive" } };
+  const subprocesses = createSubprocessBudget({ limit: 2, unknownDirectory, bootIdentity: () => "boot-a",
+    proveOwner: async (_record, id) => verdicts[id] });
   const post = async (runtime, id) => {
     const response = responseCapture();
     await runtime.handleRequest(requestStream("POST", `/api/capacity/utility-owners/${id}/release`), response);
@@ -344,19 +344,26 @@ test("an operator releases an unproven utility owner only through the audited ca
       const reported = async () => (await getRoute(runtime, "/api/capacity")).body.utilityOwners;
       await waitFor(() => subprocesses.unknownOwnerStatus().every((owner) => owner.reason !== "awaiting-reconciliation"), 5000,
         "startup reconciliation did not classify the unknown owners");
-      assert.deepEqual(new Set((await reported()).map((owner) => `${owner.id}:${owner.reason}:${owner.releasable}`)),
-        new Set([`${unproven}:job-absent-without-marker:true`, `${running}:owner-alive:false`]));
+      assert.deepEqual(new Set((await reported()).map((owner) => `${owner.id}:${owner.reason}:${owner.releasable}:${owner.clearsAfterRestart}`)),
+        new Set([`${unproven}:job-absent-without-marker:false:true`, `${running}:owner-alive:false:true`]));
       const refused = await post(runtime, running);
       assert.equal(refused.statusCode, 409);
       assert.equal(refused.body.code, "UTILITY_OWNER_ALIVE");
+      // Missing evidence is never overridden, and nothing is audited.
+      const unprovenRefusal = await post(runtime, unproven);
+      assert.equal(unprovenRefusal.statusCode, 409);
+      assert.deepEqual([unprovenRefusal.body.code, unprovenRefusal.body.reason, unprovenRefusal.body.clearsAfterRestart],
+        ["UTILITY_OWNER_UNPROVEN", "job-absent-without-marker", true]);
+      const audits = () => runtime.database.listAudit(20).filter((entry) => entry.action === "utility.owner.released");
+      assert.deepEqual(audits(), []);
+      assert.deepEqual((await getRoute(runtime, "/api/capacity")).body.utilityProcesses, { active: 2, unknown: 2, limit: 2 });
+      verdicts[unproven] = { empty: true, reason: "proven" };
       const released = await post(runtime, unproven);
       assert.equal(released.statusCode, 200);
-      assert.deepEqual(released.body.released, { id: unproven, proven: false, reason: "job-absent-without-marker",
+      assert.deepEqual(released.body.released, { id: unproven, proven: true, reason: "proven",
         platform: process.platform, recordedAt: "2026-10-09T10:00:00.000Z" });
       assert.deepEqual(released.body.capacity.utilityProcesses, { active: 1, unknown: 1, limit: 2 });
-      const audit = runtime.database.listAudit(20).filter((entry) => entry.action === "utility.owner.released");
-      assert.deepEqual(audit.map((entry) => [entry.target, entry.details.reason, entry.details.proven]),
-        [[unproven, "job-absent-without-marker", false]]);
+      assert.deepEqual(audits().map((entry) => [entry.target, entry.details.reason, entry.details.proven]), [[unproven, "proven", true]]);
       assert.equal((await post(runtime, unproven)).statusCode, 404);
       assert.equal((await post(runtime, "not-an-owner")).statusCode, 404);
     }, { subprocesses })();

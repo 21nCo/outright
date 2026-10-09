@@ -7,12 +7,22 @@ import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
 
 const TREE_EMPTY_PROOF = "__OUTRIGHT_UTILITY_TREE_EMPTY_V1__\n";
 const UTILITY_DIAGNOSTIC_PREFIX = "__OUTRIGHT_UTILITY_DIAGNOSTIC_V1__ ";
-// A record without a comparable boot identity predates this boot only when
-// it is older than the boot time by this margin and its owner is gone.
-const PREDATES_BOOT_MARGIN_MS = 10 * 60 * 1000;
 const MAX_REPORTED_UNKNOWN_OWNERS = 32;
-// The recorded native owner may still settle or release its own permit.
-const OWNER_ALIVE_REASONS = new Set(["owner-alive", "runtime-alive"]);
+// Positive whole-tree evidence: the supervisor's empty-tree frame, an opened
+// empty job, an absent launchd service, a supervisor-removed handshake, an
+// unlaunched owner's gone runtime, or an earlier boot.
+const RELEASE_EVIDENCE = new Set(["proven", "earlier-boot"]);
+// Verdicts that observed the recorded tree, or its runtime, still running.
+const LIVE_OWNER_REASONS = new Set(["owner-alive", "runtime-alive", "job-alive", "service-retained", "handshake-retained"]);
+// States no proof has examined since they arose; a re-check may release them.
+const RECHECK_REASONS = new Set(["awaiting-reconciliation", "owner-unsettled", "release-failed"]);
+
+// The one release predicate. The live supervisor frame, startup and admission
+// reconciliation, and an operator re-check all lower utility capacity only
+// when it holds; every other verdict keeps the reservation charged.
+export function utilityOwnerReleased(proof) {
+  return proof?.empty === true && RELEASE_EVIDENCE.has(proof.reason);
+}
 
 export function utilityBudgetUnavailable(error) {
   return ["SUBPROCESS_CAPACITY", "SUBPROCESS_OWNERSHIP_UNKNOWN", "SUBPROCESS_OWNERSHIP_RECORD_FAILED"].includes(error?.code);
@@ -92,7 +102,8 @@ function ownerRecord(directory, id, owner, replace = false) {
     const descriptor = openSync(temporary, "wx", 0o600);
     created = true;
     try {
-      writeFileSync(descriptor, `${JSON.stringify({ ...owner, platform: process.platform, recordedAt: new Date().toISOString() })}\n`);
+      // A replaced record keeps its original time; only identity changes.
+      writeFileSync(descriptor, `${JSON.stringify({ recordedAt: new Date().toISOString(), ...owner, platform: process.platform })}\n`);
       fsyncSync(descriptor);
     } finally { closeSync(descriptor); }
     if (replace) renameSync(temporary, filename);
@@ -428,29 +439,31 @@ async function windowsTreeProof(record, id, status, directory) {
   return emptyMarkerMatches({ ...record, jobName }, id, directory) ? proven : unproven("job-absent-without-marker");
 }
 
-function recordPredatesBoot(record, now, uptimeSeconds) {
-  const recordedAt = Date.parse(record.recordedAt);
-  return Number.isFinite(recordedAt) && recordedAt < now - uptimeSeconds * 1000 - PREDATES_BOOT_MARGIN_MS;
+// The boot a record was spawned in or, for a record written without one, the
+// boot in which recovery first observed it. Either bounds its processes.
+function recordedBootIdentity(record) {
+  for (const value of [record?.bootId, record?.observedBootId]) {
+    if (typeof value === "string" && value) return value;
+  }
+  return null;
 }
 
 // Only positive platform evidence that the recorded tree is empty releases a
 // utility permit. The order is fixed on every platform: an earlier recorded
 // boot first (PIDs are reused across boots), then the recorded owner process,
-// then the platform's whole-tree proof. Missing, unreadable, foreign or
-// ambiguous evidence returns its reason and keeps the reservation charged.
+// then the platform's whole-tree proof. A boot compares only when both
+// identities were read; a missing one, wall-clock time or a dead direct PID
+// is never proof. Missing, unreadable, foreign or ambiguous evidence returns
+// its reason and keeps the reservation charged.
 export async function nativeOwnerProof(record, id, { platform = process.platform, status = nativeStatus,
-  bootId = platform === process.platform ? currentBootIdentity() : null, directory = null,
-  now = Date.now(), uptimeSeconds = os.uptime() } = {}) {
+  bootId = platform === process.platform ? currentBootIdentity() : null, directory = null } = {}) {
   if (!record || record.platform !== platform || !["active", "unknown"].includes(record.state)) return unproven("record-unreadable");
   if (!recordedIdentityMatches(record, id, platform)) return unproven("identity-mismatch");
-  const comparableBoot = typeof record.bootId === "string" && record.bootId && bootId;
-  if (comparableBoot && record.bootId !== bootId) return { empty: true, reason: "earlier-boot" };
+  const recordedBoot = recordedBootIdentity(record);
+  if (recordedBoot && bootId && recordedBoot !== bootId) return { empty: true, reason: "earlier-boot" };
   // Sound only because the authorized record is fsynced before "go".
   if (record.authorized === false) return ownerProcessGone(record.runtimePid, platform) ? proven : unproven("runtime-alive");
   if (!ownerProcessGone(record.pid, platform)) return unproven("owner-alive");
-  // A prior-format record has no boot identity. Wall-clock age alone is not
-  // proof, but together with its gone owner it bounds the reservation.
-  if (!comparableBoot && recordPredatesBoot(record, now, uptimeSeconds)) return { empty: true, reason: "predates-boot" };
   if (platform === "linux") return linuxTreeProof(record, id, status);
   if (platform === "darwin") return darwinTreeProof(id, status);
   return windowsTreeProof(record, id, status, directory);
@@ -469,7 +482,8 @@ function releaseOwnerFiles(directory, id, record) {
 
 // Git, scanner and editor requests share one admission point. Command permits
 // stay charged until close; detached editor permits cover process creation.
-export function createSubprocessBudget({ limit = 8, execute = runOwned, launch = spawn, unknownDirectory = null, proveOwner = nativeOwnerProof } = {}) {
+export function createSubprocessBudget({ limit = 8, execute = runOwned, launch = spawn, unknownDirectory = null,
+  proveOwner = nativeOwnerProof, bootIdentity = currentBootIdentity } = {}) {
   if (!Number.isSafeInteger(limit) || limit < 0) throw new RangeError("Utility process limit must be a non-negative integer");
   const retained = retainedUnknownOwners(unknownDirectory);
   const unreadableOwners = retained.unreadable;
@@ -477,9 +491,12 @@ export function createSubprocessBudget({ limit = 8, execute = runOwned, launch =
   const unknownOwners = new Set(retained.ids);
   let unknown = unreadableOwners ? limit : retained.ids.size;
   let active = unknown;
+  // Owners whose release decision is in progress: a running command, or a
+  // reconciliation or operator re-check proving its tree.
   const inFlightOwners = new Set();
-  // The latest proof verdict for each unknown owner, reported with capacity.
-  const ownerReasons = new Map();
+  // The latest verdict for each unknown owner and whether its record carries
+  // the boot that a restart proves over, reported with capacity.
+  const ownerStates = new Map();
   let reconciliationPromise;
   function admit() {
     if (active >= limit) {
@@ -496,7 +513,7 @@ export function createSubprocessBudget({ limit = 8, execute = runOwned, launch =
     const ownerId = randomUUID();
     // The absolute handshake path and boot identity are recorded at spawn;
     // recovery never re-derives them from a later runtime environment.
-    const identity = { ...nativeOwner(ownerId), bootId: currentBootIdentity() };
+    const identity = { ...nativeOwner(ownerId), bootId: bootIdentity() };
     try { ownerRecord(unknownDirectory, ownerId, { state: "active", authorized: false,
       runtimePid: process.pid, ...identity }); }
     catch (error) {
@@ -507,11 +524,14 @@ export function createSubprocessBudget({ limit = 8, execute = runOwned, launch =
     inFlightOwners.add(ownerId);
     return new Promise((resolve, reject) => {
       let settled = false;
-      const finish = (error, stdout, stderr, ownerProven = true, owner = {}) => {
+      const finish = (error, stdout, stderr, frameProven = true, owner = {}) => {
+        // The supervisor's frame (or no launched supervisor) is the live
+        // path's evidence, read through the same release predicate.
+        let ownerProven = utilityOwnerReleased(frameProven ? proven : unproven("owner-unsettled"));
         if (settled) {
           // A stop-grace rejection settles the caller, not the native tree.
           // Only a later genuine empty-tree frame may release its permit,
-          // unless an operator release already owns this reservation.
+          // unless a reconciliation or operator re-check owns it right now.
           if (ownerProven && unknownOwners.has(ownerId) && !inFlightOwners.has(ownerId)) {
             try {
               releaseOwnerRecord(unknownDirectory, ownerId);
@@ -519,7 +539,7 @@ export function createSubprocessBudget({ limit = 8, execute = runOwned, launch =
               accountedOwners.delete(ownerId);
               active -= 1;
               unknown -= 1;
-              ownerReasons.delete(ownerId);
+              ownerStates.delete(ownerId);
               removeOwnerDirectory(owner.handshakePath);
             } catch { /* Recovery retains the charged record. */ }
           }
@@ -541,7 +561,7 @@ export function createSubprocessBudget({ limit = 8, execute = runOwned, launch =
           unknown += 1;
           accountedOwners.add(ownerId);
           unknownOwners.add(ownerId);
-          ownerReasons.set(ownerId, "owner-unsettled");
+          ownerStates.set(ownerId, { reason: "owner-unsettled", boot: identity.bootId });
           // The reservation already contains the last durable authorization
           // state. A failed replacement may have reached rename before fsync;
           // overwriting it here could falsely turn an authorized native tree
@@ -596,17 +616,42 @@ export function createSubprocessBudget({ limit = 8, execute = runOwned, launch =
     unknown -= 1;
     accountedOwners.delete(id);
     unknownOwners.delete(id);
-    ownerReasons.delete(id);
+    ownerStates.delete(id);
   }
   // Releases the owner's durable files after its proof; false keeps it charged.
   function releaseProvenOwner(id, record) {
     try { releaseOwnerFiles(unknownDirectory, id, record); }
     catch {
-      ownerReasons.set(id, "release-failed");
+      ownerStates.set(id, { reason: "release-failed", boot: recordedBootIdentity(record) });
       return false;
     }
     forgetOwner(id);
     return true;
+  }
+  // A record without a boot identity cannot be bounded by a later boot until
+  // recovery durably stamps the boot it was observed in. That boot is never
+  // inferred: an unreadable identity or a failed write keeps it unstamped.
+  function adoptObservedBoot(id, record) {
+    const current = bootIdentity();
+    if (!record || record.platform !== process.platform || recordedBootIdentity(record) || !current) return true;
+    try {
+      // A crash-era replacement file would block the new one.
+      try { unlinkSync(path.join(unknownDirectory, `${id}.tmp`)); }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+      ownerRecord(unknownDirectory, id, { ...record, observedBootId: current }, true);
+      record.observedBootId = current;
+      return true;
+    } catch { return false; }
+  }
+  // Every proof of a retained owner: the caller owns it while this runs.
+  async function proveRetainedOwner(id) {
+    const record = readOwnerRecord(id);
+    let proof = await proveOwner(record, id, { directory: unknownDirectory, bootId: bootIdentity() });
+    if (!utilityOwnerReleased(proof) && !adoptObservedBoot(id, record) && !LIVE_OWNER_REASONS.has(proof.reason)) {
+      proof = unproven("boot-adoption-failed");
+    }
+    if (!utilityOwnerReleased(proof)) ownerStates.set(id, { reason: proof.reason, boot: recordedBootIdentity(record) });
+    return { record, proof };
   }
   async function reconcileUnknown() {
     if (!unknownDirectory || !unknown || unreadableOwners) return 0;
@@ -617,39 +662,44 @@ export function createSubprocessBudget({ limit = 8, execute = runOwned, launch =
         if (!/^[0-9a-f-]{36}\.json$/.test(name)) continue;
         const id = name.slice(0, -5);
         if (!accountedOwners.has(id) || inFlightOwners.has(id) || !unknownOwners.has(id)) continue;
-        const record = readOwnerRecord(id);
-        const proof = await proveOwner(record, id, { directory: unknownDirectory }); // NOSONAR S9382: native owner proofs are serialized; each may terminate a tree
-        if (!proof.empty) ownerReasons.set(id, proof.reason);
-        else if (releaseProvenOwner(id, record)) released += 1;
+        inFlightOwners.add(id);
+        try {
+          const { record, proof } = await proveRetainedOwner(id); // NOSONAR S9382: native owner proofs are serialized; each may terminate a tree
+          if (utilityOwnerReleased(proof) && releaseProvenOwner(id, record)) released += 1;
+        } finally { inFlightOwners.delete(id); }
       }
       return released;
     })().finally(() => { reconciliationPromise = null; });
     return reconciliationPromise;
   }
-  // Unknown owners stay visible with the reason their tree is unproven.
+  // Unknown owners stay visible with the reason their tree is unproven and
+  // whether a computer restart will prove it gone.
   function unknownOwnerStatus() {
     return [...unknownOwners].slice(0, MAX_REPORTED_UNKNOWN_OWNERS).map((id) => {
-      const reason = ownerReasons.get(id) ?? "awaiting-reconciliation";
-      return { id, reason, releasable: !OWNER_ALIVE_REASONS.has(reason) && !inFlightOwners.has(id) };
+      const { reason, boot = null } = ownerStates.get(id) ?? { reason: "awaiting-reconciliation" };
+      return { id, reason, releasable: RECHECK_REASONS.has(reason) && !inFlightOwners.has(id),
+        clearsAfterRestart: Boolean(boot) };
     });
   }
-  // An explicit, audited operator release bounds an owner whose recorded
-  // processes are gone but whose platform evidence cannot prove the whole
-  // tree empty (for example a Windows job killed with its supervisor). A
-  // live recorded owner is refused; a provable owner is released normally.
+  // An operator release is a fresh, audited re-check through the same
+  // release predicate. It never overrides missing or live evidence: those
+  // owners stay charged until proof, or until a later boot for a record
+  // that carries its boot.
   async function releaseUnknownOwner(id, { audit }) {
-    if (!unknownDirectory || !unknownOwners.has(id) || inFlightOwners.has(id)) {
+    if (!unknownDirectory || !unknownOwners.has(id)) {
       throw ownerReleaseError(404, "Unknown utility owner was not found", "UTILITY_OWNER_NOT_FOUND");
     }
+    if (inFlightOwners.has(id)) throw ownerReleaseError(409, "The utility owner is already being checked", "UTILITY_OWNER_BUSY");
     inFlightOwners.add(id);
     try {
-      const record = readOwnerRecord(id);
-      const proof = await proveOwner(record, id, { directory: unknownDirectory });
-      if (!proof.empty) ownerReasons.set(id, proof.reason);
-      if (!proof.empty && OWNER_ALIVE_REASONS.has(proof.reason)) {
-        throw ownerReleaseError(409, "The recorded utility owner is still running", "UTILITY_OWNER_ALIVE", { reason: proof.reason });
+      const { record, proof } = await proveRetainedOwner(id);
+      if (!utilityOwnerReleased(proof)) {
+        const live = LIVE_OWNER_REASONS.has(proof.reason);
+        throw ownerReleaseError(409, live ? "The recorded utility owner is still running"
+          : "The utility owner's processes are not proven gone", live ? "UTILITY_OWNER_ALIVE" : "UTILITY_OWNER_UNPROVEN",
+        { reason: proof.reason, clearsAfterRestart: Boolean(recordedBootIdentity(record)) });
       }
-      const outcome = { id, proven: proof.empty, reason: proof.reason, platform: record?.platform ?? null, recordedAt: record?.recordedAt ?? null };
+      const outcome = { id, proven: true, reason: proof.reason, platform: record?.platform ?? null, recordedAt: record?.recordedAt ?? null };
       await audit(outcome);
       if (!releaseProvenOwner(id, record)) {
         throw ownerReleaseError(503, "Utility ownership reservation could not be cleared", "UTILITY_OWNER_RELEASE_FAILED");

@@ -306,9 +306,9 @@ static bool valid_empty_marker(const wchar_t *marker, const wchar_t *job) {
   return wcslen(name) == 42 && wcsncmp(name, owner, 36) == 0 && wcscmp(name + 36, L".empty") == 0;
 }
 
-// Written only after the kernel reported zero job members (or before any
-// launch), and before the live proof frame, so a restarted runtime that can
-// no longer open the Local\ job name still has identity-bound evidence.
+// Written only for a job this supervisor created, after the kernel reported
+// zero members, and before the live proof frame, so a restarted runtime that
+// can no longer open the Local\ job name still has identity-bound evidence.
 static void write_empty_marker(void) {
   if (!utility_job_name || !utility_empty_marker || wcscmp(utility_empty_marker, L"-") == 0) return;
   char boot[64];
@@ -343,14 +343,28 @@ static bool utility_start_authorized(void) {
   return memcmp(command, "go\n", sizeof(command)) == 0;
 }
 
-static int utility_prelaunch_exit(int code) {
-  if (utility_proof_enabled) {
-    write_empty_marker();
-    intptr_t descriptor = _get_osfhandle(3);
-    DWORD written = 0;
-    if (descriptor != -1)
-      WriteFile((HANDLE)descriptor, UTILITY_TREE_EMPTY, sizeof(UTILITY_TREE_EMPTY) - 1, &written, NULL);
-  }
+static bool job_empty(HANDLE job) {
+  JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting = {0};
+  return job && QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), NULL)
+    && accounting.ActiveProcesses == 0;
+}
+
+// The only producer of the marker and the empty-tree frame, which the
+// runtime reads through utilityOwnerReleased in subprocess-budget.mjs. The
+// job must be this supervisor's own new job: an existing named job, or none,
+// is never evidence.
+static void prove_own_job_empty(HANDLE own_job) {
+  if (!utility_proof_enabled || !job_empty(own_job)) return;
+  write_empty_marker();
+  intptr_t descriptor = _get_osfhandle(3);
+  DWORD written = 0;
+  if (descriptor != -1)
+    WriteFile((HANDLE)descriptor, UTILITY_TREE_EMPTY, sizeof(UTILITY_TREE_EMPTY) - 1, &written, NULL);
+}
+
+static int utility_prelaunch_exit(HANDLE own_job, int code) {
+  prove_own_job_empty(own_job);
+  if (own_job) CloseHandle(own_job);
   return code;
 }
 
@@ -375,17 +389,19 @@ int wmain(int argc, wchar_t **argv) {
     utility_empty_marker = argv[3];
   }
   HANDLE job = CreateJobObjectW(NULL, utility_mode ? argv[2] : NULL);
-  if (!job) return utility_prelaunch_exit(70);
-  if (utility_mode && GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(job); return utility_prelaunch_exit(70); }
+  // Neither a failed creation nor another owner's job, whose members this
+  // supervisor never started, can prove the recorded tree empty.
+  if (!job) return 70;
+  if (utility_mode && GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(job); return 69; }
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
   limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-  if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return utility_prelaunch_exit(71);
+  if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return utility_prelaunch_exit(job, 71);
 
   int first_argument = 1;
   if (utility_mode) first_argument = 4;
   else if (test_mode) first_argument = 3;
   wchar_t *line = command_line(argc, argv, first_argument);
-  if (!line) return utility_prelaunch_exit(72);
+  if (!line) return utility_prelaunch_exit(job, 72);
   // The native child owns no control input. Forward only output and error;
   // sharing the supervisor's stdin would let Git or a helper consume Stop.
   SECURITY_ATTRIBUTES inherited = {0};
@@ -393,7 +409,7 @@ int wmain(int argc, wchar_t **argv) {
   inherited.bInheritHandle = TRUE;
   HANDLE null_input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
     &inherited, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-  if (null_input == INVALID_HANDLE_VALUE) { free(line); return utility_prelaunch_exit(72); }
+  if (null_input == INVALID_HANDLE_VALUE) { free(line); return utility_prelaunch_exit(job, 72); }
   HANDLE output = NULL, error_output = NULL;
   HANDLE own_process = GetCurrentProcess();
   if (!DuplicateHandle(own_process, GetStdHandle(STD_OUTPUT_HANDLE), own_process, &output,
@@ -403,7 +419,7 @@ int wmain(int argc, wchar_t **argv) {
     if (output) CloseHandle(output);
     CloseHandle(null_input);
     free(line);
-    return utility_prelaunch_exit(72);
+    return utility_prelaunch_exit(job, 72);
   }
   STARTUPINFOW startup = {0};
   startup.cb = sizeof(startup);
@@ -418,18 +434,18 @@ int wmain(int argc, wchar_t **argv) {
   if (utility_owner && (proof_handle == -1
       || !SetHandleInformation((HANDLE)proof_handle, HANDLE_FLAG_INHERIT, 0))) {
     CloseHandle(null_input); CloseHandle(output); CloseHandle(error_output); free(line);
-    return utility_prelaunch_exit(72);
+    return utility_prelaunch_exit(job, 72);
   }
   if (utility_mode && !utility_start_authorized()) {
-    CloseHandle(null_input); CloseHandle(output); CloseHandle(error_output); free(line); CloseHandle(job);
-    return utility_prelaunch_exit(0);
+    CloseHandle(null_input); CloseHandle(output); CloseHandle(error_output); free(line);
+    return utility_prelaunch_exit(job, 0);
   }
   // The utility flag belongs to this supervisor, never to Git hooks or
   // provider grandchildren that may launch an ordinary three-fd supervisor.
   bool inherited_utility_flag = GetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", NULL, 0) != 0;
   if (inherited_utility_flag && !SetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", NULL)) {
-    CloseHandle(null_input); CloseHandle(output); CloseHandle(error_output); free(line); CloseHandle(job);
-    return utility_prelaunch_exit(72);
+    CloseHandle(null_input); CloseHandle(output); CloseHandle(error_output); free(line);
+    return utility_prelaunch_exit(job, 72);
   }
   PROCESS_INFORMATION process = {0};
   BOOL launched = CreateProcessW(NULL, line, NULL, NULL, TRUE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
@@ -438,7 +454,7 @@ int wmain(int argc, wchar_t **argv) {
   CloseHandle(null_input);
   CloseHandle(output);
   CloseHandle(error_output);
-  if (!launched) { free(line); return utility_prelaunch_exit(73); }
+  if (!launched) { free(line); return utility_prelaunch_exit(job, 73); }
   free(line);
   if (!AssignProcessToJobObject(job, process.hProcess)) {
     TerminateProcess(process.hProcess, 126);
@@ -487,13 +503,7 @@ int wmain(int argc, wchar_t **argv) {
     if (accounting.ActiveProcesses == 0) break;
     Sleep(25);
   }
-  if (utility_owner) {
-    write_empty_marker();
-    HANDLE proof = (HANDLE)proof_handle;
-    DWORD written = 0;
-    if (proof != INVALID_HANDLE_VALUE)
-      WriteFile(proof, UTILITY_TREE_EMPTY, sizeof(UTILITY_TREE_EMPTY) - 1, &written, NULL);
-  }
+  if (utility_owner) prove_own_job_empty(job);
   CloseHandle(job);
   return (int)exit_code;
 }

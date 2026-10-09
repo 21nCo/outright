@@ -290,12 +290,22 @@ function terminalCapacityMessages(terminal) {
   return messages;
 }
 
+// An unproven utility owner keeps its reservation. Name why, and promise a
+// restart only when every unknown owner records the boot it would outlive.
+function utilityOwnershipText(unknown, owners) {
+  const reported = Array.isArray(owners) ? owners : [];
+  const reasons = [...new Set(reported.map((owner) => owner?.reason).filter((reason) => typeof reason === "string"))];
+  const detail = reasons.length ? ` (${reasons.join(", ")})` : "";
+  const restart = reported.length === unknown && reported.every((owner) => owner?.clearsAfterRestart === true);
+  return `Utility process ownership is unverified${detail}. Its capacity stays reserved until its processes are proven gone${restart ? " or the computer restarts" : ""}.`;
+}
+
 function processCapacityMessages(capacity) {
   const messages = [];
   const utility = capacity.utilityProcesses;
   if (!utility || !validCapacityCount(utility.active) || !validCapacityCount(utility.limit)) messages.push("Utility process capacity is unknown.");
   else {
-    if (validCapacityCount(utility.unknown) && utility.unknown) messages.push("Utility process ownership is unverified. Its capacity stays reserved until recovery.");
+    if (validCapacityCount(utility.unknown) && utility.unknown) messages.push(utilityOwnershipText(utility.unknown, capacity.utilityOwners));
     if (atCapacityLimit(utility.active, utility.limit)) messages.push("Utility process capacity is full. Retry when a process finishes.");
   }
   const queueFull = atCapacityLimit(capacity.queued, capacity.limits.maxQueuedRuns);

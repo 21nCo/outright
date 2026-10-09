@@ -762,6 +762,19 @@ async function settingsCapacityWithoutEventRegression() {
   otherClientCapacity = { ...otherClientCapacity, terminalProcesses: { active: 0, unknown: 0, limit: 12 } };
   signalChange();
   await until(() => capacityAnnouncement() === "Capacity is available for new work.", "terminal recovery returns status to available");
+  const unprovenOwner = { id: "00000000-0000-4000-8000-000000000001", reason: "job-absent-without-marker", releasable: false };
+  otherClientCapacity = { ...otherClientCapacity, utilityProcesses: { active: 1, unknown: 1, limit: 8 },
+    utilityOwners: [{ ...unprovenOwner, clearsAfterRestart: true }] };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Utility process ownership is unverified (job-absent-without-marker). Its capacity stays reserved until its processes are proven gone or the computer restarts.",
+    "an unproven utility owner names its reason and the restart that clears it");
+  otherClientCapacity = { ...otherClientCapacity, utilityOwners: [{ ...unprovenOwner, clearsAfterRestart: false }] };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Utility process ownership is unverified (job-absent-without-marker). Its capacity stays reserved until its processes are proven gone.",
+    "a restart is not promised for an owner without a recorded boot");
+  otherClientCapacity = { ...otherClientCapacity, utilityProcesses: { active: 0, limit: 8 }, utilityOwners: [] };
+  signalChange();
+  await until(() => capacityAnnouncement() === "Capacity is available for new work.", "utility recovery returns status to available");
   otherClientCapacity = { ...otherClientCapacity, utilityProcesses: null, terminalProcesses: null };
   signalChange();
   await until(() => capacityAnnouncement() === "Terminal capacity is unknown. Utility process capacity is unknown.",
