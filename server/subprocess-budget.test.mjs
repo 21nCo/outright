@@ -7,6 +7,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpath
 import { realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { PassThrough } from "node:stream";
 import { createSubprocessBudget, currentBootIdentity, nativeOwnerProof, runOwned } from "./subprocess-budget.mjs";
 import { createGitService } from "./git-service.mjs";
@@ -388,6 +389,106 @@ test("a record without a boot identity is bounded by the boot recovery first obs
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("a restart is promised exactly where the real proof in a later boot releases the owner", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-restart-"));
+  const foreign = process.platform === "linux" ? "darwin" : "linux";
+  const shapes = {
+    "owner-alive": { pid: process.pid, bootId: "boot-a" },
+    "native-unproven": { bootId: "boot-a" },
+    "identity-mismatch": () => ({ bootId: "boot-a", ...ownerIdentity(process.platform, randomUUID()) }),
+    "record-unreadable": (id) => ({ bootId: "boot-a", platform: foreign, ...ownerIdentity(foreign, id) }),
+    adopted: {},
+    "adoption-failed": {},
+  };
+  const ids = Object.fromEntries(Object.keys(shapes).map((name) => [name, randomUUID()]));
+  for (const [name, shape] of Object.entries(shapes)) {
+    const id = ids[name];
+    const fields = typeof shape === "function" ? shape(id) : shape;
+    writeFileSync(path.join(root, `${id}.json`), JSON.stringify({ state: "unknown", platform: process.platform, authorized: true,
+      pid: 2147483647, recordedAt: "2026-10-09T10:00:00.000Z", ...ownerIdentity(process.platform, id), ...fields }), { mode: 0o600 });
+  }
+  // The real proof order, with native evidence that never proves a tree empty.
+  const budgetAt = (bootId) => createSubprocessBudget({ limit: 6, unknownDirectory: root, bootIdentity: () => bootId,
+    proveOwner: (record, id, options) => nativeOwnerProof(record, id, { ...options, status: async () => ({ status: "unknown", failed: true }) }) });
+  try {
+    const before = budgetAt("boot-a");
+    // A directory where the boot stamp's replacement file must go.
+    const blocked = path.join(root, `${ids["adoption-failed"]}.tmp`);
+    mkdirSync(blocked);
+    assert.equal(await before.reconcileUnknown(), 0);
+    const promised = new Map(before.unknownOwnerStatus().map((owner) => [owner.id, owner.clearsAfterRestart]));
+    for (const id of Object.values(ids)) {
+      await assert.rejects(before.releaseUnknownOwner(id, { audit: async () => {} }),
+        (error) => error.statusCode === 409 && error.details.clearsAfterRestart === promised.get(id), id);
+    }
+    // Stamped only in the new boot, the owner is not bounded by it.
+    rmSync(blocked, { recursive: true });
+    const after = budgetAt("boot-b");
+    await after.reconcileUnknown();
+    const released = Object.fromEntries(Object.entries(ids).map(([name, id]) => [name, !existsSync(path.join(root, `${id}.json`))]));
+    assert.deepEqual(Object.fromEntries(Object.entries(ids).map(([name, id]) => [name, promised.get(id)])), released);
+    assert.deepEqual(released, { "owner-alive": true, "native-unproven": true, "identity-mismatch": false,
+      "record-unreadable": false, adopted: true, "adoption-failed": false });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a failed boot identity read is retried, so a later reconciliation stamps the owner", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-boot-retry-"));
+  const preload = path.join(root, "fail-boot-reads.mjs");
+  // Fails the platform's real boot identity source for the first N reads.
+  writeFileSync(preload, `import cp from "node:child_process";
+    import fs from "node:fs";
+    import { syncBuiltinESMExports } from "node:module";
+    globalThis.bootReads = 0;
+    const failing = Number(process.env.FAIL_BOOT_READS);
+    const fail = () => { globalThis.bootReads += 1; if (globalThis.bootReads <= failing) throw Object.assign(new Error("transient"), { code: "EAGAIN" }); };
+    const execFileSync = cp.execFileSync;
+    cp.execFileSync = function (file, args, ...rest) {
+      if (args?.includes("kern.bootsessionuuid") || args?.includes("--boot-identity")) fail();
+      return execFileSync.call(this, file, args, ...rest);
+    };
+    const readFileSync = fs.readFileSync;
+    fs.readFileSync = function (file, ...rest) {
+      if (file === "/proc/sys/kernel/random/boot_id") fail();
+      return readFileSync.call(this, file, ...rest);
+    };
+    syncBuiltinESMExports();`);
+  const script = `const { createSubprocessBudget, currentBootIdentity } = await import(${JSON.stringify(new URL("./subprocess-budget.mjs", import.meta.url).href)});
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const [directory, id] = process.argv.slice(1);
+    const reads = [currentBootIdentity(), currentBootIdentity()];
+    const budget = createSubprocessBudget({ limit: 1, unknownDirectory: directory, proveOwner: async () => ({ empty: false, reason: "probe-failed" }) });
+    await budget.reconcileUnknown();
+    for (let call = 0; call < 6; call += 1) currentBootIdentity();
+    const record = JSON.parse(fs.readFileSync(path.join(directory, id + ".json"), "utf8"));
+    console.log(JSON.stringify({ reads, observed: record.observedBootId ?? null, restart: budget.unknownOwnerStatus()[0].clearsAfterRestart, bootReads: globalThis.bootReads }));`;
+  const run = (failing) => {
+    const directory = mkdtempSync(path.join(root, "owners-"));
+    const id = randomUUID();
+    writeFileSync(path.join(directory, `${id}.json`), JSON.stringify({ state: "unknown", platform: process.platform, authorized: true,
+      pid: 2147483647, recordedAt: "2026-10-09T10:00:00.000Z", ...ownerIdentity(process.platform, id) }), { mode: 0o600 });
+    const result = spawnSync(process.execPath, ["--import", pathToFileURL(preload).href, "--input-type=module", "-e", script, directory, id],
+      { encoding: "utf8", timeout: 15_000, env: { ...process.env, FAIL_BOOT_READS: String(failing) } });
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout.trim().split("\n").at(-1));
+  };
+  try {
+    const control = run(0);
+    if (!control.reads[0]) return assert.equal(process.platform, "win32", "this platform has no readable boot identity");
+    // One transient failure: the next caller reads it, and recovery stamps it.
+    const transient = run(1);
+    assert.deepEqual(transient.reads, [null, control.reads[0]]);
+    assert.equal(transient.observed, control.reads[0]);
+    assert.equal(transient.restart, true);
+    assert.equal(transient.bootReads, 2, "a successful read was not kept");
+    // A persistently unreadable identity is retried, then spaced out.
+    const persistent = run(Number.MAX_SAFE_INTEGER);
+    assert.deepEqual([persistent.reads, persistent.observed, persistent.restart], [[null, null], null, false]);
+    assert.equal(persistent.bootReads, 3, "failed boot reads were retried without bound");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("restarted utility budgets release earlier-boot owners through the real platform proof", async (t) => {
   const current = currentBootIdentity();
   t.diagnostic(`boot identity: ${current}`);
@@ -471,10 +572,12 @@ test("reconciliation, operator re-check and the reported flag share one release 
     assert.equal(await budget.reconcileUnknown(), 0);
     for (const owner of budget.unknownOwnerStatus()) {
       const { reason } = verdictFor.get(owner.id);
-      assert.deepEqual(owner, { id: owner.id, reason, releasable: false, clearsAfterRestart: true });
+      // A later boot never reaches a record its proof rejects before comparing boots.
+      const restart = !["identity-mismatch", "record-unreadable"].includes(reason);
+      assert.deepEqual(owner, { id: owner.id, reason, releasable: false, clearsAfterRestart: restart });
       const code = live.includes(reason) ? "UTILITY_OWNER_ALIVE" : "UTILITY_OWNER_UNPROVEN";
       await assert.rejects(budget.releaseUnknownOwner(owner.id, { audit }), (error) => error.statusCode === 409
-        && error.details.code === code && error.details.reason === reason && error.details.clearsAfterRestart === true, reason);
+        && error.details.code === code && error.details.reason === reason && error.details.clearsAfterRestart === restart, reason);
     }
     assert.deepEqual(audits, []);
     assert.deepEqual(budget.capacity(), { active: count, unknown: count, limit: count });
@@ -582,6 +685,45 @@ test("a Windows supervisor that finds its job name already in use writes no mark
     if (squatter && squatter.exitCode === null) {
       const closed = new Promise((resolve) => squatter.once("close", resolve));
       squatter.stdin.end("stop\n");
+      await closed;
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a Windows supervisor that cannot create its job launches nothing and proves its tree empty", { skip: process.platform !== "win32", timeout: 30_000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-utility-win-nojob-"));
+  const unknownDirectory = path.join(root, "unknown");
+  const launched = path.join(root, "launched");
+  let squatter;
+  let observed = null;
+  const budget = createSubprocessBudget({ limit: 1, unknownDirectory,
+    execute(file, args, options, onClose) {
+      const jobName = `Local\\OutrightUtility-${options.__ownerId}`;
+      // A named event already holds the job's name, so CreateJobObjectW fails.
+      squatter = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+        `$held = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::ManualReset, '${jobName}'); [Console]::Out.WriteLine('held'); [void][Console]::In.ReadLine()`],
+      { stdio: ["pipe", "pipe", "inherit"], windowsHide: true });
+      squatter.once("error", (error) => onClose(error, "", "", false, {}));
+      squatter.stdout.once("data", () => runOwned(file, args, options, (...result) => {
+        // Observe the durable evidence before the budget releases it.
+        const marker = path.join(unknownDirectory, `${options.__ownerId}.empty`);
+        observed = { proven: result[3], marker: existsSync(marker) ? readFileSync(marker, "utf8") : null, jobName };
+        onClose(...result);
+      }));
+    } });
+  try {
+    await assert.rejects(budget.run(process.execPath, ["-e", `require('node:fs').writeFileSync(${JSON.stringify(launched)}, '1')`], { timeout: 20_000 }),
+      (error) => error.code === 70);
+    assert.equal(existsSync(launched), false, "the command ran without a job");
+    assert.equal(observed?.proven, true);
+    assert.ok(observed.marker?.startsWith(`__OUTRIGHT_UTILITY_TREE_EMPTY_V1__ ${observed.jobName} `), observed.marker);
+    assert.deepEqual(budget.capacity(), { active: 0, unknown: 0, limit: 1 }, "a supervisor that launched nothing kept its permit");
+    assert.deepEqual(readdirSync(unknownDirectory), []);
+  } finally {
+    if (squatter && squatter.exitCode === null) {
+      const closed = new Promise((resolve) => squatter.once("close", resolve));
+      squatter.stdin.end("\n");
       await closed;
     }
     rmSync(root, { recursive: true, force: true });

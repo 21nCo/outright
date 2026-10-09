@@ -349,12 +349,12 @@ static bool job_empty(HANDLE job) {
     && accounting.ActiveProcesses == 0;
 }
 
-// The only producer of the marker and the empty-tree frame, which the
-// runtime reads through utilityOwnerReleased in subprocess-budget.mjs. The
-// job must be this supervisor's own new job: an existing named job, or none,
-// is never evidence.
-static void prove_own_job_empty(HANDLE own_job) {
-  if (!utility_proof_enabled || !job_empty(own_job)) return;
+// The marker and the empty-tree frame, which the runtime reads through
+// utilityOwnerReleased in subprocess-budget.mjs. Their only two sources:
+// this supervisor's own new job observed with zero members, or a failed job
+// creation before anything was launched. An existing named job is never
+// evidence.
+static void write_tree_empty_proof(void) {
   write_empty_marker();
   intptr_t descriptor = _get_osfhandle(3);
   DWORD written = 0;
@@ -362,10 +362,22 @@ static void prove_own_job_empty(HANDLE own_job) {
     WriteFile((HANDLE)descriptor, UTILITY_TREE_EMPTY, sizeof(UTILITY_TREE_EMPTY) - 1, &written, NULL);
 }
 
+static void prove_own_job_empty(HANDLE own_job) {
+  if (utility_proof_enabled && job_empty(own_job)) write_tree_empty_proof();
+}
+
 static int utility_prelaunch_exit(HANDLE own_job, int code) {
   prove_own_job_empty(own_job);
   if (own_job) CloseHandle(own_job);
   return code;
+}
+
+// A launched tree is abandoned through its own job, and proven only after the
+// kernel reports that job empty within a bounded wait.
+static int utility_abandon_exit(HANDLE own_job, UINT job_exit, int code) {
+  if (!TerminateJobObject(own_job, job_exit)) return code;
+  for (int attempt = 0; attempt < 200 && !job_empty(own_job); attempt++) Sleep(25);
+  return utility_prelaunch_exit(own_job, code);
 }
 
 int wmain(int argc, wchar_t **argv) {
@@ -389,9 +401,15 @@ int wmain(int argc, wchar_t **argv) {
     utility_empty_marker = argv[3];
   }
   HANDLE job = CreateJobObjectW(NULL, utility_mode ? argv[2] : NULL);
-  // Neither a failed creation nor another owner's job, whose members this
-  // supervisor never started, can prove the recorded tree empty.
-  if (!job) return 70;
+  // Another owner's job, whose members this supervisor never started, cannot
+  // prove the recorded tree empty; nor can a name it may not open.
+  if (!job && utility_mode && GetLastError() == ERROR_ACCESS_DENIED) return 69;
+  // Without a job nothing was launched: the recorded tree is this process
+  // alone, and it ends with this exit.
+  if (!job) {
+    if (utility_proof_enabled) write_tree_empty_proof();
+    return 70;
+  }
   if (utility_mode && GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(job); return 69; }
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
   limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -457,21 +475,17 @@ int wmain(int argc, wchar_t **argv) {
   if (!launched) { free(line); return utility_prelaunch_exit(job, 73); }
   free(line);
   if (!AssignProcessToJobObject(job, process.hProcess)) {
-    TerminateProcess(process.hProcess, 126);
-    return 74;
+    // The suspended child never ran, so it started nothing. Once it is gone
+    // the own job, which it never joined, holds the whole tree: none.
+    bool gone = TerminateProcess(process.hProcess, 126) && WaitForSingleObject(process.hProcess, 5000) == WAIT_OBJECT_0;
+    return gone ? utility_prelaunch_exit(job, 74) : 74;
   }
-  if (ResumeThread(process.hThread) == (DWORD)-1) {
-    TerminateJobObject(job, 126);
-    return 75;
-  }
+  if (ResumeThread(process.hThread) == (DWORD)-1) return utility_abandon_exit(job, 126, 75);
   CloseHandle(process.hThread);
 
   if (!test_mode) {
     HANDLE owner_thread = CreateThread(NULL, 0, watch_owner, job, 0, NULL);
-    if (owner_thread == NULL) {
-      TerminateJobObject(job, 137);
-      return 79;
-    }
+    if (owner_thread == NULL) return utility_abandon_exit(job, 137, 79);
     CloseHandle(owner_thread);
   }
 

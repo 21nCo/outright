@@ -731,15 +731,17 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // terminal transaction succeeds. Other platforms may leave a record only
     // after a hard kill; both are safe to remove after the durable commit.
     try { if (state.launchHandshakePath) unlinkSync(state.launchHandshakePath); } catch { /* Already gone. */ }
-    if (finished.message) publish({ type: "message.created", conversationId: state.conversation.id, payload: finished.message });
     active.delete(state.run.id);
     pendingOutcomes.delete(state.run.id);
-    publish({ type: "capacity.changed" });
-    if (shuttingDown) setTimeout(onShutdownRecovery, 0);
     admissionRetryRuns.delete(state.run.id);
     clearAssistant(state);
-    emit(state.run.id, `run.${status}`, { exitCode: terminalExitCode, error: message || null, finishedAt });
-    drain();
+    if (shuttingDown) setTimeout(onShutdownRecovery, 0);
+    // The freed slot reaches the queue even if a client notification fails.
+    try {
+      if (finished.message) publish({ type: "message.created", conversationId: state.conversation.id, payload: finished.message });
+      publish({ type: "capacity.changed" });
+      emitTerminal(state.run.id, state.conversation.id, `run.${status}`, { exitCode: terminalExitCode, error: message || null, finishedAt });
+    } finally { drain(); }
   }
 
   function finish(state, exitCode, error) {
@@ -763,10 +765,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       if (preserveOnMaintenance && database.maintenanceActive && error.statusCode === 503) return false;
       throw error;
     }
-    queue.splice(index, 1);
+    const [stopped] = queue.splice(index, 1);
     admissionRetryRuns.delete(runId);
     if (!queue.length) { queueReadRetryPending = false; clearDiskRetry(); }
-    emit(runId, "run.stopped", { queued: true });
+    emitTerminal(runId, stopped.conversation.id, "run.stopped", { queued: true });
     return true;
   }
 
@@ -1180,16 +1182,27 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     return committed.event;
   }
 
+  // A terminal row is committed before its event. Even when the event log is
+  // full or unwritable, a bounded transient notification makes connected
+  // clients refresh that durable state. The fault never reaches the close
+  // listener, retry timer or stop request that committed it, nor retries
+  // that transaction.
+  function emitTerminal(runId, conversationId, type, payload) {
+    let event = null;
+    try { event = database.appendRunEvent(runId, type, payload); }
+    catch (error) {
+      if (!storageAdmissionFailure(error)) console.warn("Run terminal event failed after terminal commit", error);
+    }
+    publish({ type: "run.event", conversationId, runId,
+      payload: event ?? { runId, type, payload, seq: null, transient: true, createdAt: new Date().toISOString() } });
+    return event;
+  }
+
   function emit(runId, type, payload) {
     const event = database.appendRunEvent(runId, type, payload);
-    const run = database.getRun(runId);
-    // Terminal state is already durable even if the event log is full. Send a
-    // bounded runtime notification so connected clients refresh that state.
-    const terminal = ["run.completed", "run.failed", "run.stopped"].includes(type);
     // Event replay and transcript persistence have separate quotas. A dropped
     // replay event does not imply that the visible transcript lost a message.
-    if (event || terminal) publish({ type: "run.event", conversationId: run?.conversationId, runId,
-      payload: event ?? { runId, type, payload, seq: null, transient: true, createdAt: new Date().toISOString() } });
+    if (event) publish({ type: "run.event", conversationId: database.getRun(runId)?.conversationId, runId, payload: event });
     return event;
   }
 

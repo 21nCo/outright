@@ -810,6 +810,60 @@ test("an optional omission write fault after terminal commit does not repeat the
   }
 });
 
+test("a terminal event storage fault after commit is contained and the queue still drains", async () => {
+  for (const code of ["SQLITE_BUSY", "SQLITE_IOERR_WRITE"]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-postcommit-event-"));
+    const database = createOutrightDatabase({ filename: path.join(realpathSync(directory), "outright.db") });
+    let manager;
+    const children = [];
+    const published = [];
+    try {
+      database.updateSettings({ maxConcurrentRuns: 1 });
+      const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory,
+        title: "Postcommit event", provider: "claude" });
+      const first = database.createRun({ conversationId: conversation.id, provider: "claude", approvalPolicy: "read-only", prompt: "first" });
+      const second = database.createRun({ conversationId: conversation.id, provider: "claude", approvalPolicy: "read-only", prompt: "second" });
+      const third = database.createRun({ conversationId: conversation.id, provider: "claude", approvalPolicy: "read-only", prompt: "third" });
+      manager = createAgentManager({ database, publish: (event) => published.push(event),
+        launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+        spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+      await manager.schedule({ conversation, run: first });
+      await manager.schedule({ conversation, run: second });
+      await manager.schedule({ conversation, run: third });
+      const finishRun = database.finishRun;
+      const finishes = [];
+      database.finishRun = (id, ...rest) => { finishes.push(id); return finishRun.call(database, id, ...rest); };
+      const appendRunEvent = database.appendRunEvent;
+      database.appendRunEvent = (runId, type, ...rest) => {
+        if (["run.completed", "run.stopped"].includes(type)) throw Object.assign(new Error(`terminal event ${code}`), { code });
+        return appendRunEvent.call(database, runId, type, ...rest);
+      };
+      // The close listener is where the committed run's event used to throw.
+      assert.doesNotThrow(() => children[0].emit("close", 0, null), code);
+      assert.equal(database.getRun(first.id).status, "completed");
+      assert.deepEqual(finishes, [first.id], `${code} retried the committed terminal transaction`);
+      assert.ok(published.some((event) => event.type === "run.event" && event.runId === first.id && event.conversationId === conversation.id
+        && event.payload?.type === "run.completed" && event.payload.transient === true && event.payload.seq === null), code);
+      const deadline = Date.now() + 1500;
+      while (children.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(children.length, 2, `${code} after the terminal commit stranded the queued run`);
+      assert.equal(database.getRun(second.id).status, "running");
+      // A queued run's stop commits first too; its event fault is not the request's failure.
+      await manager.stop(third.id);
+      assert.equal(database.getRun(third.id).status, "stopped");
+      assert.ok(published.some((event) => event.runId === third.id && event.payload?.type === "run.stopped" && event.payload.transient === true));
+      database.appendRunEvent = appendRunEvent;
+      children[1].emit("close", 0, null);
+      assert.equal(database.listAudit(100).filter((row) => row.action === "agent.run.completed" && row.target === first.id).length, 1,
+        `${code} audited the committed finish more than once`);
+    } finally {
+      await manager?.shutdown();
+      await database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
 test("cancellation retains the run slot until its stopped outcome is durable", async () => {
   const database = fakeDatabase();
   database.getSettings = () => ({ maxConcurrentRuns: 1 });
