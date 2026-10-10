@@ -135,6 +135,13 @@ export function isProviderSessionId(value) {
   return typeof value === "string" && SESSION_PATTERN.test(value);
 }
 
+// The one model name rule for launch, settings and conversations, so a saved
+// model can always be launched. Empty means the adapter's default.
+export const MODEL_NAME_REQUIREMENT = "Model name must start with a letter or digit and use only letters, digits and . _ : / @ + [ ] -, up to 200 characters";
+export function isModelName(value) {
+  return typeof value === "string" && (value === "" || MODEL_PATTERN.test(value));
+}
+
 // Rejects anything the adapter cannot honour exactly. There is no fallback
 // to another permission mode, model or reasoning level.
 export function validateRunConfiguration(adapter, { model = "", reasoningEffort, approvalPolicy, sessionId } = {}) {
@@ -145,7 +152,7 @@ export function validateRunConfiguration(adapter, { model = "", reasoningEffort,
   if (!Object.hasOwn(capabilities.permissionModes, approvalPolicy)) {
     throw configurationError(`${adapter.label} does not support the ${approvalPolicy} approval policy; choose ${Object.keys(capabilities.permissionModes).join(" or ")}`);
   }
-  if (typeof model !== "string" || (model && !MODEL_PATTERN.test(model))) throw configurationError(`Model name is invalid for ${adapter.label}`, "PROVIDER_CONFIGURATION_INVALID", 400);
+  if (!isModelName(model)) throw configurationError(`Model name is invalid for ${adapter.label}`, "PROVIDER_CONFIGURATION_INVALID", 400);
   if (model && !capabilities.customModels && !capabilities.models.includes(model)) {
     throw configurationError(`${adapter.label} does not support model ${model}`);
   }

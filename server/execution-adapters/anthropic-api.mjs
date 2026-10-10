@@ -50,8 +50,12 @@ export const anthropicApiAdapter = defineAdapter({
   },
   normalize(raw) {
     if (raw.type === "content_block_delta") {
-      return raw.delta?.type === "text_delta" && typeof raw.delta.text === "string" && raw.delta.text
-        ? [{ type: "assistant.delta", payload: { text: raw.delta.text } }] : [];
+      // A text delta without text would otherwise drop part of the answer
+      // and still complete. Other delta types are ignored.
+      if (!raw.delta || typeof raw.delta !== "object" || (raw.delta.type === "text_delta" && typeof raw.delta.text !== "string")) {
+        return [{ type: "provider.failure", payload: { message: "Anthropic API sent a malformed text delta; the answer is incomplete", terminal: true, native: { type: "malformed_delta" } } }];
+      }
+      return raw.delta.type === "text_delta" && raw.delta.text ? [{ type: "assistant.delta", payload: { text: raw.delta.text } }] : [];
     }
     if (raw.type === "message_start") return [{ type: "usage", payload: { inputTokens: raw.message?.usage?.input_tokens, native: raw.message?.usage ?? null } }];
     if (raw.type === "message_delta") {

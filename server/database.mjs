@@ -7,7 +7,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import { foldFindText } from "../src/lib/find-text.js";
-import { EXECUTION_ADAPTER_IDS, findExecutionAdapter, isProviderSessionId } from "./execution-adapters/index.mjs";
+import { EXECUTION_ADAPTER_IDS, findExecutionAdapter, isModelName, isProviderSessionId, MODEL_NAME_REQUIREMENT } from "./execution-adapters/index.mjs";
 import { RESOURCE_BUDGETS, RETAINED_MESSAGE_FIELDS, RETAINED_ROW_OVERHEAD_BYTES } from "./resource-budgets.mjs";
 import { allocatedDatabaseUsage, archiveShadowPaths, beginArchiveShadow, recoverArchiveShadow } from "./archive-shadow.mjs";
 import { readRunOutcome, removeRunOutcome, saveRunOutcome } from "./run-outcome-journal.mjs";
@@ -55,7 +55,7 @@ const RUN_RETAINED_FIELDS = RETAINED_COLUMNS.find(([name]) => name === "runs")[1
 
 const SETTING_RULES = {
   provider: (value) => EXECUTION_ADAPTER_IDS.includes(value),
-  model: (value) => typeof value === "string" && value.length <= 200,
+  model: isModelName,
   reasoningEffort: (value) => ["low", "medium", "high", "xhigh"].includes(value),
   approvalPolicy: (value) => ["read-only", "workspace-write", "danger-full-access"].includes(value),
   editor: (value) => ["zed", "code", "cursor", "finder"].includes(value),
@@ -2226,7 +2226,8 @@ function markArchivedForDeletion(db, id, automatic, cutoff) {
 
 function validateConversationExecution(input) {
   if (input.provider != null && input.provider !== "" && !EXECUTION_ADAPTER_IDS.includes(input.provider)) throw databaseError(400, "Provider is not supported");
-  if (input.model != null && (typeof input.model !== "string" || input.model.length > 200)) throw databaseError(400, "Model must be 200 characters or fewer");
+  // Launch applies the same rule, so a saved model is never refused at send.
+  if (input.model != null && !isModelName(input.model)) throw databaseError(400, MODEL_NAME_REQUIREMENT, { code: "PROVIDER_CONFIGURATION_INVALID" });
 }
 
 function validateConversationPatch(db, api, id, patch) {
@@ -3043,6 +3044,7 @@ function validateSettingsPatch(patch) {
   for (const [key, value] of Object.entries(patch)) {
     const validate = SETTING_RULES[key];
     if (!validate) throw databaseError(400, `Unknown setting: ${key}`);
+    if (key === "model" && !validate(value)) throw databaseError(400, MODEL_NAME_REQUIREMENT, { code: "PROVIDER_CONFIGURATION_INVALID" });
     if (!validate(value)) throw databaseError(400, `Invalid value for setting: ${key}`);
   }
 }

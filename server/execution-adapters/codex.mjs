@@ -10,8 +10,9 @@ export const codexAdapter = defineAdapter({
   modelProvider: "openai",
   authority: { source: "harness-login" },
   executable: "codex",
-  // The minimum is the oldest CLI whose flags and JSON stream were verified.
-  versions: { minimum: "0.145.0", belowMajor: 1 },
+  // The minimum is the CLI the fixtures were recorded from, the oldest one
+  // whose "--"-separated exec and exec resume argv and JSON stream were seen.
+  versions: { minimum: "0.162.1", belowMajor: 1 },
   capabilities: {
     permissionModes: SANDBOX_MODES,
     models: ["gpt-5.4", "gpt-5.3-codex"],

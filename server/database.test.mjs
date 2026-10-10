@@ -83,6 +83,29 @@ test("a conversation's native session is scoped to its provider", () => {
   } finally { database.close(); }
 });
 
+test("every save path applies the launch model rule", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const invalid = { statusCode: 400, details: { code: "PROVIDER_CONFIGURATION_INVALID" } };
+    const create = (model) => database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Model", provider: "claude", model });
+    const conversation = create("claude-opus-5-5");
+    // Before, any string up to 200 characters saved and every later send returned 400.
+    for (const model of ["claude sonnet", "-x", "--help", "m".repeat(201), 7]) {
+      assert.throws(() => database.updateSettings({ model }), invalid, `settings ${model}`);
+      assert.throws(() => create(model), invalid, `create ${model}`);
+      assert.throws(() => database.updateConversation(conversation.id, { model }), invalid, `patch ${model}`);
+    }
+    assert.equal(database.getSettings().model, "");
+    assert.equal(database.getConversation(conversation.id).model, "claude-opus-5-5");
+    // Names launch accepts still save, and empty selects the adapter default.
+    for (const model of ["us.anthropic/claude-opus-5-5@v1", ""]) {
+      assert.equal(database.updateSettings({ model }).model, model);
+      assert.equal(create(model).model, model);
+      assert.equal(database.updateConversation(conversation.id, { model }).model, model);
+    }
+  } finally { database.close(); }
+});
+
 test("a run that finishes late cannot restore a session the chat reset or replaced after launch", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

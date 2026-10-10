@@ -3,7 +3,7 @@ import { claudeAdapter } from "./claude.mjs";
 import { codexAdapter } from "./codex.mjs";
 import { configurationError, validateRunConfiguration } from "./contract.mjs";
 
-export { describeAdapter, isProviderSessionId, versionCompatibility } from "./contract.mjs";
+export { describeAdapter, isModelName, isProviderSessionId, MODEL_NAME_REQUIREMENT, versionCompatibility } from "./contract.mjs";
 
 // Adding a provider means adding an adapter here. Persisted runs and
 // conversations store only the adapter id, so ids are permanent.

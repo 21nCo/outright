@@ -66,7 +66,10 @@ test("CLI versions are gated to the verified supported range", () => {
   assert.deepEqual(versionCompatibility(claude, claude.parseVersion(fixture("claude", "version.txt"))), { version: "2.1.296", compatible: true, reason: "" });
   const old = versionCompatibility(codex, codex.parseVersion("codex-cli 0.20.0"));
   assert.equal(old.compatible, false);
-  assert.match(old.reason, /Codex 0\.20\.0 is not supported; Outright supports 0\.145\.0 or newer below 1\.0\.0/);
+  assert.match(old.reason, /Codex 0\.20\.0 is not supported; Outright supports 0\.162\.1 or newer below 1\.0\.0/);
+  // No evidence exists below the recorded fixtures, so older CLIs are not enqueued.
+  assert.equal(versionCompatibility(codex, codex.parseVersion("codex-cli 0.162.0")).compatible, false);
+  assert.equal(versionCompatibility(codex, codex.parseVersion("codex-cli 0.145.0")).compatible, false);
   assert.equal(versionCompatibility(claude, claude.parseVersion("3.0.0 (Claude Code)")).compatible, false, "an unverified major is incompatible");
   assert.match(versionCompatibility(codex, codex.parseVersion("codex development build")).reason, /unrecognized version/);
 });
@@ -243,6 +246,20 @@ test("an Anthropic answer cut off at the output cap fails visibly and keeps its 
     assert.deepEqual([failure?.payload.terminal, failure?.payload.native], [true, { stop_reason: "max_tokens" }]);
     assert.match(failure.payload.message, /8192-token output limit; the answer is truncated/);
   });
+});
+
+test("a recognized Anthropic text delta without text fails the run instead of dropping it", async () => {
+  await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", "malformed-delta.sse")); }, async (base) => {
+    const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
+    assert.equal(result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join(""), "READY");
+    // Before, the numeric text normalized to nothing and message_stop completed the run.
+    const failures = result.events.filter((event) => event.type === "provider.failure");
+    assert.deepEqual(failures.map((event) => [event.payload.terminal, event.payload.message]), [[true, "Anthropic API sent a malformed text delta; the answer is incomplete"]]);
+    assert.equal(JSON.stringify(failures).includes("424242"), false, "the malformed payload is not echoed");
+  });
+  // A delta type Outright does not consume stays ignored for forward compatibility.
+  assert.deepEqual(anthropic.normalize({ type: "content_block_delta", index: 0, delta: { type: "future_delta", value: 1 } }), []);
+  assert.equal(anthropic.normalize({ type: "content_block_delta", index: 0 })[0].type, "provider.failure");
 });
 
 test("the direct provider never forwards its key across a redirect", async () => {

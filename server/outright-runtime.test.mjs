@@ -1527,7 +1527,7 @@ test("an installed but incompatible CLI is reported before enqueueing", { skip: 
   await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "must not persist" }), result);
   assert.equal(result.statusCode, 409);
   assert.equal(result.body.code, "PROVIDER_INCOMPATIBLE");
-  assert.match(result.body.error, /Codex 0\.20\.0 is not supported; Outright supports 0\.145\.0 or newer/);
+  assert.match(result.body.error, /Codex 0\.20\.0 is not supported; Outright supports 0\.162\.1 or newer/);
   const status = runtime.agents.providers().find((entry) => entry.id === "codex");
   assert.deepEqual([status.available, status.compatible, status.version], [true, false, "0.20.0"]);
   assert.deepEqual(runtime.database.listMessages(conversation.id), []);
