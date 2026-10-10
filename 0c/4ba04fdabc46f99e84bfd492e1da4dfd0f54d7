@@ -1,0 +1,53 @@
+docs/out-3-execution-adapters.md
+  s_1900bb15a7199a::t_6b7e540bdd9da8 12,18,26,30,32
+server/agent-manager.mjs
+  s_1900bb15a7199a::t_6c7b222f0b60a2 6,282,356-358,667-671
+server/agent-manager.test.mjs
+  s_1900bb15a7199a::t_bcd39b6d1e4bf4 1524-1548
+server/archive-windows-lock.mjs
+  s_1900bb15a7199a::t_818c8639136cf1 6,31,39,50,90
+server/database.mjs
+  s_1900bb15a7199a::t_04d67d3c839211 10,2230-2235
+server/database.test.mjs
+  s_1900bb15a7199a::t_3082bd3bc77329 67-73
+server/execution-adapters.test.mjs
+  s_1900bb15a7199a::t_69126c2f2deb7b 140-141,158,254-315
+server/execution-adapters/anthropic-api-runner.mjs
+  s_1900bb15a7199a::t_b52bc3d43b3209 11,13-26,36-38,67-68,103-106,112-117,119,129,139,142
+server/execution-adapters/anthropic-api.mjs
+  s_1900bb15a7199a::t_04e5b9b1a691ce 2,37,58
+server/execution-adapters/claude.mjs
+  s_1900bb15a7199a::t_fcbf0835b4be38 54
+server/execution-adapters/codex.mjs
+  s_1900bb15a7199a::t_f700efdde4eb10 56-57,59
+server/execution-adapters/contract.mjs
+  s_1900bb15a7199a::t_7ce4f5dee43152 16-17
+server/execution-adapters/index.mjs
+  s_1900bb15a7199a::t_6d5a88407b8bf5 41-47,50
+server/outright-runtime.test.mjs
+  s_1900bb15a7199a::t_002070c7075d31 1502-1535
+server/provider-discovery.mjs
+  s_1900bb15a7199a::t_47e993afedf04c 9,38,49-52,59,62,70,101
+server/provider-discovery.test.mjs
+  s_1900bb15a7199a::t_fb78776dad8ef0 212-228
+server/subprocess-budget.mjs
+  s_1900bb15a7199a::t_5031b5264602db 7,205-206,208-210,221,345,361
+server/subprocess-budget.test.mjs
+  s_1900bb15a7199a::t_3222825140b5f6 58-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0c4ba04fdabc46f99e84bfd492e1da4dfd0f54d7",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
