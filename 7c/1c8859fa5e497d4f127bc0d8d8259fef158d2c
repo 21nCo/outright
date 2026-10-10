@@ -1,0 +1,25 @@
+docs/out-3-execution-adapters.md
+  s_ce12272281eb3b::t_770e85e1c7fa32 22
+server/execution-adapters/index.mjs
+  s_ce12272281eb3b::t_9efe9b7da3d75d 19-20
+server/outright-runtime.mjs
+  s_ce12272281eb3b::t_781d2e3f4fd492 608-612
+server/outright-runtime.test.mjs
+  s_ce12272281eb3b::t_4699fa54ebd936 1486-1520
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7c1c8859fa5e497d4f127bc0d8d8259fef158d2c",
+  "prompts": {},
+  "sessions": {
+    "s_ce12272281eb3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d2376f8-4af3-4920-96da-dff6a042ab4c",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
