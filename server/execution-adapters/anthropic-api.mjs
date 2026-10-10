@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import { anthropicEndpoint, ENDPOINT_REQUIREMENT } from "./anthropic-api-runner.mjs";
 import { ADAPTER_CONTRACT_VERSION, defineAdapter } from "./contract.mjs";
 
 // Bumped whenever the runner's argv or output stream changes.
@@ -33,6 +34,7 @@ export const anthropicApiAdapter = defineAdapter({
   },
   detect(environment = process.env) {
     if (!environment.OUTRIGHT_ANTHROPIC_API_KEY) return { available: false, version: "", reason: "Set OUTRIGHT_ANTHROPIC_API_KEY to enable Outright-managed Anthropic API runs" };
+    if (!anthropicEndpoint(environment)) return { available: false, version: "", reason: `${ENDPOINT_REQUIREMENT}; fix or unset it to use api.anthropic.com` };
     return { available: true, version: ANTHROPIC_RUNNER_VERSION, reason: "" };
   },
   buildLaunch({ run }) {
@@ -53,7 +55,7 @@ export const anthropicApiAdapter = defineAdapter({
     }
     if (raw.type === "message_start") return [{ type: "usage", payload: { inputTokens: raw.message?.usage?.input_tokens, native: raw.message?.usage ?? null } }];
     if (raw.type === "message_delta") return [{ type: "usage", payload: { outputTokens: raw.usage?.output_tokens, native: { ...raw.usage, stop_reason: raw.delta?.stop_reason } } }];
-    if (raw.type === "error") return [{ type: "provider.failure", payload: { message: String(raw.error?.message ?? "Anthropic API request failed"), native: raw.error ?? null } }];
+    if (raw.type === "error") return [{ type: "provider.failure", payload: { message: String(raw.error?.message ?? "Anthropic API request failed"), terminal: true, native: raw.error ?? null } }];
     // Pings, block boundaries and thinking deltas carry no user-visible state.
     if (["ping", "content_block_start", "content_block_stop", "message_stop"].includes(raw.type)) return [];
     return [{ type: "provider.event", payload: raw }];

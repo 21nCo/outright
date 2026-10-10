@@ -209,6 +209,23 @@ test("successful version checks also close their detached helper tree", { skip: 
   }
 });
 
+test("a harness version probe never receives a direct provider's credential", { skip: process.platform === "win32" }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-env-"));
+  const executable = path.join(directory, "env-probe");
+  writeFileSync(executable, "#!/bin/sh\necho \"version ${OUTRIGHT_ANTHROPIC_API_KEY:-absent} ${OUTRIGHT_ANTHROPIC_BASE_URL:-absent} ${outright_anthropic_api_key:-absent} ${ANTHROPIC_API_KEY:-absent}\"\n");
+  chmodSync(executable, 0o755);
+  const variables = { OUTRIGHT_ANTHROPIC_API_KEY: "direct-key", OUTRIGHT_ANTHROPIC_BASE_URL: "https://direct.example", outright_anthropic_api_key: "direct-lower", ANTHROPIC_API_KEY: "harness-own-key" };
+  const saved = Object.fromEntries(Object.keys(variables).map((name) => [name, process.env[name]]));
+  Object.assign(process.env, variables);
+  try {
+    // Before the shared filter the probe inherited the runtime's whole environment.
+    assert.equal((await defaultProbe(executable)).trim(), "version absent absent absent harness-own-key");
+  } finally {
+    for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("a new-session helper cannot survive a completed provider probe", { skip: process.platform === "win32" }, async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-session-"));
   const executable = path.join(directory, "session-probe");

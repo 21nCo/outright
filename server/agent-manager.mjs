@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildExecutionEnvironment, buildExecutionLaunch, requireExecutionAdapter } from "./execution-adapters/index.mjs";
+import { buildExecutionEnvironment, buildExecutionLaunch, requireExecutionAdapter, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
 import { RESOURCE_BUDGETS, retainedTranscriptMessageBytes } from "./resource-budgets.mjs";
 
@@ -279,7 +279,7 @@ process.stdin.on("end", () => {
 
 function supervisorCommand(args, timeout) {
   return new Promise((resolve) => {
-    execFile(AGENT_SUPERVISOR, args, { encoding: "utf8", timeout, killSignal: "SIGKILL", maxBuffer: 4096 },
+    execFile(AGENT_SUPERVISOR, args, { encoding: "utf8", timeout, killSignal: "SIGKILL", maxBuffer: 4096, env: withoutDirectProviderCredentials(process.env) },
       (error, stdout, stderr) => {
         if (process.env.CI && stderr) console.error(stderr.trimEnd());
         resolve({ error, stdout });
@@ -353,7 +353,9 @@ function nativeOwnershipPending(state) {
 
 function freezeTerminalOutcome(state, exitCode, error) {
   if (state.terminalOutcome) return;
-  const successful = exitCode === 0 && !error && !state.stopped;
+  // A provider that reported a terminal failure did not succeed, whatever
+  // its exit code.
+  const successful = exitCode === 0 && !error && !state.stopped && !state.providerFailed;
   let status = "failed";
   if (state.stopped) status = "stopped";
   else if (successful) status = "completed";
@@ -662,8 +664,11 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         catch (error) { if (error.statusCode !== 507) throw error; }
       }
       // A provider-reported failure explains a nonzero exit better than
-      // stderr noise; it never turns a successful exit into a failure.
-      if (event.type === "provider.failure") state.providerFailure = truncateUtf8(event.payload.message ?? "", MAX_PROVIDER_FAILURE_BYTES);
+      // stderr noise. Only a terminal one fails a run that exits 0.
+      if (event.type === "provider.failure" && (event.payload.terminal === true || !state.providerFailed)) {
+        state.providerFailure = truncateUtf8(event.payload.message ?? "", MAX_PROVIDER_FAILURE_BYTES);
+        if (event.payload.terminal === true) state.providerFailed = true;
+      }
       const emittedPayload = ["assistant.delta", "assistant.message"].includes(event.type)
         ? { ...event.payload, text: truncateUtf8(event.payload.text ?? "", MAX_ASSISTANT_EVENT_BYTES), truncated: Buffer.byteLength(event.payload.text ?? "") > MAX_ASSISTANT_EVENT_BYTES }
         : event.payload;

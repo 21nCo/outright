@@ -7,7 +7,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import { foldFindText } from "../src/lib/find-text.js";
-import { EXECUTION_ADAPTER_IDS } from "./execution-adapters/index.mjs";
+import { EXECUTION_ADAPTER_IDS, findExecutionAdapter } from "./execution-adapters/index.mjs";
 import { RESOURCE_BUDGETS, RETAINED_MESSAGE_FIELDS, RETAINED_ROW_OVERHEAD_BYTES } from "./resource-budgets.mjs";
 import { allocatedDatabaseUsage, archiveShadowPaths, beginArchiveShadow, recoverArchiveShadow } from "./archive-shadow.mjs";
 import { readRunOutcome, removeRunOutcome, saveRunOutcome } from "./run-outcome-journal.mjs";
@@ -2226,6 +2226,12 @@ function validateConversationPatch(db, api, id, patch) {
   if (patch.providerSessionId != null
     && (typeof patch.providerSessionId !== "string" || Buffer.byteLength(patch.providerSessionId) > 4096)) {
     throw databaseError(400, "Provider session id is invalid");
+  }
+  // A stored session that the adapter cannot resume would refuse every
+  // later send.
+  const adapter = findExecutionAdapter(patch.provider ?? current?.provider);
+  if (patch.providerSessionId && adapter && !adapter.capabilities.resume) {
+    throw databaseError(409, `${adapter.label} cannot resume a provider session`, { code: "PROVIDER_RESUME_UNSUPPORTED" });
   }
   if (patch.archived === true && api.findUnresolvedInterruptedRun(id)) {
     throw databaseError(409, "Resolve the interrupted run before archiving this conversation");

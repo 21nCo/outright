@@ -4,6 +4,7 @@ import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, read
 import os from "node:os";
 import path from "node:path";
 import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
+import { withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
 
 const TREE_EMPTY_PROOF = "__OUTRIGHT_UTILITY_TREE_EMPTY_V1__\n";
 const UTILITY_DIAGNOSTIC_PREFIX = "__OUTRIGHT_UTILITY_DIAGNOSTIC_V1__ ";
@@ -201,8 +202,12 @@ export function runOwned(file, args, options, onClose) {
   // make terminal emptiness proof depend on a second, unrelated owner.
   if (file === AGENT_SUPERVISOR && ["--probe", "--terminate", "--terminate-owned", "--identity",
     "--utility-probe", "--utility-terminate"].includes(args[0])) {
-    return execFile(file, args, options, (error, stdout, stderr) => onClose(error, stdout, stderr, true));
+    return execFile(file, args, { ...options, env: withoutDirectProviderCredentials(options.env ?? process.env) },
+      (error, stdout, stderr) => onClose(error, stdout, stderr, true));
   }
+  // Git runs repository hooks an agent may have written, so no utility ever
+  // receives a direct provider's credential.
+  const env = withoutDirectProviderCredentials(options.env ?? process.env);
   const ownerId = options.__ownerId ?? randomUUID();
   // The Windows supervisor writes its durable emptiness marker beside the
   // owner record only after its Job Object reports zero active processes.
@@ -213,7 +218,7 @@ export function runOwned(file, args, options, onClose) {
   let child;
   try {
     child = (options.__spawn ?? spawn)(AGENT_SUPERVISOR, command, { cwd: options.cwd,
-      env: { ...(options.env ?? process.env), OUTRIGHT_UTILITY_OWNER: "1" },
+      env: { ...env, OUTRIGHT_UTILITY_OWNER: "1" },
       windowsHide: true, stdio: ["pipe", "pipe", "pipe", "pipe"] });
   } catch (error) {
     if (directory) rmdirSync(directory);
@@ -337,7 +342,7 @@ export function runOwned(file, args, options, onClose) {
       // its environment available until a bounded native bootout attempt
       // finishes, then retain unknown capacity if emptiness was not proven.
       try {
-        execFile(AGENT_SUPERVISOR, ["--terminate", command[0]], { env: options.env ?? process.env, timeout: 5000, maxBuffer: 64 * 1024 },
+        execFile(AGENT_SUPERVISOR, ["--terminate", command[0]], { env, timeout: 5000, maxBuffer: 64 * 1024 },
           (terminationError) => {
             if (!terminationError) treeEmpty = true;
             else error ??= terminationError;
@@ -353,7 +358,7 @@ export function runOwned(file, args, options, onClose) {
 
 function nativeStatus(args, env = process.env) {
   return new Promise((resolve) => {
-    execFile(AGENT_SUPERVISOR, args, { env, timeout: 5000, maxBuffer: 4096 }, (error, stdout) => {
+    execFile(AGENT_SUPERVISOR, args, { env: withoutDirectProviderCredentials(env), timeout: 5000, maxBuffer: 4096 }, (error, stdout) => {
       resolve({ status: String(stdout ?? "").trim(), failed: Boolean(error && ![3].includes(error.code)) });
     });
   });

@@ -1499,6 +1499,40 @@ test("an installed but incompatible CLI is reported before enqueueing", { skip: 
   assert.deepEqual(runtime.database.listRuns(conversation.id), []);
 }));
 
+test("an unusable direct-provider endpoint is reported before enqueueing", { skip: process.platform === "win32", timeout: 20000 }, async () => {
+  const saved = { key: process.env.OUTRIGHT_ANTHROPIC_API_KEY, base: process.env.OUTRIGHT_ANTHROPIC_BASE_URL };
+  process.env.OUTRIGHT_ANTHROPIC_API_KEY = "sk-ant-endpoint";
+  try {
+    await withWorktreeRuntime(async (runtime, { project, worktree }) => {
+      const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Direct endpoint", provider: "anthropic-api" });
+      for (const base of ["invalid-url", "http://example.com"]) {
+        process.env.OUTRIGHT_ANTHROPIC_BASE_URL = base;
+        const result = responseCapture();
+        await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "must not persist", approvalPolicy: "read-only", reasoningEffort: "medium" }), result);
+        // Before, a set key was enough: the run was queued and failed at launch.
+        assert.equal(result.statusCode, 409, base);
+        assert.equal(result.body.code, "PROVIDER_UNAVAILABLE");
+        assert.match(result.body.error, /OUTRIGHT_ANTHROPIC_BASE_URL must be an https URL or a loopback http address/);
+      }
+      assert.deepEqual(runtime.database.listMessages(conversation.id), []);
+      assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+    })();
+  } finally {
+    for (const [name, value] of [["OUTRIGHT_ANTHROPIC_API_KEY", saved.key], ["OUTRIGHT_ANTHROPIC_BASE_URL", saved.base]]) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  }
+});
+
+test("a conversation cannot store a session its adapter cannot resume", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Direct session", provider: "anthropic-api" });
+  const result = responseCapture();
+  await runtime.handleRequest(requestStream("PATCH", `/api/conversations/${conversation.id}`, { providerSessionId: "msg-session" }), result);
+  assert.equal(result.statusCode, 409);
+  assert.equal(result.body.code, "PROVIDER_RESUME_UNSUPPORTED");
+  assert.equal(runtime.database.getConversation(conversation.id).providerSessionId, null);
+}));
+
 test("session recovery is refused for an adapter that cannot resume", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
   runtime.agents.providerAvailable = async () => true;
   const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Direct recovery", provider: "anthropic-api" });

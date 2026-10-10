@@ -51,7 +51,7 @@ export const claudeAdapter = defineAdapter({
     }
     if (raw.type === "result") {
       if (raw.result && !raw.is_error) events.push({ type: "assistant.message", payload: { text: raw.result } });
-      if (raw.is_error) events.push({ type: "provider.failure", payload: { message: String(raw.result || raw.subtype || "Claude Code reported a failure"), native: { subtype: raw.subtype, is_error: true, terminal_reason: raw.terminal_reason, api_error_status: raw.api_error_status } } });
+      if (raw.is_error) events.push({ type: "provider.failure", payload: { message: String(raw.result || raw.subtype || "Claude Code reported a failure"), terminal: true, native: { subtype: raw.subtype, is_error: true, terminal_reason: raw.terminal_reason, api_error_status: raw.api_error_status } } });
       events.push({ type: "usage", payload: { costUsd: raw.total_cost_usd, inputTokens: raw.usage?.input_tokens, outputTokens: raw.usage?.output_tokens, native: raw.usage ?? null } });
     }
     if (!events.length && raw.type !== "stream_event") events.push({ type: "provider.event", payload: raw });

@@ -38,10 +38,16 @@ export function buildExecutionLaunch({ conversation, run, sessionId }) {
 // including any credentials the user configured for that CLI.
 const DIRECT_PROVIDER_VARIABLES = new Set(EXECUTION_ADAPTERS.flatMap((adapter) => adapter.environment));
 
+// The base environment for any subprocess that is not a direct-provider run:
+// harness probes, git/gh utilities (and the repository hooks they execute)
+// and native supervisor control commands. Windows names are case-insensitive.
+export function withoutDirectProviderCredentials(environment = process.env) {
+  return Object.fromEntries(Object.entries(environment).filter(([key]) => !DIRECT_PROVIDER_VARIABLES.has(key.toUpperCase())));
+}
+
 export function buildExecutionEnvironment(id, runtimeEnvironment, inherited = runtimeEnvironment) {
   const adapter = requireExecutionAdapter(id);
-  // Windows variable names are case-insensitive.
-  const environment = Object.fromEntries(Object.entries(inherited).filter(([key]) => !DIRECT_PROVIDER_VARIABLES.has(key.toUpperCase())));
+  const environment = withoutDirectProviderCredentials(inherited);
   for (const variable of adapter.environment) if (runtimeEnvironment[variable]) environment[variable] = runtimeEnvironment[variable];
   return environment;
 }

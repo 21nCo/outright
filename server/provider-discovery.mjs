@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { describeAdapter, EXECUTION_ADAPTERS, versionCompatibility } from "./execution-adapters/index.mjs";
+import { describeAdapter, EXECUTION_ADAPTERS, versionCompatibility, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
 
 const MAX_VERSION_BYTES = 16 * 1024;
 const execFileAsync = promisify(execFile);
@@ -35,7 +35,7 @@ async function providerExecutable(id, signal) {
   return id;
 }
 
-function probeCommand(id, providerPath) {
+export function probeCommand(id, providerPath) {
   if (process.platform === "win32" && !EXECUTION_ADAPTERS.some((adapter) => adapter.executable === id)) throw new Error(`Unknown provider: ${id}`);
   let supervisor = process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH;
   if (!supervisor && process.platform === "win32") {
@@ -46,17 +46,20 @@ function probeCommand(id, providerPath) {
     supervisor = fileURLToPath(new URL(`./bin/${manifest.filename}`, import.meta.url));
   }
   supervisor ??= fileURLToPath(new URL("./bin/agent-supervisor", import.meta.url));
-  if (process.platform === "win32") return { executable: supervisor, args: [process.env.ComSpec || "cmd.exe", "/d", "/s", "/c", `${id} --version`], stdio: ["ignore", "pipe", "pipe"] };
+  // A harness CLI never sees a direct provider's credential, even to print
+  // its version.
+  const env = withoutDirectProviderCredentials(process.env);
+  if (process.platform === "win32") return { executable: supervisor, args: [process.env.ComSpec || "cmd.exe", "/d", "/s", "/c", `${id} --version`], stdio: ["ignore", "pipe", "pipe"], env };
   // The platform supervisor owns descendants even after setsid/reparenting.
   // The Linux handshake and macOS launch gate are private to this one probe.
   const token = randomUUID();
   if (process.platform === "darwin") {
     const ownershipLabel = `com.21n.outright.probe.${token}`;
     return { executable: supervisor, args: [ownershipLabel, providerPath, "--version"], ownershipLabel,
-      stdio: ["ignore", "pipe", "pipe", "pipe"], env: { ...process.env, OUTRIGHT_LAUNCH_GATE_FD: "3" } };
+      stdio: ["ignore", "pipe", "pipe", "pipe"], env: { ...env, OUTRIGHT_LAUNCH_GATE_FD: "3" } };
   }
   const handshakePath = join(tmpdir(), `outright-probe-${token}.json`);
-  return { executable: supervisor, args: [handshakePath, providerPath, "--version"], cleanupPath: handshakePath, stdio: ["pipe", "pipe", "pipe", "pipe"] };
+  return { executable: supervisor, args: [handshakePath, providerPath, "--version"], cleanupPath: handshakePath, stdio: ["pipe", "pipe", "pipe", "pipe"], env };
 }
 
 // A detached child leaves its parent's process group but remains in the
@@ -64,7 +67,7 @@ function probeCommand(id, providerPath) {
 // descendants before the owner so a forced shutdown cannot orphan a helper.
 async function probeDescendants(ownerPid) {
   const { stdout } = await execFileAsync("/bin/ps", ["-A", "-o", "pid=,ppid=,stat="],
-    { encoding: "utf8", timeout: 1_000, maxBuffer: 4 * 1024 * 1024 });
+    { encoding: "utf8", timeout: 1_000, maxBuffer: 4 * 1024 * 1024, env: withoutDirectProviderCredentials(process.env) });
   const children = new Map();
   let ownerState;
   for (const line of stdout.split("\n")) {
@@ -95,7 +98,7 @@ async function forceProbeCleanup(child, command) {
     // The launchd resource coalition survives setsid and reparenting. Its
     // control command proves that every member has left before returning.
     await execFileAsync(command.executable, ["--terminate", command.ownershipLabel],
-      { timeout: 5_000, maxBuffer: MAX_VERSION_BYTES });
+      { timeout: 5_000, maxBuffer: MAX_VERSION_BYTES, env: command.env });
   } else if (process.platform !== "win32") {
     // Linux's native supervisor is a subreaper, so double-forked helpers are
     // adopted back into this tree. Stop the owner before the final snapshot so

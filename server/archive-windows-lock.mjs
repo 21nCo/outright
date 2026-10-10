@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
 
 function supervisorPath() {
   if (process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH) return process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH;
@@ -27,7 +28,7 @@ function waitUntil(predicate, timeoutMs) {
 export function sameWindowsArchiveFile(left, right) {
   if (process.platform !== "win32") throw new Error("Windows archive identity used on another platform");
   const result = spawnSync(supervisorPath(), ["--same-file", left, right],
-    { stdio: "ignore", windowsHide: true, timeout: 5000 });
+    { stdio: "ignore", windowsHide: true, timeout: 5000, env: withoutDirectProviderCredentials(process.env) });
   if (result.status === 0) return true;
   if (result.status === 3) return false;
   throw new Error("Windows archive file identity could not be verified");
@@ -35,7 +36,7 @@ export function sameWindowsArchiveFile(left, right) {
 
 function archiveOwnerBirth(pid) {
   const result = spawnSync(supervisorPath(), ["--identity", String(pid)],
-    { encoding: "utf8", windowsHide: true, timeout: 5000 });
+    { encoding: "utf8", windowsHide: true, timeout: 5000, env: withoutDirectProviderCredentials(process.env) });
   if (result.status === 3) return null;
   if (result.status === 0 && /^\d+$/.test(result.stdout.trim())) return result.stdout.trim();
   throw new Error("Windows archive lock owner identity is unknown");
@@ -46,7 +47,7 @@ function archiveOwnerExited(pid, birth) {
   if (birth === undefined) return archiveOwnerBirth(pid) === null;
   if (birth === null) return true;
   const result = spawnSync(supervisorPath(), ["--probe", String(pid), birth],
-    { encoding: "utf8", windowsHide: true, timeout: 5000 });
+    { encoding: "utf8", windowsHide: true, timeout: 5000, env: withoutDirectProviderCredentials(process.env) });
   if (result.status === 3) return true;
   if (result.status === 0 && result.stdout.trim() === "alive") return false;
   throw new Error("Windows archive lock owner exit is unknown");
@@ -86,7 +87,7 @@ export function acquireWindowsArchiveLock(filenames) {
   const ready = `${filenames[0]}.archive-lock-${token}.ready`;
   const stop = `${filenames[0]}.archive-lock-${token}.stop`;
   const child = spawn(supervisorPath(), ["--archive-lock", String(process.pid), ready, stop, ...unique.values()],
-    { stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
+    { stdio: ["pipe", "ignore", "ignore"], windowsHide: true, env: withoutDirectProviderCredentials(process.env) });
   child.on("error", () => {});
   child.stdin.on("error", () => {});
   let ownerBirth;

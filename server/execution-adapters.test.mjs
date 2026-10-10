@@ -137,6 +137,8 @@ test("recorded Codex streams normalize without erasing provider details", () => 
   assert.ok(failures.length >= 1);
   assert.match(failures.at(-1).payload.message, /not supported when using Codex with a ChatGPT account/);
   assert.equal(failures.at(-1).payload.native.type, "turn.failed");
+  // A top-level error may be a retried stream notice; only turn.failed is terminal.
+  assert.deepEqual(failures.map((event) => [event.payload.native.type, event.payload.terminal]), [["error", false], ["turn.failed", true]]);
 });
 
 test("recorded Claude Code streams normalize without erasing provider details", () => {
@@ -153,6 +155,7 @@ test("recorded Claude Code streams normalize without erasing provider details", 
   const failure = failed.find((event) => event.type === "provider.failure").payload;
   assert.match(failure.message, /issue with the selected model/);
   assert.deepEqual([failure.native.terminal_reason, failure.native.api_error_status], ["api_error", 404]);
+  assert.equal(failure.terminal, true);
 });
 
 function runRunner(args, environment) {
@@ -245,6 +248,68 @@ test("one stream event is bounded across chunks and data lines", async () => {
       assert.equal(result.events.at(-1).payload.message, "Anthropic API stream event exceeded 1 MiB");
       assert.ok(result.stdout.length < 1024, "the oversized event is not echoed");
     });
+  }
+});
+
+test("a malformed stream event fails the run and keeps the text already streamed", async () => {
+  const delta = (text) => `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })}\n\n`;
+  for (const broken of ["data: {broken-json}\n\n", "data: [1]\n\n"]) {
+    await withApiFixture((response) => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end(`${delta("partial")}${broken}${delta(" lost")}data: {"type":"message_stop"}\n\n`);
+    }, async (base) => {
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      // Before, the event was dropped and message_stop completed the run.
+      assert.equal(result.code, 1, broken);
+      assert.deepEqual(result.events.map((event) => [event.type, event.payload.text ?? event.payload.message]),
+        [["assistant.delta", "partial"], ["provider.failure", "Anthropic API sent a malformed stream event"]]);
+      assert.equal(result.events.at(-1).payload.terminal, true);
+    });
+  }
+});
+
+test("the direct runner stops reading the API while its consumer is stalled", { skip: process.platform === "win32" }, async () => {
+  // Pipes are synchronous on Linux, so only asynchronous stdout can buffer.
+  const event = `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "x".repeat(60 * 1024) } })}\n\n`;
+  const events = 512;
+  let flushed = false;
+  await withApiFixture((response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    let index = 0;
+    const pump = () => {
+      while (index < events) { index += 1; if (!response.write(event)) { response.once("drain", pump); return; } }
+      response.end('data: {"type":"message_stop"}\n\n', () => { flushed = true; });
+    };
+    pump();
+  }, async (base) => {
+    const child = spawn(process.execPath, [fileURLToPath(new URL("./execution-adapters/anthropic-api-runner.mjs", import.meta.url)), "--model", "m", "--", "hi"],
+      { env: { PATH: process.env.PATH, OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base }, stdio: ["ignore", "pipe", "ignore"] });
+    child.stdout.pause();
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    // Without waiting for drain the runner read all 30 MiB into its own memory.
+    assert.equal(flushed, false, "the API stream is held back while stdout is full");
+    let bytes = 0;
+    const closed = new Promise((resolve) => child.on("close", resolve));
+    child.stdout.on("data", (chunk) => { bytes += chunk.length; });
+    child.stdout.resume();
+    const code = await closed;
+    assert.equal(code, 0);
+    assert.equal(flushed, true);
+    assert.ok(bytes > events * 60 * 1024, "every event was delivered once the consumer resumed");
+  });
+});
+
+test("an unusable direct-provider endpoint is reported as unavailable", async () => {
+  for (const base of ["invalid-url", "http://example.com", "ftp://api.anthropic.com"]) {
+    const discovery = createProviderDiscovery({ environment: { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base }, probe: async () => { throw new Error("missing"); } });
+    try {
+      // Before, only the key was checked, so the run was queued and failed at launch.
+      assert.equal(await discovery.available("anthropic-api"), false, base);
+      assert.match(discovery.list().find((entry) => entry.id === "anthropic-api").reason, /OUTRIGHT_ANTHROPIC_BASE_URL must be an https URL or a loopback http address/);
+    } finally { await discovery.close(); }
+  }
+  for (const base of ["https://gateway.example/anthropic", "http://127.0.0.1:8080"]) {
+    assert.equal(anthropic.detect({ OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base }).available, true, base);
   }
 });
 

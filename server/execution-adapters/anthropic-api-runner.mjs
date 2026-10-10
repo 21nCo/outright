@@ -8,9 +8,22 @@ import { pathToFileURL } from "node:url";
 const MAX_EVENT_BYTES = 1024 * 1024;
 const MAX_ERROR_BYTES = 64 * 1024;
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+export const ENDPOINT_REQUIREMENT = "OUTRIGHT_ANTHROPIC_BASE_URL must be an https URL or a loopback http address";
 
-function fail(type, message, code = 1) {
-  process.stdout.write(`${JSON.stringify({ type: "error", error: { type, message } })}\n`);
+// The manager may stop reading; wait for it instead of buffering the whole
+// stream in this process.
+function write(record) {
+  if (process.stdout.write(`${JSON.stringify(record)}\n`)) return undefined;
+  return new Promise((resolve) => {
+    const done = () => { process.stdout.off("drain", done); process.stdout.off("close", done); process.stdout.off("error", done); resolve(); };
+    process.stdout.on("drain", done);
+    process.stdout.once("close", done);
+    process.stdout.once("error", done);
+  });
+}
+
+async function fail(type, message, code = 1) {
+  await write({ type: "error", error: { type, message } });
   process.exitCode = code;
 }
 
@@ -20,7 +33,9 @@ function parseArguments(argv) {
   return { model: argv[1], prompt: argv[3] };
 }
 
-function endpoint(environment) {
+// Shared with the adapter's detect(), so an unusable endpoint is reported
+// before a run is queued rather than when the runner starts.
+export function anthropicEndpoint(environment) {
   let base;
   try { base = new URL(environment.OUTRIGHT_ANTHROPIC_BASE_URL || "https://api.anthropic.com"); }
   catch { return null; }
@@ -49,8 +64,8 @@ export async function run(argv = process.argv.slice(2), environment = process.en
   if (!request) return fail("invalid_request_error", "Usage: anthropic-api-runner --model <model> -- <prompt>", 2);
   const apiKey = environment.OUTRIGHT_ANTHROPIC_API_KEY;
   if (!apiKey) return fail("authentication_error", "OUTRIGHT_ANTHROPIC_API_KEY is not set", 2);
-  const url = endpoint(environment);
-  if (!url) return fail("invalid_request_error", "OUTRIGHT_ANTHROPIC_BASE_URL must be an https URL", 2);
+  const url = anthropicEndpoint(environment);
+  if (!url) return fail("invalid_request_error", ENDPOINT_REQUIREMENT, 2);
   let response;
   try {
     response = await fetch(url, {
@@ -85,18 +100,23 @@ export async function run(argv = process.argv.slice(2), environment = process.en
   let dataBytes = 0;
   let stopped = false;
   let errored = false;
-  const dispatch = () => {
-    if (!data.length) return;
+  // Returns false when the stream can no longer be trusted. Text already
+  // written stays in the transcript; the run still fails.
+  const dispatch = async () => {
+    if (!data.length) return true;
     const payload = data.join("\n");
     data = [];
     dataBytes = 0;
     let event;
     try { event = JSON.parse(payload); }
-    catch { return; }
-    if (event?.type === "message_stop") stopped = true;
-    if (event?.type === "error") errored = true;
-    process.stdout.write(`${JSON.stringify(event)}\n`);
+    catch { return false; }
+    if (!event || typeof event !== "object" || Array.isArray(event)) return false;
+    if (event.type === "message_stop") stopped = true;
+    if (event.type === "error") errored = true;
+    await write(event);
+    return true;
   };
+  const malformedEvent = () => fail("api_error", "Anthropic API sent a malformed stream event");
   // Returning from the read loop cancels the response body.
   const overflow = () => fail("api_error", "Anthropic API stream event exceeded 1 MiB");
   try {
@@ -106,7 +126,7 @@ export async function run(argv = process.argv.slice(2), environment = process.en
       while ((newline = buffered.indexOf("\n")) >= 0) {
         const line = buffered.slice(0, newline).replace(/\r$/, "");
         buffered = buffered.slice(newline + 1);
-        if (!line) dispatch();
+        if (!line) { if (!(await dispatch())) return malformedEvent(); }
         else if (line.startsWith("data:")) {
           const value = line.slice(5).trimStart();
           data.push(value);
@@ -116,10 +136,10 @@ export async function run(argv = process.argv.slice(2), environment = process.en
       }
       if (dataBytes + Buffer.byteLength(buffered) > MAX_EVENT_BYTES) return overflow();
     }
-    dispatch();
+    if (!(await dispatch())) return malformedEvent();
   } catch (error) { return fail("network_error", `Anthropic API stream failed: ${error?.message ?? "stream error"}`); }
   if (errored) process.exitCode = 1;
-  else if (!stopped) fail("api_error", "Anthropic API stream ended before message_stop");
+  else if (!stopped) await fail("api_error", "Anthropic API stream ended before message_stop");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await run();

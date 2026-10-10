@@ -9,12 +9,13 @@ The scheduler in `server/agent-manager.mjs` owns supervision, persistence, recov
 | `kind` | `harness` drives an external agent CLI that authenticates itself. `direct-provider` is Outright-managed execution against a model API. |
 | `modelProvider`, `authority` | The model vendor and where authority comes from. A harness uses its own CLI login. A direct provider names its own environment credential; a harness login never grants API access, and there is no fallback between them. |
 | `environment` | Direct providers only: the `OUTRIGHT_*` variables the adapter reads. They are removed from every spawn and handed only to that adapter's process. |
+| `detect` | Direct providers only: checks the credential and endpoint settings, so an unusable configuration is reported as unavailable before anything is queued. |
 | `versions` | The oldest verified version and the first unverified major. Anything outside the range, or an unparseable `--version`, is reported as incompatible. |
 | `capabilities` | Approval policies mapped to native permission modes, suggested models and whether custom names are allowed, reasoning efforts, resume support, structured output (`jsonl`), read-only support and hosted suitability. |
 | `sessionIdentity` | The native field carrying the provider's session id. Resume uses only a session created by the same adapter. |
 | `buildLaunch`, `normalize` | Argv construction and stream normalization. Positional values follow `--`, so a prompt or session id can never become an option or subcommand. |
 
-Normalized events are `session`, `assistant.delta`, `assistant.message`, `tool.started`, `tool.completed`, `usage`, `provider.failure` and `provider.event`. Usage and failure events keep provider detail under `native`, and unknown records remain `provider.event`.
+Normalized events are `session`, `assistant.delta`, `assistant.message`, `tool.started`, `tool.completed`, `usage`, `provider.failure` and `provider.event`. Usage and failure events keep provider detail under `native`, and unknown records remain `provider.event`. A `provider.failure` marked `terminal: true` (Codex `turn.failed`, a Claude Code `is_error` result, an Anthropic `error` event) fails the run even if the process exits 0. A non-terminal failure, such as a Codex top-level `error` notice that may precede a retry, only explains a nonzero exit.
 
 ## Validation order
 
@@ -22,13 +23,13 @@ Normalized events are `session`, `assistant.delta`, `assistant.message`, `tool.s
 2. Next, a fresh discovery probe checks availability and version compatibility. A missing provider returns `409 PROVIDER_UNAVAILABLE`, and an out-of-range version returns `409 PROVIDER_INCOMPATIBLE`. Both checks finish before any message or run row is written.
 3. At launch, the scheduler builds the argv through the same validation. A queued run that has become invalid fails with that message instead of starting.
 
-Switching a conversation's provider clears its stored session unless the same edit attaches a new one.
+Switching a conversation's provider clears its stored session unless the same edit attaches a new one. Attaching a session to a conversation whose adapter cannot resume returns `409 PROVIDER_RESUME_UNSUPPORTED`.
 
 ## Credentials and environment
 
-Each spawn gets a scoped environment. `OUTRIGHT_*` runtime settings are never inherited. A direct provider receives only the `OUTRIGHT_*` variables it declares. A harness CLI inherits the rest of Outright's environment unchanged, and that is its effective authority. For example, Claude Code honours an `ANTHROPIC_API_KEY` exported for Outright, just as it would in a shell. Enabling the direct provider cannot change that, because its key lives in `OUTRIGHT_ANTHROPIC_API_KEY`. The direct provider also never reads `ANTHROPIC_API_KEY`, so a key set up for a harness cannot become direct-provider authority.
+Each run spawn gets a scoped environment. `OUTRIGHT_*` runtime settings are never inherited. A direct provider receives only the `OUTRIGHT_*` variables it declares. Every other subprocess starts from `withoutDirectProviderCredentials()`, which removes the declared variables (case-insensitively, for Windows). That covers harness `--version` probes on every platform, git and gh utilities and the repository hooks they run, and native supervisor control commands. Integrated terminals already drop all `OUTRIGHT_*` variables. Short-lived system tools that Outright runs by absolute path for process inspection (`ps`, `sysctl`, `icacls`, `taskkill`) inherit the runtime environment but never run repository or provider code. A harness CLI inherits the rest of Outright's environment unchanged, and that is its effective authority. For example, Claude Code honours an `ANTHROPIC_API_KEY` exported for Outright, just as it would in a shell. Enabling the direct provider cannot change that, because its key lives in `OUTRIGHT_ANTHROPIC_API_KEY`. The direct provider also never reads `ANTHROPIC_API_KEY`, so a key set up for a harness cannot become direct-provider authority.
 
-The Anthropic runner sends its key only to the configured endpoint. That endpoint must be https or a loopback http address. Redirects are refused rather than followed, and a streamed event is limited to 1 MiB in total, counting every data line that has not yet been dispatched.
+The Anthropic runner sends its key only to the configured endpoint. That endpoint must be https or a loopback http address, and discovery applies the same check. Redirects are refused rather than followed. A streamed event is limited to 1 MiB in total, counting every data line that has not yet been dispatched. A malformed event fails the run, but text that has already streamed is kept. The runner waits for stdout to drain, so it stops reading from the API while Outright is not consuming its output.
 
 ## Adapters
 

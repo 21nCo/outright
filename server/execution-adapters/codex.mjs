@@ -53,8 +53,10 @@ export const codexAdapter = defineAdapter({
     if (raw.type === "turn.completed" && raw.usage) {
       events.push({ type: "usage", payload: { inputTokens: raw.usage.input_tokens, outputTokens: raw.usage.output_tokens, native: raw.usage } });
     }
+    // A top-level error can be a retried stream notice ("Reconnecting...");
+    // only turn.failed ends the turn.
     if (raw.type === "turn.failed" || raw.type === "error") {
-      events.push({ type: "provider.failure", payload: { message: String(raw.error?.message ?? raw.message ?? "Codex reported a failure"), native: raw } });
+      events.push({ type: "provider.failure", payload: { message: String(raw.error?.message ?? raw.message ?? "Codex reported a failure"), terminal: raw.type === "turn.failed", native: raw } });
     }
     if (!events.length) events.push({ type: "provider.event", payload: raw });
     return events;

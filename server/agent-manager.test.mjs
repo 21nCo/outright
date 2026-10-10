@@ -1521,6 +1521,31 @@ test("a run never resumes another provider's session and reports its normalized 
   } finally { await manager.shutdown(); }
 });
 
+test("a terminal provider failure fails the run even when the process exits 0", async () => {
+  const cases = [
+    { provider: "claude", lines: [{ type: "result", subtype: "success", is_error: true, result: "Claude Code reported an API error" }], status: "failed", error: "Claude Code reported an API error" },
+    { provider: "anthropic-api", lines: [{ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }], status: "failed", error: "Overloaded" },
+    // A retried Codex stream notice is not the end of the turn.
+    { provider: "codex", lines: [{ type: "error", message: "Reconnecting... 1/5" }, { type: "item.completed", item: { type: "agent_message", text: "done" } }], status: "completed", error: null },
+  ];
+  for (const { provider, lines, status, error } of cases) {
+    const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider });
+    const child = fakeChild();
+    const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child,
+      launchCommand: async (command) => ({ executable: "fake-owner", args: [], display: command.display }) });
+    try {
+      const run = database.createRun({ ...codexRun(`run-${provider}`), provider });
+      await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+      for (const line of lines) child.stdout.write(`${JSON.stringify(line)}\n`);
+      await new Promise((resolve) => setImmediate(resolve));
+      child.emit("close", 0, null);
+      // Before, exit 0 always completed the run and discarded the failure.
+      assert.equal(database.getRun(run.id).status, status, provider);
+      assert.equal(database.getRun(run.id).error || null, error, provider);
+    } finally { await manager.shutdown(); }
+  }
+});
+
 test("a direct-provider credential reaches only its own adapter's spawn", async () => {
   const environment = { PATH: "/usr/bin", ANTHROPIC_API_KEY: "harness-own-key", OUTRIGHT_ANTHROPIC_API_KEY: "direct-key",
     OUTRIGHT_ANTHROPIC_BASE_URL: "http://127.0.0.1:9", OUTRIGHT_OTHER: "runtime-only" };

@@ -64,6 +64,13 @@ test("a conversation's native session is scoped to its provider", () => {
     assert.equal(database.updateConversation(conversation.id, { provider: "claude", providerSessionId: "attached" }).providerSessionId, "attached",
       "an explicit attach in the same edit is kept");
     assert.throws(() => database.updateConversation(conversation.id, { provider: "hermes" }), { statusCode: 400 });
+    // A session the adapter cannot resume would make every later send fail.
+    assert.throws(() => database.updateConversation(conversation.id, { provider: "anthropic-api", providerSessionId: "msg-session" }),
+      { statusCode: 409, details: { code: "PROVIDER_RESUME_UNSUPPORTED" } });
+    const direct = database.updateConversation(conversation.id, { provider: "anthropic-api" });
+    assert.deepEqual([direct.provider, direct.providerSessionId], ["anthropic-api", null]);
+    assert.throws(() => database.updateConversation(conversation.id, { providerSessionId: "msg-session" }), { statusCode: 409 });
+    assert.equal(database.updateConversation(conversation.id, { providerSessionId: null }).providerSessionId, null, "clearing is always allowed");
     assert.throws(() => database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", provider: "hermes" }), { statusCode: 400 });
     assert.throws(() => database.updateSettings({ provider: "hermes" }));
     assert.equal(database.updateSettings({ provider: "anthropic-api" }).provider, "anthropic-api");

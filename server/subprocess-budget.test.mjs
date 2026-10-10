@@ -55,6 +55,31 @@ test("Git and scanner share admission, reject bursts before spawn, and recover a
   } finally { rmSync(holdFile, { force: true }); rmSync(root, { recursive: true, force: true }); }
 });
 
+test("git utilities and the repository hooks they run never receive a direct provider's credential", { skip: process.platform === "win32" }, async () => {
+  const root = await realpath(mkdtempSync(path.join(os.tmpdir(), "outright-utility-env-")));
+  const repository = path.join(root, "repo");
+  const report = path.join(root, "hook-env");
+  execFileSync("git", ["init", "-q", repository]);
+  execFileSync("git", ["-C", repository, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "init"]);
+  // An agent with workspace-write can author a hook like this one.
+  writeFileSync(path.join(repository, ".git", "hooks", "post-checkout"),
+    `#!/bin/sh\necho "\${OUTRIGHT_ANTHROPIC_API_KEY:-absent} \${OUTRIGHT_ANTHROPIC_BASE_URL:-absent} \${ANTHROPIC_API_KEY:-absent}" >> ${JSON.stringify(report)}\n`, { mode: 0o755 });
+  const direct = { OUTRIGHT_ANTHROPIC_API_KEY: "direct-key", OUTRIGHT_ANTHROPIC_BASE_URL: "https://direct.example" };
+  const saved = Object.fromEntries(Object.keys(direct).map((name) => [name, process.env[name]]));
+  Object.assign(process.env, direct);
+  const budget = createSubprocessBudget({ limit: 1, unknownDirectory: path.join(root, "unknown") });
+  try {
+    // The inherited base environment and an explicit one (as gh uses) are both filtered.
+    await budget.run("git", ["-C", repository, "worktree", "add", "-q", path.join(root, "inherited")], { timeout: 10_000 });
+    await budget.run("git", ["-C", repository, "worktree", "add", "-q", path.join(root, "explicit")],
+      { timeout: 10_000, env: { ...process.env, ANTHROPIC_API_KEY: "harness-own-key" } });
+    assert.deepEqual(readFileSync(report, "utf8").trim().split("\n"), ["absent absent absent", "absent absent harness-own-key"]);
+  } finally {
+    for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("malformed utility caps fail closed before admitting work", () => {
   for (const limit of [NaN, Infinity, -1, 0.5, "8"]) {
     assert.throws(() => createSubprocessBudget({ limit }), RangeError);

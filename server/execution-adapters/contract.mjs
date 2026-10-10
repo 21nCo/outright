@@ -13,6 +13,8 @@
 export const ADAPTER_CONTRACT_VERSION = 1;
 export const APPROVAL_POLICIES = Object.freeze(["read-only", "workspace-write", "danger-full-access"]);
 export const REASONING_EFFORTS = Object.freeze(["low", "medium", "high", "xhigh"]);
+// A provider.failure with `terminal: true` fails the run even if the process
+// exits 0; any other failure only explains a nonzero exit.
 export const NORMALIZED_EVENT_TYPES = Object.freeze(["session", "assistant.delta", "assistant.message", "tool.started", "tool.completed", "usage", "provider.failure", "provider.event"]);
 // Values that reach a provider's argv must never parse as an option.
 const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@+[\]-]{0,199}$/;
