@@ -52,6 +52,24 @@ test("persists settings, groups, conversations, messages, runs, and search", () 
   }
 });
 
+test("a conversation's native session is scoped to its provider", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Switch", provider: "claude" });
+    database.updateConversation(conversation.id, { providerSessionId: "claude-session" });
+    assert.equal(database.updateConversation(conversation.id, { provider: "claude", title: "Same" }).providerSessionId, "claude-session");
+    // Before adapters, switching kept the Claude token for the next Codex resume.
+    const switched = database.updateConversation(conversation.id, { provider: "codex" });
+    assert.deepEqual([switched.provider, switched.providerSessionId], ["codex", null]);
+    assert.equal(database.updateConversation(conversation.id, { provider: "claude", providerSessionId: "attached" }).providerSessionId, "attached",
+      "an explicit attach in the same edit is kept");
+    assert.throws(() => database.updateConversation(conversation.id, { provider: "hermes" }), { statusCode: 400 });
+    assert.throws(() => database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", provider: "hermes" }), { statusCode: 400 });
+    assert.throws(() => database.updateSettings({ provider: "hermes" }));
+    assert.equal(database.updateSettings({ provider: "anthropic-api" }).provider, "anthropic-api");
+  } finally { database.close(); }
+});
+
 test("global search bounds recent text and response bytes while keeping conversation Find available", async () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

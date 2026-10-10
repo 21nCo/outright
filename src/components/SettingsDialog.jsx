@@ -3,6 +3,7 @@ import { Bell, Brain, Code, ShieldCheck, Trash } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { APPROVAL_POLICY_OPTIONS, providerOptionLabel, providerReady, providerStatusText, reasoningOptions, supportsPolicy, withProvider } from "@/lib/providers";
 import { api } from "@/lib/runtime-api";
 
 export function SettingsDialog({ open, onOpenChange, settings, providers, templates, runtimeEvent, onSaved, onError }) {
@@ -201,11 +202,13 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
       }
     } finally { if (session === archiveSessionRef.current) setDeleting(false); }
   }
+  const selectedProvider = providers.find((provider) => provider.id === draft.provider);
   return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent className="settings-dialog"><DialogHeader><DialogTitle>Outright settings</DialogTitle><DialogDescription>Defaults for new conversations and local execution.</DialogDescription></DialogHeader><div className="settings-grid">
-    <Setting icon={Brain} label="Default provider"><select value={draft.provider} onChange={(event) => setDraft({ ...draft, provider: event.target.value })}>{providers.map((provider) => <option key={provider.id} value={provider.id} disabled={!provider.available}>{provider.label}{provider.available ? "" : " (unavailable)"}</option>)}</select></Setting>
-    <Setting icon={Brain} label="Default model"><Input value={draft.model ?? ""} onChange={(event) => setDraft({ ...draft, model: event.target.value })} placeholder="Provider default" /></Setting>
-    <Setting icon={ShieldCheck} label="Approval policy"><select value={draft.approvalPolicy} onChange={(event) => setDraft({ ...draft, approvalPolicy: event.target.value })}><option value="read-only">Read only</option><option value="workspace-write">Workspace write</option><option value="danger-full-access">Full access</option></select></Setting>
-    <Setting icon={Brain} label="Reasoning effort"><select value={draft.reasoningEffort} onChange={(event) => setDraft({ ...draft, reasoningEffort: event.target.value })}>{["low", "medium", "high", "xhigh"].map((value) => <option key={value}>{value}</option>)}</select></Setting>
+    <Setting icon={Brain} label="Default provider"><select value={draft.provider} aria-describedby="default-provider-status" onChange={(event) => setDraft(withProvider(draft, providers, event.target.value))}>{providers.map((provider) => <option key={provider.id} value={provider.id} disabled={!providerReady(provider) && provider.id !== draft.provider}>{providerOptionLabel(provider)}</option>)}</select></Setting>
+    <Setting icon={Brain} label="Default model"><Input value={draft.model ?? ""} list="default-provider-models" onChange={(event) => setDraft({ ...draft, model: event.target.value })} placeholder="Provider default" /><datalist id="default-provider-models">{(selectedProvider?.models ?? []).map((model) => <option key={model} value={model} />)}</datalist></Setting>
+    <p id="default-provider-status" className="provider-status" role="status" aria-live="polite">{providerStatusText(selectedProvider)}</p>
+    <Setting icon={ShieldCheck} label="Approval policy"><select value={draft.approvalPolicy} onChange={(event) => setDraft({ ...draft, approvalPolicy: event.target.value })}>{APPROVAL_POLICY_OPTIONS.map(({ value, label }) => <option key={value} value={value} disabled={!supportsPolicy(selectedProvider, value)}>{label}{supportsPolicy(selectedProvider, value) ? "" : " (not supported)"}</option>)}</select></Setting>
+    <Setting icon={Brain} label="Reasoning effort"><select value={draft.reasoningEffort} onChange={(event) => setDraft({ ...draft, reasoningEffort: event.target.value })}>{reasoningOptions(selectedProvider).map((value) => <option key={value}>{value}</option>)}</select></Setting>
     <Setting icon={Code} label="Editor"><select value={draft.editor} onChange={(event) => setDraft({ ...draft, editor: event.target.value })}><option value="zed">Zed</option><option value="code">VS Code</option><option value="cursor">Cursor</option><option value="finder">Finder</option></select></Setting>
     <Setting icon={Bell} label="Notifications"><span className="switch-row"><input type="checkbox" aria-label="Notify when runs finish" checked={draft.notifications} onChange={(event) => setDraft({ ...draft, notifications: event.target.checked })} /> Notify when runs finish</span></Setting>
     {Object.entries(BUDGET_RANGES).map(([name, [label, min, max]]) =>

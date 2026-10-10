@@ -1,0 +1,234 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { createServer } from "node:http";
+import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { ADAPTER_CONTRACT_VERSION, defineAdapter, NORMALIZED_EVENT_TYPES, validateRunConfiguration } from "./execution-adapters/contract.mjs";
+import { buildExecutionLaunch, describeAdapter, EXECUTION_ADAPTERS, findExecutionAdapter, validateExecutionConfiguration, versionCompatibility } from "./execution-adapters/index.mjs";
+import { createProviderDiscovery } from "./provider-discovery.mjs";
+
+const fixtures = new URL("../tests/fixtures/execution-adapters/", import.meta.url);
+const fixture = (adapter, name) => readFileSync(new URL(`${adapter}/${name}`, fixtures), "utf8");
+// Every normalized event must belong to the contract's shared vocabulary.
+const normalized = (adapter, records) => records.flatMap((record) => adapter.normalize(record)).map((event) => {
+  assert.ok(NORMALIZED_EVENT_TYPES.includes(event.type), `${adapter.id} emitted ${event.type}`);
+  return event;
+});
+const normalizeFixture = (adapter, name) => normalized(adapter, fixture(adapter.id, name).split("\n").filter(Boolean).map((line) => JSON.parse(line)));
+const baseRun = { model: "", reasoningEffort: "medium", approvalPolicy: "read-only", prompt: "review" };
+const codex = findExecutionAdapter("codex");
+const claude = findExecutionAdapter("claude");
+const anthropic = findExecutionAdapter("anthropic-api");
+
+function harnessSpec(overrides = {}) {
+  return {
+    id: "fixture", label: "Fixture", kind: "harness", contractVersion: ADAPTER_CONTRACT_VERSION, modelProvider: "openai",
+    authority: { source: "harness-login" }, executable: "fixture", versions: { minimum: "1.0.0", belowMajor: 2 },
+    capabilities: { permissionModes: { "read-only": "ro" }, models: ["m"], reasoningEfforts: ["medium"], structuredOutput: "jsonl" },
+    parseVersion: () => "1.0.0", buildLaunch: () => ({}), normalize: () => [],
+    ...overrides,
+  };
+}
+
+test("the adapter contract rejects specifications the scheduler could not trust", () => {
+  assert.equal(defineAdapter(harnessSpec()).capabilities.readOnly, true);
+  assert.throws(() => defineAdapter(harnessSpec({ contractVersion: 2 })), /targets contract 2/);
+  assert.throws(() => defineAdapter(harnessSpec({ executable: "/usr/bin/codex --flag" })), /bare executable/);
+  assert.throws(() => defineAdapter(harnessSpec({ capabilities: { ...harnessSpec().capabilities, permissionModes: { sudo: "x" } } })), /approval policies/);
+  assert.throws(() => defineAdapter(harnessSpec({ capabilities: { ...harnessSpec().capabilities, resume: true } })), /native session field/);
+  // A direct provider can never borrow a harness CLI login.
+  assert.throws(() => defineAdapter(harnessSpec({ kind: "direct-provider", detect: () => ({}) })), /own API credential/);
+  assert.throws(() => defineAdapter(harnessSpec({ versions: { minimum: "2.0.0", belowMajor: 2 } })), /version range/);
+});
+
+test("every registered adapter has fixtures and a serializable description without secrets", () => {
+  assert.deepEqual(EXECUTION_ADAPTERS.map((adapter) => adapter.id), ["codex", "claude", "anthropic-api"]);
+  for (const adapter of EXECUTION_ADAPTERS) {
+    assert.ok(existsSync(new URL(`${adapter.id}/`, fixtures)), `${adapter.id} needs compatibility fixtures`);
+    const description = describeAdapter(adapter);
+    assert.equal(description.contractVersion, ADAPTER_CONTRACT_VERSION);
+    assert.deepEqual(JSON.parse(JSON.stringify(description)), description);
+    assert.ok(description.capabilities.permissionModes.length > 0);
+  }
+  assert.deepEqual(describeAdapter(anthropic).authority, { source: "env", variable: "ANTHROPIC_API_KEY" });
+  assert.equal(describeAdapter(codex).capabilities.hosted, false);
+  assert.equal(describeAdapter(anthropic).capabilities.hosted, true);
+});
+
+test("CLI versions are gated to the verified supported range", () => {
+  assert.deepEqual(versionCompatibility(codex, codex.parseVersion(fixture("codex", "version.txt"))), { version: "0.162.1", compatible: true, reason: "" });
+  assert.deepEqual(versionCompatibility(claude, claude.parseVersion(fixture("claude", "version.txt"))), { version: "2.1.296", compatible: true, reason: "" });
+  const old = versionCompatibility(codex, codex.parseVersion("codex-cli 0.20.0"));
+  assert.equal(old.compatible, false);
+  assert.match(old.reason, /Codex 0\.20\.0 is not supported; Outright supports 0\.145\.0 or newer below 1\.0\.0/);
+  assert.equal(versionCompatibility(claude, claude.parseVersion("3.0.0 (Claude Code)")).compatible, false, "an unverified major is incompatible");
+  assert.match(versionCompatibility(codex, codex.parseVersion("codex development build")).reason, /unrecognized version/);
+});
+
+test("unsupported configurations are rejected instead of falling back", () => {
+  // Before adapters, an unknown policy silently became workspace-write.
+  assert.throws(() => validateExecutionConfiguration({ provider: "codex", ...baseRun, approvalPolicy: "bypass" }),
+    { code: "PROVIDER_CONFIGURATION_UNSUPPORTED", statusCode: 409 });
+  assert.throws(() => validateExecutionConfiguration({ provider: "anthropic-api", ...baseRun, approvalPolicy: "workspace-write" }),
+    { code: "PROVIDER_CONFIGURATION_UNSUPPORTED", message: /Anthropic API does not support the workspace-write approval policy/ });
+  assert.throws(() => validateExecutionConfiguration({ provider: "anthropic-api", ...baseRun, reasoningEffort: "high" }),
+    { code: "PROVIDER_CONFIGURATION_UNSUPPORTED" });
+  assert.throws(() => validateExecutionConfiguration({ provider: "codex", ...baseRun, reasoningEffort: undefined }),
+    { code: "PROVIDER_CONFIGURATION_UNSUPPORTED" }, "an invalid effort used to be dropped silently");
+  assert.throws(() => validateExecutionConfiguration({ provider: "hermes", ...baseRun }), { code: "PROVIDER_UNKNOWN", statusCode: 400 });
+  assert.throws(() => validateExecutionConfiguration({ provider: "anthropic-api", ...baseRun, sessionId: "a1d55507-d4ad-43ef-8154-19b111bbed42" }),
+    { code: "PROVIDER_RESUME_UNSUPPORTED" });
+  assert.doesNotThrow(() => validateRunConfiguration(codex, { ...baseRun, model: "gpt-6.1-sol" }), "harness CLIs accept custom model names");
+});
+
+test("model, session and prompt values can never become provider options", () => {
+  assert.throws(() => validateExecutionConfiguration({ provider: "claude", ...baseRun, model: "--dangerously-skip-permissions" }),
+    { code: "PROVIDER_CONFIGURATION_INVALID", statusCode: 400 });
+  assert.throws(() => buildExecutionLaunch({ conversation: { worktreePath: "/w" }, run: { provider: "codex", ...baseRun }, sessionId: "--dangerously-bypass-approvals-and-sandbox" }),
+    { code: "PROVIDER_SESSION_INVALID" });
+  for (const prompt of ["review", "--help", "-"]) {
+    for (const sessionId of [null, "01a12627-f09a-7fd1-acee-6058eb376e35"]) {
+      for (const provider of ["codex", "claude"]) {
+        const { args } = buildExecutionLaunch({ conversation: { worktreePath: "/w" }, run: { provider, ...baseRun, prompt }, sessionId });
+        // Codex resume takes the session id as a positional before the prompt.
+        assert.equal(args.at(-1), prompt, `${provider} keeps ${prompt} positional`);
+        assert.equal(args.at(sessionId && provider === "codex" ? -3 : -2), "--");
+      }
+    }
+  }
+});
+
+test("native permission modes and session identity are preserved per adapter", () => {
+  const conversation = { worktreePath: "/w" };
+  const claudeResume = buildExecutionLaunch({ conversation, run: { provider: "claude", ...baseRun, approvalPolicy: "danger-full-access" }, sessionId: "s-1" }).args;
+  assert.deepEqual(claudeResume.slice(claudeResume.indexOf("--permission-mode"), claudeResume.indexOf("--permission-mode") + 2), ["--permission-mode", "bypassPermissions"]);
+  assert.deepEqual(claudeResume.slice(claudeResume.indexOf("--resume"), claudeResume.indexOf("--resume") + 2), ["--resume", "s-1"]);
+  const codexResume = buildExecutionLaunch({ conversation, run: { provider: "codex", ...baseRun, approvalPolicy: "workspace-write" }, sessionId: "s-1" }).args;
+  assert.deepEqual(codexResume.slice(0, 3), ["exec", "resume", "--json"]);
+  assert.ok(codexResume.includes('sandbox_mode="workspace-write"'));
+  assert.deepEqual(codexResume.slice(-3, -1), ["--", "s-1"]);
+  const direct = buildExecutionLaunch({ conversation, run: { provider: "anthropic-api", ...baseRun } });
+  assert.equal(direct.executable, process.execPath);
+  assert.deepEqual(direct.args.slice(1), ["--model", "claude-opus-5-5", "--", "review"]);
+});
+
+test("recorded Codex streams normalize without erasing provider details", () => {
+  const fresh = normalizeFixture(codex, "exec.jsonl");
+  const session = fresh.find((event) => event.type === "session").payload.sessionId;
+  assert.equal(session, "01a12627-f09a-7fd1-acee-6058eb376e35");
+  assert.ok(fresh.some((event) => event.type === "assistant.message" && event.payload.text));
+  assert.ok(fresh.some((event) => event.type === "tool.completed" && event.payload.item.type === "command_execution"), "tool items stay native");
+  const usage = fresh.find((event) => event.type === "usage").payload;
+  assert.ok(Number.isFinite(usage.inputTokens) && Number.isFinite(usage.outputTokens));
+  assert.ok(Object.hasOwn(usage.native, "cached_input_tokens"), "provider-specific usage detail is retained");
+  const resumed = normalizeFixture(codex, "resume.jsonl");
+  assert.equal(resumed.find((event) => event.type === "session").payload.sessionId, session, "resume continues the native thread");
+  assert.equal(resumed.find((event) => event.type === "assistant.message").payload.text, "READY");
+  const failedTurn = normalizeFixture(codex, "failed-turn.jsonl");
+  assert.equal(failedTurn.some((event) => event.type === "tool.completed"), false, "CLI notices are not tool calls");
+  assert.ok(failedTurn.some((event) => event.type === "provider.event" && event.payload.item?.type === "error"), "CLI notices stay as native events");
+  const failures = failedTurn.filter((event) => event.type === "provider.failure");
+  assert.ok(failures.length >= 1);
+  assert.match(failures.at(-1).payload.message, /not supported when using Codex with a ChatGPT account/);
+  assert.equal(failures.at(-1).payload.native.type, "turn.failed");
+});
+
+test("recorded Claude Code streams normalize without erasing provider details", () => {
+  const fresh = normalizeFixture(claude, "print.jsonl");
+  const session = fresh.find((event) => event.type === "session").payload.sessionId;
+  assert.equal(session, "a1d55507-d4ad-43ef-8154-19b111bbed42");
+  assert.equal(fresh.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join(""), "READY");
+  const usage = fresh.find((event) => event.type === "usage").payload;
+  assert.ok(Number.isFinite(usage.costUsd));
+  assert.ok(Object.hasOwn(usage.native, "cache_read_input_tokens"));
+  assert.equal(normalizeFixture(claude, "resume.jsonl").find((event) => event.type === "session").payload.sessionId, session);
+  const failed = normalizeFixture(claude, "error-result.jsonl");
+  assert.equal(failed.some((event) => event.type === "assistant.message"), false, "an error result is not an assistant answer");
+  const failure = failed.find((event) => event.type === "provider.failure").payload;
+  assert.match(failure.message, /issue with the selected model/);
+  assert.deepEqual([failure.native.terminal_reason, failure.native.api_error_status], ["api_error", 404]);
+});
+
+function runRunner(args, environment) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [fileURLToPath(new URL("./execution-adapters/anthropic-api-runner.mjs", import.meta.url)), ...args],
+      { env: { PATH: process.env.PATH, ...environment }, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, stdout, events: normalized(anthropic, stdout.split("\n").filter(Boolean).map((line) => JSON.parse(line))) }));
+  });
+}
+
+async function withApiFixture(respond, callback) {
+  const requests = [];
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => { requests.push({ headers: request.headers, body: JSON.parse(body), url: request.url }); respond(response); });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try { return await callback(`http://127.0.0.1:${server.address().port}`, requests); }
+  finally { await new Promise((resolve) => server.close(resolve)); }
+}
+
+test("the Outright-managed Anthropic path streams through its own credential", async () => {
+  const secret = "sk-ant-fixture-secret";
+  await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", "stream.sse")); }, async (base, requests) => {
+    const launch = buildExecutionLaunch({ conversation: { worktreePath: "/w" }, run: { provider: "anthropic-api", ...baseRun, prompt: "--help" } });
+    assert.equal(launch.args.includes(secret), false);
+    const result = await runRunner(launch.args.slice(1), { ANTHROPIC_API_KEY: secret, ANTHROPIC_BASE_URL: base });
+    assert.equal(result.code, 0);
+    assert.equal(result.stdout.includes(secret), false, "the key is never echoed");
+    assert.equal(requests[0].url, "/v1/messages");
+    assert.equal(requests[0].headers["x-api-key"], secret);
+    assert.deepEqual([requests[0].body.model, requests[0].body.stream, requests[0].body.messages[0].content], ["claude-opus-5-5", true, "--help"]);
+    assert.equal(result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join(""), "READY now");
+    const usage = result.events.filter((event) => event.type === "usage").map((event) => event.payload);
+    assert.deepEqual([usage[0].inputTokens, usage.at(-1).outputTokens, usage.at(-1).native.stop_reason], [12, 3, "end_turn"]);
+    assert.equal(result.events.some((event) => event.type === "provider.event"), false, "stream noise is not persisted");
+  });
+});
+
+test("Anthropic API failures are normalized and fail the run", async () => {
+  await withApiFixture((response) => { response.writeHead(401, { "content-type": "application/json" }); response.end(fixture("anthropic-api", "unauthorized.json")); }, async (base) => {
+    const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { ANTHROPIC_API_KEY: "bad", ANTHROPIC_BASE_URL: base });
+    assert.equal(result.code, 1);
+    assert.deepEqual(result.events.map((event) => [event.type, event.payload.message, event.payload.native?.type]), [["provider.failure", "invalid x-api-key", "authentication_error"]]);
+  });
+  await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", "overloaded.sse")); }, async (base) => {
+    const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: base });
+    assert.equal(result.code, 1);
+    assert.equal(result.events.at(-1).payload.message, "Overloaded");
+  });
+  // A key is never sent over plaintext to a non-local host, and no CLI login is consulted.
+  const insecure = await runRunner(["--model", "m", "--", "hi"], { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "http://example.com" });
+  assert.equal(insecure.code, 2);
+  assert.match(insecure.events[0].payload.message, /must be an https URL/);
+  const missing = await runRunner(["--model", "m", "--", "hi"], {});
+  assert.equal(missing.code, 2);
+  assert.match(missing.events[0].payload.message, /ANTHROPIC_API_KEY is not set/);
+});
+
+test("discovery reports incompatible and unconfigured providers before authorization", async () => {
+  const probed = [];
+  const versions = { codex: "codex-cli 0.20.0", claude: "2.1.296 (Claude Code)" };
+  const discovery = createProviderDiscovery({ environment: {}, probe: async (executable) => { probed.push(executable); return versions[executable]; } });
+  try {
+    assert.equal(await discovery.available("codex"), false, "an installed but unsupported CLI is not authorized");
+    assert.equal(await discovery.available("claude"), true);
+    assert.equal(await discovery.available("anthropic-api"), false, "a Claude Code login does not grant API access");
+    const byId = Object.fromEntries(discovery.list().map((entry) => [entry.id, entry]));
+    assert.deepEqual([byId.codex.available, byId.codex.compatible, byId.codex.version], [true, false, "0.20.0"]);
+    assert.match(byId.codex.reason, /0\.20\.0 is not supported/);
+    assert.deepEqual([byId.claude.compatible, byId.claude.capabilities.resume], [true, true]);
+    assert.match(byId["anthropic-api"].reason, /ANTHROPIC_API_KEY/);
+    assert.equal(probed.includes("anthropic-api"), false, "a direct provider is never probed as a CLI");
+  } finally { await discovery.close(); }
+  const configured = createProviderDiscovery({ environment: { ANTHROPIC_API_KEY: "k" }, probe: async () => { throw new Error("missing"); } });
+  try {
+    assert.equal(await configured.available("anthropic-api"), true);
+    assert.equal(configured.list().find((entry) => entry.id === "anthropic-api").version, "1.0.0");
+  } finally { await configured.close(); }
+});

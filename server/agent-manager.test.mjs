@@ -9,7 +9,11 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { AGENT_SUPERVISOR, buildProviderCommand, consumeBoundedLines, createAgentManager as createRuntimeAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_AUTHORIZED_CONTROL, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
+import { AGENT_SUPERVISOR, buildProviderCommand, consumeBoundedLines, createAgentManager as createRuntimeAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_AUTHORIZED_CONTROL, LAUNCH_WRAPPER_SOURCE, processGroupAlive, terminateTree } from "./agent-manager.mjs";
+import { claudeAdapter } from "./execution-adapters/claude.mjs";
+import { codexAdapter } from "./execution-adapters/codex.mjs";
+const normalizeClaude = (raw) => claudeAdapter.normalize(raw);
+const normalizeCodex = (raw) => codexAdapter.normalize(raw);
 import { streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
 import { createOutrightDatabase } from "./database.mjs";
 import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
@@ -1234,7 +1238,8 @@ function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/
     updateConversation: (id, patch) => conversations.set(id, { ...conversations.get(id), ...patch }),
     getRun: (id) => runs.get(id) ?? null,
     createRun: (run) => {
-      const stored = { ...run, worktreePath: run.worktreePath ?? conversations.get(run.conversationId)?.worktreePath };
+      // Mirrors the reasoning_effort column default of the real schema.
+      const stored = { reasoningEffort: "medium", ...run, worktreePath: run.worktreePath ?? conversations.get(run.conversationId)?.worktreePath };
       runs.set(run.id, stored);
       return stored;
     },
@@ -1492,6 +1497,28 @@ test("keeps recovered session ids run-local when the conversation switched provi
   assert.equal(database.getRun(run.id).providerSessionId, "codex-session");
   assert.equal(database.getConversation("conv-1").providerSessionId, "claude-session");
   child.emit("close", 0, null);
+});
+
+test("a run never resumes another provider's session and reports its normalized failure", async () => {
+  const claudeSession = "a1d55507-d4ad-43ef-8154-19b111bbed42";
+  const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "claude", providerSessionId: claudeSession });
+  const launched = [];
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child,
+    launchCommand: async (command) => { launched.push(command); return { executable: "fake-owner", args: [], display: command.display }; } });
+  try {
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.createRun(codexRun("run-1")) });
+    // Before adapters the scheduler passed the chat's Claude token to `codex exec resume`.
+    assert.deepEqual(launched[0].args.slice(0, 2), ["exec", "--json"]);
+    assert.equal(launched[0].args.includes(claudeSession), false);
+    child.stderr.write("Reading additional input from stdin...\n");
+    child.stdout.write("null\n[1]\n");
+    child.stdout.write(`${JSON.stringify({ type: "turn.failed", error: { message: "The selected model is not supported" } })}\n`);
+    await new Promise((resolve) => setImmediate(resolve));
+    child.emit("close", 1, null);
+    assert.equal(database.getRun("run-1").status, "failed");
+    assert.equal(database.getRun("run-1").error, "The selected model is not supported", "the provider's failure outranks stderr noise");
+  } finally { await manager.shutdown(); }
 });
 
 test("a full conversation metadata budget does not fail a provider session event", async () => {
@@ -3576,7 +3603,7 @@ const waitForReady = async (runId) => {
   throw new Error("the provider/descendant pair never became signal-ready");
 };
 const schedule = async (runId) => {
-  const run = database.createRun({ id: runId, conversationId: "conv-1", provider: "codex", prompt: "p", approvalPolicy: "read-only" });
+  const run = database.createRun({ id: runId, conversationId: "conv-1", provider: "codex", prompt: "p", approvalPolicy: "read-only", reasoningEffort: "medium" });
   await agent.schedule({ conversation: database.getConversation("conv-1"), run });
   return waitForReady(runId);
 };

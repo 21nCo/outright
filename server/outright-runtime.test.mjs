@@ -1163,7 +1163,8 @@ function withWorktreeRuntime(fn, options = {}) {
         if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
       }
       mkdirSync(bin, { recursive: true });
-      writeFileSync(path.join(bin, "codex"), "#!/bin/sh\nexit 0\n");
+      // A supported version keeps compatibility gating out of unrelated fixtures.
+      writeFileSync(path.join(bin, "codex"), "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.162.1'; fi\nexit 0\n");
       chmodSync(path.join(bin, "codex"), 0o755);
       const configFile = path.join(root, "outright.config.json");
       writeFileSync(configFile, JSON.stringify({ scanRoots: [root], maxDepth: 2, maxProjects: 8 }));
@@ -1460,6 +1461,57 @@ for (const operation of ["send", "recovery"]) {
   }));
 }
 
+test("unsupported provider configurations are rejected before probing or durable side effects", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  runtime.agents.providerAvailable = async () => { throw new Error("static validation must precede discovery"); };
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Direct", provider: "anthropic-api" });
+  const send = async (body) => {
+    const result = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, body), result);
+    return result;
+  };
+  // The default policy is workspace-write; the direct provider cannot edit files.
+  const unsupported = await send({ prompt: "edit files" });
+  assert.equal(unsupported.statusCode, 409);
+  assert.equal(unsupported.body.code, "PROVIDER_CONFIGURATION_UNSUPPORTED");
+  assert.match(unsupported.body.error, /Anthropic API does not support the workspace-write approval policy/);
+  const injected = await send({ prompt: "hi", provider: "claude", model: "--dangerously-skip-permissions" });
+  assert.equal(injected.statusCode, 400);
+  assert.equal(injected.body.code, "PROVIDER_CONFIGURATION_INVALID");
+  const unknown = await send({ prompt: "hi", provider: "hermes" });
+  assert.equal(unknown.body.code, "PROVIDER_UNKNOWN");
+  assert.deepEqual(runtime.database.listMessages(conversation.id), []);
+  assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+}));
+
+test("an installed but incompatible CLI is reported before enqueueing", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
+  // Settle the startup probe so authorization cannot reuse its in-flight result.
+  assert.equal(await runtime.agents.providerAvailable("codex"), true);
+  writeFileSync(path.join(bin, "codex"), "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.20.0'; fi\n");
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Old CLI", provider: "codex" });
+  const result = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "must not persist" }), result);
+  assert.equal(result.statusCode, 409);
+  assert.equal(result.body.code, "PROVIDER_INCOMPATIBLE");
+  assert.match(result.body.error, /Codex 0\.20\.0 is not supported; Outright supports 0\.145\.0 or newer/);
+  const status = runtime.agents.providers().find((entry) => entry.id === "codex");
+  assert.deepEqual([status.available, status.compatible, status.version], [true, false, "0.20.0"]);
+  assert.deepEqual(runtime.database.listMessages(conversation.id), []);
+  assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+}));
+
+test("session recovery is refused for an adapter that cannot resume", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  runtime.agents.providerAvailable = async () => true;
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Direct recovery", provider: "anthropic-api" });
+  const interrupted = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "anthropic-api", approvalPolicy: "read-only", reasoningEffort: "medium", prompt: "unfinished", providerSessionId: "msg-session" });
+  runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+  const result = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${interrupted.id}/resume`, { policy: "resume-session" }), result);
+  assert.equal(result.statusCode, 409);
+  assert.equal(result.body.code, "PROVIDER_RESUME_UNSUPPORTED");
+  assert.equal(runtime.database.getRun(interrupted.id).recoveryDecision, null);
+  assert.equal(runtime.database.listRuns(conversation.id).length, 1);
+}));
+
 for (const operation of ["send", "recovery"]) {
   test(`slow executable provider probe stays asynchronous and bounded for ${operation}`, { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
     // Exercise the real execFile --version path through each HTTP endpoint.
@@ -1468,7 +1520,7 @@ for (const operation of ["send", "recovery"]) {
     // in-flight result instead of testing the slow executable below.
     assert.equal(await runtime.agents.providerAvailable("codex"), true);
     const probeMarker = path.join(bin, "slow-probe-ran");
-    writeFileSync(path.join(bin, "codex"), `#!/bin/sh\nif [ "$1" = "--version" ]; then sleep 0.4; echo ran > '${probeMarker}'; echo 'codex test'; fi\n`);
+    writeFileSync(path.join(bin, "codex"), `#!/bin/sh\nif [ "$1" = "--version" ]; then sleep 0.4; echo ran > '${probeMarker}'; echo 'codex-cli 0.162.1'; fi\n`);
     const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Probe latency", provider: "codex" });
     let interrupted;
     if (operation === "recovery") {

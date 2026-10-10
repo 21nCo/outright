@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { domId, nextTabIndex } from "../src/lib/accessibility.js";
+import { providerOptionLabel, providerStatusText, supportsPolicy, withProvider } from "../src/lib/providers.js";
 
 const root = new URL("../", import.meta.url);
 
@@ -49,4 +50,20 @@ test("core surfaces retain their semantic wiring and narrow-screen fallbacks", a
   assert.match(styles, /\.command-dialog \{[^}]+padding: 0;[^}]+overflow: hidden;/);
   assert.match(styles, /\.setting-row > input:not\(\[type="checkbox"\]\)/);
   assert.match(styles, /@media \(prefers-reduced-motion: reduce\)/);
+});
+
+test("provider controls explain readiness and only offer supported choices", async () => {
+  const direct = { id: "anthropic-api", label: "Anthropic API", kind: "direct-provider", available: true, compatible: true, version: "1.0.0",
+    authority: { source: "env", variable: "ANTHROPIC_API_KEY" }, capabilities: { permissionModes: ["read-only"], reasoningEfforts: ["medium"], resume: false } };
+  const oldCodex = { id: "codex", label: "Codex", available: true, compatible: false, reason: "Codex 0.20.0 is not supported" };
+  assert.equal(providerOptionLabel(oldCodex), "Codex (unsupported version)");
+  assert.equal(providerStatusText(oldCodex), "Codex 0.20.0 is not supported");
+  assert.match(providerStatusText(direct), /Outright-managed via ANTHROPIC_API_KEY · Read only · no session resume/);
+  assert.equal(supportsPolicy(direct, "workspace-write"), false);
+  assert.deepEqual(withProvider({ provider: "codex", approvalPolicy: "workspace-write", reasoningEffort: "high" }, [direct], "anthropic-api"),
+    { provider: "anthropic-api", approvalPolicy: "read-only", reasoningEffort: "medium" });
+  const [app, settings] = await Promise.all([readFile(new URL("src/App.jsx", root), "utf8"), readFile(new URL("src/components/SettingsDialog.jsx", root), "utf8")]);
+  assert.match(settings, /aria-describedby="default-provider-status"/);
+  assert.match(settings, /id="default-provider-status" className="provider-status" role="status" aria-live="polite"/);
+  assert.match(app, /aria-describedby="chat-settings-provider-status"/);
 });

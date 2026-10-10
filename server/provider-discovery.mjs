@@ -6,10 +6,8 @@ import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-const PROVIDERS = [
-  { id: "codex", label: "Codex", models: ["gpt-5.4", "gpt-5.3-codex"] },
-  { id: "claude", label: "Claude Code", models: ["sonnet", "opus", "haiku"] },
-];
+import { describeAdapter, EXECUTION_ADAPTERS, versionCompatibility } from "./execution-adapters/index.mjs";
+
 const MAX_VERSION_BYTES = 16 * 1024;
 const execFileAsync = promisify(execFile);
 const pendingAccess = new Map();
@@ -38,7 +36,7 @@ async function providerExecutable(id, signal) {
 }
 
 function probeCommand(id, providerPath) {
-  if (process.platform === "win32" && !PROVIDERS.some((provider) => provider.id === id)) throw new Error(`Unknown provider: ${id}`);
+  if (process.platform === "win32" && !EXECUTION_ADAPTERS.some((adapter) => adapter.executable === id)) throw new Error(`Unknown provider: ${id}`);
   let supervisor = process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH;
   if (!supervisor && process.platform === "win32") {
     const manifest = JSON.parse(readFileSync(new URL("./bin/agent-supervisor.json", import.meta.url), "utf8"));
@@ -119,8 +117,13 @@ async function forceProbeCleanup(child, command) {
   child.kill("SIGKILL");
 }
 
-export function createProviderDiscovery({ probe = defaultProbe, onChange = () => {}, refreshMs = 30_000, schedule = setInterval, cancel = clearInterval } = {}) {
-  let snapshot = PROVIDERS.map((provider) => ({ ...provider, available: false, version: "", checking: true }));
+// A provider is ready only when it is both available and compatible. Each
+// snapshot entry carries the adapter's versioned capabilities so the UI can
+// explain an unavailable or incompatible provider before anything is queued.
+export function createProviderDiscovery({ probe = defaultProbe, onChange = () => {}, refreshMs = 30_000, schedule = setInterval, cancel = clearInterval, adapters = EXECUTION_ADAPTERS, environment = process.env } = {}) {
+  const providerEntries = adapters.map((adapter) => ({ adapter, description: describeAdapter(adapter), id: adapter.id }));
+  const ready = (entry) => entry?.available === true && entry.compatible === true;
+  let snapshot = providerEntries.map(({ description }) => ({ ...description, available: false, compatible: false, version: "", reason: "", checking: true }));
   const pending = new Map();
   const controllers = new Map();
   const lastChecked = new Map();
@@ -130,21 +133,32 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
   let closed = false;
 
   function probeProvider(id, force = false) {
-    const provider = PROVIDERS.find((item) => item.id === id);
+    const provider = providerEntries.find((item) => item.id === id);
     if (!provider) return Promise.resolve(false);
     if (pending.has(id)) return pending.get(id);
     if (cleanupErrors.has(id)) return Promise.resolve(false);
-    if (!force && lastChecked.has(id) && Date.now() - lastChecked.get(id) < refreshMs) return Promise.resolve(snapshot.find((item) => item.id === id)?.available === true);
+    if (!force && lastChecked.has(id) && Date.now() - lastChecked.get(id) < refreshMs) return Promise.resolve(ready(snapshot.find((item) => item.id === id)));
     const controller = new AbortController();
     controllers.set(id, controller);
+    const { adapter, description } = provider;
     const task = (async () => {
       let next;
       try {
-        const version = await probe(id, { signal: controller.signal });
-        next = { ...provider, available: true, version: String(version).trim(), checking: false };
+        let version;
+        if (adapter.kind === "harness") {
+          version = adapter.parseVersion(await probe(adapter.executable, { signal: controller.signal }));
+        } else {
+          // A direct provider is detected from its own credential reference,
+          // never from a harness login or subprocess.
+          const detected = adapter.detect(environment);
+          if (!detected.available) throw Object.assign(new Error(detected.reason), { reason: detected.reason });
+          version = detected.version;
+        }
+        next = { ...description, available: true, ...versionCompatibility(adapter, version), checking: false };
       } catch (error) {
         if (error?.code === "OUTRIGHT_PROBE_CLEANUP_UNCERTAIN") cleanupErrors.set(id, error);
-        next = { ...provider, available: false, version: "", checking: false };
+        next = { ...description, available: false, compatible: false, version: "",
+          reason: error?.reason ?? `${adapter.label} CLI is not available`, checking: false };
       }
       if (!closed) {
         const index = snapshot.findIndex((item) => item.id === id);
@@ -153,7 +167,7 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
         lastChecked.set(id, Date.now());
         if (changed) onChange(snapshot);
       }
-      return next.available;
+      return ready(next);
     })().finally(() => { if (pending.get(id) === task) pending.delete(id); if (controllers.get(id) === controller) controllers.delete(id); });
     pending.set(id, task);
     return task;
@@ -161,7 +175,7 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
 
   async function refresh(force = false) {
     if (closed) return Promise.resolve(snapshot);
-    await Promise.all(PROVIDERS.map((provider) => probeProvider(provider.id, force)));
+    await Promise.all(providerEntries.map((provider) => probeProvider(provider.id, force)));
     return snapshot;
   }
 

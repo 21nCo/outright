@@ -499,6 +499,7 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
 .setting-row > span:first-child { display: flex; align-items: center; gap: 5px; color: var(--muted-foreground); font-size: 10px; font-weight: 600; }
 .setting-row > span:first-child svg { width: 13px; height: 13px; }
 .setting-row > select, .setting-row > input:not([type="checkbox"]) { width: 100%; }
+.provider-status { grid-column: 1 / -1; margin: -4px 0 0; color: var(--muted-foreground); font-size: 11px; overflow-wrap: anywhere; }
 .switch-row { height: 34px; display: flex; align-items: center; gap: 7px; color: var(--foreground); font-size: 11px; }
 .template-settings { padding-top: 15px; border-top: 1px solid var(--line-soft); }
 .template-settings > header strong, .template-settings > header h3 { display: block; margin: 0; font-size: 11px; font-weight: 700; }

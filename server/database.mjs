@@ -7,6 +7,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import { foldFindText } from "../src/lib/find-text.js";
+import { EXECUTION_ADAPTER_IDS } from "./execution-adapters/index.mjs";
 import { RESOURCE_BUDGETS, RETAINED_MESSAGE_FIELDS, RETAINED_ROW_OVERHEAD_BYTES } from "./resource-budgets.mjs";
 import { allocatedDatabaseUsage, archiveShadowPaths, beginArchiveShadow, recoverArchiveShadow } from "./archive-shadow.mjs";
 import { readRunOutcome, removeRunOutcome, saveRunOutcome } from "./run-outcome-journal.mjs";
@@ -53,7 +54,7 @@ const RETAINED_COLUMNS = [
 const RUN_RETAINED_FIELDS = RETAINED_COLUMNS.find(([name]) => name === "runs")[1];
 
 const SETTING_RULES = {
-  provider: (value) => typeof value === "string" && ["codex", "claude"].includes(value),
+  provider: (value) => EXECUTION_ADAPTER_IDS.includes(value),
   model: (value) => typeof value === "string" && value.length <= 200,
   reasoningEffort: (value) => ["low", "medium", "high", "xhigh"].includes(value),
   approvalPolicy: (value) => ["read-only", "workspace-write", "danger-full-access"].includes(value),
@@ -845,6 +846,7 @@ export function createOutrightDatabase(options = {}) {
       return db.prepare(`SELECT ${conversationColumns()} FROM conversations WHERE id = ? AND deleting = 0`).get(id);
     },
     createConversation(input) {
+      validateConversationExecution(input);
       if (retainedBytes(db) >= this.getSettings().maxRetainedMiB * 1024 * 1024) {
         throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
       }
@@ -859,12 +861,16 @@ export function createOutrightDatabase(options = {}) {
     updateConversation(id, patch) {
       const { current, archiveOnly } = validateConversationPatch(db, this, id, patch);
       if (archiveOnly && current?.archived) return this.getConversation(id);
+      // A native session belongs to the provider that created it. Switching
+      // providers starts a new session unless the same edit attaches one.
+      const effective = patch.provider !== undefined && current && patch.provider !== current.provider && patch.providerSessionId === undefined
+        ? { ...patch, providerSessionId: null } : patch;
       const fields = [];
       const values = [];
       for (const [key, column] of Object.entries({ title: "title", provider: "provider", model: "model", archived: "archived", pinned: "pinned", providerSessionId: "provider_session_id", tabPosition: "tab_position" })) {
-        if (patch[key] === undefined) continue;
+        if (effective[key] === undefined) continue;
         fields.push(`${column} = ?`);
-        values.push(typeof patch[key] === "boolean" ? Number(patch[key]) : patch[key]);
+        values.push(typeof effective[key] === "boolean" ? Number(effective[key]) : effective[key]);
       }
       if (fields.length) {
         fields.push("updated_at = ?");
@@ -2204,9 +2210,16 @@ function markArchivedForDeletion(db, id, automatic, cutoff) {
   }).immediate();
 }
 
+function validateConversationExecution(input) {
+  if (input.provider != null && input.provider !== "" && !EXECUTION_ADAPTER_IDS.includes(input.provider)) throw databaseError(400, "Provider is not supported");
+  if (input.model != null && (typeof input.model !== "string" || input.model.length > 200)) throw databaseError(400, "Model must be 200 characters or fewer");
+}
+
 function validateConversationPatch(db, api, id, patch) {
-  const current = db.prepare("SELECT archived, deleting FROM conversations WHERE id = ?").get(id);
+  const current = db.prepare("SELECT archived, deleting, provider FROM conversations WHERE id = ?").get(id);
   if (current?.deleting) throw databaseError(409, "Archived conversation deletion is in progress");
+  if (patch.provider !== undefined && !EXECUTION_ADAPTER_IDS.includes(patch.provider)) throw databaseError(400, "Provider is not supported");
+  validateConversationExecution({ model: patch.model });
   if (patch.archived !== undefined && typeof patch.archived !== "boolean") {
     throw databaseError(400, "Conversation archived state must be a boolean");
   }

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildExecutionLaunch, requireExecutionAdapter } from "./execution-adapters/index.mjs";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
 import { RESOURCE_BUDGETS, retainedTranscriptMessageBytes } from "./resource-budgets.mjs";
 
@@ -13,6 +14,7 @@ const MAX_ASSISTANT_EVENT_BYTES = 255 * 1024;
 const MAX_RUN_TRANSCRIPT_ITEMS = RESOURCE_BUDGETS.maxRunTranscriptItems;
 const MAX_RUN_TRANSCRIPT_BYTES = RESOURCE_BUDGETS.maxRunTranscriptBytes;
 const MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES = 16 * 1024;
+const MAX_PROVIDER_FAILURE_BYTES = 4 * 1024;
 const ASSISTANT_TRUNCATION_MARKER = "\n\n[Output truncated by Outright at 1 MiB]";
 // Assistant checkpoints are coalesced: a new durable checkpoint is written
 // only after this many new stream bytes (or this much time) accumulate, so a
@@ -357,7 +359,7 @@ function freezeTerminalOutcome(state, exitCode, error) {
   else if (successful) status = "completed";
   state.terminalOutcome = {
     status,
-    message: error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : ""),
+    message: error?.message || (!successful ? state.providerFailure || state.stderr.trim() || `Agent exited with code ${exitCode}` : ""),
     finishedAt: new Date().toISOString(),
     exitCode,
   };
@@ -615,12 +617,14 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if (!line.trim()) return;
     let raw;
     try { raw = JSON.parse(line); }
-    catch {
+    catch { raw = null; }
+    // Adapters normalize JSON records only; any other line is plain output.
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
       emit(state.run.id, "process.stdout", { text: truncateUtf8(line, MAX_PROCESS_EVENT_BYTES), truncated: Buffer.byteLength(line) > MAX_PROCESS_EVENT_BYTES });
       return;
     }
-    const events = state.run.provider === "claude" ? normalizeClaude(raw) : normalizeCodex(raw);
-    for (const event of events) {
+    state.adapter ??= requireExecutionAdapter(state.run.provider);
+    for (const event of state.adapter.normalize(raw)) {
       let checkpointDelta = null;
       if (event.type === "session") {
         if (typeof event.payload.sessionId !== "string" || Buffer.byteLength(event.payload.sessionId) > 4096) continue;
@@ -649,9 +653,15 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       if (event.type === "usage") {
         // Provider usage is optional telemetry. A quota refusal must not
         // escape the stdout listener and terminate supervision of every run.
-        try { database.updateRun(state.run.id, event.payload); }
+        // Native details stay in the emitted event, not in run columns.
+        const usage = Object.fromEntries(["inputTokens", "outputTokens", "costUsd"]
+          .filter((key) => Number.isFinite(event.payload[key])).map((key) => [key, event.payload[key]]));
+        try { if (Object.keys(usage).length) database.updateRun(state.run.id, usage); }
         catch (error) { if (error.statusCode !== 507) throw error; }
       }
+      // A provider-reported failure explains a nonzero exit better than
+      // stderr noise; it never turns a successful exit into a failure.
+      if (event.type === "provider.failure") state.providerFailure = truncateUtf8(event.payload.message ?? "", MAX_PROVIDER_FAILURE_BYTES);
       const emittedPayload = ["assistant.delta", "assistant.message"].includes(event.type)
         ? { ...event.payload, text: truncateUtf8(event.payload.text ?? "", MAX_ASSISTANT_EVENT_BYTES), truncated: Buffer.byteLength(event.payload.text ?? "") > MAX_ASSISTANT_EVENT_BYTES }
         : event.payload;
@@ -891,8 +901,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     authorize?.();
     // Recovery retry explicitly asks for a new provider session even when
     // the conversation still advertises the interrupted one.
+    // A native session belongs to the provider that created it. Never hand
+    // another provider's resume token to this run's adapter.
     if (entry.providerSessionId !== undefined) state.conversation = { ...current, providerSessionId: entry.providerSessionId };
-    else if (entry.forceFreshSession) state.conversation = { ...current, providerSessionId: null };
+    else if (entry.forceFreshSession || current.provider !== entry.run.provider) state.conversation = { ...current, providerSessionId: null };
     else state.conversation = current;
     return { authorize };
   }
@@ -1580,71 +1592,7 @@ function boundedToolPayload(runId, item) {
 }
 
 export function buildProviderCommand(conversation, run) {
-  if (run.provider === "claude") {
-    const args = ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-prompts", "none"];
-    const mode = { "read-only": "plan", "workspace-write": "acceptEdits", "danger-full-access": "bypassPermissions" }[run.approvalPolicy] ?? "acceptEdits";
-    args.push("--permission-mode", mode);
-    if (run.model) args.push("--model", run.model);
-    if (validReasoningEffort(run.reasoningEffort)) args.push("--effort", run.reasoningEffort);
-    if (conversation.providerSessionId) args.push("--resume", conversation.providerSessionId);
-    args.push(run.prompt);
-    return { executable: "claude", args, display: ["claude", "-p", "…", "--permission-mode", mode].join(" ") };
-  }
-
-  if (conversation.providerSessionId) {
-    const args = ["exec", "resume", "--json"];
-    if (run.model) args.push("--model", run.model);
-    if (validReasoningEffort(run.reasoningEffort)) args.push("-c", `model_reasoning_effort=${JSON.stringify(run.reasoningEffort)}`);
-    if (run.approvalPolicy === "danger-full-access") args.push("--dangerously-bypass-approvals-and-sandbox");
-    else args.push("-c", `sandbox_mode=${JSON.stringify(validSandbox(run.approvalPolicy))}`);
-    args.push(conversation.providerSessionId, run.prompt);
-    return { executable: "codex", args, display: "codex exec resume --json …" };
-  }
-  const sandbox = ["read-only", "workspace-write", "danger-full-access"].includes(run.approvalPolicy) ? run.approvalPolicy : "workspace-write";
-  const args = ["exec", "--json", "-C", conversation.worktreePath, "--sandbox", sandbox];
-  if (run.model) args.push("--model", run.model);
-  if (validReasoningEffort(run.reasoningEffort)) args.push("-c", `model_reasoning_effort=${JSON.stringify(run.reasoningEffort)}`);
-  args.push(run.prompt);
-  return { executable: "codex", args, display: `codex exec --json --sandbox ${sandbox} …` };
-}
-
-export function normalizeCodex(raw) {
-  const events = [];
-  if (raw.type === "thread.started" && raw.thread_id) events.push({ type: "session", payload: { sessionId: raw.thread_id } });
-  if (raw.type === "item.started") events.push({ type: "tool.started", payload: { item: raw.item } });
-  if (raw.type === "item.completed") {
-    const item = raw.item ?? {};
-    if (item.type === "agent_message" && item.text) events.push({ type: "assistant.message", payload: { text: item.text } });
-    else events.push({ type: "tool.completed", payload: { item } });
-  }
-  if (raw.type === "turn.completed" && raw.usage) events.push({ type: "usage", payload: { inputTokens: raw.usage.input_tokens, outputTokens: raw.usage.output_tokens } });
-  if (!events.length) events.push({ type: "provider.event", payload: raw });
-  return events;
-}
-
-export function normalizeClaude(raw) {
-  const events = [];
-  if (raw.type === "system" && raw.subtype === "init" && raw.session_id) events.push({ type: "session", payload: { sessionId: raw.session_id } });
-  const delta = raw.event?.delta;
-  if (raw.type === "stream_event" && delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
-    events.push({ type: "assistant.delta", payload: { text: delta.text } });
-  }
-  if (raw.type === "assistant") {
-    for (const block of raw.message?.content ?? []) {
-      if (block.type === "tool_use") events.push({ type: "tool.started", payload: { item: block } });
-    }
-  }
-  if (raw.type === "user") {
-    for (const block of raw.message?.content ?? []) {
-      if (block.type === "tool_result") events.push({ type: "tool.completed", payload: { item: block } });
-    }
-  }
-  if (raw.type === "result") {
-    if (raw.result && !events.some((event) => event.type === "assistant.delta")) events.push({ type: "assistant.message", payload: { text: raw.result } });
-    events.push({ type: "usage", payload: { costUsd: raw.total_cost_usd, inputTokens: raw.usage?.input_tokens, outputTokens: raw.usage?.output_tokens } });
-  }
-  if (!events.length && raw.type !== "stream_event") events.push({ type: "provider.event", payload: raw });
-  return events;
+  return buildExecutionLaunch({ conversation, run, sessionId: conversation.providerSessionId });
 }
 
 function assertPrivateLaunchDirectory(directory) {
@@ -1695,12 +1643,4 @@ export function hardenWindowsLaunchDirectory(directory, run = spawnSync, environ
 function sanitizedEnvironment(environment) {
   const blocked = /^(OUTRIGHT_|VITE_|npm_|NODE_OPTIONS$)/i;
   return Object.fromEntries(Object.entries(environment).filter(([key, value]) => value != null && !blocked.test(key)));
-}
-
-function validReasoningEffort(value) {
-  return ["low", "medium", "high", "xhigh"].includes(value);
-}
-
-function validSandbox(value) {
-  return ["read-only", "workspace-write"].includes(value) ? value : "workspace-write";
 }
