@@ -1,0 +1,21 @@
+server/agent-supervisor-darwin.c
+  s_fd2012bf034554::t_34df003c260b8b 6,303,305-328,384-387,417-423,427,449,455,811-823,827-828,831,836-846,861,867-878,885-888,909-914,964
+server/subprocess-budget.test.mjs
+  s_fd2012bf034554::t_b53be47eb25357 26-34,780,840-904
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ca85534759e206ddb3625c64d9dc976665c8119c",
+  "prompts": {},
+  "sessions": {
+    "s_fd2012bf034554": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bba569bd-afce-4b37-bbb1-2a85837124dd",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
