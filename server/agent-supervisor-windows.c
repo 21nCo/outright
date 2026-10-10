@@ -1,9 +1,127 @@
+#define _WIN32_WINNT 0x0602
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <io.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
+
+#pragma comment(lib, "advapi32.lib")
+
+#define UTILITY_TREE_EMPTY "__OUTRIGHT_UTILITY_TREE_EMPTY_V1__\n"
+#define UTILITY_JOB_PREFIX L"Local\\OutrightUtility-"
+static bool utility_proof_enabled = false;
+static const wchar_t *utility_job_name = NULL;
+static const wchar_t *utility_empty_marker = NULL;
+
+static void ignore_invalid_descriptor(const wchar_t *expression, const wchar_t *function,
+    const wchar_t *file, unsigned int line, uintptr_t reserved) {
+  (void)expression; (void)function; (void)file; (void)line; (void)reserved;
+}
+
+// Windows volumes may report ino=0 to Node. Compare native file IDs before
+// treating two pathnames as a hard-link pair or skipping a second byte lock.
+// Unknown identity is never evidence that two paths are the same file.
+static int compare_file_handles(HANDLE left, HANDLE right) {
+  FILE_ID_INFO first = {0}, second = {0};
+  if (GetFileInformationByHandleEx(left, FileIdInfo, &first, sizeof(first))
+    && GetFileInformationByHandleEx(right, FileIdInfo, &second, sizeof(second))) {
+    unsigned char zero[sizeof(first.FileId.Identifier)] = {0};
+    if (memcmp(first.FileId.Identifier, zero, sizeof(zero)) != 0
+      && memcmp(second.FileId.Identifier, zero, sizeof(zero)) != 0) {
+      return first.VolumeSerialNumber == second.VolumeSerialNumber
+        && memcmp(first.FileId.Identifier, second.FileId.Identifier, sizeof(zero)) == 0;
+    }
+  }
+  BY_HANDLE_FILE_INFORMATION a = {0}, b = {0};
+  if (!GetFileInformationByHandle(left, &a) || !GetFileInformationByHandle(right, &b)
+    || (!a.nFileIndexHigh && !a.nFileIndexLow)
+    || (!b.nFileIndexHigh && !b.nFileIndexLow)) return -1;
+  return a.dwVolumeSerialNumber == b.dwVolumeSerialNumber
+    && a.nFileIndexHigh == b.nFileIndexHigh && a.nFileIndexLow == b.nFileIndexLow;
+}
+
+static int same_file(int argc, wchar_t **argv) {
+  if (argc != 4) return 64;
+  HANDLE left = CreateFileW(argv[2], FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (left == INVALID_HANDLE_VALUE) return 4;
+  HANDLE right = CreateFileW(argv[3], FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (right == INVALID_HANDLE_VALUE) { CloseHandle(left); return 4; }
+  int comparison = compare_file_handles(left, right);
+  CloseHandle(right);
+  CloseHandle(left);
+  return comparison == 1 ? 0 : comparison == 0 ? 3 : 4;
+}
+
+// Hold SQLite's Windows lock-byte range with a handle that permits rename.
+// SQLite's own handles omit FILE_SHARE_DELETE, so they cannot be retained
+// across archive promotion. The parent rechecks both files after this helper
+// acquires the lock and before any rename.
+static int archive_lock(int argc, wchar_t **argv) {
+  if (argc < 6) return 64;
+  wchar_t *end = NULL;
+  unsigned long parent_pid = wcstoul(argv[2], &end, 10);
+  if (!parent_pid || end == argv[2] || *end != L'\0') return 64;
+  HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, parent_pid);
+  if (!parent) return 70;
+  HANDLE *files = calloc((size_t)(argc - 5), sizeof(HANDLE));
+  if (!files) { CloseHandle(parent); return 72; }
+  int held = 0;
+  int result = 0;
+  for (int index = 5; index < argc; index++) {
+    HANDLE file = CreateFileW(argv[index], GENERIC_READ | GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) { result = 73; break; }
+    bool duplicate = false;
+    for (int previous = 0; previous < held; previous++) {
+      if (compare_file_handles(files[previous], file) == 1) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (duplicate) { CloseHandle(file); continue; }
+    OVERLAPPED overlap = {0};
+    overlap.Offset = 0x40000000;
+    if (!LockFileEx(file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+        0, 512, 0, &overlap)) { CloseHandle(file); result = 74; break; }
+    files[held++] = file;
+  }
+  HANDLE ready = CreateFileW(argv[3], GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, CREATE_NEW,
+    FILE_ATTRIBUTE_NORMAL, NULL);
+  if (ready == INVALID_HANDLE_VALUE) result = result ? result : 75;
+  else {
+    char status[16];
+    int length = snprintf(status, sizeof(status), "%d", result);
+    DWORD written = 0;
+    if (!WriteFile(ready, status, (DWORD)length, &written, NULL)
+      || written != (DWORD)length || !FlushFileBuffers(ready)) result = 76;
+    CloseHandle(ready);
+  }
+  // The pipe's only writer belongs to the archive worker thread. A worker
+  // termination closes it even if the runtime process remains alive. The
+  // private stop marker handles normal synchronous release; the process
+  // handle covers a hard runtime exit.
+  HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+  while (WaitForSingleObject(parent, 10) == WAIT_TIMEOUT) {
+    if (GetFileAttributesW(argv[4]) != INVALID_FILE_ATTRIBUTES) break;
+    if (input == NULL || input == INVALID_HANDLE_VALUE
+      || !PeekNamedPipe(input, NULL, 0, NULL, NULL, NULL)) break;
+  }
+  for (int index = held - 1; index >= 0; index--) CloseHandle(files[index]);
+  free(files);
+  CloseHandle(parent);
+  DeleteFileW(argv[3]);
+  // The stop marker belongs to this same lock lifetime. Removing it after
+  // the ready marker keeps an interrupted JS worker from leaking artifacts.
+  DeleteFileW(argv[4]);
+  return result;
+}
 
 static wchar_t *quote_argument(const wchar_t *value) {
   size_t length = wcslen(value);
@@ -56,33 +174,320 @@ static wchar_t *command_line(int argc, wchar_t **argv, int first_argument) {
   return line;
 }
 
+// The runtime owns the only writer of this control pipe. Closing it on a hard
+// runtime exit tears down the Job Object; an explicit stop uses the same path.
+// The supervisor remains alive until the kernel reports zero job members.
+static DWORD WINAPI watch_owner(void *raw_job) {
+  HANDLE job = (HANDLE)raw_job;
+  HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+  if (input == NULL || input == INVALID_HANDLE_VALUE) {
+    TerminateJobObject(job, 137);
+    return 0;
+  }
+  char buffer[32];
+  DWORD count = 0;
+  // Only the runtime holds the write end. Any command means stop; this also
+  // handles a control message split across pipe reads.
+  ReadFile(input, buffer, sizeof(buffer), &count, NULL);
+  TerminateJobObject(job, 137);
+  return 0;
+}
+
+static unsigned long long process_birth(HANDLE process) {
+  FILETIME created, exited, kernel, user;
+  if (!GetProcessTimes(process, &created, &exited, &kernel, &user)) return 0;
+  return ((unsigned long long)created.dwHighDateTime << 32) | created.dwLowDateTime;
+}
+
+static int inspect_owner(int argc, wchar_t **argv) {
+  bool identity = wcscmp(argv[1], L"--identity") == 0;
+  bool terminate = wcscmp(argv[1], L"--terminate") == 0;
+  if ((identity && argc != 3) || (!identity && argc != 4)) return 64;
+  wchar_t *end = NULL;
+  unsigned long pid = wcstoul(argv[2], &end, 10);
+  if (pid == 0 || end == argv[2] || *end != L'\0') return 64;
+  unsigned long long expected = 0;
+  if (!identity) {
+    end = NULL;
+    expected = _wcstoui64(argv[3], &end, 10);
+    if (expected == 0 || end == argv[3] || *end != L'\0') return 64;
+  }
+  DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+  if (terminate) access |= PROCESS_TERMINATE;
+  HANDLE process = OpenProcess(access, FALSE, (DWORD)pid);
+  if (!process) {
+    if (GetLastError() == ERROR_INVALID_PARAMETER) { wprintf(L"absent\n"); return 3; }
+    wprintf(L"unknown\n"); return 4;
+  }
+  unsigned long long birth = process_birth(process);
+  if (birth == 0) { CloseHandle(process); wprintf(L"unknown\n"); return 4; }
+  if (identity) { wprintf(L"%llu\n", birth); CloseHandle(process); return 0; }
+  if (birth != expected || WaitForSingleObject(process, 0) == WAIT_OBJECT_0) {
+    CloseHandle(process); wprintf(L"absent\n"); return 3;
+  }
+  if (terminate) {
+    if (!TerminateProcess(process, 137) || WaitForSingleObject(process, 5000) != WAIT_OBJECT_0) {
+      CloseHandle(process); wprintf(L"unknown\n"); return 4;
+    }
+    CloseHandle(process); wprintf(L"exited\n"); return 0;
+  }
+  CloseHandle(process); wprintf(L"alive\n"); return 0;
+}
+
+static bool valid_utility_job(const wchar_t *name) {
+  const wchar_t *prefix = UTILITY_JOB_PREFIX;
+  size_t start = wcslen(prefix);
+  if (wcsncmp(name, prefix, start) != 0 || wcslen(name + start) != 36) return false;
+  for (size_t index = 0; index < 36; index++) {
+    wchar_t value = name[start + index];
+    if (index == 8 || index == 13 || index == 18 || index == 23) {
+      if (value != L'-') return false;
+    } else if (!((value >= L'0' && value <= L'9') || (value >= L'a' && value <= L'f'))) return false;
+  }
+  return true;
+}
+
+static int inspect_utility_job(int argc, wchar_t **argv) {
+  if (argc != 3 || !valid_utility_job(argv[2])) return 64;
+  bool terminate = wcscmp(argv[1], L"--utility-terminate") == 0;
+  HANDLE job = OpenJobObjectW(JOB_OBJECT_QUERY | (terminate ? JOB_OBJECT_TERMINATE : 0), FALSE, argv[2]);
+  if (!job) {
+    if (GetLastError() == ERROR_FILE_NOT_FOUND) { wprintf(L"absent\n"); return 3; }
+    wprintf(L"unknown\n"); return 4;
+  }
+  if (terminate && !TerminateJobObject(job, 137)) {
+    CloseHandle(job); wprintf(L"unknown\n"); return 4;
+  }
+  JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting = {0};
+  bool empty = false;
+  for (int attempt = 0; attempt < (terminate ? 200 : 1); attempt++) {
+    if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+        &accounting, sizeof(accounting), NULL)) break;
+    if (accounting.ActiveProcesses == 0) { empty = true; break; }
+    if (terminate) Sleep(25);
+  }
+  CloseHandle(job);
+  if (!empty && terminate) { wprintf(L"unknown\n"); return 4; }
+  wprintf(L"%ls\n", empty ? L"exited" : L"alive");
+  return empty ? 3 : 0;
+}
+
+// The prefetcher's boot counter changes on every boot. Recovery compares it
+// before any PID check because PIDs are reused across boots.
+static bool boot_identity(char *identity, size_t size) {
+  DWORD boot = 0;
+  DWORD length = sizeof(boot);
+  if (RegGetValueW(HKEY_LOCAL_MACHINE,
+      L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters",
+      L"BootId", RRF_RT_REG_DWORD, NULL, &boot, &length) != ERROR_SUCCESS) return false;
+  int written = snprintf(identity, size, "windows-boot:%lu", (unsigned long)boot);
+  return written > 0 && (size_t)written < size;
+}
+
+static int print_boot_identity(int argc) {
+  if (argc != 2) return 64;
+  char identity[64];
+  if (!boot_identity(identity, sizeof(identity))) { wprintf(L"unknown\n"); return 4; }
+  printf("%s\n", identity);
+  return 0;
+}
+
+// The marker lives beside the runtime's owner record and is named for the
+// same owner UUID as the job. "-" means the caller keeps no durable record.
+static bool valid_empty_marker(const wchar_t *marker, const wchar_t *job) {
+  if (wcscmp(marker, L"-") == 0) return true;
+  size_t length = wcslen(marker);
+  const wchar_t *owner = job + wcslen(UTILITY_JOB_PREFIX);
+  bool drive = length > 3 && marker[1] == L':' && (marker[2] == L'\\' || marker[2] == L'/');
+  bool unc = length > 2 && marker[0] == L'\\' && marker[1] == L'\\';
+  if (!drive && !unc) return false;
+  const wchar_t *name = marker + length;
+  while (name > marker && name[-1] != L'\\' && name[-1] != L'/') name--;
+  return wcslen(name) == 42 && wcsncmp(name, owner, 36) == 0 && wcscmp(name + 36, L".empty") == 0;
+}
+
+// Written only for a job this supervisor created, after the kernel reported
+// zero members, and before the live proof frame, so a restarted runtime that
+// can no longer open the Local\ job name still has identity-bound evidence.
+static void write_empty_marker(void) {
+  if (!utility_job_name || !utility_empty_marker || wcscmp(utility_empty_marker, L"-") == 0) return;
+  char boot[64];
+  if (!boot_identity(boot, sizeof(boot))) strcpy_s(boot, sizeof(boot), "unknown");
+  char content[192];
+  int length = snprintf(content, sizeof(content), "%.*s ", (int)(sizeof(UTILITY_TREE_EMPTY) - 2), UTILITY_TREE_EMPTY);
+  for (const wchar_t *cursor = utility_job_name; *cursor && length < (int)sizeof(content) - 1; cursor++) content[length++] = (char)*cursor;
+  int tail = snprintf(content + length, sizeof(content) - (size_t)length, " %s\n", boot);
+  if (length <= 0 || tail <= 0 || (size_t)(length + tail) >= sizeof(content)) return;
+  length += tail;
+  HANDLE marker = CreateFileW(utility_empty_marker, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
+  if (marker == INVALID_HANDLE_VALUE) return;
+  DWORD written = 0;
+  bool durable = WriteFile(marker, content, (DWORD)length, &written, NULL)
+    && written == (DWORD)length && FlushFileBuffers(marker);
+  CloseHandle(marker);
+  // A partial marker is not evidence; the reservation stays charged.
+  if (!durable) DeleteFileW(utility_empty_marker);
+}
+
+static bool utility_start_authorized(void) {
+  HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+  if (input == NULL || input == INVALID_HANDLE_VALUE) return false;
+  char command[3];
+  DWORD used = 0;
+  while (used < sizeof(command)) {
+    DWORD count = 0;
+    if (!ReadFile(input, command + used, (DWORD)sizeof(command) - used, &count, NULL) || count == 0) return false;
+    used += count;
+  }
+  return memcmp(command, "go\n", sizeof(command)) == 0;
+}
+
+static bool job_empty(HANDLE job) {
+  JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting = {0};
+  return job && QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), NULL)
+    && accounting.ActiveProcesses == 0;
+}
+
+// The marker and the empty-tree frame, which the runtime reads through
+// utilityOwnerReleased in subprocess-budget.mjs. Their only two sources:
+// this supervisor's own new job observed with zero members, or a failed job
+// creation before anything was launched. An existing named job is never
+// evidence.
+static void write_tree_empty_proof(void) {
+  write_empty_marker();
+  intptr_t descriptor = _get_osfhandle(3);
+  DWORD written = 0;
+  if (descriptor != -1)
+    WriteFile((HANDLE)descriptor, UTILITY_TREE_EMPTY, sizeof(UTILITY_TREE_EMPTY) - 1, &written, NULL);
+}
+
+static void prove_own_job_empty(HANDLE own_job) {
+  if (utility_proof_enabled && job_empty(own_job)) write_tree_empty_proof();
+}
+
+static int utility_prelaunch_exit(HANDLE own_job, int code) {
+  prove_own_job_empty(own_job);
+  if (own_job) CloseHandle(own_job);
+  return code;
+}
+
+// A launched tree is abandoned through its own job, and proven only after the
+// kernel reports that job empty within a bounded wait.
+static int utility_abandon_exit(HANDLE own_job, UINT job_exit, int code) {
+  if (!TerminateJobObject(own_job, job_exit)) return code;
+  for (int attempt = 0; attempt < 200 && !job_empty(own_job); attempt++) Sleep(25);
+  return utility_prelaunch_exit(own_job, code);
+}
+
 int wmain(int argc, wchar_t **argv) {
+  _set_invalid_parameter_handler(ignore_invalid_descriptor);
   if (argc < 2) return 64;
+  if (wcscmp(argv[1], L"--same-file") == 0) return same_file(argc, argv);
+  if (wcscmp(argv[1], L"--archive-lock") == 0) return archive_lock(argc, argv);
+  if (wcscmp(argv[1], L"--identity") == 0 || wcscmp(argv[1], L"--probe") == 0
+      || wcscmp(argv[1], L"--terminate") == 0) return inspect_owner(argc, argv);
+  if (wcscmp(argv[1], L"--utility-probe") == 0 || wcscmp(argv[1], L"--utility-terminate") == 0)
+    return inspect_utility_job(argc, argv);
+  if (wcscmp(argv[1], L"--boot-identity") == 0) return print_boot_identity(argc);
   bool test_mode = wcscmp(argv[1], L"--test-runner") == 0;
+  bool utility_mode = wcscmp(argv[1], L"--utility-owner") == 0;
+  utility_proof_enabled = utility_mode;
   if (test_mode && argc < 4) return 64;
-  HANDLE job = CreateJobObjectW(NULL, NULL);
-  if (!job) return 70;
+  if (utility_mode && (argc < 5 || !valid_utility_job(argv[2]) || !valid_empty_marker(argv[3], argv[2])
+      || GetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", NULL, 0) == 0)) return 64;
+  if (utility_mode) {
+    utility_job_name = argv[2];
+    utility_empty_marker = argv[3];
+  }
+  HANDLE job = CreateJobObjectW(NULL, utility_mode ? argv[2] : NULL);
+  // Another owner's job, whose members this supervisor never started, cannot
+  // prove the recorded tree empty; nor can a name it may not open.
+  if (!job && utility_mode && GetLastError() == ERROR_ACCESS_DENIED) return 69;
+  // Without a job nothing was launched: the recorded tree is this process
+  // alone, and it ends with this exit.
+  if (!job) {
+    if (utility_proof_enabled) write_tree_empty_proof();
+    return 70;
+  }
+  if (utility_mode && GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(job); return 69; }
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
   limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-  if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return 71;
+  if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return utility_prelaunch_exit(job, 71);
 
-  wchar_t *line = command_line(argc, argv, test_mode ? 3 : 1);
-  if (!line) return 72;
+  int first_argument = 1;
+  if (utility_mode) first_argument = 4;
+  else if (test_mode) first_argument = 3;
+  wchar_t *line = command_line(argc, argv, first_argument);
+  if (!line) return utility_prelaunch_exit(job, 72);
+  // The native child owns no control input. Forward only output and error;
+  // sharing the supervisor's stdin would let Git or a helper consume Stop.
+  SECURITY_ATTRIBUTES inherited = {0};
+  inherited.nLength = sizeof(inherited);
+  inherited.bInheritHandle = TRUE;
+  HANDLE null_input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    &inherited, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (null_input == INVALID_HANDLE_VALUE) { free(line); return utility_prelaunch_exit(job, 72); }
+  HANDLE output = NULL, error_output = NULL;
+  HANDLE own_process = GetCurrentProcess();
+  if (!DuplicateHandle(own_process, GetStdHandle(STD_OUTPUT_HANDLE), own_process, &output,
+        0, TRUE, DUPLICATE_SAME_ACCESS)
+      || !DuplicateHandle(own_process, GetStdHandle(STD_ERROR_HANDLE), own_process, &error_output,
+        0, TRUE, DUPLICATE_SAME_ACCESS)) {
+    if (output) CloseHandle(output);
+    CloseHandle(null_input);
+    free(line);
+    return utility_prelaunch_exit(job, 72);
+  }
   STARTUPINFOW startup = {0};
   startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESTDHANDLES;
+  startup.hStdInput = null_input;
+  startup.hStdOutput = output;
+  startup.hStdError = error_output;
+  bool utility_owner = utility_mode;
+  // Most supervisor clients have only the three standard descriptors. The
+  // CRT treats an out-of-range descriptor as an invalid-parameter failure.
+  intptr_t proof_handle = utility_owner ? _get_osfhandle(3) : -1;
+  if (utility_owner && (proof_handle == -1
+      || !SetHandleInformation((HANDLE)proof_handle, HANDLE_FLAG_INHERIT, 0))) {
+    CloseHandle(null_input); CloseHandle(output); CloseHandle(error_output); free(line);
+    return utility_prelaunch_exit(job, 72);
+  }
+  if (utility_mode && !utility_start_authorized()) {
+    CloseHandle(null_input); CloseHandle(output); CloseHandle(error_output); free(line);
+    return utility_prelaunch_exit(job, 0);
+  }
+  // The utility flag belongs to this supervisor, never to Git hooks or
+  // provider grandchildren that may launch an ordinary three-fd supervisor.
+  bool inherited_utility_flag = GetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", NULL, 0) != 0;
+  if (inherited_utility_flag && !SetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", NULL)) {
+    CloseHandle(null_input); CloseHandle(output); CloseHandle(error_output); free(line);
+    return utility_prelaunch_exit(job, 72);
+  }
   PROCESS_INFORMATION process = {0};
-  if (!CreateProcessW(NULL, line, NULL, NULL, TRUE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-      NULL, NULL, &startup, &process)) return 73;
+  BOOL launched = CreateProcessW(NULL, line, NULL, NULL, TRUE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+    NULL, NULL, &startup, &process);
+  if (inherited_utility_flag) SetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", L"1");
+  CloseHandle(null_input);
+  CloseHandle(output);
+  CloseHandle(error_output);
+  if (!launched) { free(line); return utility_prelaunch_exit(job, 73); }
   free(line);
   if (!AssignProcessToJobObject(job, process.hProcess)) {
-    TerminateProcess(process.hProcess, 126);
-    return 74;
+    // The suspended child never ran, so it started nothing. Once it is gone
+    // the own job, which it never joined, holds the whole tree: none.
+    bool gone = TerminateProcess(process.hProcess, 126) && WaitForSingleObject(process.hProcess, 5000) == WAIT_OBJECT_0;
+    return gone ? utility_prelaunch_exit(job, 74) : 74;
   }
-  if (ResumeThread(process.hThread) == (DWORD)-1) {
-    TerminateJobObject(job, 126);
-    return 75;
-  }
+  if (ResumeThread(process.hThread) == (DWORD)-1) return utility_abandon_exit(job, 126, 75);
   CloseHandle(process.hThread);
+
+  if (!test_mode) {
+    HANDLE owner_thread = CreateThread(NULL, 0, watch_owner, job, 0, NULL);
+    if (owner_thread == NULL) return utility_abandon_exit(job, 137, 79);
+    CloseHandle(owner_thread);
+  }
 
   if (test_mode) {
     for (;;) {
@@ -100,11 +505,9 @@ int wmain(int argc, wchar_t **argv) {
   GetExitCodeProcess(process.hProcess, &exit_code);
   CloseHandle(process.hProcess);
 
-  // Test files must not carry helper processes into the next file. Provider
-  // runs retain the normal wait-for-descendants contract below.
-  if (test_mode) {
-    if (!TerminateJobObject(job, exit_code)) return 77;
-  }
+  // A finished direct command must not hold a utility permit indefinitely
+  // through an escaped helper. The Job Object owns and reaps that tree.
+  if ((utility_owner || test_mode) && !TerminateJobObject(job, exit_code)) return 77;
 
   // The job owns descendants even when they detach from the provider. Keep
   // this supervisor alive until the kernel reports that the job is empty.
@@ -114,6 +517,7 @@ int wmain(int argc, wchar_t **argv) {
     if (accounting.ActiveProcesses == 0) break;
     Sleep(25);
   }
+  if (utility_owner) prove_own_job_empty(job);
   CloseHandle(job);
   return (int)exit_code;
 }

@@ -32,16 +32,21 @@ let cancelFile = null;
 let forwardedSignal = null;
 let timedOut = false;
 let escalation;
+let currentFile = null;
+let currentFileStartedAt = 0;
 const requestedTimeout = Number(process.env.OUTRIGHT_TEST_SUITE_TIMEOUT_MS);
 const suiteTimeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
-  ? Math.min(600_000, Math.max(1000, requestedTimeout)) : 600_000;
+  ? Math.min(1_200_000, Math.max(1000, requestedTimeout)) : 1_200_000;
+// The suite owns each file serially. Windows' native and SQLite files consume
+// most of the old 10-minute global budget before the browser file begins;
+// retain a bounded per-file deadline and allow the browser its full turn.
 // The focused 1000px wheel fixture has a 330-second interaction phase and a
 // separate cleanup allowance. Its per-file runner must outlive both.
 const smallWheelCap = Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP);
 const testFileTimeoutMs = smallWheelCap > 0 && smallWheelCap <= 1000 ? 390_000 : 300_000;
 const deadline = setTimeout(() => {
   timedOut = true;
-  console.error(`Test suite timed out after ${suiteTimeoutMs}ms`);
+  console.error(`Test suite timed out after ${suiteTimeoutMs}ms: file=${currentFile ?? "between-files"} fileElapsedMs=${currentFile ? Date.now() - currentFileStartedAt : 0} runner=${child?.pid ?? "none"}`);
   signalRunner("SIGKILL");
 }, suiteTimeoutMs);
 
@@ -103,8 +108,11 @@ async function reapGroup(groupId) {
 }
 
 async function runFile(file) {
+  currentFile = path.basename(file);
+  currentFileStartedAt = Date.now();
   if (process.env.CI) console.error(`CI test runner starting: file=${path.basename(file)} launcher=${process.pid}`);
   const cancelDirectory = windowsSupervisor ? mkdtempSync(path.join(os.tmpdir(), "outright-test-cancel-")) : null;
+  const testDataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-data-"));
   cancelFile = cancelDirectory ? path.join(cancelDirectory, "cancel") : null;
   child = spawn(windowsSupervisor ?? process.execPath, [
     ...(windowsSupervisor ? ["--test-runner", cancelFile, process.execPath] : []),
@@ -112,6 +120,7 @@ async function runFile(file) {
   ], {
     stdio: "inherit",
     detached: process.platform !== "win32",
+    env: { ...process.env, OUTRIGHT_DATA_DIR: testDataDirectory },
   });
   const runner = child;
   const closed = await new Promise((resolve) => {
@@ -128,6 +137,9 @@ async function runFile(file) {
   child = null;
   cancelFile = null;
   if (cancelDirectory) rmSync(cancelDirectory, { recursive: true, force: true });
+  if (groupGone) rmSync(testDataDirectory, { recursive: true, force: true });
+  else console.error(`Preserved test data for unverified runner group: ${testDataDirectory}`);
+  currentFile = null;
   return { groupGone, passed: groupGone && closed.status === 0 && !closed.signal };
 }
 

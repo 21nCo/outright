@@ -1,15 +1,41 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
-import { Readable } from "node:stream";
-import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { PassThrough, Readable } from "node:stream";
+import { execFile, spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAlive, defaultRecoveryProcessIdentity, defaultTerminateRecoveryProcess, runtimeAllowedHosts } from "./outright-runtime.mjs";
 import { createOutrightDatabase } from "./database.mjs";
-import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
+import { AGENT_SUPERVISOR, createAgentManager, LAUNCH_AUTHORIZED_CONTROL } from "./agent-manager.mjs";
+import { createTerminalManager } from "./terminal-manager.mjs";
+import { createSubprocessBudget } from "./subprocess-budget.mjs";
+import { randomUUID } from "node:crypto";
+
+const execFileAsync = promisify(execFile);
+
+// Polls a condition until a deadline, then fails instead of hanging the run.
+async function waitFor(condition, timeoutMs, message) {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) assert.fail(message);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function settledWithin(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    })]);
+  } finally { clearTimeout(timer); }
+}
 
 if (process.env.CI && process.platform !== "win32") {
   const group = spawnSync("/bin/ps", ["-o", "pgid=", "-p", String(process.pid)], { encoding: "utf8", timeout: 1000 });
@@ -28,10 +54,45 @@ function requestStream(method, url, body) {
   stream.method = method;
   stream.url = url;
   stream.headers = { host: "localhost:4173" };
-  if (body != null) stream.push(JSON.stringify(body));
+  if (body !== undefined) stream.push(JSON.stringify(body));
   stream.push(null);
   return stream;
 }
+
+test("retention POST bodies reject null and arrays without deleting archived history", withRuntime(async (runtime) => {
+  const archived = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Keep", provider: "codex" });
+  runtime.database.updateConversation(archived.id, { archived: true });
+  for (const route of ["/api/retention/cleanup", "/api/retention/delete-archived"]) {
+    for (const body of [null, [], "wrong shape"]) {
+      const response = responseCapture();
+      await runtime.handleRequest(requestStream("POST", route, body), response);
+      assert.equal(response.statusCode, 400);
+      assert.ok(runtime.database.getConversation(archived.id));
+    }
+  }
+}));
+
+test("malformed terminal requests refuse before discovery, audit admission, or native launch", withRuntime(async (runtime) => {
+  for (const body of [null, [], "wrong shape", {}, { cwd: "/tmp", name: {} },
+    { cwd: "/tmp", cols: "100" }, { cwd: "/tmp", rows: 1000 }]) {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/terminals", body), response);
+    assert.equal(response.statusCode, 400);
+  }
+  assert.equal(runtime.database.listAudit(100).some((entry) => entry.action === "terminal.create.requested"), false);
+}));
+
+test("conversation detail identifies the exited run awaiting its terminal storage commit", withRuntime(async (runtime) => {
+  const conversation = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Storage recovery", provider: "codex" });
+  const pending = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "finish" });
+  const sibling = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "wait" });
+  runtime.agents.isOutcomePending = (runId) => runId === pending.id;
+  const result = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `/api/conversations/${conversation.id}`), result);
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.runs.find((run) => run.id === pending.id).outcomePending, true);
+  assert.equal(result.body.runs.find((run) => run.id === sibling.id).outcomePending, false);
+}));
 
 function responseCapture() {
   return {
@@ -54,7 +115,9 @@ function withRuntime(fn, options = {}) {
   return async () => {
     const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-"));
     process.env.OUTRIGHT_DATA_DIR = dataDirectory;
-    const runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json", ...options });
+    const { seed, ...runtimeOptions } = options;
+    await seed?.(dataDirectory);
+    const runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json", ...runtimeOptions });
     try {
       // The runtime wires its own database, manager, and event hub, so the
       // recovery endpoint is exercised exactly as in production.
@@ -66,6 +129,981 @@ function withRuntime(fn, options = {}) {
     }
   };
 }
+
+test("the API maintenance gate distinguishes transient archive maintenance from permanent recovery failure on every route", (() => {
+  let failure;
+  return withRuntime(async (runtime) => {
+    for (const [expected, message] of [
+      ["ARCHIVE_MAINTENANCE_TRANSIENT", undefined],
+      ["ARCHIVE_MAINTENANCE_FAILED", "corrupt retained marker"],
+    ]) {
+      failure = message;
+      // The gate runs before routing, so bootstrap and an unrelated route
+      // report the same classification while capacity stays readable.
+      for (const route of ["/api/bootstrap", "/api/settings"]) {
+        const response = responseCapture();
+        await runtime.handleRequest(requestStream("GET", route), response);
+        assert.equal(response.statusCode, 503, route);
+        assert.equal(response.body.code, expected, route);
+        assert.match(response.body.error, message ? /recovery failed: corrupt retained marker/ : /retry shortly/);
+      }
+      const capacity = responseCapture();
+      await runtime.handleRequest(requestStream("GET", "/api/capacity"), capacity);
+      assert.equal(capacity.statusCode, 200);
+    }
+  }, { databaseFactory(options) {
+    const database = createOutrightDatabase(options);
+    return new Proxy(database, { get(target, key, receiver) {
+      if (key === "maintenanceActive") return true;
+      if (key === "capacity") return () => ({ ...target.capacity(), maintenanceError: failure });
+      return Reflect.get(target, key, receiver);
+    } });
+  } });
+})());
+
+// The real reconciliation commits its first batch, then is interrupted. The
+// attempt rejects with the injected error, or with the database's own 503.
+function afterFirstBatch(error = null) {
+  return { afterFirstBatch: true, error };
+}
+
+function withRunRecoveryFaults(faults, fn, { auditRefusal = null, runs = 1 } = {}) {
+  // Each fault rejects one reconciliation attempt. Database callbacks and
+  // queued-run wakeups are captured at the real runtime boundary.
+  const state = { reconcileCalls: 0, resumes: 0, audits: 0, auditDetails: [], callbacks: {}, runId: null };
+  return withRuntime(async (runtime) => fn(runtime, state), {
+    databaseFactory(options) {
+      state.callbacks = options;
+      const database = createOutrightDatabase(options);
+      const reconcile = database.reconcileInterruptedRuns.bind(database);
+      database.reconcileInterruptedRuns = (settings) => {
+        const fault = faults[state.reconcileCalls];
+        state.reconcileCalls += 1;
+        if (fault?.afterFirstBatch) {
+          let checks = 0;
+          const signal = { get aborted() { checks += 1; return checks > 1 || settings.signal.aborted; } };
+          return reconcile({ ...settings, signal }).then(() => assert.fail("the fixture reconciliation was not interrupted"),
+            (error) => { throw fault.error ?? error; });
+        }
+        return fault ? Promise.reject(fault) : reconcile(settings);
+      };
+      const audit = database.audit.bind(database);
+      database.audit = (action, details) => {
+        if (action === "runtime.runs.reconciled") {
+          state.audits += 1;
+          state.auditDetails.push(details);
+          if (auditRefusal) throw auditRefusal;
+        }
+        return audit(action, details);
+      };
+      return database;
+    },
+    agentManagerFactory(options) {
+      const manager = createAgentManager(options);
+      const resume = manager.resumeQueued;
+      manager.resumeQueued = () => { state.resumes += 1; return resume(); };
+      return manager;
+    },
+    seed() {
+      const seed = createOutrightDatabase();
+      const conversation = seed.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Interrupted", provider: "codex" });
+      state.runId = seed.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "pending" }).id;
+      const filename = seed.filename;
+      seed.close();
+      if (runs <= 1) return;
+      // A legacy backlog larger than one reconciliation batch.
+      const db = new Database(filename);
+      try {
+        const row = db.prepare("SELECT * FROM runs WHERE id = ?").get(state.runId);
+        const columns = Object.keys(row);
+        const insert = db.prepare(`INSERT INTO runs (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`);
+        db.transaction(() => {
+          for (let index = 1; index < runs; index += 1) insert.run(...columns.map((column) => (column === "id" ? `${row.id}-${index}` : row[column])));
+        })();
+      } finally { db.close(); }
+    },
+  });
+}
+
+function storageFault(code) {
+  return Object.assign(new Error(`injected ${code}`), { code });
+}
+
+async function getRoute(runtime, route) {
+  const response = responseCapture();
+  await runtime.handleRequest(requestStream("GET", route), response);
+  return response;
+}
+
+test("a transient run reconciliation failure retries without resuming queued work early", withRunRecoveryFaults([storageFault("SQLITE_BUSY"), storageFault("SQLITE_IOERR_WRITE")], async (runtime, state) => {
+  await Promise.resolve();
+  const pending = await getRoute(runtime, "/api/settings");
+  assert.equal(pending.statusCode, 503);
+  assert.equal(pending.body.code, "RUN_RECOVERY_TRANSIENT");
+  // Migration and deletion callbacks cannot bypass an unfinished recovery.
+  state.callbacks.onMigrationComplete();
+  state.callbacks.onDeletionWorkerExit();
+  assert.equal(state.resumes, 0);
+  await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "bounded retry did not recover");
+  assert.equal(state.reconcileCalls, 3);
+  assert.equal(state.resumes, 1, "queued work resumes exactly once after recovery completes");
+  assert.equal((await getRoute(runtime, "/api/settings")).statusCode, 200);
+  const capacity = (await getRoute(runtime, "/api/capacity")).body;
+  assert.equal(capacity.runRecoveryPhase, "complete");
+  assert.equal(capacity.runRecoveryError, null);
+  assert.equal(runtime.database.getRun(state.runId).status, "interrupted");
+}));
+
+test("a persistent run reconciliation failure stays closed until an explicit bootstrap retry recovers it", withRunRecoveryFaults([new Error("corrupt recovery row")], async (runtime, state) => {
+  await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "failed recovery did not settle");
+  state.callbacks.onMigrationComplete();
+  state.callbacks.onDeletionWorkerExit();
+  assert.equal(state.resumes, 0, "callbacks never launch queued work after a failed recovery");
+  for (const route of ["/api/settings", "/api/bootstrap"]) {
+    const failed = await getRoute(runtime, route);
+    assert.equal(failed.statusCode, 503);
+    assert.equal(failed.body.code, "RUN_RECOVERY_FAILED", route);
+  }
+  assert.equal(state.reconcileCalls, 1, "a permanent failure is not retried on a timer");
+  assert.equal((await getRoute(runtime, "/api/capacity")).body.runRecoveryPhase, "failed");
+  await new Promise((resolve) => setTimeout(resolve, 1050));
+  const restarted = await getRoute(runtime, "/api/bootstrap");
+  assert.equal(restarted.body.code, "RUN_RECOVERY_TRANSIENT", "the operator retry starts one new recovery cycle");
+  await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "restarted recovery did not settle");
+  assert.equal(state.reconcileCalls, 2);
+  assert.equal(state.resumes, 1, "deferred callbacks resume queued work once after recovery");
+  assert.equal((await getRoute(runtime, "/api/settings")).statusCode, 200);
+}));
+
+test("a refused post-recovery summary audit leaves the runtime serving", withRunRecoveryFaults([], async (runtime, state) => {
+  await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "recovery did not settle");
+  assert.equal(state.audits, 1, "the summary audit was attempted and refused");
+  assert.equal(runtime.database.getRun(state.runId).status, "interrupted");
+  assert.equal((await getRoute(runtime, "/api/settings")).statusCode, 200);
+  assert.equal(state.resumes, 1, "queued work resumes despite the refused audit");
+  assert.equal((await getRoute(runtime, "/api/capacity")).body.runRecoveryPhase, "complete");
+}, { auditRefusal: storageFault("SQLITE_FULL") }));
+
+test("shutdown during a run recovery retry backoff settles without another attempt", withRunRecoveryFaults(Array.from({ length: 8 }, () => storageFault("SQLITE_BUSY")), async (runtime, state) => {
+  await waitFor(() => state.reconcileCalls >= 3, 5000, "bounded retry did not reach the third attempt");
+  const started = Date.now();
+  await settledWithin(runtime.shutdown(), 2000, "shutdown waited for the retry schedule");
+  const calls = state.reconcileCalls;
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.equal(state.reconcileCalls, calls, "an aborted backoff timer never retries after shutdown");
+  assert.ok(Date.now() - started < 2000);
+  assert.equal(state.resumes, 0);
+}));
+
+function interruptedRunCount(runtime) {
+  return runtime.database.capacity().recoverable;
+}
+
+test("a retry after a committed partial batch audits every reconciled run and resumes once", withRunRecoveryFaults([afterFirstBatch()], async (runtime, state) => {
+  await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "recovery did not settle");
+  assert.equal(state.reconcileCalls, 2);
+  assert.equal(interruptedRunCount(runtime), 64, "the fixture backlog was not reconciled");
+  assert.deepEqual(state.auditDetails, [{ target: "runtime", count: 64, counts: { "never-started": 64 } }],
+    "the first attempt's committed batch is part of the recovery outcome");
+  assert.equal(state.resumes, 1, "queued work resumes exactly once although the final attempt found no rows");
+}, { runs: 64 }));
+
+test("reconciliation progress accumulates across attempts and an operator-restarted cycle", withRunRecoveryFaults([afterFirstBatch(), afterFirstBatch(new Error("corrupt recovery row"))], async (runtime, state) => {
+  await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "failed recovery did not settle");
+  assert.equal((await getRoute(runtime, "/api/capacity")).body.runRecoveryPhase, "failed");
+  assert.deepEqual(state.auditDetails, []);
+  assert.equal(state.resumes, 0);
+  await new Promise((resolve) => setTimeout(resolve, 1050));
+  assert.equal((await getRoute(runtime, "/api/bootstrap")).body.code, "RUN_RECOVERY_TRANSIENT");
+  await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "restarted recovery did not settle");
+  assert.equal(state.reconcileCalls, 3);
+  assert.equal(interruptedRunCount(runtime), 150);
+  assert.deepEqual(state.auditDetails, [{ target: "runtime", count: 150, counts: { "never-started": 150 } }]);
+  assert.equal(state.resumes, 1);
+}, { runs: 150 }));
+
+test("the capacity route re-checks a utility owner and releases it only on audited positive proof", async () => {
+  const unknownDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-runtime-utility-owner-"));
+  const unproven = randomUUID();
+  const running = randomUUID();
+  for (const id of [unproven, running]) {
+    writeFileSync(path.join(unknownDirectory, `${id}.json`), JSON.stringify({ state: "unknown", platform: process.platform,
+      authorized: true, pid: 2147483647, recordedAt: "2026-10-09T10:00:00.000Z", bootId: "boot-a" }), { mode: 0o600 });
+  }
+  const verdicts = { [unproven]: { empty: false, reason: "job-absent-without-marker" }, [running]: { empty: false, reason: "owner-alive" } };
+  const subprocesses = createSubprocessBudget({ limit: 2, unknownDirectory, bootIdentity: () => "boot-a",
+    proveOwner: async (_record, id) => verdicts[id] });
+  const post = async (runtime, id) => {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/capacity/utility-owners/${id}/release`), response);
+    return response;
+  };
+  try {
+    await withRuntime(async (runtime) => {
+      await settledWithin(runtime.whenRunRecoveryComplete(), 5000, "recovery did not settle");
+      const reported = async () => (await getRoute(runtime, "/api/capacity")).body.utilityOwners;
+      await waitFor(() => subprocesses.unknownOwnerStatus().every((owner) => owner.reason !== "awaiting-reconciliation"), 5000,
+        "startup reconciliation did not classify the unknown owners");
+      assert.deepEqual(new Set((await reported()).map((owner) => `${owner.id}:${owner.reason}:${owner.releasable}:${owner.clearsAfterRestart}`)),
+        new Set([`${unproven}:job-absent-without-marker:false:true`, `${running}:owner-alive:false:true`]));
+      const refused = await post(runtime, running);
+      assert.equal(refused.statusCode, 409);
+      assert.equal(refused.body.code, "UTILITY_OWNER_ALIVE");
+      // Missing evidence is never overridden, and nothing is audited.
+      const unprovenRefusal = await post(runtime, unproven);
+      assert.equal(unprovenRefusal.statusCode, 409);
+      assert.deepEqual([unprovenRefusal.body.code, unprovenRefusal.body.reason, unprovenRefusal.body.clearsAfterRestart],
+        ["UTILITY_OWNER_UNPROVEN", "job-absent-without-marker", true]);
+      const audits = () => runtime.database.listAudit(20).filter((entry) => entry.action === "utility.owner.released");
+      assert.deepEqual(audits(), []);
+      assert.deepEqual((await getRoute(runtime, "/api/capacity")).body.utilityProcesses, { active: 2, unknown: 2, limit: 2 });
+      verdicts[unproven] = { empty: true, reason: "proven" };
+      const released = await post(runtime, unproven);
+      assert.equal(released.statusCode, 200);
+      assert.deepEqual(released.body.released, { id: unproven, proven: true, reason: "proven",
+        platform: process.platform, recordedAt: "2026-10-09T10:00:00.000Z" });
+      assert.deepEqual(released.body.capacity.utilityProcesses, { active: 1, unknown: 1, limit: 2 });
+      assert.deepEqual(audits().map((entry) => [entry.target, entry.details.reason, entry.details.proven]), [[unproven, "proven", true]]);
+      assert.equal((await post(runtime, unproven)).statusCode, 404);
+      assert.equal((await post(runtime, "not-an-owner")).statusCode, 404);
+    }, { subprocesses })();
+  } finally { rmSync(unknownDirectory, { recursive: true, force: true }); }
+});
+
+test("runtime startup settles an orphan PTY before serving requests", withRuntime(async (runtime) => {
+  await runtime.database.waitForTerminalAuditReconciliation();
+  const audit = runtime.database.listAudit(20);
+  assert.ok(audit.some((entry) => entry.action === "terminal.unknown" && entry.target === "orphan-terminal"));
+  assert.equal(runtime.database.reconcileTerminalAudit(), 0);
+}, { seed(dataDirectory) {
+  const database = createOutrightDatabase({ filename: path.join(dataDirectory, "outright.db") });
+  try { database.auditCritical("terminal.created", { target: "orphan-terminal" }); }
+  finally { database.close(); }
+} }));
+
+test("runtime startup preserves terminal ownership evidence across run reconciliation", withRuntime(async (runtime) => {
+  await runtime.database.waitForTerminalAuditReconciliation();
+  const target = "379634b7-8989-47c5-9174-c09529b206a1";
+  const marker = path.join(runtime.database.launchDirectory, `terminal-${target}.json`);
+  assert.equal(existsSync(marker), true, "run-handshake sweeping must not erase the terminal owner's marker");
+  assert.equal(runtime.database.terminalUnknownReservations().some((entry) => entry.target === target), true);
+  assert.equal(runtime.database.listAudit(20).some((entry) => entry.action === "terminal.recovered" && entry.target === target), false);
+  if (process.platform === "linux") {
+    // The marker has no matching live process identity. Native recovery must
+    // keep the reservation and audit pending instead of trusting a dead PID.
+    assert.equal(await runtime.terminals.reconcileUnknown(), 0);
+    assert.equal(runtime.terminals.capacity().active, 1);
+    assert.equal(runtime.database.listAudit(20).some((entry) => entry.action === "terminal.recovered" && entry.target === target), false);
+  }
+}, { seed(dataDirectory) {
+  const database = createOutrightDatabase({ filename: path.join(dataDirectory, "outright.db") });
+  try {
+    const target = "379634b7-8989-47c5-9174-c09529b206a1";
+    database.auditCritical("terminal.created", { target, cwd: "/tmp",
+      ownershipLabel: `com.21n.outright.terminal.${target}` });
+    writeFileSync(path.join(database.launchDirectory, `terminal-${target}.json`),
+      JSON.stringify({ pid: 4242, processIdentity: "linux:owned-terminal" }));
+  } finally { database.close(); }
+} }));
+
+test("shutdown during archive cutover preserves a rejected queued cancellation and releases the runtime lease", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-cutover-shutdown-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  const filename = path.join(dataDirectory, "outright.db");
+  const gate = new Int32Array(new SharedArrayBuffer(4));
+  let runtime;
+  let successor;
+  try {
+    process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json", deletionWorkerGate: gate.buffer });
+    const survivor = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Pending work", provider: "codex" });
+    const run = runtime.database.createRun({ conversationId: survivor.id, provider: "codex", approvalPolicy: "read-only", prompt: "keep this queued" });
+    // Keep the manager's actual queue occupied without starting a provider.
+    runtime.database.canLaunchRun = () => false;
+    await runtime.agents.schedule({ conversation: survivor, run });
+    const archived = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Old archive", provider: "codex" });
+    const message = runtime.database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    const legacy = new Database(filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
+    legacy.close();
+    runtime.database.updateConversation(archived.id, { archived: true });
+    const deletion = runtime.database.deleteArchivedConversation(archived.id, archived.id);
+    const deadline = Date.now() + 5000;
+    while (Atomics.load(gate, 0) !== 1) {
+      assert.ok(Date.now() < deadline, "archive worker did not reach cutover");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    await assert.rejects(runtime.agents.stop(run.id), (error) => error.statusCode === 503);
+    await runtime.shutdown();
+    await assert.rejects(deletion, (error) => error.statusCode === 503);
+    const retained = new Database(filename, { readonly: true });
+    try {
+      assert.equal(retained.prepare("SELECT status FROM runs WHERE id = ?").get(run.id).status, "queued");
+      assert.equal(retained.prepare("SELECT body FROM messages WHERE id = ?").get(message.id).body.length, 4 * 1024 * 1024);
+    } finally { retained.close(); }
+    successor = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    const recovered = successor.database.getRun(run.id);
+    assert.equal(recovered.status, "interrupted");
+    assert.equal(recovered.recoveryClass, "never-started");
+    const response = responseCapture();
+    await successor.handleRequest(requestStream("GET", "/api/capacity"), response);
+    assert.equal(response.statusCode, 200);
+  } finally {
+    Atomics.store(gate, 0, 2);
+    Atomics.notify(gate, 0);
+    await successor?.shutdown();
+    await runtime?.shutdown();
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR;
+    else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+test("a failed agent shutdown retains the runtime lease until recovery can finish", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-shutdown-lease-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  let runtime;
+  let successor;
+  let storageAvailable = false;
+  let assertionFailure;
+  try {
+    process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    const originalShutdown = runtime.agents.shutdown;
+    runtime.agents.shutdown = () => storageAvailable
+      ? originalShutdown()
+      : Promise.reject(Object.assign(new Error("outcome journal unavailable"), { code: "ENOSPC" }));
+    await assert.rejects(runtime.shutdown(), /Runtime shutdown retains recovery ownership/);
+    assert.throws(() => createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" }),
+      (error) => error.code === "OUTRIGHT_RUNTIME_LEASE_HELD");
+    storageAvailable = true;
+    await runtime.shutdown();
+    successor = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+  } catch (error) {
+    assertionFailure = error;
+    throw error;
+  } finally {
+    storageAvailable = true;
+    const cleanup = await Promise.allSettled([successor?.shutdown(), runtime?.shutdown()]);
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR;
+    else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    let cleanupError = cleanup.find((result) => result.status === "rejected")?.reason;
+    try { rmSync(dataDirectory, { recursive: true, force: true }); }
+    catch (error) { cleanupError ??= error; }
+    if (cleanupError && !assertionFailure) throw cleanupError;
+  }
+});
+
+for (const [terminalFailure, sqliteRecovers] of [[false, true], [false, false], [true, true]]) test(`a storage-faulted exited run ${terminalFailure ? "reports terminal disposal failure" : "releases the runtime lease"} after ${sqliteRecovers ? "SQLite" : "journal-only"} recovery`, async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-shutdown-recover-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  let runtime;
+  let successor;
+  let child;
+  let durableFinish;
+  let durableJournal;
+  let released = false;
+  try {
+    process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json",
+      terminalManagerFactory: (options) => {
+        const manager = createTerminalManager(options);
+        if (terminalFailure) {
+          const dispose = manager.shutdown.bind(manager);
+          manager.shutdown = async () => { await dispose(); throw new Error("terminal disposal failed"); };
+        }
+        return manager;
+      },
+      agentManagerFactory: (options) => createAgentManager({ ...options,
+        validateConversation: async () => () => {},
+        launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+        spawnProcess: () => {
+          child = new PassThrough();
+          child.stdin = new PassThrough();
+          child.stdout = new PassThrough();
+          child.stderr = new PassThrough();
+          child.stdio = [child.stdin, child.stdout, child.stderr, new PassThrough()];
+          const write = child.stdin.write.bind(child.stdin);
+          child.stdin.write = (chunk, ...args) => {
+            const result = write(chunk, ...args);
+            if (String(chunk).includes("go\n")) queueMicrotask(() => child.stdio[3].write(`${LAUNCH_AUTHORIZED_CONTROL}\n`));
+            return result;
+          };
+          child.kill = () => true;
+          return child;
+        },
+      }) });
+    const conversation = runtime.database.createConversation({ projectId: "p", worktreeId: "w",
+      worktreePath: dataDirectory, title: "Recovery", provider: "codex" });
+    const run = runtime.database.createRun({ conversationId: conversation.id, provider: "codex",
+      approvalPolicy: "read-only", prompt: "finish" });
+    await runtime.agents.schedule({ conversation, run });
+    durableFinish = runtime.database.finishRun;
+    durableJournal = runtime.database.savePendingRunOutcome;
+    runtime.database.finishRun = () => { throw Object.assign(new Error("SQLite full"), { code: "ENOSPC" }); };
+    runtime.database.savePendingRunOutcome = () => { throw Object.assign(new Error("journal full"), { code: "ENOSPC" }); };
+    child.emit("close", 0, null);
+    await assert.rejects(runtime.shutdown(), (error) => error.code === "OUTRIGHT_SHUTDOWN_RECOVERY_PENDING");
+    assert.throws(() => createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" }),
+      (error) => error.code === "OUTRIGHT_RUNTIME_LEASE_HELD");
+    if (sqliteRecovers) runtime.database.finishRun = durableFinish;
+    runtime.database.savePendingRunOutcome = durableJournal;
+    runtime.agents.resumeQueued();
+    const completed = settledWithin(runtime.whenShutdownComplete(), 3000, "lease did not release after recovery");
+    if (terminalFailure) {
+      await assert.rejects(completed, /Runtime shutdown did not finish cleanly/);
+      await assert.rejects(runtime.shutdown(), /Runtime shutdown did not finish cleanly/);
+    } else await completed;
+    released = true;
+    successor = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    assert.equal(successor.database.getRun(run.id).status, "completed");
+    assert.equal(successor.database.listAudit(100).filter((entry) => entry.action === "agent.run.completed" && entry.target === run.id).length, 1);
+  } finally {
+    // An assertion failure must not hide behind the deliberately faulted
+    // shutdown. Restore the writable methods before final cleanup.
+    if (runtime && durableFinish) runtime.database.finishRun = durableFinish;
+    if (runtime && durableJournal) runtime.database.savePendingRunOutcome = durableJournal;
+    if (!released) runtime?.agents.resumeQueued();
+    try { await successor?.shutdown(); } catch { /* The assertion above owns the failure. */ }
+    try { await runtime?.shutdown(); } catch { /* The assertion above owns the failure. */ }
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR;
+    else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+test("run detail pages a migrated oversized replay tail without returning pruned output", (() => {
+  let runId;
+  return withRuntime(async (runtime) => {
+    const deadline = Date.now() + 5_000;
+    while (runtime.database.capacity().migrationStatus === "migrating" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(runtime.database.capacity().migrationStatus, "ready", "Legacy replay migration did not finish");
+    const first = responseCapture();
+    await runtime.handleRequest(requestStream("GET", `/api/runs/${runId}?after=0`), first);
+    assert.equal(first.statusCode, 200);
+    assert.ok(first.body.events[0].seq > 1);
+    assert.equal(first.body.events.at(-1).seq, 40);
+    assert.ok(Buffer.byteLength(first.raw) <= 8 * 1024 * 1024);
+    const cursor = first.body.events[5].seq;
+    const later = responseCapture();
+    await runtime.handleRequest(requestStream("GET", `/api/runs/${runId}?after=${cursor}`), later);
+    assert.equal(later.statusCode, 200);
+    assert.deepEqual(later.body.events.map((event) => event.seq), first.body.events.slice(6).map((event) => event.seq));
+  }, { seed(dataDirectory) {
+    const filename = path.join(dataDirectory, "outright.db");
+    const database = createOutrightDatabase({ filename });
+    const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Legacy replay", provider: "codex" });
+    runId = database.createRun({ conversationId: chat.id, provider: "codex", approvalPolicy: "read-only", prompt: "work" }).id;
+    database.close();
+    const legacy = new Database(filename);
+    legacy.pragma("user_version = 0");
+    const insert = legacy.prepare("INSERT INTO run_events (run_id, seq, type, payload, created_at) VALUES (?, ?, 'legacy', ?, ?)");
+    const payload = JSON.stringify({ text: "x".repeat(256 * 1024) });
+    legacy.transaction(() => {
+      for (let seq = 1; seq <= 40; seq++) insert.run(runId, seq, payload, new Date().toISOString());
+    })();
+    legacy.close();
+  } });
+})());
+
+test("retention HTTP rejects invalid and future cutoffs without deleting fresh archived history", withRuntime(async (runtime) => {
+  const chat = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Fresh archive", provider: "codex" });
+  runtime.database.updateConversation(chat.id, { archived: true });
+  const beforeAudit = runtime.database.listAudit(500).length;
+  for (const before of ["nonsense", "9999-01-01T00:00:00.000Z", new Date(Date.now() + 60_000).toISOString(),
+    new Date(Date.now() + 86_400_000).toISOString().replace("Z", "+00:00")]) {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", { before }), response);
+    assert.equal(response.statusCode, 400);
+    assert.ok(runtime.database.getConversation(chat.id));
+  }
+  for (let index = 0; index < 20; index += 1) {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", { before: "invalid" }), response);
+    assert.equal(response.statusCode, 400);
+  }
+  assert.equal(runtime.database.listAudit(500).length, beforeAudit, "malformed cleanup accumulated pending audit rows");
+  const oldInstant = new Date(Date.now() - 95 * 86_400_000);
+  const offsetCutoff = `${new Date(oldInstant.getTime() + 5.5 * 3_600_000).toISOString().slice(0, 19)}+05:30`;
+  for (const before of ["Jan 1 2000", offsetCutoff]) {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", { before }), response);
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.deleted, 0);
+    assert.ok(runtime.database.getConversation(chat.id));
+  }
+  const normal = responseCapture();
+  await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", {}), normal);
+  assert.equal(normal.statusCode, 200);
+  assert.equal(normal.body.deleted, 0);
+  assert.ok(runtime.database.getConversation(chat.id));
+}));
+
+test("accepted cleanup failure records a correlated unknown outcome before returning an error", withRuntime(async (runtime) => {
+  const original = runtime.database.pruneHistory;
+  runtime.database.pruneHistory = async () => { throw Object.assign(new Error("cleanup interrupted"), { statusCode: 503 }); };
+  try {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", {}), response);
+    assert.equal(response.statusCode, 503);
+    const entries = runtime.database.listAudit(10);
+    const request = entries.find((entry) => entry.action === "retention.cleanup.requested");
+    const outcome = entries.find((entry) => entry.action === "retention.cleanup.unknown");
+    assert.ok(request);
+    assert.equal(outcome?.details.operationId, request.details.operationId);
+    assert.ok(outcome.id > request.id);
+  } finally { runtime.database.pruneHistory = original; }
+}));
+
+test("runtime startup classifies an interrupted cleanup request before serving work", withRuntime(async (runtime) => {
+  const entries = runtime.database.listAudit(20);
+  const request = entries.find((entry) => entry.action === "retention.cleanup.requested");
+  const outcome = entries.find((entry) => entry.action === "retention.cleanup.unknown");
+  assert.ok(request);
+  assert.equal(outcome?.details.operationId, request.details.operationId);
+}, { async seed(dataDirectory) {
+  const database = createOutrightDatabase({ filename: path.join(dataDirectory, "outright.db") });
+  await database.auditRetentionCleanupRequested({ operationId: "interrupted-cleanup", before: "2020-01-01T00:00:00.000Z" });
+  database.close();
+} }));
+
+test("retention HTTP normalizes timezone cutoffs and keeps unfinished archived runs", withRuntime(async (runtime) => {
+  await runtime.whenRunRecoveryComplete();
+  const database = runtime.database;
+  const rows = Object.fromEntries(database.listConversations({ archived: true }).map((item) => [item.title, item]));
+  const requestCleanup = async (before) => {
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", { before }), response);
+    assert.equal(response.statusCode, 200);
+    return response.body;
+  };
+  assert.equal((await requestCleanup("Jan 1 2000")).deleted, 0);
+  assert.ok(database.getConversation(rows.fresh.id));
+  const cutoff = new Date(Date.now() - 95 * 86_400_000);
+  const offsetCutoff = `${new Date(cutoff.getTime() + 5.5 * 3_600_000).toISOString().slice(0, 19)}+05:30`;
+  assert.equal((await requestCleanup(offsetCutoff)).deleted, 1);
+  assert.equal(database.getConversation(rows.settled.id), undefined);
+  for (const name of ["fresh", "queued", "active", "interrupted"]) assert.ok(database.getConversation(rows[name].id));
+  const runs = Object.fromEntries(["queued", "active", "interrupted"].map((name) => [name, database.listRuns(rows[name].id)[0]]));
+  database.updateRun(runs.queued.id, { status: "stopped" });
+  database.updateRun(runs.active.id, { status: "completed" });
+  database.resolveInterruptedRun(runs.interrupted.id, "discard");
+  assert.equal((await requestCleanup(offsetCutoff)).deleted, 3);
+  assert.ok(database.getConversation(rows.fresh.id));
+}, { seed(dataDirectory) {
+  const filename = path.join(dataDirectory, "outright.db");
+  const database = createOutrightDatabase({ filename });
+  try {
+    const rows = Object.fromEntries(["fresh", "settled", "queued", "active", "interrupted"].map((title) => [title,
+      database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title, provider: "codex" })]));
+    for (const item of Object.values(rows)) database.updateConversation(item.id, { archived: true });
+    for (const name of ["queued", "active", "interrupted"]) {
+      const run = database.createRun({ conversationId: rows[name].id, provider: "codex", approvalPolicy: "read-only", prompt: name });
+      if (name !== "queued") database.updateRun(run.id, { status: name === "active" ? "running" : "interrupted" });
+    }
+  } finally { database.close(); }
+  const admin = new Database(filename);
+  try {
+    const old = new Date(Date.now() - 100 * 86_400_000).toISOString();
+    for (const title of ["settled", "queued", "active", "interrupted"]) {
+      admin.prepare("UPDATE conversations SET updated_at = ? WHERE title = ?").run(old, title);
+    }
+  } finally { admin.close(); }
+} }));
+
+test("explicit archived deletion at the HTTP boundary restores admission without exposing protected siblings", withRuntime(async (runtime) => {
+  const database = runtime.database;
+  database.updateSettings({ maxRetainedMiB: 64 });
+  const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Recent archive", provider: "codex" });
+  const live = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Live", provider: "codex" });
+  const protectedChat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Recoverable", provider: "codex" });
+  database.updateConversation(protectedChat.id, { archived: true });
+  const recovery = database.createRun({ conversationId: protectedChat.id, provider: "codex", approvalPolicy: "read-only", prompt: "recover" });
+  database.updateRun(recovery.id, { status: "interrupted" });
+  const filler = database.addMessage({ conversationId: archived.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+  const remaining = 63 * 1024 * 1024 - database.capacity().retainedBytes;
+  database.upsertMessage({ ...filler, body: `${filler.body}${"x".repeat(remaining - 8)}` });
+  database.updateConversation(archived.id, { archived: true });
+  const ordinary = responseCapture();
+  await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", {}), ordinary);
+  assert.equal(ordinary.body.deleted, 0);
+  assert.throws(() => database.submitRun({ conversationId: live.id, provider: "codex", approvalPolicy: "read-only", prompt: "work" }, "work"), (error) => error.statusCode === 507);
+  const listing = responseCapture();
+  await runtime.handleRequest(requestStream("GET", "/api/retention/archived"), listing);
+  assert.deepEqual(listing.body.conversations.map((item) => item.id), [archived.id]);
+  assert.equal(listing.body.conversations[0].worktreePath, "/tmp/w");
+  for (const body of [{ id: archived.id }, { id: live.id, confirmation: live.id }, { id: protectedChat.id, confirmation: protectedChat.id }]) {
+    const denied = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived", body), denied);
+    assert.equal(denied.statusCode, body.confirmation ? 409 : 400);
+  }
+  const deleted = responseCapture();
+  await runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived", { id: archived.id, confirmation: archived.id }), deleted);
+  assert.equal(deleted.statusCode, 200);
+  assert.equal(deleted.body.deleted, 1);
+  assert.ok(deleted.body.capacity.availableForNewWorkBytes > 1024);
+  assert.equal(database.submitRun({ conversationId: live.id, provider: "codex", approvalPolicy: "read-only", prompt: "work" }, "work").run.status, "queued");
+  assert.ok(database.getRun(recovery.id));
+}));
+
+test("oversized archived HTTP deletion defers without blocking live output or capacity reads", withRuntime(async (runtime) => {
+  const database = runtime.database;
+  const active = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Active", provider: "codex" });
+  const running = database.createRun({ conversationId: active.id, provider: "codex", approvalPolicy: "read-only", prompt: "work" });
+  database.updateRun(running.id, { status: "running" });
+  const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Old", provider: "codex" });
+  const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "short" });
+  const legacy = new Database(database.filename);
+  legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(8 * 1024 * 1024), message.id);
+  legacy.close();
+  const oldRun = database.createRun({ conversationId: archived.id, provider: "codex", approvalPolicy: "read-only", prompt: "retained history" });
+  database.updateRun(oldRun.id, { status: "completed" });
+  database.updateConversation(archived.id, { archived: true });
+  const deleteResponse = responseCapture();
+  await runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived", { id: archived.id, confirmation: archived.id }), deleteResponse);
+  assert.equal(deleteResponse.statusCode, 202);
+  assert.equal(deleteResponse.body.deleted, 0);
+  assert.equal(deleteResponse.body.deferred, true);
+  assert.equal(deleteResponse.body.capacity.cleanupPending, true);
+  const hiddenRun = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `/api/runs/${oldRun.id}`), hiddenRun);
+  assert.equal(hiddenRun.statusCode, 404, "a marked archive cannot expose a partial run history");
+  assert.equal(database.canLaunchRun(), true, "deferred cleanup must leave unrelated run slots available");
+  database.appendRunEvent(running.id, "progress", { text: "still writable" });
+  const capacityResponse = responseCapture();
+  await runtime.handleRequest(requestStream("GET", "/api/capacity"), capacityResponse);
+  assert.equal(capacityResponse.statusCode, 200);
+  database.updateRun(running.id, { status: "completed" });
+  const deadline = Date.now() + 5_000;
+  while (database.capacity().cleanupPending || database.maintenanceActive) {
+    assert.ok(Date.now() < deadline, "marked HTTP deletion did not resume");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id));
+  assert.equal(database.canLaunchRun(), true);
+}));
+
+test("HTTP bootstrap stays available during shadow copy and preserves a concurrent write", async () => {
+  const configDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-shadow-http-config-"));
+  const configFile = path.join(configDirectory, "outright.config.json");
+  writeFileSync(configFile, JSON.stringify({ scanRoots: [], maxDepth: 1, maxProjects: 1 }));
+  const copyGate = new Int32Array(new SharedArrayBuffer(4));
+  const copyPhase = new Int32Array(new SharedArrayBuffer(4));
+  try { await withRuntime(async (runtime) => {
+    const database = runtime.database;
+    const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Old", provider: "codex" });
+    const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "short" });
+    const legacy = new Database(database.filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(96 * 1024 * 1024), message.id);
+    legacy.close();
+    database.updateConversation(archived.id, { archived: true });
+    const deletion = responseCapture();
+    const request = runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived",
+      { id: archived.id, confirmation: archived.id }), deletion);
+    try {
+      const copyingDeadline = Date.now() + 10_000;
+      while (Atomics.load(copyPhase, 0) === 0 || statSync(`${database.filename}.archive-next`, { throwIfNoEntry: false })?.size === 0) {
+        assert.ok(Date.now() < copyingDeadline, "shadow copy never wrote candidate bytes");
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      assert.equal(Atomics.load(copyPhase, 0), 1, "HTTP probe did not start while VACUUM INTO was running");
+      const inCopyBootstrap = responseCapture();
+      const inCopyRequest = runtime.handleRequest(requestStream("GET", "/api/bootstrap"), inCopyBootstrap);
+      const inCopySurvivor = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "During copy", provider: "codex" });
+      await inCopyRequest;
+      assert.equal(inCopyBootstrap.statusCode, 200, `in-copy bootstrap was unavailable: ${inCopyBootstrap.raw}`);
+      assert.ok(database.getConversation(inCopySurvivor.id), "in-copy write was unavailable");
+      const deadline = Date.now() + 5_000;
+      while (Atomics.load(copyGate, 0) !== 1) {
+        assert.ok(Date.now() < deadline, "HTTP cleanup did not enter shadow copy");
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      const bootstrap = responseCapture();
+      await runtime.handleRequest(requestStream("GET", "/api/bootstrap"), bootstrap);
+      assert.equal(bootstrap.statusCode, 200, `shadow copy blocked an unrelated bootstrap: ${bootstrap.raw}`);
+      assert.equal(bootstrap.body.capacity.cleanupPending, true);
+      assert.equal(database.maintenanceActive, false);
+      const survivor = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "New", provider: "codex" });
+      Atomics.store(copyGate, 0, 2);
+      Atomics.notify(copyGate, 0);
+      await request;
+      assert.equal(deletion.statusCode, 202, "a stale shadow should defer after a concurrent HTTP-visible write");
+      assert.ok(database.getConversation(survivor.id));
+      const completed = Date.now() + 8_000;
+      while (database.capacity().cleanupPending || database.maintenanceActive) {
+        assert.ok(Date.now() < completed, "deferred HTTP cleanup did not resume");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.ok(database.listAudit().some((entry) => entry.action === "retention.archived.deleted" && entry.target === archived.id));
+    } finally {
+      Atomics.store(copyGate, 0, 2);
+      Atomics.notify(copyGate, 0);
+    }
+  }, { deletionCopyGate: copyGate.buffer, deletionCopyPhase: copyPhase.buffer, configUrl: pathToFileURL(configFile) })(); }
+  finally { rmSync(configDirectory, { recursive: true, force: true }); }
+});
+
+test("oversized archive writer returns retryable HTTP writes while capacity remains readable", (() => {
+  const lockGate = new Int32Array(new SharedArrayBuffer(4));
+  return withRuntime(async (runtime) => {
+    const database = runtime.database;
+    const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Old", provider: "codex" });
+    const message = database.addMessage({ conversationId: archived.id, role: "assistant", body: "small" });
+    const legacy = new Database(database.filename);
+    legacy.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
+    legacy.close();
+    database.updateConversation(archived.id, { archived: true });
+    const deletionResponse = responseCapture();
+    const deletion = runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived",
+      { id: archived.id, confirmation: archived.id }), deletionResponse);
+    const cleanupResponse = responseCapture();
+    try {
+      const deadline = Date.now() + 5000;
+      while (Atomics.load(lockGate, 0) !== 1) {
+        assert.ok(Date.now() < deadline, "archive writer did not acquire its lock");
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      const capacity = responseCapture();
+      await runtime.handleRequest(requestStream("GET", "/api/capacity"), capacity);
+      assert.equal(capacity.statusCode, 200);
+      assert.equal(capacity.body.cleanupPending, true);
+      const denied = responseCapture();
+      await runtime.handleRequest(requestStream("POST", "/api/groups", { name: "Retry after cleanup" }), denied);
+      assert.equal(denied.statusCode, 503);
+      assert.match(denied.body.error, /retry shortly/);
+      await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", {}), cleanupResponse);
+      assert.equal(cleanupResponse.statusCode, 503, "offline maintenance must reject another cleanup before auditing it");
+    } finally {
+      Atomics.store(lockGate, 0, 2);
+      Atomics.notify(lockGate, 0);
+    }
+    await deletion;
+    assert.equal(deletionResponse.statusCode, 200);
+    const retryCleanup = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", {}), retryCleanup);
+    assert.equal(retryCleanup.statusCode, 200);
+    assert.ok(database.listAudit().some((entry) => entry.action === "retention.cleaned"),
+      "successful cleanup response lost its required audit while the worker held SQLite");
+    const reopened = new Database(database.filename);
+    try {
+      assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleaned'").get().count, 1,
+        "cleanup response did not leave one durable completion audit");
+    } finally { reopened.close(); }
+    const retry = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/groups", { name: "Retry after cleanup" }), retry);
+    assert.equal(retry.statusCode, 201);
+    assert.equal(database.getConversation(archived.id), undefined);
+  }, { deletionWorkerGate: lockGate.buffer });
+})());
+
+test("archived HTTP cursor reaches an older selection and rejects malformed pages", withRuntime(async (runtime) => {
+  const database = runtime.database;
+  const firstCreated = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "First", provider: "codex" });
+  database.updateConversation(firstCreated.id, { archived: true });
+  for (let index = 0; index < 3; index++) {
+    const row = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: `Newer ${index}`, provider: "codex" });
+    database.updateConversation(row.id, { archived: true });
+  }
+  const oldestSelectable = database.listDeletableArchivedConversations().conversations.at(-1);
+  const first = responseCapture();
+  await runtime.handleRequest(requestStream("GET", "/api/retention/archived?limit=2"), first);
+  assert.equal(first.statusCode, 200);
+  assert.equal(first.body.conversations.length, 2);
+  assert.equal(first.body.conversations.some((row) => row.id === oldestSelectable.id), false);
+  const second = responseCapture();
+  await runtime.handleRequest(requestStream("GET", `/api/retention/archived?limit=2&cursor=${first.body.nextCursor}`), second);
+  assert.equal(second.statusCode, 200);
+  assert.equal(second.body.conversations.some((row) => row.id === oldestSelectable.id), true);
+  assert.equal(second.body.nextCursor, null);
+  const deleted = responseCapture();
+  await runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived", { id: oldestSelectable.id, confirmation: oldestSelectable.id }), deleted);
+  assert.equal(deleted.statusCode, 200);
+  assert.ok(database.getConversation(first.body.conversations[0].id));
+  for (const query of ["limit=101", "limit=0", "cursor=%21", "cursor="]) {
+    const invalid = responseCapture();
+    await runtime.handleRequest(requestStream("GET", `/api/retention/archived?${query}`), invalid);
+    assert.equal(invalid.statusCode, 400);
+  }
+}));
+
+test("archived HTTP pages bound serialized metadata while cursors reach long-title chats", withRuntime(async (runtime) => {
+  const title = '"\n📦'.repeat(32 * 1024);
+  const worktreePath = `/tmp/${"x".repeat(128 * 1024)}`;
+  const ids = [];
+  for (let index = 0; index < 3; index += 1) {
+    const row = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath,
+      title: `${index}${title}`, provider: "codex" });
+    runtime.database.updateConversation(row.id, { archived: true });
+    ids.push(row.id);
+  }
+  const seen = [];
+  let cursor = null;
+  let pages = 0;
+  do {
+    assert.ok(++pages <= ids.length + 1, "archived pagination did not terminate");
+    const response = responseCapture();
+    const query = cursor ? `?limit=2&cursor=${encodeURIComponent(cursor)}` : "?limit=2";
+    await runtime.handleRequest(requestStream("GET", `/api/retention/archived${query}`), response);
+    assert.equal(response.statusCode, 200);
+    assert.ok(Buffer.byteLength(response.raw) < 16 * 1024, "archived response copied full legacy metadata");
+    assert.ok(response.body.conversations.every((row) => row.title.endsWith("…") && row.worktreePath.endsWith("…")));
+    seen.push(...response.body.conversations.map((row) => row.id));
+    cursor = response.body.nextCursor;
+  } while (cursor);
+  assert.deepEqual(new Set(seen), new Set(ids), "paging skipped an eligible oversized chat");
+}));
+
+test("concurrent HTTP submissions admit only the configured queue budget", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  runtime.database.updateSettings({ maxQueuedRuns: 3 });
+  runtime.agents.providerAvailable = async () => true;
+  // Hold scheduling so admission, rather than a provider's completion speed,
+  // decides the burst outcome at the HTTP boundary.
+  runtime.agents.schedule = async ({ run }) => ({ id: run.id, status: run.status });
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id,
+    worktreePath: worktree.path, title: "Burst", provider: "codex" });
+  const replies = Array.from({ length: 20 }, () => responseCapture());
+  await Promise.all(replies.map((reply, index) => runtime.handleRequest(
+    requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: `burst ${index}` }), reply)));
+  assert.equal(replies.filter((reply) => reply.statusCode === 202).length, 3);
+  assert.equal(replies.filter((reply) => reply.statusCode === 429).length, 17);
+  assert.equal(runtime.database.capacity().queued, 3);
+  assert.equal(runtime.database.messageCount(conversation.id), 3, "rejected submissions leave no message");
+}));
+
+test("capacity-reclaim deletion routes recheck queued work against actual audited headroom", async () => {
+  for (const kind of ["group", "membership", "template", "trust"]) {
+    await withRuntime(async (runtime) => {
+      const database = runtime.database;
+      database.updateSettings({ maxRetainedMiB: 64 });
+      const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: kind, provider: "codex" });
+      const queued = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "waiting" });
+      let url;
+      let body;
+      let method = "DELETE";
+      if (kind === "group") url = `/api/groups/${database.createGroup("Spare group").id}`;
+      else if (kind === "membership") {
+        const group = database.createGroup("Membership group");
+        database.setProjectGroup("spare-project", group.id);
+        url = "/api/project-memberships";
+        method = "PUT";
+        body = { projectId: "spare-project", groupId: null };
+      }
+      else if (kind === "template") url = `/api/templates/${database.saveTemplate({ title: "Spare", prompt: "safe" }).id}`;
+      else {
+        database.trustProject("spare-project", "/tmp/spare");
+        url = "/api/trust";
+        body = { projectId: "spare-project" };
+      }
+      const filler = database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+      const desiredAvailable = 64 * 1024 - 50;
+      const increase = database.capacity().availableForNewWorkBytes - desiredAvailable;
+      assert.ok(increase > 0);
+      database.upsertMessage({ ...filler, body: `${filler.body}${"x".repeat(increase)}` });
+      assert.equal(database.canLaunchRun(), false);
+      let wakeups = 0;
+      runtime.agents.resumeQueued = () => { wakeups += 1; };
+      const response = responseCapture();
+      await runtime.handleRequest(requestStream(method, url, body), response);
+      assert.ok([200, 204].includes(response.statusCode), `${kind} deletion succeeded`);
+      // Revoking trust now commits its own audit row. That row can cost more
+      // bytes than the removed trust record at this exact boundary.
+      assert.equal(database.canLaunchRun(), kind !== "trust", `${kind} deletion reported incorrect launch room`);
+      assert.equal(wakeups, 1, `${kind} deletion woke deferred work`);
+      assert.equal(database.getRun(queued.id).status, "queued");
+    })();
+  }
+});
+
+test("capacity-restoring edits wake deferred runs at the launch boundary", withRuntime(async (runtime) => {
+  const database = runtime.database;
+  database.updateSettings({ maxRetainedMiB: 64 });
+  const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w",
+    title: "Conversation ".repeat(150), provider: "codex" });
+  const queued = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "waiting" });
+  const group = database.createGroup("Group ".repeat(350));
+  const template = database.saveTemplate({ title: "Spare", prompt: "Template ".repeat(300) });
+  const filler = database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+  let fillerBody = filler.body;
+  let wakeups = 0;
+  runtime.agents.resumeQueued = () => { wakeups += 1; };
+  for (const [url, method, body] of [
+    ["/api/templates", "POST", { id: template.id, title: template.title, prompt: "short" }],
+    [`/api/groups/${group.id}`, "PATCH", { name: "Short group" }],
+    [`/api/conversations/${conversation.id}`, "PATCH", { title: "Short conversation" }],
+  ]) {
+    const increase = database.capacity().availableForNewWorkBytes - (64 * 1024 - 50);
+    assert.ok(increase > 0);
+    fillerBody += "x".repeat(increase);
+    database.upsertMessage({ ...filler, body: fillerBody });
+    assert.equal(database.canLaunchRun(), false);
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream(method, url, body), response);
+    assert.ok([200, 201].includes(response.statusCode), `${url} edit succeeded: ${response.raw}`);
+    assert.equal(database.canLaunchRun(), true, `${url} edit restored launch room`);
+    assert.equal(wakeups, 1 + ["/api/templates", `/api/groups/${group.id}`, `/api/conversations/${conversation.id}`].indexOf(url));
+    assert.equal(database.getRun(queued.id).status, "queued");
+  }
+}));
+
+test("moving a conversation to a shorter worktree path wakes deferred work", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const database = runtime.database;
+  database.updateSettings({ maxRetainedMiB: 64 });
+  const conversation = database.createConversation({ projectId: project.id, worktreeId: "old", worktreePath: `/tmp/${"old".repeat(1400)}`,
+    title: "Movable", provider: "codex" });
+  const queued = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "waiting" });
+  const filler = database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+  const increase = database.capacity().availableForNewWorkBytes - (64 * 1024 - 50);
+  assert.ok(increase > 0);
+  database.upsertMessage({ ...filler, body: `${filler.body}${"x".repeat(increase)}` });
+  assert.equal(database.canLaunchRun(), false);
+  let wakeups = 0;
+  runtime.agents.resumeQueued = () => { wakeups += 1; };
+  const response = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/move`,
+    { projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path }), response);
+  assert.equal(response.statusCode, 200, response.raw);
+  assert.equal(database.canLaunchRun(), true);
+  assert.equal(wakeups, 1);
+  assert.equal(database.getRun(queued.id).status, "queued");
+}));
+
+test("bootstrap and retention remain reachable when default groups cannot fit the retained budget", async () => {
+  const configDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-budget-config-"));
+  const configFile = path.join(configDirectory, "outright.config.json");
+  writeFileSync(configFile, JSON.stringify({ scanRoots: [], maxDepth: 1, maxProjects: 1 }));
+  try {
+    await withRuntime(async (runtime) => {
+  const database = runtime.database;
+  database.updateSettings({ maxRetainedMiB: 64 });
+  const archived = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Reclaimable", provider: "codex" });
+  const filler = database.addMessage({ conversationId: archived.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
+  const remaining = 63 * 1024 * 1024 - database.capacity().retainedBytes;
+  database.upsertMessage({ ...filler, body: `${filler.body}${"x".repeat(remaining - 300)}` });
+  database.updateConversation(archived.id, { archived: true });
+  const firstGroup = database.createGroup("Core systems");
+  assert.throws(() => database.createGroup("Experiments"), (error) => error.statusCode === 507);
+  database.deleteGroup(firstGroup.id);
+  const bootstrap = responseCapture();
+  await runtime.handleRequest(requestStream("GET", "/api/bootstrap"), bootstrap);
+  assert.equal(bootstrap.statusCode, 200);
+  assert.deepEqual(bootstrap.body.projectGroups.groups, [], "failed setup leaves no partial default group");
+  assert.equal(bootstrap.body.capacity.availableForNewWorkBytes < 64 * 1024, true);
+  const listing = responseCapture();
+  await runtime.handleRequest(requestStream("GET", "/api/retention/archived"), listing);
+  assert.deepEqual(listing.body.conversations.map((row) => row.id), [archived.id]);
+  const deleted = responseCapture();
+  await runtime.handleRequest(requestStream("POST", "/api/retention/delete-archived", { id: archived.id, confirmation: archived.id }), deleted);
+  assert.equal(deleted.statusCode, 200);
+  assert.equal(database.canLaunchRun(), true);
+  const rescan = responseCapture();
+  await runtime.handleRequest(requestStream("POST", "/api/projects"), rescan);
+  assert.equal(rescan.statusCode, 200);
+  assert.deepEqual(database.listGroups().groups.map((group) => group.name), ["Core systems", "Experiments"]);
+    }, { configUrl: pathToFileURL(configFile) })();
+  } finally { rmSync(configDirectory, { recursive: true, force: true }); }
+});
 
 function seedLegacyUnknownTargetDatabase(filename) {
   const legacy = new Database(filename);
@@ -149,6 +1187,37 @@ function withWorktreeRuntime(fn, options = {}) {
     }
   };
 }
+
+const worktreeRefreshBehavior = { blockScan: false };
+test("worktree create and remove report committed effects when the following scan has no utility capacity", { skip: process.platform === "win32" },
+  withWorktreeRuntime(async (runtime, { project }) => {
+    const create = responseCapture();
+    await runtime.handleRequest(requestStream("POST", "/api/worktrees", {
+      projectId: project.id, branch: "capacity-test", name: "capacity-test",
+    }), create);
+    assert.equal(create.statusCode, 201);
+    assert.equal(create.body.refreshDeferred, true);
+    assert.ok(existsSync(create.body.path));
+
+    worktreeRefreshBehavior.blockScan = false;
+    await runtime.projects(true);
+    const remove = responseCapture();
+    await runtime.handleRequest(requestStream("DELETE", "/api/worktrees", {
+      projectId: project.id, worktreePath: create.body.path, confirmation: create.body.path,
+    }), remove);
+    assert.equal(remove.statusCode, 200);
+    assert.equal(remove.body.removed, true);
+    assert.equal(remove.body.refreshDeferred, true);
+    assert.equal(existsSync(create.body.path), false);
+    const actions = runtime.database.listAudit(20).map((entry) => entry.action);
+    assert.ok(actions.includes("git.worktree.created"));
+    assert.ok(actions.includes("git.worktree.removed"));
+  }, { subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: async (file, args, options) => {
+      if (worktreeRefreshBehavior.blockScan && args[2] === "rev-parse") throw Object.assign(new Error("capacity"), { code: "SUBPROCESS_CAPACITY", statusCode: 429 });
+      const result = await execFileAsync(file, args, options);
+      if (args[2] === "worktree" && ["add", "remove"].includes(args[3])) worktreeRefreshBehavior.blockScan = true;
+      return result;
+    } } }));
 
 test("reconciles runs at startup and resolves discard decisions through the API", withRuntime(async (runtime) => {
   const conversation = runtime.database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recovery", provider: "codex" });
@@ -394,7 +1463,12 @@ for (const operation of ["send", "recovery"]) {
 for (const operation of ["send", "recovery"]) {
   test(`slow executable provider probe stays asynchronous and bounded for ${operation}`, { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
     // Exercise the real execFile --version path through each HTTP endpoint.
-    writeFileSync(path.join(bin, "codex"), "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then sleep 0.25; echo 'codex test'; fi\n");
+    // Runtime construction starts an independent display probe. Finish it
+    // before replacing the fixture, so authorization cannot reuse that old
+    // in-flight result instead of testing the slow executable below.
+    assert.equal(await runtime.agents.providerAvailable("codex"), true);
+    const probeMarker = path.join(bin, "slow-probe-ran");
+    writeFileSync(path.join(bin, "codex"), `#!/bin/sh\nif [ "$1" = "--version" ]; then sleep 0.4; echo ran > '${probeMarker}'; echo 'codex test'; fi\n`);
     const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Probe latency", provider: "codex" });
     let interrupted;
     if (operation === "recovery") {
@@ -409,8 +1483,10 @@ for (const operation of ["send", "recovery"]) {
       await runtime.handleRequest(requestStream("POST", operation === "send" ? `/api/conversations/${conversation.id}/runs` : `/api/runs/${interrupted.id}/resume`, operation === "send" ? { prompt: "measure probe" } : { policy: "retry" }), response);
     } finally { clearInterval(timer); }
     const elapsed = performance.now() - started;
-    assert.ok(elapsed >= 200 && elapsed < 2500, `${operation} took ${elapsed.toFixed(1)} ms with a 250 ms executable probe`);
-    assert.ok(ticks >= 5, `${operation} blocked the event loop during its executable probe`);
+    assert.ok(existsSync(probeMarker), `${operation} did not run the replacement executable`);
+    assert.equal(readFileSync(probeMarker, "utf8").trim(), "ran", `${operation} did not complete the replacement executable`);
+    assert.ok(ticks >= 1, `${operation} blocked the event loop during its executable probe (${elapsed.toFixed(1)} ms)`);
+    assert.ok(elapsed < 5000, `${operation} exceeded the bounded provider-probe response budget (${elapsed.toFixed(1)} ms)`);
     assert.equal(response.statusCode, 202);
   }));
 }
@@ -529,6 +1605,7 @@ test("legacy running rows without process ownership require explicit bounded cle
     seedLegacyRunningUnknownTargetDatabase(path.join(dataDirectory, "outright.db"), { secondRun: true });
     process.env.OUTRIGHT_DATA_DIR = dataDirectory;
     runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    await runtime.whenRunRecoveryComplete();
     const legacy = runtime.database.getRun("legacy-interrupted");
     assert.equal(legacy.status, "interrupted");
     assert.equal(legacy.recoveryClass, "unknown");
@@ -584,6 +1661,155 @@ test("holds an exclusive runtime lease before startup reconciliation", async () 
     await replacement?.shutdown();
     await unexpected?.shutdown();
     if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+test("failed startup releases its lease and preserves queued work through recovery and manager failures", async () => {
+  for (const stage of ["launch directory", "retention reconciliation", "terminal manager"]) {
+    const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-startup-lease-"));
+    const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+    process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+    let replacement;
+    try {
+      const seed = createOutrightDatabase();
+      const conversation = seed.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Recoverable", provider: "codex" });
+      const queued = seed.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "keep queued" });
+      await seed.close();
+
+      const failure = new Error(`${stage} failed`);
+      const options = stage === "launch directory" ? { hardenLaunchDirectory: () => { throw failure; } }
+        : stage === "retention reconciliation" ? { databaseFactory: (settings) => {
+          const database = createOutrightDatabase(settings);
+          database.reconcilePendingRetentionCleanup = () => { throw failure; };
+          return database;
+        } } : { terminalManagerFactory: () => { throw failure; } };
+      assert.throws(() => createOutrightRuntime({ configUrl: "file:///nonexistent-config.json", ...options }), (error) => error === failure);
+      replacement = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+      assert.equal(replacement.database.getRun(queued.id).status, "interrupted", `${stage} lost recoverable run state`);
+      assert.equal(replacement.database.getRun(queued.id).prompt, "keep queued");
+      assert.equal(replacement.database.getConversation(conversation.id)?.id, conversation.id);
+    } finally {
+      await replacement?.shutdown();
+      if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+      rmSync(dataDirectory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("failed startup reports both construction and synchronous cleanup failures", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-startup-errors-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+  const startupFailure = new Error("launch directory denied");
+  const cleanupFailure = new Error("cleanup report failed");
+  let replacement;
+  try {
+    assert.throws(() => createOutrightRuntime({ configUrl: "file:///nonexistent-config.json",
+      hardenLaunchDirectory: () => { throw startupFailure; },
+      databaseFactory: (options) => {
+        const database = createOutrightDatabase(options);
+        const close = database.closeFailedStartup.bind(database);
+        database.closeFailedStartup = () => { close(); throw cleanupFailure; };
+        return database;
+      },
+    }), (error) => error instanceof AggregateError
+      && error.errors[0] === startupFailure && error.errors[1] === cleanupFailure);
+    replacement = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    assert.ok(replacement.database.capacity(), "the failed constructor retained its SQLite lease");
+  } finally {
+    await replacement?.shutdown();
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR;
+    else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+test("large terminal audit recovery refreshes runtime capacity after startup", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-runtime-audit-scan-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+  let runtime;
+  try {
+    const seed = createOutrightDatabase();
+    await seed.close();
+    const writer = new Database(path.join(dataDirectory, "outright.db"));
+    const target = "54d20348-0790-4ba8-b888-e05887e48451";
+    try {
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)");
+      writer.transaction(() => {
+        for (let index = 0; index < 3_000; index += 1) insert.run("legacy.telemetry", "", "{}", "2026-09-01T00:00:00.000Z");
+        insert.run("terminal.created", target, JSON.stringify({ cwd: dataDirectory, pid: 333 }), "2026-09-01T00:00:00.000Z");
+      }).immediate();
+    } finally { writer.close(); }
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json",
+      terminalManagerFactory: (options) => createTerminalManager({ ...options, recoverTerminal: async () => false }) });
+    assert.equal(runtime.terminals.capacity().recoveryPending, true);
+    const deadline = Date.now() + 10_000;
+    while ((runtime.terminals.capacity().recoveryPending || runtime.terminals.capacity().unknown !== 1) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(runtime.terminals.capacity().unknown, 1,
+      "completed audit scan did not refresh the live terminal manager's reservations");
+    assert.equal(runtime.terminals.get(target)?.status, "unknown");
+  } finally {
+    await runtime?.shutdown();
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR;
+    else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+test("shutdown fences a stuck native recovery and releases the lease for a successor", async () => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-runtime-audit-shutdown-"));
+  const previousDataDir = process.env.OUTRIGHT_DATA_DIR;
+  process.env.OUTRIGHT_DATA_DIR = dataDirectory;
+  let runtime;
+  let successor;
+  let finishRecovery;
+  try {
+    const target = "54d20348-0790-4ba8-b888-e05887e48452";
+    const seed = createOutrightDatabase();
+    seed.auditCritical("terminal.created", { target, cwd: dataDirectory, pid: 333 });
+    await seed.close();
+    let markRecoveryStarted;
+    const recoveryStarted = new Promise((resolve) => { markRecoveryStarted = resolve; });
+    const recoveryResult = new Promise((resolve) => { finishRecovery = resolve; });
+    runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json",
+      terminalManagerFactory: (options) => createTerminalManager({ ...options, recoverTerminal: () => {
+        markRecoveryStarted();
+        return recoveryResult;
+      } }) });
+    await recoveryStarted;
+    await settledWithin(runtime.shutdown(), 250, "shutdown waited for native proof");
+    successor = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json",
+      terminalManagerFactory: (options) => createTerminalManager({ ...options, recoverTerminal: async () => false }) });
+    const scanDeadline = Date.now() + 10_000;
+    while (successor.terminals.capacity().recoveryPending && Date.now() < scanDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(Boolean(successor.terminals.capacity().recoveryPending), false, "successor terminal audit scan did not settle");
+    assert.equal(successor.terminals.capacity().unknown, 1);
+    finishRecovery(true);
+    const lateProofDeadline = Date.now() + 250;
+    let lateProofChecks = 0;
+    while (Date.now() < lateProofDeadline) {
+      lateProofChecks += 1;
+      assert.equal(successor.terminals.capacity().unknown, 1,
+        "the closed runtime released a reservation after its lease moved to a successor");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(lateProofChecks >= 2, "late native proof was not observed over a bounded interval");
+    const writer = new Database(path.join(dataDirectory, "outright.db"), { readonly: true });
+    try {
+      assert.equal(writer.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.recovered' AND target = ?").get(target).count, 0);
+    } finally { writer.close(); }
+  } finally {
+    finishRecovery?.(false);
+    await successor?.shutdown();
+    await runtime?.shutdown();
+    if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR;
+    else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
     rmSync(dataDirectory, { recursive: true, force: true });
   }
 });
@@ -1002,6 +2228,97 @@ test("blocks recovery of a newer run while an older interrupted run is unresolve
   }, { recoveryProcessAlive: () => treeVerdict });
 })());
 
+test("malformed prelaunch outcomes remain recoverable and are removed after a decision", withRuntime(async (runtime) => {
+  await runtime.whenRunRecoveryComplete();
+  const conversation = runtime.database.listConversations()[0];
+  const runs = runtime.database.listRuns(conversation.id);
+  const queued = runs.find((run) => run.prompt === "queued");
+  const launching = runs.find((run) => run.prompt === "launching");
+  const sibling = runs.find((run) => run.prompt === "valid sibling");
+  assert.equal(sibling.status, "completed");
+  for (const run of [queued, launching]) {
+    assert.equal(run.recoveryClass, "never-started");
+    const marker = path.join(runtime.database.launchDirectory, `${run.id}.outcome.json`);
+    assert.equal(existsSync(marker), true, "bad evidence is preserved until a decision commits");
+    const response = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/runs/${run.id}/resume`, { policy: "discard" }), response);
+    assert.equal(response.statusCode, 200, JSON.stringify(response.body));
+    assert.equal(existsSync(marker), false, "resolved bad evidence is promptly removed");
+  }
+  assert.equal(runtime.database.findUnresolvedInterruptedRunForWorktree("/tmp/recovery-tree"), undefined);
+}, { seed(dataDirectory) {
+  const database = createOutrightDatabase({ filename: path.join(dataDirectory, "outright.db") });
+  try {
+    const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/recovery-tree", title: "Recovery", provider: "codex" });
+    const queued = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "queued" });
+    const launching = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "launching" });
+    const sibling = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "valid sibling" });
+    database.updateRun(launching.id, { status: "launching" });
+    for (const run of [queued, launching]) writeFileSync(path.join(database.launchDirectory, `${run.id}.outcome.json`), "{broken");
+    database.savePendingRunOutcome(sibling.id, { status: "completed", finishedAt: new Date().toISOString(), exitCode: 0, message: "" });
+  } finally { database.close(); }
+} }));
+
+test("unreadable outcome evidence is quarantined until it can be replayed", async () => {
+  const unreadable = new Set();
+  const faulted = new Set();
+  const originalRead = fs.readFileSync;
+  fs.readFileSync = (filename, ...args) => {
+    if (unreadable.has(String(filename))) {
+      faulted.add(String(filename));
+      const error = new Error("injected outcome read failure");
+      error.code = "EIO";
+      throw error;
+    }
+    return originalRead(filename, ...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    await withRuntime(async (runtime) => {
+      await runtime.whenRunRecoveryComplete();
+      const conversation = runtime.database.listConversations()[0];
+      const runs = runtime.database.listRuns(conversation.id);
+      const sibling = runs.find((run) => run.prompt === "valid sibling");
+      assert.equal(sibling.status, "completed", "a read fault is isolated to its run");
+      assert.equal(runtime.database.listAudit(100).filter((entry) => entry.action === "agent.run.outcome.invalid").length, 0);
+      for (const status of ["queued", "launching", "running"]) {
+        const blocked = runs.find((run) => run.prompt === `unreadable ${status}`);
+        assert.equal(blocked.recoveryClass, `outcome-unreadable-${status}`);
+        const marker = path.join(runtime.database.launchDirectory, `${blocked.id}.outcome.json`);
+        assert.equal(faulted.has(marker), true, `${status} startup did not exercise the read fault`);
+        const unavailable = responseCapture();
+        await runtime.handleRequest(requestStream("POST", `/api/runs/${blocked.id}/resume`, { policy: "discard" }), unavailable);
+        assert.equal(unavailable.statusCode, 503);
+        assert.equal(runtime.database.getRun(blocked.id).recoveryDecision, null);
+        unreadable.delete(marker);
+        const replayed = responseCapture();
+        await runtime.handleRequest(requestStream("POST", `/api/runs/${blocked.id}/resume`, { policy: "discard" }), replayed);
+        assert.equal(replayed.statusCode, 200, JSON.stringify(replayed.body));
+        assert.equal(replayed.body.status, "completed", "valid fsynced outcome wins over a discard request");
+        assert.equal(existsSync(marker), false);
+        assert.equal(runtime.database.listAudit(100).filter((entry) => entry.action === "agent.run.completed" && entry.target === blocked.id).length, 1);
+      }
+    }, { seed(dataDirectory) {
+      const database = createOutrightDatabase({ filename: path.join(dataDirectory, "outright.db") });
+      try {
+        const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/recovery-tree", title: "Recovery", provider: "codex" });
+        const sibling = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "valid sibling" });
+        const outcome = { status: "completed", finishedAt: new Date().toISOString(), exitCode: 0, message: "" };
+        database.savePendingRunOutcome(sibling.id, outcome);
+        for (const status of ["queued", "launching", "running"]) {
+          const blocked = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: `unreadable ${status}` });
+          if (status !== "queued") database.updateRun(blocked.id, status === "running" ? { status, pid: 424242 } : { status });
+          database.savePendingRunOutcome(blocked.id, outcome);
+          unreadable.add(path.join(database.launchDirectory, `${blocked.id}.outcome.json`));
+        }
+      } finally { database.close(); }
+    } })();
+  } finally {
+    fs.readFileSync = originalRead;
+    syncBuiltinESMExports();
+  }
+});
+
 // Regression: the discard branch did not check the conditional update result,
 // so the loser of a concurrent decision race returned HTTP 200 with a null
 // body and published a bogus resolution event.
@@ -1336,6 +2653,7 @@ async function withLaunchCrash({ status, handshake }, fn) {
     }
     seeded.close();
     runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json" });
+    await runtime.whenRunRecoveryComplete();
     await fn({ runtime, conversation, run, pid });
   } finally {
     await runtime?.shutdown();

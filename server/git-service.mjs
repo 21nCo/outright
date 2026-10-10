@@ -1,18 +1,75 @@
-import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { access, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
+import { utilityBudgetUnavailable, utilityProcesses } from "./subprocess-budget.mjs";
 
-const execFileAsync = promisify(execFile);
-
-export function createGitService({ database, getProjects, getConfig }) {
+export function createGitService({ database, getProjects, getConfig, subprocesses = utilityProcesses }) {
+  const git = (cwd, args, overrides = {}) => runGit(subprocesses, cwd, args, overrides);
+  const safeGit = async (cwd, args, overrides = {}) => {
+    try { return await git(cwd, args, overrides); }
+    catch (error) {
+      if (utilityBudgetUnavailable(error) || mutationOutcomeUncertain(error)) { throw error; }
+      return "";
+    }
+  };
+  const optionalGit = async (cwd, args) => {
+    try { return await git(cwd, args); }
+    catch (error) {
+      if (utilityBudgetUnavailable(error)) { throw error; }
+      return "";
+    }
+  };
+  const gitOutputOnFailure = async (cwd, args) => {
+    try { return await git(cwd, args, { maxBuffer: 12 * 1024 * 1024 }); }
+    catch (error) {
+      if (utilityBudgetUnavailable(error) || mutationOutcomeUncertain(error)) { throw error; }
+      return (error.stdout ?? "").trimEnd();
+    }
+  };
+  const headIsUnborn = async (cwd) => {
+    const headRef = await git(cwd, ["symbolic-ref", "--quiet", "HEAD"]);
+    try { await git(cwd, ["show-ref", "--verify", "--quiet", headRef]); return false; }
+    catch (error) {
+      // Git returns 1 only when the branch has no ref. A broken existing ref
+      // returns 128; keep every staged entry on any uncertain failure.
+      if (error.code === 1) return true;
+      throw error;
+    }
+  };
+  const clearUnbornIndex = async (cwd, files, failure) => {
+    if (!await headIsUnborn(cwd)) throw failure;
+    await git(cwd, ["rm", "-f", "--cached", "--ignore-unmatch", "--", ...files]);
+  };
+  const recoverResetFailure = async (cwd, files, failure) => {
+    if (utilityBudgetUnavailable(failure)) throw failure;
+    // An unborn branch has no HEAD to reset against. Only then are all
+    // staged entries additions that can be removed without touching files.
+    if (!/ambiguous argument ['"]?HEAD|unknown revision.*HEAD|bad revision ['"]?HEAD|could not resolve ['"]?HEAD/i
+      .test(`${failure.message}\n${failure.stderr ?? ""}`)) throw failure;
+    await clearUnbornIndex(cwd, files, failure);
+  };
+  const recoverRestoreFailure = async (cwd, files, failure) => {
+    if (utilityBudgetUnavailable(failure)) throw failure;
+    const detail = `${failure.message}\n${failure.stderr ?? ""}`;
+    if (/could not resolve ['"]?HEAD['"]?/i.test(detail)) {
+      await clearUnbornIndex(cwd, files, failure);
+      return;
+    }
+    if (!/not a git command|unknown subcommand|unknown option/i.test(detail)) throw failure;
+    try { await git(cwd, ["reset", "HEAD", "--", ...files]); }
+    catch (error_) { await recoverResetFailure(cwd, files, error_); }
+  };
+  const unstagePaths = async (cwd, files) => {
+    try { await git(cwd, ["restore", "--staged", "--", ...files]); }
+    catch (error_) { await recoverRestoreFailure(cwd, files, error_); }
+  };
   async function status(worktreePath) {
     const cwd = await requireWorktree(worktreePath);
     const [branch, porcelain, recent] = await Promise.all([
       git(cwd, ["branch", "--show-current"]),
       // NUL-delimited output keeps filenames with spaces or quotes intact.
       git(cwd, ["status", "--porcelain=v1", "--branch", "-z"]),
-      safeGit(cwd, ["log", "-8", "--pretty=format:%h%x09%an%x09%ar%x09%s"]),
+      optionalGit(cwd, ["log", "-8", "--pretty=format:%h%x09%an%x09%ar%x09%s"]),
     ]);
     const { header, files } = parsePorcelain(porcelain);
     return {
@@ -45,26 +102,26 @@ export function createGitService({ database, getProjects, getConfig }) {
   async function stage(worktreePath, files) {
     const cwd = await requireWorktree(worktreePath);
     const validated = await validateFiles(cwd, files);
-    await git(cwd, ["add", "--", ...validated]);
-    database.audit("git.stage", { target: cwd, files: validated });
-    return status(cwd);
+    await auditedMutation("git.stage.requested", "git.stage", { target: cwd, files: validated },
+      () => git(cwd, ["add", "--", ...validated]));
+    return statusAfterMutation(cwd);
   }
 
   async function unstage(worktreePath, files) {
     const cwd = await requireWorktree(worktreePath);
     const validated = await validateFiles(cwd, files);
-    try { await git(cwd, ["restore", "--staged", "--", ...validated]); }
-    catch { await git(cwd, ["rm", "--cached", "--", ...validated]); }
-    database.audit("git.unstage", { target: cwd, files: validated });
-    return status(cwd);
+    await auditedMutation("git.unstage.requested", "git.unstage", { target: cwd, files: validated },
+      () => unstagePaths(cwd, validated));
+    return statusAfterMutation(cwd);
   }
 
   async function commit(worktreePath, message) {
     const cwd = await requireWorktree(worktreePath);
     if (!message?.trim()) throw httpError(400, "Commit message is required");
-    const output = await git(cwd, ["commit", "-m", message.trim()], { maxBuffer: 8 * 1024 * 1024 });
-    database.audit("git.commit", { target: cwd, message: message.trim() });
-    return { output, status: await status(cwd) };
+    const output = await auditedMutation("git.commit.requested", "git.commit", { target: cwd, message: message.trim() },
+      () => git(cwd, ["commit", "-m", message.trim()], { maxBuffer: 8 * 1024 * 1024 }));
+    const refreshed = await statusAfterMutation(cwd);
+    return { output, status: refreshed.refreshDeferred ? null : refreshed, refreshDeferred: refreshed.refreshDeferred ?? false };
   }
 
   async function createWorktree({ projectId, branch, name, baseBranch = "HEAD" }) {
@@ -77,8 +134,9 @@ export function createGitService({ database, getProjects, getConfig }) {
     const destination = path.resolve(path.dirname(project.path), directoryName);
     await requireScanRoot(destination);
     if (await exists(destination)) throw httpError(409, "Destination already exists");
-    await git(root, ["worktree", "add", "-b", branch, destination, baseBranch]);
-    database.audit("git.worktree.created", { target: destination, projectId, branch, baseBranch });
+    await auditedMutation("git.worktree.create.requested", "git.worktree.created",
+      { target: destination, projectId, branch, baseBranch },
+      () => git(root, ["worktree", "add", "-b", branch, destination, baseBranch]));
     return { path: destination, branch };
   }
 
@@ -92,8 +150,8 @@ export function createGitService({ database, getProjects, getConfig }) {
     if (database.findUnresolvedInterruptedRunForWorktree?.(worktreePath)) {
       throw httpError(409, "Resolve the interrupted run before removing this worktree");
     }
-    await git(project.path, ["worktree", "remove", worktreePath]);
-    database.audit("git.worktree.removed", { target: worktreePath, projectId });
+    await auditedMutation("git.worktree.remove.requested", "git.worktree.removed",
+      { target: worktreePath, projectId }, () => git(project.path, ["worktree", "remove", worktreePath]));
     return { removed: true };
   }
 
@@ -108,9 +166,8 @@ export function createGitService({ database, getProjects, getConfig }) {
       finder: ["open", ["-R", target]],
     };
     const [executable, args] = commands[configured] ?? commands.zed;
-    const child = execFile(executable, args, { windowsHide: true }, () => {});
-    child.unref?.();
-    database.audit("editor.open", { target, editor: configured });
+    await auditedMutation("editor.open.requested", "editor.open", { target, editor: configured }, () =>
+      subprocesses.launchDetached(executable, args, { windowsHide: true }));
     return { opened: true, editor: configured, target };
   }
 
@@ -130,9 +187,9 @@ export function createGitService({ database, getProjects, getConfig }) {
     }
     let pullRequest = null;
     try {
-      const { stdout } = await execFileAsync("gh", ["pr", "view", "--json", "number,title,url,state,headRefName,baseRefName,statusCheckRollup"], { cwd, env: githubEnvironment(cwd), encoding: "utf8", timeout: 6000, maxBuffer: 2 * 1024 * 1024 });
+      const { stdout } = await subprocesses.run("gh", ["pr", "view", "--json", "number,title,url,state,headRefName,baseRefName,statusCheckRollup"], { cwd, env: githubEnvironment(cwd), encoding: "utf8", timeout: 6000, maxBuffer: 2 * 1024 * 1024 });
       pullRequest = JSON.parse(stdout);
-    } catch { /* A worktree does not need an associated PR. */ }
+    } catch (error) { if (utilityBudgetUnavailable(error)) throw error; /* A worktree does not need an associated PR. */ }
     return { instructionFiles, skills, pullRequest };
   }
 
@@ -151,15 +208,46 @@ export function createGitService({ database, getProjects, getConfig }) {
     return resolved;
   }
 
+  async function auditedMutation(requestAction, outcomeAction, details, mutate) {
+    const evidence = { ...details, operationId: randomUUID() };
+    database.auditAdmission(requestAction, evidence);
+    let result;
+    try { result = await mutate(); }
+    catch (error) {
+      // A signal, timeout or output-limit kill can arrive after Git changed
+      // the index, commit or worktree. Preserve the admission for inspection
+      // instead of recording a false negative and inviting a duplicate retry.
+      if (mutationOutcomeUncertain(error)) throw outcomeUnknown(error, evidence.operationId);
+      try { database.auditCritical(`${outcomeAction}.failed`, { ...evidence, error: String(error.message ?? error).slice(0, 1024) }); }
+      catch (auditError) { throw outcomeUnknown(auditError, evidence.operationId); }
+      throw error;
+    }
+    // An admission can be followed by a quota change while an external
+    // command runs. A required outcome either commits before success returns
+    // or leaves the request as an explicit unresolved operation on failure.
+    try { database.auditCritical(outcomeAction, evidence); }
+    catch (error) { throw outcomeUnknown(error, evidence.operationId); }
+    return result;
+  }
+
+  async function statusAfterMutation(cwd) {
+    try { return await status(cwd); }
+    // The effect has a durable audit outcome. A read failure after that point
+    // must ask the client to refresh later, not invite a duplicate mutation.
+    catch { return { refreshDeferred: true }; }
+  }
+
   return { status, diff, stage, unstage, commit, createWorktree, removeWorktree, openInEditor, context, requireWorktree };
 }
 
-async function git(cwd, args, overrides = {}) {
-  const { stdout } = await execFileAsync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 10_000, maxBuffer: 4 * 1024 * 1024, ...overrides });
+function mutationOutcomeUncertain(error) {
+  return Boolean(error?.killed || error?.signal || ["ETIMEDOUT", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", "SUBPROCESS_OWNERSHIP_UNKNOWN"].includes(error?.code));
+}
+
+async function runGit(subprocesses, cwd, args, overrides = {}) {
+  const { stdout } = await subprocesses.run("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 10_000, maxBuffer: 4 * 1024 * 1024, ...overrides });
   return stdout.trimEnd();
 }
-async function safeGit(cwd, args, overrides = {}) { try { return await git(cwd, args, overrides); } catch { return ""; } }
-async function gitOutputOnFailure(cwd, args) { try { return await git(cwd, args, { maxBuffer: 12 * 1024 * 1024 }); } catch (error) { return (error.stdout ?? "").trimEnd(); } }
 // Porcelain v1 with -z: each record is "XY path"; renames/copies follow with
 // the original path in a second record. No quoting or arrow separators.
 function parsePorcelain(output) {
@@ -183,6 +271,12 @@ function isWithin(root, target) { const relative = path.relative(root, target); 
 async function canonicalPath(target) { try { return await realpath(target); } catch { return path.resolve(target); } }
 async function exists(target) { try { await access(target); return true; } catch { return false; } }
 function httpError(statusCode, message) { const error = new Error(message); error.statusCode = statusCode; return error; }
+function outcomeUnknown(cause, operationId) {
+  const error = httpError(503, `Action outcome could not be recorded; inspect the target before retrying (operation ${operationId})`);
+  error.details = { operationId, outcomeUnknown: true };
+  error.cause = cause;
+  return error;
+}
 
 function githubEnvironment(cwd) {
   if (!cwd.includes(`${path.sep}dev${path.sep}n${path.sep}`)) return process.env;

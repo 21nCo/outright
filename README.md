@@ -73,6 +73,17 @@ npm run test:sites
 
 The suite covers provider command construction and event normalization, SQLite recovery, PTY input/output, Git review/staging/commits, guarded worktree lifecycle, scanner parsing, and browser interaction regressions. Install Chrome or Chromium before running `npm test`; the browser suite fails explicitly rather than skipping coverage if it cannot find an executable. GitHub CI runners include Chrome, and `CHROME_PATH` overrides the detected location.
 
+## Unverified terminal capacity
+
+Terminals run inside a native process ownership boundary. If Outright cannot verify that a boundary is empty after a crash or failed helper call, Settings keeps its slot charged. Stop Outright and inspect the unresolved owner before releasing it:
+
+```bash
+node scripts/reconcile-terminal-capacity.mjs --list
+node scripts/reconcile-terminal-capacity.mjs --target TERMINAL_ID --verified-empty --evidence "How the native process tree was verified empty"
+```
+
+The second command releases one reservation and records the operator's evidence in the audit log. It refuses to run while another runtime holds the database lease. Use `--database /path/to/outright.db` with both commands when `OUTRIGHT_DATA_DIR` or a custom database path is in use. Do not release a reservation while its owner or descendants remain active.
+
 ## Linear delivery automation
 
 The project includes a paused Hermes workflow for processing the Outright Linear backlog one issue at a time through implementation, pull-request creation, and independent review. Linear access is routed through Composio CLI. See [`automation/hermes/README.md`](automation/hermes/README.md) for the workflow and activation commands.

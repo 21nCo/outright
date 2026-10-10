@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { ArrowsClockwise, Plus, TerminalWindow, X } from "@phosphor-icons/react";
@@ -8,14 +8,22 @@ import { domId, nextTabIndex } from "@/lib/accessibility";
 import { pruneExitedIds } from "@/lib/terminal-exit-state";
 import { api } from "@/lib/runtime-api";
 
+const EMPTY_UNVERIFIED_IDS = new Set();
+
 export function TerminalPane(props) {
   return <WorktreeTerminalPane key={JSON.stringify([props.worktree.id, props.worktree.path])} {...props} />;
 }
 
-function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) {
+function terminalTabLabel(terminal) {
+  if (terminal.status === "exited") return `${terminal.name}, process exited ${terminal.exitCode ?? "unknown"}`;
+  if (terminal.status === "unknown") return `${terminal.name}, ownership unverified`;
+  return terminal.name;
+}
+
+function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = EMPTY_UNVERIFIED_IDS, sendRuntime, onError }) {
   const hostRef = useRef(null);
   const xtermRef = useRef(null);
-  const fitRef = useRef(null);
+  const fitSelectedRef = useRef(null);
   const activeIdRef = useRef("");
   const displayedCursorRef = useRef(0);
   const inputReadyRef = useRef(false);
@@ -29,7 +37,10 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   const selectingRef = useRef(false);
   const mountedRef = useRef(false);
   const queuedReconnectRef = useRef(null);
+  const focusRequestRef = useRef(null);
   const terminalsRef = useRef([]);
+  const unverifiedTerminalIdsRef = useRef(unverifiedTerminalIds);
+  unverifiedTerminalIdsRef.current = unverifiedTerminalIds;
   const worktreeNameRef = useRef(worktree.name);
   const onErrorRef = useRef(onError);
   worktreeNameRef.current = worktree.name;
@@ -54,12 +65,15 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     xterm.loadAddon(fit);
     xterm.open(hostRef.current);
     xtermRef.current = xterm;
-    fitRef.current = fit;
     const resizeTerminal = () => {
       try {
         if (document.hidden) return;
+        const dimensions = fit.proposeDimensions();
+        if (!dimensions) return;
         fit.fit();
         if (!loadingRef.current && activeIdRef.current && !exitedIdsRef.current.has(activeIdRef.current)
+          && !unverifiedTerminalIdsRef.current.has(activeIdRef.current)
+          && terminalsRef.current.find((item) => item.id === activeIdRef.current)?.status === "running"
           && (inputReadyRef.current || awaitingVisibleFitRef.current)) {
           sendRuntime({ type: "terminal.resize", terminalId: activeIdRef.current, cols: xterm.cols, rows: xterm.rows });
           inputReadyRef.current = true;
@@ -67,16 +81,61 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
         }
       } catch { /* The terminal may be transitioning out of the DOM. */ }
     };
+    fitSelectedRef.current = resizeTerminal;
     const resize = new ResizeObserver(resizeTerminal);
     resize.observe(hostRef.current);
     document.addEventListener("visibilitychange", resizeTerminal);
     const disposable = xterm.onData((data) => {
-      if (inputReadyRef.current && !loadingRef.current && activeIdRef.current) sendRuntime({ type: "terminal.input", terminalId: activeIdRef.current, data });
+      if (inputReadyRef.current && !loadingRef.current && activeIdRef.current
+        && !unverifiedTerminalIdsRef.current.has(activeIdRef.current)) sendRuntime({ type: "terminal.input", terminalId: activeIdRef.current, data });
     });
-    return () => { disposable.dispose(); document.removeEventListener("visibilitychange", resizeTerminal); resize.disconnect(); xterm.dispose(); xtermRef.current = null; };
+    return () => { disposable.dispose(); document.removeEventListener("visibilitychange", resizeTerminal); resize.disconnect(); fitSelectedRef.current = null; xterm.dispose(); xtermRef.current = null; };
   }, [sendRuntime]);
 
+  // The selected terminal and the busy state both change the committed pane.
+  // Publish its PTY size only after that React commit, using the same fit path
+  // as ResizeObserver and visibility restoration.
+  useLayoutEffect(() => {
+    if (!loading && activeId) fitSelectedRef.current?.();
+  }, [activeId, loading]);
+
+  // The socket callback has already fenced sends. Commit a durable warning
+  // even when a later output or capacity event replaced runtimeEvent.
+  useLayoutEffect(() => {
+    const pending = pendingOutputRef.current;
+    if (pending && unverifiedTerminalIds.has(pending.id)) pending.unknown = true;
+    if (!terminalsRef.current.some((item) => unverifiedTerminalIds.has(item.id) && item.status !== "unknown")) return;
+    stageTerminals(terminalsRef.current.map((item) => unverifiedTerminalIds.has(item.id)
+      ? { ...item, status: "unknown" } : item));
+    if (unverifiedTerminalIds.has(activeIdRef.current)) {
+      inputReadyRef.current = false;
+      awaitingVisibleFitRef.current = false;
+      setExitNotice("Terminal ownership is unverified. Inspect local terminal recovery.");
+    }
+  }, [unverifiedTerminalIds]);
+
+  useLayoutEffect(() => {
+    const request = focusRequestRef.current;
+    if (!request?.id || request.id !== activeId || request.token !== reconcileTokenRef.current) return;
+    focusRequestRef.current = null;
+    if (document.activeElement === document.body) {
+      document.getElementById(domId("terminal-tab", request.id))?.focus({ preventScroll: true });
+    }
+  }, [terminals, activeId, loading]);
+
+  useEffect(() => {
+    const cancelFocus = (event) => {
+      if (event.type === "focusin" && event.target === document.body) return;
+      if (focusRequestRef.current) focusRequestRef.current = null;
+    };
+    for (const type of ["pointerdown", "keydown", "focusin"]) document.addEventListener(type, cancelFocus, true);
+    return () => {
+      for (const type of ["pointerdown", "keydown", "focusin"]) document.removeEventListener(type, cancelFocus, true);
+    };
+  }, []);
+
   function beginSelection() {
+    focusRequestRef.current = null;
     const token = ++reconcileTokenRef.current;
     loadingRef.current = true;
     inputReadyRef.current = false;
@@ -86,9 +145,11 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   }
 
   function stageTerminals(next) {
-    terminalsRef.current = next;
-    pruneExitedIds(exitedIdsRef.current, next, pendingOutputRef.current);
-    if (activeIdRef.current && !next.some((item) => item.id === activeIdRef.current)) {
+    const guarded = next.map((item) => unverifiedTerminalIdsRef.current.has(item.id)
+      ? { ...item, status: "unknown" } : item);
+    terminalsRef.current = guarded;
+    pruneExitedIds(exitedIdsRef.current, guarded, pendingOutputRef.current);
+    if (activeIdRef.current && !guarded.some((item) => item.id === activeIdRef.current)) {
       activeIdRef.current = "";
       displayedCursorRef.current = 0;
       inputReadyRef.current = false;
@@ -96,7 +157,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       xtermRef.current?.reset();
       setActiveId("");
     }
-    setTerminals(next);
+    setTerminals(guarded);
   }
 
   function recoverSelection(restoreInput = false, restoreFit = false) {
@@ -109,18 +170,20 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       xtermRef.current?.reset();
       setActiveId(activeIdRef.current);
     } else if (selected) {
-      const running = !exitedIdsRef.current.has(selected.id) && selected.status !== "exited";
+      const running = !exitedIdsRef.current.has(selected.id) && !unverifiedTerminalIdsRef.current.has(selected.id)
+        && selected.status === "running";
       inputReadyRef.current = restoreInput && running;
       awaitingVisibleFitRef.current = restoreFit && running;
     }
   }
 
   async function activateTerminal(terminal, token) {
-    const pending = { id: terminal.id, chunks: [], length: 0, overflow: false, exit: null };
+    const pending = { id: terminal.id, chunks: [], length: 0, overflow: false, exit: null, unknown: false };
     pendingOutputRef.current = pending;
     try {
       const detail = await api(`/api/terminals/${terminal.id}`);
       if (token !== reconcileTokenRef.current) return;
+      if (!detail || typeof detail !== "object") throw new Error("Terminal detail is unavailable");
       // Leave output and exit events staged through the layout handoff. A
       // resize can settle while the snapshot request is in flight.
       await new Promise((resolve) => {
@@ -130,6 +193,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       });
       if (token !== reconcileTokenRef.current) return;
       if (pending.overflow) throw new Error("Terminal output exceeded the activation buffer; retry the tab");
+      const status = pending.unknown || unverifiedTerminalIdsRef.current.has(terminal.id)
+        ? "unknown" : detail.status ?? terminal.status;
       const xterm = xtermRef.current;
       xterm?.reset();
       if (detail.buffer) xterm?.write(detail.buffer);
@@ -138,24 +203,31 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
         if (!Number.isSafeInteger(detail.outputCursor) || !Number.isSafeInteger(cursor) || cursor > detail.outputCursor) xterm?.write(data);
         if (Number.isSafeInteger(cursor)) displayedCursor = Math.max(displayedCursor, cursor);
       }
-      const exited = pending.exit || (detail.status === "exited" ? { exitCode: detail.exitCode } : null);
+      let exited = null;
+      if (status !== "unknown") {
+        if (pending.exit) exited = pending.exit;
+        else if (status === "exited") exited = { exitCode: detail.exitCode };
+      }
       if (exited) {
         exitedIdsRef.current.add(terminal.id);
         xterm?.writeln(`\r\n\x1b[90m[process exited ${exited.exitCode ?? "unknown"}]\x1b[0m`);
         stageTerminals(terminalsRef.current.map((item) => item.id === terminal.id ? { ...item, status: "exited", exitCode: exited.exitCode } : item));
-      } else {
+      } else if (status === "running") {
         exitedIdsRef.current.delete(terminal.id);
         stageTerminals(terminalsRef.current.map((item) => item.id === terminal.id ? { ...item, status: "running", exitCode: undefined } : item));
+      } else {
+        inputReadyRef.current = false;
+        awaitingVisibleFitRef.current = false;
+        stageTerminals(terminalsRef.current.map((item) => item.id === terminal.id ? { ...item, status } : item));
       }
-      setExitNotice(exited ? `${terminal.name} process exited ${exited.exitCode ?? "unknown"}` : "");
+      let notice = "";
+      if (exited) notice = `${terminal.name} process exited ${exited.exitCode ?? "unknown"}`;
+      else if (status === "unknown") notice = `${terminal.name} ownership is unverified. Inspect local terminal recovery.`;
+      setExitNotice(notice);
       activeIdRef.current = terminal.id;
       displayedCursorRef.current = displayedCursor;
-      if (!exited && !document.hidden) {
-        try { fitRef.current?.fit(); } catch { /* The host may be transitioning. */ }
-        if (xterm) sendRuntime({ type: "terminal.resize", terminalId: terminal.id, cols: xterm.cols, rows: xterm.rows });
-        inputReadyRef.current = true;
-      } else if (!exited) awaitingVisibleFitRef.current = true;
       setActiveId(terminal.id);
+      if (!exited && status === "running") awaitingVisibleFitRef.current = true;
     } finally {
       if (pendingOutputRef.current === pending) pendingOutputRef.current = null;
     }
@@ -170,7 +242,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
         const { terminals: all } = await api("/api/terminals");
         if (cancelled || token !== reconcileTokenRef.current) return;
         const matching = all.filter((terminal) => terminal.cwd === worktree.path);
-        let terminal = matching.find((item) => item.status === "running");
+        let terminal = matching.find((item) => item.status === "running") ?? matching.find((item) => item.status === "unknown");
         if (!terminal) terminal = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: worktreeNameRef.current, cols: 100, rows: 30 } });
         if (cancelled || token !== reconcileTokenRef.current) return;
         stageTerminals([...matching.filter((item) => item.id !== terminal.id), terminal]);
@@ -178,7 +250,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       } catch (error) { if (!cancelled && token === reconcileTokenRef.current) { recoverSelection(); onErrorRef.current(error); } }
       finally { if (!cancelled && token === reconcileTokenRef.current) { loadingRef.current = false; setLoading(false); } }
     })();
-    return () => { cancelled = true; mountedRef.current = false; ++reconcileTokenRef.current; selectingRef.current = false; queuedReconnectRef.current = null; pendingOutputRef.current = null; activeIdRef.current = ""; displayedCursorRef.current = 0; };
+    return () => { cancelled = true; mountedRef.current = false; ++reconcileTokenRef.current; selectingRef.current = false; queuedReconnectRef.current = null; focusRequestRef.current = null; pendingOutputRef.current = null; activeIdRef.current = ""; displayedCursorRef.current = 0; };
   }, [worktree.id, worktree.path]);
 
   useEffect(() => {
@@ -200,7 +272,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     if (runtimeEvent?.type === "terminal.exit") {
       const pending = pendingOutputRef.current;
       if (pending?.id === runtimeEvent.terminalId) pending.exit = runtimeEvent.payload;
-      if (terminalsRef.current.some((item) => item.id === runtimeEvent.terminalId)) {
+      if (!unverifiedTerminalIdsRef.current.has(runtimeEvent.terminalId)
+        && terminalsRef.current.some((item) => item.id === runtimeEvent.terminalId)) {
         const firstExit = !exitedIdsRef.current.has(runtimeEvent.terminalId);
         exitedIdsRef.current.add(runtimeEvent.terminalId);
         stageTerminals(terminalsRef.current.map((item) => item.id === runtimeEvent.terminalId
@@ -214,6 +287,16 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
             xtermRef.current?.writeln(`\r\n\x1b[90m[process exited ${runtimeEvent.payload.exitCode ?? "unknown"}]\x1b[0m`);
           }
         }
+      }
+    }
+    if (runtimeEvent?.type === "terminal.audit-failed") {
+      if (pendingOutputRef.current?.id === runtimeEvent.terminalId) pendingOutputRef.current.unknown = true;
+      stageTerminals(terminalsRef.current.map((item) => item.id === runtimeEvent.terminalId
+        ? { ...item, status: "unknown" } : item));
+      if (runtimeEvent.terminalId === activeIdRef.current) {
+        inputReadyRef.current = false;
+        awaitingVisibleFitRef.current = false;
+        setExitNotice("Terminal ownership is unverified. Inspect local terminal recovery.");
       }
     }
     if (runtimeEvent?.type === "runtime.connected" && (runtimeEvent.payload?.replay?.requestedAfter > 0 || runtimeEvent.payload?.restarted) && activeIdRef.current) {
@@ -234,6 +317,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       if (token !== reconcileTokenRef.current) return;
       const matching = all.filter((terminal) => terminal.cwd === worktree.path);
       let terminal = matching.find((item) => item.id === previousId && item.status === "running") ?? matching.find((item) => item.status === "running");
+      if (!terminal) terminal = matching.find((item) => item.status === "unknown");
       if (!terminal) terminal = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: worktreeNameRef.current, cols: 100, rows: 30 } });
       if (token !== reconcileTokenRef.current) return;
       stageTerminals([...matching.filter((item) => item.id !== terminal.id), terminal]);
@@ -292,6 +376,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
     const previousId = activeIdRef.current;
     const focusedClose = document.activeElement?.closest(".terminal-tab")?.querySelector('[role="tab"]')?.dataset.tabId === id;
     const token = beginSelection();
+    if (focusedClose) focusRequestRef.current = { id: null, token };
     try {
       await api(`/api/terminals/${id}`, { method: "DELETE" });
       if (token !== reconcileTokenRef.current) return;
@@ -306,14 +391,17 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
       }
       if (token !== reconcileTokenRef.current) return;
       stageTerminals(remaining);
-      if (focusedClose) {
-        const nextId = next.id;
-        requestAnimationFrame(() => {
-          if (document.activeElement === document.body) document.getElementById(domId("terminal-tab", nextId))?.focus({ preventScroll: true });
-        });
-      }
+      if (focusRequestRef.current?.token === token) focusRequestRef.current.id = next.id;
       await activateTerminal(next, token);
-    } catch (error) { if (token === reconcileTokenRef.current) { recoverSelection(wasReady, wasAwaitingFit); onErrorRef.current(error); } }
+    } catch (error) {
+      if (token === reconcileTokenRef.current) {
+        recoverSelection(wasReady, wasAwaitingFit);
+        if (focusRequestRef.current?.token === token && !focusRequestRef.current.id) {
+          focusRequestRef.current = null;
+        }
+        onErrorRef.current(error);
+      }
+    }
     finally { finishMutation(token); }
   }
 
@@ -362,7 +450,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, sendRuntime, onError }) 
   return <section className="terminal-pane" aria-label="Worktree terminals">
     <p className="sr-only" id="terminal-help">Terminal input and output. Use the left and right arrow keys on a terminal tab to switch sessions.</p>
     <header className="terminal-tabs" role="tablist" aria-label="Open terminals" aria-orientation="horizontal" aria-busy={loading} onKeyDown={navigateTerminalTabs}>
-      {terminals.map((terminal) => <div className={`terminal-tab ${terminal.id === activeId ? "is-active" : ""}`} key={terminal.id}><button className="terminal-tab-select" id={domId("terminal-tab", terminal.id)} data-tab-id={terminal.id} role="tab" aria-selected={terminal.id === activeId} aria-controls="terminal-panel" tabIndex={terminal.id === activeId || (!activeId && terminals[0]?.id === terminal.id) ? 0 : -1} aria-disabled={loading || undefined} aria-label={`${terminal.name}${terminal.status === "exited" ? `, process exited ${terminal.exitCode ?? "unknown"}` : ""}`} onClick={() => selectTerminal(terminal)}><TerminalWindow /><span>{terminal.name}</span></button><button className="terminal-tab-close" aria-label={`Close terminal ${terminal.name}`} disabled={loading} onClick={() => closeTerminal(terminal.id)}><X /></button></div>)}
+      {terminals.map((terminal) => <div className={`terminal-tab ${terminal.id === activeId ? "is-active" : ""}`} key={terminal.id}><button className="terminal-tab-select" id={domId("terminal-tab", terminal.id)} data-tab-id={terminal.id} role="tab" aria-selected={terminal.id === activeId} aria-controls="terminal-panel" tabIndex={terminal.id === activeId || (!activeId && terminals[0]?.id === terminal.id) ? 0 : -1} aria-disabled={loading || undefined} aria-label={terminalTabLabel(terminal)} onClick={() => selectTerminal(terminal)}><TerminalWindow /><span>{terminal.name}</span></button><button className="terminal-tab-close" aria-label={`Close terminal ${terminal.name}`} disabled={loading || terminal.recoveryReservation} onClick={() => closeTerminal(terminal.id)}><X /></button></div>)}
       <Button variant="ghost" size="icon-xs" disabled={loading} onClick={createTerminal} aria-label="New terminal"><Plus /></Button>
       {loading && <span className="terminal-loading" role="status"><ArrowsClockwise className="spin" />Loading terminal</span>}
     </header>

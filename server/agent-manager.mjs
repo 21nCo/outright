@@ -4,11 +4,15 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync,
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
+import { RESOURCE_BUDGETS, retainedTranscriptMessageBytes } from "./resource-budgets.mjs";
 
 const MAX_PROVIDER_LINE_BYTES = 1024 * 1024;
 const MAX_ASSISTANT_BYTES = 1024 * 1024;
 const MAX_PROCESS_EVENT_BYTES = 64 * 1024;
 const MAX_ASSISTANT_EVENT_BYTES = 255 * 1024;
+const MAX_RUN_TRANSCRIPT_ITEMS = RESOURCE_BUDGETS.maxRunTranscriptItems;
+const MAX_RUN_TRANSCRIPT_BYTES = RESOURCE_BUDGETS.maxRunTranscriptBytes;
+const MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES = 16 * 1024;
 const ASSISTANT_TRUNCATION_MARKER = "\n\n[Output truncated by Outright at 1 MiB]";
 // Assistant checkpoints are coalesced: a new durable checkpoint is written
 // only after this many new stream bytes (or this much time) accumulate, so a
@@ -160,7 +164,12 @@ const teardown = () => {
   teardownStarted = true;
   if (providerGone) finishWhenOwnedGroupIsEmpty();
   else {
-    try { provider.kill("SIGTERM"); } catch { /* Already gone. */ }
+    // Windows uses the supervisor's stdin as the Job Object control channel.
+    // Killing that supervisor first would let the wrapper report completion
+    // without observing its owned descendants leave the job.
+    if (process.platform === "win32" && executable === ${JSON.stringify(AGENT_SUPERVISOR)}) {
+      try { provider.stdin.end("stop\\n"); } catch { /* The owner already exited. */ }
+    } else try { provider.kill("SIGTERM"); } catch { /* Already gone. */ }
     // The production supervisor owns its descendants and its own escalation:
     // never kill it before it has reaped them. For a direct child (including
     // the wrapper's coalesced go/stop fixture), retain this parent as the
@@ -207,7 +216,9 @@ process.stdin.on("data", (chunk) => {
       // restart recovery never mistakes the pre-submit race for an exited run.
       provider = spawn(executable, commandArgs, darwinLaunch
         ? { stdio: ["ignore", "inherit", "inherit", "pipe"], env: { ...process.env, OUTRIGHT_LAUNCH_GATE_FD: "3" } }
-        : { stdio: ["ignore", "inherit", "inherit"] });
+        : { stdio: [process.platform === "win32" && executable === ${JSON.stringify(AGENT_SUPERVISOR)}
+          ? "pipe" : "ignore", "inherit", "inherit"] });
+      provider.stdin?.on?.("error", () => {});
       // Durable provider identity: escalation targets the provider alone so this
       // wrapper — the provider's parent — survives to reap it. Without this, a
       // group-wide SIGKILL kills the wrapper first and a killed-but-unreaped
@@ -258,7 +269,10 @@ process.stdin.on("data", (chunk) => {
 // The runtime went away before authorizing the launch: exit without ever
 // starting the provider, so an abandoned handshake can never mutate the
 // worktree.
-process.stdin.on("end", () => { if (!authorized) { try { fs.unlinkSync(handshakePath); } catch {} process.exit(0); } });
+process.stdin.on("end", () => {
+  if (!authorized) { try { fs.unlinkSync(handshakePath); } catch {} process.exit(0); }
+  teardown();
+});
 `;
 
 function supervisorCommand(args, timeout) {
@@ -309,16 +323,82 @@ export async function defaultLaunchCommand(command, run, launchDirectory) {
   };
 }
 
-export function createAgentManager({ database, publish, onProvidersChanged = () => {}, providerDiscoveryFactory = createProviderDiscovery, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
+function storageAdmissionFailure(error) {
+  return error?.statusCode === 507
+    || /^(?:SQLITE_(?:FULL|IOERR|READONLY|BUSY|LOCKED)(?:_|$)|E(?:IO|PERM|ACCES|BUSY|NFILE|MFILE|STALE|NOSPC|ROFS)$)/.test(error?.code ?? "");
+}
+
+function persistentStorageFailure(error) {
+  return error?.statusCode === 507
+    || /^(?:SQLITE_(?:FULL|READONLY)(?:_|$)|E(?:PERM|ACCES|NOSPC|ROFS)$)/.test(error?.code ?? "");
+}
+
+function deferredAdmissionForStorage(error) {
+  if (!storageAdmissionFailure(error)) return null;
+  return persistentStorageFailure(error) ? "persistent-deferred" : "retry-deferred";
+}
+
+function nativeOwnershipPending(state) {
+  if (!state.launchHandshakePath || !existsSync(state.launchHandshakePath)) return false;
+  // Only the Windows wrapper writes this marker after its supervisor exits
+  // with an empty Job Object. It remains until the terminal database commit.
+  if (process.platform !== "win32") return true;
+  try {
+    const record = JSON.parse(readFileSync(state.launchHandshakePath, "utf8"));
+    return record.completed !== true || record.pid !== state.child?.pid;
+  } catch { return true; }
+}
+
+function freezeTerminalOutcome(state, exitCode, error) {
+  if (state.terminalOutcome) return;
+  const successful = exitCode === 0 && !error && !state.stopped;
+  let status = "failed";
+  if (state.stopped) status = "stopped";
+  else if (successful) status = "completed";
+  state.terminalOutcome = {
+    status,
+    message: error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : ""),
+    finishedAt: new Date().toISOString(),
+    exitCode,
+  };
+}
+
+function unresolvedOutcomeUnavailable() {
+  const unavailable = new Error("Run outcome storage is unavailable; retry shortly");
+  unavailable.statusCode = 503;
+  return unavailable;
+}
+
+export function createAgentManager({ database, publish, onProvidersChanged = () => {}, onShutdownRecovery = () => {}, onDiskRetry = () => {}, providerDiscoveryFactory = createProviderDiscovery, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
   const resolvedLaunchDirectory = launchDirectory
     ?? database.launchDirectory;
   assertPrivateLaunchDirectory(resolvedLaunchDirectory);
   const active = new Map();
+  // Exited providers no longer consume a process slot, but their uncommitted
+  // outcome and launch proof must remain owned until SQLite accepts it.
+  const pendingOutcomes = new Map();
   const queue = [];
   const launches = new Set();
+  const maintenanceWaiters = new Set();
   let shuttingDown = false;
   let shutdownPromise;
+  let diskRetryTimer;
+  let diskRetryDueAt = 0;
+  let diskRetryDelayMs = 100;
+  let hardRetryProbed = false;
+  const admissionRetryRuns = new Set();
+  let queueReadRetryPending = false;
   const providerDiscovery = providerDiscoveryFactory({ onChange: onProvidersChanged });
+
+  function wakeMaintenanceWaiters() {
+    for (const resolve of maintenanceWaiters) resolve();
+    maintenanceWaiters.clear();
+  }
+
+  function waitForMaintenance() {
+    if (!database.maintenanceActive || shuttingDown) return Promise.resolve();
+    return new Promise((resolve) => maintenanceWaiters.add(resolve));
+  }
 
   function providers() {
     return providerDiscovery.list();
@@ -334,11 +414,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     return database.getRun(run.id);
   }
 
-  async function start(state, authorize) {
+  function preflightAgentAdmission(state, authorize) {
     const { conversation, run } = state;
-    const command = buildProviderCommand(conversation, run);
-    const launch = await launchCommand(command, run, resolvedLaunchDirectory);
-    if (state.stopped || shuttingDown) return;
     // The asynchronous capability check is a retry boundary: trust and the
     // selected durable target may have changed while it was in flight.
     const current = database.getConversation(run.conversationId);
@@ -346,6 +423,38 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       throw new Error("Conversation target changed while preparing the run; submit again");
     }
     authorize?.();
+    // Validation and capability setup can yield while a sibling spends the
+    // remaining retained budget. Defer before the durable launch transition.
+    try {
+      if (database.canLaunchRun?.() === false) return "deferred";
+    } catch (error) {
+      const deferred = deferredAdmissionForStorage(error);
+      if (deferred) return deferred;
+      throw error;
+    }
+    try {
+      database.auditAdmission("agent.run.start.requested", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath });
+    } catch (error) {
+      // No process has been spawned yet. A transient SQLite lock or I/O
+      // failure must leave the run queued for a fresh admission attempt;
+      // terminalizing it can itself fail under the same storage fault.
+      const deferred = deferredAdmissionForStorage(error);
+      if (deferred) return deferred;
+      if (error.statusCode === 503 && database.maintenanceActive) return "deferred";
+      throw error;
+    }
+    admissionRetryRuns.delete(run.id);
+    clearDiskRetry();
+    return null;
+  }
+
+  async function start(state, authorize) {
+    const { conversation, run } = state;
+    const command = buildProviderCommand(conversation, run);
+    const launch = await launchCommand(command, run, resolvedLaunchDirectory);
+    if (state.stopped || shuttingDown) return;
+    const admission = preflightAgentAdmission(state, authorize);
+    if (admission) return admission;
     const startedAt = new Date().toISOString();
     // Crash-safe launch handshake, phase 1: this durable marker means "a spawn
     // may have been issued, but the provider was never authorized to run". A
@@ -354,7 +463,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // authorization), so recovery always has an explicit safe continuation
     // instead of being permanently gated on a missing pid.
     database.updateRun(run.id, { status: "launching", startedAt });
-    database.audit("agent.run.started", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath, approvalPolicy: run.approvalPolicy });
+    database.auditCritical("agent.run.started", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath, approvalPolicy: run.approvalPolicy });
     emit(run.id, "run.started", { provider: run.provider, model: run.model, startedAt, command: launch.display ?? command.display });
 
     const child = spawnProcess(launch.executable, launch.args, {
@@ -377,10 +486,26 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     const childClosed = new Promise((resolve) => { resolveChildClosed = resolve; });
     let resolveLaunchAuthorized;
     const launchAuthorized = new Promise((resolve) => { resolveLaunchAuthorized = resolve; });
+    // A SQLite fault in a provider's metadata or checkpoint callback must
+    // become this run's owned failure. An exception escaping EventEmitter's
+    // data listener would instead terminate supervision of every run.
+    const failProviderOutput = (error) => {
+      if (state.processError) return;
+      state.processError = error;
+      state.checkpointHalted = true;
+      terminateTree(child, "SIGTERM");
+    };
     consumeBoundedLines(child.stdout, {
       maxLineBytes: MAX_PROVIDER_LINE_BYTES,
-      onLine: (line) => handleProviderLine(state, line),
-      onOverflow: () => emit(run.id, "process.output_truncated", { stream: "stdout", maxBytes: MAX_PROVIDER_LINE_BYTES }),
+      onLine: (line) => {
+        if (state.processError) return;
+        try { handleProviderLine(state, line); }
+        catch (error) { failProviderOutput(error); }
+      },
+      onOverflow: () => {
+        try { emit(run.id, "process.output_truncated", { stream: "stdout", maxBytes: MAX_PROVIDER_LINE_BYTES }); }
+        catch (error) { failProviderOutput(error); }
+      },
     });
     const control = child.stdio?.[LAUNCH_CONTROL_FD];
     if (!control) {
@@ -400,7 +525,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     child.stderr.on("data", (chunk) => {
       const text = chunk.toString();
       state.stderr = `${state.stderr}${text}`.slice(-16_000);
-      emit(run.id, "process.stderr", { text: truncateUtf8(text, MAX_PROCESS_EVENT_BYTES), truncated: Buffer.byteLength(text) > MAX_PROCESS_EVENT_BYTES });
+      try { emit(run.id, "process.stderr", { text: truncateUtf8(text, MAX_PROCESS_EVENT_BYTES), truncated: Buffer.byteLength(text) > MAX_PROCESS_EVENT_BYTES }); }
+      catch (error) { failProviderOutput(error); }
     });
     child.on("error", (error) => {
       state.processError = error;
@@ -457,6 +583,34 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     try { child?.stdin?.write?.("go\n"); } catch { /* The wrapper already exited; its close event finishes the run. */ }
   }
 
+  function persistSessionMetadata(state) {
+    const sessionId = state.pendingSessionId;
+    if (!sessionId) return true;
+    try {
+      database.updateRun(state.run.id, { providerSessionId: sessionId });
+      // A recovered run retains its immutable provider even when its chat
+      // changes providers; never replace another provider's resume token.
+      const current = database.getConversation(state.conversation.id);
+      if (current?.provider === state.run.provider) {
+        database.updateConversation(state.conversation.id, { providerSessionId: sessionId });
+      }
+      if (state.pendingSessionId === sessionId) state.pendingSessionId = null;
+      return true;
+    } catch (error) {
+      if (!storageAdmissionFailure(error) && !(error.statusCode === 503 && database.maintenanceActive)) throw error;
+      state.sessionStorageError = error;
+      // A retained-budget refusal is a policy outcome, not a storage fault.
+      // The run row keeps its token and finishRun makes one budgeted copy;
+      // never re-arm a disk probe for the rest of the run.
+      if (error.statusCode === 507) {
+        if (state.pendingSessionId === sessionId) state.pendingSessionId = null;
+        return false;
+      }
+      if (!database.maintenanceActive) retryUnknownDiskUsage(persistentStorageFailure(error));
+      return false;
+    }
+  }
+
   function handleProviderLine(state, line) {
     if (!line.trim()) return;
     let raw;
@@ -469,15 +623,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     for (const event of events) {
       let checkpointDelta = null;
       if (event.type === "session") {
+        if (typeof event.payload.sessionId !== "string" || Buffer.byteLength(event.payload.sessionId) > 4096) continue;
         state.run.providerSessionId = event.payload.sessionId;
-        database.updateRun(state.run.id, { providerSessionId: event.payload.sessionId });
-        // A recovered run keeps its immutable provider, while the conversation
-        // may have since switched providers. Preserve the run-local session but
-        // never replace another provider's conversation-level resume token.
-        const currentConversation = database.getConversation(state.conversation.id);
-        if (currentConversation?.provider === state.run.provider) {
-          database.updateConversation(state.conversation.id, { providerSessionId: event.payload.sessionId });
-        }
+        state.pendingSessionId = event.payload.sessionId;
+        persistSessionMetadata(state);
       }
       if (event.type === "assistant.delta") {
         appendAssistantText(state, event.payload.text, emit);
@@ -497,7 +646,12 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         archiveAssistant(state, (current) => persistAssistantCheckpoint(current, { publishEvent: true }));
         persistTranscriptItem(state, { kind: "tool", body: toolTranscriptLabel(event), payload: { item: event.payload.item ?? null } });
       }
-      if (event.type === "usage") database.updateRun(state.run.id, event.payload);
+      if (event.type === "usage") {
+        // Provider usage is optional telemetry. A quota refusal must not
+        // escape the stdout listener and terminate supervision of every run.
+        try { database.updateRun(state.run.id, event.payload); }
+        catch (error) { if (error.statusCode !== 507) throw error; }
+      }
       const emittedPayload = ["assistant.delta", "assistant.message"].includes(event.type)
         ? { ...event.payload, text: truncateUtf8(event.payload.text ?? "", MAX_ASSISTANT_EVENT_BYTES), truncated: Buffer.byteLength(event.payload.text ?? "") > MAX_ASSISTANT_EVENT_BYTES }
         : event.payload;
@@ -506,103 +660,201 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         continue;
       }
       const emitted = emit(state.run.id, event.type, emittedPayload);
-      if (event.type === "assistant.delta") state.lastAssistantDeltaSeq = emitted.seq;
+      if (event.type === "assistant.delta" && emitted) state.lastAssistantDeltaSeq = emitted.seq;
     }
   }
 
-  function finish(state, exitCode, error) {
-    if (!active.has(state.run.id) || state.finishing) return;
-    state.finishing = true;
-    clearCheckpointTimer(state);
-    const successful = exitCode === 0 && !error && !state.stopped;
-    const status = state.stopped ? "stopped" : successful ? "completed" : "failed";
-    const message = error?.message || (!successful ? state.stderr.trim() || `Agent exited with code ${exitCode}` : "");
-    const finishedAt = new Date().toISOString();
-    const transcriptMessage = pendingAssistantMessage(state);
-    // The last transcript checkpoint and terminal run state commit together.
-    // A crash can therefore leave the run recoverable, but never terminal with
-    // its final assistant segment missing.
-    const finished = database.finishRun(state.run.id, { status, finishedAt, exitCode, error: message || null, pid: null }, transcriptMessage);
+  function persistTerminalOutcome(state, result) {
+    const { status, message, finishedAt, exitCode: terminalExitCode } = state.terminalOutcome;
+    // Journal the frozen provider exit before SQLite so a BUSY/FULL failure
+    // during shutdown can still recover its true outcome after restart.
+    const pendingMessage = pendingAssistantMessage(state);
+    result.transcriptMessage = budgetTranscript(state, pendingMessage, { terminal: true });
+    if (!state.outcomeJournaled && database.savePendingRunOutcome) {
+      try {
+        database.savePendingRunOutcome(state.run.id, {
+          ...state.terminalOutcome, transcriptMessage: result.transcriptMessage,
+          transcriptOmitted: Boolean(state.transcriptOmitted || (pendingMessage && !result.transcriptMessage)),
+        });
+        state.outcomeJournaled = true;
+        state.outcomeJournalError = null;
+        result.journalBecameDurable = true;
+      } catch (journalError) { state.outcomeJournalError = journalError; }
+    }
+    // The final checkpoint and terminal row commit together.
+    result.finished = database.finishRun(state.run.id, {
+      status, finishedAt, exitCode: terminalExitCode, error: message || null, pid: null,
+      ...(state.run.providerSessionId ? { providerSessionId: state.run.providerSessionId } : {}),
+      ...(state.transcriptOmitted ? { transcriptOmitted: true } : {}),
+    }, result.transcriptMessage);
+  }
+
+  function deferFailedTerminalOutcome(state, exitCode, error, writeError, journalBecameDurable) {
+    state.finishing = false;
+    if (!storageAdmissionFailure(writeError) && !(writeError.statusCode === 503 && database.maintenanceActive)) throw writeError;
+    state.pendingFinish = { exitCode, error };
+    state.finishFailureCount = (state.finishFailureCount ?? 0) + 1;
+    const persistent = persistentStorageFailure(writeError) || state.finishFailureCount >= 2;
+    if (shuttingDown && journalBecameDurable) setTimeout(onShutdownRecovery, 0);
+    if (persistent && (!state.child || state.closed)) {
+      active.delete(state.run.id);
+      pendingOutcomes.set(state.run.id, state);
+      publish({ type: "run.outcome_pending", runId: state.run.id, conversationId: state.conversation.id, reason: "storage-unavailable" });
+      publish({ type: "capacity.changed" });
+      if (!database.maintenanceActive) drain();
+    }
+    if (!database.maintenanceActive) retryUnknownDiskUsage(persistent);
+    return false;
+  }
+
+  function completeTerminalOutcome(state, { finished, transcriptMessage }) {
+    const { status, message, finishedAt, exitCode: terminalExitCode } = state.terminalOutcome;
+    state.pendingFinish = null;
+    state.terminalOutcome = null;
+    state.pendingSessionId = null;
+    if (state.outcomeJournaled) {
+      try { database.removePendingRunOutcome(state.run.id); }
+      catch { /* The committed row makes a stale record safe to sweep on restart. */ }
+      state.outcomeJournaled = false;
+    }
+    if (transcriptMessage && !finished.message) {
+      // finishRun committed the terminal state, omission flag and audit in one
+      // transaction. A failure to write the optional notice cannot retry that
+      // transaction or duplicate its audit after a process restart.
+      try { markTranscriptOmitted(state); }
+      catch (noticeError) {
+        state.transcriptOmitted = true;
+        if (!storageAdmissionFailure(noticeError)) console.warn("Run transcript omission notice failed after terminal commit", noticeError);
+      }
+    } else if (finished.run?.transcriptOmitted) state.transcriptOmitted = true;
     // A Windows wrapper leaves a completed Job Object proof until this
     // terminal transaction succeeds. Other platforms may leave a record only
     // after a hard kill; both are safe to remove after the durable commit.
     try { if (state.launchHandshakePath) unlinkSync(state.launchHandshakePath); } catch { /* Already gone. */ }
-    if (finished.message) publish({ type: "message.created", conversationId: state.conversation.id, payload: finished.message });
     active.delete(state.run.id);
+    pendingOutcomes.delete(state.run.id);
+    admissionRetryRuns.delete(state.run.id);
     clearAssistant(state);
-    database.audit(`agent.run.${status}`, { target: state.run.id, exitCode, error: message || undefined });
-    emit(state.run.id, `run.${status}`, { exitCode, error: message || null, finishedAt });
-    drain();
+    if (shuttingDown) setTimeout(onShutdownRecovery, 0);
+    // The freed slot reaches the queue even if a client notification fails.
+    try {
+      if (finished.message) publish({ type: "message.created", conversationId: state.conversation.id, payload: finished.message });
+      publish({ type: "capacity.changed" });
+      emitTerminal(state.run.id, state.conversation.id, `run.${status}`, { exitCode: terminalExitCode, error: message || null, finishedAt });
+    } finally { drain(); }
   }
 
-  async function stop(runId) {
+  function finish(state, exitCode, error) {
+    if ((!active.has(state.run.id) && !pendingOutcomes.has(state.run.id)) || state.finishing) return;
+    if (state.child && !state.closed) return false;
+    state.finishing = true;
+    clearCheckpointTimer(state);
+    freezeTerminalOutcome(state, exitCode, error);
+    const result = { finished: null, transcriptMessage: null, journalBecameDurable: false };
+    try { persistTerminalOutcome(state, result); }
+    catch (writeError) { return deferFailedTerminalOutcome(state, exitCode, error, writeError, result.journalBecameDurable); }
+    completeTerminalOutcome(state, result);
+    return true;
+  }
+
+  function stopQueuedRun(runId, preserveOnMaintenance) {
+    const index = queue.findIndex((entry) => entry.run.id === runId);
+    if (index < 0) return false;
+    try { database.finishRun(runId, { status: "stopped", finishedAt: new Date().toISOString() }); }
+    catch (error) {
+      if (preserveOnMaintenance && database.maintenanceActive && error.statusCode === 503) return false;
+      throw error;
+    }
+    const [stopped] = queue.splice(index, 1);
+    admissionRetryRuns.delete(runId);
+    if (!queue.length) { queueReadRetryPending = false; clearDiskRetry(); }
+    emitTerminal(runId, stopped.conversation.id, "run.stopped", { queued: true });
+    return true;
+  }
+
+  function settleFrozenOutcome(state, preserveOnMaintenance) {
+    if (finish(state, state.terminalOutcome.exitCode, state.pendingFinish?.error)) return true;
+    if (preserveOnMaintenance) return false;
+    throw unresolvedOutcomeUnavailable();
+  }
+
+  async function waitForOwnedAgentTree(state, runId) {
+    if (!state.child) return;
+    const started = Date.now();
+    let teardownRequested = Boolean(state.ownsDescendants);
+    let escalated = false;
+    let groupEscalated = false;
+    while (state.ownsDescendants
+      ? !state.closed || nativeOwnershipPending(state)
+      : !state.closed || processGroupAlive(state.child)) {
+      const elapsed = Date.now() - started;
+      if (!teardownRequested && elapsed >= terminationGraceMs) {
+        requestWrapperTeardown(state);
+        teardownRequested = true;
+      } else if (!state.ownsDescendants && teardownRequested && !escalated && elapsed >= terminationGraceMs + escalationGraceMs) {
+        escalateTree(state.child, state.launchHandshakePath);
+        escalated = true;
+      } else if (!state.ownsDescendants && escalated && !groupEscalated && elapsed >= terminationGraceMs + 2 * escalationGraceMs) {
+        terminateTree(state.child, "SIGKILL");
+        groupEscalated = true;
+      }
+      // Killing a native subreaper would escape its descendants. Keep its
+      // durable owner charged and report the timeout instead.
+      if (elapsed >= terminationTimeoutMs) throw new Error(`Agent process tree did not terminate: ${runId}`);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  function finishStoppedAgentState(state, preserveOnMaintenance) {
+    try {
+      if (finish(state, state.exitCode ?? null, null) === false) {
+        if (preserveOnMaintenance && !state.child) return false;
+        throw unresolvedOutcomeUnavailable();
+      }
+    } catch (error) {
+      // A childless validation can race archive cutover; its queued row then
+      // remains protected for the successor instead of claiming cancellation.
+      if (preserveOnMaintenance && !state.child && database.maintenanceActive && error.statusCode === 503) return false;
+      throw error;
+    }
+    return true;
+  }
+
+  async function stop(runId, preserveOnMaintenance = false) {
+    const pending = pendingOutcomes.get(runId);
+    if (pending) {
+      if (finish(pending, pending.pendingFinish.exitCode, pending.pendingFinish.error)) return true;
+      if (preserveOnMaintenance) return false;
+      throw unresolvedOutcomeUnavailable();
+    }
     const state = active.get(runId);
-    if (!state) {
-      const index = queue.findIndex((entry) => entry.run.id === runId);
-      if (index < 0) return false;
-      queue.splice(index, 1);
-      database.updateRun(runId, { status: "stopped", finishedAt: new Date().toISOString() });
-      emit(runId, "run.stopped", { queued: true });
-      return true;
+    if (!state) return stopQueuedRun(runId, preserveOnMaintenance);
+    if (state.terminalOutcome && (!state.child || state.closed)) {
+      return settleFrozenOutcome(state, preserveOnMaintenance);
     }
     if (state.stopping) return state.stopping;
     state.stopped = true;
     // Keep the capacity reservation until both validation and tree shutdown end.
-    if (state.child) terminateTree(state.child, "SIGTERM");
+    // On Windows the supervisor's control pipe owns Job Object teardown.
+    // taskkill /T /F here kills the verifier before it can report an empty job.
+    // An injected or legacy leaf has no native Job Object to ask for cleanup.
+    // Its ordinary child signal remains necessary on Windows too.
+    if (state.child && (process.platform !== "win32" || !state.ownsDescendants || !state.child.pid)) terminateTree(state.child, "SIGTERM");
     // Cancellation must not wait for an acknowledgement that may never arrive.
     // stdin ordering guarantees a post-authorization stop follows "go", while
     // an unauthorized owner treats stop/end as abandonment.
-    if (state.child && state.ownsDescendants) requestWrapperTeardown(state);
+    if (state.child && (state.ownsDescendants || process.platform === "win32")) requestWrapperTeardown(state);
     state.stopping = (async () => {
-      if (state.child) {
-        const started = Date.now();
-        // Do not depend on the first process-group SIGTERM winning the spawn /
-        // setsid race. The supervisor command is the authoritative teardown
-        // request and is safe when cancellation kept it unauthorized. Generic
-        // wrappers retain the configured graceful window below.
-        let teardownRequested = Boolean(state.ownsDescendants);
-        let escalated = false;
-        let groupEscalated = false;
-        while (state.ownsDescendants
-          ? !state.closed || Boolean(state.launchHandshakePath && existsSync(state.launchHandshakePath))
-          : !state.closed || processGroupAlive(state.child)) {
-          const elapsed = Date.now() - started;
-          if (!teardownRequested && elapsed >= terminationGraceMs) {
-            // The platform supervisor owns teardown. Linux adopts escaped
-            // descendants as a subreaper and does not remove its handshake
-            // until the whole tree is gone; the non-Linux wrapper uses its
-            // ordered descendant/provider fallback.
-            requestWrapperTeardown(state);
-            teardownRequested = true;
-          } else if (!state.ownsDescendants && teardownRequested && !escalated && elapsed >= terminationGraceMs + escalationGraceMs) {
-            // The wrapper never managed (or was never the launch wrapper):
-            // fall back to killing the provider alone, so the wrapper — if
-            // alive — still reaps it.
-            escalateTree(state.child, state.launchHandshakePath);
-            escalated = true;
-          } else if (!state.ownsDescendants && escalated && !groupEscalated && elapsed >= terminationGraceMs + 2 * escalationGraceMs) {
-            // Last resort: the wrapper had its chance to reap; anything still
-            // executing in the group is killed outright. Liveness below
-            // recognizes the resulting non-executing zombie members as gone.
-            terminateTree(state.child, "SIGKILL");
-            groupEscalated = true;
-          }
-          if (elapsed >= terminationTimeoutMs) {
-            // A native supervisor is the only process that can adopt and reap
-            // escaped descendants. If it hangs or is hard-killed, falling back
-            // to a group kill would orphan zombies to PID 1 and recreate the
-            // leak this ownership boundary prevents. Fail closed, retain the
-            // durable handshake, and never claim the tree stopped.
-            state.stopping = null;
-            throw new Error(`Agent process tree did not terminate: ${runId}`);
-          }
-          await new Promise((resolve) => setTimeout(resolve, 25));
-        }
-      }
-      finish(state, state.exitCode ?? null, null);
-      return true;
+      await waitForOwnedAgentTree(state, runId);
+      return finishStoppedAgentState(state, preserveOnMaintenance);
     })();
-    return state.stopping;
+    const stopping = state.stopping;
+    try { return await stopping; }
+    finally {
+      // A failed durable write or tree teardown must remain retryable. The
+      // async body above can settle before its promise is assigned to state.
+      if (state.stopping === stopping && active.has(runId)) state.stopping = null;
+    }
   }
 
   // Asks the launch wrapper to tear its provider tree down in reaping order
@@ -613,49 +865,217 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     try { state.child?.stdin?.write?.("stop\n"); } catch { /* The wrapper already exited. */ }
   }
 
+  function conflictsWithActiveRun(entry) {
+    return [...active.values(), ...pendingOutcomes.values()].some((state) => {
+      const activeWorktree = state.run.worktreePath ?? state.conversation.worktreePath;
+      const queuedWorktree = entry.run.worktreePath ?? entry.conversation.worktreePath;
+      return state.conversation.id === entry.run.conversationId
+        || (activeWorktree && queuedWorktree && activeWorktree === queuedWorktree);
+    });
+  }
+
+  async function prepareQueuedLaunch(state, entry) {
+    const fresh = database.getConversation(entry.run.conversationId);
+    if (!fresh) throw new Error("Conversation no longer exists");
+    if (entry.run.worktreePath && fresh.worktreePath !== entry.run.worktreePath) {
+      throw new Error("Conversation target changed after this run was queued; submit again");
+    }
+    const authorize = await validateConversation(fresh);
+    if (state.stopped || shuttingDown) return null;
+    const current = database.getConversation(fresh.id);
+    if (!current || ["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== fresh[key])
+      || (entry.run.worktreePath && current.worktreePath !== entry.run.worktreePath)) {
+      throw new Error("Conversation target changed while preparing the run; submit again");
+    }
+    // Recheck mutable trust synchronously immediately before spawning.
+    authorize?.();
+    // Recovery retry explicitly asks for a new provider session even when
+    // the conversation still advertises the interrupted one.
+    if (entry.providerSessionId !== undefined) state.conversation = { ...current, providerSessionId: entry.providerSessionId };
+    else if (entry.forceFreshSession) state.conversation = { ...current, providerSessionId: null };
+    else state.conversation = current;
+    return { authorize };
+  }
+
+  async function handleQueuedLaunchError(state, error) {
+    if (error.statusCode === 503 && database.maintenanceActive && !state.child && !state.stopped) {
+      // Revalidate the target after the archive worker reopens SQLite.
+      await waitForMaintenance();
+      return "retry";
+    }
+    if (!state.stopped && !error?.preserveActiveRun) {
+      // A refused terminal transaction keeps its slot and a bounded retry.
+      if (finish(state, null, error) === false && database.maintenanceActive) await waitForMaintenance();
+    }
+    return "finished";
+  }
+
+  async function launchQueued(state, entry) {
+    while (!state.stopped && !shuttingDown) {
+      try {
+        const prepared = await prepareQueuedLaunch(state, entry);
+        if (!prepared) return;
+        const admission = await start(state, prepared.authorize);
+        if (["deferred", "retry-deferred", "persistent-deferred"].includes(admission)) {
+          active.delete(entry.run.id);
+          queue.unshift(entry);
+          retryDeferredAdmission(admission !== "deferred", entry.run.id, admission === "persistent-deferred");
+          // The archive worker closes SQLite while promoting its snapshot.
+          // Keep schedule's readback pending until the reopened connection is
+          // available, even though this run is safely queued again.
+          if (database.maintenanceActive) await waitForMaintenance();
+        }
+        return;
+      } catch (error) {
+        if (await handleQueuedLaunchError(state, error) === "retry") continue;
+        return;
+      }
+    }
+  }
+
+  function retryUnknownDiskUsage(persistent = false) {
+    if (shuttingDown && ![...active.values(), ...pendingOutcomes.values()].some((state) => state.pendingFinish && !state.outcomeJournaled)) return;
+    // Probe a newly observed hard fault once promptly; a continuing refusal
+    // then backs off to a maintenance-rate probe instead of a busy loop.
+    let delay = diskRetryDelayMs;
+    if (persistent) delay = hardRetryProbed ? 30_000 : 100;
+    if (diskRetryTimer) {
+      // The earliest owner wins. A newly exited result must never wait behind
+      // an unrelated admission's long backoff, regardless of fault class.
+      if (diskRetryDueAt <= Date.now() + delay) return;
+      clearTimeout(diskRetryTimer);
+    }
+    if (persistent) hardRetryProbed = true;
+    else diskRetryDelayMs = Math.min(30_000, diskRetryDelayMs * 2);
+    diskRetryDueAt = Date.now() + delay;
+    diskRetryTimer = setTimeout(() => {
+      diskRetryTimer = null;
+      diskRetryDueAt = 0;
+      retryPendingSessionMetadata();
+      retryPendingFinishes();
+      drain();
+      onDiskRetry();
+    }, delay);
+    diskRetryTimer.unref?.();
+  }
+
+  function clearDiskRetry() {
+    // A sibling may free a slot and drain the queue while another completed
+    // run still awaits its terminal commit. Keep that retry armed until every
+    // such owner has durable outcome evidence.
+    if (!shuttingDown && (queueReadRetryPending || admissionRetryRuns.size
+      || [...active.values(), ...pendingOutcomes.values()].some((state) => state.pendingFinish || state.pendingSessionId))) return;
+    if (diskRetryTimer) clearTimeout(diskRetryTimer);
+    diskRetryTimer = null;
+    diskRetryDueAt = 0;
+    diskRetryDelayMs = 100;
+    hardRetryProbed = false;
+  }
+
+  function retryPendingSessionMetadata() {
+    if (database.maintenanceActive) return;
+    for (const state of [...active.values(), ...pendingOutcomes.values()]) {
+      if (!state.pendingSessionId) continue;
+      try { persistSessionMetadata(state); }
+      catch (error) {
+        // A non-storage contract failure still belongs to this run. Do not
+        // let a timer callback terminate the runtime's event loop.
+        state.processError ??= error;
+        state.checkpointHalted = true;
+        if (state.child && !state.closed) terminateTree(state.child, "SIGTERM");
+      }
+    }
+  }
+
+  function retryPendingFinishes() {
+    if (database.maintenanceActive) return;
+    for (const state of [...active.values(), ...pendingOutcomes.values()]) {
+      if (!state.pendingFinish || (state.child && !state.closed)) continue;
+      const { exitCode, error } = state.pendingFinish;
+      finish(state, exitCode, error);
+    }
+  }
+
+  function retryDeferredAdmission(storageFault = false, runId = null, persistent = false) {
+    if (database.maintenanceActive) return;
+    if (storageFault && runId) admissionRetryRuns.add(runId);
+    // A failed SQLite write/read needs its own retry owner even if the last
+    // measured capacity was below the ordinary launch threshold. Capacity
+    // alone cannot tell whether the fault has cleared.
+    if (admissionRetryRuns.size) { retryUnknownDiskUsage(persistent); return; }
+    let observed;
+    try { observed = database.capacity?.(); }
+    catch (error) {
+      if (!storageAdmissionFailure(error)) throw error;
+      retryUnknownDiskUsage(persistentStorageFailure(error));
+      return;
+    }
+    // Unknown physical usage may recover without another capacity event. A
+    // measured budget with room can also race the admission check. A genuinely
+    // full budget waits for an explicit release instead of polling forever.
+    if (observed?.diskUsageStatus === "unknown"
+      || observed?.availableForNewWorkBytes >= 64 * 1024) retryUnknownDiskUsage();
+  }
+
+  function launchNextQueuedRun() {
+    let admissible;
+    try { admissible = database.canLaunchRun?.(); }
+    catch (error) {
+      if (!storageAdmissionFailure(error)) throw error;
+      queueReadRetryPending = true;
+      retryUnknownDiskUsage(persistentStorageFailure(error));
+      return false;
+    }
+    queueReadRetryPending = false;
+    if (admissible === false) { retryDeferredAdmission(); return false; }
+    clearDiskRetry();
+    const index = queue.findIndex((entry) => !conflictsWithActiveRun(entry));
+    if (index < 0) return false;
+    const entry = queue.splice(index, 1)[0];
+    const state = { ...entry, assistantSegments: [], assistantBytes: 0, assistantTruncated: false,
+      assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, transcriptSizes: new Map(),
+      transcriptBytes: 0, transcriptOmitted: false, stderr: "", stopped: false,
+      checkpointPendingBytes: 0, lastCheckpointAt: 0, checkpointTimer: null, checkpointHalted: false };
+    active.set(entry.run.id, state);
+    state.launch = entry.launch = launchQueued(state, entry);
+    launches.add(state.launch);
+    state.launch.then(() => launches.delete(state.launch), () => launches.delete(state.launch));
+    return true;
+  }
 
   function drain() {
-    if (shuttingDown) return;
-    const max = database.getSettings().maxConcurrentRuns;
-    while (active.size < max && queue.length) {
-      const index = queue.findIndex((entry) => ![...active.values()].some((state) => {
-        const activeWorktree = state.run.worktreePath ?? state.conversation.worktreePath;
-        const queuedWorktree = entry.run.worktreePath ?? entry.conversation.worktreePath;
-        return state.conversation.id === entry.run.conversationId
-          || (activeWorktree && queuedWorktree && activeWorktree === queuedWorktree);
-      }));
-      if (index < 0) return;
-      const entry = queue.splice(index, 1)[0];
-      const state = { ...entry, assistantSegments: [], assistantBytes: 0, assistantTruncated: false, assistantMessageId: null, assistantCreatedAt: null, transcriptSeq: 0, stderr: "", stopped: false, checkpointPendingBytes: 0, lastCheckpointAt: 0, checkpointTimer: null, checkpointHalted: false };
-      active.set(entry.run.id, state);
-      state.launch = entry.launch = (async () => {
-        try {
-          const fresh = database.getConversation(entry.run.conversationId);
-          if (!fresh) throw new Error("Conversation no longer exists");
-          if (entry.run.worktreePath && fresh.worktreePath !== entry.run.worktreePath) {
-            throw new Error("Conversation target changed after this run was queued; submit again");
-          }
-          const authorize = await validateConversation(fresh);
-          if (state.stopped || shuttingDown) return;
-          const current = database.getConversation(fresh.id);
-          if (!current || ["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== fresh[key])
-            || (entry.run.worktreePath && current.worktreePath !== entry.run.worktreePath)) {
-            throw new Error("Conversation target changed while preparing the run; submit again");
-          }
-          // Recheck mutable trust synchronously immediately before spawning.
-          authorize?.();
-          // A recovery retry explicitly asks for a new provider session even
-          // when the conversation still advertises the interrupted one.
-          state.conversation = entry.providerSessionId !== undefined
-            ? { ...current, providerSessionId: entry.providerSessionId }
-            : entry.forceFreshSession ? { ...current, providerSessionId: null } : current;
-          await start(state, authorize);
-        } catch (error) {
-          if (!state.stopped && !error?.preserveActiveRun) finish(state, null, error);
-        }
-      })();
-      launches.add(state.launch);
-      state.launch.then(() => launches.delete(state.launch), () => launches.delete(state.launch));
+    // Every entry point, including the disk retry timer, reaches this guard.
+    // During the archive cutover getSettings cannot read the closed SQLite
+    // connection. onDeletionWorkerExit calls resumeQueued after it reopens.
+    if (shuttingDown || database.maintenanceActive) return;
+    if (!queue.length) {
+      queueReadRetryPending = false;
+      admissionRetryRuns.clear();
+      clearDiskRetry();
+      return;
+    }
+    let max;
+    try { max = database.getSettings().maxConcurrentRuns; }
+    catch (error) {
+      if (!storageAdmissionFailure(error)) throw error;
+      queueReadRetryPending = true;
+      retryUnknownDiskUsage(persistentStorageFailure(error));
+      return;
+    }
+    // A successful settings read resolves its fault. If every slot is already
+    // occupied, a finish/cancellation will re-enter drain when capacity frees.
+    if (active.size >= max) {
+      queueReadRetryPending = false;
+      clearDiskRetry();
+    }
+    // Bound unresolved outcomes by the same configured concurrency budget.
+    // This leaves room for independent work while preventing a failed store
+    // from accumulating an unlimited set of finished run snapshots in RAM.
+    // Each preparing/running provider may become an exited pending outcome.
+    // Keep that reservation until its terminal row commits, even if it stops
+    // consuming a process slot before SQLite recovers.
+    while (active.size < max && active.size + pendingOutcomes.size < RESOURCE_BUDGETS.maxPendingRunOutcomes && queue.length) {
+      if (!launchNextQueuedRun()) return;
     }
   }
 
@@ -664,10 +1084,21 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   // one message rather than duplicating partial content.
   function persistTranscriptItem(state, item) {
     state.transcriptSeq = (state.transcriptSeq ?? 0) + 1;
+    const toolItem = item.payload?.item ?? null;
     const payload = item.kind === "text"
       ? { runId: state.run.id, provider: state.run.provider, truncated: Boolean(item.payload?.truncated) }
-      : { runId: state.run.id, item: item.payload?.item ?? null };
-    const message = database.addMessage({ id: `${state.run.id}:${state.transcriptSeq}`, conversationId: state.conversation.id, role: "assistant", kind: item.kind, body: item.body, payload });
+      : boundedToolPayload(state.run.id, toolItem);
+    const body = item.kind === "tool" ? truncateUtf8(item.body, MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES) : item.body;
+    const input = budgetTranscript(state, { id: `${state.run.id}:${state.transcriptSeq}`, createdAt: new Date().toISOString(), conversationId: state.conversation.id, role: "assistant", kind: item.kind, body, payload });
+    if (!input) return;
+    let message;
+    try { message = database.addMessage(input, { omissionRunId: state.run.id }); }
+    catch (error) {
+      if (error.statusCode !== 507) { throw error; }
+      markTranscriptOmitted(state);
+      return;
+    }
+    if (!message) { markTranscriptOmitted(state); return; }
     publish({ type: "message.created", conversationId: state.conversation.id, payload: message });
   }
 
@@ -716,12 +1147,20 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     clearCheckpointTimer(state);
     state.checkpointPendingBytes = 0;
     state.lastCheckpointAt = Date.now();
-    const message = pendingAssistantMessage(state);
+    const message = budgetTranscript(state, pendingAssistantMessage(state));
     if (!message) return null;
     // The capped body plus truncation marker is now durable; discarded deltas
     // beyond the cap must not schedule further rewrites of the same body.
     if (state.assistantTruncated) state.checkpointHalted = true;
-    const stored = database.upsertMessage(message);
+    let stored;
+    try { stored = database.upsertMessage(message, { omissionRunId: state.run.id }); }
+    catch (error) {
+      if (error.statusCode !== 507) { throw error; }
+      markTranscriptOmitted(state);
+      state.checkpointHalted = true;
+      return null;
+    }
+    if (!stored) { markTranscriptOmitted(state); state.checkpointHalted = true; return null; }
     if (publishEvent) publish({ type: "message.created", conversationId: state.conversation.id, payload: stored });
     return stored;
   }
@@ -730,42 +1169,133 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     clearCheckpointTimer(state);
     state.checkpointPendingBytes = 0;
     state.lastCheckpointAt = Date.now();
-    const message = pendingAssistantMessage(state);
+    const message = budgetTranscript(state, pendingAssistantMessage(state));
     if (!message) return emit(state.run.id, "assistant.delta", payload);
     if (state.assistantTruncated) state.checkpointHalted = true;
     // The delta event and the transcript prefix that already contains it are
     // one SQLite commit. The message records the event cursor, so a page load
     // racing publication can discard that already-durable delta exactly once.
     const committed = database.appendRunEventWithMessage(state.run.id, "assistant.delta", payload, message);
-    state.lastAssistantDeltaSeq = committed.event.seq;
-    publish({ type: "run.event", conversationId: state.conversation.id, runId: state.run.id, payload: committed.event });
+    if (!committed.message) { markTranscriptOmitted(state); state.checkpointHalted = true; }
+    if (committed.event) state.lastAssistantDeltaSeq = committed.event.seq;
+    if (committed.event) publish({ type: "run.event", conversationId: state.conversation.id, runId: state.run.id, payload: committed.event });
     return committed.event;
+  }
+
+  // A terminal row is committed before its event. Even when the event log is
+  // full or unwritable, a bounded transient notification makes connected
+  // clients refresh that durable state. The fault never reaches the close
+  // listener, retry timer or stop request that committed it, nor retries
+  // that transaction.
+  function emitTerminal(runId, conversationId, type, payload) {
+    let event = null;
+    try { event = database.appendRunEvent(runId, type, payload); }
+    catch (error) {
+      if (!storageAdmissionFailure(error)) console.warn("Run terminal event failed after terminal commit", error);
+    }
+    publish({ type: "run.event", conversationId, runId,
+      payload: event ?? { runId, type, payload, seq: null, transient: true, createdAt: new Date().toISOString() } });
+    return event;
   }
 
   function emit(runId, type, payload) {
     const event = database.appendRunEvent(runId, type, payload);
-    const run = database.getRun(runId);
-    publish({ type: "run.event", conversationId: run?.conversationId, runId, payload: event });
+    // Event replay and transcript persistence have separate quotas. A dropped
+    // replay event does not imply that the visible transcript lost a message.
+    if (event) publish({ type: "run.event", conversationId: database.getRun(runId)?.conversationId, runId, payload: event });
     return event;
+  }
+
+  function budgetTranscript(state, message, { terminal = false } = {}) {
+    if (!message) return null;
+    const prior = state.transcriptSizes.get(message.id) ?? 0;
+    // Leave room for both the omission notice and a final assistant segment.
+    if (!prior && state.transcriptSizes.size >= MAX_RUN_TRANSCRIPT_ITEMS - (terminal ? 0 : 2)) {
+      markTranscriptOmitted(state, { terminal });
+      return null;
+    }
+    const ceiling = MAX_RUN_TRANSCRIPT_BYTES - (terminal ? 512 : 4096);
+    const metadataBytes = retainedTranscriptMessageBytes({ ...message, body: "" });
+    const allowance = ceiling - state.transcriptBytes + prior - metadataBytes;
+    if (allowance <= 0) { markTranscriptOmitted(state, { terminal }); return null; }
+    const originalBytes = Buffer.byteLength(message.body ?? "");
+    const body = originalBytes > allowance ? truncateUtf8(message.body, Math.max(0, allowance - 64)) : message.body;
+    const bounded = originalBytes > allowance
+      ? { ...message, body: `${body}\n[Further output omitted: transcript budget reached]`, payload: { ...message.payload, truncated: true } }
+      : message;
+    const size = retainedTranscriptMessageBytes(bounded);
+    if (state.transcriptBytes - prior + size > ceiling) { markTranscriptOmitted(state, { terminal }); return null; }
+    state.transcriptSizes.set(message.id, size);
+    state.transcriptBytes += size - prior;
+    if (originalBytes > allowance) markTranscriptOmitted(state, { terminal });
+    return bounded;
+  }
+
+  function markTranscriptOmitted(state, { terminal = false } = {}) {
+    if (state.transcriptOmitted) return;
+    if (terminal) {
+      state.transcriptOmitted = true;
+      return;
+    }
+    // The optional message can itself be refused at the aggregate cap. The
+    // run row uses reserved transition space, so it remains a durable marker
+    // through cancellation, finalization and restart.
+    database.updateRun(state.run.id, { transcriptOmitted: true });
+    state.transcriptOmitted = true;
+    try {
+      const message = database.addMessage({ id: `${state.run.id}:budget`, conversationId: state.conversation.id,
+        role: "assistant", kind: "text", body: "Further run transcript items omitted because the retention budget was reached.",
+        payload: { runId: state.run.id, provider: state.run.provider, truncated: true } });
+      publish({ type: "message.created", conversationId: state.conversation.id, payload: message });
+    } catch (error) { if (error.statusCode !== 507) throw error; }
   }
 
   return {
     providers,
     providerAvailable: providerDiscovery.available,
     schedule,
+    resumeQueued() {
+      if (database.maintenanceActive) return;
+      wakeMaintenanceWaiters();
+      retryPendingFinishes();
+      drain();
+    },
     stop,
-    activeRuns: () => [...active.keys()],
+    activeRuns: () => [...active.keys(), ...pendingOutcomes.keys()],
+    activeProcessCount: () => active.size,
+    pendingOutcomeCount: () => pendingOutcomes.size,
+    hasPendingFinishes: () => [...active.values(), ...pendingOutcomes.values()].some((state) => Boolean(state.pendingFinish)),
+    isOutcomePending: (runId) => pendingOutcomes.has(runId),
     shutdown() {
       if (shutdownPromise) return shutdownPromise;
       shuttingDown = true;
-      const ids = [...queue.map((entry) => entry.run.id), ...active.keys()];
+      clearDiskRetry();
+      wakeMaintenanceWaiters();
+      const ids = [...queue.map((entry) => entry.run.id), ...active.keys(), ...pendingOutcomes.keys()];
       shutdownPromise = Promise.allSettled([
-        ...ids.map(stop),
+        ...ids.map((id) => stop(id, true)),
         ...launches,
         providerDiscovery.close(),
       ]).then((results) => {
         const failure = results.find((result) => result.status === "rejected");
         if (failure) throw failure.reason;
+        // A database refusal may leave an exited owner in memory. Resolving
+        // shutdown is safe only when restart has an independently durable
+        // terminal result; otherwise report the hold instead of silently
+        // handing an unknown row to interruption reconciliation.
+        if (database.savePendingRunOutcome) {
+          const unjournaled = [...active.values(), ...pendingOutcomes.values()].find((state) =>
+            state.terminalOutcome && !state.outcomeJournaled && (!state.child || state.closed));
+          if (unjournaled) throw new Error(`Run outcome could not be made durable before shutdown: ${unjournaled.run.id}`,
+            { cause: unjournaled.outcomeJournalError });
+        }
+      }).catch((error) => {
+        // A failed shutdown still owns the SQLite lease. Keep one retry owner
+        // for an unjournaled exited result, and permit a later shutdown call
+        // to complete once storage is writable again.
+        shutdownPromise = null;
+        if ([...active.values(), ...pendingOutcomes.values()].some((state) => state.pendingFinish)) retryUnknownDiskUsage(true);
+        throw error;
       });
       return shutdownPromise;
     },
@@ -942,6 +1472,7 @@ export function consumeBoundedLines(stream, { maxLineBytes = MAX_PROVIDER_LINE_B
 function appendAssistantText(state, text, emit) {
   if (state.assistantTruncated) return;
   const segment = String(text ?? "");
+  if (!segment) return;
   state.assistantSegments.push(segment);
   state.assistantBytes += Buffer.byteLength(segment);
   if (state.assistantBytes > MAX_ASSISTANT_BYTES) {
@@ -1030,6 +1561,24 @@ function boundUtf8(value, maxBytes) {
 
 function truncateUtf8(value, maxBytes) { return boundUtf8(value, maxBytes).text; }
 
+function boundedToolPayload(runId, item) {
+  const payload = { runId, item };
+  if (Buffer.byteLength(JSON.stringify(payload)) <= MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES) return payload;
+  const source = JSON.stringify(item);
+  let low = 0;
+  let high = Math.min(Buffer.byteLength(source), MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES);
+  let bounded = { runId, item: { truncated: true, preview: "" } };
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = { runId, item: { truncated: true, preview: truncateUtf8(source, middle) } };
+    if (Buffer.byteLength(JSON.stringify(candidate)) <= MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES) {
+      bounded = candidate;
+      low = middle + 1;
+    } else high = middle - 1;
+  }
+  return bounded;
+}
+
 export function buildProviderCommand(conversation, run) {
   if (run.provider === "claude") {
     const args = ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-prompts", "none"];
@@ -1077,7 +1626,9 @@ export function normalizeClaude(raw) {
   const events = [];
   if (raw.type === "system" && raw.subtype === "init" && raw.session_id) events.push({ type: "session", payload: { sessionId: raw.session_id } });
   const delta = raw.event?.delta;
-  if (raw.type === "stream_event" && delta?.type === "text_delta") events.push({ type: "assistant.delta", payload: { text: delta.text } });
+  if (raw.type === "stream_event" && delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
+    events.push({ type: "assistant.delta", payload: { text: delta.text } });
+  }
   if (raw.type === "assistant") {
     for (const block of raw.message?.content ?? []) {
       if (block.type === "tool_use") events.push({ type: "tool.started", payload: { item: block } });

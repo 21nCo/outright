@@ -29,6 +29,7 @@ import { api, connectRuntime, query } from "@/lib/runtime-api";
 import { scheduleLayoutTick } from "@/lib/windowing";
 import { foldFindText } from "@/lib/find-text";
 import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, messagePrecedesPage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "@/recovery-policy";
+import { createTerminalCommandFence } from "@/lib/terminal-command-fence";
 
 const MAX_RENDERED_MESSAGES = 1000;
 function moveMessageViewport(viewport, top) {
@@ -49,8 +50,17 @@ const MAX_PENDING_RUNTIME_EVENT_BYTES = 2 * 1024 * 1024;
 const LIVE_TRUNCATION_MARKER = "\n\n[Live output truncated]";
 const LIVE_OMITTED_PREFIX = "[Earlier live output omitted]\n";
 
+function bootstrapFailureOutcome(error, manual) {
+  if (manual) return "error";
+  if (error.status !== 503) return "error";
+  if (error.payload != null && !["ARCHIVE_MAINTENANCE_TRANSIENT", "RUN_RECOVERY_TRANSIENT"].includes(error.payload.code)) return "error";
+  return "retry";
+}
+
 export function App() {
   const [bootstrap, setBootstrap] = useState(null);
+  const [bootstrapError, setBootstrapError] = useState("");
+  const bootstrapLoadRef = useRef(null);
   const [selectedProjectId, setSelectedProjectId] = useState(() => localStorage.getItem("outright.selected-project") || "");
   const [selectedWorktreeId, setSelectedWorktreeId] = useState(() => localStorage.getItem("outright.selected-worktree") || "");
   const [selectedConversationId, setSelectedConversationId] = useState(() => localStorage.getItem("outright.selected-conversation") || "");
@@ -70,8 +80,10 @@ export function App() {
   const streamingTextRef = useRef("");
   const streamingFlushRef = useRef(null);
   const [runEvents, setRunEvents] = useState([]);
+  const [pendingOutcomeRunIds, setPendingOutcomeRunIds] = useState(() => new Set());
   const [findResetGeneration, setFindResetGeneration] = useState(0);
   const [runtimeEvent, setRuntimeEvent] = useState(null);
+  const [unverifiedTerminalIds, setUnverifiedTerminalIds] = useState(() => new Set());
   const [connection, setConnection] = useState("connecting");
   const [isScanning, setIsScanning] = useState(true);
   const [isNarrow, setIsNarrow] = useState(() => typeof window !== "undefined" && window.matchMedia("(max-width: 760px)").matches);
@@ -95,6 +107,8 @@ export function App() {
   const [removeWorktreeOpen, setRemoveWorktreeOpen] = useState(false);
   const [removeConfirmation, setRemoveConfirmation] = useState("");
   const socketRef = useRef(null);
+  const terminalCommandFenceRef = useRef(null);
+  if (!terminalCommandFenceRef.current) terminalCommandFenceRef.current = createTerminalCommandFence();
   const selectedConversationRef = useRef("");
   const selectedProjectRef = useRef(selectedProjectId);
   const selectedWorktreeRef = useRef(selectedWorktreeId);
@@ -135,6 +149,7 @@ export function App() {
   const sidebarFocusIntentRef = useRef(null);
   const sidebarFocusOwnerRef = useRef(null);
   const sidebarFocusSourceRef = useRef(null);
+  const sidebarFocusLastElementRef = useRef(null);
   const inspectorRef = useRef(null);
   const inspectorInvokerRef = useRef(null);
   const inspectorReturnFocusRef = useRef(null);
@@ -149,6 +164,8 @@ export function App() {
   const conversationOwnerRef = useRef("");
   const conversationsRef = useRef([]);
   const archiveFocusRef = useRef(null);
+  const settingsRefreshRef = useRef(0);
+  const settingsVersionRef = useRef(0);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
 
   const applyStreamingText = useCallback((change, immediate = false) => {
@@ -217,18 +234,49 @@ export function App() {
     setSelectedConversationId(nextId);
   }
 
-  const loadBootstrap = useCallback(async (manual = false) => {
+  const loadBootstrap = useCallback(async (manual = false, isCurrent = () => true) => {
     setIsScanning(true);
     try {
-      const next = await api(manual ? "/api/projects" : "/api/bootstrap", manual ? { method: "POST" } : undefined);
+      const next = manual ? await api("/api/projects", { method: "POST" }) : await api("/api/bootstrap");
+      if (!isCurrent()) return false;
       if (manual) setBootstrap((current) => ({ ...current, ...next }));
       else setBootstrap(next);
+      if (!manual) setBootstrapError("");
       if (manual) setToast(`Found ${next.projects.length} Git projects`);
-    } catch (nextError) { setError(nextError.message); }
-    finally { setIsScanning(false); }
+      return true;
+    } catch (nextError) {
+      if (!isCurrent()) return false;
+      if (manual) setError(nextError.message);
+      const outcome = bootstrapFailureOutcome(nextError, manual);
+      if (!manual && outcome !== "retry") setBootstrapError(nextError.message);
+      return outcome;
+    }
+    finally { if (isCurrent()) setIsScanning(false); }
   }, []);
 
-  useEffect(() => { loadBootstrap(); }, [loadBootstrap]);
+  useEffect(() => {
+    let stopped = false;
+    let retry;
+    let bootstrapRetries = 0;
+    const load = async (remaining = null) => {
+      const loaded = await loadBootstrap(false, () => !stopped && bootstrapLoadRef.current === load);
+      if (stopped) return loaded;
+      if (remaining === null && loaded === "retry" && ++bootstrapRetries > 12) {
+        setBootstrapError("Local runtime is still unavailable. Retry when recovery completes.");
+        return "error";
+      }
+      if (remaining === null && loaded === true) bootstrapRetries = 0;
+      if (remaining === null ? loaded === "retry" : loaded !== true && remaining > 0) {
+        window.clearTimeout(retry);
+        retry = window.setTimeout(() => { void load(remaining === null ? null : remaining - 1); }, 1000);
+      }
+      return loaded;
+    };
+    load.reset = () => { bootstrapRetries = 0; window.clearTimeout(retry); };
+    bootstrapLoadRef.current = load;
+    void load();
+    return () => { stopped = true; bootstrapLoadRef.current = null; window.clearTimeout(retry); };
+  }, [loadBootstrap]);
   const providersChecking = Boolean(bootstrap?.providers?.some((provider) => provider.checking));
   useEffect(() => {
     if (!providersChecking) return;
@@ -449,6 +497,13 @@ export function App() {
         return;
       }
       pendingConversationLoadRef.current = null;
+      setPendingOutcomeRunIds((current) => {
+        const settled = (nextConversation.runs ?? []).filter((run) => !ACTIVE_RUN_STATUSES.has(run.status) && current.has(run.id));
+        if (!settled.length) return current;
+        const next = new Set(current);
+        for (const run of settled) next.delete(run.id);
+        return next;
+      });
       const activeRunIds = activeCursorOwners(nextConversation);
       const acceptedRunId = acceptedPreviewRunRef.current;
       const serverRunId = [...activeRunIds][0] ?? null;
@@ -572,7 +627,22 @@ export function App() {
   const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
   const handleRuntimeEvent = useCallback((event) => {
-    if (["projects.changed", "terminal.output", "terminal.exit", "runtime.connected"].includes(event.type)
+    if (terminalCommandFenceRef.current.observe(event)) {
+      setUnverifiedTerminalIds(terminalCommandFenceRef.current.snapshot());
+    }
+    if (event.type === "run.outcome_pending" && typeof event.runId === "string") {
+      setPendingOutcomeRunIds((current) => {
+        const next = new Set(current);
+        next.delete(event.runId);
+        next.add(event.runId);
+        if (next.size > 8) next.delete(next.values().next().value);
+        return next;
+      });
+    }
+    // A terminal event starts the durable detail refresh below. Keep the
+    // pending reservation until that snapshot shows the terminal run; clearing
+    // it here briefly announces the stale running state again.
+    if (["projects.changed", "terminal.output", "terminal.exit", "terminal.audit-failed", "runtime.connected", "capacity.changed"].includes(event.type)
       || (event.type === "run.event" && ["run.completed", "run.failed", "run.stopped"].includes(event.payload?.type))) setRuntimeEvent(event);
     const pendingLoad = pendingConversationLoadRef.current;
     if (["message.created", "run.event"].includes(event.type)
@@ -715,8 +785,10 @@ export function App() {
           // Browser timer throttling can delay a 32 ms stream flush while the
           // reader is on an older page. Show the first suffix byte after each
           // durable checkpoint now; coalesce the following deltas as usual.
-          const firstReadingDelta = Boolean(conversationRef.current?.messagePage?.hasLater) && !streamingTextRef.current;
-          applyStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event, checkpointEventSeq)), firstReadingDelta);
+          // The first byte must be visible without waiting for a throttled
+          // timer, including when the tab has been hidden during a long run.
+          const firstDelta = !streamingTextRef.current;
+          applyStreamingText((current) => current.endsWith(LIVE_TRUNCATION_MARKER) ? current : boundStreamingText(streamingTextAfterRuntimeEvent(current, event, checkpointEventSeq)), firstDelta);
         }
       }
       if (runEvent.type === "assistant.message" && ownsLiveOutput) {
@@ -739,7 +811,9 @@ export function App() {
     socketRef.current = connectionInstance;
     return () => connectionInstance.close();
   }, []);
-  const sendRuntime = useCallback((message) => socketRef.current?.send(message), []);
+  const sendRuntime = useCallback((message) => {
+    if (terminalCommandFenceRef.current.allows(message)) socketRef.current?.send(message);
+  }, []);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -767,9 +841,14 @@ export function App() {
     const narrow = window.matchMedia("(max-width: 760px)");
     let wasNarrow = narrow.matches;
     const trackFocus = (event) => {
+      // A layout transition can briefly focus BODY before the replacement
+      // control commits. Pointer and keyboard input cancel the intent below.
+      if (event.target === document.body) return;
+      const target = sidebarFocusIntentRef.current === "opener"
+        ? document.querySelector('[aria-label="Open projects sidebar"]')
+        : sidebarRef.current?.querySelector('button:not(:disabled)');
       if (sidebarFocusIntentRef.current && event.target !== sidebarFocusSourceRef.current
-        && event.target !== sidebarRef.current && !sidebarRef.current?.contains(event.target)
-        && !event.target.matches?.('[aria-label="Open projects sidebar"]')) {
+        && event.target !== target) {
         sidebarFocusIntentRef.current = null;
         sidebarFocusSourceRef.current = null;
       }
@@ -778,38 +857,73 @@ export function App() {
       else {
         sidebarFocusOwnerRef.current = null;
       }
+      sidebarFocusLastElementRef.current = sidebarFocusOwnerRef.current ? event.target : null;
+    };
+    const releaseFocusOwner = (event) => {
+      // A click on blank workspace content leaves BODY focused without a
+      // focusin event. Only an actual user gesture releases that ownership;
+      // browser blur during a breakpoint transition still needs restoration.
+      if (event.type === "pointerdown" || event.target === document.body) {
+        sidebarFocusOwnerRef.current = null;
+        sidebarFocusIntentRef.current = null;
+        sidebarFocusSourceRef.current = null;
+        sidebarFocusLastElementRef.current = null;
+      }
     };
     const synchronizeLayout = () => {
       if (narrow.matches === wasNarrow) return;
       wasNarrow = narrow.matches;
       const activeElement = document.activeElement;
-      const owner = activeElement === document.body ? sidebarFocusOwnerRef.current
-        : sidebarRef.current?.contains(activeElement) ? "sidebar"
-          : activeElement?.matches?.('[aria-label="Open projects sidebar"]') ? "opener" : null;
+      let owner = null;
+      if (activeElement === document.body) owner = sidebarFocusOwnerRef.current;
+      else if (sidebarRef.current?.contains(activeElement)) owner = "sidebar";
+      else if (activeElement?.matches?.('[aria-label="Open projects sidebar"]')) owner = "opener";
       sidebarFocusOwnerRef.current = owner;
-      sidebarFocusIntentRef.current = wasNarrow && owner === "sidebar" ? "opener"
-        : !wasNarrow && owner === "opener" ? "sidebar" : null;
-      sidebarFocusSourceRef.current = sidebarFocusIntentRef.current ? activeElement : null;
+      let focusIntent = null;
+      if (wasNarrow && owner === "sidebar") focusIntent = "opener";
+      else if (!wasNarrow && owner === "opener") focusIntent = "sidebar";
+      sidebarFocusIntentRef.current = focusIntent;
+      // Some browsers blur the disappearing control before dispatching the
+      // media change. Retain that control as the source for its late focusout.
+      let focusSource = null;
+      if (focusIntent) focusSource = activeElement === document.body ? sidebarFocusLastElementRef.current : activeElement;
+      sidebarFocusSourceRef.current = focusSource;
       setIsNarrow(wasNarrow);
       setSidebarOpen(!wasNarrow);
     };
     narrow.addEventListener("change", synchronizeLayout);
     window.addEventListener("resize", synchronizeLayout);
     document.addEventListener("focusin", trackFocus);
+    document.addEventListener("pointerdown", releaseFocusOwner, true);
+    document.addEventListener("keydown", releaseFocusOwner, true);
     return () => {
       narrow.removeEventListener("change", synchronizeLayout);
       window.removeEventListener("resize", synchronizeLayout);
       document.removeEventListener("focusin", trackFocus);
+      document.removeEventListener("pointerdown", releaseFocusOwner, true);
+      document.removeEventListener("keydown", releaseFocusOwner, true);
     };
   }, []);
   useLayoutEffect(() => {
     if (!isNarrow || !sidebarOpen) return;
     const sidebar = sidebarRef.current;
-    if (!sidebar?.contains(document.activeElement)) {
+    let frame;
+    let attempts = 0;
+    const focusDialog = () => {
+      if (sidebar?.contains(document.activeElement)) return;
+      if (document.activeElement !== document.body
+        && document.activeElement !== sidebarFocusSourceRef.current) return;
       const first = sidebar?.querySelector('button:not(:disabled)');
       if (first?.getClientRects().length) first.focus({ preventScroll: true });
-      else sidebar?.focus();
-    }
+      if (!sidebar?.contains(document.activeElement) && attempts++ < 12) frame = requestAnimationFrame(focusDialog);
+    };
+    focusDialog();
+    const restoreDialog = () => {
+      // Making the workspace inert can blur its opener after the first focus
+      // attempt. Restore only when the browser has left focus on BODY.
+      queueMicrotask(() => { if (document.activeElement === document.body) focusDialog(); });
+    };
+    document.addEventListener("focusout", restoreDialog, true);
     const containFocus = (event) => {
       if (event.key !== "Tab") return;
       const focusable = focusableElements(sidebar);
@@ -820,22 +934,38 @@ export function App() {
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     };
     sidebar?.addEventListener("keydown", containFocus);
-    return () => sidebar?.removeEventListener("keydown", containFocus);
+    return () => { cancelAnimationFrame(frame); document.removeEventListener("focusout", restoreDialog, true); sidebar?.removeEventListener("keydown", containFocus); };
   }, [isNarrow, sidebarOpen]);
   useLayoutEffect(() => {
     const intent = sidebarFocusIntentRef.current;
     if (!intent || (intent === "opener" && sidebarOpen) || (intent === "sidebar" && !sidebarOpen)) return;
     let cancelRetry = () => {};
-    const deadline = performance.now() + 3_000;
+    let active = true;
+    let attempts = 0;
+    const maxAttempts = 30;
+    let target;
+    const watchFocus = () => {
+      if (!active || sidebarFocusIntentRef.current !== intent) return;
+      const focused = document.activeElement;
+      if (focused === document.body) { transfer(); return; }
+      if (focused !== target) {
+        sidebarFocusIntentRef.current = null;
+        sidebarFocusSourceRef.current = null;
+        return;
+      }
+      const timer = window.setTimeout(watchFocus, 500);
+      cancelRetry = () => clearTimeout(timer);
+    };
     const transfer = () => {
-      if (sidebarFocusIntentRef.current !== intent) return;
-      const target = intent === "opener" ? document.querySelector('[aria-label="Open projects sidebar"]')
+      if (!active || sidebarFocusIntentRef.current !== intent) return;
+      cancelRetry();
+      cancelRetry = () => {};
+      attempts += 1;
+      target = intent === "opener" ? document.querySelector('[aria-label="Open projects sidebar"]')
         : sidebarRef.current?.querySelector('button:not(:disabled)');
-      const active = document.activeElement;
-      const fromPriorControl = active === sidebarFocusSourceRef.current || (intent === "opener"
-        ? sidebarRef.current?.contains(active)
-        : active?.matches?.('[aria-label="Open projects sidebar"]') || active === sidebarRef.current);
-      if (active !== document.body && active !== target && !fromPriorControl) {
+      const focused = document.activeElement;
+      const fromPriorControl = focused === sidebarFocusSourceRef.current;
+      if (focused !== document.body && focused !== target && !fromPriorControl) {
         sidebarFocusIntentRef.current = null; // Do not override a newer user focus choice.
         sidebarFocusSourceRef.current = null;
         return;
@@ -844,12 +974,13 @@ export function App() {
         target.focus({ preventScroll: true });
         if (document.activeElement === target && target.getBoundingClientRect().width > 0) {
           sidebarFocusOwnerRef.current = intent;
-          sidebarFocusIntentRef.current = null;
-          sidebarFocusSourceRef.current = null;
+          attempts = 0;
+          const timer = window.setTimeout(watchFocus, 500);
+          cancelRetry = () => clearTimeout(timer);
           return;
         }
       }
-      if (performance.now() < deadline) {
+      if (attempts < maxAttempts) {
         let pending = true;
         let frame;
         let timer;
@@ -863,8 +994,39 @@ export function App() {
         cancelRetry = () => { pending = false; cancelAnimationFrame(frame); clearTimeout(timer); };
       }
     };
+    // A breakpoint can detach or blur a control after focus() succeeds.
+    // Some browser viewports omit focusout, so the bounded watch also checks
+    // ownership after delayed layout tasks.
+    const restoreAfterBlur = (event) => {
+      const ownedControl = event.target === sidebarFocusSourceRef.current || (intent === "opener"
+        ? event.target.matches?.('[aria-label="Open projects sidebar"]')
+        : sidebarRef.current?.contains(event.target));
+      if (!ownedControl || sidebarFocusIntentRef.current !== intent) return;
+      queueMicrotask(() => {
+        if (active && sidebarFocusIntentRef.current === intent && document.activeElement === document.body) transfer();
+      });
+      // Some engines dispatch focusout while the old control is still active
+      // and clear activeElement only after this microtask. A committed layout
+      // task gets another chance without overriding a newer focus owner.
+      window.setTimeout(() => {
+        if (active && sidebarFocusIntentRef.current === intent && document.activeElement === document.body) transfer();
+      }, 0);
+    };
+    document.addEventListener("focusout", restoreAfterBlur, true);
+    const releaseOnUserInput = (event) => {
+      if (event.type === "pointerdown" && event.target === target) return;
+      sidebarFocusIntentRef.current = null;
+      sidebarFocusSourceRef.current = null;
+      cancelRetry();
+    };
+    document.addEventListener("pointerdown", releaseOnUserInput, true);
+    document.addEventListener("keydown", releaseOnUserInput, true);
+    const observer = new ResizeObserver(() => {
+      if (active && sidebarFocusIntentRef.current === intent && document.activeElement === document.body) transfer();
+    });
+    if (sidebarRef.current) observer.observe(sidebarRef.current);
     transfer();
-    return () => cancelRetry();
+    return () => { active = false; cancelRetry(); observer.disconnect(); document.removeEventListener("focusout", restoreAfterBlur, true); document.removeEventListener("pointerdown", releaseOnUserInput, true); document.removeEventListener("keydown", releaseOnUserInput, true); };
   }, [isNarrow, sidebarOpen]);
   useLayoutEffect(() => {
     if (!inspector) return;
@@ -896,6 +1058,11 @@ export function App() {
   }, [conversations, selectedConversationId]);
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 2800); return () => clearTimeout(timer); }, [toast]);
   useEffect(() => { if (!error) return; const timer = setTimeout(() => setError(""), 6000); return () => clearTimeout(timer); }, [error]);
+  useEffect(() => {
+    if (!bootstrap || !bootstrapError) return;
+    const timer = setTimeout(() => setBootstrapError(""), 6000);
+    return () => clearTimeout(timer);
+  }, [Boolean(bootstrap), bootstrapError]);
   useEffect(() => {
     const viewport = messageViewportRef.current;
     if (!viewport) return;
@@ -1162,7 +1329,12 @@ export function App() {
     scheduleLayoutTick(() => { if (stickToBottomRef.current && viewport.isConnected) moveMessageViewport(viewport, viewport.scrollHeight); });
   }
 
-  const activeRun = conversation?.runs?.find((run) => ["queued", "launching", "running"].includes(run.status));
+  const pendingOutcomeRuns = conversation?.runs?.filter((run) => ACTIVE_RUN_STATUSES.has(run.status)
+    && (run.outcomePending || pendingOutcomeRunIds.has(run.id))) ?? [];
+  const pendingOutcomeIds = new Set(pendingOutcomeRuns.map((run) => run.id));
+  const pendingOutcomeRun = pendingOutcomeRuns[0] ?? null;
+  const activeRun = conversation?.runs?.find((run) => ACTIVE_RUN_STATUSES.has(run.status) && !pendingOutcomeIds.has(run.id));
+  const outcomePending = Boolean(pendingOutcomeRun);
   const readingLiveText = conversation?.messagePage?.hasLater
     ? readingLivePreview(liveCheckpoint, streamingText) : "";
   const waitingForConversation = Boolean(selectedConversationId && (!conversation || !conversationDetailReady));
@@ -1176,6 +1348,8 @@ export function App() {
   // Worktree-wide recovery metadata gates sibling chats before submission;
   // the conversation-local values remain fallbacks for older runtimes.
   const interruptedRun = recoveryGate(conversation);
+  const announcedRun = pendingOutcomeRun ?? activeRun ?? interruptedRun ?? latestRun;
+  const runAnnouncement = runAnnouncementText(announcedRun, outcomePending);
   const recoveryConversation = conversation?.recoveryConversation ?? null;
 
   async function resolveRecovery(run, policy) {
@@ -1202,11 +1376,11 @@ export function App() {
       const ownerWorktree = ownerProject?.worktrees.find((item) => item.id === recoveryConversation.worktreeId);
       if (!ownerProject || !ownerWorktree) throw new Error("The recovery chat worktree is no longer available");
       pendingConversationRef.current = recoveryConversation.id;
-      await chooseProject(ownerProject, ownerWorktree);
+      chooseProject(ownerProject, ownerWorktree);
     } catch (nextError) { setError(nextError.message); }
   }
 
-  async function chooseProject(nextProject, explicitWorktree) {
+  function chooseProject(nextProject, explicitWorktree) {
     const nextWorktree = explicitWorktree ?? preferredWorktree(nextProject);
     const changed = selectedProjectRef.current !== nextProject.id || selectedWorktreeRef.current !== nextWorktree.id;
     if (changed) {
@@ -1289,7 +1463,7 @@ export function App() {
         const listRequest = conversationListRequestRef.current;
         const detail = await api(`/api/conversations/${created.id}`);
         superseded ||= listRequest !== conversationListRequestRef.current;
-        if (listRequest === conversationListRequestRef.current && !conversationListPendingRef.current && !conversationListFailed
+        if (!superseded && listRequest === conversationListRequestRef.current && !conversationListPendingRef.current && !conversationListFailed
           && selectedConversationRef.current === created.id && detail.id === created.id
           && detail.projectId === selectedProjectRef.current && detail.worktreeId === selectedWorktreeRef.current && !detail.archived) return detail;
       }
@@ -1314,7 +1488,7 @@ export function App() {
     const submittedDraft = promptOverride ?? draft;
     const submittedDraftRevision = draftRevisionRef.current;
     const prompt = submittedDraft.trim();
-    if (!prompt || activeRun || interruptedRun || firstPromptAwaitingSelection || conversationListPendingRef.current || conversationListFailed || submissionPendingRef.current) return false;
+    if (!prompt || activeRun || outcomePending || interruptedRun || firstPromptAwaitingSelection || conversationListPendingRef.current || conversationListFailed || submissionPendingRef.current) return false;
     if (selectedConversationRef.current && (!readyConversationRef.current || pendingConversationLoadRef.current || conversationLoadFailed || !isSelectedTarget(readyConversationRef.current))) return false;
     submissionPendingRef.current = true;
     let target = selectedConversationRef.current ? readyConversationRef.current : targetOverride ?? conversation;
@@ -1369,7 +1543,11 @@ export function App() {
       if (await sendPrompt(null, pending.prompt)) { setTrustRequest(null); setPendingPrompt(null); trustGrantedRef.current = false; }
     } catch (nextError) { setError(nextError.message); }
   }
-  async function stopRun() { try { await api(`/api/runs/${activeRun.id}/stop`, { method: "POST" }); } catch (nextError) { setError(nextError.message); } }
+  async function stopRun() {
+    if (!activeRun) return;
+    try { await api(`/api/runs/${activeRun.id}/stop`, { method: "POST" }); }
+    catch (nextError) { setError(nextError.message); }
+  }
   async function loadEarlierMessages() {
     if (!conversation?.messagePage?.hasMore || loadingEarlier || !conversation.messages[0]) return;
     pendingLatestScrollRef.current = null;
@@ -1638,7 +1816,7 @@ export function App() {
     try {
       const moved = await api(`/api/conversations/${conversation.id}/move`, { method: "POST", body: { projectId, worktreeId, worktreePath: nextWorktree.path } });
       await api(`/api/conversations/${conversation.id}`, { method: "PATCH", body: patch });
-      pendingConversationRef.current = moved.id; setManageChatOpen(false); await chooseProject(nextProject, nextWorktree); setToast("Conversation moved");
+      pendingConversationRef.current = moved.id; setManageChatOpen(false); chooseProject(nextProject, nextWorktree); setToast("Conversation moved");
     } catch (nextError) { setError(nextError.message); }
   }
 
@@ -1654,19 +1832,60 @@ export function App() {
 
   async function createWorktree(event) {
     event.preventDefault();
-    try { await api("/api/worktrees", { method: "POST", body: { projectId: worktreeDialog.id, ...worktreeDraft } }); setWorktreeDialog(null); setWorktreeDraft({ branch: "", name: "", baseBranch: "HEAD" }); await loadBootstrap(); setToast("Worktree created"); }
+    try { const result = await api("/api/worktrees", { method: "POST", body: { projectId: worktreeDialog.id, ...worktreeDraft } }); setWorktreeDialog(null); setWorktreeDraft({ branch: "", name: "", baseBranch: "HEAD" }); const refreshed = await bootstrapLoadRef.current?.(result.refreshDeferred ? 3 : 1); setToast(refreshed === true ? "Worktree created" : "Worktree created; project refresh delayed"); }
     catch (nextError) { setError(nextError.message); }
   }
   async function removeWorktree() {
-    try { await api("/api/worktrees", { method: "DELETE", body: { projectId: project.id, worktreePath: worktree.path, confirmation: removeConfirmation } }); setRemoveWorktreeOpen(false); setRemoveConfirmation(""); setSelectedWorktreeId(""); await loadBootstrap(); setToast("Worktree removed"); }
+    try { const result = await api("/api/worktrees", { method: "DELETE", body: { projectId: project.id, worktreePath: worktree.path, confirmation: removeConfirmation } }); setRemoveWorktreeOpen(false); setRemoveConfirmation(""); setSelectedWorktreeId(""); const refreshed = await bootstrapLoadRef.current?.(result.refreshDeferred ? 3 : 1); setToast(refreshed === true ? "Worktree removed" : "Worktree removed; project refresh delayed"); }
     catch (nextError) { setError(nextError.message); }
   }
   async function refreshAll(includeTemplates = false) {
-    try { const next = await api("/api/bootstrap"); setBootstrap(next); if (includeTemplates) setToast("Templates updated"); } catch (nextError) { setError(nextError.message); }
+    const request = ++settingsRefreshRef.current;
+    const settingsVersion = settingsVersionRef.current;
+    try {
+      const next = await api("/api/bootstrap");
+      if (request !== settingsRefreshRef.current) return;
+      setBootstrap((current) => ({ ...next, settings: settingsVersion === settingsVersionRef.current ? next.settings : current.settings }));
+      if (includeTemplates) setToast("Templates updated");
+    } catch (nextError) { if (request === settingsRefreshRef.current) setError(nextError.message); }
   }
   function openManageChat() { if (!conversation || !conversationDetailReady || !isSelectedTarget(conversation)) return; setChatDraft({ title: conversation.title, providerSessionId: conversation.providerSessionId ?? "", provider: conversation.provider, model: conversation.model ?? "", destination: `${conversation.projectId}::${conversation.worktreeId}` }); setManageChatOpen(true); }
 
-  if (!bootstrap || !project || !worktree) return <LoadingScreen isScanning={isScanning} />;
+  if (!bootstrap || !project || !worktree) return <LoadingScreen isScanning={isScanning} error={bootstrapError} onRetry={() => {
+    setBootstrapError("");
+    const retry = bootstrapLoadRef.current;
+    if (retry) {
+      retry.reset?.();
+      retry().catch((retryError) => {
+        if (bootstrapLoadRef.current === retry) setBootstrapError(retryError.message);
+      });
+    }
+  }} />;
+
+  let conversationContent = <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />;
+  if (waitingForConversation) conversationContent = <output className="conversation-loading-status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</output>;
+  if (conversation?.messages.length) conversationContent = <WindowedMessages key={conversation.id} messages={conversation.messages}
+    messagePage={conversation.messagePage} viewportRef={messageViewportRef} restoreAnchorId={restoreMessageAnchorId}
+    renderMessage={(message) => <Message message={message} conversationId={conversation.id} />}
+    onFind={findConversationMessage} onCancelFind={() => {
+      pendingFindRef.current?.abort(); pendingFindRef.current = null; activeFindMatchRef.current = null; findProgressRef.current = null;
+    }} resetFindGeneration={findResetGeneration} />;
+  let unsentHelp = "Return to its worktree before sending again.";
+  if (unsentForOwner) unsentHelp = firstPromptAwaitingSelection
+    ? "Open the created chat before sending again." : "Send again when the chat is ready.";
+  let composerPlaceholder = "Create a chat to start an agent…";
+  if (conversation) composerPlaceholder = `Ask ${conversation.provider} to work in ${worktree.name}…`;
+  if (waitingForConversation) composerPlaceholder = "Loading selected chat…";
+  if (conversationLoadFailed) composerPlaceholder = "Chat unavailable; retry loading…";
+  if (interruptedRun) composerPlaceholder = "Choose how to recover the interrupted run first…";
+  let composerHint = <span className="send-hint"><Command /> Enter to send</span>;
+  if (waitingForConversation) composerHint = <span className="send-hint" role="status" aria-live="polite">{conversationLoadFailed ? "Chat unavailable; retry loading" : "Loading selected chat"}</span>;
+  if (interruptedRun) composerHint = <span className="send-hint running"><WarningCircle aria-hidden="true" />Recovery decision required</span>;
+  if (outcomePending) composerHint = <span className="send-hint running"><WarningCircle aria-hidden="true" />Saving final run outcome</span>;
+  if (activeRun) composerHint = <span className="send-hint running"><span className="status-dot demo" aria-hidden="true" />{`Agent is ${activeRun.status}`}</span>;
+  let composerAction = <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun) || submissionUnavailable || firstPromptAwaitingSelection} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>;
+  if (outcomePending) composerAction = <Button size="icon" type="button" variant="destructive" disabled aria-label="Final run outcome pending"><Stop weight="fill" /></Button>;
+  if (activeRun) composerAction = <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button>;
 
   return <div className={`app-shell ${sidebarOpen ? "sidebar-is-open" : "sidebar-is-closed"}`}>
     <aside className="sidebar" id="project-sidebar" role={isNarrow && sidebarOpen ? "dialog" : undefined} aria-modal={isNarrow && sidebarOpen ? true : undefined} aria-label="Projects and worktrees" aria-hidden={!sidebarOpen} tabIndex={isNarrow ? -1 : undefined} ref={sidebarRef}>
@@ -1679,23 +1898,25 @@ export function App() {
     {isNarrow && sidebarOpen && <div className="mobile-scrim" onClick={closeSidebar} aria-hidden="true" />}
 
     <main id="main-workspace" className={`workspace ${inspector ? "has-inspector" : ""}`} inert={isNarrow && sidebarOpen ? true : undefined} aria-hidden={isNarrow && sidebarOpen ? true : undefined}>
-      <header className="workspace-bar">{!sidebarOpen && <Button variant="ghost" size="icon-sm" onClick={openSidebar} aria-label="Open projects sidebar" aria-controls="project-sidebar" aria-expanded={sidebarOpen}><SidebarSimple /></Button>}<div className="workspace-context"><span>{project.name}</span><CaretRight /><GitBranch /><strong>{worktree.name}</strong></div><div className="workspace-tools"><RunState run={activeRun ?? latestRun} /><WorktreeState worktree={worktree} /><Tooltip><TooltipTrigger render={<Button variant={inspector === "changes" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("changes", event.currentTarget)} aria-label="Changes" aria-controls="workspace-inspector" aria-expanded={inspector === "changes"} />}><GitDiff /></TooltipTrigger><TooltipContent>Changes</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "terminal" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("terminal", event.currentTarget)} aria-label="Terminal" aria-controls="workspace-inspector" aria-expanded={inspector === "terminal"} />}><TerminalWindow /></TooltipTrigger><TooltipContent>Terminal ⌘⇧T</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "context" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("context", event.currentTarget)} aria-label="Project context" aria-controls="workspace-inspector" aria-expanded={inspector === "context"} />}><Info /></TooltipTrigger><TooltipContent>Project context</TooltipContent></Tooltip><ThemeMenu theme={theme} onThemeChange={setTheme} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Worktree options" />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, editor: settings.editor } }).then(() => setToast(`Opened in ${settings.editor}`)).catch((nextError) => setError(nextError.message))}><PencilSimple />Open in {settings.editor}</DropdownMenuItem><DropdownMenuItem onClick={() => setWorktreeDialog(project)}><GitBranch />New worktree</DropdownMenuItem>{worktree.isLinked && <><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onClick={() => setRemoveWorktreeOpen(true)}><Trash />Remove worktree</DropdownMenuItem></>}</DropdownMenuContent></DropdownMenu></div></header>
+      <header className="workspace-bar">{!sidebarOpen && <Button variant="ghost" size="icon-sm" onClick={openSidebar} aria-label="Open projects sidebar" aria-controls="project-sidebar" aria-expanded={sidebarOpen}><SidebarSimple /></Button>}<div className="workspace-context"><span>{project.name}</span><CaretRight /><GitBranch /><strong>{worktree.name}</strong></div><div className="workspace-tools"><RunState run={pendingOutcomeRun ?? activeRun ?? latestRun} outcomePending={outcomePending} /><WorktreeState worktree={worktree} /><Tooltip><TooltipTrigger render={<Button variant={inspector === "changes" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("changes", event.currentTarget)} aria-label="Changes" aria-controls="workspace-inspector" aria-expanded={inspector === "changes"} />}><GitDiff /></TooltipTrigger><TooltipContent>Changes</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "terminal" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("terminal", event.currentTarget)} aria-label="Terminal" aria-controls="workspace-inspector" aria-expanded={inspector === "terminal"} />}><TerminalWindow /></TooltipTrigger><TooltipContent>Terminal ⌘⇧T</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "context" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("context", event.currentTarget)} aria-label="Project context" aria-controls="workspace-inspector" aria-expanded={inspector === "context"} />}><Info /></TooltipTrigger><TooltipContent>Project context</TooltipContent></Tooltip><ThemeMenu theme={theme} onThemeChange={setTheme} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Worktree options" />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, editor: settings.editor } }).then(() => setToast(`Opened in ${settings.editor}`)).catch((nextError) => setError(nextError.message))}><PencilSimple />Open in {settings.editor}</DropdownMenuItem><DropdownMenuItem onClick={() => setWorktreeDialog(project)}><GitBranch />New worktree</DropdownMenuItem>{worktree.isLinked && <><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onClick={() => setRemoveWorktreeOpen(true)}><Trash />Remove worktree</DropdownMenuItem></>}</DropdownMenuContent></DropdownMenu></div></header>
       <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll" role="tablist" aria-label="Open agent chats" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', selectConversation)}>{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={() => { dragConversationRef.current = item.id; }} onDragOver={(event) => event.preventDefault()} onDrop={() => reorderConversation(item.id)}><button className="tab-select" id={domId("chat-tab", item.id)} data-tab-id={item.id} role="tab" aria-selected={item.id === selectedConversationId} aria-controls="conversation-panel" tabIndex={item.id === selectedConversationId ? 0 : -1} onClick={() => selectConversation(item.id)} onDoubleClick={() => { selectConversation(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); archiveChat(item, event.currentTarget); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
       <div className="work-area">
         <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
-          <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} onManage={openManageChat} />
-          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversation?.messages.length ? <WindowedMessages key={conversation.id} messages={conversation.messages} messagePage={conversation.messagePage} viewportRef={messageViewportRef} restoreAnchorId={restoreMessageAnchorId} renderMessage={(message) => <Message message={message} conversationId={conversation.id} />} onFind={findConversationMessage} onCancelFind={() => { pendingFindRef.current?.abort(); pendingFindRef.current = null; activeFindMatchRef.current = null; findProgressRef.current = null; }} resetFindGeneration={findResetGeneration} /> : waitingForConversation ? <p role="status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</p> : <EmptyChat worktree={worktree} onCreate={() => setNewChatOpen(true)} />}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} />}{!conversation?.messagePage?.hasLater && activeRun && !streamingText && <RunningMessage run={activeRun} events={runEvents} />}</div></ScrollArea>
+          <span className="sr-only run-announcement" role="status" aria-live="polite" aria-atomic="true">{runAnnouncement}</span>
+          <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} pendingRuns={pendingOutcomeRuns} onManage={openManageChat} />
+          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversationContent}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} busy={activeRun?.status === "running"} />}{!conversation?.messagePage?.hasLater && (activeRun || pendingOutcomeRun) && !streamingText && <RunningMessage run={activeRun ?? pendingOutcomeRun} events={runEvents} outcomePending={!activeRun && outcomePending} busy={activeRun?.status === "running"} />}</div></ScrollArea>
           {readingLiveText && <section className="history-live-tail" aria-label={activeRun ? "Live output while reading history" : "Recent output while reading history"} tabIndex={0}><strong>{activeRun ? "Live output" : "Recent output"}</strong><p>{readingLiveText}</p></section>}
           {conversation?.messagePage?.hasLater && <div className="history-forward"><button className="history-later" onClick={loadLaterMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading later messages…" : `Load later messages · ${conversation.messagePage.newerCount} remaining`}</button><button className="history-return" onClick={() => loadConversation({ returnToLatest: true })}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button></div>}
+          {outcomePending && <div className="recovery-notice"><WarningCircle weight="fill" /><span className="recovery-copy"><strong>Run outcome waiting for storage</strong><span>The agent process has exited. Outright is saving the final result for {pendingOutcomeRuns.length === 1 ? "run" : "runs"} {pendingOutcomeRuns.map((run, index) => <code key={run.id}>{run.id}{index < pendingOutcomeRuns.length - 1 ? ", " : ""}</code>)} and will update this chat when storage recovers.</span></span></div>}
           {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}
-          <form className="composer" onSubmit={sendPrompt}>{unsentCreatedChat && <div className="first-prompt-notice" role="status" aria-live="polite">Chat created, but your message was not sent. {unsentForOwner ? firstPromptAwaitingSelection ? "Open the created chat before sending again." : "Send again when the chat is ready." : "Return to its worktree before sending again."}{unsentForOwner && firstPromptAwaitingSelection && conversations.some((item) => item.id === unsentForOwner.id) && <Button type="button" variant="outline" size="sm" onClick={() => selectConversation(unsentForOwner.id)}>Open created chat</Button>}{!unsentForOwner && unsentProject && unsentWorktree && <Button type="button" variant="outline" size="sm" onClick={() => { pendingConversationRef.current = unsentCreatedChat.id; chooseProject(unsentProject, unsentWorktree); }}>Return to created chat</Button>}<Button type="button" variant="ghost" size="sm" onClick={() => { setUnsentCreatedChat(null); editDraft(""); }}>Discard unsent message</Button></div>}<textarea aria-label="Message the agent" disabled={Boolean(interruptedRun) || submissionUnavailable} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={interruptedRun ? "Choose how to recover the interrupted run first…" : conversationLoadFailed ? "Chat unavailable; retry loading…" : waitingForConversation ? "Loading selected chat…" : conversation ? `Ask ${conversation.provider} to work in ${worktree.name}…` : "Create a chat to start an agent…"} value={draft} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={editDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{activeRun ? <span className="send-hint running" role="status" aria-live="polite"><span className="status-dot demo" aria-hidden="true" />Agent is {activeRun.status}</span> : interruptedRun ? <span className="send-hint running" role="status" aria-live="polite"><WarningCircle aria-hidden="true" />Recovery decision required</span> : waitingForConversation ? <span className="send-hint" role="status" aria-live="polite">{conversationLoadFailed ? "Chat unavailable; retry loading" : "Loading selected chat"}</span> : <span className="send-hint"><Command /> Enter to send</span>}{activeRun ? <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button> : <Button size="icon" type="submit" disabled={!draft.trim() || Boolean(interruptedRun) || submissionUnavailable || firstPromptAwaitingSelection} aria-label="Send message"><PaperPlaneTilt weight="fill" /></Button>}</div></form>
+          <form className="composer" onSubmit={sendPrompt}>{unsentCreatedChat && <div className="first-prompt-notice" role="status" aria-live="polite">Chat created, but your message was not sent. {unsentHelp}{unsentForOwner && firstPromptAwaitingSelection && conversations.some((item) => item.id === unsentForOwner.id) && <Button type="button" variant="outline" size="sm" onClick={() => selectConversation(unsentForOwner.id)}>Open created chat</Button>}{!unsentForOwner && unsentProject && unsentWorktree && <Button type="button" variant="outline" size="sm" onClick={() => { pendingConversationRef.current = unsentCreatedChat.id; chooseProject(unsentProject, unsentWorktree); }}>Return to created chat</Button>}<Button type="button" variant="ghost" size="sm" onClick={() => { setUnsentCreatedChat(null); editDraft(""); }}>Discard unsent message</Button></div>}<textarea aria-label="Message the agent" disabled={Boolean(interruptedRun) || submissionUnavailable} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={composerPlaceholder} value={draft} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={editDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{composerHint}{composerAction}</div></form>
         </section>
-        {inspector && <aside className="inspector" id="workspace-inspector" aria-label="Workspace inspector" tabIndex={-1} ref={inspectorRef}><header><nav role="tablist" aria-label="Inspector panels" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', setInspector)}><button id="inspector-tab-changes" data-tab-id="changes" role="tab" className={inspector === "changes" ? "is-active" : ""} aria-selected={inspector === "changes"} aria-controls="inspector-content" tabIndex={inspector === "changes" ? 0 : -1} onClick={() => setInspector("changes")}><GitDiff />Changes</button><button id="inspector-tab-terminal" data-tab-id="terminal" role="tab" className={inspector === "terminal" ? "is-active" : ""} aria-selected={inspector === "terminal"} aria-controls="inspector-content" tabIndex={inspector === "terminal" ? 0 : -1} onClick={() => setInspector("terminal")}><TerminalWindow />Terminal</button><button id="inspector-tab-context" data-tab-id="context" role="tab" className={inspector === "context" ? "is-active" : ""} aria-selected={inspector === "context"} aria-controls="inspector-content" tabIndex={inspector === "context" ? 0 : -1} onClick={() => setInspector("context")}><TreeStructure />Context</button></nav><Button variant="ghost" size="icon-xs" onClick={closeInspector} aria-label="Close inspector"><X /></Button></header><div className="inspector-body" id="inspector-content" role="tabpanel" aria-labelledby={`inspector-tab-${inspector}`}>{inspector === "changes" && <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />}{inspector === "terminal" && <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} sendRuntime={sendRuntime} onError={handleError} />}{inspector === "context" && <ContextPane worktree={worktree} settings={settings} onError={handleError} />}</div></aside>}
+        {inspector && <aside className="inspector" id="workspace-inspector" aria-label="Workspace inspector" tabIndex={-1} ref={inspectorRef}><header><nav role="tablist" aria-label="Inspector panels" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', setInspector)}><button id="inspector-tab-changes" data-tab-id="changes" role="tab" className={inspector === "changes" ? "is-active" : ""} aria-selected={inspector === "changes"} aria-controls="inspector-content" tabIndex={inspector === "changes" ? 0 : -1} onClick={() => setInspector("changes")}><GitDiff />Changes</button><button id="inspector-tab-terminal" data-tab-id="terminal" role="tab" className={inspector === "terminal" ? "is-active" : ""} aria-selected={inspector === "terminal"} aria-controls="inspector-content" tabIndex={inspector === "terminal" ? 0 : -1} onClick={() => setInspector("terminal")}><TerminalWindow />Terminal</button><button id="inspector-tab-context" data-tab-id="context" role="tab" className={inspector === "context" ? "is-active" : ""} aria-selected={inspector === "context"} aria-controls="inspector-content" tabIndex={inspector === "context" ? 0 : -1} onClick={() => setInspector("context")}><TreeStructure />Context</button></nav><Button variant="ghost" size="icon-xs" onClick={closeInspector} aria-label="Close inspector"><X /></Button></header><div className="inspector-body" id="inspector-content" role="tabpanel" aria-labelledby={`inspector-tab-${inspector}`}>{inspector === "changes" && <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />}{inspector === "terminal" && <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} unverifiedTerminalIds={unverifiedTerminalIds} sendRuntime={sendRuntime} onError={handleError} />}{inspector === "context" && <ContextPane worktree={worktree} settings={settings} onError={handleError} />}</div></aside>}
       </div>
     </main>
 
     <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} projects={bootstrap.projects} onSelectProject={chooseProject} onSelectConversation={(item) => { const nextProject = bootstrap.projects.find((entry) => entry.id === item.projectId); const nextWorktree = nextProject?.worktrees.find((entry) => entry.id === item.worktreeId); if (nextProject && nextWorktree) { pendingConversationRef.current = item.id; chooseProject(nextProject, nextWorktree); } }} />
-    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} onSaved={(nextSettings, refresh) => { setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") Notification.requestPermission(); if (refresh) refreshAll(true); }} onError={handleError} />
+    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} runtimeEvent={runtimeEvent} onSaved={(nextSettings, refresh) => { if (refresh !== "history" && refresh !== "settings" && refresh !== "templates") { ++settingsVersionRef.current; setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") requestNotificationPermission(); } if (refresh) void refreshAll(refresh === "templates"); }} onError={handleError} />
 
     <SimpleDialog open={newChatOpen} onOpenChange={setNewChatOpen} title="New agent chat" description={`${project.name} / ${worktree.name}`} onSubmit={(event) => { event.preventDefault(); createConversation(); }} submit="Create chat"><label htmlFor="chat-title">What should the agent work on?</label><Input id="chat-title" autoFocus value={newChatTitle} onChange={(event) => setNewChatTitle(event.target.value)} placeholder="Review the worktree scanner" /></SimpleDialog>
     <SimpleDialog open={newGroupOpen} onOpenChange={setNewGroupOpen} title="Create project group" description="Organize related projects together in the sidebar." onSubmit={createGroup} submit="Create group" disabled={!newGroupName.trim()}><label htmlFor="group-name">Group name</label><Input id="group-name" autoFocus value={newGroupName} onChange={(event) => setNewGroupName(event.target.value)} placeholder="Client work" /></SimpleDialog>
@@ -1703,14 +1924,22 @@ export function App() {
     <Dialog open={manageChatOpen} onOpenChange={setManageChatOpen}><DialogContent><form className="dialog-form" onSubmit={saveChatSettings}><DialogHeader><DialogTitle>Conversation settings</DialogTitle><DialogDescription>Rename, move, pin, or attach an existing provider session.</DialogDescription></DialogHeader><label htmlFor="chat-settings-title">Title</label><Input id="chat-settings-title" value={chatDraft.title} onChange={(event) => setChatDraft({ ...chatDraft, title: event.target.value })} /><label htmlFor="chat-settings-destination">Move to worktree</label><select id="chat-settings-destination" value={chatDraft.destination} onChange={(event) => setChatDraft({ ...chatDraft, destination: event.target.value })}>{bootstrap.projects.map((item) => <optgroup key={item.id} label={item.name}>{item.worktrees.filter((entry) => !entry.isPrunable && !entry.isBare).map((entry) => <option key={entry.id} value={`${item.id}::${entry.id}`}>{entry.name} · {entry.branch}</option>)}</optgroup>)}</select><label htmlFor="chat-settings-provider">Provider</label><select id="chat-settings-provider" value={chatDraft.provider} onChange={(event) => setChatDraft({ ...chatDraft, provider: event.target.value })}>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.label}</option>)}</select><label htmlFor="chat-settings-model">Model</label><Input id="chat-settings-model" value={chatDraft.model} onChange={(event) => setChatDraft({ ...chatDraft, model: event.target.value })} placeholder="Provider default" /><label htmlFor="chat-settings-session">Provider session ID</label><Input id="chat-settings-session" value={chatDraft.providerSessionId} onChange={(event) => setChatDraft({ ...chatDraft, providerSessionId: event.target.value })} placeholder="Attach or resume an existing session" /><div className="manage-actions"><Button type="button" variant="outline" onClick={() => updateConversation({ pinned: !conversation.pinned })}><PushPin />{conversation?.pinned ? "Unpin" : "Pin"}</Button><Button type="button" variant="destructive" onClick={archiveConversation}><Archive />Archive conversation</Button></div><DialogFooter><Button variant="outline" type="button" onClick={() => setManageChatOpen(false)}>Cancel</Button><Button type="submit">Save</Button></DialogFooter></form></DialogContent></Dialog>
     <SimpleDialog open={Boolean(worktreeDialog)} onOpenChange={(open) => !open && setWorktreeDialog(null)} title="Create worktree" description={worktreeDialog?.name ?? ""} onSubmit={createWorktree} submit="Create worktree" disabled={!worktreeDraft.branch.trim()}><label htmlFor="worktree-branch">Branch name</label><Input id="worktree-branch" value={worktreeDraft.branch} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, branch: event.target.value })} placeholder="feature/my-change" /><label htmlFor="worktree-directory">Directory name <small>optional</small></label><Input id="worktree-directory" value={worktreeDraft.name} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, name: event.target.value })} placeholder="project-my-change" /><label htmlFor="worktree-base">Base revision</label><Input id="worktree-base" value={worktreeDraft.baseBranch} onChange={(event) => setWorktreeDraft({ ...worktreeDraft, baseBranch: event.target.value })} /></SimpleDialog>
     <Dialog open={removeWorktreeOpen} onOpenChange={setRemoveWorktreeOpen}><DialogContent><DialogHeader><DialogTitle>Remove worktree?</DialogTitle><DialogDescription>This is allowed only when the linked worktree has no uncommitted changes. Type its exact path to confirm.</DialogDescription></DialogHeader><code className="confirm-path">{worktree.path}</code><label htmlFor="remove-worktree-confirmation">Confirmation path</label><Input id="remove-worktree-confirmation" value={removeConfirmation} onChange={(event) => setRemoveConfirmation(event.target.value)} placeholder="Exact worktree path" /><DialogFooter><Button variant="outline" onClick={() => setRemoveWorktreeOpen(false)}>Cancel</Button><Button variant="destructive" disabled={removeConfirmation !== worktree.path} onClick={removeWorktree}>Remove worktree</Button></DialogFooter></DialogContent></Dialog>
-    {toast && <div className="toast" role="status" aria-live="polite"><CheckCircle weight="fill" />{toast}</div>}{error && <div className="error-toast" role="alert" aria-live="assertive"><WarningCircle weight="fill" /><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error"><X /></button></div>}
+    {toast && <div className="toast" role="status" aria-live="polite"><CheckCircle weight="fill" />{toast}</div>}
+    {(error || bootstrapError) && <div className="error-toast-stack">
+      {error && <div className="error-toast" role="alert" aria-live="assertive"><WarningCircle weight="fill" /><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error"><X /></button></div>}
+      {bootstrapError && <div className="error-toast" role="alert" aria-live="assertive"><WarningCircle weight="fill" /><span>{bootstrapError}</span><button onClick={() => setBootstrapError("")} aria-label="Dismiss loading error"><X /></button></div>}
+    </div>}
   </div>;
 }
 
 function ProjectTree({ project, activeProjectId, activeWorktreeId, expanded, groups, onToggle, onSelectProject, onSelectWorktree, onMove, onCreateWorktree }) {
   return <div className={`project-tree ${project.id === activeProjectId ? "is-active" : ""}`}><div className="project-row"><button className="tree-caret" onClick={onToggle} aria-label={`${expanded ? "Collapse" : "Expand"} ${project.name}`} aria-expanded={expanded}>{expanded ? <CaretDown /> : <CaretRight />}</button><button className="project-select" onClick={onSelectProject}><FolderOpen weight={project.id === activeProjectId ? "fill" : "duotone"} /><span><strong>{project.name}</strong><small>{compactPath(project.path)}</small></span></button><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-xs" className="project-menu" aria-label={`Project options for ${project.name}`} />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={onCreateWorktree}><GitBranch />New worktree</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuGroup><DropdownMenuLabel>Move to group</DropdownMenuLabel>{groups.map((group) => <DropdownMenuItem key={group.id} onClick={() => onMove(group.id)}><Folders />{group.name}</DropdownMenuItem>)}</DropdownMenuGroup><DropdownMenuItem onClick={() => onMove(null)}>Ungrouped</DropdownMenuItem></DropdownMenuContent></DropdownMenu></div>{expanded && <div className="worktree-list">{project.worktrees.map((item) => <button className={`worktree-row ${project.id === activeProjectId && item.id === activeWorktreeId ? "is-active" : ""}`} aria-current={project.id === activeProjectId && item.id === activeWorktreeId ? "page" : undefined} key={item.id} onClick={() => onSelectWorktree(item)}><span /><GitBranch /><span className="worktree-copy"><strong>{item.name}</strong><small>{item.branch}</small></span><GitHealth worktree={item} /></button>)}</div>}</div>;
 }
-function ConversationHeader({ conversation, worktree, latestRun, onManage }) { return <section className="conversation-header"><div className="conversation-symbol"><ChatCircle weight="duotone" /></div><div><h1>{conversation?.title ?? "No conversation selected"}</h1><p><GitBranch />{worktree.branch}<span>·</span>{compactPath(worktree.path)}</p></div><div className="conversation-meta">{conversation && <button onClick={onManage}><span>{conversation.provider}</span><PencilSimple /></button>}{latestRun && <small>{runSummary(latestRun)}</small>}</div></section>; }
+function ConversationHeader({ conversation, worktree, latestRun, pendingRuns, onManage }) {
+  const latestPending = pendingRuns.some((run) => run.id === latestRun?.id);
+  const earlierPending = pendingRuns.length - Number(latestPending);
+  return <section className="conversation-header"><div className="conversation-symbol"><ChatCircle weight="duotone" /></div><div><h1>{conversation?.title ?? "No conversation selected"}</h1><p><GitBranch />{worktree.branch}<span>·</span>{compactPath(worktree.path)}</p></div><div className="conversation-meta">{conversation && <button onClick={onManage}><span>{conversation.provider}</span><PencilSimple /></button>}{latestRun && <small>{runSummary(latestRun, latestPending)}</small>}{earlierPending > 0 && <small>{earlierPending} earlier outcome{earlierPending === 1 ? "" : "s"} pending</small>}</div></section>;
+}
 function Message({ message, conversationId }) {
   const [bodyPage, setBodyPage] = useState(null);
   const [bodyError, setBodyError] = useState("");
@@ -1737,11 +1966,17 @@ function Message({ message, conversationId }) {
   if (message.kind === "tool") return <article className="message is-agent is-tool" data-message-id={message.id}><div className="avatar"><CheckCircle weight="fill" /></div><div className="message-body"><p className="message-text">{message.body}</p>{bodyReader}</div></article>;
   return <article className={`message ${user ? "is-user" : "is-agent"}`} data-message-id={message.id}><div className="avatar">{user ? "Y" : <Sparkle weight="fill" />}</div><div className="message-body"><div className="message-meta"><strong>{user ? "You" : "Outright"}</strong><time>{formatTime(message.createdAt)}</time></div><p className="message-text">{message.body}</p>{bodyReader}{message.payload?.runId && <small className="message-run">{message.payload.provider} · {message.payload.runId.slice(0, 8)}</small>}</div></article>;
 }
-function StreamingMessage({ text, events }) { return <article className="message is-agent is-streaming" aria-busy="true"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="message-text">{text}</p><ToolActivity events={events} /></div></article>; }
-function RunningMessage({ run, events }) { return <article className="message is-agent is-streaming" role="status" aria-live="polite"><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="thinking-copy">{run.status === "queued" ? "Waiting for an execution slot…" : "Working in this worktree…"}</p><ToolActivity events={events} /></div></article>; }
+function StreamingMessage({ text, events, busy }) { return <article className="message is-agent is-streaming" aria-busy={busy}><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="message-text">{text}</p><ToolActivity events={events} /></div></article>; }
+function RunningMessage({ run, events, outcomePending = false, busy }) {
+  let activityText = "Working in this worktree…";
+  if (run.status === "queued") activityText = "Waiting for an execution slot…";
+  if (outcomePending) activityText = "Waiting for storage to save the final result…";
+  return <article className="message is-agent is-streaming" aria-busy={busy}><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="thinking-copy">{activityText}</p><ToolActivity events={events} /></div></article>;
+}
 // Interrupted runs surface here until the operator picks a continuation
 // policy; the preserved partial output stays visible above the notice.
 function RecoveryNotice({ run, conversation, recoveryConversation, onOpenRecovery, onResolve }) {
+  const evidenceUnreadable = run.recoveryClass?.startsWith("outcome-unreadable-");
   const classCopy = {
     "never-started": "it was still queued, so no provider process started and no side effects happened",
     exited: "its provider process exited during the restart; partial side effects may exist in the worktree",
@@ -1757,27 +1992,52 @@ function RecoveryNotice({ run, conversation, recoveryConversation, onOpenRecover
   const title = action === "discard-unverifiable"
     ? "Unverifiable legacy recovery requires cleanup"
     : ownsRecovery ? "Run interrupted by a runtime restart" : `Recovery required in ${owner?.title ?? "another chat"}`;
-  const copy = action === "discard-unverifiable"
-    ? "Outright cannot verify this legacy provider or its original worktree. After checking outside Outright that it is no longer running, discard only this recovery record to release its gate."
-    : ownsRecovery
-      ? `Reconciliation found ${classCopy}. Review the preserved partial output above, then choose how to continue before anything is retried.`
-      : "Another chat in this worktree owns an interrupted run. Open it to inspect the preserved output and choose an explicit continuation policy.";
+  let copy;
+  if (action === "discard-unverifiable") {
+    copy = "Outright cannot verify this legacy provider or its original worktree. After checking outside Outright that it is no longer running, discard only this recovery record to release its gate.";
+  } else if (ownsRecovery && evidenceUnreadable) {
+    copy = "The final result is temporarily unreadable. Outright is protecting its recovery record. Retry a decision after storage recovers; a valid result will be replayed before any new work starts.";
+  } else if (ownsRecovery) {
+    copy = `Reconciliation found ${classCopy}. Review the preserved partial output above, then choose how to continue before anything is retried.`;
+  } else {
+    copy = "Another chat in this worktree owns an interrupted run. Open it to inspect the preserved output and choose an explicit continuation policy.";
+  }
   return <div className="recovery-notice" role="alert"><WarningCircle weight="fill" /><div className="recovery-copy"><strong>{title}</strong><p>{copy}</p></div><div className="recovery-actions">{action === "discard-unverifiable" ? <Button size="sm" variant="destructive" onClick={() => onResolve(run, "discard-unverifiable")}>Discard legacy record</Button> : action === "owner" ? <><Button size="sm" disabled={!sessionId} onClick={() => onResolve(run, "resume-session")}><ArrowsClockwise />Resume session</Button><Button size="sm" variant="outline" onClick={() => onResolve(run, "retry")}>Retry from scratch</Button><Button size="sm" variant="ghost" onClick={() => onResolve(run, "discard")}>Discard</Button></> : <Button size="sm" onClick={onOpenRecovery}><ChatCircle />Open recovery chat</Button>}</div></div>;
 }
 function ToolActivity({ events }) { if (!events.length) return null; return <div className="tool-activity">{events.slice(-4).map((event) => <div key={event.id}><CheckCircle /><span>{toolLabel(event)}</span></div>)}</div>; }
 function EmptyChat({ worktree, onCreate }) { return <div className="empty-chat"><ChatCircle size={29} /><h2>Start in {worktree.name}</h2><p>Create a durable conversation, then run Codex or Claude directly in this worktree.</p><Button onClick={onCreate}><Plus />New chat</Button></div>; }
 function WorktreeState({ worktree }) { if (worktree.isPrunable) return <span className="worktree-state warning"><WarningCircle />stale</span>; if (worktree.changedCount) return <span className="worktree-state warning"><GitDiff />{worktree.changedCount} changed</span>; return <span className="worktree-state clean"><Check />clean</span>; }
-function RunState({ run }) { if (!run) return null; const running = ["queued", "launching", "running"].includes(run.status); const pendingDecision = run.status === "interrupted" && !run.recoveryDecision; return <span className={`run-state ${run.status}`} role="status" aria-live="polite" title={pendingDecision ? "Restart interrupted this run; choose a continuation below" : undefined}><span className={`status-dot ${running || pendingDecision ? "demo" : run.status === "completed" ? "live" : "error"}`} aria-hidden="true" />{run.status}{run.costUsd != null && <small>${Number(run.costUsd).toFixed(3)}</small>}</span>; }
+function runAnnouncementText(run, outcomePending) {
+  if (!run) return "";
+  if (outcomePending) return "Saving final run outcome";
+  if (run.status === "interrupted") return "Run interrupted; recovery decision required";
+  return `Run ${run.status}`;
+}
+function RunState({ run, outcomePending = false }) {
+  if (!run) return null;
+  const running = ["queued", "launching", "running"].includes(run.status);
+  const pendingDecision = run.status === "interrupted" && !run.recoveryDecision;
+  let dotState = "error";
+  if (running || pendingDecision) dotState = "demo";
+  else if (run.status === "completed") dotState = "live";
+  return <span className={`run-state ${run.status}`} title={pendingDecision ? "Restart interrupted this run; choose a continuation below" : undefined}><span className={`status-dot ${dotState}`} aria-hidden="true" />{outcomePending ? "outcome pending" : run.status}{run.transcriptOmitted ? " · output omitted" : ""}{run.costUsd != null && <small>${Number(run.costUsd).toFixed(3)}</small>}</span>;
+}
 function GitHealth({ worktree }) { if (worktree.isPrunable) return <span className="git-health warning"><WarningCircle /></span>; if (worktree.changedCount) return <span className="git-health warning"><span className="status-dot demo" />{worktree.changedCount}</span>; return <span className="git-health clean"><Check /></span>; }
 function TemplateMenu({ templates, onSelect }) { if (!templates.length) return null; return <DropdownMenu><DropdownMenuTrigger render={<Button type="button" variant="ghost" size="icon-sm" aria-label="Prompt templates" />}><ClockCounterClockwise /></DropdownMenuTrigger><DropdownMenuContent align="start"><DropdownMenuGroup><DropdownMenuLabel>Prompt templates</DropdownMenuLabel>{templates.map((template) => <DropdownMenuItem key={template.id} onClick={() => onSelect(template.prompt)}>{template.title}</DropdownMenuItem>)}</DropdownMenuGroup></DropdownMenuContent></DropdownMenu>; }
 function ThemeMenu({ theme, onThemeChange }) { const Icon = theme === "light" ? Sun : theme === "dark" ? Moon : Desktop; return <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Change theme" />}><Icon /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup><DropdownMenuLabel>Appearance</DropdownMenuLabel></DropdownMenuGroup><DropdownMenuRadioGroup value={theme} onValueChange={onThemeChange}><DropdownMenuRadioItem value="system"><Desktop />System</DropdownMenuRadioItem><DropdownMenuRadioItem value="light"><Sun />Light</DropdownMenuRadioItem><DropdownMenuRadioItem value="dark"><Moon />Dark</DropdownMenuRadioItem></DropdownMenuRadioGroup></DropdownMenuContent></DropdownMenu>; }
 function SimpleDialog({ open, onOpenChange, title, description, onSubmit, submit, disabled, children }) { return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><form className="dialog-form" onSubmit={onSubmit}><DialogHeader><DialogTitle>{title}</DialogTitle><DialogDescription>{description}</DialogDescription></DialogHeader>{children}<DialogFooter><Button type="button" variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button><Button type="submit" disabled={disabled}>{submit}</Button></DialogFooter></form></DialogContent></Dialog>; }
-function LoadingScreen({ isScanning }) { return <div className="loading-screen" role="status" aria-live="polite"><span className="brand-glyph"><Sparkle weight="fill" /></span><h1>Outright</h1><p>{isScanning ? "Starting the local runtime…" : "No projects found"}</p></div>; }
+function LoadingScreen({ isScanning, error, onRetry }) { return <div className="loading-screen" role="status" aria-live="polite"><span className="brand-glyph"><Sparkle weight="fill" /></span><h1>Outright</h1>{error ? <><p role="alert">{error}</p><Button onClick={onRetry}>Retry</Button></> : <p>{isScanning ? "Starting the local runtime…" : "No projects found"}</p>}</div>; }
 function buildGroupedProjects(projects, state) { const result = state.groups.map((group) => ({ ...group, projects: projects.filter((project) => state.memberships[project.id] === group.id) })); const ungrouped = projects.filter((project) => !state.groups.some((group) => group.id === state.memberships[project.id])); return ungrouped.length ? [...result, { id: "ungrouped", name: "Ungrouped", projects: ungrouped }] : result; }
 function preferredWorktree(project) { return project.worktrees.find((item) => item.name === "dev" || item.path.endsWith("-dev")) ?? project.worktrees.find((item) => item.branch === "next") ?? project.worktrees[0]; }
 function compactPath(value = "") { return value.replace(/^\/Users\/[^/]+/, "~"); }
 function defaultSettings() { return { provider: "codex", model: "", reasoningEffort: "medium", approvalPolicy: "workspace-write", editor: "zed", notifications: true, maxConcurrentRuns: 3 }; }
 function focusableElements(container) { return container ? [...container.querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')].filter((element) => element.getClientRects().length && element.getAttribute("aria-hidden") !== "true") : []; }
+
+function requestNotificationPermission() {
+  // The microtask also turns older browsers' synchronous throws into a
+  // rejection, so both failure paths are handled by the same promise chain.
+  void Promise.resolve().then(() => Notification.requestPermission()).catch(() => {});
+}
 function boundStreamingText(value) { return value.length > MAX_STREAMING_CHARACTERS ? `${value.slice(0, MAX_STREAMING_CHARACTERS)}${LIVE_TRUNCATION_MARKER}` : value; }
 
 function boundPageMessage(message, matchNeedle = "") {
@@ -1855,5 +2115,11 @@ function readingLivePreview(checkpoint, suffix) {
   return truncated ? `[Earlier live output omitted]\n${visible}` : visible;
 }
 function formatTime(value) { return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(value)); }
-function runSummary(run) { const tokens = Number(run.inputTokens ?? 0) + Number(run.outputTokens ?? 0); return `${run.status}${tokens ? ` · ${tokens.toLocaleString()} tokens` : ""}${run.costUsd != null ? ` · $${Number(run.costUsd).toFixed(3)}` : ""}`; }
+function runSummary(run, outcomePending = false) {
+  const tokens = Number(run.inputTokens ?? 0) + Number(run.outputTokens ?? 0);
+  const omission = run.transcriptOmitted ? " · output omitted" : "";
+  const tokenSummary = tokens ? ` · ${tokens.toLocaleString()} tokens` : "";
+  const costSummary = run.costUsd == null ? "" : ` · $${Number(run.costUsd).toFixed(3)}`;
+  return `${outcomePending ? "outcome pending" : run.status}${omission}${tokenSummary}${costSummary}`;
+}
 function toolLabel(event) { const item = event.payload?.item ?? {}; return item.command || item.name || item.type || (event.type === "tool.started" ? "Tool started" : "Tool completed"); }

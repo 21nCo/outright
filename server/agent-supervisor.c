@@ -4,6 +4,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -11,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -24,7 +26,14 @@
 #define INPUT_CAPACITY 4096
 #define TEARDOWN_BUDGET_MS 750
 #define AUTHORIZED_CONTROL "__OUTRIGHT_LAUNCH_AUTHORIZED_V1__"
+#define UTILITY_TREE_EMPTY "__OUTRIGHT_UTILITY_TREE_EMPTY_V1__"
 #define CONTROL_FD 3
+
+static int utility_prelaunch_exit(int code) {
+  if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL)
+    dprintf(CONTROL_FD, "%s\n", UTILITY_TREE_EMPTY);
+  return code;
+}
 
 static volatile sig_atomic_t termination_requested = 0;
 
@@ -89,6 +98,68 @@ static bool process_identity(pid_t pid, char *identity, size_t identity_size) {
   if (boot_id[0] == '\0' || start_ticks == 0) return false;
   int written = snprintf(identity, identity_size, "linux:%s:%llu", boot_id, start_ticks);
   return written > 0 && (size_t)written < identity_size;
+}
+
+// Recovery only signals the native owner that still carries this terminal's
+// private launch marker. A same-tick recycled PID must not inherit ownership.
+static bool terminal_owner_command(pid_t pid, const char *handshake_path) {
+  char filename[64];
+  snprintf(filename, sizeof(filename), "/proc/%ld/cmdline", (long)pid);
+  FILE *file = fopen(filename, "rb");
+  if (file == NULL) return false;
+  char command[8192];
+  size_t length = fread(command, 1, sizeof(command), file);
+  bool complete = feof(file) && !ferror(file);
+  fclose(file);
+  if (!complete || length < 3 || command[length - 1] != '\0') return false;
+  size_t first = strnlen(command, length);
+  if (first == length) return false;
+  size_t second = first + 1;
+  if (second >= length) return false;
+  size_t second_length = strnlen(command + second, length - second);
+  size_t third = second + second_length + 1;
+  if (third >= length) return false;
+  return strcmp(command + second, "--stop-on-owner-exit") == 0
+    && strcmp(command + third, handshake_path) == 0;
+}
+
+// A pidfd binds the signal to the same kernel process whose boot-scoped
+// identity and marker were checked. A recycled numeric PID cannot be signaled.
+static int terminate_owned_process(const char *raw_pid, const char *expected_identity, const char *handshake_path) {
+  char *end = NULL;
+  errno = 0;
+  long parsed = strtol(raw_pid, &end, 10);
+  if (errno != 0 || end == raw_pid || *end != '\0' || parsed <= 0 || parsed > INT_MAX
+      || expected_identity == NULL || strlen(expected_identity) >= 160
+      || handshake_path == NULL || strlen(handshake_path) >= 4096) return 64;
+#if defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
+  int descriptor = (int)syscall(SYS_pidfd_open, (pid_t)parsed, 0);
+  if (descriptor < 0) return 4;
+  char actual[160];
+  bool matched = process_identity((pid_t)parsed, actual, sizeof(actual))
+    && strcmp(actual, expected_identity) == 0
+    && terminal_owner_command((pid_t)parsed, handshake_path);
+  if (!matched) { close(descriptor); return 4; }
+  int result = (int)syscall(SYS_pidfd_send_signal, descriptor, SIGTERM, NULL, 0);
+  close(descriptor);
+  if (result != 0) return 4;
+  dprintf(STDOUT_FILENO, "signaled\n");
+  return 0;
+#else
+  return 4;
+#endif
+}
+
+static bool supports_owned_termination(void) {
+#if defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
+  int descriptor = (int)syscall(SYS_pidfd_open, getpid(), 0);
+  if (descriptor < 0) return false;
+  int result = (int)syscall(SYS_pidfd_send_signal, descriptor, 0, NULL, 0);
+  close(descriptor);
+  return result == 0;
+#else
+  return false;
+#endif
 }
 
 static int ensure_parent_directory(const char *filename) {
@@ -331,6 +402,7 @@ static int authorize_provider(char **provider_argv, const char *handshake_path, 
     int null_input = open("/dev/null", O_RDONLY);
     if (null_input < 0 || dup2(null_input, STDIN_FILENO) < 0) _exit(126);
     if (null_input != STDIN_FILENO) close(null_input);
+    unsetenv("OUTRIGHT_UTILITY_OWNER");
     execvp(provider_argv[0], provider_argv);
     dprintf(STDERR_FILENO, "Unable to start provider: %s\n", strerror(errno));
     _exit(127);
@@ -354,14 +426,26 @@ static int authorize_provider(char **provider_argv, const char *handshake_path, 
 }
 
 int main(int argc, char **argv) {
-  if (argc < 3) {
-    dprintf(STDERR_FILENO, "Usage: %s HANDSHAKE_PATH EXECUTABLE [ARG...]\n", argv[0]);
-    return 64;
+  if (argc == 5 && strcmp(argv[1], "--terminate-owned") == 0) {
+    return terminate_owned_process(argv[2], argv[3], argv[4]);
   }
-  const char *handshake_path = argv[1];
+  bool stop_on_owner_exit = argc > 1 && strcmp(argv[1], "--stop-on-owner-exit") == 0;
+  int first = stop_on_owner_exit ? 2 : 1;
+  if (argc < first + 2) {
+    dprintf(STDERR_FILENO, "Usage: %s [--stop-on-owner-exit] HANDSHAKE_PATH EXECUTABLE [ARG...]\n", argv[0]);
+    return utility_prelaunch_exit(64);
+  }
+  // Crash recovery signals a numeric PID only through a verified pidfd. Do
+  // not admit a managed PTY on a kernel where its owner cannot later be
+  // terminated safely after a runtime restart.
+  if (stop_on_owner_exit && !supports_owned_termination()) {
+    dprintf(STDERR_FILENO, "Managed terminals require Linux pidfd_open and pidfd_send_signal support\n");
+    return utility_prelaunch_exit(69);
+  }
+  const char *handshake_path = argv[first];
   if (prctl(PR_SET_CHILD_SUBREAPER, 1) != 0) {
     dprintf(STDERR_FILENO, "Unable to claim provider descendants: %s\n", strerror(errno));
-    return 70;
+    return utility_prelaunch_exit(70);
   }
   struct sigaction action;
   memset(&action, 0, sizeof(action));
@@ -372,7 +456,7 @@ int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
   if (write_handshake(handshake_path, false, 0) != 0) {
     dprintf(STDERR_FILENO, "Unable to persist launch ownership: %s\n", strerror(errno));
-    return 73;
+    return utility_prelaunch_exit(73);
   }
 
   bool authorized = false;
@@ -389,7 +473,7 @@ int main(int argc, char **argv) {
 
   for (;;) {
     reap_children(provider_pid, &provider_reaped, &provider_status);
-    if (authorized && termination_requested && !stopping) {
+    if (authorized && (termination_requested || (stop_on_owner_exit && input_closed)) && !stopping) {
       stopping = true;
       stop_requested = true;
       teardown_deadline = monotonic_ms() + TEARDOWN_BUDGET_MS;
@@ -407,8 +491,14 @@ int main(int argc, char **argv) {
       }
       reap_children(provider_pid, &provider_reaped, &provider_status);
       snapshot = inspect_owned_tree(getpid(), provider_pid, true);
-      bool tree_empty = snapshot.complete ? snapshot.count == 0 : no_children_remaining();
+      // An adopted child can be a zombie while PID 1 is still reaping it.
+      // It cannot execute or retain a resource, but we must also know that
+      // no direct child remains before reporting native tree emptiness.
+      bool tree_empty = no_children_remaining()
+        && (snapshot.complete ? snapshot.live_count == 0 : true);
       if (provider_reaped && tree_empty) {
+        if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL)
+          dprintf(CONTROL_FD, "%s\n", UTILITY_TREE_EMPTY);
         unlink(handshake_path);
         if (stop_requested || termination_requested) _exit(137);
         exit_like_provider(provider_status);
@@ -416,6 +506,8 @@ int main(int argc, char **argv) {
     }
 
     if (!authorized && (termination_requested || input_closed)) {
+      if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL)
+        dprintf(CONTROL_FD, "%s\n", UTILITY_TREE_EMPTY);
       unlink(handshake_path);
       return 0;
     }
@@ -428,8 +520,9 @@ int main(int argc, char **argv) {
     struct pollfd descriptor = { .fd = STDIN_FILENO, .events = POLLIN | POLLHUP };
     int poll_result = poll(&descriptor, 1, 25);
     if (poll_result < 0 && errno != EINTR) {
-      if (!authorized) unlink(handshake_path);
-      return 74;
+      if (!authorized) { unlink(handshake_path); return utility_prelaunch_exit(74); }
+      termination_requested = 1;
+      continue;
     }
     if (poll_result <= 0) continue;
     if (descriptor.revents & POLLIN) {
@@ -445,9 +538,9 @@ int main(int argc, char **argv) {
           while (line_length > 0 && (line_start[line_length - 1] == '\r' || line_start[line_length - 1] == ' ' || line_start[line_length - 1] == '\t')) line_start[--line_length] = '\0';
           while (*line_start == ' ' || *line_start == '\t') line_start++;
           if (strcmp(line_start, "go") == 0 && !authorized) {
-            if (authorize_provider(&argv[2], handshake_path, &provider_pid) != 0) {
+            if (authorize_provider(&argv[first + 1], handshake_path, &provider_pid) != 0) {
               unlink(handshake_path);
-              return 75;
+              return utility_prelaunch_exit(75);
             }
             authorized = true;
             // Acknowledge only after the provider identity is durable and the
@@ -462,6 +555,8 @@ int main(int argc, char **argv) {
             }
           } else if (strcmp(line_start, "stop") == 0) {
             if (!authorized) {
+              if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL)
+                dprintf(CONTROL_FD, "%s\n", UTILITY_TREE_EMPTY);
               unlink(handshake_path);
               return 0;
             }
@@ -477,8 +572,10 @@ int main(int argc, char **argv) {
         memmove(input, line_start, remaining);
         input_length = remaining;
         if (input_length == sizeof(input) - 1) {
-          if (!authorized) unlink(handshake_path);
-          return 65;
+          if (!authorized) { unlink(handshake_path); return utility_prelaunch_exit(65); }
+          termination_requested = 1;
+          input_length = 0;
+          continue;
         }
       } else if (read_count == 0) {
         input_closed = true;

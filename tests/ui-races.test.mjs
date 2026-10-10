@@ -270,6 +270,26 @@ async function waitForJson(url, child, logs, diagnostic, deadline = Date.now() +
   throw new Error(`Timed out waiting for ${url}: ${diagnostic()}; output: ${logs()}`);
 }
 
+async function waitForDevToolsPort(profile, child, logs, diagnostic, deadline) {
+  const marker = path.join(profile, "DevToolsActivePort");
+  let lastMarker = "missing";
+  while (Date.now() < deadline) {
+    if (hasExited(child)) throw new Error(`Chrome exited before DevTools selected a port: ${diagnostic()}; output: ${logs()}`);
+    if (existsSync(marker)) {
+      try {
+        lastMarker = readFileSync(marker, "utf8").split(/\r?\n/, 1)[0];
+        const port = Number(lastMarker);
+        if (Number.isInteger(port) && port > 0 && port <= 65535) return port;
+      } catch (error) {
+        if (!["EPERM", "EACCES", "ENOENT"].includes(error?.code)) throw error;
+        lastMarker = error.code;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Timed out waiting for Chrome's DevTools port (marker=${lastMarker}): ${diagnostic()}; output: ${logs()}`);
+}
+
 function connectDevTools(url, handshakeTimeout = 10_000) {
   return new Promise((resolve, reject) => {
     // A responsive DevTools HTTP endpoint does not guarantee its WebSocket
@@ -327,16 +347,18 @@ async function closeDevTools(devtools) {
   if (devtools.socket.readyState !== WebSocket.CLOSED) devtools.socket.terminate();
 }
 
-async function waitForFixture(send, deadline) {
+async function waitForFixture(send, deadline, diagnostics = () => "") {
   let state;
   while (Date.now() < deadline) {
     let evaluated;
     try {
       evaluated = await send("Runtime.evaluate", {
-        expression: "({ title: document.title, text: document.getElementById('results')?.textContent ?? '', progress: window.__fixtureProgress && { ...window.__fixtureProgress, elapsedMs: Math.round(performance.now() - window.__fixtureStartedAt), stepElapsedMs: Math.round(performance.now() - window.__fixtureProgress.stepStartedAt) } })",
+        expression: "({ title: document.title, text: document.getElementById('results')?.textContent ?? '', progress: window.__fixtureProgress && { ...window.__fixtureProgress, elapsedMs: Math.round(performance.now() - window.__fixtureStartedAt), stepElapsedMs: Math.round(performance.now() - window.__fixtureProgress.stepStartedAt) }, timings: window.__fixtureTimings?.slice() })",
         returnByValue: true,
       });
-    } catch (error) { throw new Error(`${error.message}; ${fixtureProgress(state)}`, { cause: error }); }
+    } catch (error) {
+      throw new Error(`${error.message}; ${fixtureProgress(state)}; phaseRemaining=${deadline - Date.now()}ms; ${diagnostics()}`, { cause: error });
+    }
     const next = evaluated?.exceptionDetails ? null : evaluated?.result?.value;
     if (next && typeof next.title === "string") {
       state = next;
@@ -345,20 +367,25 @@ async function waitForFixture(send, deadline) {
     }
     await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(0, deadline - Date.now()))));
   }
-  throw new Error(`Interaction phase exceeded its pre-cleanup deadline: ${fixtureProgress(state)}; page=${state?.title ?? "unavailable"}; output=${state?.text?.slice(-1000) ?? "unavailable"}`);
+  throw new Error(`Interaction phase exceeded its pre-cleanup deadline: ${fixtureProgress(state)}; ${diagnostics()}; page=${state?.title ?? "unavailable"}; output=${state?.text?.slice(-1000) ?? "unavailable"}`);
 }
 
 function fixtureProgress(state) {
   const progress = state?.progress;
+  const timing = state?.timings?.length
+    ? `, recent=${JSON.stringify(state.timings.slice(-5))}, slowest=${JSON.stringify([...state.timings].sort((a, b) => b.ms - a.ms).slice(0, 5))}` : "";
   return progress
-    ? `${progress.completed}/${progress.total} complete, current step=${progress.step}, elapsed=${progress.elapsedMs}ms, step=${progress.stepElapsedMs}ms`
+    ? `${progress.completed}/${progress.total} complete, current step=${progress.step}, elapsed=${progress.elapsedMs}ms, step=${progress.stepElapsedMs}ms${timing}`
     : "fixture has not reported a step";
 }
 
 test("browser fixture polling reports its last step and preserves the phase deadline", { timeout: 5_000 }, async () => {
   const progress = { step: "terminal activation", completed: 7, total: 21, elapsedMs: 1234, stepElapsedMs: 250 };
-  const send = async () => ({ result: { value: { title: "Running", text: "Running interaction regressions", progress } } });
-  await assert.rejects(waitForFixture(send, Date.now() + 30), /7\/21 complete, current step=terminal activation, elapsed=1234ms/);
+  const timings = [{ step: "slow", ms: 900 }, { step: "fast", ms: 10 }];
+  const send = async () => ({ result: { value: { title: "Running", text: "Running interaction regressions", progress, timings } } });
+  await assert.rejects(waitForFixture(send, Date.now() + 30, () => "owner=responsive drawer"), (error) =>
+    /7\/21 complete, current step=terminal activation, elapsed=1234ms/.test(error.message)
+    && /recent=.*fast.*slowest=.*slow.*owner=responsive drawer/.test(error.message));
   let polls = 0;
   const completed = await waitForFixture(async () => {
     polls += 1;
@@ -376,6 +403,8 @@ test("browser fixture polling reports its last step and preserves the phase dead
   }, Date.now() + 1_000);
   assert.equal(recovered.title, "PASS");
   assert.equal(transientPolls, 4);
+  await assert.rejects(waitForFixture(async () => { throw new Error("DevTools detached"); }, Date.now() + 100,
+    () => "owner=browser fixture"), /DevTools detached; fixture has not reported a step; phaseRemaining=.*owner=browser fixture/);
   let missing = false;
   let missingPolls = 0;
   await assert.rejects(waitForFixture(async () => {
@@ -603,13 +632,16 @@ test("a vanished Windows launcher preserves verified descendants without adoptin
   assert.equal(launcher.ownedWindows.has(4103), false);
 });
 
-// The normal child has 180 seconds including its 155-second interaction phase
+// A measured full local run took 133.5 seconds; macOS CI reached 103/108 at
+// 148.4 seconds. Keep a finite phase with room for the final responsive and
+// recovery steps, while preserving their separate performance assertions.
+// The normal child has 235 seconds including its 210-second interaction phase
 // and cleanup. A focused 1000px full-span wheel fixture gets a larger finite
 // phase bound. The parent must outlive either child contract and reserve its
 // own tree/profile cleanup time.
 const smallWheelCap = Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) > 0
   && Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) <= 1000;
-const browserPhaseTimeout = smallWheelCap ? 330_000 : 155_000;
+const browserPhaseTimeout = smallWheelCap ? 330_000 : 210_000;
 const browserFixtureTimeout = browserPhaseTimeout + 25_000;
 const nestedStartupAllowance = 15_000;
 const nestedRunnerBudget = (childBudget, startupAllowance) => childBudget + startupAllowance;
@@ -682,7 +714,6 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     return duration;
   };
   const port = await unusedPort();
-  const debugPort = await unusedPort();
   const profile = process.env.OUTRIGHT_TEST_UI_PROFILE ?? mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
   const vite = spawn(process.execPath, [viteCli, "--config", "tests/vite.ui-races.config.mjs", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
     cwd: root,
@@ -706,6 +737,9 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     const executable = chromeExecutable();
     const launchedAt = new Date().toISOString();
     const browserLog = path.join(profile, "chrome.log");
+    // A caller-supplied profile can retain the previous launch's port. Only
+    // this launch may provide the marker consumed below.
+    rmSync(path.join(profile, "DevToolsActivePort"), { force: true });
     const logFd = openSync(browserLog, "w");
     try {
       browser = spawn(executable, [
@@ -716,7 +750,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       "--disable-gpu",
       "--no-default-browser-check",
       "--no-first-run",
-      `--remote-debugging-port=${debugPort}`,
+      "--remote-debugging-port=0",
       `--user-data-dir=${profile}`,
       "about:blank",
     ], {
@@ -746,7 +780,11 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       if (!browser.ownedWindows?.has(browser.pid)) throw new Error(`Cannot capture Chrome launch identity: ${diagnostic()}; output: ${logs()}`);
     }
     phase = "wait for Chrome DevTools HTTP";
-    await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, logs, diagnostic, Math.min(Date.now() + 45_000, deadline));
+    // A port released by unusedPort() can be claimed by another process before
+    // Chrome binds it, especially in the nested Windows cleanup fixture.
+    const devToolsDeadline = Math.min(Date.now() + 45_000, deadline);
+    const debugPort = await waitForDevToolsPort(profile, browser, logs, diagnostic, devToolsDeadline);
+    await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, logs, diagnostic, devToolsDeadline);
     snapshotWindowsTree(browser);
     phase = "create DevTools target";
     const targetResponse = await fetch(`http://127.0.0.1:${debugPort}/json/new?${encodeURIComponent("about:blank")}`, { method: "PUT", signal: AbortSignal.timeout(Math.min(10_000, remaining())) });
@@ -853,13 +891,19 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       if (viewportError) throw viewportError;
       if (pageErrors.length) throw new Error(`Uncaught browser error: ${pageErrors.join("; ")}`);
       return send(method, params);
-    }, deadline);
+    }, deadline, () => JSON.stringify({ vitePid: vite.pid, viteExit: vite.exitCode, viteSignal: vite.signalCode,
+      browserPid: browser?.pid, browserExit: browser?.exitCode, browserSignal: browser?.signalCode,
+      devtoolsReady: devtools?.socket.readyState, viteOutput: output.slice(-500) }));
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
     const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
-    assert.match(state.text, new RegExp(`${selectedCount ?? 94} interaction regressions passed`));
+    const expectedCount = selectedCount ?? 112;
+    const completedCount = Number(state.text.match(/(\d+) interaction regressions passed/)?.[1]);
+    assert.equal(completedCount, expectedCount,
+      `browser fixture completed ${completedCount || 0} of ${expectedCount} expected interactions; last step: ${state.progress?.step ?? "unknown"}`);
     const performanceFixture = state.text.match(/Performance fixture: (\{[^\n]+\})/);
     if (!process.env.OUTRIGHT_UI_STEP) assert.ok(performanceFixture, "large fixture measurements were not recorded");
     if (performanceFixture) console.log(`UI performance: ${performanceFixture[1]}`);
+    if (!process.env.OUTRIGHT_UI_STEP) console.log(`UI fixture timings: ${fixtureProgress(state)}`);
     if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
   } catch (error) {
     failure = new Error(`UI fixture ${phase}: ${error.message}`, { cause: error });

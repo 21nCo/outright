@@ -34,44 +34,61 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
     return () => { ++statusRequestRef.current; ++diffRequestRef.current; };
   }, [worktree.path]);
 
-  const loadDiff = useCallback(async (filePath, mode) => {
+  const loadDiff = useCallback(async (filePath, mode, reportError = true) => {
     const owner = ownerRef.current;
-    if (owner.path !== worktree.path) return;
+    if (owner.path !== worktree.path) return { kind: "stale" };
     const request = ++diffRequestRef.current;
     // A same-selection refresh retains the reader's line and find state.
     // A different file or mode owns different text, even on failure.
-    if (selectionRef.current.file !== filePath || selectionRef.current.mode !== mode) return;
-    if (!filePath) { setDiff(""); return; }
+    if (selectionRef.current.file !== filePath || selectionRef.current.mode !== mode) return { kind: "stale" };
+    if (!filePath) { setDiff(""); return { kind: "ok" }; }
     try {
       const next = await api(query("/api/git/diff", { path: worktree.path, file: filePath, staged: mode === "staged" }));
-      if (ownerRef.current === owner && request === diffRequestRef.current && selectionRef.current.file === filePath && selectionRef.current.mode === mode) setDiff(next.diff);
-    } catch (error) { if (ownerRef.current === owner && request === diffRequestRef.current && selectionRef.current.file === filePath && selectionRef.current.mode === mode) onError(error); }
+      if (ownerRef.current !== owner || request !== diffRequestRef.current || selectionRef.current.file !== filePath || selectionRef.current.mode !== mode) return { kind: "stale" };
+      setDiff(next.diff);
+      return { kind: "ok" };
+    } catch (error) {
+      if (ownerRef.current !== owner || request !== diffRequestRef.current || selectionRef.current.file !== filePath || selectionRef.current.mode !== mode) return { kind: "stale" };
+      if (reportError) onError(error);
+      return { kind: "error", error };
+    }
   }, [worktree.path, onError]);
 
-  const refresh = useCallback(async () => {
+  const applyStatusSelection = useCallback(async (next) => {
+    const selection = selectionRef.current;
+    const current = next.files.find((file) => file.path === selection.file);
+    const nextFile = current?.path ?? next.files[0]?.path ?? "";
+    const entry = current ?? next.files[0];
+    const mode = hasStaged(entry) ? selection.mode : "unstaged";
+    if (nextFile !== selection.file || mode !== selection.mode) setDiff("");
+    selectionRef.current = { file: nextFile, mode };
+    setSelectedFile(nextFile);
+    setViewMode(mode);
+    if (!nextFile) { ++diffRequestRef.current; setDiff(""); return { kind: "ok" }; }
+    return loadDiff(nextFile, mode, false);
+  }, [loadDiff]);
+
+  const refresh = useCallback(async (afterMutation = false) => {
     const owner = ownerRef.current;
-    if (owner.path !== worktree.path) return;
+    if (owner.path !== worktree.path) return { kind: "stale" };
     const request = ++statusRequestRef.current;
     setLoading(true);
     try {
       const next = await api(query("/api/git/status", { path: worktree.path }));
-      if (ownerRef.current !== owner || request !== statusRequestRef.current) return;
+      if (ownerRef.current !== owner || request !== statusRequestRef.current) return { kind: "stale" };
       setStatus(next);
-      const selection = selectionRef.current;
-      const current = next.files.find((file) => file.path === selection.file);
-      const nextFile = current?.path ?? next.files[0]?.path ?? "";
-      const entry = current ?? next.files[0];
-      const mode = hasStaged(entry) ? selection.mode : "unstaged";
-      if (nextFile !== selection.file || mode !== selection.mode) setDiff("");
-      selectionRef.current = { file: nextFile, mode };
-      setSelectedFile(nextFile);
-      setViewMode(mode);
-      if (nextFile) {
-        await loadDiff(nextFile, mode);
-      } else { ++diffRequestRef.current; setDiff(""); }
-    } catch (error) { if (ownerRef.current === owner && request === statusRequestRef.current) onError(error); }
+      const diffResult = await applyStatusSelection(next);
+      if (diffResult.kind === "stale") return diffResult;
+      if (diffResult.kind === "error") throw diffResult.error;
+      return { kind: "ok" };
+    } catch (error) {
+      if (ownerRef.current !== owner || request !== statusRequestRef.current) return { kind: "stale" };
+      if (afterMutation && error.status === 429) return { kind: "capacity" };
+      onError(error);
+      return { kind: "error" };
+    }
     finally { if (ownerRef.current === owner && request === statusRequestRef.current) setLoading(false); }
-  }, [worktree.path, loadDiff, onError]);
+  }, [worktree.path, applyStatusSelection, onError]);
 
   useLayoutEffect(() => { refreshRef.current = refresh; }, [refresh]);
   useEffect(() => { refreshRef.current(); }, [worktree.path]);
@@ -97,7 +114,10 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
     const path = worktree.path;
     try {
       await api(endpoint, { method: "POST", body: { path, files } });
-      if (ownerRef.current === owner) await refresh();
+      if (ownerRef.current === owner) {
+        const refreshed = await refresh(true);
+        if (ownerRef.current === owner && refreshed.kind === "capacity") onToast("Change saved; refresh when utility capacity is available");
+      }
     } catch (error) { if (ownerRef.current === owner) onError(error); }
   }
   async function commit() {
@@ -106,7 +126,10 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
     try {
       await api("/api/git/commit", { method: "POST", body: { path, message: commitMessage } });
       if (ownerRef.current !== owner) return;
-      setCommitMessage(""); onToast("Commit created"); await refresh();
+      setCommitMessage("");
+      const refreshed = await refresh(true);
+      if (ownerRef.current === owner && refreshed.kind === "ok") onToast("Commit created");
+      if (ownerRef.current === owner && refreshed.kind === "capacity") onToast("Commit created; refresh when utility capacity is available");
     } catch (error) { if (ownerRef.current === owner) onError(error); }
   }
 
@@ -114,7 +137,7 @@ export function ChangesPane({ worktree, runtimeEvent, settings, onError, onToast
   const stagedEligible = hasStaged(selected);
 
   return <section className="changes-pane">
-    <header className="pane-toolbar"><div><strong>{status?.branch || worktree.branch}</strong><span>{status?.files.length ?? 0} changed files</span></div><Button variant="ghost" size="icon-sm" onClick={refresh} aria-label="Refresh changes"><ArrowsClockwise className={loading ? "spin" : ""} /></Button></header>
+    <header className="pane-toolbar"><div><strong>{status?.branch || worktree.branch}</strong><span>{status?.files.length ?? 0} changed files</span></div><Button variant="ghost" size="icon-sm" onClick={() => refresh()} aria-label="Refresh changes"><ArrowsClockwise className={loading ? "spin" : ""} /></Button></header>
     <div className="changes-layout">
       <div className="changed-files" aria-busy={loading}>
         {status && !status.files.length && <div className="clean-state" role="status"><Check />Working tree is clean</div>}

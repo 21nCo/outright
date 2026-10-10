@@ -72,7 +72,11 @@ test("Windows launcher removes owned helpers before exit after success, failure,
       const status = await Promise.race([closed, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Windows launcher hung: ${output}`)), 12000); })])
         .finally(() => clearTimeout(timer));
       assert.equal(status, outcome === "success" ? 0 : outcome === "cancel" ? 143 : 1, output);
-      if (outcome === "timeout") assert.match(output, /Test suite timed out after 8000ms/);
+      if (outcome === "timeout") {
+        assert.match(output, /Test suite timed out after 8000ms/);
+        assert.match(output, /file=owned\.test\.mjs fileElapsedMs=\d+ runner=\d+/,
+          "the deadline did not identify its owned file and runner");
+      }
       assert.notEqual(windowsProcessIdentity(pid)?.CreatedMs, identity.CreatedMs,
         `Owned helper was active when the launcher exited after ${outcome}: ${output}`);
     } finally {

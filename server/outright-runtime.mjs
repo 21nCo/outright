@@ -10,44 +10,246 @@ import { AGENT_SUPERVISOR, createAgentManager, defaultGroupMembers, hardenWindow
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
+import { utilityProcesses } from "./subprocess-budget.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
+import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000 }) {
+function throwFailedRuntimeStartup(error, { eventHub, wss, database }) {
+  // The constructor has not admitted an agent or PTY. Stop startup-owned
+  // managers and release the physical lease before reporting its failure.
+  const cleanupErrors = [];
+  try { eventHub?.shutdown(); } catch (error_) { cleanupErrors.push(error_); }
+  try { wss?.close(); } catch (error_) { cleanupErrors.push(error_); }
+  try { database.closeFailedStartup(); }
+  catch (error_) { cleanupErrors.push(error_); }
+  if (cleanupErrors.length) throw new AggregateError([error, ...cleanupErrors], "Runtime startup and cleanup failed");
+  throw error;
+}
+
+// Interrupted-run reconciliation retries busy, locked, I/O and capacity
+// faults on a bounded schedule. Anything else, or an exhausted schedule, is a
+// failed recovery that a later bootstrap request may explicitly restart.
+const RUN_RECOVERY_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000];
+const RUN_RECOVERY_RESTART_COOLDOWN_MS = 1000;
+const UTILITY_OWNER_RELEASE_ROUTE = /^\/api\/capacity\/utility-owners\/([0-9a-f-]{36})\/release$/;
+
+function transientRunRecoveryFailure(error) {
+  return error?.statusCode === 503 || error?.statusCode === 507
+    || /^(?:SQLITE_(?:BUSY|LOCKED|IOERR|FULL)(?:_|$)|E(?:IO|AGAIN|BUSY|NFILE|MFILE|STALE|NOSPC)$)/.test(error?.code ?? "");
+}
+
+function abortableDelay(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal.aborted) { resolve(false); return; }
+    const done = () => { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(!signal.aborted); };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, databaseFactory = createOutrightDatabase, agentManagerFactory = createAgentManager, hardenLaunchDirectory = process.platform === "win32" ? hardenWindowsLaunchDirectory : () => {}, terminalManagerFactory = createTerminalManager } = {}) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
-  const database = createOutrightDatabase({ runtimeLease: true });
+  let agents;
+  let terminals;
+  let publish;
+  let runtimeCapacity;
+  let shuttingDown = false;
+  // One owner for interrupted-run recovery. Queued work resumes only after a
+  // reconciliation completes; every other phase defers the wakeup until then.
+  // Progress accumulates every committed batch across the initial cycle,
+  // transient retries and operator-restarted cycles.
+  const runRecovery = { phase: "pending", error: null, failedAt: 0, resumeDeferred: false, cycle: Promise.resolve(),
+    progress: { count: 0, counts: {} } };
+  const runRecoveryController = new AbortController();
+  function resumeQueuedAfterRecovery() {
+    if (runRecovery.phase !== "complete") { runRecovery.resumeDeferred = true; return; }
+    if (!shuttingDown) agents.resumeQueued();
+  }
+  const database = databaseFactory({ runtimeLease: true, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, onMigrationComplete: () => {
+    resumeQueuedAfterRecovery();
+    publish({ type: "capacity.changed", payload: runtimeCapacity() });
+  }, onDeletionWorkerStart: () => {
+    publish({ type: "capacity.changed", payload: runtimeCapacity() });
+  }, onDeletionWorkerExit: () => {
+    resumeQueuedAfterRecovery();
+    publish({ type: "capacity.changed", payload: runtimeCapacity() });
+  }, onTerminalAuditReconciled: () => {
+    if (shuttingDown || !terminals) return;
+    terminals.reloadUnknownReservations();
+    void terminals.reconcileUnknown().then(() => {
+      if (!shuttingDown) publish({ type: "capacity.changed", payload: runtimeCapacity() });
+    })
+      .catch((error) => { if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:terminal-recovery]", error); });
+  }, onTerminalAuditError: (error) => {
+    if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:terminal-audit]", error);
+  } });
+  let eventHub;
+  let wss;
+  try {
   // Completion markers are trusted recovery evidence. Secure their directory
   // before reconciliation reads any record, rather than waiting for the agent
   // manager to initialize after recovery has already classified pending rows.
-  if (process.platform === "win32") hardenWindowsLaunchDirectory(database.launchDirectory);
-  const reconciliation = database.reconcileInterruptedRuns({
+  hardenLaunchDirectory(database.launchDirectory);
+  database.reconcilePendingRetentionCleanup();
+  database.reconcileTerminalAudit();
+  const reconcileInterruptedRuns = () => database.reconcileInterruptedRuns({ yieldBetweenBatches: true,
+    signal: runRecoveryController.signal, progress: runRecovery.progress,
     probeAlive: (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync),
   });
-  if (reconciliation.count) database.audit("runtime.runs.reconciled", { target: "runtime", ...reconciliation });
-  const eventHub = createRuntimeEventHub();
+  // The first bounded batch commits during construction, before any request
+  // or terminal recovery can observe the previous runtime's pending rows.
+  const reconciliation = reconcileInterruptedRuns();
+  void Promise.resolve(reconciliation).catch(() => {});
+  eventHub = createRuntimeEventHub();
   const runtimeInstanceId = randomUUID();
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024 });
+  wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024 });
   let latestScan = null;
   let latestScanAt = 0;
   let inFlightScan = null;
   let watcher = null;
   let watcherTimer = null;
-  let shuttingDown = false;
   let shutdownPromise;
+  let resolveShutdownCompletion;
+  let rejectShutdownCompletion;
+  const shutdownCompletion = new Promise((resolve, reject) => {
+    resolveShutdownCompletion = resolve;
+    rejectShutdownCompletion = reject;
+  });
+  // Shutdown can finish before a host asks for its completion signal.
+  void shutdownCompletion.catch(() => {});
 
-  function publish(event) {
+  publish = function publish(event) {
     return eventHub.publish(event);
-  }
+  };
 
-  const agents = createAgentManager({ database, publish, onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }), validateConversation: async (conversation) => {
+  terminals = terminalManagerFactory({ database, publish, subprocesses });
+  const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl), subprocesses });
+  runtimeCapacity = function runtimeCapacity() {
+    const capacity = database.capacity();
+    return { ...capacity, activeProcesses: agents?.activeProcessCount() ?? 0,
+      runRecoveryPending: runRecovery.phase === "pending" || runRecovery.phase === "retrying",
+      runRecoveryPhase: runRecovery.phase, runRecoveryError: runRecovery.error?.message ?? null,
+      pendingRunOutcomes: agents?.pendingOutcomeCount() ?? 0,
+      limits: { ...capacity.limits, maxPendingRunOutcomes: RESOURCE_BUDGETS.maxPendingRunOutcomes },
+      utilityProcesses: subprocesses.capacity(), utilityOwners: subprocesses.unknownOwnerStatus?.() ?? [],
+      terminalProcesses: terminals.capacity() };
+  };
+  // Construct the agent manager after the remaining synchronous startup
+  // checks. No provider discovery owner then needs asynchronous teardown on
+  // a failed synchronous constructor path.
+  agents = agentManagerFactory({ database, publish,
+    onShutdownRecovery: () => {
+      // The first shutdown may have failed while both SQLite and its outcome
+      // journal refused writes. Once an exited result commits, resume the
+      // finalizer without asking Vite or a signal handler to call it again.
+      if (shuttingDown) {
+        // A recovery callback may arrive before the first shutdown promise
+        // rejects and releases its retry owner. Join it, then retry once.
+        void Promise.resolve(shutdownPromise).catch(() => {}).then(() => shutdown())
+          .catch((error) => console.error("Runtime shutdown recovery failed", error));
+      }
+    },
+    onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }), validateConversation: async (conversation) => {
     const target = await resolveWorktreeTarget(conversation);
     return () => {
       if (database.getConversation(conversation.id)?.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
       if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required");
     };
   } });
-  const terminals = createTerminalManager({ database, publish });
-  const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl) });
+  function completeRunRecovery() {
+    runRecovery.phase = "complete";
+    runRecovery.error = null;
+    if (shuttingDown) return;
+    // Every attempt's committed rows belong to this one recovery, even when
+    // the final attempt found none. The summary audit is telemetry and cannot
+    // turn that durable recovery into a failed runtime.
+    const { count, counts } = runRecovery.progress;
+    if (count) {
+      try { database.audit("runtime.runs.reconciled", { target: "runtime", count, counts: { ...counts } }); }
+      catch (error) { if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:run-recovery-audit]", error); }
+    }
+    if (count || runRecovery.resumeDeferred) {
+      runRecovery.resumeDeferred = false;
+      agents.resumeQueued();
+    }
+    publish({ type: "capacity.changed", payload: runtimeCapacity() });
+  }
+
+  // Returns the retry delay, or undefined once recovery has failed.
+  function recordRunRecoveryFailure(error, attempt) {
+    runRecovery.error = error;
+    if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:run-recovery]", error);
+    const delay = transientRunRecoveryFailure(error) ? RUN_RECOVERY_RETRY_DELAYS_MS[attempt] : undefined;
+    runRecovery.phase = delay === undefined ? "failed" : "retrying";
+    if (delay === undefined) runRecovery.failedAt = Date.now();
+    // The same storage fault may refuse the capacity read. It cannot cancel
+    // the scheduled retry that owns this recovery.
+    try { publish({ type: "capacity.changed", payload: runtimeCapacity() }); }
+    catch (error_) { if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:run-recovery-capacity]", error_); }
+    return delay;
+  }
+
+  async function recoverInterruptedRuns(firstAttempt) {
+    const { signal } = runRecoveryController;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        // Each retry depends on the previous attempt's committed batches.
+        await (attempt === 0 ? firstAttempt : reconcileInterruptedRuns());
+      } catch (error) {
+        if (shuttingDown || signal.aborted) return;
+        const delay = recordRunRecoveryFailure(error, attempt);
+        if (delay === undefined || !await abortableDelay(delay, signal)) return;
+        continue;
+      }
+      completeRunRecovery();
+      return;
+    }
+  }
+
+  function startRunRecoveryCycle(firstAttempt) {
+    // A queued-run wakeup failure after completion belongs to the agent
+    // manager; it cannot reopen recovery or reject shutdown's join.
+    runRecovery.cycle = recoverInterruptedRuns(firstAttempt).catch((error) => {
+      if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:run-recovery-resume]", error);
+    });
+  }
+
+  // A failed recovery keeps refusing work. An operator bootstrap retry starts
+  // one new bounded cycle instead of requiring a runtime restart.
+  function restartFailedRunRecovery() {
+    if (runRecovery.phase !== "failed" || shuttingDown
+      || Date.now() - runRecovery.failedAt < RUN_RECOVERY_RESTART_COOLDOWN_MS) return false;
+    runRecovery.phase = "retrying";
+    startRunRecoveryCycle(Promise.resolve().then(reconcileInterruptedRuns));
+    return true;
+  }
+
+  startRunRecoveryCycle(reconciliation);
+
+  function assertRunRecoveryComplete(url, request) {
+    if (runRecovery.phase === "complete") return;
+    const restarted = url.pathname === "/api/bootstrap" && request.method === "GET" && restartFailedRunRecovery();
+    const failed = runRecovery.phase === "failed" && !restarted;
+    throw apiError(503, failed ? `Run recovery failed: ${runRecovery.error?.message ?? runRecovery.error}`
+      : "Run recovery is reconciling interrupted work; retry shortly",
+    { code: failed ? "RUN_RECOVERY_FAILED" : "RUN_RECOVERY_TRANSIENT" });
+  }
+  function startOwnershipRecovery() {
+    const onRecovered = (resolved) => {
+      if (resolved && !shuttingDown) publish({ type: "capacity.changed", payload: runtimeCapacity() });
+    };
+    void terminals.reconcileUnknown().then(onRecovered).catch(() => {});
+    if (typeof subprocesses.reconcileUnknown === "function") {
+      void Promise.resolve().then(() => subprocesses.reconcileUnknown()).then(async (resolved) => {
+        onRecovered(resolved);
+        // A terminal proof may have been refused only because utility owners
+        // occupied every helper slot. Retry it after capacity is reclaimed.
+        if (resolved && !shuttingDown) await terminals.reconcileUnknown();
+      }).catch(() => {});
+    }
+  }
+  startOwnershipRecovery();
 
   // Validates that a project/worktree/path triple names exactly one discovered
   // worktree belonging to that project. Trust and execution then bind to the
@@ -66,7 +268,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     if (!force && latestScan && timestamp - latestScanAt < 1500) return latestScan;
     if (!inFlightScan) {
       inFlightScan = loadOutrightConfig(configUrl)
-        .then(scanProjects)
+        .then((config) => scanProjects(config, subprocesses))
         .then(async (result) => {
           latestScan = result;
           latestScanAt = Date.now();
@@ -77,6 +279,19 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         .finally(() => { inFlightScan = null; });
     }
     return inFlightScan;
+  }
+
+  async function refreshProjectsAfterMutation(result) {
+    try {
+      await projects(true);
+      publish({ type: "projects.changed", payload: latestScan });
+      return result;
+    } catch {
+      // The Git effect and its audit outcome have already committed. A scan
+      // failure cannot turn that success into a retryable failure.
+      latestScanAt = 0;
+      return { ...result, refreshDeferred: true };
+    }
   }
 
   async function refreshWatcher(projectList) {
@@ -106,13 +321,35 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   }
 
   function ensureDefaultGroups(projectList) {
-    const current = database.listGroups();
-    if (current.groups.length) return;
-    const core = database.createGroup("Core systems");
-    const experiments = database.createGroup("Experiments");
-    for (const project of projectList) {
-      database.setProjectGroup(project.id, /experiment|prototype|playground/i.test(`${project.name} ${project.path}`) ? experiments.id : core.id);
+    try {
+      database.ensureDefaultGroups(projectList);
+    } catch (error) {
+      // An over-quota legacy database still needs bootstrap and retention UI.
+      // The next scan can finish creating defaults once space is reclaimed.
+      if (error.statusCode !== 507) throw error;
     }
+  }
+
+  function editRetainedData(edit) {
+    const launchable = database.canLaunchRun();
+    const result = edit();
+    if (!launchable && database.canLaunchRun()) agents.resumeQueued();
+    return result;
+  }
+
+  // An operator release re-proves the owner and frees it only on positive
+  // whole-tree evidence, durably audited first; a refused audit or missing
+  // evidence keeps the capacity charged.
+  async function releaseUtilityOwner(id) {
+    if (typeof subprocesses.releaseUnknownOwner !== "function") throw apiError(404, "Unknown utility owner was not found");
+    const released = await subprocesses.releaseUnknownOwner(id, {
+      audit: (outcome) => database.auditRequired("utility.owner.released", { target: outcome.id, proven: outcome.proven,
+        reason: outcome.reason, platform: outcome.platform, recordedAt: outcome.recordedAt }),
+    });
+    publish({ type: "capacity.changed", payload: runtimeCapacity() });
+    // A terminal proof may have waited only for this helper slot.
+    if (!shuttingDown) void terminals.reconcileUnknown().catch(() => {});
+    return { released, capacity: runtimeCapacity() };
   }
 
   async function handleRequest(request, response) {
@@ -121,6 +358,16 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     try {
       assertRuntimeRequest(request, allowedHosts);
       if (shuttingDown) throw apiError(503, "Runtime is shutting down");
+      // A zero-row reconciliation resolves in the constructor's next
+      // microtask. Let that settle before classifying a new request as busy.
+      if (runRecovery.phase === "pending") await Promise.resolve();
+      if (url.pathname !== "/api/capacity") assertRunRecoveryComplete(url, request);
+      if (database.maintenanceActive && url.pathname !== "/api/capacity") {
+        const failure = database.capacity().maintenanceError;
+        throw apiError(503, failure ? `Archive maintenance recovery failed: ${failure}`
+          : "Archive maintenance is running; retry shortly",
+        { code: failure ? "ARCHIVE_MAINTENANCE_FAILED" : "ARCHIVE_MAINTENANCE_TRANSIENT" });
+      }
       if (url.pathname === "/api/bootstrap" && request.method === "GET") {
         const scan = await projects();
         return json(response, 200, {
@@ -132,12 +379,51 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           templates: database.listTemplates(),
           terminals: terminals.list(),
           activeRuns: agents.activeRuns(),
+          capacity: runtimeCapacity(),
         });
       }
       if (url.pathname === "/api/projects" && ["GET", "POST"].includes(request.method)) return json(response, 200, await projects(request.method === "POST"));
       if (url.pathname === "/api/providers" && request.method === "GET") return json(response, 200, { providers: agents.providers() });
       if (url.pathname === "/api/settings" && request.method === "GET") return json(response, 200, database.getSettings());
-      if (url.pathname === "/api/settings" && request.method === "PATCH") return json(response, 200, database.updateSettings(await readJson(request)));
+      if (url.pathname === "/api/settings" && request.method === "PATCH") {
+        const settings = database.updateSettings(await readJson(request));
+        agents.resumeQueued();
+        publish({ type: "capacity.changed", payload: runtimeCapacity() });
+        return json(response, 200, settings);
+      }
+      if (url.pathname === "/api/capacity" && request.method === "GET") return json(response, 200, runtimeCapacity());
+      const utilityOwnerMatch = UTILITY_OWNER_RELEASE_ROUTE.exec(url.pathname);
+      if (utilityOwnerMatch && request.method === "POST") return json(response, 200, await releaseUtilityOwner(utilityOwnerMatch[1]));
+      if (url.pathname === "/api/retention/archived" && request.method === "GET") {
+        const limitText = url.searchParams.get("limit");
+        const limit = limitText === null ? 100 : Number(limitText);
+        return json(response, 200, database.listDeletableArchivedConversations({ limit, cursor: url.searchParams.get("cursor") }));
+      }
+      if (url.pathname === "/api/retention/delete-archived" && request.method === "POST") {
+        const body = await readJson(request);
+        if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Retention request must be a JSON object");
+        const result = await database.deleteArchivedConversation(body.id, body.confirmation);
+        agents.resumeQueued();
+        return json(response, result.deferred ? 202 : 200, { deleted: result.deleted, deferred: Boolean(result.deferred), capacity: runtimeCapacity() });
+      }
+      if (url.pathname === "/api/retention/cleanup" && request.method === "POST") {
+        const body = await readJson(request);
+        if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Retention request must be a JSON object");
+        const cutoff = database.validateRetentionCutoff(body.before);
+        const operationId = randomUUID();
+        await database.auditRetentionCleanupRequested({ operationId, before: cutoff });
+        let result;
+        try {
+          result = await database.pruneHistory({ before: cutoff, limit: 100 });
+        } catch (error) {
+          await database.auditRequired("retention.cleanup.unknown", { operationId, before: cutoff,
+            reason: "cleanup failed after admission", error: error.message });
+          throw error;
+        }
+        await database.auditRequired("retention.cleaned", { operationId, deleted: result.deleted, deferred: result.deferred, before: cutoff });
+        agents.resumeQueued();
+        return json(response, 200, { deleted: result.deleted, deferred: result.deferred, capacity: runtimeCapacity() });
+      }
 
       if (url.pathname === "/api/groups" && request.method === "GET") return json(response, 200, database.listGroups());
       if (url.pathname === "/api/groups" && request.method === "POST") {
@@ -146,10 +432,21 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         return json(response, 201, database.createGroup(body.name));
       }
       const groupMatch = url.pathname.match(/^\/api\/groups\/([^/]+)$/);
-      if (groupMatch && request.method === "PATCH") return json(response, 200, database.updateGroup(groupMatch[1], await readJson(request)));
-      if (groupMatch && request.method === "DELETE") return json(response, database.deleteGroup(groupMatch[1]) ? 204 : 404, null);
+      if (groupMatch && request.method === "PATCH") {
+        const patch = await readJson(request);
+        const group = editRetainedData(() => database.updateGroup(groupMatch[1], patch));
+        return json(response, 200, group);
+      }
+      if (groupMatch && request.method === "DELETE") {
+        const deleted = database.deleteGroup(groupMatch[1]);
+        if (deleted) agents.resumeQueued();
+        return json(response, deleted ? 204 : 404, null);
+      }
       if (url.pathname === "/api/project-memberships" && request.method === "PUT") {
-        const body = await readJson(request); database.setProjectGroup(body.projectId, body.groupId); return json(response, 200, database.listGroups());
+        const body = await readJson(request);
+        database.setProjectGroup(body.projectId, body.groupId);
+        if (!body.groupId) agents.resumeQueued();
+        return json(response, 200, database.listGroups());
       }
 
       if (url.pathname === "/api/conversations" && request.method === "GET") return json(response, 200, { conversations: database.listConversations({ projectId: url.searchParams.get("projectId"), worktreeId: url.searchParams.get("worktreeId"), archived: url.searchParams.get("archived") === "true" }) });
@@ -172,7 +469,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           ...conversation,
           messages: messagePage.messages,
           messagePage: messagePage.page,
-          runs: database.listRuns(conversation.id),
+          runs: database.listRuns(conversation.id).map((run) => ({
+            ...run, outcomePending: agents.isOutcomePending(run.id),
+          })),
           oldestInterruptedRun: database.findUnresolvedInterruptedRun(conversation.id) ?? null,
           worktreeInterruptedRun,
           recoveryConversation: recoveryConversation ? {
@@ -188,7 +487,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         });
       }
       if (conversationMatch && request.method === "PATCH") {
-        const conversation = database.updateConversation(conversationMatch[1], await readJson(request));
+        const patch = await readJson(request);
+        const conversation = editRetainedData(() => database.updateConversation(conversationMatch[1], patch));
         publish({ type: "conversation.updated", conversationId: conversationMatch[1], payload: conversation });
         return json(response, conversation ? 200 : 404, conversation);
       }
@@ -270,7 +570,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           throw apiError(409, "Resolve the interrupted run before moving this conversation away from its recovery worktree", { code: "RUN_RECOVERY_REQUIRED" });
         }
         const { worktreePath: destinationPath } = await resolveWorktreeTarget(body);
-        const conversation = database.moveConversation(conversationMoveMatch[1], { projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath });
+        const conversation = editRetainedData(() => database.moveConversation(conversationMoveMatch[1],
+          { projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath }));
         database.audit("conversation.moved", { target: conversation.id, projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath });
         publish({ type: "conversation.updated", conversationId: conversation.id, payload: conversation });
         return json(response, 200, conversation);
@@ -304,15 +605,15 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         }
         const currentInterrupted = database.findUnresolvedInterruptedRunForWorktree(conversation.worktreePath);
         if (currentInterrupted) throw apiError(409, "Resolve the interrupted run before starting more agent work", { code: "RUN_RECOVERY_REQUIRED", runId: currentInterrupted.id });
-        const userMessage = database.addMessage({ conversationId: conversation.id, role: "user", kind: "text", body: prompt });
+        const { run, message: userMessage } = database.submitRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, provider, model: body.model ?? conversation.model ?? settings.model, reasoningEffort: body.reasoningEffort || settings.reasoningEffort, approvalPolicy: body.approvalPolicy || settings.approvalPolicy, prompt }, prompt);
         publish({ type: "message.created", conversationId: conversation.id, payload: userMessage });
-        const run = database.createRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, provider, model: body.model ?? conversation.model ?? settings.model, reasoningEffort: body.reasoningEffort || settings.reasoningEffort, approvalPolicy: body.approvalPolicy || settings.approvalPolicy, prompt });
         return json(response, 202, await agents.schedule({ conversation: database.getConversation(conversation.id), run }));
       }
       const runMatch = url.pathname.match(/^\/api\/runs\/([^/]+)$/);
       if (runMatch && request.method === "GET") {
         const run = database.getRun(runMatch[1]);
-        return json(response, run ? 200 : 404, run ? { ...run, events: database.listRunEvents(run.id, Number(url.searchParams.get("after") ?? 0)) } : { error: "Run not found" });
+        if (!run || !database.getConversation(run.conversationId)) return json(response, 404, { error: "Run not found" });
+        return json(response, 200, { ...run, events: database.listRunEvents(run.id, Number(url.searchParams.get("after") ?? 0)) });
       }
       const stopRunMatch = url.pathname.match(/^\/api\/runs\/([^/]+)\/stop$/);
       if (stopRunMatch && request.method === "POST") { const stopped = await agents.stop(stopRunMatch[1]); return json(response, stopped ? 202 : 404, { stopped }); }
@@ -321,6 +622,12 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         let interrupted = database.getRun(resumeRunMatch[1]);
         if (!interrupted) throw apiError(404, "Run not found");
         if (interrupted.status !== "interrupted" || interrupted.recoveryDecision) throw apiError(409, "Run is not waiting for a recovery decision");
+        const replayed = database.retryUnreadableRunOutcome(interrupted.id);
+        if (replayed?.status !== undefined && replayed.status !== "interrupted") {
+          publish({ type: "run.resolved", conversationId: replayed.conversationId, runId: replayed.id, payload: replayed });
+          return json(response, 200, replayed);
+        }
+        if (replayed) interrupted = replayed;
         const body = await readJson(request);
         const policy = body.policy;
         if (!["discard", "discard-unverifiable", "resume-session", "retry"].includes(policy)) throw apiError(400, "Recovery policy must be discard, discard-unverifiable, resume-session, or retry");
@@ -348,7 +655,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           if (body.confirmation !== interrupted.id) throw apiError(400, "Exact run id confirmation is required for unverifiable legacy cleanup", { code: "RECOVERY_CONFIRMATION_REQUIRED", runId: interrupted.id });
           const resolved = database.resolveInterruptedRun(interrupted.id, policy);
           if (!resolved) throw apiError(409, "Run is not waiting for a recovery decision");
-          database.audit("agent.run.recovery.discard-unverifiable", { target: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
           publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: resolved });
           return json(response, 200, resolved);
         }
@@ -369,7 +675,13 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         // a recorded discard would clear the submission gate and let a new run
         // start while the original descendants may still mutate the same
         // worktree.
-        for (const pending of database.listUnresolvedInterruptedRunsForWorktree(interrupted.worktreePath)) {
+        for (let pending of database.listUnresolvedInterruptedRunsForWorktree(interrupted.worktreePath)) {
+          const siblingReplay = database.retryUnreadableRunOutcome(pending.id);
+          if (siblingReplay?.status !== undefined && siblingReplay.status !== "interrupted") {
+            publish({ type: "run.resolved", conversationId: siblingReplay.conversationId, runId: siblingReplay.id, payload: siblingReplay });
+            continue;
+          }
+          if (siblingReplay) pending = siblingReplay;
           // Both classes are durable proofs made during restart reconciliation.
           // Re-probing an exited row later would let an unrelated process that
           // reused the PID turn a settled fact back into an unknown/alive gate.
@@ -432,7 +744,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (policy === "discard") {
           const resolved = database.resolveInterruptedRun(interrupted.id, policy);
           if (!resolved) throw apiError(409, "Run is not waiting for a recovery decision");
-          database.audit("agent.run.recovery.discard", { target: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
           publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: resolved });
           return json(response, 200, resolved);
         }
@@ -482,7 +793,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         }
         const recovery = database.beginInterruptedRunRecovery(interrupted.id, policy, { providerSessionId: sessionId });
         if (!recovery) throw apiError(409, "Run is not waiting for a recovery decision");
-        database.audit(`agent.run.recovery.${policy}`, { target: recovery.run.id, recoveredFrom: interrupted.id, conversationId: conversation.id, recoveryClass: interrupted.recoveryClass });
         publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: recovery.interrupted });
         return json(response, 202, await agents.schedule({
           conversation: recovery.conversation,
@@ -496,16 +806,32 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const body = await readJson(request);
         const project = (await projects()).projects.find((item) => item.id === body.projectId && item.path === body.projectPath);
         if (!project || body.confirmation !== project.path) throw apiError(400, "Exact project path confirmation is required");
-        database.trustProject(project.id, project.path); database.audit("project.trusted", { target: project.id, path: project.path });
+        database.trustProject(project.id, project.path);
         return json(response, 200, { trusted: true, projectId: project.id });
       }
-      if (url.pathname === "/api/trust" && request.method === "DELETE") { const body = await readJson(request); database.untrustProject(body.projectId); return json(response, 200, { trusted: false }); }
+      if (url.pathname === "/api/trust" && request.method === "DELETE") {
+        const body = await readJson(request);
+        database.untrustProject(body.projectId);
+        agents.resumeQueued();
+        return json(response, 200, { trusted: false });
+      }
 
       if (url.pathname === "/api/terminals" && request.method === "GET") return json(response, 200, { terminals: terminals.list() });
-      if (url.pathname === "/api/terminals" && request.method === "POST") { const body = await readJson(request); await projects(); const cwd = await git.requireWorktree(body.cwd); return json(response, 201, terminals.create({ ...body, cwd })); }
+      if (url.pathname === "/api/terminals" && request.method === "POST") {
+        const body = await readJson(request);
+        if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.cwd !== "string" || !body.cwd
+          || (body.name !== undefined && (typeof body.name !== "string" || body.name.length > 200))
+          || (body.cols !== undefined && (!Number.isInteger(body.cols) || body.cols < 20 || body.cols > 400))
+          || (body.rows !== undefined && (!Number.isInteger(body.rows) || body.rows < 5 || body.rows > 200))) {
+          throw apiError(400, "Terminal path, name, or dimensions are invalid");
+        }
+        await projects();
+        const cwd = await git.requireWorktree(body.cwd);
+        return json(response, 201, await terminals.create({ ...body, cwd }));
+      }
       const terminalMatch = url.pathname.match(/^\/api\/terminals\/([^/]+)$/);
       if (terminalMatch && request.method === "GET") { const terminal = terminals.get(terminalMatch[1]); return json(response, terminal ? 200 : 404, terminal ?? { error: "Terminal not found" }); }
-      if (terminalMatch && request.method === "DELETE") return json(response, terminals.close(terminalMatch[1]) ? 204 : 404, null);
+      if (terminalMatch && request.method === "DELETE") return json(response, await terminals.close(terminalMatch[1]) ? 204 : 404, null);
 
       if (url.pathname === "/api/git/status" && request.method === "GET") return json(response, 200, await git.status(requiredQuery(url, "path")));
       if (url.pathname === "/api/git/diff" && request.method === "GET") return json(response, 200, await git.diff(requiredQuery(url, "path"), url.searchParams.get("file"), url.searchParams.get("staged") === "true"));
@@ -515,18 +841,30 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/context" && request.method === "GET") return json(response, 200, await git.context(requiredQuery(url, "path")));
       if (url.pathname === "/api/editor/open" && request.method === "POST") { const body = await readJson(request); return json(response, 200, await git.openInEditor(body.path, body.file, body.editor)); }
 
-      if (url.pathname === "/api/worktrees" && request.method === "POST") { const result = await git.createWorktree(await readJson(request)); await projects(true); publish({ type: "projects.changed", payload: latestScan }); return json(response, 201, result); }
-      if (url.pathname === "/api/worktrees" && request.method === "DELETE") { const result = await git.removeWorktree(await readJson(request)); await projects(true); publish({ type: "projects.changed", payload: latestScan }); return json(response, 200, result); }
+      if (url.pathname === "/api/worktrees" && request.method === "POST") { const result = await git.createWorktree(await readJson(request)); return json(response, 201, await refreshProjectsAfterMutation(result)); }
+      if (url.pathname === "/api/worktrees" && request.method === "DELETE") { const result = await git.removeWorktree(await readJson(request)); return json(response, 200, await refreshProjectsAfterMutation(result)); }
 
       if (url.pathname === "/api/templates" && request.method === "GET") return json(response, 200, { templates: database.listTemplates() });
-      if (url.pathname === "/api/templates" && request.method === "POST") return json(response, 201, database.saveTemplate(await readJson(request)));
+      if (url.pathname === "/api/templates" && request.method === "POST") {
+        const input = await readJson(request);
+        const template = editRetainedData(() => database.saveTemplate(input));
+        return json(response, 201, template);
+      }
       const templateMatch = url.pathname.match(/^\/api\/templates\/([^/]+)$/);
-      if (templateMatch && request.method === "DELETE") return json(response, database.deleteTemplate(templateMatch[1]) ? 204 : 404, null);
+      if (templateMatch && request.method === "DELETE") {
+        const deleted = database.deleteTemplate(templateMatch[1]);
+        if (deleted) agents.resumeQueued();
+        return json(response, deleted ? 204 : 404, null);
+      }
       if (url.pathname === "/api/search" && request.method === "GET") return json(response, 200, database.search(requiredQuery(url, "q")));
       if (url.pathname === "/api/audit" && request.method === "GET") return json(response, 200, { entries: database.listAudit(Number(url.searchParams.get("limit") ?? 100)) });
       throw apiError(404, "API route not found");
     } catch (error) {
       if (response.destroyed) return true;
+      if (["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error?.code)) {
+        return json(response, 503, { error: "Storage cleanup is writing; retry shortly" });
+      }
+      if (error?.message?.includes("OUTRIGHT_RETAINED_LIMIT")) return json(response, 507, { error: "Retained history is full; archive conversations, then delete selected archived chats or clean up older history" });
       return json(response, error.statusCode ?? 500, { error: error.message || "Internal server error", ...(error.details ?? {}) });
     }
   }
@@ -574,19 +912,54 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   function shutdown() {
     if (shutdownPromise) return shutdownPromise;
     shuttingDown = true;
+    runRecoveryController.abort();
     clearTimeout(watcherTimer);
+    let disposed = false;
     shutdownPromise = (async () => {
-      await Promise.all([watcher?.close(), agents.shutdown()]);
+      const shutdownErrors = [];
+      const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown()]);
+      for (const result of preliminaries) if (result.status === "rejected") shutdownErrors.push(result.reason);
+      // A failed agent shutdown may be the sole owner of an exited provider's
+      // result while both SQLite and its recovery sidecar are unavailable.
+      // Keep the database and its exclusive lease alive for its retry timer.
+      if (shutdownErrors.length) {
+        const error = new AggregateError(shutdownErrors, "Runtime shutdown retains recovery ownership");
+        if (agents.hasPendingFinishes()) error.code = "OUTRIGHT_SHUTDOWN_RECOVERY_PENDING";
+        throw error;
+      }
       await inFlightScan?.catch(() => {});
-      terminals.shutdown();
+      await runRecovery.cycle;
+      // Native-owner probes may remain slow or stuck. Terminal shutdown fences
+      // their late results before the database lease is released.
+      try { await terminals.shutdown(); }
+      catch (error) { shutdownErrors.push(error); }
       eventHub.shutdown();
       wss.close();
-      database.close();
-    })();
+      await database.close();
+      disposed = true;
+      if (shutdownErrors.length) {
+        const error = new AggregateError(shutdownErrors, "Runtime shutdown did not finish cleanly");
+        error.code = "OUTRIGHT_SHUTDOWN_DISPOSAL_FAILED";
+        rejectShutdownCompletion(error);
+        throw error;
+      }
+      resolveShutdownCompletion();
+    })().catch((error) => {
+      // A pending run outcome or failed database close still owns the lease
+      // and may be retried. Once the lease is released, preserve the final
+      // result for every host awaiting the same shutdown.
+      if (!disposed) shutdownPromise = null;
+      throw error;
+    });
     return shutdownPromise;
   }
 
-  return { attach, handleRequest, projects, publish, database, agents, terminals, git, shutdown };
+  return { attach, handleRequest, projects, publish, database, agents, terminals, git, shutdown,
+    whenShutdownComplete: () => shutdownCompletion, whenRunRecoveryComplete: () => runRecovery.cycle };
+  } catch (error) {
+    runRecoveryController.abort();
+    throwFailedRuntimeStartup(error, { eventHub, wss, database });
+  }
 }
 
 function readJson(request) {
@@ -680,7 +1053,7 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
       if (["alive", "exited"].includes(verdict)) return verdict;
       if (verdict === "absent") {
         // A unique launchd label can be absent briefly after the authorized
-        // wrapper has spawned its supervisor but before launchctl submit has
+        // wrapper has spawned its supervisor but before launchctl bootstrap has
         // completed. The matching wrapper proves that launch is still in
         // progress, but there is not yet a kernel boundary that recovery can
         // terminate, so keep the run unresolved until the job appears or the
@@ -707,7 +1080,7 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
           }
         }
         if (liveSupervisorIdentity === supervisorIdentity) return "unknown";
-        // launchctl submit is forked by the supervisor and inherits the
+        // launchctl bootstrap is forked by the supervisor and inherits the
         // wrapper-owned process group. If the supervisor dies while submit is
         // in flight, that child can still create the job, so the whole group
         // must be empty before an absent label is accepted as exited.
