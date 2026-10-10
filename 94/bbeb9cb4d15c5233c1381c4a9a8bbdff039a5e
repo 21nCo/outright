@@ -1,0 +1,37 @@
+docs/out-3-execution-adapters.md
+  s_ce12272281eb3b::t_0bd7c97ae58631 30,32
+server/agent-manager.test.mjs
+  s_ce12272281eb3b::t_756051eae4ced8 1528-1530
+server/execution-adapters.test.mjs
+  s_ce12272281eb3b::t_d049e1baae7931 223-234,328-340
+server/execution-adapters/anthropic-api-runner.mjs
+  s_ce12272281eb3b::t_5c467a0cacc733 10-11,46-49,82
+server/execution-adapters/anthropic-api.mjs
+  s_ce12272281eb3b::t_1c5f7a862111f1 2,57-62
+server/outright-runtime.mjs
+  s_ce12272281eb3b::t_7a6568e051918b 9,1065,1108,1203
+server/outright-runtime.test.mjs
+  s_ce12272281eb3b::t_ff11b6018fe73a 2734-2761
+server/subprocess-budget.mjs
+  s_ce12272281eb3b::t_c9a1fb6c628d30 147
+tests/fixtures/execution-adapters/anthropic-api/max-tokens.sse
+  s_ce12272281eb3b::t_08ba3ed3a50369 1-24
+tests/ui-races.jsx
+  s_ce12272281eb3b::t_70f419614a3ec5 4674-4675,4678,4686-4689,4692-4695
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "94bbeb9cb4d15c5233c1381c4a9a8bbdff039a5e",
+  "prompts": {},
+  "sessions": {
+    "s_ce12272281eb3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d2376f8-4af3-4920-96da-dff6a042ab4c",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
