@@ -1,0 +1,35 @@
+server/agent-manager.test.mjs
+  s_1900bb15a7199a::t_93739da162a83a 1238-1250,1514-1551,1647,1663,1688,1690,1692,3518
+docs/out-3-execution-adapters.md
+  s_1900bb15a7199a::t_852a6022757dbf 28-29
+server/resource-budgets.test.mjs
+  s_1900bb15a7199a::t_b8797dccf2ef12 788,799
+server/database.mjs
+  s_1900bb15a7199a::t_f0b08d7ff349f6 875-881,1683-1684,1725-1732,1748,2233,2399,2446,2882
+src/App.jsx
+  s_1900bb15a7199a::t_2b258e37f9d3d0 105,1810-1813,1857
+server/agent-manager.mjs
+  s_1900bb15a7199a::t_a7a2b1b0b0deaa 605-607,712,919-921
+tests/ui-races.jsx
+  s_1900bb15a7199a::t_1285da49d0924b 298-334,5426
+server/database.test.mjs
+  s_1900bb15a7199a::t_63e299881881a3 86-120
+tests/ui-races.test.mjs
+  s_1900bb15a7199a::t_809ba27c5f8192 899
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "be1bbb679d10d951c513dbfe80ceffd7cfb8f0c9",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
