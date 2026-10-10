@@ -23,6 +23,15 @@ function cleanupDescendant(root, pidFile) {
   rmSync(root, { recursive: true, force: true });
 }
 
+// A child's output, including FD 3 proof frames, is complete only at 'close':
+// 'exit' can fire while its pipes still hold data.
+function closed(child) {
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (status) => resolve(status));
+  });
+}
+
 test("Git and scanner share admission, reject bursts before spawn, and recover after child close", async () => {
   const root = await realpath(mkdtempSync(path.join(os.tmpdir(), "outright-process-budget-")));
   const budget = createSubprocessBudget({ limit: 1 });
@@ -768,8 +777,7 @@ test("macOS supervisor reports the first provider exit after launchd's minimum r
     const starts = path.join(root, `${name}.starts`);
     const child = spawn(AGENT_SUPERVISOR, [label, "/bin/sh", provider, starts, String(seconds), String(code)],
       { cwd: root, stdio, env: { ...process.env, ...environment } });
-    const exited = new Promise((resolve) => child.once("exit", (status) => resolve(status)));
-    return { label, starts, child, exited, invocation: path.join(temporaryRoot, `outright-env-${label}`) };
+    return { label, starts, child, exited: closed(child), invocation: path.join(temporaryRoot, `outright-env-${label}`) };
   };
   const startCount = (run) => existsSync(run.starts) ? readFileSync(run.starts, "utf8").split("\n").filter(Boolean).length : 0;
   try {
@@ -827,6 +835,71 @@ test("macOS launch helper runs its provider once and records only the first exit
     assert.equal(readFileSync(path.join(invocation, "status"), "utf8"), "7\n");
     assert.equal(readFileSync(starts, "utf8"), "ran\n", "the provider ran more than once");
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("macOS launch helper forwards termination only to a provider it has not reaped", { skip: process.platform !== "darwin", timeout: 30_000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-darwin-helper-signal-"));
+  const started = path.join(root, "started");
+  const helpers = [];
+  const helper = (name, script) => {
+    const invocation = path.join(root, name);
+    mkdirSync(invocation, { mode: 0o700 });
+    writeFileSync(path.join(invocation, "environment"), [root, "3", "/bin/sh", "-c", script].map((entry) => `${entry}\0`).join(""),
+      { mode: 0o600 });
+    // The test hook pauses after the provider exits, before its exit is recorded.
+    const child = spawn(AGENT_SUPERVISOR, ["--utility-exec", invocation], { stdio: ["ignore", "ignore", "pipe"],
+      env: { ...process.env, OUTRIGHT_LAUNCH_HELPER_TEST_RECORD_PAUSE_MS: "1500" } });
+    helpers.push(child);
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    return { child, status: closed(child), stderr: () => stderr, recorded: () => readFileSync(path.join(invocation, "status"), "utf8") };
+  };
+  const until = async (condition, description) => {
+    const deadline = Date.now() + 10_000;
+    while (!condition()) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${description}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+  try {
+    const reaped = helper("reaped", "exit 7");
+    await until(() => reaped.stderr().includes("recording\n"), "the record window");
+    reaped.child.kill("SIGTERM");
+    assert.equal(await reaped.status, 7, "a request after the provider exited changed the helper's exit");
+    assert.equal(reaped.stderr().includes("forwarded"), false, "a request was forwarded to an already reaped provider");
+    assert.equal(reaped.recorded(), "7\n");
+    // Control: a running provider still receives the request.
+    const running = helper("running", `echo > ${JSON.stringify(started)}; exec /bin/sleep 30`);
+    await until(() => existsSync(started), "the provider to start");
+    running.child.kill("SIGTERM");
+    assert.equal(await running.status, 143);
+    assert.ok(running.stderr().includes("forwarded\n"), "a running provider did not receive the request");
+    assert.equal(running.recorded(), "143\n");
+  } finally {
+    for (const child of helpers) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a macOS supervisor started by a relative path runs its provider once", { skip: process.platform !== "darwin", timeout: 20_000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-darwin-relative-"));
+  const starts = path.join(root, "starts");
+  const label = `com.21n.outright.relative-${randomUUID()}`;
+  const temporaryRoot = realpathSync(execFileSync("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"], { encoding: "utf8" }).trim());
+  // launchd starts the job from its own working directory, not the caller's.
+  const cwd = path.dirname(path.dirname(path.resolve(AGENT_SUPERVISOR)));
+  const relative = `./${path.relative(cwd, path.resolve(AGENT_SUPERVISOR))}`;
+  try {
+    const child = spawn(relative, [label, "/bin/sh", "-c", `echo ran >> ${JSON.stringify(starts)}; exit 5`], { cwd, stdio: "ignore" });
+    assert.equal(await closed(child), 5, "launchd could not start the helper named by a relative path");
+    assert.equal(readFileSync(starts, "utf8"), "ran\n");
+    assert.equal(existsSync(path.join(temporaryRoot, `outright-env-${label}`)), false, "the private launch directory was left behind");
+    const service = spawnSync("/bin/launchctl", ["print", `gui/${process.getuid()}/${label}`], { stdio: "ignore" });
+    assert.notEqual(service.status, 0, "the launchd job was left behind");
+  } finally {
+    spawnSync(AGENT_SUPERVISOR, ["--terminate", label], { stdio: "ignore", timeout: 10_000 });
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("a failed native owner releases capacity only after its detached child is gone", { timeout: 15_000 }, async () => {

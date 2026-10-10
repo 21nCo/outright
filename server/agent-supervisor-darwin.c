@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -299,8 +300,32 @@ static int read_first_exit(const char *label, int *code) {
 }
 
 static volatile sig_atomic_t provider_pid = 0;
+static volatile sig_atomic_t announce_forwarding = 0;
 static void forward_signal(int signal_number) {
-  if (provider_pid > 0) kill((pid_t)provider_pid, signal_number);
+  if (provider_pid <= 0) return;
+  if (announce_forwarding) write(STDERR_FILENO, "forwarded\n", 10);
+  kill((pid_t)provider_pid, signal_number);
+}
+
+// Test-only and inert unless set: announce forwarded signals and pause after
+// the provider exits, before its exit is recorded, so a test can deliver a
+// termination request inside that window. A launchd job starts the helper
+// with launchd's environment, so a caller's environment cannot enable it.
+static unsigned record_pause_ms(void) {
+  const char *raw = getenv("OUTRIGHT_LAUNCH_HELPER_TEST_RECORD_PAUSE_MS");
+  if (raw == NULL) return 0;
+  char *end = NULL;
+  long value = strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || value < 1 || value > 10000) return 0;
+  announce_forwarding = 1;
+  return (unsigned)value;
+}
+
+static void pause_before_record(unsigned milliseconds) {
+  if (milliseconds == 0) return;
+  dprintf(STDERR_FILENO, "recording\n");
+  struct timespec delay = { .tv_sec = milliseconds / 1000, .tv_nsec = (long)(milliseconds % 1000) * 1000000L };
+  while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
 }
 
 // Reads the private launch file and removes it. Only the invocation whose
@@ -356,7 +381,10 @@ static char **parse_launch_file(char *data, size_t length, char ***tokens, char 
 }
 
 // Runs the provider as a child so its exit can be recorded. Termination
-// requests sent to the job's main process are forwarded to the provider.
+// requests sent to the job's main process are forwarded to the provider only
+// while it is unreaped. On return the forwarded signals stay blocked, so a
+// request arriving while the exit is recorded cannot reach a reused PID or
+// change the recorded code; the helper exits with them still pending.
 static int run_provider(char **command, char **environment) {
   sigset_t forwarded;
   sigset_t previous;
@@ -386,10 +414,17 @@ static int run_provider(char **command, char **environment) {
   sigaction(SIGINT, &action, NULL);
   sigaction(SIGHUP, &action, NULL);
   sigprocmask(SIG_SETMASK, &previous, NULL);
+  // Wait without reaping: the exited provider stays a zombie, so its PID
+  // cannot be reused while a forwarded signal may still target it.
+  siginfo_t info;
+  int observed;
+  while ((observed = waitid(P_PID, (id_t)child, &info, WEXITED | WNOWAIT)) != 0 && errno == EINTR) {}
+  sigprocmask(SIG_BLOCK, &forwarded, NULL);
+  provider_pid = 0;
   int status = 0;
   pid_t waited;
   while ((waited = waitpid(child, &status, 0)) < 0 && errno == EINTR) {}
-  if (waited != child) return 70;
+  if (observed != 0 || waited != child) return 70;
   if (WIFEXITED(status)) return WEXITSTATUS(status);
   return WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 70;
 }
@@ -411,11 +446,13 @@ static int run_launch_command(int argc, char **argv) {
     close(directory_fd);
     return 73;
   }
+  unsigned pause = record_pause_ms();
   char **tokens = NULL;
   char **environment = NULL;
   char **command = parse_launch_file(data, length, &tokens, &environment);
   int code = 73;
   if (command != NULL) code = chdir(tokens[0]) == 0 ? run_provider(command, environment) : 71;
+  pause_before_record(pause);
   record_first_exit(directory_fd, code);
   close(directory_fd);
   free(command); free(tokens); free(data);
@@ -771,21 +808,42 @@ static int control_existing_job(const char *mode, const char *label) {
   return 64;
 }
 
-static int self_test(const char *label) {
+// Removes a self-test invocation directory and the helper's private entries.
+static void remove_self_test_directory(const char *directory) {
+  int directory_fd = open(directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (directory_fd >= 0) {
+    remove_private_entry(directory_fd, LAUNCH_ENVIRONMENT, true);
+    remove_private_entry(directory_fd, LAUNCH_DEFINITION, true);
+    remove_private_entry(directory_fd, LAUNCH_STATUS, true);
+    close(directory_fd);
+  }
+  rmdir(directory);
+}
+
+static int self_test(const char *supervisor, const char *label) {
   if (!valid_label(label)) return 64;
   char *target = service_target(label);
   if (target == NULL) return 70;
-  // Verify the registration production uses: a run-once bootstrapped job.
+  // Verify the registration production uses: a run-once bootstrapped job
+  // whose helper is this binary and claims a launch file for its provider.
   char directory[4096];
   char definition[4096];
+  char launch[4096];
   if (!private_temporary_root(directory, sizeof(directory))
       || strlcat(directory, "/outright-self-test-XXXXXX", sizeof(directory)) >= sizeof(directory)
       || mkdtemp(directory) == NULL) { free(target); return 71; }
   snprintf(definition, sizeof(definition), "%s/" LAUNCH_DEFINITION, directory);
-  char *arguments[] = { "/bin/sleep", "5", NULL };
-  int registered = bootstrap_job(definition, label, arguments, NULL, NULL);
-  rmdir(directory);
-  if (registered != 0) { free(target); return 71; }
+  snprintf(launch, sizeof(launch), "%s/" LAUNCH_ENVIRONMENT, directory);
+  static const char provider[] = "/\0" "2\0" "/bin/sleep\0" "5";
+  int descriptor = open(launch, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+  bool written = descriptor >= 0 && write_all(descriptor, provider, sizeof(provider));
+  if (descriptor >= 0 && close(descriptor) != 0) written = false;
+  char *arguments[] = { (char *)supervisor, "--utility-exec", directory, NULL };
+  if (!written || bootstrap_job(definition, label, arguments, NULL, NULL) != 0) {
+    remove_self_test_directory(directory);
+    free(target);
+    return 71;
+  }
   int result = 72;
   for (int attempt = 0; attempt < 100; attempt++) {
     service_state state;
@@ -800,18 +858,34 @@ static int self_test(const char *label) {
     nanosleep(&delay, NULL);
   }
   bootout(target);
+  remove_self_test_directory(directory);
   free(target);
   if (result == 0) dprintf(STDOUT_FILENO, "supported\n");
   return result;
 }
 
+// launchd starts a job's program from its own working directory, so the job
+// must name this exact binary by absolute path however argv[0] was spelled.
+static bool resolve_supervisor_path(char *resolved, size_t capacity) {
+  char executable[4096];
+  char canonical[4096];
+  uint32_t size = sizeof(executable);
+  if (_NSGetExecutablePath(executable, &size) != 0 || realpath(executable, canonical) == NULL
+      || canonical[0] != '/' || strlen(canonical) >= capacity) return false;
+  strcpy(resolved, canonical);
+  return true;
+}
+
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "--utility-exec") == 0)
     return run_launch_command(argc, argv);
-  if (argc == 3 && strcmp(argv[1], "--self-test") == 0) return self_test(argv[2]);
   if (argc == 3 && (strcmp(argv[1], "--probe") == 0 || strcmp(argv[1], "--terminate") == 0)) {
     return control_existing_job(argv[1], argv[2]);
   }
+  char supervisor[4096];
+  bool supervisor_resolved = resolve_supervisor_path(supervisor, sizeof(supervisor));
+  if (argc == 3 && strcmp(argv[1], "--self-test") == 0)
+    return supervisor_resolved ? self_test(supervisor, argv[2]) : 71;
   if (argc < 3 || !valid_label(argv[1])) {
     dprintf(STDERR_FILENO, "Usage: %s LABEL EXECUTABLE [ARG...]\n", argv[0]);
     return utility_prelaunch_exit(64);
@@ -832,6 +906,12 @@ int main(int argc, char **argv) {
   pid_t owner_pid = getppid();
   if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL && !utility_start_authorized(owner_pid))
     return utility_prelaunch_exit(0);
+  // Without this binary's absolute path launchd could not start the helper;
+  // stop before any launch record, output pipe or job exists.
+  if (!supervisor_resolved) {
+    dprintf(STDERR_FILENO, "Unable to resolve the supervisor's own path\n");
+    return utility_prelaunch_exit(71);
+  }
 
   // launchd writes provider output into kernel-bounded FIFOs. The supervisor
   // relays them to its inherited pipes; if downstream stops reading, normal
@@ -881,7 +961,7 @@ int main(int argc, char **argv) {
     close(stdout_fd); close(stderr_fd); unlink(stdout_path); unlink(stderr_path); free(target);
     return utility_prelaunch_exit(0);
   }
-  char *job[] = { argv[0], "--utility-exec", environment_directory, NULL };
+  char *job[] = { supervisor, "--utility-exec", environment_directory, NULL };
   int submitted = bootstrap_job(definition, argv[1], job, stdout_path, stderr_path);
   if (submitted != 0) {
     cleanup_launch_environment(argv[1]);
