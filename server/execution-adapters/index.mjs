@@ -32,3 +32,16 @@ export function buildExecutionLaunch({ conversation, run, sessionId }) {
   const adapter = validateExecutionConfiguration({ ...run, sessionId });
   return adapter.buildLaunch({ worktreePath: conversation.worktreePath, run, sessionId: sessionId || null });
 }
+
+// Direct-provider variables are removed from every spawn and handed only to
+// the adapter that declares them. A harness keeps its CLI's own authority,
+// including any credentials the user configured for that CLI.
+const DIRECT_PROVIDER_VARIABLES = new Set(EXECUTION_ADAPTERS.flatMap((adapter) => adapter.environment));
+
+export function buildExecutionEnvironment(id, runtimeEnvironment, inherited = runtimeEnvironment) {
+  const adapter = requireExecutionAdapter(id);
+  // Windows variable names are case-insensitive.
+  const environment = Object.fromEntries(Object.entries(inherited).filter(([key]) => !DIRECT_PROVIDER_VARIABLES.has(key.toUpperCase())));
+  for (const variable of adapter.environment) if (runtimeEnvironment[variable]) environment[variable] = runtimeEnvironment[variable];
+  return environment;
+}

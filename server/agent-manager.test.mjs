@@ -1521,6 +1521,34 @@ test("a run never resumes another provider's session and reports its normalized 
   } finally { await manager.shutdown(); }
 });
 
+test("a direct-provider credential reaches only its own adapter's spawn", async () => {
+  const environment = { PATH: "/usr/bin", ANTHROPIC_API_KEY: "harness-own-key", OUTRIGHT_ANTHROPIC_API_KEY: "direct-key",
+    OUTRIGHT_ANTHROPIC_BASE_URL: "http://127.0.0.1:9", OUTRIGHT_OTHER: "runtime-only" };
+  for (const provider of ["claude", "codex", "anthropic-api"]) {
+    const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider });
+    const spawned = [];
+    const child = fakeChild();
+    const manager = createAgentManager({ database, publish: () => {}, environment,
+      spawnProcess: (executable, args, options) => { spawned.push(options.env); return child; },
+      launchCommand: async (command) => ({ executable: "fake-owner", args: [], display: command.display }) });
+    try {
+      await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.createRun({ ...codexRun(`run-${provider}`), provider }) });
+      const env = spawned[0];
+      // Before scoping, every harness inherited the direct provider's key and endpoint.
+      const direct = provider === "anthropic-api";
+      assert.equal(env.OUTRIGHT_ANTHROPIC_API_KEY, direct ? "direct-key" : undefined, provider);
+      assert.equal(env.OUTRIGHT_ANTHROPIC_BASE_URL, direct ? "http://127.0.0.1:9" : undefined, provider);
+      assert.equal(env.OUTRIGHT_OTHER, undefined, "other runtime settings stay private");
+      // A harness keeps the authority its user configured for that CLI.
+      assert.equal(env.ANTHROPIC_API_KEY, "harness-own-key");
+      assert.equal(env.PATH, "/usr/bin");
+    } finally {
+      child.emit("close", 0, null);
+      await manager.shutdown();
+    }
+  }
+});
+
 test("a full conversation metadata budget does not fail a provider session event", async () => {
   const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex", providerSessionId: null });
   database.updateConversation = () => { const error = new Error("Retained history is full"); error.statusCode = 507; throw error; };

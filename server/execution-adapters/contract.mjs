@@ -7,7 +7,9 @@
 // Two kinds exist. A "harness" adapter drives an external agent CLI (Codex,
 // Claude Code, ...) that authenticates itself. A "direct-provider" adapter is
 // Outright-managed execution against a model provider API; it must name its
-// own credential reference and never inherits a harness login.
+// own credential reference and never inherits a harness login. Its settings
+// live in Outright's own OUTRIGHT_* namespace and are handed only to its own
+// spawn, so enabling it never changes the authority of a harness CLI.
 export const ADAPTER_CONTRACT_VERSION = 1;
 export const APPROVAL_POLICIES = Object.freeze(["read-only", "workspace-write", "danger-full-access"]);
 export const REASONING_EFFORTS = Object.freeze(["low", "medium", "high", "xhigh"]);
@@ -17,6 +19,7 @@ const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@+[\]-]{0,199}$/;
 const SESSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const ID_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
+const DIRECT_VARIABLE_PATTERN = /^OUTRIGHT_[A-Z0-9_]+$/;
 
 function contractError(message) {
   return new TypeError(`Invalid execution adapter: ${message}`);
@@ -55,7 +58,9 @@ export function defineAdapter(spec) {
     if (typeof spec.parseVersion !== "function") throw contractError(`${spec.id} must parse its CLI version`);
   } else {
     // A harness login never grants direct API access.
-    if (authority.source !== "env" || !/^[A-Z][A-Z0-9_]*$/.test(authority.variable ?? "")) throw contractError(`${spec.id} must reference its own API credential`);
+    if (authority.source !== "env" || !DIRECT_VARIABLE_PATTERN.test(authority.variable ?? "")) throw contractError(`${spec.id} must reference its own API credential`);
+    if (!Array.isArray(spec.environment) || !spec.environment.includes(authority.variable)
+      || spec.environment.some((variable) => !DIRECT_VARIABLE_PATTERN.test(variable))) throw contractError(`${spec.id} must declare its OUTRIGHT_* launch environment`);
     if (typeof spec.detect !== "function") throw contractError(`${spec.id} must detect its credential`);
   }
   const versions = spec.versions ?? {};
@@ -72,6 +77,7 @@ export function defineAdapter(spec) {
   for (const method of ["buildLaunch", "normalize"]) if (typeof spec[method] !== "function") throw contractError(`${spec.id} must implement ${method}`);
   return Object.freeze({
     ...spec,
+    environment: Object.freeze([...(spec.kind === "harness" ? [] : spec.environment)]),
     capabilities: Object.freeze({
       ...capabilities,
       readOnly: modes.includes("read-only"),

@@ -8,6 +8,7 @@ The scheduler in `server/agent-manager.mjs` owns supervision, persistence, recov
 | --- | --- |
 | `kind` | `harness` drives an external agent CLI that authenticates itself. `direct-provider` is Outright-managed execution against a model API. |
 | `modelProvider`, `authority` | The model vendor and where authority comes from. A harness uses its own CLI login. A direct provider names its own environment credential; a harness login never grants API access, and there is no fallback between them. |
+| `environment` | Direct providers only: the `OUTRIGHT_*` variables the adapter reads. They are removed from every spawn and handed only to that adapter's process. |
 | `versions` | The oldest verified version and the first unverified major. Anything outside the range, or an unparseable `--version`, is reported as incompatible. |
 | `capabilities` | Approval policies mapped to native permission modes, suggested models and whether custom names are allowed, reasoning efforts, resume support, structured output (`jsonl`), read-only support and hosted suitability. |
 | `sessionIdentity` | The native field carrying the provider's session id. Resume uses only a session created by the same adapter. |
@@ -23,12 +24,22 @@ Normalized events are `session`, `assistant.delta`, `assistant.message`, `tool.s
 
 Switching a conversation's provider clears its stored session unless the same edit attaches a new one.
 
+## Credentials and environment
+
+Each spawn gets a scoped environment. `OUTRIGHT_*` runtime settings are never inherited. A direct provider receives only the `OUTRIGHT_*` variables it declares. A harness CLI inherits the rest of Outright's environment unchanged, and that is its effective authority. For example, Claude Code honours an `ANTHROPIC_API_KEY` exported for Outright, just as it would in a shell. Enabling the direct provider cannot change that, because its key lives in `OUTRIGHT_ANTHROPIC_API_KEY`. The direct provider also never reads `ANTHROPIC_API_KEY`, so a key set up for a harness cannot become direct-provider authority.
+
+The Anthropic runner sends its key only to the configured endpoint. That endpoint must be https or a loopback http address. Redirects are refused rather than followed, and a streamed event is limited to 1 MiB in total, counting every data line that has not yet been dispatched.
+
 ## Adapters
 
 | Adapter | Kind | Supported versions | Notes |
 | --- | --- | --- | --- |
 | `codex` | harness | 0.145.0 up to, but not including, 1.0.0 | Sandbox modes map one-to-one. Resume uses `exec resume` with a config override for the sandbox. |
 | `claude` | harness | 2.1.296 up to, but not including, 3.0.0 | Policies map to `plan`, `acceptEdits` and `bypassPermissions`. |
-| `anthropic-api` | direct-provider | runner 1.x | Requires `ANTHROPIC_API_KEY`. It is read-only because it has no tools, does not resume, uses the model's default effort and accepts only https or loopback endpoints. |
+| `anthropic-api` | direct-provider | runner 1.x | Requires `OUTRIGHT_ANTHROPIC_API_KEY`. `OUTRIGHT_ANTHROPIC_BASE_URL` optionally overrides the endpoint. It is read-only because it has no tools, does not resume, uses the model's default effort and accepts only https or loopback endpoints. |
 
 Adding an adapter means adding a module, registering it, adding fixtures under `tests/fixtures/execution-adapters/<id>/` (enforced by `server/execution-adapters.test.mjs`) and recording live evidence for its minimum version. Adapters are trusted code shipped with Outright. Loading user-supplied adapters at runtime is out of scope until there is a trust policy for them.
+
+## Deferred to OUT-38
+
+Model, approval policy and reasoning effort are still global defaults, not per-provider ones. A chat switched to `anthropic-api` while the default policy is `workspace-write`, or while the default effort is not `medium`, is therefore rejected with `409 PROVIDER_CONFIGURATION_UNSUPPORTED`. Outright does not substitute a supported value. The error names Settings as the place to change the default. The default-model suggestions also follow the default provider, even though chats on other providers share the same field. Per-provider and per-role execution profiles belong to [OUT-38](https://linear.app/21n/issue/OUT-38/configure-reusable-execution-profiles-per-workflow-task-and-agent-role).

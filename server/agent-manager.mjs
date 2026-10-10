@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildExecutionLaunch, requireExecutionAdapter } from "./execution-adapters/index.mjs";
+import { buildExecutionEnvironment, buildExecutionLaunch, requireExecutionAdapter } from "./execution-adapters/index.mjs";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
 import { RESOURCE_BUDGETS, retainedTranscriptMessageBytes } from "./resource-budgets.mjs";
 
@@ -371,7 +371,7 @@ function unresolvedOutcomeUnavailable() {
   return unavailable;
 }
 
-export function createAgentManager({ database, publish, onProvidersChanged = () => {}, onShutdownRecovery = () => {}, onDiskRetry = () => {}, providerDiscoveryFactory = createProviderDiscovery, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory }) {
+export function createAgentManager({ database, publish, onProvidersChanged = () => {}, onShutdownRecovery = () => {}, onDiskRetry = () => {}, providerDiscoveryFactory = createProviderDiscovery, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory, environment = process.env }) {
   const resolvedLaunchDirectory = launchDirectory
     ?? database.launchDirectory;
   assertPrivateLaunchDirectory(resolvedLaunchDirectory);
@@ -390,7 +390,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   let hardRetryProbed = false;
   const admissionRetryRuns = new Set();
   let queueReadRetryPending = false;
-  const providerDiscovery = providerDiscoveryFactory({ onChange: onProvidersChanged });
+  const providerDiscovery = providerDiscoveryFactory({ onChange: onProvidersChanged, environment });
 
   function wakeMaintenanceWaiters() {
     for (const resolve of maintenanceWaiters) resolve();
@@ -470,7 +470,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
 
     const child = spawnProcess(launch.executable, launch.args, {
       cwd: conversation.worktreePath,
-      env: sanitizedEnvironment(process.env),
+      // Each adapter gets a scoped environment: direct-provider credentials
+      // reach only the adapter that declares them.
+      env: buildExecutionEnvironment(run.provider, environment, sanitizedEnvironment(environment)),
       // fd 3 is a manager-only launch-control channel. The provider inherits
       // stdout/stderr from its owner but never inherits this descriptor.
       stdio: ["pipe", "pipe", "pipe", "pipe"],

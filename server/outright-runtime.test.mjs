@@ -1512,6 +1512,49 @@ test("session recovery is refused for an adapter that cannot resume", { skip: pr
   assert.equal(runtime.database.listRuns(conversation.id).length, 1);
 }));
 
+test("a direct-provider run streams through the supervised runtime with its scoped credential", { skip: process.platform === "win32", timeout: 30000 }, async () => {
+  const stream = readFileSync(new URL("../tests/fixtures/execution-adapters/anthropic-api/stream.sse", import.meta.url), "utf8");
+  const unauthorized = readFileSync(new URL("../tests/fixtures/execution-adapters/anthropic-api/unauthorized.json", import.meta.url), "utf8");
+  const requests = [];
+  const server = (await import("node:http")).createServer((request, response) => {
+    request.resume();
+    request.on("end", () => {
+      requests.push(request.headers["x-api-key"]);
+      if (request.headers["x-api-key"] === "sk-ant-runtime") { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(stream); }
+      else { response.writeHead(401, { "content-type": "application/json" }); response.end(unauthorized); }
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const saved = { key: process.env.OUTRIGHT_ANTHROPIC_API_KEY, base: process.env.OUTRIGHT_ANTHROPIC_BASE_URL };
+  process.env.OUTRIGHT_ANTHROPIC_API_KEY = "sk-ant-runtime";
+  process.env.OUTRIGHT_ANTHROPIC_BASE_URL = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await withWorktreeRuntime(async (runtime, { project, worktree }) => {
+      const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Direct", provider: "anthropic-api" });
+      const send = async () => {
+        const response = responseCapture();
+        await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "--help", approvalPolicy: "read-only", reasoningEffort: "medium" }), response);
+        assert.equal(response.statusCode, 202, JSON.stringify(response.body));
+        await waitFor(() => !["queued", "launching", "running"].includes(runtime.database.getRun(response.body.id).status), 20000, "the direct-provider run did not finish");
+        return runtime.database.getRun(response.body.id);
+      };
+      const completed = await send();
+      assert.equal(completed.status, "completed", completed.error);
+      assert.ok(runtime.database.listMessages(conversation.id).some((message) => message.role === "assistant" && JSON.stringify(message).includes("READY now")));
+      process.env.OUTRIGHT_ANTHROPIC_API_KEY = "sk-ant-revoked";
+      const failed = await send();
+      assert.equal(failed.status, "failed");
+      assert.equal(failed.error, "invalid x-api-key", "the native failure explains the exit");
+      assert.deepEqual(requests, ["sk-ant-runtime", "sk-ant-revoked"]);
+    })();
+  } finally {
+    for (const [name, value] of [["OUTRIGHT_ANTHROPIC_API_KEY", saved.key], ["OUTRIGHT_ANTHROPIC_BASE_URL", saved.base]]) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 for (const operation of ["send", "recovery"]) {
   test(`slow executable provider probe stays asynchronous and bounded for ${operation}`, { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
     // Exercise the real execFile --version path through each HTTP endpoint.

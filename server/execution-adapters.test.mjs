@@ -39,6 +39,11 @@ test("the adapter contract rejects specifications the scheduler could not trust"
   assert.throws(() => defineAdapter(harnessSpec({ capabilities: { ...harnessSpec().capabilities, resume: true } })), /native session field/);
   // A direct provider can never borrow a harness CLI login.
   assert.throws(() => defineAdapter(harnessSpec({ kind: "direct-provider", detect: () => ({}) })), /own API credential/);
+  // A direct provider's credential must sit in Outright's namespace, which no harness spawn inherits.
+  const direct = { kind: "direct-provider", detect: () => ({}), environment: ["ANTHROPIC_API_KEY"], authority: { source: "env", variable: "ANTHROPIC_API_KEY" } };
+  assert.throws(() => defineAdapter(harnessSpec(direct)), /own API credential/);
+  assert.throws(() => defineAdapter(harnessSpec({ ...direct, authority: { source: "env", variable: "OUTRIGHT_KEY" } })), /launch environment/);
+  assert.deepEqual(defineAdapter(harnessSpec({ ...direct, authority: { source: "env", variable: "OUTRIGHT_KEY" }, environment: ["OUTRIGHT_KEY"] })).environment, ["OUTRIGHT_KEY"]);
   assert.throws(() => defineAdapter(harnessSpec({ versions: { minimum: "2.0.0", belowMajor: 2 } })), /version range/);
 });
 
@@ -51,7 +56,7 @@ test("every registered adapter has fixtures and a serializable description witho
     assert.deepEqual(JSON.parse(JSON.stringify(description)), description);
     assert.ok(description.capabilities.permissionModes.length > 0);
   }
-  assert.deepEqual(describeAdapter(anthropic).authority, { source: "env", variable: "ANTHROPIC_API_KEY" });
+  assert.deepEqual(describeAdapter(anthropic).authority, { source: "env", variable: "OUTRIGHT_ANTHROPIC_API_KEY" });
   assert.equal(describeAdapter(codex).capabilities.hosted, false);
   assert.equal(describeAdapter(anthropic).capabilities.hosted, true);
 });
@@ -178,7 +183,7 @@ test("the Outright-managed Anthropic path streams through its own credential", a
   await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", "stream.sse")); }, async (base, requests) => {
     const launch = buildExecutionLaunch({ conversation: { worktreePath: "/w" }, run: { provider: "anthropic-api", ...baseRun, prompt: "--help" } });
     assert.equal(launch.args.includes(secret), false);
-    const result = await runRunner(launch.args.slice(1), { ANTHROPIC_API_KEY: secret, ANTHROPIC_BASE_URL: base });
+    const result = await runRunner(launch.args.slice(1), { OUTRIGHT_ANTHROPIC_API_KEY: secret, OUTRIGHT_ANTHROPIC_BASE_URL: base });
     assert.equal(result.code, 0);
     assert.equal(result.stdout.includes(secret), false, "the key is never echoed");
     assert.equal(requests[0].url, "/v1/messages");
@@ -193,40 +198,72 @@ test("the Outright-managed Anthropic path streams through its own credential", a
 
 test("Anthropic API failures are normalized and fail the run", async () => {
   await withApiFixture((response) => { response.writeHead(401, { "content-type": "application/json" }); response.end(fixture("anthropic-api", "unauthorized.json")); }, async (base) => {
-    const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { ANTHROPIC_API_KEY: "bad", ANTHROPIC_BASE_URL: base });
+    const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "bad", OUTRIGHT_ANTHROPIC_BASE_URL: base });
     assert.equal(result.code, 1);
     assert.deepEqual(result.events.map((event) => [event.type, event.payload.message, event.payload.native?.type]), [["provider.failure", "invalid x-api-key", "authentication_error"]]);
   });
   await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", "overloaded.sse")); }, async (base) => {
-    const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: base });
+    const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
     assert.equal(result.code, 1);
     assert.equal(result.events.at(-1).payload.message, "Overloaded");
   });
   // A key is never sent over plaintext to a non-local host, and no CLI login is consulted.
-  const insecure = await runRunner(["--model", "m", "--", "hi"], { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "http://example.com" });
+  const insecure = await runRunner(["--model", "m", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: "http://example.com" });
   assert.equal(insecure.code, 2);
   assert.match(insecure.events[0].payload.message, /must be an https URL/);
-  const missing = await runRunner(["--model", "m", "--", "hi"], {});
+  // A harness's own Anthropic credential is never borrowed by the direct provider.
+  const missing = await runRunner(["--model", "m", "--", "hi"], { ANTHROPIC_API_KEY: "harness-key" });
   assert.equal(missing.code, 2);
-  assert.match(missing.events[0].payload.message, /ANTHROPIC_API_KEY is not set/);
+  assert.match(missing.events[0].payload.message, /OUTRIGHT_ANTHROPIC_API_KEY is not set/);
+});
+
+test("the direct provider never forwards its key across a redirect", async () => {
+  await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", "stream.sse")); }, async (target, followed) => {
+    for (const [status, location] of [[307, `${target}/v1/messages`], [308, "http://example.com/v1/messages"], [302, "/v1/elsewhere"]]) {
+      await withApiFixture((response) => { response.writeHead(status, { location }); response.end(); }, async (base, requests) => {
+        const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "sk-ant-redirect", OUTRIGHT_ANTHROPIC_BASE_URL: base });
+        assert.equal(result.code, 1, `HTTP ${status} must fail the run`);
+        assert.match(result.events.at(-1).payload.message, new RegExp(`redirected the request \\(HTTP ${status}\\)`));
+        assert.equal(requests.length, 1, "a same-origin redirect is not followed either");
+      });
+    }
+    assert.equal(followed.length, 0, "the cross-origin hop never received the key");
+  });
+});
+
+test("one stream event is bounded across chunks and data lines", async () => {
+  // Each data line is small and the event never reaches a blank-line dispatch.
+  const line = `data: ${"x".repeat(64 * 1024)}\n`;
+  for (const lines of [24, 40]) {
+    await withApiFixture((response) => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      for (let index = 0; index < lines; index += 1) response.write(line);
+      response.end("\n");
+    }, async (base) => {
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      assert.equal(result.code, 1, `a ${lines}-line event must fail`);
+      assert.equal(result.events.at(-1).payload.message, "Anthropic API stream event exceeded 1 MiB");
+      assert.ok(result.stdout.length < 1024, "the oversized event is not echoed");
+    });
+  }
 });
 
 test("discovery reports incompatible and unconfigured providers before authorization", async () => {
   const probed = [];
   const versions = { codex: "codex-cli 0.20.0", claude: "2.1.296 (Claude Code)" };
-  const discovery = createProviderDiscovery({ environment: {}, probe: async (executable) => { probed.push(executable); return versions[executable]; } });
+  const discovery = createProviderDiscovery({ environment: { ANTHROPIC_API_KEY: "harness-key" }, probe: async (executable) => { probed.push(executable); return versions[executable]; } });
   try {
     assert.equal(await discovery.available("codex"), false, "an installed but unsupported CLI is not authorized");
     assert.equal(await discovery.available("claude"), true);
-    assert.equal(await discovery.available("anthropic-api"), false, "a Claude Code login does not grant API access");
+    assert.equal(await discovery.available("anthropic-api"), false, "a Claude Code login or key does not grant direct API access");
     const byId = Object.fromEntries(discovery.list().map((entry) => [entry.id, entry]));
     assert.deepEqual([byId.codex.available, byId.codex.compatible, byId.codex.version], [true, false, "0.20.0"]);
     assert.match(byId.codex.reason, /0\.20\.0 is not supported/);
     assert.deepEqual([byId.claude.compatible, byId.claude.capabilities.resume], [true, true]);
-    assert.match(byId["anthropic-api"].reason, /ANTHROPIC_API_KEY/);
+    assert.match(byId["anthropic-api"].reason, /OUTRIGHT_ANTHROPIC_API_KEY/);
     assert.equal(probed.includes("anthropic-api"), false, "a direct provider is never probed as a CLI");
   } finally { await discovery.close(); }
-  const configured = createProviderDiscovery({ environment: { ANTHROPIC_API_KEY: "k" }, probe: async () => { throw new Error("missing"); } });
+  const configured = createProviderDiscovery({ environment: { OUTRIGHT_ANTHROPIC_API_KEY: "k" }, probe: async () => { throw new Error("missing"); } });
   try {
     assert.equal(await configured.available("anthropic-api"), true);
     assert.equal(configured.list().find((entry) => entry.id === "anthropic-api").version, "1.0.0");

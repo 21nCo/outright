@@ -15,7 +15,10 @@ export const anthropicApiAdapter = defineAdapter({
   contractVersion: ADAPTER_CONTRACT_VERSION,
   modelProvider: "anthropic",
   // Never the Claude Code login: a subscription does not grant API access.
-  authority: { source: "env", variable: "ANTHROPIC_API_KEY" },
+  // Outright's own variables, not ANTHROPIC_*, so Claude Code keeps whatever
+  // authority it already had when this provider is enabled.
+  authority: { source: "env", variable: "OUTRIGHT_ANTHROPIC_API_KEY" },
+  environment: ["OUTRIGHT_ANTHROPIC_API_KEY", "OUTRIGHT_ANTHROPIC_BASE_URL"],
   versions: { minimum: "1.0.0", belowMajor: 2 },
   capabilities: {
     permissionModes: { "read-only": "no-tools" },
@@ -29,11 +32,12 @@ export const anthropicApiAdapter = defineAdapter({
     hosted: true,
   },
   detect(environment = process.env) {
-    if (!environment.ANTHROPIC_API_KEY) return { available: false, version: "", reason: "Set ANTHROPIC_API_KEY to enable Outright-managed Anthropic API runs" };
+    if (!environment.OUTRIGHT_ANTHROPIC_API_KEY) return { available: false, version: "", reason: "Set OUTRIGHT_ANTHROPIC_API_KEY to enable Outright-managed Anthropic API runs" };
     return { available: true, version: ANTHROPIC_RUNNER_VERSION, reason: "" };
   },
   buildLaunch({ run }) {
-    // The key stays in the inherited environment, never in argv. A blank
+    // The key reaches the runner only through its scoped environment, never
+    // argv. A blank
     // model means the adapter's advertised default, the first listed model.
     const model = run.model || this.capabilities.models[0];
     return {

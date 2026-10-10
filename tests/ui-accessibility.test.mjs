@@ -54,11 +54,11 @@ test("core surfaces retain their semantic wiring and narrow-screen fallbacks", a
 
 test("provider controls explain readiness and only offer supported choices", async () => {
   const direct = { id: "anthropic-api", label: "Anthropic API", kind: "direct-provider", available: true, compatible: true, version: "1.0.0",
-    authority: { source: "env", variable: "ANTHROPIC_API_KEY" }, capabilities: { permissionModes: ["read-only"], reasoningEfforts: ["medium"], resume: false } };
+    authority: { source: "env", variable: "OUTRIGHT_ANTHROPIC_API_KEY" }, capabilities: { permissionModes: ["read-only"], reasoningEfforts: ["medium"], resume: false } };
   const oldCodex = { id: "codex", label: "Codex", available: true, compatible: false, reason: "Codex 0.20.0 is not supported" };
   assert.equal(providerOptionLabel(oldCodex), "Codex (unsupported version)");
   assert.equal(providerStatusText(oldCodex), "Codex 0.20.0 is not supported");
-  assert.match(providerStatusText(direct), /Outright-managed via ANTHROPIC_API_KEY · Read only · no session resume/);
+  assert.match(providerStatusText(direct), /Outright-managed via OUTRIGHT_ANTHROPIC_API_KEY · Read only · no session resume/);
   assert.equal(supportsPolicy(direct, "workspace-write"), false);
   assert.deepEqual(withProvider({ provider: "codex", approvalPolicy: "workspace-write", reasoningEffort: "high" }, [direct], "anthropic-api"),
     { provider: "anthropic-api", approvalPolicy: "read-only", reasoningEffort: "medium" });
