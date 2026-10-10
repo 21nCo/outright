@@ -1,0 +1,83 @@
+docs/out-3-execution-adapters.md
+  s_ce12272281eb3b::t_43fee4cd3544ce 1-34
+server/agent-manager.mjs
+  s_ce12272281eb3b::t_d161d228731cee 6,17,362,620-622,626-627,656-659,662-664,904-905,907,1595
+server/agent-manager.test.mjs
+  s_ce12272281eb3b::t_c3f079f626b692 12-16,1241-1242,1502-1523,3606
+server/database.test.mjs
+  s_ce12272281eb3b::t_472998a93a582a 55-72
+server/execution-adapters.test.mjs
+  s_ce12272281eb3b::t_a8021a0ff4cd92 1-234
+server/execution-adapters/anthropic-api-runner.mjs
+  s_ce12272281eb3b::t_31418067fd3639 1-102
+server/execution-adapters/anthropic-api.mjs
+  s_ce12272281eb3b::t_959095b32bd0b4 1-57
+server/execution-adapters/claude.mjs
+  s_ce12272281eb3b::t_a0348025dcaac0 1-60
+server/execution-adapters/codex.mjs
+  s_ce12272281eb3b::t_df9b35222c3b57 1-62
+server/execution-adapters/contract.mjs
+  s_ce12272281eb3b::t_97f2b348ddd0ba 1-142
+server/execution-adapters/index.mjs
+  s_ce12272281eb3b::t_0a0ac1f190fbf3 1-34
+server/outright-runtime.test.mjs
+  s_ce12272281eb3b::t_cec651d291d95d 1166-1167,1464-1514,1523
+src/App.jsx
+  s_ce12272281eb3b::t_a44debe6e0370c 31,1524-1525,1926
+src/components/SettingsDialog.jsx
+  s_ce12272281eb3b::t_794a07347a373e 6,205,207-211
+src/lib/providers.js
+  s_ce12272281eb3b::t_26210eba39a479 1-43
+src/styles.css
+  s_ce12272281eb3b::t_732c243ec91b30 502
+tests/fixtures/execution-adapters/README.md
+  s_ce12272281eb3b::t_e93ff3f60754ff 1-4
+tests/fixtures/execution-adapters/anthropic-api/overloaded.sse
+  s_ce12272281eb3b::t_9353b18da928a9 1-6
+tests/fixtures/execution-adapters/anthropic-api/stream.sse
+  s_ce12272281eb3b::t_e42b7976e8e8dc 1-24
+tests/fixtures/execution-adapters/anthropic-api/unauthorized.json
+  s_ce12272281eb3b::t_e476af31e61ab7 1
+tests/fixtures/execution-adapters/claude/error-result.jsonl
+  s_ce12272281eb3b::t_22ef0bb352c122 1-4
+tests/fixtures/execution-adapters/claude/print.jsonl
+  s_ce12272281eb3b::t_3a68f9a61f3467 1-11
+tests/fixtures/execution-adapters/claude/resume.jsonl
+  s_ce12272281eb3b::t_96ecbff39a21d0 1-21
+tests/fixtures/execution-adapters/claude/version.txt
+  s_ce12272281eb3b::t_b5d36cdf52be40 1
+tests/fixtures/execution-adapters/codex/exec.jsonl
+  s_ce12272281eb3b::t_bbc3512fa309a5 1-14
+tests/fixtures/execution-adapters/codex/failed-turn.jsonl
+  s_ce12272281eb3b::t_4d22e55f3942ef 1-8
+tests/fixtures/execution-adapters/codex/resume.jsonl
+  s_ce12272281eb3b::t_09fb91e6a79661 1-5
+tests/fixtures/execution-adapters/codex/version.txt
+  s_ce12272281eb3b::t_bd4e3d5c591b01 1
+tests/ui-accessibility.test.mjs
+  s_ce12272281eb3b::t_98216ec577918f 5,54-69
+server/database.mjs
+  s_ce12272281eb3b::t_4a27782ac13238 10,57,849,864-867,871,873,2213-2217,2219,2221-2222
+server/outright-runtime.mjs
+  s_ce12272281eb3b::t_87765f82764cd0 9,161-171,609-610,621,798-800
+server/provider-discovery.mjs
+  s_ce12272281eb3b::t_67bc7977fdc197 9-10,39,120-126,136,140,143,147-157,160-161,170,178
+server/provider-discovery.test.mjs
+  s_ce12272281eb3b::t_adad6efe4044f0 263,274,278,290,309,324,341,356,385
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ea7784800e815664a7c7f51bf1233145a555448e",
+  "prompts": {},
+  "sessions": {
+    "s_ce12272281eb3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d2376f8-4af3-4920-96da-dff6a042ab4c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
