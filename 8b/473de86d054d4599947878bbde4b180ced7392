@@ -1,0 +1,39 @@
+server/outright-runtime.test.mjs
+  s_1900bb15a7199a::t_cc4b211895bc29 1530
+docs/out-3-execution-adapters.md
+  s_1900bb15a7199a::t_66ff1c6e4b0202 22,38,44,48
+server/agent-manager.test.mjs
+  s_1900bb15a7199a::t_8835db3ad0e080 1649-1651
+server/database.mjs
+  s_1900bb15a7199a::t_c030efb14c4b5f 10,58,2229-2230,3047
+server/database.test.mjs
+  s_1900bb15a7199a::t_65adf0c0f58b76 86-108
+server/execution-adapters.test.mjs
+  s_1900bb15a7199a::t_8529b4f397f6a1 69-72,251-264
+server/execution-adapters/anthropic-api.mjs
+  s_1900bb15a7199a::t_129f5c0fa283ea 53-58
+server/execution-adapters/codex.mjs
+  s_1900bb15a7199a::t_fba642767f50a1 13-15
+server/execution-adapters/contract.mjs
+  s_1900bb15a7199a::t_01acc873d144bc 138-144,155
+server/execution-adapters/index.mjs
+  s_1900bb15a7199a::t_afa5d7095285b9 6
+tests/fixtures/execution-adapters/anthropic-api/malformed-delta.sse
+  s_1900bb15a7199a::t_bd3a389a0df82d 1-24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8b473de86d054d4599947878bbde4b180ced7392",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
