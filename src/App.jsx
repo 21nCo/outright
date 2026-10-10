@@ -102,7 +102,7 @@ export function App() {
   const [trustRequest, setTrustRequest] = useState(null);
   const [pendingPrompt, setPendingPrompt] = useState(null);
   const [manageChatOpen, setManageChatOpen] = useState(false);
-  const [chatDraft, setChatDraft] = useState({ title: "", providerSessionId: "", provider: "codex", model: "", destination: "" });
+  const [chatDraft, setChatDraft] = useState({ title: "", providerSessionId: "", openedSessionId: "", provider: "codex", model: "", destination: "" });
   const [worktreeDialog, setWorktreeDialog] = useState(null);
   const [worktreeDraft, setWorktreeDraft] = useState({ branch: "", name: "", baseBranch: "HEAD" });
   const [removeWorktreeOpen, setRemoveWorktreeOpen] = useState(false);
@@ -1807,7 +1807,10 @@ export function App() {
   async function archiveConversation() { const updated = await updateConversation({ archived: true }); if (!updated) return; setManageChatOpen(false); }
   async function saveChatSettings(event) {
     event.preventDefault();
-    const { destination, ...patch } = chatDraft;
+    const { destination, openedSessionId, ...patch } = chatDraft;
+    // An untouched session field is not an edit. Sending its value from when
+    // the dialog opened would discard a session the running agent recorded since.
+    if (patch.provider === conversation.provider && patch.providerSessionId === openedSessionId) delete patch.providerSessionId;
     if (!destination || destination === `${conversation.projectId}::${conversation.worktreeId}`) {
       await updateConversation(patch); setManageChatOpen(false); return;
     }
@@ -1851,7 +1854,7 @@ export function App() {
       if (includeTemplates) setToast("Templates updated");
     } catch (nextError) { if (request === settingsRefreshRef.current) setError(nextError.message); }
   }
-  function openManageChat() { if (!conversation || !conversationDetailReady || !isSelectedTarget(conversation)) return; setChatDraft({ title: conversation.title, providerSessionId: conversation.providerSessionId ?? "", provider: conversation.provider, model: conversation.model ?? "", destination: `${conversation.projectId}::${conversation.worktreeId}` }); setManageChatOpen(true); }
+  function openManageChat() { if (!conversation || !conversationDetailReady || !isSelectedTarget(conversation)) return; setChatDraft({ title: conversation.title, providerSessionId: conversation.providerSessionId ?? "", openedSessionId: conversation.providerSessionId ?? "", provider: conversation.provider, model: conversation.model ?? "", destination: `${conversation.projectId}::${conversation.worktreeId}` }); setManageChatOpen(true); }
 
   if (!bootstrap || !project || !worktree) return <LoadingScreen isScanning={isScanning} error={bootstrapError} onRetry={() => {
     setBootstrapError("");

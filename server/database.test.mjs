@@ -83,6 +83,41 @@ test("a conversation's native session is scoped to its provider", () => {
   } finally { database.close(); }
 });
 
+test("a run that finishes late cannot restore a session the chat reset or replaced after launch", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const launch = (title, session) => {
+      const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title, provider: "codex" });
+      if (session) database.updateConversation(conversation.id, { providerSessionId: session });
+      const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: title });
+      database.updateRun(run.id, { status: "running", providerSessionId: session ?? null });
+      return { conversation: database.getConversation(conversation.id), run };
+    };
+    const finish = ({ conversation, run }, session) => database.finishRun(run.id,
+      { status: "completed", finishedAt: new Date().toISOString(), exitCode: 0, providerSessionId: session }, null, { sessionEpoch: conversation.sessionEpoch });
+    const cases = {
+      "switch away and back": (id) => { database.updateConversation(id, { provider: "claude" }); database.updateConversation(id, { provider: "codex" }); },
+      "explicit clear": (id) => database.updateConversation(id, { providerSessionId: null }),
+      "explicit attach": (id) => database.updateConversation(id, { providerSessionId: "session-b" }),
+    };
+    for (const [name, edit] of Object.entries(cases)) {
+      const launched = launch(name, "session-a");
+      const expected = name === "explicit attach" ? "session-b" : null;
+      edit(launched.conversation.id);
+      // Before the epoch fence, either stale write put session-a back.
+      assert.equal(database.adoptConversationSession(launched.conversation.id, { provider: "codex", sessionEpoch: launched.conversation.sessionEpoch, providerSessionId: "session-a" }), false, name);
+      finish(launched, "session-a");
+      assert.equal(database.getConversation(launched.conversation.id).providerSessionId, expected, name);
+      assert.equal(database.getRun(launched.run.id).providerSessionId, "session-a", `${name}: the run keeps its own session`);
+    }
+    // Edits that leave the session alone keep the run's continuity.
+    const untouched = launch("rename", null);
+    database.updateConversation(untouched.conversation.id, { title: "Renamed", pinned: true, provider: "codex", providerSessionId: "" });
+    finish(untouched, "session-new");
+    assert.equal(database.getConversation(untouched.conversation.id).providerSessionId, "session-new");
+  } finally { database.close(); }
+});
+
 test("global search bounds recent text and response bytes while keeping conversation Find available", async () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {

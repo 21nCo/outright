@@ -872,6 +872,13 @@ export function createOutrightDatabase(options = {}) {
         fields.push(`${column} = ?`);
         values.push(typeof effective[key] === "boolean" ? Number(effective[key]) : effective[key]);
       }
+      // A changed provider or session starts a new session epoch. A run
+      // copies its native session to the chat only within the epoch it
+      // launched in, so a late finish cannot undo this edit.
+      if (current && ((effective.provider !== undefined && effective.provider !== current.provider)
+        || (effective.providerSessionId !== undefined && (effective.providerSessionId || null) !== (current.providerSessionId || null)))) {
+        fields.push("session_epoch = session_epoch + 1");
+      }
       if (fields.length) {
         fields.push("updated_at = ?");
         values.push(now(), id);
@@ -1673,6 +1680,8 @@ export function createOutrightDatabase(options = {}) {
         if (!result.changes) return null;
         const conversation = this.getConversation(interrupted.conversationId);
         if (conversation?.provider === interrupted.provider) {
+          // Either decision starts a new session epoch, so a late write from
+          // the interrupted run cannot replace the session chosen here.
           if (decision === "retry") this.updateConversation(interrupted.conversationId, { providerSessionId: null });
           else if (providerSessionId && conversation.providerSessionId !== providerSessionId) this.updateConversation(interrupted.conversationId, { providerSessionId });
         }
@@ -1713,7 +1722,14 @@ export function createOutrightDatabase(options = {}) {
       }
       return this.getRun(id);
     },
-    finishRun(id, patch, transcriptMessage = null) {
+    // Copies a run's native session to its chat only while the chat still
+    // has the run's provider and the session epoch the run launched in.
+    adoptConversationSession(conversationId, { provider, sessionEpoch, providerSessionId }) {
+      if (!Number.isInteger(sessionEpoch) || !providerSessionId) return false;
+      return withinRetainedBudget(() => db.prepare(`UPDATE conversations SET provider_session_id = ?, updated_at = ?
+        WHERE id = ? AND provider = ? AND session_epoch = ? AND deleting = 0`).run(providerSessionId, now(), conversationId, provider, sessionEpoch).changes > 0);
+    },
+    finishRun(id, patch, transcriptMessage = null, { sessionEpoch } = {}) {
       const finish = db.transaction(() => {
         let message = null;
         if (transcriptMessage) {
@@ -1729,9 +1745,7 @@ export function createOutrightDatabase(options = {}) {
         let sessionMetadataRefused = false;
         if (patch.providerSessionId) {
           try {
-            withinRetainedBudget(() => db.prepare(`UPDATE conversations SET provider_session_id = ?, updated_at = ?
-              WHERE id = (SELECT conversation_id FROM runs WHERE id = ?)
-                AND provider = (SELECT provider FROM runs WHERE id = ?)`).run(patch.providerSessionId, now(), id, id));
+            this.adoptConversationSession(run.conversationId, { provider: run.provider, sessionEpoch, providerSessionId: patch.providerSessionId });
           } catch (error) {
             if (error.statusCode !== 507) throw error;
             sessionMetadataRefused = true;
@@ -2216,7 +2230,7 @@ function validateConversationExecution(input) {
 }
 
 function validateConversationPatch(db, api, id, patch) {
-  const current = db.prepare("SELECT archived, deleting, provider FROM conversations WHERE id = ?").get(id);
+  const current = db.prepare("SELECT archived, deleting, provider, provider_session_id AS providerSessionId FROM conversations WHERE id = ?").get(id);
   if (current?.deleting) throw databaseError(409, "Archived conversation deletion is in progress");
   if (patch.provider !== undefined && !EXECUTION_ADAPTER_IDS.includes(patch.provider)) throw databaseError(400, "Provider is not supported");
   validateConversationExecution({ model: patch.model });
@@ -2382,7 +2396,7 @@ function migrate(db) {
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, worktree_path TEXT NOT NULL,
       title TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', provider_session_id TEXT, tab_position INTEGER NOT NULL DEFAULT 0,
-      archived INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, deleting INTEGER NOT NULL DEFAULT 0,
+      session_epoch INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, deleting INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS conversations_scope ON conversations(project_id, worktree_id, archived, updated_at);
@@ -2429,6 +2443,7 @@ function migrate(db) {
   try { db.exec("ALTER TABLE conversations ADD COLUMN tab_position INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE conversations ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
+  try { db.exec("ALTER TABLE conversations ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   prepareVisibleConversationLookup(db);
   prepareRecentTitleLookup(db);
   prepareSearchMessageHeads(db);
@@ -2864,7 +2879,7 @@ function reserveRecoveryHeadroom(db, configured = Number(db.prepare("SELECT valu
 
 function conversationColumns() {
   return `id, project_id AS projectId, worktree_id AS worktreeId, worktree_path AS worktreePath, title, provider, model,
-    provider_session_id AS providerSessionId, archived, pinned, tab_position AS tabPosition, created_at AS createdAt, updated_at AS updatedAt`;
+    provider_session_id AS providerSessionId, session_epoch AS sessionEpoch, archived, pinned, tab_position AS tabPosition, created_at AS createdAt, updated_at AS updatedAt`;
 }
 
 function assertConversationNotDeleting(db, id) {

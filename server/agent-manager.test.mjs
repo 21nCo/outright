@@ -1235,7 +1235,19 @@ function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/
     runs,
     getSettings: () => ({ maxConcurrentRuns: 8 }),
     getConversation: (id) => conversations.get(id),
-    updateConversation: (id, patch) => conversations.set(id, { ...conversations.get(id), ...patch }),
+    updateConversation: (id, patch) => {
+      const current = conversations.get(id);
+      // Mirrors the real session epoch: a provider or session edit fences runs.
+      const edited = (patch.provider !== undefined && patch.provider !== current.provider)
+        || (patch.providerSessionId !== undefined && (patch.providerSessionId || null) !== (current.providerSessionId || null));
+      conversations.set(id, { ...current, ...patch, ...(edited ? { sessionEpoch: (current.sessionEpoch ?? 0) + 1 } : {}) });
+    },
+    adoptConversationSession: (id, { provider, sessionEpoch, providerSessionId }) => {
+      const current = conversations.get(id);
+      if (current?.provider !== provider || current.sessionEpoch !== sessionEpoch) return false;
+      conversations.set(id, { ...current, providerSessionId });
+      return true;
+    },
     getRun: (id) => runs.get(id) ?? null,
     createRun: (run) => {
       // Mirrors the reasoning_effort column default of the real schema.
@@ -1499,6 +1511,44 @@ test("keeps recovered session ids run-local when the conversation switched provi
   child.emit("close", 0, null);
 });
 
+test("a session reset during a run survives the run's late session writes and the next send starts fresh", async () => {
+  for (const reset of ["switch away and back", "explicit clear"]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-session-epoch-"));
+    const database = createOutrightDatabase({ filename: path.join(realpathSync(directory), "outright.db") });
+    const launched = [];
+    const children = [];
+    const manager = createAgentManager({ database, publish: () => {},
+      launchCommand: (command) => { launched.push(command.args); return { executable: process.execPath, args: [], display: "fixture" }; },
+      spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+    try {
+      const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory, title: reset, provider: "codex" });
+      database.updateConversation(conversation.id, { providerSessionId: "019a-session-a" });
+      const first = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "first" });
+      await manager.schedule({ conversation: database.getConversation(conversation.id), run: first });
+      assert.ok(launched[0].includes("019a-session-a"), "control: the first run resumes the attached session");
+      if (reset === "explicit clear") database.updateConversation(conversation.id, { providerSessionId: null });
+      else { database.updateConversation(conversation.id, { provider: "claude" }); database.updateConversation(conversation.id, { provider: "codex" }); }
+      // The session event and the terminal copy both arrive after the reset.
+      children[0].stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: "019a-session-a" })}\n`);
+      await new Promise((resolve) => setImmediate(resolve));
+      children[0].emit("close", 0, null);
+      assert.equal(database.getRun(first.id).status, "completed");
+      assert.equal(database.getRun(first.id).providerSessionId, "019a-session-a", reset);
+      assert.equal(database.getConversation(conversation.id).providerSessionId, null, `${reset}: a stale run restored the discarded session`);
+      const second = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "second" });
+      await manager.schedule({ conversation: database.getConversation(conversation.id), run: second });
+      assert.equal(launched[1].includes("019a-session-a"), false, `${reset}: the next send resumed the discarded session`);
+      children[1].stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: "019a-session-c" })}\n`);
+      children[1].emit("close", 0, null);
+      assert.equal(database.getConversation(conversation.id).providerSessionId, "019a-session-c", "a run in the current epoch still records its session");
+    } finally {
+      await manager.shutdown();
+      await database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
 test("a provider-emitted session id that could never be resumed is not stored", async () => {
   const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex", providerSessionId: null });
   const child = fakeChild();
@@ -1594,7 +1644,7 @@ test("a direct-provider credential reaches only its own adapter's spawn", async 
 
 test("a full conversation metadata budget does not fail a provider session event", async () => {
   const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex", providerSessionId: null });
-  database.updateConversation = () => { const error = new Error("Retained history is full"); error.statusCode = 507; throw error; };
+  database.adoptConversationSession = () => { const error = new Error("Retained history is full"); error.statusCode = 507; throw error; };
   const child = fakeChild();
   const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
   const run = database.createRun(codexRun("quota-session"));
@@ -1610,7 +1660,7 @@ test("a full conversation metadata budget does not fail a provider session event
 test("a retained-budget session refusal is final and arms no storage retry for the live run", async () => {
   const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex", providerSessionId: null });
   let conversationWrites = 0;
-  database.updateConversation = () => {
+  database.adoptConversationSession = () => {
     conversationWrites += 1;
     throw Object.assign(new Error("Retained history is full"), { statusCode: 507 });
   };
@@ -1635,11 +1685,11 @@ test("a retained-budget session refusal is final and arms no storage retry for t
 
 test("a provider metadata storage fault retries without ending its live provider", async () => {
   const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex" });
-  const updateConversation = database.updateConversation;
+  const adoptConversationSession = database.adoptConversationSession;
   let refused = true;
-  database.updateConversation = (...args) => {
+  database.adoptConversationSession = (...args) => {
     if (refused) throw Object.assign(new Error("metadata write failed"), { code: "SQLITE_IOERR_WRITE" });
-    return updateConversation(...args);
+    return adoptConversationSession(...args);
   };
   const child = fakeChild();
   const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
@@ -3465,6 +3515,7 @@ const database = {
   getSettings: () => ({ maxConcurrentRuns: 8 }),
   getConversation: (id) => ({ id, worktreePath: "/tmp" }),
   updateConversation: () => {},
+  adoptConversationSession: () => false,
   getRun: (id) => runs.get(id) ?? null,
   createRun: (run) => { runs.set(run.id, run); return run; },
   updateRun: (id, patch) => { runs.set(id, { ...runs.get(id), ...patch }); return runs.get(id); },

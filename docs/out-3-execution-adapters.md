@@ -25,6 +25,8 @@ Normalized events are `session`, `assistant.delta`, `assistant.message`, `tool.s
 
 Switching a conversation's provider clears its stored session unless the same edit attaches a new one. Attaching a session to a conversation whose adapter cannot resume returns `409 PROVIDER_RESUME_UNSUPPORTED`. Attach, launch and provider-emitted session ids all use the same format rule. An attached id that breaks it returns `400 PROVIDER_SESSION_INVALID`, and an emitted id that breaks it is not stored, so a stored session can always be resumed.
 
+A conversation's session belongs to a session epoch. Any edit that changes its provider or session, including a recovery retry or resume, starts a new epoch. A run reads the epoch at launch, together with the session it resumes, and copies its native session back to the conversation only while that epoch is current, both when the provider emits the id and when the run finishes. A switch away and back, an explicit clear or an attach made during a run therefore survives the run's late writes, and the next send starts from the conversation's session, not the discarded one. The run row always keeps its own native session. Edits to other fields, such as the title, do not start an epoch, and the conversation settings dialog sends the session field only when the user changes it.
+
 ## Credentials and environment
 
 Each run spawn gets a scoped environment. `OUTRIGHT_*` runtime settings are never inherited. A direct provider receives only the `OUTRIGHT_*` variables it declares.

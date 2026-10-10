@@ -295,6 +295,43 @@ async function chatSettingsArchiveRegression() {
   assert(!host.querySelector('#conversation-panel')?.hasAttribute('aria-labelledby'), "Empty conversation panel still references an archived tab");
 }
 
+async function chatSettingsSessionEditRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  let current = { ...chats.A, providerSessionId: "session-A" };
+  const patches = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [current] });
+    if (url.pathname === "/api/conversations/chat-A" && options.method === "PATCH") {
+      const patch = JSON.parse(options.body);
+      patches.push(patch);
+      current = { ...current, ...patch, providerSessionId: patch.providerSessionId === undefined ? current.providerSessionId : patch.providerSessionId || null };
+      return response(current);
+    }
+    if (url.pathname === "/api/conversations/chat-A") return response(current);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.conversation-header h1')?.textContent === chats.A.title, "session edit fixture loaded");
+  const save = async (edit, label) => {
+    host.querySelector('.conversation-meta button').click();
+    await until(() => document.querySelector('#chat-settings-session')?.value === (current.providerSessionId ?? ""), `${label}: dialog opened`);
+    edit();
+    await settle();
+    [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Save").click();
+    await until(() => patches.length && !document.querySelector('[role="dialog"]'), `${label}: saved`);
+    return patches.splice(0).at(-1);
+  };
+  // Before, every Save sent the session from when the dialog opened, which
+  // discards a session the running agent recorded meanwhile.
+  const renamed = await save(() => setControlValue(document.querySelector('#chat-settings-title'), "Renamed"), "rename");
+  assert(renamed.title === "Renamed" && !("providerSessionId" in renamed), `A rename sent the session field: ${JSON.stringify(renamed)}`);
+  const cleared = await save(() => setControlValue(document.querySelector('#chat-settings-session'), ""), "clear");
+  assert(cleared.providerSessionId === "", `Clearing the session did not send it: ${JSON.stringify(cleared)}`);
+}
+
 async function settingsRetentionDraftRegression() {
   root.render(null);
   await settle();
@@ -5386,6 +5423,7 @@ try {
     ["same-worktree chat selection", sameWorktreeChatSelectionRegression, "click, keyboard and created-chat selection load only the selected detail and fence sends"],
     ["chat tab controls", chatTabControlRegression, "chat tab navigation ignores nested archive controls"],
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
+    ["chat settings session edit", chatSettingsSessionEditRegression, "conversation settings send the session only when the user edits it"],
     ["settings retention draft", settingsRetentionDraftRegression, "missing archived data stays safe and cancel, cleanup and save use the persisted retention age"],
     ["settings save session fence", settingsSaveSessionFenceRegression, "delayed GET and PATCH save completions cannot change a reopened Settings dialog"],
     ["settings shared refresh order", settingsSharedRefreshOrderRegression, "a settings save preserves an in-flight template refresh without reverting the new quota"],

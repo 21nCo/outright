@@ -602,11 +602,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     try {
       database.updateRun(state.run.id, { providerSessionId: sessionId });
       // A recovered run retains its immutable provider even when its chat
-      // changes providers; never replace another provider's resume token.
-      const current = database.getConversation(state.conversation.id);
-      if (current?.provider === state.run.provider) {
-        database.updateConversation(state.conversation.id, { providerSessionId: sessionId });
-      }
+      // changes providers, and a provider or session edit after launch wins.
+      // The run row always keeps its own token.
+      database.adoptConversationSession(state.conversation.id, { provider: state.run.provider, sessionEpoch: state.sessionEpoch, providerSessionId: sessionId });
       if (state.pendingSessionId === sessionId) state.pendingSessionId = null;
       return true;
     } catch (error) {
@@ -711,7 +709,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       status, finishedAt, exitCode: terminalExitCode, error: message || null, pid: null,
       ...(state.run.providerSessionId ? { providerSessionId: state.run.providerSessionId } : {}),
       ...(state.transcriptOmitted ? { transcriptOmitted: true } : {}),
-    }, result.transcriptMessage);
+    }, result.transcriptMessage, { sessionEpoch: state.sessionEpoch });
   }
 
   function deferFailedTerminalOutcome(state, exitCode, error, writeError, journalBecameDurable) {
@@ -918,6 +916,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // the conversation still advertises the interrupted one.
     // A native session belongs to the provider that created it. Never hand
     // another provider's resume token to this run's adapter.
+    // The epoch read with the session this run launches from fences every
+    // later copy of its native session back to the chat.
+    state.sessionEpoch = current.sessionEpoch;
     if (entry.providerSessionId !== undefined) state.conversation = { ...current, providerSessionId: entry.providerSessionId };
     else if (entry.forceFreshSession || current.provider !== entry.run.provider) state.conversation = { ...current, providerSessionId: null };
     else state.conversation = current;
