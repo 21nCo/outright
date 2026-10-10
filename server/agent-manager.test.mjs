@@ -9,7 +9,11 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { AGENT_SUPERVISOR, buildProviderCommand, consumeBoundedLines, createAgentManager as createRuntimeAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_AUTHORIZED_CONTROL, LAUNCH_WRAPPER_SOURCE, normalizeClaude, normalizeCodex, processGroupAlive, terminateTree } from "./agent-manager.mjs";
+import { AGENT_SUPERVISOR, buildProviderCommand, consumeBoundedLines, createAgentManager as createRuntimeAgentManager, defaultGroupMembers, escalateTree, hardenWindowsLaunchDirectory, LAUNCH_AUTHORIZED_CONTROL, LAUNCH_WRAPPER_SOURCE, processGroupAlive, terminateTree } from "./agent-manager.mjs";
+import { claudeAdapter } from "./execution-adapters/claude.mjs";
+import { codexAdapter } from "./execution-adapters/codex.mjs";
+const normalizeClaude = (raw) => claudeAdapter.normalize(raw);
+const normalizeCodex = (raw) => codexAdapter.normalize(raw);
 import { streamingTextAfterRuntimeEvent } from "../src/recovery-policy.js";
 import { createOutrightDatabase } from "./database.mjs";
 import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
@@ -1231,10 +1235,23 @@ function fakeDatabase(initialConversation = { id: "conv-1", worktreePath: "/tmp/
     runs,
     getSettings: () => ({ maxConcurrentRuns: 8 }),
     getConversation: (id) => conversations.get(id),
-    updateConversation: (id, patch) => conversations.set(id, { ...conversations.get(id), ...patch }),
+    updateConversation: (id, patch) => {
+      const current = conversations.get(id);
+      // Mirrors the real session epoch: a provider or session edit fences runs.
+      const edited = (patch.provider !== undefined && patch.provider !== current.provider)
+        || (patch.providerSessionId !== undefined && (patch.providerSessionId || null) !== (current.providerSessionId || null));
+      conversations.set(id, { ...current, ...patch, ...(edited ? { sessionEpoch: (current.sessionEpoch ?? 0) + 1 } : {}) });
+    },
+    adoptConversationSession: (id, { provider, sessionEpoch, providerSessionId }) => {
+      const current = conversations.get(id);
+      if (current?.provider !== provider || current.sessionEpoch !== sessionEpoch) return false;
+      conversations.set(id, { ...current, providerSessionId });
+      return true;
+    },
     getRun: (id) => runs.get(id) ?? null,
     createRun: (run) => {
-      const stored = { ...run, worktreePath: run.worktreePath ?? conversations.get(run.conversationId)?.worktreePath };
+      // Mirrors the reasoning_effort column default of the real schema.
+      const stored = { reasoningEffort: "medium", ...run, worktreePath: run.worktreePath ?? conversations.get(run.conversationId)?.worktreePath };
       runs.set(run.id, stored);
       return stored;
     },
@@ -1494,9 +1511,196 @@ test("keeps recovered session ids run-local when the conversation switched provi
   child.emit("close", 0, null);
 });
 
+test("a session reset during a run survives the run's late session writes and the next send starts fresh", async () => {
+  for (const reset of ["switch away and back", "explicit clear"]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-session-epoch-"));
+    const database = createOutrightDatabase({ filename: path.join(realpathSync(directory), "outright.db") });
+    const launched = [];
+    const children = [];
+    const manager = createAgentManager({ database, publish: () => {},
+      launchCommand: (command) => { launched.push(command.args); return { executable: process.execPath, args: [], display: "fixture" }; },
+      spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+    try {
+      const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory, title: reset, provider: "codex" });
+      database.updateConversation(conversation.id, { providerSessionId: "019a-session-a" });
+      const first = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "first" });
+      await manager.schedule({ conversation: database.getConversation(conversation.id), run: first });
+      assert.ok(launched[0].includes("019a-session-a"), "control: the first run resumes the attached session");
+      if (reset === "explicit clear") database.updateConversation(conversation.id, { providerSessionId: null });
+      else { database.updateConversation(conversation.id, { provider: "claude" }); database.updateConversation(conversation.id, { provider: "codex" }); }
+      // The session event and the terminal copy both arrive after the reset.
+      children[0].stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: "019a-session-a" })}\n`);
+      await new Promise((resolve) => setImmediate(resolve));
+      children[0].emit("close", 0, null);
+      assert.equal(database.getRun(first.id).status, "completed");
+      assert.equal(database.getRun(first.id).providerSessionId, "019a-session-a", reset);
+      assert.equal(database.getConversation(conversation.id).providerSessionId, null, `${reset}: a stale run restored the discarded session`);
+      const second = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "second" });
+      await manager.schedule({ conversation: database.getConversation(conversation.id), run: second });
+      assert.equal(launched[1].includes("019a-session-a"), false, `${reset}: the next send resumed the discarded session`);
+      children[1].stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: "019a-session-c" })}\n`);
+      children[1].emit("close", 0, null);
+      assert.equal(database.getConversation(conversation.id).providerSessionId, "019a-session-c", "a run in the current epoch still records its session");
+    } finally {
+      await manager.shutdown();
+      await database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a session attached while a recovery run waits to launch survives that run's late session writes", async () => {
+  for (const policy of ["resume-session", "retry"]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-recovery-epoch-"));
+    const database = createOutrightDatabase({ filename: path.join(realpathSync(directory), "outright.db") });
+    const launched = [];
+    const children = [];
+    let gate = null;
+    const manager = createAgentManager({ database, publish: () => {},
+      validateConversation: async () => { await gate?.promise; return () => {}; },
+      launchCommand: (command) => { launched.push(command.args); return { executable: process.execPath, args: [], display: "fixture" }; },
+      spawnProcess: () => { const child = fakeChild(); child.once("close", () => { child.exited = true; }); children.push(child); return child; } });
+    try {
+      const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory, title: policy, provider: "codex" });
+      database.updateConversation(conversation.id, { providerSessionId: "019a-session-a" });
+      const interrupted = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+      database.updateRun(interrupted.id, { status: "interrupted", recoveryClass: "never-started", providerSessionId: "019a-session-a" });
+      const recovery = database.beginInterruptedRunRecovery(interrupted.id, policy, { providerSessionId: "019a-session-a" });
+      // The recovery run is held before launch while the user attaches X.
+      let release;
+      gate = { promise: new Promise((resolve) => { release = resolve; }) };
+      const scheduled = manager.schedule({ conversation: recovery.conversation, run: recovery.run,
+        forceFreshSession: policy === "retry", providerSessionId: policy === "retry" ? null : "019a-session-a" });
+      await new Promise((resolve) => setImmediate(resolve));
+      database.updateConversation(conversation.id, { providerSessionId: "019a-session-x" });
+      gate = null;
+      release();
+      await scheduled;
+      const runSession = policy === "retry" ? "019a-session-s" : "019a-session-a";
+      assert.equal(launched[0].includes("019a-session-a"), policy === "resume-session", "control: recovery launches from its decided session");
+      assert.equal(launched[0].includes("019a-session-x"), false);
+      children[0].stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: runSession })}\n`);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(database.getConversation(conversation.id).providerSessionId, "019a-session-x", `${policy}: the session event replaced the attached session`);
+      children[0].emit("close", 0, null);
+      assert.equal(database.getRun(recovery.run.id).status, "completed");
+      assert.equal(database.getRun(recovery.run.id).providerSessionId, runSession, policy);
+      assert.equal(database.getConversation(conversation.id).providerSessionId, "019a-session-x", `${policy}: the finish replaced the attached session`);
+      const next = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "next" });
+      await manager.schedule({ conversation: database.getConversation(conversation.id), run: next });
+      assert.ok(launched[1].includes("019a-session-x"), "the next send resumes the attached session");
+      children[1].stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: "019a-session-c" })}\n`);
+      children[1].emit("close", 0, null);
+      assert.equal(database.getConversation(conversation.id).providerSessionId, "019a-session-c", "an ordinary send still records its session");
+    } finally {
+      // A failed assertion must not surface as a shutdown timeout.
+      for (const child of children) if (!child.exited) child.emit("close", 0, null);
+      await manager.shutdown();
+      await database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a provider-emitted session id that could never be resumed is not stored", async () => {
+  const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex", providerSessionId: null });
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  const run = database.createRun(codexRun("run-1"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  // Before, any id up to 4096 bytes was stored and every later send was rejected.
+  for (const id of ["--resume-last", " leading-space", "s".repeat(300)]) child.stdout.write(JSON.stringify({ type: "thread.started", thread_id: id }) + "\n");
+  assert.equal(database.getRun(run.id).providerSessionId ?? null, null);
+  assert.equal(database.getConversation("conv-1").providerSessionId, null);
+  child.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "019a-valid" }) + "\n");
+  assert.equal(database.getRun(run.id).providerSessionId, "019a-valid");
+  child.emit("close", 0, null);
+});
+
+test("a run never resumes another provider's session and reports its normalized failure", async () => {
+  const claudeSession = "a1d55507-d4ad-43ef-8154-19b111bbed42";
+  const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "claude", providerSessionId: claudeSession });
+  const launched = [];
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child,
+    launchCommand: async (command) => { launched.push(command); return { executable: "fake-owner", args: [], display: command.display }; } });
+  try {
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.createRun(codexRun("run-1")) });
+    // Before adapters the scheduler passed the chat's Claude token to `codex exec resume`.
+    assert.deepEqual(launched[0].args.slice(0, 2), ["exec", "--json"]);
+    assert.equal(launched[0].args.includes(claudeSession), false);
+    child.stderr.write("Reading additional input from stdin...\n");
+    child.stdout.write("null\n[1]\n");
+    child.stdout.write(`${JSON.stringify({ type: "turn.failed", error: { message: "The selected model is not supported" } })}\n`);
+    await new Promise((resolve) => setImmediate(resolve));
+    child.emit("close", 1, null);
+    assert.equal(database.getRun("run-1").status, "failed");
+    assert.equal(database.getRun("run-1").error, "The selected model is not supported", "the provider's failure outranks stderr noise");
+  } finally { await manager.shutdown(); }
+});
+
+test("a terminal provider failure fails the run even when the process exits 0", async () => {
+  const cases = [
+    { provider: "claude", lines: [{ type: "result", subtype: "success", is_error: true, result: "Claude Code reported an API error" }], status: "failed", error: "Claude Code reported an API error" },
+    { provider: "anthropic-api", lines: [{ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }], status: "failed", error: "Overloaded" },
+    // An answer cut off at the output cap is not a completed run.
+    { provider: "anthropic-api", lines: [{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial" } }, { type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: { output_tokens: 8192 } }, { type: "message_stop" }],
+      status: "failed", error: "Anthropic API stopped at the 8192-token output limit; the answer is truncated" },
+    // A text delta without text is an incomplete answer, not a completed one.
+    { provider: "anthropic-api", lines: [{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial" } }, { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: 7 } }, { type: "message_stop" }],
+      status: "failed", error: "Anthropic API sent a malformed text delta; the answer is incomplete" },
+    // A retried Codex stream notice is not the end of the turn.
+    { provider: "codex", lines: [{ type: "error", message: "Reconnecting... 1/5" }, { type: "item.completed", item: { type: "agent_message", text: "done" } }], status: "completed", error: null },
+  ];
+  for (const { provider, lines, status, error } of cases) {
+    const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider });
+    const child = fakeChild();
+    const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child,
+      launchCommand: async (command) => ({ executable: "fake-owner", args: [], display: command.display }) });
+    try {
+      const run = database.createRun({ ...codexRun(`run-${provider}`), provider });
+      await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+      for (const line of lines) child.stdout.write(`${JSON.stringify(line)}\n`);
+      await new Promise((resolve) => setImmediate(resolve));
+      child.emit("close", 0, null);
+      // Before, exit 0 always completed the run and discarded the failure.
+      assert.equal(database.getRun(run.id).status, status, provider);
+      assert.equal(database.getRun(run.id).error || null, error, provider);
+    } finally { await manager.shutdown(); }
+  }
+});
+
+test("a direct-provider credential reaches only its own adapter's spawn", async () => {
+  const environment = { PATH: "/usr/bin", ANTHROPIC_API_KEY: "harness-own-key", OUTRIGHT_ANTHROPIC_API_KEY: "direct-key",
+    OUTRIGHT_ANTHROPIC_BASE_URL: "http://127.0.0.1:9", OUTRIGHT_OTHER: "runtime-only" };
+  for (const provider of ["claude", "codex", "anthropic-api"]) {
+    const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider });
+    const spawned = [];
+    const child = fakeChild();
+    const manager = createAgentManager({ database, publish: () => {}, environment,
+      spawnProcess: (executable, args, options) => { spawned.push(options.env); return child; },
+      launchCommand: async (command) => ({ executable: "fake-owner", args: [], display: command.display }) });
+    try {
+      await manager.schedule({ conversation: database.getConversation("conv-1"), run: database.createRun({ ...codexRun(`run-${provider}`), provider }) });
+      const env = spawned[0];
+      // Before scoping, every harness inherited the direct provider's key and endpoint.
+      const direct = provider === "anthropic-api";
+      assert.equal(env.OUTRIGHT_ANTHROPIC_API_KEY, direct ? "direct-key" : undefined, provider);
+      assert.equal(env.OUTRIGHT_ANTHROPIC_BASE_URL, direct ? "http://127.0.0.1:9" : undefined, provider);
+      assert.equal(env.OUTRIGHT_OTHER, undefined, "other runtime settings stay private");
+      // A harness keeps the authority its user configured for that CLI.
+      assert.equal(env.ANTHROPIC_API_KEY, "harness-own-key");
+      assert.equal(env.PATH, "/usr/bin");
+    } finally {
+      child.emit("close", 0, null);
+      await manager.shutdown();
+    }
+  }
+});
+
 test("a full conversation metadata budget does not fail a provider session event", async () => {
   const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex", providerSessionId: null });
-  database.updateConversation = () => { const error = new Error("Retained history is full"); error.statusCode = 507; throw error; };
+  database.adoptConversationSession = () => { const error = new Error("Retained history is full"); error.statusCode = 507; throw error; };
   const child = fakeChild();
   const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
   const run = database.createRun(codexRun("quota-session"));
@@ -1512,7 +1716,7 @@ test("a full conversation metadata budget does not fail a provider session event
 test("a retained-budget session refusal is final and arms no storage retry for the live run", async () => {
   const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex", providerSessionId: null });
   let conversationWrites = 0;
-  database.updateConversation = () => {
+  database.adoptConversationSession = () => {
     conversationWrites += 1;
     throw Object.assign(new Error("Retained history is full"), { statusCode: 507 });
   };
@@ -1537,11 +1741,11 @@ test("a retained-budget session refusal is final and arms no storage retry for t
 
 test("a provider metadata storage fault retries without ending its live provider", async () => {
   const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex" });
-  const updateConversation = database.updateConversation;
+  const adoptConversationSession = database.adoptConversationSession;
   let refused = true;
-  database.updateConversation = (...args) => {
+  database.adoptConversationSession = (...args) => {
     if (refused) throw Object.assign(new Error("metadata write failed"), { code: "SQLITE_IOERR_WRITE" });
-    return updateConversation(...args);
+    return adoptConversationSession(...args);
   };
   const child = fakeChild();
   const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
@@ -3367,6 +3571,7 @@ const database = {
   getSettings: () => ({ maxConcurrentRuns: 8 }),
   getConversation: (id) => ({ id, worktreePath: "/tmp" }),
   updateConversation: () => {},
+  adoptConversationSession: () => false,
   getRun: (id) => runs.get(id) ?? null,
   createRun: (run) => { runs.set(run.id, run); return run; },
   updateRun: (id, patch) => { runs.set(id, { ...runs.get(id), ...patch }); return runs.get(id); },
@@ -3576,7 +3781,7 @@ const waitForReady = async (runId) => {
   throw new Error("the provider/descendant pair never became signal-ready");
 };
 const schedule = async (runId) => {
-  const run = database.createRun({ id: runId, conversationId: "conv-1", provider: "codex", prompt: "p", approvalPolicy: "read-only" });
+  const run = database.createRun({ id: runId, conversationId: "conv-1", provider: "codex", prompt: "p", approvalPolicy: "read-only", reasoningEffort: "medium" });
   await agent.schedule({ conversation: database.getConversation("conv-1"), run });
   return waitForReady(runId);
 };

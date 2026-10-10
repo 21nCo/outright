@@ -209,6 +209,23 @@ test("successful version checks also close their detached helper tree", { skip: 
   }
 });
 
+test("a harness version probe never receives a direct provider's credential", { skip: process.platform === "win32" }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-env-"));
+  const executable = path.join(directory, "env-probe");
+  writeFileSync(executable, "#!/bin/sh\necho \"version ${OUTRIGHT_ANTHROPIC_API_KEY:-absent} ${OUTRIGHT_ANTHROPIC_BASE_URL:-absent} ${outright_anthropic_api_key:-absent} ${ANTHROPIC_API_KEY:-absent}\"\n");
+  chmodSync(executable, 0o755);
+  const variables = { OUTRIGHT_ANTHROPIC_API_KEY: "direct-key", OUTRIGHT_ANTHROPIC_BASE_URL: "https://direct.example", outright_anthropic_api_key: "direct-lower", ANTHROPIC_API_KEY: "harness-own-key" };
+  const saved = Object.fromEntries(Object.keys(variables).map((name) => [name, process.env[name]]));
+  Object.assign(process.env, variables);
+  try {
+    // Before the shared filter the probe inherited the runtime's whole environment.
+    assert.equal((await defaultProbe(executable)).trim(), "version absent absent absent harness-own-key");
+  } finally {
+    for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("a new-session helper cannot survive a completed provider probe", { skip: process.platform === "win32" }, async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-session-"));
   const executable = path.join(directory, "session-probe");
@@ -260,7 +277,7 @@ test("provider reads stay responsive while an asynchronous probe is pending", as
     probe: (id) => {
       calls += 1;
       if (id === "claude") return Promise.reject(new Error("not installed"));
-      if (calls > 2) return Promise.resolve("codex 1.2.3");
+      if (calls > 2) return Promise.resolve("codex-cli 0.162.1");
       return new Promise((resolve) => { finish = resolve; });
     },
     onChange: (providers) => changes.push(providers),
@@ -271,11 +288,11 @@ test("provider reads stay responsive while an asynchronous probe is pending", as
     assert.equal(calls, 2);
     const available = discovery.available("codex");
     assert.equal(calls, 2, "concurrent authorization shares the in-flight probe");
-    finish("codex 1.2.3");
+    finish("codex-cli 0.162.1");
     assert.equal(await available, true);
     assert.equal(calls, 2, "a successful in-flight probe must authorize without a second serial probe");
     assert.equal(await discovery.available("claude"), false);
-    assert.equal(discovery.list().find((item) => item.id === "codex").version, "codex 1.2.3");
+    assert.equal(discovery.list().find((item) => item.id === "codex").version, "0.162.1", "the snapshot reports the parsed CLI version");
     assert.ok(changes.length >= 1);
   } finally { discovery.close(); }
 });
@@ -287,7 +304,7 @@ test("a stale unavailable provider is probed again on the first authorization", 
     if (id !== "codex") throw new Error("missing");
     probes += 1;
     if (!installed) throw new Error("missing");
-    return "codex ready";
+    return "codex-cli 0.162.1";
   } });
   try {
     await discovery.refresh();
@@ -306,7 +323,7 @@ test("authorization retries a negative probe that was already in flight before i
     if (id !== "codex") throw new Error("missing");
     calls += 1;
     if (calls === 1) { await new Promise((resolve) => { release = resolve; }); throw new Error("old negative"); }
-    return "installed";
+    return "codex-cli 0.162.1";
   } });
   try {
     await Promise.resolve();
@@ -321,7 +338,7 @@ test("authorization rechecks a positive snapshot after removal and recovers afte
   let state = "installed";
   const discovery = createProviderDiscovery({ probe: async (id) => {
     if (id !== "codex" || state !== "installed") throw new Error("CLI unavailable");
-    return "codex ready";
+    return "codex-cli 0.162.1";
   } });
   try {
     await discovery.refresh();
@@ -338,7 +355,7 @@ test("authorization rechecks a positive snapshot after removal and recovers afte
 test("a slow unrelated CLI cannot delay authorization of the requested provider", async () => {
   let releaseSibling;
   const discovery = createProviderDiscovery({ probe: (id) => id === "codex"
-    ? Promise.resolve("codex ready")
+    ? Promise.resolve("codex-cli 0.162.1")
     : new Promise((resolve) => { releaseSibling = resolve; }) });
   try {
     await Promise.resolve(); // Start background display discovery with both CLIs.
@@ -353,7 +370,7 @@ test("a slow unrelated CLI cannot delay authorization of the requested provider"
 
 test("provider checks are bounded after shutdown and stale cache refreshes without blocking reads", async () => {
   let calls = 0;
-  const discovery = createProviderDiscovery({ probe: async () => { calls += 1; return "v1"; }, refreshMs: 1 });
+  const discovery = createProviderDiscovery({ probe: async () => { calls += 1; return "codex-cli 0.162.1"; }, refreshMs: 1 });
   try {
     await discovery.refresh();
     const first = calls;
@@ -382,7 +399,7 @@ test("the periodic display tick observes install and removal after a slow initia
       if (id !== "codex") throw new Error("missing");
       if (calls.filter((item) => item === id).length === 1) await new Promise((resolve) => { releaseInitial = resolve; });
       if (!installed) throw new Error("missing");
-      return "codex ready";
+      return "codex-cli 0.162.1";
     },
   });
   try {

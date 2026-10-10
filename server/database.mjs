@@ -7,6 +7,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import { foldFindText } from "../src/lib/find-text.js";
+import { EXECUTION_ADAPTER_IDS, findExecutionAdapter, isModelName, isProviderSessionId, MODEL_NAME_REQUIREMENT } from "./execution-adapters/index.mjs";
 import { RESOURCE_BUDGETS, RETAINED_MESSAGE_FIELDS, RETAINED_ROW_OVERHEAD_BYTES } from "./resource-budgets.mjs";
 import { allocatedDatabaseUsage, archiveShadowPaths, beginArchiveShadow, recoverArchiveShadow } from "./archive-shadow.mjs";
 import { readRunOutcome, removeRunOutcome, saveRunOutcome } from "./run-outcome-journal.mjs";
@@ -53,8 +54,8 @@ const RETAINED_COLUMNS = [
 const RUN_RETAINED_FIELDS = RETAINED_COLUMNS.find(([name]) => name === "runs")[1];
 
 const SETTING_RULES = {
-  provider: (value) => typeof value === "string" && ["codex", "claude"].includes(value),
-  model: (value) => typeof value === "string" && value.length <= 200,
+  provider: (value) => EXECUTION_ADAPTER_IDS.includes(value),
+  model: isModelName,
   reasoningEffort: (value) => ["low", "medium", "high", "xhigh"].includes(value),
   approvalPolicy: (value) => ["read-only", "workspace-write", "danger-full-access"].includes(value),
   editor: (value) => ["zed", "code", "cursor", "finder"].includes(value),
@@ -845,6 +846,7 @@ export function createOutrightDatabase(options = {}) {
       return db.prepare(`SELECT ${conversationColumns()} FROM conversations WHERE id = ? AND deleting = 0`).get(id);
     },
     createConversation(input) {
+      validateConversationExecution(input);
       if (retainedBytes(db) >= this.getSettings().maxRetainedMiB * 1024 * 1024) {
         throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
       }
@@ -859,12 +861,23 @@ export function createOutrightDatabase(options = {}) {
     updateConversation(id, patch) {
       const { current, archiveOnly } = validateConversationPatch(db, this, id, patch);
       if (archiveOnly && current?.archived) return this.getConversation(id);
+      // A native session belongs to the provider that created it. Switching
+      // providers starts a new session unless the same edit attaches one.
+      const effective = patch.provider !== undefined && current && patch.provider !== current.provider && patch.providerSessionId === undefined
+        ? { ...patch, providerSessionId: null } : patch;
       const fields = [];
       const values = [];
       for (const [key, column] of Object.entries({ title: "title", provider: "provider", model: "model", archived: "archived", pinned: "pinned", providerSessionId: "provider_session_id", tabPosition: "tab_position" })) {
-        if (patch[key] === undefined) continue;
+        if (effective[key] === undefined) continue;
         fields.push(`${column} = ?`);
-        values.push(typeof patch[key] === "boolean" ? Number(patch[key]) : patch[key]);
+        values.push(typeof effective[key] === "boolean" ? Number(effective[key]) : effective[key]);
+      }
+      // A changed provider or session starts a new session epoch. A run
+      // copies its native session to the chat only within the epoch it
+      // launched in, so a late finish cannot undo this edit.
+      if (current && ((effective.provider !== undefined && effective.provider !== current.provider)
+        || (effective.providerSessionId !== undefined && (effective.providerSessionId || null) !== (current.providerSessionId || null)))) {
+        fields.push("session_epoch = session_epoch + 1");
       }
       if (fields.length) {
         fields.push("updated_at = ?");
@@ -1667,6 +1680,8 @@ export function createOutrightDatabase(options = {}) {
         if (!result.changes) return null;
         const conversation = this.getConversation(interrupted.conversationId);
         if (conversation?.provider === interrupted.provider) {
+          // Either decision starts a new session epoch, so a late write from
+          // the interrupted run cannot replace the session chosen here.
           if (decision === "retry") this.updateConversation(interrupted.conversationId, { providerSessionId: null });
           else if (providerSessionId && conversation.providerSessionId !== providerSessionId) this.updateConversation(interrupted.conversationId, { providerSessionId });
         }
@@ -1707,7 +1722,14 @@ export function createOutrightDatabase(options = {}) {
       }
       return this.getRun(id);
     },
-    finishRun(id, patch, transcriptMessage = null) {
+    // Copies a run's native session to its chat only while the chat still
+    // has the run's provider and the session epoch the run launched in.
+    adoptConversationSession(conversationId, { provider, sessionEpoch, providerSessionId }) {
+      if (!Number.isInteger(sessionEpoch) || !providerSessionId) return false;
+      return withinRetainedBudget(() => db.prepare(`UPDATE conversations SET provider_session_id = ?, updated_at = ?
+        WHERE id = ? AND provider = ? AND session_epoch = ? AND deleting = 0`).run(providerSessionId, now(), conversationId, provider, sessionEpoch).changes > 0);
+    },
+    finishRun(id, patch, transcriptMessage = null, { sessionEpoch } = {}) {
       const finish = db.transaction(() => {
         let message = null;
         if (transcriptMessage) {
@@ -1723,9 +1745,7 @@ export function createOutrightDatabase(options = {}) {
         let sessionMetadataRefused = false;
         if (patch.providerSessionId) {
           try {
-            withinRetainedBudget(() => db.prepare(`UPDATE conversations SET provider_session_id = ?, updated_at = ?
-              WHERE id = (SELECT conversation_id FROM runs WHERE id = ?)
-                AND provider = (SELECT provider FROM runs WHERE id = ?)`).run(patch.providerSessionId, now(), id, id));
+            this.adoptConversationSession(run.conversationId, { provider: run.provider, sessionEpoch, providerSessionId: patch.providerSessionId });
           } catch (error) {
             if (error.statusCode !== 507) throw error;
             sessionMetadataRefused = true;
@@ -2204,15 +2224,29 @@ function markArchivedForDeletion(db, id, automatic, cutoff) {
   }).immediate();
 }
 
+function validateConversationExecution(input) {
+  if (input.provider != null && input.provider !== "" && !EXECUTION_ADAPTER_IDS.includes(input.provider)) throw databaseError(400, "Provider is not supported");
+  // Launch applies the same rule, so a saved model is never refused at send.
+  if (input.model != null && !isModelName(input.model)) throw databaseError(400, MODEL_NAME_REQUIREMENT, { code: "PROVIDER_CONFIGURATION_INVALID" });
+}
+
 function validateConversationPatch(db, api, id, patch) {
-  const current = db.prepare("SELECT archived, deleting FROM conversations WHERE id = ?").get(id);
+  const current = db.prepare("SELECT archived, deleting, provider, provider_session_id AS providerSessionId FROM conversations WHERE id = ?").get(id);
   if (current?.deleting) throw databaseError(409, "Archived conversation deletion is in progress");
+  if (patch.provider !== undefined && !EXECUTION_ADAPTER_IDS.includes(patch.provider)) throw databaseError(400, "Provider is not supported");
+  validateConversationExecution({ model: patch.model });
   if (patch.archived !== undefined && typeof patch.archived !== "boolean") {
     throw databaseError(400, "Conversation archived state must be a boolean");
   }
-  if (patch.providerSessionId != null
-    && (typeof patch.providerSessionId !== "string" || Buffer.byteLength(patch.providerSessionId) > 4096)) {
-    throw databaseError(400, "Provider session id is invalid");
+  // Launch applies the same rule, so an attached session stays resumable.
+  if (patch.providerSessionId != null && patch.providerSessionId !== "" && !isProviderSessionId(patch.providerSessionId)) {
+    throw databaseError(400, "Provider session id is invalid", { code: "PROVIDER_SESSION_INVALID" });
+  }
+  // A stored session that the adapter cannot resume would refuse every
+  // later send.
+  const adapter = findExecutionAdapter(patch.provider ?? current?.provider);
+  if (patch.providerSessionId && adapter && !adapter.capabilities.resume) {
+    throw databaseError(409, `${adapter.label} cannot resume a provider session`, { code: "PROVIDER_RESUME_UNSUPPORTED" });
   }
   if (patch.archived === true && api.findUnresolvedInterruptedRun(id)) {
     throw databaseError(409, "Resolve the interrupted run before archiving this conversation");
@@ -2363,7 +2397,7 @@ function migrate(db) {
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, worktree_path TEXT NOT NULL,
       title TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', provider_session_id TEXT, tab_position INTEGER NOT NULL DEFAULT 0,
-      archived INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, deleting INTEGER NOT NULL DEFAULT 0,
+      session_epoch INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, deleting INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS conversations_scope ON conversations(project_id, worktree_id, archived, updated_at);
@@ -2410,6 +2444,7 @@ function migrate(db) {
   try { db.exec("ALTER TABLE conversations ADD COLUMN tab_position INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE conversations ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
+  try { db.exec("ALTER TABLE conversations ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0"); } catch { /* Already migrated. */ }
   prepareVisibleConversationLookup(db);
   prepareRecentTitleLookup(db);
   prepareSearchMessageHeads(db);
@@ -2845,7 +2880,7 @@ function reserveRecoveryHeadroom(db, configured = Number(db.prepare("SELECT valu
 
 function conversationColumns() {
   return `id, project_id AS projectId, worktree_id AS worktreeId, worktree_path AS worktreePath, title, provider, model,
-    provider_session_id AS providerSessionId, archived, pinned, tab_position AS tabPosition, created_at AS createdAt, updated_at AS updatedAt`;
+    provider_session_id AS providerSessionId, session_epoch AS sessionEpoch, archived, pinned, tab_position AS tabPosition, created_at AS createdAt, updated_at AS updatedAt`;
 }
 
 function assertConversationNotDeleting(db, id) {
@@ -3009,6 +3044,7 @@ function validateSettingsPatch(patch) {
   for (const [key, value] of Object.entries(patch)) {
     const validate = SETTING_RULES[key];
     if (!validate) throw databaseError(400, `Unknown setting: ${key}`);
+    if (key === "model" && !validate(value)) throw databaseError(400, MODEL_NAME_REQUIREMENT, { code: "PROVIDER_CONFIGURATION_INVALID" });
     if (!validate(value)) throw databaseError(400, `Invalid value for setting: ${key}`);
   }
 }

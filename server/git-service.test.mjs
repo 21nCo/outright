@@ -120,6 +120,34 @@ test("editor launch releases utility capacity when a GUI stays open and records 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("an editor and the worktree code it runs never receive a direct provider's credential", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-editor-env-"));
+  const variables = { OUTRIGHT_ANTHROPIC_API_KEY: "direct-key", OUTRIGHT_ANTHROPIC_BASE_URL: "https://direct.example", outright_anthropic_api_key: "direct-lower",
+    ANTHROPIC_API_KEY: "harness-own-key", PATH: `${root}${path.delimiter}${process.env.PATH}` };
+  const saved = Object.fromEntries(Object.keys(variables).map((name) => [name, process.env[name]]));
+  try {
+    const cwd = await realpath(root);
+    const report = path.join(cwd, "editor-env.txt");
+    await writeFile(path.join(cwd, "code"), `#!/bin/sh\necho "\${OUTRIGHT_ANTHROPIC_API_KEY:-absent} \${OUTRIGHT_ANTHROPIC_BASE_URL:-absent} \${outright_anthropic_api_key:-absent} \${ANTHROPIC_API_KEY:-absent}" > ${JSON.stringify(report)}.tmp && mv ${JSON.stringify(report)}.tmp ${JSON.stringify(report)}\n`);
+    await chmod(path.join(cwd, "code"), 0o755);
+    Object.assign(process.env, variables);
+    // The real default launcher; before, it inherited the runtime environment.
+    const service = createGitService({ database: { getSettings: () => ({ editor: "code" }), auditAdmission() {}, auditCritical() {} },
+      getProjects: () => [{ worktrees: [{ path: cwd }] }], getConfig: async () => ({ scanRoots: [cwd] }), subprocesses: createSubprocessBudget({ limit: 1 }) });
+    await service.openInEditor(cwd);
+    const deadline = Date.now() + 5_000;
+    let observed = null;
+    while (observed === null && Date.now() < deadline) {
+      observed = await readFile(report, "utf8").catch(() => null);
+      if (observed === null) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(observed?.trim(), "absent absent absent harness-own-key");
+  } finally {
+    for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("unstage capacity refusal preserves a staged tracked modification", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "outright-unstage-capacity-"));
   try {

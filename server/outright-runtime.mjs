@@ -1,11 +1,12 @@
 import { WebSocketServer } from "ws";
 import chokidar from "chokidar";
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./child-process.mjs";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { realpath } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { createOutrightDatabase } from "./database.mjs";
+import { validateExecutionConfiguration, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
 import { AGENT_SUPERVISOR, createAgentManager, defaultGroupMembers, hardenWindowsLaunchDirectory, terminateTree } from "./agent-manager.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { createGitService } from "./git-service.mjs";
@@ -157,6 +158,17 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required");
     };
   } });
+  // Every submission and recovery is checked against the adapter's declared
+  // capabilities, then against a fresh availability and version probe, before
+  // any durable row exists. Unsupported settings never fall back silently.
+  async function preflightProvider(config) {
+    try { validateExecutionConfiguration(config); }
+    catch (error) { throw apiError(error.statusCode ?? 409, error.message, { code: error.code }); }
+    if (await agents.providerAvailable(config.provider)) return;
+    const status = agents.providers().find((entry) => entry.id === config.provider);
+    if (status?.available && !status.compatible) throw apiError(409, status.reason, { code: "PROVIDER_INCOMPATIBLE" });
+    throw apiError(409, status?.reason || `${config.provider} CLI is not available`, { code: "PROVIDER_UNAVAILABLE" });
+  }
   function completeRunRecovery() {
     runRecovery.phase = "complete";
     runRecovery.error = null;
@@ -593,8 +605,12 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const target = await resolveWorktreeTarget({ projectId: conversation.projectId, worktreeId: conversation.worktreeId, worktreePath: conversation.worktreePath });
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         const settings = database.getSettings();
-        const provider = body.provider || conversation.provider || settings.provider;
-        if (!await agents.providerAvailable(provider)) throw apiError(409, `${provider} CLI is not available`);
+        // Defaults fill only omitted fields. A supplied false, 0 or "" is
+        // validated as given and rejected, never replaced by a default.
+        const submitted = (key, fallback) => body[key] ?? fallback;
+        const provider = submitted("provider", conversation.provider || settings.provider);
+        const runConfig = { provider, model: submitted("model", conversation.model ?? settings.model), reasoningEffort: submitted("reasoningEffort", settings.reasoningEffort), approvalPolicy: submitted("approvalPolicy", settings.approvalPolicy) };
+        await preflightProvider({ ...runConfig, sessionId: provider === conversation.provider ? conversation.providerSessionId : null });
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         // Archive, move, or recovery can commit during either validation await.
         // Fence both message and run creation to the current durable target.
@@ -605,7 +621,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         }
         const currentInterrupted = database.findUnresolvedInterruptedRunForWorktree(conversation.worktreePath);
         if (currentInterrupted) throw apiError(409, "Resolve the interrupted run before starting more agent work", { code: "RUN_RECOVERY_REQUIRED", runId: currentInterrupted.id });
-        const { run, message: userMessage } = database.submitRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, provider, model: body.model ?? conversation.model ?? settings.model, reasoningEffort: body.reasoningEffort || settings.reasoningEffort, approvalPolicy: body.approvalPolicy || settings.approvalPolicy, prompt }, prompt);
+        const { run, message: userMessage } = database.submitRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, ...runConfig, prompt }, prompt);
         publish({ type: "message.created", conversationId: conversation.id, payload: userMessage });
         return json(response, 202, await agents.schedule({ conversation: database.getConversation(conversation.id), run }));
       }
@@ -776,14 +792,15 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         // submission, and again inside the agent drain before spawning.
         const target = await resolveWorktreeTarget({ projectId: conversation.projectId, worktreeId: conversation.worktreeId, worktreePath: conversation.worktreePath });
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
-        if (!await agents.providerAvailable(interrupted.provider)) throw apiError(409, `${interrupted.provider} CLI is not available`);
-        if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         // Recovery is bound to the immutable run session first. A mutable
         // conversation session is only a compatible fallback when the
         // conversation still targets the same provider.
         const sessionId = interrupted.providerSessionId
           || (conversation.provider === interrupted.provider ? conversation.providerSessionId : null);
         if (policy === "resume-session" && !sessionId) throw apiError(409, "No provider session is available to resume", { code: "NO_PROVIDER_SESSION" });
+        await preflightProvider({ provider: interrupted.provider, model: interrupted.model, reasoningEffort: interrupted.reasoningEffort,
+          approvalPolicy: interrupted.approvalPolicy, sessionId: policy === "resume-session" ? sessionId : null });
+        if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         const currentRecoveryConversation = database.getConversation(conversation.id);
         if (!currentRecoveryConversation || currentRecoveryConversation.archived) {
           throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
@@ -1048,7 +1065,7 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
   if (platform === "darwin") {
     const target = darwinLaunchdTarget(handshake);
     if (target) {
-      const result = run(AGENT_SUPERVISOR, ["--probe", handshake.platformOwnershipId], { encoding: "utf8" });
+      const result = run(AGENT_SUPERVISOR, ["--probe", handshake.platformOwnershipId], { encoding: "utf8", env: withoutDirectProviderCredentials(process.env) });
       const verdict = result.stdout?.trim();
       if (["alive", "exited"].includes(verdict)) return verdict;
       if (verdict === "absent") {
@@ -1091,7 +1108,7 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
         // The first absent-label sample predates the group probe. Submit may
         // have succeeded immediately before its child exited, so re-read the
         // unique label after the group is empty to form a coherent proof.
-        const settled = run(AGENT_SUPERVISOR, ["--probe", handshake.platformOwnershipId], { encoding: "utf8" }).stdout?.trim();
+        const settled = run(AGENT_SUPERVISOR, ["--probe", handshake.platformOwnershipId], { encoding: "utf8", env: withoutDirectProviderCredentials(process.env) }).stdout?.trim();
         return settled === "absent" ? "exited" : recoveryVerdict(settled);
       }
       darwinOwnershipUnknown = true;
@@ -1186,7 +1203,7 @@ export function defaultTerminateRecoveryProcess(pid, signal = "SIGTERM", handsha
   if (platform === "darwin") {
     const target = darwinLaunchdTarget(handshake);
     if (target) {
-      const result = run(AGENT_SUPERVISOR, ["--terminate", handshake.platformOwnershipId], { stdio: "ignore" });
+      const result = run(AGENT_SUPERVISOR, ["--terminate", handshake.platformOwnershipId], { stdio: "ignore", env: withoutDirectProviderCredentials(process.env) });
       if (result.status !== 0) throw new Error("Unable to terminate the recovered macOS process coalition");
       return true;
     }
