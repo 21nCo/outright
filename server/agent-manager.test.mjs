@@ -1549,6 +1549,59 @@ test("a session reset during a run survives the run's late session writes and th
   }
 });
 
+test("a session attached while a recovery run waits to launch survives that run's late session writes", async () => {
+  for (const policy of ["resume-session", "retry"]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-recovery-epoch-"));
+    const database = createOutrightDatabase({ filename: path.join(realpathSync(directory), "outright.db") });
+    const launched = [];
+    const children = [];
+    let gate = null;
+    const manager = createAgentManager({ database, publish: () => {},
+      validateConversation: async () => { await gate?.promise; return () => {}; },
+      launchCommand: (command) => { launched.push(command.args); return { executable: process.execPath, args: [], display: "fixture" }; },
+      spawnProcess: () => { const child = fakeChild(); child.once("close", () => { child.exited = true; }); children.push(child); return child; } });
+    try {
+      const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: directory, title: policy, provider: "codex" });
+      database.updateConversation(conversation.id, { providerSessionId: "019a-session-a" });
+      const interrupted = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
+      database.updateRun(interrupted.id, { status: "interrupted", recoveryClass: "never-started", providerSessionId: "019a-session-a" });
+      const recovery = database.beginInterruptedRunRecovery(interrupted.id, policy, { providerSessionId: "019a-session-a" });
+      // The recovery run is held before launch while the user attaches X.
+      let release;
+      gate = { promise: new Promise((resolve) => { release = resolve; }) };
+      const scheduled = manager.schedule({ conversation: recovery.conversation, run: recovery.run,
+        forceFreshSession: policy === "retry", providerSessionId: policy === "retry" ? null : "019a-session-a" });
+      await new Promise((resolve) => setImmediate(resolve));
+      database.updateConversation(conversation.id, { providerSessionId: "019a-session-x" });
+      gate = null;
+      release();
+      await scheduled;
+      const runSession = policy === "retry" ? "019a-session-s" : "019a-session-a";
+      assert.equal(launched[0].includes("019a-session-a"), policy === "resume-session", "control: recovery launches from its decided session");
+      assert.equal(launched[0].includes("019a-session-x"), false);
+      children[0].stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: runSession })}\n`);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(database.getConversation(conversation.id).providerSessionId, "019a-session-x", `${policy}: the session event replaced the attached session`);
+      children[0].emit("close", 0, null);
+      assert.equal(database.getRun(recovery.run.id).status, "completed");
+      assert.equal(database.getRun(recovery.run.id).providerSessionId, runSession, policy);
+      assert.equal(database.getConversation(conversation.id).providerSessionId, "019a-session-x", `${policy}: the finish replaced the attached session`);
+      const next = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "next" });
+      await manager.schedule({ conversation: database.getConversation(conversation.id), run: next });
+      assert.ok(launched[1].includes("019a-session-x"), "the next send resumes the attached session");
+      children[1].stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: "019a-session-c" })}\n`);
+      children[1].emit("close", 0, null);
+      assert.equal(database.getConversation(conversation.id).providerSessionId, "019a-session-c", "an ordinary send still records its session");
+    } finally {
+      // A failed assertion must not surface as a shutdown timeout.
+      for (const child of children) if (!child.exited) child.emit("close", 0, null);
+      await manager.shutdown();
+      await database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
 test("a provider-emitted session id that could never be resumed is not stored", async () => {
   const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex", providerSessionId: null });
   const child = fakeChild();

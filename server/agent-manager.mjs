@@ -917,8 +917,11 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // A native session belongs to the provider that created it. Never hand
     // another provider's resume token to this run's adapter.
     // The epoch read with the session this run launches from fences every
-    // later copy of its native session back to the chat.
-    state.sessionEpoch = current.sessionEpoch;
+    // later copy of its native session back to the chat. A recovery run's
+    // session was chosen at the recovery decision, so it keeps that epoch:
+    // an edit made while it waited to launch outranks it.
+    const recoverySession = entry.providerSessionId !== undefined || entry.forceFreshSession;
+    state.sessionEpoch = recoverySession ? entry.conversation?.sessionEpoch : current.sessionEpoch;
     if (entry.providerSessionId !== undefined) state.conversation = { ...current, providerSessionId: entry.providerSessionId };
     else if (entry.forceFreshSession || current.provider !== entry.run.provider) state.conversation = { ...current, providerSessionId: null };
     else state.conversation = current;
