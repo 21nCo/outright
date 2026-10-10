@@ -1,5 +1,5 @@
 import { fileURLToPath } from "node:url";
-import { anthropicEndpoint, ENDPOINT_REQUIREMENT } from "./anthropic-api-runner.mjs";
+import { anthropicEndpoint, ENDPOINT_REQUIREMENT, MAX_OUTPUT_TOKENS } from "./anthropic-api-runner.mjs";
 import { ADAPTER_CONTRACT_VERSION, defineAdapter } from "./contract.mjs";
 
 // Bumped whenever the runner's argv or output stream changes.
@@ -54,7 +54,12 @@ export const anthropicApiAdapter = defineAdapter({
         ? [{ type: "assistant.delta", payload: { text: raw.delta.text } }] : [];
     }
     if (raw.type === "message_start") return [{ type: "usage", payload: { inputTokens: raw.message?.usage?.input_tokens, native: raw.message?.usage ?? null } }];
-    if (raw.type === "message_delta") return [{ type: "usage", payload: { outputTokens: raw.usage?.output_tokens, native: { ...raw.usage, stop_reason: raw.delta?.stop_reason } } }];
+    if (raw.type === "message_delta") {
+      const usage = { type: "usage", payload: { outputTokens: raw.usage?.output_tokens, native: { ...raw.usage, stop_reason: raw.delta?.stop_reason } } };
+      // A cut-off answer must not look complete. The text so far is kept.
+      if (raw.delta?.stop_reason !== "max_tokens") return [usage];
+      return [usage, { type: "provider.failure", payload: { message: `Anthropic API stopped at the ${MAX_OUTPUT_TOKENS}-token output limit; the answer is truncated`, terminal: true, native: { stop_reason: "max_tokens" } } }];
+    }
     if (raw.type === "error") return [{ type: "provider.failure", payload: { message: String(raw.error?.message ?? "Anthropic API request failed"), terminal: true, native: raw.error ?? null } }];
     // Pings, block boundaries and thinking deltas carry no user-visible state.
     if (["ping", "content_block_start", "content_block_stop", "message_stop"].includes(raw.type)) return [];

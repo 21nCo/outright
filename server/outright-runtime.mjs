@@ -6,7 +6,7 @@ import path from "node:path";
 import { realpath } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { createOutrightDatabase } from "./database.mjs";
-import { validateExecutionConfiguration } from "./execution-adapters/index.mjs";
+import { validateExecutionConfiguration, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
 import { AGENT_SUPERVISOR, createAgentManager, defaultGroupMembers, hardenWindowsLaunchDirectory, terminateTree } from "./agent-manager.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { createGitService } from "./git-service.mjs";
@@ -1062,7 +1062,7 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
   if (platform === "darwin") {
     const target = darwinLaunchdTarget(handshake);
     if (target) {
-      const result = run(AGENT_SUPERVISOR, ["--probe", handshake.platformOwnershipId], { encoding: "utf8" });
+      const result = run(AGENT_SUPERVISOR, ["--probe", handshake.platformOwnershipId], { encoding: "utf8", env: withoutDirectProviderCredentials(process.env) });
       const verdict = result.stdout?.trim();
       if (["alive", "exited"].includes(verdict)) return verdict;
       if (verdict === "absent") {
@@ -1105,7 +1105,7 @@ export function defaultRecoveryProcessAlive(pid, platform = process.platform, gr
         // The first absent-label sample predates the group probe. Submit may
         // have succeeded immediately before its child exited, so re-read the
         // unique label after the group is empty to form a coherent proof.
-        const settled = run(AGENT_SUPERVISOR, ["--probe", handshake.platformOwnershipId], { encoding: "utf8" }).stdout?.trim();
+        const settled = run(AGENT_SUPERVISOR, ["--probe", handshake.platformOwnershipId], { encoding: "utf8", env: withoutDirectProviderCredentials(process.env) }).stdout?.trim();
         return settled === "absent" ? "exited" : recoveryVerdict(settled);
       }
       darwinOwnershipUnknown = true;
@@ -1200,7 +1200,7 @@ export function defaultTerminateRecoveryProcess(pid, signal = "SIGTERM", handsha
   if (platform === "darwin") {
     const target = darwinLaunchdTarget(handshake);
     if (target) {
-      const result = run(AGENT_SUPERVISOR, ["--terminate", handshake.platformOwnershipId], { stdio: "ignore" });
+      const result = run(AGENT_SUPERVISOR, ["--terminate", handshake.platformOwnershipId], { stdio: "ignore", env: withoutDirectProviderCredentials(process.env) });
       if (result.status !== 0) throw new Error("Unable to terminate the recovered macOS process coalition");
       return true;
     }

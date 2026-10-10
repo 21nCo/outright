@@ -144,7 +144,7 @@ function readBootIdentity() {
     let identity = null;
     if (process.platform === "linux") identity = readFileSync("/proc/sys/kernel/random/boot_id", "utf8");
     else if (process.platform === "darwin") identity = execFileSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], { encoding: "utf8", timeout: 5000 });
-    else if (process.platform === "win32") identity = execFileSync(AGENT_SUPERVISOR, ["--boot-identity"], { encoding: "utf8", timeout: 5000, windowsHide: true });
+    else if (process.platform === "win32") identity = execFileSync(AGENT_SUPERVISOR, ["--boot-identity"], { encoding: "utf8", timeout: 5000, windowsHide: true, env: withoutDirectProviderCredentials(process.env) });
     identity = identity?.trim();
     return identity && /^[\w:.-]{1,128}$/.test(identity) ? identity : null;
   } catch { return null; }

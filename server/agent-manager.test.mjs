@@ -1525,6 +1525,9 @@ test("a terminal provider failure fails the run even when the process exits 0", 
   const cases = [
     { provider: "claude", lines: [{ type: "result", subtype: "success", is_error: true, result: "Claude Code reported an API error" }], status: "failed", error: "Claude Code reported an API error" },
     { provider: "anthropic-api", lines: [{ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }], status: "failed", error: "Overloaded" },
+    // An answer cut off at the output cap is not a completed run.
+    { provider: "anthropic-api", lines: [{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial" } }, { type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: { output_tokens: 8192 } }, { type: "message_stop" }],
+      status: "failed", error: "Anthropic API stopped at the 8192-token output limit; the answer is truncated" },
     // A retried Codex stream notice is not the end of the turn.
     { provider: "codex", lines: [{ type: "error", message: "Reconnecting... 1/5" }, { type: "item.completed", item: { type: "agent_message", text: "done" } }], status: "completed", error: null },
   ];

@@ -4671,9 +4671,11 @@ async function providerBootstrapConvergenceRegression() {
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
   const bootstrap = deferred();
   let providerReads = 0;
+  const ready = (id, label) => ({ id, label, kind: "harness", available: true, compatible: true, checking: false, version: "9.9.9", capabilities: { permissionModes: ["read-only"], resume: true } });
+  const converged = [ready("codex", "Codex"), ready("claude", "Claude Code")];
   route = async (url) => {
     if (url.pathname === "/api/bootstrap") return bootstrap.promise;
-    if (url.pathname === "/api/providers") { providerReads += 1; return response({ providers: [{ id: "codex", label: "Codex", available: true, checking: false }] }); }
+    if (url.pathname === "/api/providers") { providerReads += 1; return response({ providers: converged }); }
     if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
     if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
     return response({});
@@ -4681,11 +4683,16 @@ async function providerBootstrapConvergenceRegression() {
   const socketCount = fixtureSockets.length;
   root.render(<TooltipProvider><App /></TooltipProvider>);
   await until(() => fixtureSockets.length > socketCount, "socket before bootstrap");
-  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "providers.changed", payload: { providers: [{ id: "codex", available: true, checking: false }] } }) }));
-  bootstrap.resolve(response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", label: "Codex", available: false, checking: true }], templates: [], trustedProjects: [] }));
+  // This event arrives before bootstrap and is lost; only the refresh can converge.
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "providers.changed", payload: { providers: converged } }) }));
+  const checking = (id, label) => ({ id, label, kind: "harness", available: false, compatible: false, checking: true });
+  bootstrap.resolve(response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [checking("codex", "Codex"), checking("claude", "Claude Code")], templates: [], trustedProjects: [] }));
   await until(() => host.querySelector('[aria-label="Settings"]'), "settings after checking bootstrap");
   host.querySelector('[aria-label="Settings"]').click();
-  await until(() => document.querySelector('[role="dialog"] option[value="codex"]')?.disabled === false, "provider converged after missed event");
+  // The selected option is never disabled, so watch the status line and a
+  // non-selected provider, which stay "checking" until the snapshot converges.
+  await until(() => document.querySelector('[role="dialog"] option[value="claude"]')?.disabled === false
+    && document.querySelector("#default-provider-status")?.textContent.startsWith("Codex 9.9.9"), "provider converged after missed event");
   assert(providerReads > 0, "Checking bootstrap did not refresh providers");
   document.querySelector('[role="dialog"] button[aria-label="Close"]')?.click();
 }

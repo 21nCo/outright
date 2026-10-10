@@ -7,6 +7,8 @@ import { pathToFileURL } from "node:url";
 
 const MAX_EVENT_BYTES = 1024 * 1024;
 const MAX_ERROR_BYTES = 64 * 1024;
+// A fixed output cap; a response that reaches it fails its run (see the adapter).
+export const MAX_OUTPUT_TOKENS = 8192;
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 export const ENDPOINT_REQUIREMENT = "OUTRIGHT_ANTHROPIC_BASE_URL must be an https URL or a loopback http address";
 
@@ -41,7 +43,10 @@ export function anthropicEndpoint(environment) {
   catch { return null; }
   // The key must never cross a network in plaintext.
   if (base.protocol !== "https:" && !(base.protocol === "http:" && LOCAL_HOSTS.has(base.hostname))) return null;
-  return new URL("/v1/messages", base);
+  // Relative to the base path, as the Anthropic SDKs resolve it, so a
+  // gateway mounted at https://host/anthropic receives /anthropic/v1/messages.
+  if (!base.pathname.endsWith("/")) base.pathname += "/";
+  return new URL("v1/messages", base);
 }
 
 async function discard(body) {
@@ -74,7 +79,7 @@ export async function run(argv = process.argv.slice(2), environment = process.en
       // validated, possibly over plaintext or to another origin.
       redirect: "manual",
       headers: { "content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model: request.model, max_tokens: 8192, stream: true, messages: [{ role: "user", content: request.prompt }] }),
+      body: JSON.stringify({ model: request.model, max_tokens: MAX_OUTPUT_TOKENS, stream: true, messages: [{ role: "user", content: request.prompt }] }),
     });
   } catch (error) { return fail("network_error", `Anthropic API request failed: ${error?.cause?.code ?? error?.message ?? "network error"}`); }
   if (response.status >= 300 && response.status < 400) {

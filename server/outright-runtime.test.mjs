@@ -2731,6 +2731,34 @@ test("recovery identities are boot-scoped and Windows taskkill supplies a whole-
   assert.deepEqual(kills, [[789, "SIGKILL"]], "Linux escalation preserves the supervisor and targets only the revalidated provider");
 });
 
+test("recovery supervisor control never receives a direct provider credential", () => {
+  const ownershipToken = "00000000-0000-4000-8000-000000000002";
+  // A dead wrapper and supervisor with an absent label reach the settled re-probe.
+  const handshake = { ownershipToken, platformOwnershipId: `com.21n.outright.${ownershipToken}`, processIdentity: "darwin:wrapper",
+    providerPid: 456, providerProcessIdentity: "darwin-process:supervisor" };
+  const saved = { key: process.env.OUTRIGHT_ANTHROPIC_API_KEY, base: process.env.OUTRIGHT_ANTHROPIC_BASE_URL };
+  process.env.OUTRIGHT_ANTHROPIC_API_KEY = "sk-ant-recovery";
+  process.env.OUTRIGHT_ANTHROPIC_BASE_URL = "https://gateway.example";
+  const calls = [];
+  try {
+    const run = (executable, args, options) => { calls.push([executable, args[0], options?.env]); return { status: 3, stdout: "absent\n" }; };
+    defaultRecoveryProcessAlive(123, "darwin", () => null, () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); }, handshake, run);
+    defaultTerminateRecoveryProcess(123, "SIGTERM", handshake, "darwin", (executable, args, options) => { calls.push([executable, args[0], options?.env]); return { status: 0 }; });
+  } finally {
+    for (const [name, value] of [["OUTRIGHT_ANTHROPIC_API_KEY", saved.key], ["OUTRIGHT_ANTHROPIC_BASE_URL", saved.base]]) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  }
+  const supervisor = calls.filter(([executable]) => executable === AGENT_SUPERVISOR);
+  assert.deepEqual(supervisor.map(([, command]) => command), ["--probe", "--probe", "--terminate"]);
+  for (const [, command, env] of supervisor) {
+    // Before, these calls inherited the runtime environment unfiltered.
+    assert.ok(env, `${command} gets an explicit environment`);
+    assert.equal(env.OUTRIGHT_ANTHROPIC_API_KEY, undefined, command);
+    assert.equal(env.OUTRIGHT_ANTHROPIC_BASE_URL, undefined, command);
+  }
+});
+
 test("macOS recovery termination stops a provider that ignores SIGTERM", {
   skip: process.platform !== "darwin",
 }, async () => {

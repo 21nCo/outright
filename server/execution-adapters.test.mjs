@@ -220,6 +220,18 @@ test("Anthropic API failures are normalized and fail the run", async () => {
   assert.match(missing.events[0].payload.message, /OUTRIGHT_ANTHROPIC_API_KEY is not set/);
 });
 
+test("an Anthropic answer cut off at the output cap fails visibly and keeps its text", async () => {
+  await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", "max-tokens.sse")); }, async (base, requests) => {
+    const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
+    assert.equal(requests[0].body.max_tokens, 8192, "the declared cap is the one requested");
+    assert.equal(result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join(""), "READY now");
+    // Before, a max_tokens stop normalized to usage only and the run completed.
+    const failure = result.events.find((event) => event.type === "provider.failure");
+    assert.deepEqual([failure?.payload.terminal, failure?.payload.native], [true, { stop_reason: "max_tokens" }]);
+    assert.match(failure.payload.message, /8192-token output limit; the answer is truncated/);
+  });
+});
+
 test("the direct provider never forwards its key across a redirect", async () => {
   await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", "stream.sse")); }, async (target, followed) => {
     for (const [status, location] of [[307, `${target}/v1/messages`], [308, "http://example.com/v1/messages"], [302, "/v1/elsewhere"]]) {
@@ -311,6 +323,19 @@ test("an unusable direct-provider endpoint is reported as unavailable", async ()
   for (const base of ["https://gateway.example/anthropic", "http://127.0.0.1:8080"]) {
     assert.equal(anthropic.detect({ OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base }).available, true, base);
   }
+});
+
+test("a path-prefixed gateway base receives the request under its own path", async () => {
+  await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", "stream.sse")); }, async (origin, requests) => {
+    for (const suffix of ["/anthropic", "/anthropic/", "/team/anthropic"]) {
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: `${origin}${suffix}` });
+      assert.equal(result.code, 0, suffix);
+      // Before, the leading-slash resolution sent the key to /v1/messages at the origin root.
+      assert.equal(requests.at(-1).url, `${suffix.replace(/\/$/, "")}/v1/messages`, suffix);
+    }
+    await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: origin });
+    assert.equal(requests.at(-1).url, "/v1/messages", "a bare origin keeps the documented path");
+  });
 });
 
 test("discovery reports incompatible and unconfigured providers before authorization", async () => {
