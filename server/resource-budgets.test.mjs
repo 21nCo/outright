@@ -1090,7 +1090,7 @@ test("optional metadata cannot exhaust terminal and restart recovery space", () 
     assert.ok(database.capacity().availableForNewWorkBytes <= 1);
 
     for (const conversation of conversations.slice(0, 256)) {
-      assert.throws(() => database.updateConversation(conversation.id, { providerSessionId: "s".repeat(4096) }),
+      assert.throws(() => database.updateConversation(conversation.id, { providerSessionId: "s".repeat(256) }),
         (error) => error.statusCode === 507);
       assert.equal(database.getConversation(conversation.id).providerSessionId, null);
     }

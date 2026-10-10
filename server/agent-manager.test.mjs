@@ -1499,6 +1499,21 @@ test("keeps recovered session ids run-local when the conversation switched provi
   child.emit("close", 0, null);
 });
 
+test("a provider-emitted session id that could never be resumed is not stored", async () => {
+  const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "codex", providerSessionId: null });
+  const child = fakeChild();
+  const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child });
+  const run = database.createRun(codexRun("run-1"));
+  await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+  // Before, any id up to 4096 bytes was stored and every later send was rejected.
+  for (const id of ["--resume-last", " leading-space", "s".repeat(300)]) child.stdout.write(JSON.stringify({ type: "thread.started", thread_id: id }) + "\n");
+  assert.equal(database.getRun(run.id).providerSessionId ?? null, null);
+  assert.equal(database.getConversation("conv-1").providerSessionId, null);
+  child.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "019a-valid" }) + "\n");
+  assert.equal(database.getRun(run.id).providerSessionId, "019a-valid");
+  child.emit("close", 0, null);
+});
+
 test("a run never resumes another provider's session and reports its normalized failure", async () => {
   const claudeSession = "a1d55507-d4ad-43ef-8154-19b111bbed42";
   const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider: "claude", providerSessionId: claudeSession });

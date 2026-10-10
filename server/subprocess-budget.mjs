@@ -1,4 +1,4 @@
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "./child-process.mjs";
 import { randomUUID } from "node:crypto";
 import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -635,7 +635,9 @@ export function createSubprocessBudget({ limit = 8, execute = runOwned, launch =
         else { child.unref?.(); resolve({ pid: child.pid }); }
       };
       try {
-        child = launch(file, args, { ...options, stdio: "ignore", detached: process.platform !== "win32" });
+        // An editor runs worktree code (terminals, tasks, language servers).
+        child = launch(file, args, { ...options, env: withoutDirectProviderCredentials(options.env ?? process.env),
+          stdio: "ignore", detached: process.platform !== "win32" });
         child.once("error", finish);
         child.once("spawn", () => finish(null));
       } catch (error) { finish(error); }

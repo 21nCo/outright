@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn } from "./child-process.mjs";
 import { constants, readFileSync, rmSync } from "node:fs";
 import { access } from "node:fs/promises";
 import { randomUUID } from "node:crypto";

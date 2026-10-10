@@ -71,6 +71,12 @@ test("a conversation's native session is scoped to its provider", () => {
     assert.deepEqual([direct.provider, direct.providerSessionId], ["anthropic-api", null]);
     assert.throws(() => database.updateConversation(conversation.id, { providerSessionId: "msg-session" }), { statusCode: 409 });
     assert.equal(database.updateConversation(conversation.id, { providerSessionId: null }).providerSessionId, null, "clearing is always allowed");
+    database.updateConversation(conversation.id, { provider: "claude" });
+    // Launch requires this format; before, attach accepted any string and every send then failed.
+    for (const session of [" leading-space", "s".repeat(300), "--resume", 42]) {
+      assert.throws(() => database.updateConversation(conversation.id, { providerSessionId: session }),
+        { statusCode: 400, details: { code: "PROVIDER_SESSION_INVALID" } }, String(session));
+    }
     assert.throws(() => database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", provider: "hermes" }), { statusCode: 400 });
     assert.throws(() => database.updateSettings({ provider: "hermes" }));
     assert.equal(database.updateSettings({ provider: "anthropic-api" }).provider, "anthropic-api");

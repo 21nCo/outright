@@ -3,7 +3,7 @@ import { claudeAdapter } from "./claude.mjs";
 import { codexAdapter } from "./codex.mjs";
 import { configurationError, validateRunConfiguration } from "./contract.mjs";
 
-export { describeAdapter, versionCompatibility } from "./contract.mjs";
+export { describeAdapter, isProviderSessionId, versionCompatibility } from "./contract.mjs";
 
 // Adding a provider means adding an adapter here. Persisted runs and
 // conversations store only the adapter id, so ids are permanent.
@@ -36,13 +36,14 @@ export function buildExecutionLaunch({ conversation, run, sessionId }) {
 // Direct-provider variables are removed from every spawn and handed only to
 // the adapter that declares them. A harness keeps its CLI's own authority,
 // including any credentials the user configured for that CLI.
-const DIRECT_PROVIDER_VARIABLES = new Set(EXECUTION_ADAPTERS.flatMap((adapter) => adapter.environment));
+export const DIRECT_PROVIDER_VARIABLES = Object.freeze(EXECUTION_ADAPTERS.flatMap((adapter) => adapter.environment));
+const directProviderVariables = new Set(DIRECT_PROVIDER_VARIABLES);
 
-// The base environment for any subprocess that is not a direct-provider run:
-// harness probes, git/gh utilities (and the repository hooks they execute)
-// and native supervisor control commands. Windows names are case-insensitive.
+// The base environment for any subprocess that is not a direct-provider run.
+// server/child-process.mjs applies it to every spawn. Windows names are
+// case-insensitive.
 export function withoutDirectProviderCredentials(environment = process.env) {
-  return Object.fromEntries(Object.entries(environment).filter(([key]) => !DIRECT_PROVIDER_VARIABLES.has(key.toUpperCase())));
+  return Object.fromEntries(Object.entries(environment).filter(([key]) => !directProviderVariables.has(key.toUpperCase())));
 }
 
 export function buildExecutionEnvironment(id, runtimeEnvironment, inherited = runtimeEnvironment) {

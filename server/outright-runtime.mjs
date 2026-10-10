@@ -1,6 +1,6 @@
 import { WebSocketServer } from "ws";
 import chokidar from "chokidar";
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./child-process.mjs";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { realpath } from "node:fs/promises";

@@ -1,9 +1,9 @@
-import { execFile, spawn, spawnSync } from "node:child_process";
+import { execFile, spawnExecution, spawnSync } from "./child-process.mjs";
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildExecutionEnvironment, buildExecutionLaunch, requireExecutionAdapter, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
+import { buildExecutionEnvironment, buildExecutionLaunch, DIRECT_PROVIDER_VARIABLES, isProviderSessionId, requireExecutionAdapter, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
 import { RESOURCE_BUDGETS, retainedTranscriptMessageBytes } from "./resource-budgets.mjs";
 
@@ -54,6 +54,13 @@ const { execFileSync } = require("node:child_process");
 const [handshakePath, ownershipToken, rawPlatformOwnershipId, executable, ...commandArgs] = process.argv.slice(1);
 const platformOwnershipId = rawPlatformOwnershipId === "-" ? null : rawPlatformOwnershipId;
 fs.mkdirSync(path.dirname(handshakePath), { recursive: true });
+// The wrapper holds its run's scoped environment, which for a direct provider
+// includes its credential. Identity helpers are system tools started by
+// absolute path, never looked up from the worktree, and never get it.
+const directProviderVariables = new Set(${JSON.stringify(DIRECT_PROVIDER_VARIABLES)});
+const utilityEnvironment = Object.fromEntries(Object.entries(process.env)
+  .filter(([key]) => !directProviderVariables.has(key.toUpperCase())));
+const powershell = path.win32.join(process.env.SystemRoot || "C:\\\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 const ownershipTitle = \`outright-agent-\${ownershipToken}\`;
 process.title = ownershipTitle;
 const processIdentityFor = (pid, expectedOwnershipToken = null) => {
@@ -66,12 +73,12 @@ const processIdentityFor = (pid, expectedOwnershipToken = null) => {
       return bootId && startTicks ? \`linux:\${bootId}:\${startTicks}\` : null;
     }
     if (process.platform === "darwin") {
-      const boot = execFileSync("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8" }).trim();
+      const boot = execFileSync("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8", env: utilityEnvironment }).trim();
       if (!expectedOwnershipToken) {
-        const started = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" }).trim();
+        const started = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: utilityEnvironment }).trim();
         return boot && started ? \`darwin-process:\${boot}:\${started}\` : null;
       }
-      const command = execFileSync("/bin/ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" }).trim();
+      const command = execFileSync("/bin/ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", env: utilityEnvironment }).trim();
       return boot && command === \`outright-agent-\${expectedOwnershipToken}\`
         ? \`darwin:\${boot}:\${expectedOwnershipToken}\`
         : null;
@@ -80,7 +87,7 @@ const processIdentityFor = (pid, expectedOwnershipToken = null) => {
       const script = "$boot=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks;"
         + "$start=(Get-Process -Id " + String(pid) + ").StartTime.ToUniversalTime().Ticks;"
         + "Write-Output ($boot.ToString() + ':' + $start.ToString())";
-      const started = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true }).trim();
+      const started = execFileSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true, env: utilityEnvironment }).trim();
       return started ? \`win32:\${started}\` : null;
     }
   } catch {}
@@ -373,7 +380,7 @@ function unresolvedOutcomeUnavailable() {
   return unavailable;
 }
 
-export function createAgentManager({ database, publish, onProvidersChanged = () => {}, onShutdownRecovery = () => {}, onDiskRetry = () => {}, providerDiscoveryFactory = createProviderDiscovery, spawnProcess = spawn, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory, environment = process.env }) {
+export function createAgentManager({ database, publish, onProvidersChanged = () => {}, onShutdownRecovery = () => {}, onDiskRetry = () => {}, providerDiscoveryFactory = createProviderDiscovery, spawnProcess = spawnExecution, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory, environment = process.env }) {
   const resolvedLaunchDirectory = launchDirectory
     ?? database.launchDirectory;
   assertPrivateLaunchDirectory(resolvedLaunchDirectory);
@@ -631,7 +638,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     for (const event of state.adapter.normalize(raw)) {
       let checkpointDelta = null;
       if (event.type === "session") {
-        if (typeof event.payload.sessionId !== "string" || Buffer.byteLength(event.payload.sessionId) > 4096) continue;
+        // An id that could never be resumed is not stored.
+        if (!isProviderSessionId(event.payload.sessionId)) continue;
         state.run.providerSessionId = event.payload.sessionId;
         state.pendingSessionId = event.payload.sessionId;
         persistSessionMetadata(state);

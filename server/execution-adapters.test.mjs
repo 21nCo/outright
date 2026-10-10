@@ -74,17 +74,30 @@ test("CLI versions are gated to the verified supported range", () => {
 test("unsupported configurations are rejected instead of falling back", () => {
   // Before adapters, an unknown policy silently became workspace-write.
   assert.throws(() => validateExecutionConfiguration({ provider: "codex", ...baseRun, approvalPolicy: "bypass" }),
-    { code: "PROVIDER_CONFIGURATION_UNSUPPORTED", statusCode: 409 });
+    { code: "PROVIDER_CONFIGURATION_INVALID", statusCode: 400 });
   assert.throws(() => validateExecutionConfiguration({ provider: "anthropic-api", ...baseRun, approvalPolicy: "workspace-write" }),
     { code: "PROVIDER_CONFIGURATION_UNSUPPORTED", message: /Anthropic API does not support the workspace-write approval policy/ });
   assert.throws(() => validateExecutionConfiguration({ provider: "anthropic-api", ...baseRun, reasoningEffort: "high" }),
     { code: "PROVIDER_CONFIGURATION_UNSUPPORTED" });
   assert.throws(() => validateExecutionConfiguration({ provider: "codex", ...baseRun, reasoningEffort: undefined }),
-    { code: "PROVIDER_CONFIGURATION_UNSUPPORTED" }, "an invalid effort used to be dropped silently");
+    { code: "PROVIDER_CONFIGURATION_INVALID", statusCode: 400 }, "an invalid effort used to be dropped silently");
   assert.throws(() => validateExecutionConfiguration({ provider: "hermes", ...baseRun }), { code: "PROVIDER_UNKNOWN", statusCode: 400 });
   assert.throws(() => validateExecutionConfiguration({ provider: "anthropic-api", ...baseRun, sessionId: "a1d55507-d4ad-43ef-8154-19b111bbed42" }),
     { code: "PROVIDER_RESUME_UNSUPPORTED" });
   assert.doesNotThrow(() => validateRunConfiguration(codex, { ...baseRun, model: "gpt-6.1-sol" }), "harness CLIs accept custom model names");
+});
+
+test("malformed approval policies and efforts are invalid requests and are not echoed", () => {
+  // Before, any value was a 409 "unsupported" that interpolated the raw input.
+  for (const field of ["approvalPolicy", "reasoningEffort"]) {
+    for (const value of [{ toString: () => "object" }, ["read-only"], 7, "x".repeat(5000)]) {
+      assert.throws(() => validateExecutionConfiguration({ provider: "claude", ...baseRun, [field]: value }), (error) => {
+        assert.deepEqual([error.code, error.statusCode], ["PROVIDER_CONFIGURATION_INVALID", 400], field);
+        assert.ok(error.message.length < 200 && !error.message.includes("object") && !error.message.includes("xxxx"), error.message);
+        return true;
+      });
+    }
+  }
 });
 
 test("model, session and prompt values can never become provider options", () => {
@@ -323,6 +336,24 @@ test("an unusable direct-provider endpoint is reported as unavailable", async ()
   for (const base of ["https://gateway.example/anthropic", "http://127.0.0.1:8080"]) {
     assert.equal(anthropic.detect({ OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base }).available, true, base);
   }
+});
+
+test("an endpoint carrying a user name or password is refused before queueing and never echoed", async () => {
+  await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", "stream.sse")); }, async (origin, requests) => {
+    const { port } = new URL(origin);
+    for (const base of [`http://user:fixture-password@127.0.0.1:${port}/anthropic`, `https://fixture-password@api.anthropic.com`]) {
+      // Before, detect() accepted it and fetch rejected it after the run was
+      // queued, with an error that quoted the URL and its password.
+      const status = anthropic.detect({ OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      assert.equal(status.available, false, base);
+      assert.match(status.reason, /without a user name or password/);
+      assert.equal(status.reason.includes("fixture-password"), false);
+      const result = await runRunner(["--model", "m", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      assert.equal(result.code, 2);
+      assert.equal(result.stdout.includes("fixture-password"), false, "the failure persisted as a run event is free of the secret");
+    }
+    assert.equal(requests.length, 0);
+  });
 });
 
 test("a path-prefixed gateway base receives the request under its own path", async () => {

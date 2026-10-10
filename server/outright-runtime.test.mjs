@@ -1505,7 +1505,7 @@ test("an unusable direct-provider endpoint is reported before enqueueing", { ski
   try {
     await withWorktreeRuntime(async (runtime, { project, worktree }) => {
       const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Direct endpoint", provider: "anthropic-api" });
-      for (const base of ["invalid-url", "http://example.com"]) {
+      for (const base of ["invalid-url", "http://example.com", "https://user:fixture-password@127.0.0.1:9/anthropic"]) {
         process.env.OUTRIGHT_ANTHROPIC_BASE_URL = base;
         const result = responseCapture();
         await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "must not persist", approvalPolicy: "read-only", reasoningEffort: "medium" }), result);
@@ -1513,6 +1513,7 @@ test("an unusable direct-provider endpoint is reported before enqueueing", { ski
         assert.equal(result.statusCode, 409, base);
         assert.equal(result.body.code, "PROVIDER_UNAVAILABLE");
         assert.match(result.body.error, /OUTRIGHT_ANTHROPIC_BASE_URL must be an https URL or a loopback http address/);
+        assert.equal(JSON.stringify(result.body).includes("fixture-password"), false);
       }
       assert.deepEqual(runtime.database.listMessages(conversation.id), []);
       assert.deepEqual(runtime.database.listRuns(conversation.id), []);

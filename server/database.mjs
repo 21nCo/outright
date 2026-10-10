@@ -7,7 +7,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import { foldFindText } from "../src/lib/find-text.js";
-import { EXECUTION_ADAPTER_IDS, findExecutionAdapter } from "./execution-adapters/index.mjs";
+import { EXECUTION_ADAPTER_IDS, findExecutionAdapter, isProviderSessionId } from "./execution-adapters/index.mjs";
 import { RESOURCE_BUDGETS, RETAINED_MESSAGE_FIELDS, RETAINED_ROW_OVERHEAD_BYTES } from "./resource-budgets.mjs";
 import { allocatedDatabaseUsage, archiveShadowPaths, beginArchiveShadow, recoverArchiveShadow } from "./archive-shadow.mjs";
 import { readRunOutcome, removeRunOutcome, saveRunOutcome } from "./run-outcome-journal.mjs";
@@ -2223,9 +2223,9 @@ function validateConversationPatch(db, api, id, patch) {
   if (patch.archived !== undefined && typeof patch.archived !== "boolean") {
     throw databaseError(400, "Conversation archived state must be a boolean");
   }
-  if (patch.providerSessionId != null
-    && (typeof patch.providerSessionId !== "string" || Buffer.byteLength(patch.providerSessionId) > 4096)) {
-    throw databaseError(400, "Provider session id is invalid");
+  // Launch applies the same rule, so an attached session stays resumable.
+  if (patch.providerSessionId != null && patch.providerSessionId !== "" && !isProviderSessionId(patch.providerSessionId)) {
+    throw databaseError(400, "Provider session id is invalid", { code: "PROVIDER_SESSION_INVALID" });
   }
   // A stored session that the adapter cannot resume would refuse every
   // later send.

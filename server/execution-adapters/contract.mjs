@@ -129,22 +129,31 @@ export function versionCompatibility(adapter, version) {
   return { version, compatible: true, reason: "" };
 }
 
+// The one session id rule for launch, conversation attach and ids a
+// provider emits, so a stored session can always be resumed.
+export function isProviderSessionId(value) {
+  return typeof value === "string" && SESSION_PATTERN.test(value);
+}
+
 // Rejects anything the adapter cannot honour exactly. There is no fallback
 // to another permission mode, model or reasoning level.
 export function validateRunConfiguration(adapter, { model = "", reasoningEffort, approvalPolicy, sessionId } = {}) {
   const { capabilities } = adapter;
+  // Unknown values are malformed requests and are never echoed back.
+  if (!APPROVAL_POLICIES.includes(approvalPolicy)) throw configurationError(`Approval policy must be one of ${APPROVAL_POLICIES.join(", ")}`, "PROVIDER_CONFIGURATION_INVALID", 400);
+  if (!REASONING_EFFORTS.includes(reasoningEffort)) throw configurationError(`Reasoning effort must be one of ${REASONING_EFFORTS.join(", ")}`, "PROVIDER_CONFIGURATION_INVALID", 400);
   if (!Object.hasOwn(capabilities.permissionModes, approvalPolicy)) {
-    throw configurationError(`${adapter.label} does not support the ${approvalPolicy || "missing"} approval policy; choose ${Object.keys(capabilities.permissionModes).join(" or ")}`);
+    throw configurationError(`${adapter.label} does not support the ${approvalPolicy} approval policy; choose ${Object.keys(capabilities.permissionModes).join(" or ")}`);
   }
   if (typeof model !== "string" || (model && !MODEL_PATTERN.test(model))) throw configurationError(`Model name is invalid for ${adapter.label}`, "PROVIDER_CONFIGURATION_INVALID", 400);
   if (model && !capabilities.customModels && !capabilities.models.includes(model)) {
     throw configurationError(`${adapter.label} does not support model ${model}`);
   }
   if (!capabilities.reasoningEfforts.includes(reasoningEffort)) {
-    throw configurationError(`${adapter.label} does not support ${reasoningEffort || "missing"} reasoning effort`);
+    throw configurationError(`${adapter.label} does not support ${reasoningEffort} reasoning effort`);
   }
   if (sessionId != null && sessionId !== "") {
     if (!capabilities.resume) throw configurationError(`${adapter.label} cannot resume a provider session`, "PROVIDER_RESUME_UNSUPPORTED");
-    if (typeof sessionId !== "string" || !SESSION_PATTERN.test(sessionId)) throw configurationError(`Provider session id is invalid for ${adapter.label}`, "PROVIDER_SESSION_INVALID", 400);
+    if (!isProviderSessionId(sessionId)) throw configurationError(`Provider session id is invalid for ${adapter.label}`, "PROVIDER_SESSION_INVALID", 400);
   }
 }
