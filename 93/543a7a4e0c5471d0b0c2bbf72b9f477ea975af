@@ -1,0 +1,23 @@
+docs/out-3-execution-adapters.md
+  s_1900bb15a7199a::t_f3cc17eaf45020 28,34,48
+server/agent-manager.mjs
+  s_1900bb15a7199a::t_71d7a1f0f5215f 920-924
+server/agent-manager.test.mjs
+  s_1900bb15a7199a::t_ef4c5579b38085 1552-1604
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "93543a7a4e0c5471d0b0c2bbf72b9f477ea975af",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
