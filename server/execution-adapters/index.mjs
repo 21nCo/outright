@@ -16,7 +16,8 @@ export function findExecutionAdapter(id) {
 
 export function requireExecutionAdapter(id) {
   const adapter = findExecutionAdapter(id);
-  if (!adapter) throw configurationError(`Unknown provider: ${String(id).slice(0, 64)}`, "PROVIDER_UNKNOWN", 400);
+  // The submitted value is not echoed; it may be any JSON type or length.
+  if (!adapter) throw configurationError(`Provider must be one of ${EXECUTION_ADAPTER_IDS.join(", ")}`, "PROVIDER_UNKNOWN", 400);
   return adapter;
 }
 

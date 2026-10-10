@@ -605,8 +605,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const target = await resolveWorktreeTarget({ projectId: conversation.projectId, worktreeId: conversation.worktreeId, worktreePath: conversation.worktreePath });
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         const settings = database.getSettings();
-        const provider = body.provider || conversation.provider || settings.provider;
-        const runConfig = { provider, model: body.model ?? conversation.model ?? settings.model, reasoningEffort: body.reasoningEffort || settings.reasoningEffort, approvalPolicy: body.approvalPolicy || settings.approvalPolicy };
+        // Defaults fill only omitted fields. A supplied false, 0 or "" is
+        // validated as given and rejected, never replaced by a default.
+        const submitted = (key, fallback) => body[key] ?? fallback;
+        const provider = submitted("provider", conversation.provider || settings.provider);
+        const runConfig = { provider, model: submitted("model", conversation.model ?? settings.model), reasoningEffort: submitted("reasoningEffort", settings.reasoningEffort), approvalPolicy: submitted("approvalPolicy", settings.approvalPolicy) };
         await preflightProvider({ ...runConfig, sessionId: provider === conversation.provider ? conversation.providerSessionId : null });
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         // Archive, move, or recovery can commit during either validation await.

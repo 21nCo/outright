@@ -1483,6 +1483,41 @@ test("unsupported provider configurations are rejected before probing or durable
   assert.deepEqual(runtime.database.listRuns(conversation.id), []);
 }));
 
+test("explicitly supplied false, 0 or empty run settings are rejected instead of taking the defaults", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  runtime.database.updateSettings({ provider: "codex", model: "gpt-5.4", approvalPolicy: "danger-full-access", reasoningEffort: "high" });
+  let probes = 0;
+  runtime.agents.providerAvailable = async () => { probes += 1; return true; };
+  runtime.agents.schedule = async ({ run }) => ({ id: run.id, status: run.status });
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Explicit", provider: "codex", model: "gpt-5.3-codex" });
+  const send = async (body) => {
+    const result = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "hi", ...body }), result);
+    return result;
+  };
+  const malformed = [
+    ...[false, 0, ""].map((value) => [{ provider: value }, "PROVIDER_UNKNOWN"]),
+    ...[false, 0, ""].map((value) => [{ approvalPolicy: value }, "PROVIDER_CONFIGURATION_INVALID"]),
+    ...[false, 0, ""].map((value) => [{ reasoningEffort: value }, "PROVIDER_CONFIGURATION_INVALID"]),
+    ...[false, 0].map((value) => [{ model: value }, "PROVIDER_CONFIGURATION_INVALID"]),
+  ];
+  for (const [body, code] of malformed) {
+    const result = await send(body);
+    assert.deepEqual([result.statusCode, result.body.code], [400, code], JSON.stringify(body));
+    assert.doesNotMatch(result.body.error, /false|\b0\b/, JSON.stringify(body));
+  }
+  assert.equal(probes, 0, "malformed settings reached discovery");
+  assert.deepEqual(runtime.database.listMessages(conversation.id), []);
+  assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+  // Omitted and null fields take the defaults; an explicit empty model
+  // still selects the adapter default rather than the conversation's model.
+  for (const [body, model] of [[{}, "gpt-5.3-codex"], [{ provider: null, model: null, approvalPolicy: null, reasoningEffort: null }, "gpt-5.3-codex"], [{ model: "" }, ""]]) {
+    const result = await send(body);
+    assert.equal(result.statusCode, 202, JSON.stringify(body));
+    const run = runtime.database.getRun(result.body.id);
+    assert.deepEqual([run.provider, run.model, run.approvalPolicy, run.reasoningEffort], ["codex", model, "danger-full-access", "high"], JSON.stringify(body));
+  }
+}));
+
 test("an installed but incompatible CLI is reported before enqueueing", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
   // Settle the startup probe so authorization cannot reuse its in-flight result.
   assert.equal(await runtime.agents.providerAvailable("codex"), true);
