@@ -1,0 +1,55 @@
+docs/out-3-execution-adapters.md
+  s_615fe25f5f8e96::t_e8d45c7da0c642 22,26,30,32-36
+server/agent-manager.mjs
+  s_615fe25f5f8e96::t_8c752aff5838ff 1,6,57-63,76,78,81,90,383,641-642
+server/agent-manager.test.mjs
+  s_615fe25f5f8e96::t_328e43ae26451d 1502-1516
+server/archive-windows-lock.mjs
+  s_615fe25f5f8e96::t_4657cc8195312a 1
+server/child-process.mjs
+  s_615fe25f5f8e96::t_760cb78b66e3f0 1-46
+server/child-process.test.mjs
+  s_615fe25f5f8e96::t_1aae16950611f9 1-110
+server/database.mjs
+  s_615fe25f5f8e96::t_05efbe44c70aee 10,2226-2228
+server/database.test.mjs
+  s_615fe25f5f8e96::t_9dcedc968935fa 74-79
+server/execution-adapters.test.mjs
+  s_615fe25f5f8e96::t_a5b37ed84b1497 77,83,90-102,341-358
+server/execution-adapters/anthropic-api-runner.mjs
+  s_615fe25f5f8e96::t_0319022b21f0f1 13,46-48,55-59,92-95,156
+server/execution-adapters/contract.mjs
+  s_615fe25f5f8e96::t_26fd9e255661db 132-137,142-144,146,153,157
+server/execution-adapters/index.mjs
+  s_615fe25f5f8e96::t_41e9f0c5247dad 6,39-40,42-44,46
+server/git-service.test.mjs
+  s_615fe25f5f8e96::t_4145ede2afe281 123-150
+server/managed-terminal.mjs
+  s_615fe25f5f8e96::t_1413fbbb31d55c 1
+server/outright-runtime.mjs
+  s_615fe25f5f8e96::t_33e27c759cea25 3
+server/outright-runtime.test.mjs
+  s_615fe25f5f8e96::t_7685236c1b8a93 1508,1516
+server/provider-discovery.mjs
+  s_615fe25f5f8e96::t_61f9d4adb7bd82 1
+server/resource-budgets.test.mjs
+  s_615fe25f5f8e96::t_deb2154645fc75 1093
+server/subprocess-budget.mjs
+  s_615fe25f5f8e96::t_15eebc02025065 1,638-640
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3af4d5b9a71cfb9fad7a7451bf8046a277ada038",
+  "prompts": {},
+  "sessions": {
+    "s_615fe25f5f8e96": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "35d76878-a4f5-4973-ad34-0981075c7fe6",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
