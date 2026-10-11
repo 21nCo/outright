@@ -37,10 +37,15 @@ const SEARCH_CANDIDATES = 256;
 const SEARCH_MESSAGE_BYTES = 16 * 1024;
 const SEARCH_QUERY_BYTES = 256;
 const SEARCH_RESPONSE_BYTES = 128 * 1024;
+const TASK_TITLE_CHARACTERS = 500;
+const TASK_OBJECTIVE_BYTES = 16 * 1024;
+const TASK_RESPONSE_BYTES = 512 * 1024;
+const TASK_THREAD_LIMIT = 200;
 const RETAINED_COLUMNS = [
   ["settings", "key, value"],
   ["spaces", "id, name, created_at"],
   ["project_memberships", "project_id, space_id"],
+  ["tasks", "id, space_id, project_id, worktree_id, worktree_path, title, objective"],
   ["conversations", "id, project_id, worktree_id, worktree_path, title, provider, model, provider_session_id, created_at, updated_at"],
   ["messages", RETAINED_MESSAGE_FIELDS.join(", ")],
   ["runs", "id, conversation_id, worktree_path, provider, model, reasoning_effort, approval_policy, prompt, status, pid, provider_session_id, created_at, started_at, finished_at, exit_code, error, cost_usd, input_tokens, output_tokens, recovery_class, recovery_decision, transcript_omitted"],
@@ -141,8 +146,8 @@ export function createOutrightDatabase(options = {}) {
   if (filename && path.isAbsolute(filename)) mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
   if (filename !== ":memory:" || options.launchDirectory) preparePrivateLaunchDirectory(launchDirectory);
   const storageFilename = filename;
-  let { db, leaseDb } = openRuntimeStorage(filename, storageFilename, Boolean(options.runtimeLease),
-    options.spacesMigrationStep);
+  const migrationHooks = { spaces: options.spacesMigrationStep, tasks: options.tasksMigrationStep };
+  let { db, leaseDb } = openRuntimeStorage(filename, storageFilename, Boolean(options.runtimeLease), migrationHooks);
   let maintenance = false;
   let maintenanceCapacity;
   let maintenanceError;
@@ -252,7 +257,7 @@ export function createOutrightDatabase(options = {}) {
     migrationTick = setImmediate(() => {
       migrationTick = undefined;
       if (closing || maintenance) return;
-      try { advanceMigrations(db); migrationError = null; }
+      try { advanceMigrations(db, migrationHooks); migrationError = null; }
       catch (error) {
         migrationError = error;
         options.onMigrationError?.(error);
@@ -830,32 +835,57 @@ export function createOutrightDatabase(options = {}) {
       return db.prepare("SELECT id, name, position, created_at AS createdAt FROM spaces WHERE id = ?").get(id);
     },
     deleteSpace(id) {
-      return db.prepare("DELETE FROM spaces WHERE id = ?").run(id).changes > 0;
+      return db.transaction(() => {
+        if (db.prepare("SELECT 1 FROM tasks WHERE space_id = ? AND archived = 0 LIMIT 1").get(id)) {
+          throw databaseError(409, "Archive or finish this space's tasks before deleting it", { code: "SPACE_HAS_TASKS" });
+        }
+        if (conversationTasksReady(db)
+          && db.prepare("SELECT 1 FROM tasks JOIN conversations ON conversations.task_id = tasks.id WHERE tasks.space_id = ? LIMIT 1").get(id)) {
+          throw databaseError(409, "This space still has archived task threads", { code: "SPACE_HAS_TASKS" });
+        }
+        // Archived space tasks without threads leave with their space.
+        db.prepare("DELETE FROM tasks WHERE space_id = ?").run(id);
+        return db.prepare("DELETE FROM spaces WHERE id = ?").run(id).changes > 0;
+      }).immediate();
     },
     setProjectSpace(projectId, spaceId) {
       if (!spaceId) db.prepare("DELETE FROM project_memberships WHERE project_id = ?").run(projectId);
       else withinRetainedBudget(() => db.prepare("INSERT INTO project_memberships (project_id, space_id) VALUES (?, ?) ON CONFLICT(project_id) DO UPDATE SET space_id = excluded.space_id").run(projectId, spaceId));
     },
     listConversations(filters = {}) {
-      const where = ["archived = ?", "deleting = 0"];
+      const source = conversationSource(db);
+      const where = [`${source.archived} = ?`, "c.deleting = 0"];
       const values = [filters.archived ? 1 : 0];
-      if (filters.projectId) { where.push("project_id = ?"); values.push(filters.projectId); }
-      if (filters.worktreeId) { where.push("worktree_id = ?"); values.push(filters.worktreeId); }
-      return db.prepare(`SELECT ${conversationColumns()} FROM conversations WHERE ${where.join(" AND ")} ORDER BY pinned DESC, tab_position, updated_at DESC`).all(...values);
+      if (filters.projectId) { where.push("c.project_id = ?"); values.push(filters.projectId); }
+      if (filters.worktreeId) { where.push("c.worktree_id = ?"); values.push(filters.worktreeId); }
+      if (filters.taskId && !conversationTasksReady(db)) return [];
+      if (filters.taskId) { where.push("c.task_id = ?"); values.push(filters.taskId); }
+      return db.prepare(`${source.sql} WHERE ${where.join(" AND ")} ORDER BY c.pinned DESC, c.tab_position, c.updated_at DESC`).all(...values);
     },
     getConversation(id) {
-      return db.prepare(`SELECT ${conversationColumns()} FROM conversations WHERE id = ? AND deleting = 0`).get(id);
+      return db.prepare(`${conversationSource(db).sql} WHERE c.id = ? AND c.deleting = 0`).get(id);
     },
+    // Without a taskId the thread gets its own worktree task in the same
+    // transaction, so existing clients keep creating chats unchanged.
     createConversation(input) {
       if (retainedBytes(db) >= this.getSettings().maxRetainedMiB * 1024 * 1024) {
         throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
       }
       const id = randomUUID();
       const timestamp = now();
+      const title = input.title?.trim() || "New agent chat";
       const position = db.prepare("SELECT COALESCE(MAX(tab_position), -1) + 1 AS position FROM conversations WHERE project_id = ? AND worktree_id = ?").get(input.projectId, input.worktreeId).position;
-      withinRetainedBudget(() => db.prepare(`INSERT INTO conversations (id, project_id, worktree_id, worktree_path, title, provider, model, tab_position, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(id, input.projectId, input.worktreeId, input.worktreePath, input.title?.trim() || "New agent chat", input.provider || "codex", input.model || "", position, timestamp, timestamp));
+      withinRetainedBudget(() => {
+        let taskId;
+        if (input.taskId === undefined || input.taskId === null) taskId = insertThreadTask(db, input, title);
+        else {
+          taskId = requireThreadTask(db, input.taskId, input);
+          db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(timestamp, taskId);
+        }
+        db.prepare(`INSERT INTO conversations (id, project_id, worktree_id, worktree_path, title, provider, model, tab_position, created_at, updated_at, task_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          .run(id, input.projectId, input.worktreeId, input.worktreePath, title, input.provider || "codex", input.model || "", position, timestamp, timestamp, taskId);
+      });
       return this.getConversation(id);
     },
     updateConversation(id, patch) {
@@ -871,7 +901,10 @@ export function createOutrightDatabase(options = {}) {
       if (fields.length) {
         fields.push("updated_at = ?");
         values.push(now(), id);
-        const update = () => db.prepare(`UPDATE conversations SET ${fields.join(", ")} WHERE id = ?`).run(...values);
+        const update = () => {
+          db.prepare(`UPDATE conversations SET ${fields.join(", ")} WHERE id = ?`).run(...values);
+          if (patch.archived !== undefined) syncTaskArchive(db, id, patch.archived);
+        };
         // Archiving makes old history eligible for cleanup even after the
         // physical new-work gate closes. Use only half of the separate
         // recovery headroom so run and audit outcomes retain space.
@@ -889,11 +922,111 @@ export function createOutrightDatabase(options = {}) {
       }
       const position = db.prepare("SELECT COALESCE(MAX(tab_position), -1) + 1 AS position FROM conversations WHERE project_id = ? AND worktree_id = ?").get(destination.projectId, destination.worktreeId).position;
       withinRetainedBudget(() => {
-        const changed = db.prepare("UPDATE conversations SET project_id = ?, worktree_id = ?, worktree_path = ?, tab_position = ?, updated_at = ? WHERE id = ? AND deleting = 0")
-          .run(destination.projectId, destination.worktreeId, destination.worktreePath, position, now(), id).changes;
+        const timestamp = now();
+        const current = db.prepare(`SELECT c.task_id AS taskId, c.project_id AS projectId, c.worktree_id AS worktreeId,
+          c.worktree_path AS worktreePath, c.title, c.archived, t.archived AS taskArchived
+          FROM conversations AS c JOIN tasks AS t ON t.id = c.task_id WHERE c.id = ? AND c.deleting = 0`).get(id);
+        if (!current) throw databaseError(409, "Conversation is unavailable for moving");
+        // The thread joins a task at its destination: the named one, its own
+        // task when it stays in place, or a new task that keeps it as visible
+        // or hidden as it was.
+        let taskId = current.taskId;
+        if (destination.taskId !== undefined && destination.taskId !== null) taskId = requireThreadTask(db, destination.taskId, destination);
+        else if (["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== destination[key])) {
+          taskId = insertThreadTask(db, destination, current.title, Boolean(current.archived || current.taskArchived));
+        }
+        const changed = db.prepare("UPDATE conversations SET project_id = ?, worktree_id = ?, worktree_path = ?, tab_position = ?, updated_at = ?, task_id = ? WHERE id = ? AND deleting = 0")
+          .run(destination.projectId, destination.worktreeId, destination.worktreePath, position, timestamp, taskId, id).changes;
         if (!changed) throw databaseError(409, "Conversation is unavailable for moving");
+        if (taskId !== current.taskId) db.prepare("UPDATE tasks SET updated_at = ? WHERE id IN (?, ?)").run(timestamp, taskId, current.taskId);
       });
       return this.getConversation(id);
+    },
+    listTasks(filters = {}) {
+      assertTasksReady(db);
+      const limit = filters.limit ?? 50;
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw databaseError(400, "Task page size must be 1 to 100");
+      const after = decodePageCursor(filters.cursor, "Task cursor is invalid");
+      const where = ["t.archived = ?"];
+      const values = [filters.archived ? 1 : 0];
+      for (const key of ["spaceId", "projectId", "worktreeId", "scopeKind", "status"]) {
+        if (filters[key] !== undefined && filters[key] !== null && (typeof filters[key] !== "string" || !filters[key] || filters[key].length > 512)) {
+          throw databaseError(400, `Task ${key} filter is invalid`);
+        }
+      }
+      // A space lists its own tasks and those of the projects filed in it.
+      if (filters.spaceId) {
+        where.push("(t.space_id = ? OR t.project_id IN (SELECT project_id FROM project_memberships WHERE space_id = ?))");
+        values.push(filters.spaceId, filters.spaceId);
+      }
+      if (filters.projectId) { where.push("t.project_id = ?"); values.push(filters.projectId); }
+      if (filters.worktreeId) { where.push("t.worktree_id = ?"); values.push(filters.worktreeId); }
+      if (filters.scopeKind) {
+        if (!["space", "project", "worktree"].includes(filters.scopeKind)) throw databaseError(400, "Task scope kind must be space, project, or worktree");
+        where.push("t.scope_kind = ?");
+        values.push(filters.scopeKind);
+      }
+      if (filters.status === "open") where.push("t.user_status = 'open'");
+      else if (filters.status) {
+        if (!["running", "waiting", "idle", "done"].includes(filters.status)) throw databaseError(400, "Task status must be running, waiting, idle, done, or open");
+        where.push(`${TASK_STATUS_SQL} = ?`);
+        values.push(filters.status);
+      }
+      if (after) { where.push("(t.updated_at < ? OR (t.updated_at = ? AND t.id < ?))"); values.push(after[0], after[0], after[1]); }
+      const rows = db.prepare(`${TASK_SELECT_SQL} WHERE ${where.join(" AND ")} ORDER BY t.updated_at DESC, t.id DESC LIMIT ?`).all(...values, limit + 1);
+      return boundedTaskPage(rows, limit);
+    },
+    getTask(id, { threads = false } = {}) {
+      assertTasksReady(db);
+      const task = hydrateTask(db.prepare(`${TASK_SELECT_SQL} WHERE t.id = ?`).get(id));
+      if (!task || !threads) return task;
+      const listed = db.prepare(`${conversationSource(db).sql} WHERE c.task_id = ? AND c.deleting = 0 ORDER BY c.created_at, c.rowid LIMIT ?`)
+        .all(id, TASK_THREAD_LIMIT);
+      return { ...task, threads: listed, threadsTruncated: task.threadCount > listed.length };
+    },
+    createTask(input) {
+      assertTasksReady(db);
+      const task = normalizeTaskInput(input);
+      const id = withinRetainedBudget(() => {
+        if (task.spaceId && !db.prepare("SELECT 1 FROM spaces WHERE id = ?").get(task.spaceId)) throw databaseError(404, "Space not found");
+        return insertTask(db, task);
+      });
+      return this.getTask(id);
+    },
+    // A task's scope never changes after creation; threads move between tasks
+    // instead. Archiving hides its threads and never deletes them.
+    updateTask(id, patch) {
+      assertTasksReady(db);
+      if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw databaseError(400, "Task update must be a JSON object");
+      const columns = { title: "title", objective: "objective", status: "user_status", archived: "archived" };
+      for (const key of Object.keys(patch)) {
+        if (!columns[key]) throw databaseError(400, ["scopeKind", "spaceId", "projectId", "worktreeId", "worktreePath", "origin"].includes(key)
+          ? "Task scope and origin cannot be changed" : `Unknown task field: ${key}`);
+      }
+      const values = {};
+      if (patch.title !== undefined) values.title = boundedText(patch.title, "Task title", TASK_TITLE_CHARACTERS);
+      if (patch.objective !== undefined) values.objective = taskObjective(patch.objective);
+      if (patch.status !== undefined) {
+        if (!["open", "done"].includes(patch.status)) throw databaseError(400, "Task status must be open or done");
+        values.status = patch.status;
+      }
+      if (patch.archived !== undefined) {
+        if (typeof patch.archived !== "boolean") throw databaseError(400, "Task archived state must be a boolean");
+        values.archived = Number(patch.archived);
+      }
+      if (!db.prepare("SELECT 1 FROM tasks WHERE id = ?").get(id)) return null;
+      const entries = Object.entries(values);
+      if (!entries.length) return this.getTask(id);
+      const archiveOnly = entries.length === 1 && values.archived === 1;
+      withinRetainedBudget(() => {
+        if (values.archived === 1 && db.prepare(`SELECT 1 FROM conversations AS c JOIN runs AS r ON r.conversation_id = c.id
+          WHERE c.task_id = ? AND r.status = 'interrupted' AND r.recovery_decision IS NULL LIMIT 1`).get(id)) {
+          throw databaseError(409, "Resolve the interrupted run before archiving this task", { code: "RUN_RECOVERY_REQUIRED" });
+        }
+        db.prepare(`UPDATE tasks SET ${entries.map(([key]) => `${columns[key]} = ?`).join(", ")}, updated_at = ? WHERE id = ?`)
+          .run(...entries.map(([, value]) => value), now(), id);
+      }, retainedReserveBytes, archiveOnly);
+      return this.getTask(id);
     },
     listMessages(conversationId) {
       assertConversationNotDeleting(db, conversationId);
@@ -2096,7 +2229,7 @@ function openDataConnection(filename) {
   return db;
 }
 
-function openRuntimeStorage(filename, storageFilename, runtimeLease, onSpacesMigrationStep) {
+function openRuntimeStorage(filename, storageFilename, runtimeLease, migrationHooks) {
   let db;
   let leaseDb;
   try {
@@ -2118,8 +2251,8 @@ function openRuntimeStorage(filename, storageFilename, runtimeLease, onSpacesMig
       if (source && (source.nlink !== 1 || !source.isFile())) throw new Error("A runtime database must be a private regular file");
     }
     db = openDataConnection(filename);
-    migrate(db, onSpacesMigrationStep);
-    advanceMigrations(db);
+    migrate(db, migrationHooks.spaces);
+    advanceMigrations(db, migrationHooks);
     return { db, leaseDb };
   } catch (error) {
     db?.close();
@@ -2290,8 +2423,12 @@ function deleteArchivedBatch(db, id, filename) {
     const result = deleteArchivedRows(db, id, filename, query, table);
     if (result) return result;
   }
+  const taskId = conversationTasksReady(db) ? db.prepare("SELECT task_id FROM conversations WHERE id = ? AND deleting = 1").get(id)?.task_id : null;
   const deleted = db.prepare("DELETE FROM conversations WHERE id = ? AND deleting = 1").run(id).changes;
-  if (deleted) auditArchivedDeletion(db, id);
+  if (deleted) {
+    deleteOrphanedTask(db, taskId);
+    auditArchivedDeletion(db, id);
+  }
   return { done: true };
 }
 
@@ -2365,11 +2502,25 @@ function migrate(db, onSpacesMigrationStep) {
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS spaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS project_memberships (project_id TEXT PRIMARY KEY, space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE);
+    CREATE TABLE IF NOT EXISTS tasks (
+      id TEXT PRIMARY KEY, scope_kind TEXT NOT NULL CHECK (scope_kind IN ('space', 'project', 'worktree')),
+      space_id TEXT REFERENCES spaces(id), project_id TEXT, worktree_id TEXT, worktree_path TEXT,
+      title TEXT NOT NULL, objective TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT 'user' CHECK (origin IN ('user', 'outbot')),
+      user_status TEXT NOT NULL DEFAULT 'open' CHECK (user_status IN ('open', 'done')),
+      archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)), created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      CHECK ((scope_kind = 'space' AND space_id IS NOT NULL AND project_id IS NULL AND worktree_id IS NULL AND worktree_path IS NULL)
+        OR (scope_kind = 'project' AND space_id IS NULL AND project_id IS NOT NULL AND worktree_id IS NULL AND worktree_path IS NULL)
+        OR (scope_kind = 'worktree' AND space_id IS NULL AND project_id IS NOT NULL AND worktree_id IS NOT NULL AND worktree_path IS NOT NULL))
+    );
+    CREATE INDEX IF NOT EXISTS tasks_recent ON tasks(archived, updated_at, id);
+    CREATE INDEX IF NOT EXISTS tasks_space_scope ON tasks(space_id, archived, updated_at);
+    CREATE INDEX IF NOT EXISTS tasks_project_scope ON tasks(project_id, worktree_id, archived, updated_at);
+    CREATE INDEX IF NOT EXISTS tasks_status ON tasks(user_status, archived, updated_at);
     CREATE TABLE IF NOT EXISTS conversations (
-      id TEXT PRIMARY KEY, project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, worktree_path TEXT NOT NULL,
+      id TEXT PRIMARY KEY, project_id TEXT NOT NULL, worktree_id TEXT, worktree_path TEXT,
       title TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', provider_session_id TEXT, tab_position INTEGER NOT NULL DEFAULT 0,
       archived INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, deleting INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, task_id TEXT NOT NULL REFERENCES tasks(id)
     );
     CREATE INDEX IF NOT EXISTS conversations_scope ON conversations(project_id, worktree_id, archived, updated_at);
     CREATE TABLE IF NOT EXISTS messages (
@@ -2418,6 +2569,7 @@ function migrate(db, onSpacesMigrationStep) {
   prepareVisibleConversationLookup(db);
   prepareRecentTitleLookup(db);
   prepareSearchMessageHeads(db);
+  prepareTaskMigration(db);
   try { db.exec("ALTER TABLE runs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'medium'"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN pid INTEGER"); } catch { /* Already migrated. */ }
   try { db.exec("ALTER TABLE runs ADD COLUMN recovery_class TEXT"); } catch { /* Already migrated. */ }
@@ -2457,6 +2609,117 @@ function migrateProjectGroupsToSpaces(db, onStep) {
     }
     if (hasTable("retained_scans")) db.prepare("UPDATE retained_scans SET table_name = 'spaces' WHERE table_name = 'project_groups'").run();
   }).immediate();
+}
+
+// Tasks became the durable unit of work. A store whose conversations predate
+// task_id backfills one worktree task per conversation in bounded batches,
+// then rebuilds the conversations table once. Schema state gates both steps.
+function prepareTaskMigration(db) {
+  if (conversationTasksReady(db)) {
+    db.exec("CREATE INDEX IF NOT EXISTS conversations_task ON conversations(task_id)");
+    return;
+  }
+  db.prepare("INSERT OR IGNORE INTO migration_progress (kind) VALUES ('tasks')").run();
+}
+
+// A migrated task reuses its conversation's id, so a resumed batch or the
+// final catch-up insert can never duplicate a task. Titles are bounded
+// copies; the conversation keeps its full title.
+const TASK_BACKFILL_SQL = `INSERT OR IGNORE INTO tasks (id, scope_kind, project_id, worktree_id, worktree_path, title,
+    objective, origin, user_status, archived, created_at, updated_at)
+  SELECT id, 'worktree', project_id, worktree_id, worktree_path, substr(title, 1, ${TASK_TITLE_CHARACTERS}),
+    '', 'user', 'open', CASE WHEN archived = 0 THEN 0 ELSE 1 END, created_at, updated_at FROM conversations`;
+
+function advanceTaskMigration(db, onStep) {
+  const job = migrationJob(db, "tasks");
+  if (!job) return;
+  const backfilled = db.transaction(() => {
+    const rows = db.prepare("SELECT rowid AS scanRowId FROM conversations WHERE rowid > ? ORDER BY rowid LIMIT 64").all(job.cursor_number);
+    if (rows.length) {
+      withMigrationGrowth(db, () => db.prepare(`${TASK_BACKFILL_SQL} WHERE rowid > ? AND rowid <= ?`)
+        .run(job.cursor_number, rows.at(-1).scanRowId));
+      db.prepare("UPDATE migration_progress SET cursor_number = ? WHERE kind = 'tasks'").run(rows.at(-1).scanRowId);
+    }
+    onStep?.("tasks-backfilled");
+    return rows.length < 64;
+  }).immediate();
+  if (backfilled) rebuildConversationsWithTasks(db, onStep);
+}
+
+// Backfilled tasks duplicate bounded metadata of history that is already
+// retained. Like recovery evidence, they may cross the configured cap once,
+// so an over-quota store still finishes upgrading.
+function withMigrationGrowth(db, write) {
+  db.prepare("UPDATE retained_usage SET legacy_ceiling = ? WHERE id = 1").run(Number.MAX_SAFE_INTEGER);
+  write();
+  reserveRecoveryHeadroom(db);
+}
+
+// SQLite's documented table rebuild: foreign keys stay off across the swap,
+// so the ON DELETE CASCADE keys from messages and runs never fire. Every
+// column present now is copied with its rowid, which the search lookups key
+// on, and every index and trigger on the table is recreated from its SQL.
+function rebuildConversationsWithTasks(db, onStep) {
+  db.pragma("foreign_keys = OFF");
+  try {
+    if (db.pragma("foreign_keys", { simple: true }) !== 0) throw new Error("Foreign keys must be off to rebuild conversations");
+    db.transaction(() => {
+      if (conversationTasksReady(db)) {
+        db.prepare("DELETE FROM migration_progress WHERE kind = 'tasks'").run();
+        return;
+      }
+      const checked = ["conversations", "messages", "runs", "tasks"];
+      const before = foreignKeyViolationCounts(db, checked);
+      withMigrationGrowth(db, () => db.prepare(`${TASK_BACKFILL_SQL} WHERE NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.id = conversations.id)`).run());
+      const columns = db.pragma("table_info(conversations)").map((column) => `"${column.name.replaceAll('"', '""')}"`).join(", ");
+      const dependents = db.prepare(`SELECT sql FROM sqlite_master WHERE tbl_name = 'conversations'
+        AND type IN ('index', 'trigger') AND sql IS NOT NULL ORDER BY type, name`).all();
+      db.exec(rebuiltConversationsSql(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'conversations'").get().sql));
+      db.exec(`INSERT INTO conversations_rebuild (rowid, ${columns}, task_id) SELECT rowid, ${columns}, id FROM conversations`);
+      onStep?.("conversations-copied");
+      db.exec("DROP TABLE conversations");
+      // Triggers on message_order name conversations. Modern RENAME would
+      // reject them while no table has that name; nothing references the
+      // rebuild table, so the legacy rename rewrites nothing.
+      db.pragma("legacy_alter_table = ON");
+      try { db.exec("ALTER TABLE conversations_rebuild RENAME TO conversations"); }
+      finally { db.pragma("legacy_alter_table = OFF"); }
+      for (const { sql } of dependents) db.exec(sql);
+      db.exec("CREATE INDEX conversations_task ON conversations(task_id)");
+      const after = foreignKeyViolationCounts(db, checked);
+      for (const [key, count] of after) {
+        if (count > (before.get(key) ?? 0)) throw new Error(`Conversation rebuild would violate foreign key ${key}`);
+      }
+      db.prepare("DELETE FROM migration_progress WHERE kind = 'tasks'").run();
+    }).immediate();
+  } finally { db.pragma("foreign_keys = ON"); }
+}
+
+// A pre-existing orphan in an unrelated legacy row must not wedge the
+// upgrade, but the rebuild itself may not add a single violation.
+function foreignKeyViolationCounts(db, tables) {
+  const counts = new Map();
+  for (const table of tables) {
+    for (const row of db.pragma(`foreign_key_check(${table})`)) {
+      const key = `${row.table}->${row.parent}`;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
+
+// Start from the stored definition so columns added by later releases keep
+// their types, defaults and constraints. Only the worktree columns relax and
+// the task reference is appended.
+function rebuiltConversationsSql(sql) {
+  let rebuilt = sql.replace(/^CREATE TABLE\s+(?:"conversations"|conversations)\s*\(/i, "CREATE TABLE conversations_rebuild (");
+  for (const column of ["worktree_id", "worktree_path"]) {
+    const pattern = new RegExp(`([(,]\\s*)${column}\\s+TEXT\\s+NOT\\s+NULL(\\s*[,)])`, "i");
+    if (!pattern.test(rebuilt)) throw new Error(`Unexpected conversations schema for ${column}`);
+    rebuilt = rebuilt.replace(pattern, `$1${column} TEXT$2`);
+  }
+  if (!rebuilt.startsWith("CREATE TABLE conversations_rebuild (") || !/\)\s*$/.test(rebuilt)) throw new Error("Unexpected conversations schema");
+  return rebuilt.replace(/\)\s*$/, ", task_id TEXT NOT NULL REFERENCES tasks(id))");
 }
 
 function prepareRecoveryLookup(db, hadRuns, version) {
@@ -2645,6 +2908,11 @@ function prepareRetainedMeasurement(db, version) {
       const insert = db.prepare("INSERT INTO retained_scans (table_name) VALUES (?)");
       for (const [table] of RETAINED_COLUMNS) insert.run(table);
     }).immediate();
+  } else {
+    // A table added by an upgrade during an unfinished scan needs its own
+    // cursor. Its triggers count nothing before measurement completes.
+    const insert = db.prepare("INSERT OR IGNORE INTO retained_scans (table_name) VALUES (?)");
+    for (const [table] of RETAINED_COLUMNS) insert.run(table);
   }
   installRetainedTriggers(db);
 }
@@ -2684,8 +2952,9 @@ function assertMessageOrderReady(db) {
 // One tick visits at most 64 rows in each migration family and retained
 // table. Cursors and byte adjustments commit together, so an interrupted
 // upgrade resumes without recounting old rows or dropping live writes.
-function advanceMigrations(db) {
+function advanceMigrations(db, hooks = {}) {
   if (!migrationPending(db)) return;
+  advanceTaskMigration(db, hooks.tasks);
   advanceRecoveryMigration(db);
   advanceEventMigration(db);
   advanceMessageMigration(db);
@@ -2870,9 +3139,156 @@ function reserveRecoveryHeadroom(db, configured = Number(db.prepare("SELECT valu
   db.prepare("UPDATE retained_usage SET legacy_ceiling = ? WHERE id = 1").run(ceiling);
 }
 
-function conversationColumns() {
-  return `id, project_id AS projectId, worktree_id AS worktreeId, worktree_path AS worktreePath, title, provider, model,
-    provider_session_id AS providerSessionId, archived, pinned, tab_position AS tabPosition, created_at AS createdAt, updated_at AS updatedAt`;
+const tasksReady = new WeakSet();
+function conversationTasksReady(db) {
+  if (tasksReady.has(db)) return true;
+  if (!db.pragma("table_info(conversations)").some((column) => column.name === "task_id")) return false;
+  tasksReady.add(db);
+  return true;
+}
+
+// An archived task hides every thread, so a thread reads as archived while
+// either it or its task is archived. Before the task rebuild commits, the
+// legacy table has no task to join and threads report a null taskId.
+function conversationSource(db) {
+  const tasks = conversationTasksReady(db);
+  const archived = tasks ? "CASE WHEN c.archived = 1 OR t.archived = 1 THEN 1 ELSE 0 END" : "c.archived";
+  return { archived, sql: `SELECT c.id, c.project_id AS projectId, c.worktree_id AS worktreeId, c.worktree_path AS worktreePath,
+    c.title, c.provider, c.model, c.provider_session_id AS providerSessionId, ${archived} AS archived, c.pinned,
+    c.tab_position AS tabPosition, c.created_at AS createdAt, c.updated_at AS updatedAt, ${tasks ? "c.task_id" : "NULL"} AS taskId
+    FROM conversations AS c${tasks ? " LEFT JOIN tasks AS t ON t.id = c.task_id" : ""}` };
+}
+
+// Derived on every read from run rows, so it is correct after a restart.
+// recovery_scope indexes exactly the unsettled runs; joining back to runs
+// reads their current status. Running work wins over a pending recovery
+// choice, and a user's done overrides both. A later waiting cause (OUT-63
+// awaiting_input) adds a level here without a schema change.
+const TASK_UNSETTLED_SQL = `unsettled AS MATERIALIZED (SELECT c.task_id AS task_id,
+    MAX(CASE WHEN r.status IN ('queued', 'launching', 'running') THEN 2 ELSE 1 END) AS level
+  FROM recovery_scope AS s JOIN runs AS r ON r.id = s.run_id JOIN conversations AS c ON c.id = r.conversation_id
+  WHERE r.status IN ('queued', 'launching', 'running') OR (r.status = 'interrupted' AND r.recovery_decision IS NULL)
+  GROUP BY c.task_id)`;
+const TASK_STATUS_SQL = `CASE WHEN t.user_status = 'done' THEN 'done' WHEN u.level = 2 THEN 'running'
+  WHEN u.level = 1 THEN 'waiting' ELSE 'idle' END`;
+const TASK_SELECT_SQL = `WITH ${TASK_UNSETTLED_SQL}
+  SELECT t.id, t.scope_kind AS scopeKind, t.space_id AS spaceId, t.project_id AS projectId, t.worktree_id AS worktreeId,
+    t.worktree_path AS worktreePath, t.title, t.objective, t.origin, t.user_status AS userStatus, ${TASK_STATUS_SQL} AS status,
+    t.archived, (SELECT COUNT(*) FROM conversations WHERE task_id = t.id AND deleting = 0) AS threadCount,
+    t.created_at AS createdAt, t.updated_at AS updatedAt
+  FROM tasks AS t LEFT JOIN unsettled AS u ON u.task_id = t.id`;
+
+function hydrateTask(row) { return row ? { ...row, archived: row.archived === 1 } : row; }
+
+function assertTasksReady(db) {
+  if (migrationJob(db, "tasks")) throw databaseError(503, "Tasks are being migrated; retry shortly");
+  if (migrationJob(db, "recovery")) throw databaseError(503, "Recovery ownership is being indexed; retry shortly");
+}
+
+function boundedText(value, label, maxCharacters) {
+  if (typeof value !== "string" || !value.trim() || value.length > maxCharacters * 2 || Array.from(value.trim()).length > maxCharacters) {
+    throw databaseError(400, `${label} must be 1 to ${maxCharacters} characters`);
+  }
+  return value.trim();
+}
+
+function taskObjective(value) {
+  if (value === undefined || value === null) return "";
+  if (typeof value !== "string" || Buffer.byteLength(value) > TASK_OBJECTIVE_BYTES) {
+    throw databaseError(400, `Task objective must be a string of at most ${TASK_OBJECTIVE_BYTES} bytes`);
+  }
+  return value;
+}
+
+// One shape check for the API and storage: each scope names exactly the ids
+// its kind requires, mirroring the tasks CHECK constraint.
+export function normalizeTaskInput(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw databaseError(400, "Task must be a JSON object");
+  const required = { space: ["spaceId"], project: ["projectId"], worktree: ["projectId", "worktreeId", "worktreePath"] }[input.scopeKind];
+  if (!required) throw databaseError(400, "Task scope kind must be space, project, or worktree");
+  for (const key of ["spaceId", "projectId", "worktreeId", "worktreePath"]) {
+    const value = input[key];
+    if (required.includes(key)) {
+      if (typeof value !== "string" || !value || Buffer.byteLength(value) > 4096) throw databaseError(400, `A ${input.scopeKind} task requires ${key}`);
+    } else if (value !== undefined && value !== null) throw databaseError(400, `A ${input.scopeKind} task cannot name ${key}`);
+  }
+  if (input.origin !== undefined && !["user", "outbot"].includes(input.origin)) throw databaseError(400, "Task origin must be user or outbot");
+  return { scopeKind: input.scopeKind, spaceId: input.spaceId ?? null, projectId: input.projectId ?? null,
+    worktreeId: input.worktreeId ?? null, worktreePath: input.worktreePath ?? null,
+    title: boundedText(input.title, "Task title", TASK_TITLE_CHARACTERS), objective: taskObjective(input.objective),
+    origin: input.origin ?? "user" };
+}
+
+function insertTask(db, task, timestamp = now()) {
+  const id = randomUUID();
+  db.prepare(`INSERT INTO tasks (id, scope_kind, space_id, project_id, worktree_id, worktree_path, title, objective, origin,
+      user_status, archived, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)`)
+    .run(id, task.scopeKind, task.spaceId ?? null, task.projectId ?? null, task.worktreeId ?? null, task.worktreePath ?? null,
+      task.title, task.objective ?? "", task.origin ?? "user", task.archived ? 1 : 0, timestamp, timestamp);
+  return id;
+}
+
+function insertThreadTask(db, target, title, archived = false) {
+  return insertTask(db, { scopeKind: "worktree", projectId: target.projectId, worktreeId: target.worktreeId,
+    worktreePath: target.worktreePath, title: Array.from(title?.trim() || "New agent chat").slice(0, TASK_TITLE_CHARACTERS).join(""), archived });
+}
+
+// New threads launch only in a worktree until OUT-57, and only into the
+// exact worktree that the task is scoped to.
+function requireThreadTask(db, taskId, target) {
+  if (typeof taskId !== "string" || !taskId || taskId.length > 512) throw databaseError(400, "Task id is invalid");
+  const task = db.prepare("SELECT scope_kind AS scopeKind, project_id AS projectId, worktree_id AS worktreeId, worktree_path AS worktreePath, archived FROM tasks WHERE id = ?").get(taskId);
+  if (!task) throw databaseError(404, "Task not found");
+  if (task.scopeKind !== "worktree") throw databaseError(409, "Only worktree tasks can get new threads", { code: "TASK_SCOPE_UNSUPPORTED" });
+  if (task.archived) throw databaseError(409, "Archived tasks cannot get new threads", { code: "TASK_ARCHIVED" });
+  if (["projectId", "worktreeId", "worktreePath"].some((key) => task[key] !== target[key])) {
+    throw databaseError(409, "The thread's worktree does not match the task's scope", { code: "TASK_SCOPE_MISMATCH" });
+  }
+  return taskId;
+}
+
+// A thread archived or restored through the conversation flow keeps a
+// single-thread task in step: restoring makes its task visible, and archiving
+// the last visible thread archives the task.
+function syncTaskArchive(db, conversationId, archived) {
+  if (!conversationTasksReady(db)) return;
+  const taskId = db.prepare("SELECT task_id FROM conversations WHERE id = ?").get(conversationId)?.task_id;
+  if (!taskId) return;
+  if (!archived) db.prepare("UPDATE tasks SET archived = 0, updated_at = ? WHERE id = ? AND archived = 1").run(now(), taskId);
+  else db.prepare(`UPDATE tasks SET archived = 1, updated_at = ? WHERE id = ? AND archived = 0
+    AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id AND archived = 0 AND deleting = 0)`).run(now(), taskId);
+}
+
+// Retention removes an archived thread; its task goes with it only when the
+// task is archived too and has no other thread.
+function deleteOrphanedTask(db, taskId) {
+  if (taskId) db.prepare("DELETE FROM tasks WHERE id = ? AND archived = 1 AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = ?)").run(taskId, taskId);
+}
+
+function decodePageCursor(cursor, message) {
+  if (cursor === null || cursor === undefined) return null;
+  if (typeof cursor !== "string" || cursor.length > 2048 || !/^[A-Za-z0-9_-]+$/.test(cursor)) throw databaseError(400, message);
+  try {
+    const after = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (Buffer.from(JSON.stringify(after)).toString("base64url") !== cursor || !Array.isArray(after) || after.length !== 2
+      || after.some((part) => typeof part !== "string" || !part || part.length > 512)) throw new Error("invalid cursor");
+    return after;
+  } catch { throw databaseError(400, message); }
+}
+
+function boundedTaskPage(rows, limit) {
+  const tasks = [];
+  let serializedBytes = 4096;
+  for (const row of rows) {
+    if (tasks.length === limit) break;
+    const task = hydrateTask(row);
+    const bytes = Buffer.byteLength(JSON.stringify(task)) + 1;
+    if (tasks.length && serializedBytes + bytes > TASK_RESPONSE_BYTES) break;
+    tasks.push(task);
+    serializedBytes += bytes;
+  }
+  const last = tasks.at(-1);
+  return { tasks, nextCursor: rows.length > tasks.length ? Buffer.from(JSON.stringify([last.updatedAt, last.id])).toString("base64url") : null };
 }
 
 function assertConversationNotDeleting(db, id) {

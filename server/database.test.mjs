@@ -1797,3 +1797,357 @@ test("an unfinished retained scan of project groups resumes under spaces", async
     } finally { await database.close(); }
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+const LEGACY_CONVERSATION_COLUMNS = "id, project_id, worktree_id, worktree_path, title, provider, model, provider_session_id, tab_position, archived, pinned, deleting, created_at, updated_at";
+const TASK_RETAINED_SIZE = "128 + COALESCE(octet_length(id), 0) + COALESCE(octet_length(space_id), 0) + COALESCE(octet_length(project_id), 0) + COALESCE(octet_length(worktree_id), 0) + COALESCE(octet_length(worktree_path), 0) + COALESCE(octet_length(title), 0) + COALESCE(octet_length(objective), 0)";
+
+// Rebuild the pre-task schema from a current store: the legacy conversations
+// definition without task_id, with every row, rowid, index and trigger kept,
+// and no tasks table. Task bytes leave the retained counter with the table.
+function seedPreTaskStore(filename, { sessionEpoch = false } = {}) {
+  const legacy = new Database(filename);
+  try {
+    legacy.pragma("foreign_keys = OFF");
+    legacy.transaction(() => {
+      const dependents = legacy.prepare(`SELECT sql FROM sqlite_master WHERE tbl_name = 'conversations'
+        AND type IN ('index', 'trigger') AND sql IS NOT NULL AND name != 'conversations_task'`).all();
+      legacy.exec(`CREATE TABLE legacy_conversations (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, worktree_path TEXT NOT NULL,
+        title TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', provider_session_id TEXT, tab_position INTEGER NOT NULL DEFAULT 0,
+        archived INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, deleting INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      )`);
+      legacy.exec(`INSERT INTO legacy_conversations (rowid, ${LEGACY_CONVERSATION_COLUMNS}) SELECT rowid, ${LEGACY_CONVERSATION_COLUMNS} FROM conversations`);
+      legacy.exec(`UPDATE retained_usage SET bytes = bytes - (SELECT COALESCE(SUM(${TASK_RETAINED_SIZE}), 0) FROM tasks) WHERE id = 1`);
+      legacy.exec("DROP TABLE conversations");
+      legacy.exec("DROP TABLE tasks");
+      legacy.pragma("legacy_alter_table = ON");
+      legacy.exec("ALTER TABLE legacy_conversations RENAME TO conversations");
+      legacy.pragma("legacy_alter_table = OFF");
+      for (const { sql } of dependents) legacy.exec(sql);
+      if (sessionEpoch) {
+        legacy.exec("ALTER TABLE conversations ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0");
+        legacy.exec("UPDATE conversations SET session_epoch = rowid * 3");
+      }
+    })();
+    assert.equal(legacy.pragma("table_info(conversations)").some((column) => column.name === "task_id"), false);
+  } finally { legacy.close(); }
+}
+
+function taskStoreSnapshot(filename) {
+  const probe = new Database(filename, { readonly: true });
+  try {
+    const all = (sql) => probe.prepare(sql).all();
+    return {
+      conversations: all(`SELECT rowid, ${LEGACY_CONVERSATION_COLUMNS} FROM conversations ORDER BY rowid`),
+      messages: all("SELECT rowid, id, conversation_id, body, search_order FROM messages ORDER BY rowid"),
+      messageOrder: all("SELECT * FROM message_order ORDER BY scope, ordinal"),
+      runs: all("SELECT rowid, id, conversation_id, status, recovery_decision FROM runs ORDER BY rowid"),
+      recoveryScope: all("SELECT * FROM recovery_scope ORDER BY run_id"),
+      searchVisible: all("SELECT * FROM search_visible_conversations ORDER BY source_rowid"),
+      searchTitles: all("SELECT * FROM search_recent_titles ORDER BY source_rowid"),
+      searchHeads: all("SELECT * FROM search_message_heads ORDER BY source_rowid"),
+      triggers: all("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'conversations' ORDER BY name"),
+      indexes: all("SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'conversations' AND name != 'conversations_task' ORDER BY name"),
+      retainedBytes: probe.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes,
+    };
+  } finally { probe.close(); }
+}
+
+function populateTaskFixture(filename) {
+  const database = createOutrightDatabase({ filename });
+  try {
+    const make = (title, worktree) => database.createConversation({ projectId: "project-1", worktreeId: worktree, worktreePath: `/tmp/${worktree}`, title, provider: "codex" });
+    const plain = make("Plain needle chat", "tree-1");
+    const pinned = make("Pinned chat", "tree-1");
+    const archived = make("Archived chat", "tree-2");
+    const deleting = make("Deleting chat", "tree-2");
+    const interrupted = make("Interrupted chat", "tree-3");
+    for (const conversation of [plain, pinned, archived, deleting, interrupted]) {
+      database.addMessage({ conversationId: conversation.id, role: "user", body: `needle in ${conversation.title}` });
+      database.addMessage({ conversationId: conversation.id, role: "assistant", body: "reply" });
+    }
+    database.updateConversation(pinned.id, { pinned: true, tabPosition: 7 });
+    database.updateConversation(archived.id, { archived: true });
+    database.updateConversation(deleting.id, { archived: true });
+    const unresolved = database.createRun({ conversationId: interrupted.id, provider: "codex", approvalPolicy: "read-only", prompt: "half" });
+    database.updateRun(unresolved.id, { status: "interrupted", recoveryClass: "never-started" });
+    const settled = database.createRun({ conversationId: plain.id, provider: "codex", approvalPolicy: "read-only", prompt: "done" });
+    database.updateRun(settled.id, { status: "completed" });
+    const search = database.search("needle").conversations.map((row) => row.id).sort();
+    return { plain, pinned, archived, deleting, interrupted, unresolved, search };
+  } finally { database.close(); }
+}
+
+test("a populated pre-task store migrates every conversation into one worktree task without changing history", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-task-upgrade-"));
+  const filename = path.join(directory, "outright.db");
+  try {
+    const fixture = populateTaskFixture(filename);
+    seedPreTaskStore(filename);
+    const raw = new Database(filename);
+    try { raw.prepare("UPDATE conversations SET deleting = 1 WHERE id = ?").run(fixture.deleting.id); }
+    finally { raw.close(); }
+    const before = taskStoreSnapshot(filename);
+    assert.equal(before.searchVisible.length, 4, "the deleting conversation is already hidden from search");
+    let database = createOutrightDatabase({ filename });
+    try {
+      assert.equal(database.capacity().migrationStatus, "ready");
+      const after = taskStoreSnapshot(filename);
+      const { retainedBytes, ...history } = after;
+      const { retainedBytes: legacyBytes, ...legacyHistory } = before;
+      assert.deepEqual(history, legacyHistory, "ids, rowids, messages, runs, recovery and search rows are unchanged");
+      const probe = new Database(filename, { readonly: true });
+      try {
+        assert.deepEqual(probe.pragma("foreign_key_check"), []);
+        const tasks = probe.prepare("SELECT * FROM tasks ORDER BY id").all();
+        assert.equal(tasks.length, before.conversations.length);
+        const taskBytes = probe.prepare(`SELECT SUM(${TASK_RETAINED_SIZE}) AS bytes FROM tasks`).get().bytes;
+        assert.equal(retainedBytes, legacyBytes + taskBytes, "backfilled tasks are counted once by the retained budget");
+        for (const conversation of before.conversations) {
+          const row = probe.prepare("SELECT task_id FROM conversations WHERE id = ?").get(conversation.id);
+          const task = tasks.find((candidate) => candidate.id === row.task_id);
+          assert.deepEqual({ ...task }, { id: row.task_id, scope_kind: "worktree", space_id: null, project_id: conversation.project_id,
+            worktree_id: conversation.worktree_id, worktree_path: conversation.worktree_path, title: conversation.title, objective: "",
+            origin: "user", user_status: "open", archived: conversation.archived, created_at: conversation.created_at,
+            updated_at: conversation.updated_at });
+        }
+        const columns = Object.fromEntries(probe.pragma("table_info(conversations)").map((column) => [column.name, column.notnull]));
+        assert.deepEqual([columns.task_id, columns.worktree_id, columns.worktree_path], [1, 0, 0]);
+      } finally { probe.close(); }
+      assert.deepEqual(database.search("needle").conversations.map((row) => row.id).sort(),
+        fixture.search.filter((id) => id !== fixture.deleting.id).sort());
+      assert.equal(database.listConversations().find((row) => row.id === fixture.pinned.id).tabPosition, 7);
+      assert.equal(database.findUnresolvedInterruptedRunForWorktree("/tmp/tree-3").id, fixture.unresolved.id);
+      assert.equal(database.getTask(database.getConversation(fixture.interrupted.id).taskId).status, "waiting");
+      assert.equal(database.getConversation(fixture.archived.id).archived, 1);
+      assert.equal(database.listTasks({ archived: true }).tasks.length, 2);
+    } finally { database.close(); }
+    const migrated = taskStoreSnapshot(filename);
+    database = createOutrightDatabase({ filename });
+    try { assert.deepEqual(taskStoreSnapshot(filename), migrated, "a second open is a no-op"); }
+    finally { database.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("an interrupted task backfill resumes without duplicates, and a failed rebuild keeps the legacy table", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-task-resume-"));
+  const filename = path.join(directory, "outright.db");
+  try {
+    let database = createOutrightDatabase({ filename });
+    try {
+      for (let index = 0; index < 70; index += 1) {
+        database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: `Chat ${index}`, provider: "codex" });
+      }
+    } finally { database.close(); }
+    seedPreTaskStore(filename, { sessionEpoch: true });
+    // The first bounded batch commits during open; closing before the next
+    // tick leaves a partially backfilled store.
+    database = createOutrightDatabase({ filename });
+    assert.equal(database.capacity().migrationStatus, "migrating");
+    assert.equal(database.getConversation(database.listConversations()[0].id).taskId, null);
+    assert.throws(() => database.listTasks(), (error) => error.statusCode === 503);
+    database.close();
+    let probe = new Database(filename, { readonly: true });
+    try {
+      assert.equal(probe.prepare("SELECT COUNT(*) AS count FROM tasks").get().count, 64);
+      assert.equal(probe.pragma("table_info(conversations)").some((column) => column.name === "task_id"), false);
+    } finally { probe.close(); }
+    assert.throws(() => createOutrightDatabase({ filename, tasksMigrationStep: (step) => {
+      if (step === "conversations-copied") throw new Error("injected rebuild failure");
+    } }), /injected rebuild failure/);
+    probe = new Database(filename, { readonly: true });
+    try {
+      assert.equal(probe.pragma("table_info(conversations)").some((column) => column.name === "task_id"), false);
+      assert.equal(probe.prepare("SELECT 1 FROM sqlite_master WHERE name = 'conversations_rebuild'").get(), undefined);
+      assert.equal(probe.prepare("SELECT COUNT(*) AS count FROM conversations").get().count, 70);
+    } finally { probe.close(); }
+    database = createOutrightDatabase({ filename });
+    try {
+      assert.equal(database.capacity().migrationStatus, "ready");
+      probe = new Database(filename, { readonly: true });
+      try {
+        assert.equal(probe.prepare("SELECT COUNT(*) AS count FROM tasks").get().count, 70);
+        assert.equal(probe.prepare("SELECT COUNT(DISTINCT task_id) AS count FROM conversations").get().count, 70);
+        const epoch = probe.pragma("table_info(conversations)").find((column) => column.name === "session_epoch");
+        assert.deepEqual({ type: epoch.type, notnull: epoch.notnull, dflt: epoch.dflt_value }, { type: "INTEGER", notnull: 1, dflt: "0" });
+        assert.equal(probe.prepare("SELECT COUNT(*) AS count FROM conversations WHERE session_epoch != rowid * 3").get().count, 0,
+          "a column added by another release keeps its values");
+        assert.deepEqual(probe.pragma("foreign_key_check"), []);
+      } finally { probe.close(); }
+      assert.equal(database.listTasks({ limit: 100 }).tasks.length, 70);
+    } finally { database.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("the tasks table rejects scope id combinations that do not match the scope kind", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const space = database.createSpace("Scoped");
+    for (const input of [
+      { scopeKind: "space" },
+      { scopeKind: "space", spaceId: space.id, projectId: "p" },
+      { scopeKind: "project", spaceId: space.id },
+      { scopeKind: "project", projectId: "p", worktreeId: "w" },
+      { scopeKind: "worktree", projectId: "p", worktreeId: "w" },
+      { scopeKind: "branch", projectId: "p" },
+    ]) {
+      assert.throws(() => database.createTask({ ...input, title: "Bad" }), (error) => error.statusCode === 400, JSON.stringify(input));
+    }
+    assert.throws(() => database.createTask({ scopeKind: "project", projectId: "p", title: " " }), (error) => error.statusCode === 400);
+    assert.throws(() => database.createTask({ scopeKind: "space", spaceId: "missing", title: "Orphan" }), (error) => error.statusCode === 404);
+    assert.equal(database.createTask({ scopeKind: "space", spaceId: space.id, title: "Space task", origin: "outbot" }).origin, "outbot");
+    assert.equal(database.createTask({ scopeKind: "project", projectId: "p", title: "Project task" }).scopeKind, "project");
+  } finally { database.close(); }
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-task-check-"));
+  const filename = path.join(directory, "outright.db");
+  try {
+    createOutrightDatabase({ filename }).close();
+    const raw = new Database(filename);
+    try {
+      raw.prepare("INSERT INTO spaces (id, name, created_at) VALUES ('s', 'S', 'now')").run();
+      const insert = raw.prepare(`INSERT INTO tasks (id, scope_kind, space_id, project_id, worktree_id, worktree_path, title, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'T', 'now', 'now')`);
+      for (const values of [["space", null, null, null, null], ["space", "s", "p", null, null], ["project", null, null, null, null],
+        ["project", "s", "p", null, null], ["project", null, "p", "w", null], ["worktree", null, "p", "w", null], ["worktree", null, null, "w", "/w"]]) {
+        assert.throws(() => insert.run(randomTaskId(), ...values), /CHECK constraint failed/, JSON.stringify(values));
+      }
+      for (const values of [["space", "s", null, null, null], ["project", null, "p", null, null], ["worktree", null, "p", "w", "/w"]]) insert.run(randomTaskId(), ...values);
+    } finally { raw.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+function randomTaskId() { return `task-${Math.random().toString(36).slice(2)}`; }
+
+test("task status derives from thread runs, user done overrides it, and both survive restart", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-task-status-"));
+  const filename = path.join(directory, "outright.db");
+  try {
+    let database = createOutrightDatabase({ filename });
+    const thread = (title, taskId) => database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title, provider: "codex", taskId });
+    const run = (conversation, patch) => {
+      const created = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "go" });
+      return patch ? database.updateRun(created.id, patch) : created;
+    };
+    let ids;
+    try {
+      const queued = thread("Queued");
+      const sibling = thread("Second thread", queued.taskId);
+      run(queued);
+      run(sibling, { status: "completed" });
+      const running = thread("Running");
+      run(running, { status: "running", pid: 99999 });
+      const waiting = thread("Waiting");
+      run(waiting, { status: "interrupted", recoveryClass: "never-started" });
+      const settled = thread("Settled");
+      run(settled, { status: "interrupted", recoveryClass: "exited", recoveryDecision: "discard" });
+      run(settled, { status: "failed" });
+      const done = thread("Done");
+      run(done, { status: "running", pid: 99998 });
+      database.updateTask(done.taskId, { status: "done" });
+      ids = { running: [queued.taskId, running.taskId], waiting: waiting.taskId, idle: settled.taskId, done: done.taskId };
+      assert.equal(database.getTask(queued.taskId).threadCount, 2);
+      const status = () => Object.fromEntries(database.listTasks().tasks.map((task) => [task.id, task.status]));
+      assert.deepEqual(status(), { [ids.running[0]]: "running", [ids.running[1]]: "running", [ids.waiting]: "waiting", [ids.idle]: "idle", [ids.done]: "done" });
+      assert.deepEqual(database.listTasks({ status: "running" }).tasks.map((task) => task.id).sort(), [...ids.running].sort());
+      assert.deepEqual(database.listTasks({ status: "waiting" }).tasks.map((task) => task.id), [ids.waiting]);
+      assert.deepEqual(database.listTasks({ status: "open" }).tasks.length, 4);
+      assert.equal(database.getTask(ids.done).userStatus, "done");
+      assert.equal(database.updateTask(ids.done, { status: "open" }).status, "running", "reopening returns to the derived status");
+      database.updateTask(ids.done, { status: "done" });
+    } finally { database.close(); }
+    database = createOutrightDatabase({ filename });
+    try {
+      // A restarted runtime would reconcile live rows to interrupted; the
+      // stored rows alone still derive the same status after reopening.
+      assert.deepEqual(Object.fromEntries(database.listTasks().tasks.map((task) => [task.id, task.status])),
+        { [ids.running[0]]: "running", [ids.running[1]]: "running", [ids.waiting]: "waiting", [ids.idle]: "idle", [ids.done]: "done" });
+      database.reconcileInterruptedRuns({ probeAlive: () => "exited" });
+      assert.equal(database.getTask(ids.running[0]).status, "waiting", "reconciled work waits for the user's recovery choice");
+      assert.equal(database.getTask(ids.done).status, "done");
+    } finally { database.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("task archive hides threads without deleting them, and retention removes an archived task with its last thread", async () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const first = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "First", provider: "codex" });
+    const second = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Second", provider: "codex", taskId: first.taskId });
+    assert.equal(database.getTask(first.taskId, { threads: true }).threads.length, 2);
+    database.addMessage({ conversationId: first.id, role: "user", body: "kept while hidden" });
+    database.updateTask(first.taskId, { archived: true });
+    assert.deepEqual(database.listConversations().map((row) => row.id), []);
+    assert.deepEqual(database.listConversations({ archived: true }).map((row) => row.id).sort(), [first.id, second.id].sort());
+    assert.equal(database.getConversation(first.id).archived, 1);
+    assert.equal(database.messageCount(first.id), 1);
+    assert.throws(() => database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Late", provider: "codex", taskId: first.taskId }),
+      (error) => error.statusCode === 409 && error.details.code === "TASK_ARCHIVED");
+    database.updateConversation(second.id, { archived: false });
+    assert.equal(database.getTask(first.taskId).archived, false, "restoring a thread restores its task");
+    assert.deepEqual(database.listConversations().map((row) => row.id).sort(), [first.id, second.id].sort());
+
+    const single = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Single", provider: "codex" });
+    database.updateConversation(single.id, { archived: true });
+    assert.equal(database.getTask(single.taskId).archived, true, "archiving the last visible thread archives its task");
+    await database.deleteArchivedConversation(single.id, single.id);
+    assert.equal(database.getTask(single.taskId), undefined);
+    database.updateConversation(first.id, { archived: true });
+    await database.deleteArchivedConversation(first.id, first.id);
+    assert.equal(database.getTask(first.taskId).threadCount, 1, "a task with another thread survives retention");
+  } finally { await database.close(); }
+});
+
+test("deleting a space is refused while it has unarchived space tasks", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const space = database.createSpace("Busy");
+    const task = database.createTask({ scopeKind: "space", spaceId: space.id, title: "Plan" });
+    assert.throws(() => database.deleteSpace(space.id), (error) => error.statusCode === 409 && error.details.code === "SPACE_HAS_TASKS");
+    assert.equal(database.listSpaces().spaces.length, 1);
+    database.updateTask(task.id, { archived: true });
+    assert.equal(database.deleteSpace(space.id), true);
+    assert.equal(database.getTask(task.id), undefined);
+  } finally { database.close(); }
+});
+
+test("moving a thread reassigns it to a destination task and leaves its old task in place", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "a", worktreePath: "/tmp/a", title: "Traveller", provider: "codex" });
+    const original = conversation.taskId;
+    assert.equal(database.moveConversation(conversation.id, { projectId: "p", worktreeId: "a", worktreePath: "/tmp/a" }).taskId, original);
+    const moved = database.moveConversation(conversation.id, { projectId: "p", worktreeId: "b", worktreePath: "/tmp/b" });
+    assert.notEqual(moved.taskId, original);
+    assert.deepEqual([database.getTask(moved.taskId).worktreeId, database.getTask(moved.taskId).title], ["b", "Traveller"]);
+    assert.deepEqual([database.getTask(original).worktreeId, database.getTask(original).threadCount], ["a", 0]);
+    const named = database.createTask({ scopeKind: "worktree", projectId: "p", worktreeId: "c", worktreePath: "/tmp/c", title: "Named" });
+    assert.throws(() => database.moveConversation(conversation.id, { projectId: "p", worktreeId: "b", worktreePath: "/tmp/b", taskId: named.id }),
+      (error) => error.statusCode === 409 && error.details.code === "TASK_SCOPE_MISMATCH");
+    assert.equal(database.moveConversation(conversation.id, { projectId: "p", worktreeId: "c", worktreePath: "/tmp/c", taskId: named.id }).taskId, named.id);
+    const project = database.createTask({ scopeKind: "project", projectId: "p", title: "Project" });
+    assert.throws(() => database.createConversation({ projectId: "p", worktreeId: "c", worktreePath: "/tmp/c", title: "No", provider: "codex", taskId: project.id }),
+      (error) => error.statusCode === 409 && error.details.code === "TASK_SCOPE_UNSUPPORTED");
+  } finally { database.close(); }
+});
+
+test("task pages are bounded and continue by cursor", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    for (let index = 0; index < 5; index += 1) database.createTask({ scopeKind: "project", projectId: index % 2 ? "odd" : "even", title: `Task ${index}`, objective: "x".repeat(16 * 1024) });
+    for (const limit of [0, 101, 1.5]) assert.throws(() => database.listTasks({ limit }), (error) => error.statusCode === 400);
+    assert.throws(() => database.listTasks({ cursor: "not a cursor" }), (error) => error.statusCode === 400);
+    assert.throws(() => database.listTasks({ status: "busy" }), (error) => error.statusCode === 400);
+    assert.throws(() => database.createTask({ scopeKind: "project", projectId: "p", title: "Big", objective: "x".repeat(16 * 1024 + 1) }), (error) => error.statusCode === 400);
+    const seen = [];
+    let cursor = null;
+    do {
+      const page = database.listTasks({ limit: 2, cursor });
+      assert.ok(page.tasks.length <= 2);
+      seen.push(...page.tasks.map((task) => task.id));
+      cursor = page.nextCursor;
+    } while (cursor);
+    assert.equal(new Set(seen).size, 5);
+    assert.equal(database.listTasks({ projectId: "odd" }).tasks.length, 2);
+  } finally { database.close(); }
+});

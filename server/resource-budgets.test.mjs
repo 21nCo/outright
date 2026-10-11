@@ -36,6 +36,7 @@ function retainedReadback(db) {
     settings: "key value",
     spaces: "id name created_at",
     project_memberships: "project_id space_id",
+    tasks: "id space_id project_id worktree_id worktree_path title objective",
     conversations: "id project_id worktree_id worktree_path title provider model provider_session_id created_at updated_at",
     messages: "id conversation_id role kind body payload created_at",
     runs: "id conversation_id worktree_path provider model reasoning_effort approval_policy prompt status pid provider_session_id created_at started_at finished_at exit_code error cost_usd input_tokens output_tokens recovery_class recovery_decision transcript_omitted",
