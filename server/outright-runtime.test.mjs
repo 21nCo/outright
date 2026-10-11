@@ -1262,11 +1262,12 @@ function seedLegacyRunningUnknownTargetDatabase(filename, { secondRun = false } 
 
 // A full harness with a real discovered, trusted git worktree and a fake
 // provider CLI on PATH, so successful submissions and replacement runs can be
-// exercised end-to-end through the HTTP surface. POSIX-only: the fake provider
-// CLI is a shell script, so callers must skip on win32.
+// exercised end-to-end through the HTTP surface. The fake CLI is a shell
+// script plus a cmd shim; tests that need POSIX process behaviour skip win32.
+// The native realpath expands Windows short names, as the runtime's does.
 function withWorktreeRuntime(fn, options = {}) {
   return async () => {
-    const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "outright-e2e-")));
+    const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-e2e-")));
     const repo = path.join(root, "repo");
     const bin = path.join(root, "bin");
     const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-"));
@@ -1285,13 +1286,15 @@ function withWorktreeRuntime(fn, options = {}) {
       mkdirSync(bin, { recursive: true });
       writeFileSync(path.join(bin, "codex"), "#!/bin/sh\nexit 0\n");
       chmodSync(path.join(bin, "codex"), 0o755);
+      if (process.platform === "win32") writeFileSync(path.join(bin, "codex.cmd"), "@exit /b 0\r\n");
       const configFile = path.join(root, "outright.config.json");
       writeFileSync(configFile, JSON.stringify({ scanRoots: [root], maxDepth: 2, maxProjects: 8 }));
       process.env.OUTRIGHT_DATA_DIR = dataDirectory;
       process.env.PATH = `${bin}${path.delimiter}${previousPath}`;
       runtime = createOutrightRuntime({ configUrl: pathToFileURL(configFile), ...options });
       const scan = await runtime.projects();
-      const project = scan.projects.find((item) => item.path === repo);
+      // Git reports Windows paths with forward slashes.
+      const project = scan.projects.find((item) => realpathSync.native(item.path) === repo);
       const worktree = project?.worktrees.find((item) => !item.isLinked);
       if (!project || !worktree) throw new Error("the temp repo was not discovered as a project worktree");
       runtime.database.trustProject(project.id, project.path);
@@ -2935,7 +2938,7 @@ async function callRuntime(runtime, method, url, body) {
   return response;
 }
 
-test("task routes create, page, read and update tasks and announce every change", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("task routes create, page, read and update tasks and announce every change", withWorktreeRuntime(async (runtime, { project, worktree }) => {
   const events = captureEvents(runtime);
   const space = runtime.database.createSpace("Planning");
   const target = { projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path };
@@ -2961,7 +2964,7 @@ test("task routes create, page, read and update tasks and announce every change"
   const projectTask = await callRuntime(runtime, "POST", "/api/tasks", { scopeKind: "project", projectId: project.id, title: "Audit" });
   const worktreeTask = await callRuntime(runtime, "POST", "/api/tasks", { scopeKind: "worktree", ...target, title: "Ship", objective: "Land the change" });
   assert.equal(worktreeTask.statusCode, 201, worktreeTask.raw);
-  assert.equal(worktreeTask.body.worktreePath, worktree.path);
+  assert.equal(worktreeTask.body.worktreePath, realpathSync.native(worktree.path));
   assert.deepEqual(events.taskChanges(), [spaceTask, projectTask, worktreeTask].map((task) => ({ taskIds: [task.body.id], truncated: false })));
 
   for (const query of ["limit=0", "limit=101", "limit=two", "archived=maybe", "status=busy", "scopeKind=branch", "cursor=%25"]) {
@@ -2999,13 +3002,13 @@ test("task routes create, page, read and update tasks and announce every change"
   assert.ok(runtime.database.listSpaces().spaces.some((candidate) => candidate.id === space.id));
 }));
 
-test("conversation create and move keep every thread in exactly one task", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("conversation create and move keep every thread in exactly one task", withWorktreeRuntime(async (runtime, { project, worktree }) => {
   const events = captureEvents(runtime);
   const target = { projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path };
   const created = await callRuntime(runtime, "POST", "/api/conversations", { ...target, title: "Legacy flow", provider: "codex" });
   assert.equal(created.statusCode, 201, created.raw);
   const own = runtime.database.getTask(created.body.taskId, { threads: true });
-  assert.deepEqual([own.scopeKind, own.title, own.worktreePath, own.threads.map((thread) => thread.id)], ["worktree", "Legacy flow", worktree.path, [created.body.id]]);
+  assert.deepEqual([own.scopeKind, own.title, own.worktreePath, own.threads.map((thread) => thread.id)], ["worktree", "Legacy flow", realpathSync.native(worktree.path), [created.body.id]]);
   assert.deepEqual(events.taskChanges(), [{ taskIds: [created.body.taskId], truncated: false }]);
 
   events.clear();
@@ -3097,9 +3100,9 @@ test("run rows that change a task's derived status announce it, whatever events 
   assert.equal(database.getTask(conversation.taskId).status, "idle");
 }));
 
-test("a queued run announces its task even when the run event log refuses the event", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("a queued run announces its task even when the run event log refuses the event", withWorktreeRuntime(async (runtime, { project, worktree }) => {
   runtime.agents.providerAvailable = async () => true;
-  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Refused log", provider: "codex" });
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: realpathSync.native(worktree.path), title: "Refused log", provider: "codex" });
   // The optional event log is full: every append is refused, as it is on a
   // retained-budget 507 or during the events migration.
   runtime.database.appendRunEvent = () => null;
@@ -3171,8 +3174,8 @@ test("task archive changes notify the conversation consumer once without moving 
   assert.deepEqual(events.of("conversation.updated"), [], "a task edit that hides nothing leaves the tabs alone");
 }));
 
-test("overlapping moves announce the task each move actually committed the thread away from", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
-  const target = { projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path };
+test("overlapping moves announce the task each move actually committed the thread away from", withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const target = { projectId: project.id, worktreeId: worktree.id, worktreePath: realpathSync.native(worktree.path) };
   const conversation = runtime.database.createConversation({ ...target, title: "Contested", provider: "codex" });
   const linkedPath = path.join(path.dirname(project.path), "linked");
   const added = spawnSync("git", ["-C", project.path, "worktree", "add", "-b", "linked", linkedPath], { encoding: "utf8" });
@@ -3218,9 +3221,11 @@ test("retention, automatic cleanup and startup recovery announce the tasks they 
     }
     events.clear();
     const cleaned = await callRuntime(runtime, "POST", "/api/retention/cleanup", { before: "2010-01-01T00:00:00.000Z" });
-    assert.deepEqual([cleaned.statusCode, cleaned.body.deleted], [200, 1], cleaned.raw);
-    assert.equal(runtime.database.getTask(seeded.stale.taskId), undefined);
-    assert.ok(events.taskChanges().some((change) => change.taskIds.includes(seeded.stale.taskId)), "automatic cleanup announced its task");
+    assert.deepEqual([cleaned.statusCode, cleaned.body.deleted, cleaned.body.tasksDeleted], [200, 1, 1], cleaned.raw);
+    for (const taskId of [seeded.stale.taskId, seeded.threadless.id]) {
+      assert.equal(runtime.database.getTask(taskId), undefined);
+      assert.ok(events.taskChanges().some((change) => change.taskIds.includes(taskId)), "automatic cleanup announced its task");
+    }
   }, {
     databaseFactory: (options) => createOutrightDatabase({ ...options, onTasksChanged: (change) => {
       reported.push(change);
@@ -3236,10 +3241,13 @@ test("retention, automatic cleanup and startup recovery announce the tasks they 
         database.updateRun(run.id, { status: "running" });
         const message = database.addMessage({ conversationId: seeded.oversized.id, role: "assistant", body: "small" });
         for (const name of ["small", "oversized", "stale"]) database.updateConversation(seeded[name].id, { archived: true });
+        seeded.threadless = database.createTask({ scopeKind: "project", projectId: "p", title: "Never had a thread" });
+        database.updateTask(seeded.threadless.id, { archived: true });
         const raw = new Database(filename);
         try {
           raw.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
           raw.prepare("UPDATE conversations SET updated_at = '2001-01-01T00:00:00.000Z' WHERE id = ?").run(seeded.stale.id);
+          raw.prepare("UPDATE tasks SET updated_at = '2001-01-01T00:00:00.000Z' WHERE id = ?").run(seeded.threadless.id);
         } finally { raw.close(); }
       } finally { database.close(); }
     },

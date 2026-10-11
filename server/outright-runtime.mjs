@@ -432,9 +432,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
             reason: "cleanup failed after admission", error: error.message });
           throw error;
         }
-        await database.auditRequired("retention.cleaned", { operationId, deleted: result.deleted, deferred: result.deferred, before: cutoff });
+        await database.auditRequired("retention.cleaned", { operationId, deleted: result.deleted, deferred: result.deferred,
+          tasksDeleted: result.tasksDeleted, before: cutoff });
         agents.resumeQueued();
-        return json(response, 200, { deleted: result.deleted, deferred: result.deferred, capacity: runtimeCapacity() });
+        return json(response, 200, { deleted: result.deleted, deferred: result.deferred, tasksDeleted: result.tasksDeleted, capacity: runtimeCapacity() });
       }
 
       // Spaces replaced project groups. The /api/groups and

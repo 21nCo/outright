@@ -2352,6 +2352,49 @@ test("a thread hidden by its task's archive ages for retention from that archive
   } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("retention reclaims archived threadless tasks after the retention window, and nothing else", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-task-threadless-"));
+  const filename = path.join(directory, "outright.db");
+  const reported = [];
+  const database = createOutrightDatabase({ filename, onTasksChanged: (change) => reported.push(...change.taskIds) });
+  try {
+    const where = { projectId: "p", worktreeId: "w", worktreePath: "/tmp/w" };
+    const thread = database.createConversation({ ...where, title: "Moved twice", provider: "codex" });
+    const sources = [thread.taskId];
+    database.updateTask(thread.taskId, { objective: "o".repeat(16 * 1024) });
+    sources.push(database.moveConversation(thread.id, where).taskId);
+    database.updateTask(sources[1], { objective: "o".repeat(16 * 1024) });
+    database.moveConversation(thread.id, where);
+    const standalone = database.createTask({ scopeKind: "project", projectId: "p", title: "Standalone", objective: "o".repeat(16 * 1024) });
+    database.updateTask(standalone.id, { archived: true });
+    const open = database.createTask({ scopeKind: "project", projectId: "p", title: "Still open" });
+    const pinned = database.createConversation({ ...where, title: "Pinned archive", provider: "codex" });
+    database.updateConversation(pinned.id, { pinned: true });
+    database.updateConversation(pinned.id, { archived: true });
+    const archivedIds = [...sources, standalone.id];
+    assert.deepEqual(archivedIds.map((id) => database.getTask(id)?.archived), [true, true, true], "moves and archive hide the threadless tasks");
+    assert.equal(database.getTask(pinned.taskId).archived, true);
+    const cutoff = () => new Date(Date.now() - (database.getSettings().retentionDays * 86_400_000) - 1000).toISOString();
+    assert.equal((await database.pruneHistory({ before: cutoff() })).tasksDeleted, 0, "a task is not stale right after its archive");
+    const writer = new Database(filename);
+    try { writer.prepare("UPDATE tasks SET updated_at = ?").run(new Date(Date.now() - 100 * 86_400_000).toISOString()); }
+    finally { writer.close(); }
+    await new Promise((resolve) => setImmediate(resolve));
+    reported.length = 0;
+    const before = database.capacity().retainedBytes;
+    const result = await database.pruneHistory({ before: cutoff(), limit: 2 });
+    assert.deepEqual([result.deleted, result.tasksDeleted], [0, 2], "the retention limit bounds task deletions too");
+    assert.equal((await database.pruneHistory({ before: cutoff() })).tasksDeleted, 1);
+    for (const id of archivedIds) assert.equal(database.getTask(id), undefined);
+    assert.ok(before - database.capacity().retainedBytes >= 3 * 16 * 1024, "retained bytes are released");
+    assert.equal(database.getTask(open.id).archived, false, "an open threadless task is never touched");
+    assert.equal(database.getTask(pinned.taskId).archived, true, "an archived task with a thread is never touched");
+    assert.equal(database.getTask(database.getConversation(thread.id).taskId).archived, false);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual([...new Set(reported)].sort(), [...archivedIds].sort(), "tasks.changed names each reclaimed task");
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("task status reads only unsettled runs, whatever the settled run history", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-task-status-plan-"));
   const filename = path.join(directory, "outright.db");

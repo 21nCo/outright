@@ -841,7 +841,8 @@ export function createOutrightDatabase(options = {}) {
             }
           }
         }
-        return { deleted: deleted.length, deferred, ids: deleted };
+        const tasksDeleted = await deleteThreadlessArchivedTasks(() => (closing || maintenance ? null : db), cutoff, limit);
+        return { deleted: deleted.length, deferred, ids: deleted, tasksDeleted };
       })();
     },
     validateRetentionCutoff(before, limit = 100) {
@@ -1020,8 +1021,9 @@ export function createOutrightDatabase(options = {}) {
     // row, threads or derived status changed. A task's lifecycle follows its
     // last visible thread whatever its origin: archiving or moving away that
     // thread hides the task, and retention deletes an archived task with its
-    // last thread. A move without taskId always starts a new task at the
-    // destination, even in place, and never restores a hidden thread.
+    // last thread, or once threadless after the retention window. A move
+    // without taskId always starts a new task at the destination, even in
+    // place, and never restores a hidden thread.
     listTasks(filters = {}) {
       assertTasksReady(db);
       const limit = filters.limit ?? 50;
@@ -3435,6 +3437,36 @@ function deleteOrphanedTask(db, taskId) {
   if (!taskId) return;
   db.prepare("DELETE FROM tasks WHERE id = ? AND archived = 1 AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = ?)").run(taskId, taskId);
   archiveTaskWithoutVisibleThreads(db, taskId, now());
+}
+
+// An archived task left without threads (a moved-away source, a standalone
+// task) ages for retention like an archived thread. Each short transaction
+// checks one page of candidates; the delete re-checks every condition, so a
+// concurrent restore or a new thread keeps its task.
+async function deleteThreadlessArchivedTasks(currentDb, cutoff, limit) {
+  let deleted = 0;
+  let after = ["", ""];
+  while (deleted < limit) {
+    const db = currentDb();
+    if (!db || !conversationTasksReady(db)) break;
+    const page = db.transaction(() => {
+      const rows = db.prepare(`SELECT id, updated_at AS updatedAt FROM tasks WHERE archived = 1 AND updated_at < ?
+        AND (updated_at, id) > (?, ?) ORDER BY updated_at, id LIMIT 64`).all(cutoff, after[0], after[1]);
+      const remove = db.prepare(`DELETE FROM tasks WHERE id = ? AND archived = 1 AND updated_at < ?
+        AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id)`);
+      let count = 0;
+      for (const row of rows) {
+        if (deleted + count >= limit) break;
+        count += remove.run(row.id, cutoff).changes;
+      }
+      return { rows, count };
+    }).immediate();
+    deleted += page.count;
+    if (page.rows.length < 64) break;
+    after = [page.rows.at(-1).updatedAt, page.rows.at(-1).id];
+    await new Promise((resolve) => setImmediate(resolve)); // NOSONAR S9382: yields between task retention pages
+  }
+  return deleted;
 }
 
 function decodePageCursor(cursor, message) {
