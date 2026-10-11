@@ -43,11 +43,13 @@ export function unsupportedChoices(provider, draft) {
 
 // A model belongs to the adapter it was chosen for: a shared vendor does not
 // make one adapter's names, such as Claude Code's aliases, valid for another.
-// After a provider switch it is kept only when the new adapter lists it.
-export function modelMismatch(providers, draft, opened) {
-  if (!draft.model || draft.model !== opened.model || draft.provider === opened.provider) return "";
-  const source = providers.find((item) => item.id === opened.provider);
+// Each dialog records the provider that was selected when the model was
+// opened or last edited; under any other provider the model is kept only
+// when that adapter lists it.
+export function modelMismatch(providers, draft, chosenFor) {
+  if (!draft.model || draft.provider === chosenFor) return "";
+  const source = providers.find((item) => item.id === chosenFor);
   const target = providers.find((item) => item.id === draft.provider);
   if (!target || target.models?.includes(draft.model)) return "";
-  return `The model “${draft.model}” was chosen for ${source?.label ?? opened.provider}; choose a ${target.label} model or clear it to use the provider default before saving.`;
+  return `The model “${draft.model}” was chosen for ${source?.label ?? chosenFor}; choose a ${target.label} model or clear it to use the provider default before saving.`;
 }

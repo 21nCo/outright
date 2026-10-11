@@ -53,10 +53,12 @@ function textRedactor(forms) {
   };
 }
 
+// The only way a record leaves the runner. Once the key is known every
+// record, synthetic ones included, is redacted here before serialization.
 // The manager may stop reading; wait for it instead of buffering the whole
 // stream in this process.
-function write(record) {
-  if (process.stdout.write(`${JSON.stringify(record)}\n`)) return undefined;
+function write(record, forms = []) {
+  if (process.stdout.write(`${JSON.stringify(redact(record, forms))}\n`)) return undefined;
   return new Promise((resolve) => {
     const done = () => { process.stdout.off("drain", done); process.stdout.off("close", done); process.stdout.off("error", done); resolve(); };
     process.stdout.on("drain", done);
@@ -65,8 +67,8 @@ function write(record) {
   });
 }
 
-async function fail(type, message, code = 1) {
-  await write({ type: "error", error: { type, message } });
+async function fail(type, message, code = 1, forms = []) {
+  await write({ type: "error", error: { type, message } }, forms);
   process.exitCode = code;
 }
 
@@ -148,7 +150,7 @@ export async function run(argv = process.argv.slice(2), environment = process.en
       if (typeof parsed?.error?.message === "string") message = parsed.error.message;
       if (typeof parsed?.error?.type === "string") type = parsed.error.type;
     } catch { /* Keep the status summary. */ }
-    return fail(redactText(type, forms), redactText(message, forms));
+    return fail(type, message, 1, forms);
   }
   const text = textRedactor(forms);
   let textIndex = 0;
@@ -178,21 +180,24 @@ export async function run(argv = process.argv.slice(2), environment = process.en
     if (event.type === "message_delta") delta = true;
     if (event.type === "error") errored = true;
     if (event.type === "content_block_delta" && event.delta?.type === "text_delta" && typeof event.delta.text === "string") {
+      // A native block index is a non-negative integer; the held text is
+      // later released under the last valid one.
+      if (!Number.isSafeInteger(event.index) || event.index < 0) return false;
       textIndex = event.index;
       event = { ...event, delta: { ...event.delta, text: text.push(event.delta.text) } };
     }
-    await write(redact(event, forms));
+    await write(event, forms);
     return true;
   };
   // Every exit releases the held text before its final record, so the
   // answer keeps everything that was not the key.
   const release = async () => {
     const rest = text.flush();
-    if (rest) await write({ type: "content_block_delta", index: textIndex, delta: { type: "text_delta", text: rest } });
+    if (rest) await write({ type: "content_block_delta", index: textIndex, delta: { type: "text_delta", text: rest } }, forms);
   };
-  const malformedEvent = () => fail("api_error", "Anthropic API sent a malformed stream event");
+  const malformedEvent = () => fail("api_error", "Anthropic API sent a malformed stream event", 1, forms);
   // Leaving the read loop cancels the response body.
-  const overflow = () => fail("api_error", "Anthropic API stream event exceeded 1 MiB");
+  const overflow = () => fail("api_error", "Anthropic API stream event exceeded 1 MiB", 1, forms);
   // SSE lines end in CRLF, LF or CR. A CR that ends a chunk may be the first
   // half of a CRLF, so it waits for the next chunk unless the stream ended.
   // Returns the failure to report, if any.
@@ -221,12 +226,12 @@ export async function run(argv = process.argv.slice(2), environment = process.en
     }
     failure ??= await readLines(true);
     if (!failure && !(await dispatch())) failure = malformedEvent;
-  } catch (error) { failure = () => fail("network_error", `Anthropic API stream failed: ${networkCode(error)}`); }
+  } catch (error) { failure = () => fail("network_error", `Anthropic API stream failed: ${networkCode(error)}`, 1, forms); }
   await release();
   if (failure) return failure();
   if (errored) process.exitCode = 1;
-  else if (!stopped) await fail("api_error", "Anthropic API stream ended before message_stop");
-  else if (!delta) await fail("api_error", "Anthropic API stream ended without a stop reason; the answer may be incomplete");
+  else if (!stopped) await fail("api_error", "Anthropic API stream ended before message_stop", 1, forms);
+  else if (!delta) await fail("api_error", "Anthropic API stream ended without a stop reason; the answer may be incomplete", 1, forms);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await run();

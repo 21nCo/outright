@@ -49,7 +49,10 @@ export function probeCommand(id, providerPath) {
   // A harness CLI never sees a direct provider's credential, even to print
   // its version.
   const env = withoutDirectProviderCredentials(process.env);
-  if (process.platform === "win32") return { executable: supervisor, args: [process.env.ComSpec || "cmd.exe", "/d", "/s", "/c", `${id} --version`], stdio: ["ignore", "pipe", "pipe"], env };
+  // The Windows supervisor tears its job down when its stdin control pipe
+  // ends. An ignored stdin is NUL, which reads as ended at once and killed
+  // every probe with 137; this pipe stays open until the supervisor exits.
+  if (process.platform === "win32") return { executable: supervisor, args: [process.env.ComSpec || "cmd.exe", "/d", "/s", "/c", `${id} --version`], stdio: ["pipe", "pipe", "pipe"], env };
   // The platform supervisor owns descendants even after setsid/reparenting.
   // The Linux handshake and macOS launch gate are private to this one probe.
   const token = randomUUID();

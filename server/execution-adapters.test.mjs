@@ -197,9 +197,11 @@ function runRunner(args, environment) {
     const child = spawn(process.execPath, [fileURLToPath(new URL("./execution-adapters/anthropic-api-runner.mjs", import.meta.url)), ...args],
       { env: { PATH: process.env.PATH, ...environment }, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
+    let stderr = "";
     child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", reject);
-    child.on("close", (code) => resolve({ code, stdout, events: normalized(anthropic, stdout.split("\n").filter(Boolean).map((line) => JSON.parse(line))) }));
+    child.on("close", (code) => resolve({ code, stdout, stderr, events: normalized(anthropic, stdout.split("\n").filter(Boolean).map((line) => JSON.parse(line))) }));
   });
 }
 
@@ -299,7 +301,8 @@ const reflectedKey = 'fixture-"reflected"\\direct-key';
 // Every form of the key a reader could recover by decoding once or more.
 const keyForms = [reflectedKey, JSON.stringify(reflectedKey).slice(1, -1), JSON.stringify(JSON.stringify(reflectedKey)).slice(1, -1)];
 function assertNoKey(result, label) {
-  const strings = [result.stdout, result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join("")];
+  // The manager persists stderr as process events and as a fallback run error.
+  const strings = [result.stdout, result.stderr, result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join("")];
   const collect = (value) => {
     if (typeof value === "string") strings.push(value);
     else if (value && typeof value === "object") for (const [name, item] of Object.entries(value)) { strings.push(name); collect(item); }
@@ -356,6 +359,44 @@ test("a key split across text deltas never reaches the assembled answer", async 
       assert.equal(result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join(""), expected);
       assert.equal(result.code, code);
       if (code) assert.equal(result.events.at(-1).payload.message, "Anthropic API sent a malformed stream event", "an event without a type fails after the held text");
+    });
+  }
+});
+
+test("a credential-bearing index never leaves the runner, whichever way the stream ends", async () => {
+  const event = (record) => `data: ${JSON.stringify(record)}\n\n`;
+  const textDelta = (index, text) => event({ type: "content_block_delta", index, delta: { type: "text_delta", text } });
+  const end = `${event({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } })}${event({ type: "message_stop" })}`;
+  // Block boundaries are forwarded redacted. The text ends in a key prefix,
+  // so a suffix is held until the stream ends.
+  const start = event({ type: "content_block_start", index: reflectedKey, content_block: { type: "text", text: "" } });
+  const held = `ok ${reflectedKey.slice(0, 5)}`;
+  const opening = `${start}${textDelta(0, held)}`;
+  const malformed = "Anthropic API sent a malformed stream event";
+  const cases = [
+    ["end_turn", `${opening}${event({ type: "content_block_stop", index: [reflectedKey] })}${end}`, 0, null, held],
+    ["error event", `${opening}${event({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } })}`, 1, "Overloaded", held],
+    ["no message_stop", opening, 1, "Anthropic API stream ended before message_stop", held],
+    ["overflow", `${opening}data: ${"x".repeat(1024 * 1024)}\n`, 1, "Anthropic API stream event exceeded 1 MiB", held],
+    ["network", opening, 1, /^Anthropic API stream failed: /, held],
+    // The held text is released under the last text delta's index, so only a
+    // native one is accepted; the rejected delta's text is not kept.
+    ...[reflectedKey, { [reflectedKey]: reflectedKey }, [reflectedKey], -1, 0.5].map((index) => [`index ${JSON.stringify(index)}`, `${start}${textDelta(0, "ok ")}${textDelta(index, reflectedKey.slice(0, 5))}${end}`, 1, malformed, "ok "]),
+  ];
+  for (const [name, body, code, message, answer] of cases) {
+    await withApiFixture((response) => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      if (name === "network") response.write(body, () => setTimeout(() => response.destroy(), 20));
+      else response.end(body);
+    }, async (base) => {
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: reflectedKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      // Before, the held text was released under the raw provider index.
+      assertNoKey(result, name);
+      assert.equal(result.code, code, name);
+      assert.equal(result.events.filter((item) => item.type === "assistant.delta").map((item) => item.payload.text).join(""), answer, name);
+      const failure = result.events.find((item) => item.type === "provider.failure")?.payload.message ?? null;
+      if (message instanceof RegExp) assert.match(failure, message, name);
+      else assert.equal(failure, message, name);
     });
   }
 });

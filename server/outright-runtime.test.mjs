@@ -1417,7 +1417,7 @@ test("archiving during asynchronous worktree validation rejects a run without du
 }));
 
 for (const operation of ["send", "recovery"]) {
-  test(`revoking trust during provider discovery rejects ${operation} before a durable commit`, { skip: process.platform === "win32", timeout: 20000 }, (() => {
+  test(`revoking trust during provider discovery rejects ${operation} before a durable commit`, { timeout: 20000 }, (() => {
     let releaseProbe;
     let enteredProbe;
     const waiting = new Promise((resolve) => { enteredProbe = resolve; });
@@ -1449,7 +1449,7 @@ for (const operation of ["send", "recovery"]) {
 }
 
 for (const operation of ["send", "recovery"]) {
-  test(`provider removal denies ${operation} before durable side effects`, { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  test(`provider removal denies ${operation} before durable side effects`, { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
     runtime.agents.providerAvailable = async () => false;
     const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Removed provider", provider: "codex" });
     let interrupted;
@@ -1642,7 +1642,9 @@ test("a direct-provider run streams through the supervised runtime with its scop
         response.writeHead(200, { "content-type": "text/event-stream" });
         const event = (data) => `data: ${JSON.stringify(data)}\n\n`;
         const delta = (text) => event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
-        response.end(`${delta(`key ${key.slice(0, 7)}`)}${delta(key.slice(7, 15))}${delta(`${key.slice(15)} kept`)}${event({ type: "error", error: { type: "api_error", message: JSON.stringify({ echoed: key }) } })}`);
+        if (requests.length === 3) response.end(`${delta(`key ${key.slice(0, 7)}`)}${delta(key.slice(7, 15))}${delta(`${key.slice(15)} kept`)}${event({ type: "error", error: { type: "api_error", message: JSON.stringify({ echoed: key }) } })}`);
+        // Then a key-bearing index on a delta that leaves a key prefix held.
+        else response.end(`${delta("index ")}${event({ type: "content_block_delta", index: key, delta: { type: "text_delta", text: key.slice(0, 5) } })}${event({ type: "message_stop" })}`);
       } else { response.writeHead(401, { "content-type": "application/json" }); response.end(unauthorized); }
     });
   });
@@ -1676,7 +1678,12 @@ test("a direct-provider run streams through the supervised runtime with its scop
       // Before, the stored answer held the key and the stored error its escape.
       const stored = JSON.stringify([runtime.database.listMessages(conversation.id), runtime.database.listRunEvents(reflected.id), reflected]);
       for (const form of [reflectedKey, JSON.stringify(reflectedKey).slice(1, -1)]) assert.equal(stored.includes(form) || stored.includes(JSON.stringify(form).slice(1, -1)), false);
-      assert.deepEqual(requests, ["sk-ant-runtime", "sk-ant-revoked", reflectedKey]);
+      const indexed = await send();
+      assert.deepEqual([indexed.status, indexed.error], ["failed", "Anthropic API sent a malformed stream event"]);
+      const indexedStored = JSON.stringify([runtime.database.listMessages(conversation.id), runtime.database.listRunEvents(indexed.id), indexed]);
+      assert.match(indexedStored, /index /, "the text before the malformed delta is kept");
+      for (const form of [reflectedKey, JSON.stringify(reflectedKey).slice(1, -1)]) assert.equal(indexedStored.includes(form) || indexedStored.includes(JSON.stringify(form).slice(1, -1)), false);
+      assert.deepEqual(requests, ["sk-ant-runtime", "sk-ant-revoked", reflectedKey, reflectedKey]);
     })();
   } finally {
     for (const [name, value] of [["OUTRIGHT_ANTHROPIC_API_KEY", saved.key], ["OUTRIGHT_ANTHROPIC_BASE_URL", saved.base]]) {
@@ -1687,14 +1694,14 @@ test("a direct-provider run streams through the supervised runtime with its scop
 });
 
 for (const operation of ["send", "recovery"]) {
-  test(`slow executable provider probe stays asynchronous and bounded for ${operation}`, { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
+  test(`slow executable provider probe stays asynchronous and bounded for ${operation}`, { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
     // Exercise the real execFile --version path through each HTTP endpoint.
     // Runtime construction starts an independent display probe. Finish it
     // before replacing the fixture, so authorization cannot reuse that old
     // in-flight result instead of testing the slow executable below.
     assert.equal(await runtime.agents.providerAvailable("codex"), true);
     const probeMarker = path.join(bin, "slow-probe-ran");
-    writeFileSync(path.join(bin, "codex"), `#!/bin/sh\nif [ "$1" = "--version" ]; then sleep 0.4; echo ran > '${probeMarker}'; echo 'codex-cli 0.162.1'; fi\n`);
+    writeNodeCommand(bin, "codex", `if (process.argv[2] === "--version") setTimeout(() => { require("node:fs").writeFileSync(${JSON.stringify(probeMarker)}, "ran\\n"); console.log("codex-cli 0.162.1"); }, 400);\n`);
     const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Probe latency", provider: "codex" });
     let interrupted;
     if (operation === "recovery") {
@@ -2635,7 +2642,7 @@ test("opens the recovery gate and schedules a replacement run after a verified d
 // no resumable session) then left the run with no process identity, so every
 // later attempt was rejected RECOVERY_PROCESS_UNKNOWN and the conversation was
 // permanently gated. The pid must survive until a decision actually commits.
-test("a failed validation after a verified-exited probe leaves recovery retryable", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("a failed validation after a verified-exited probe leaves recovery retryable", withWorktreeRuntime(async (runtime, { project, worktree }) => {
   const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Recovery", provider: "codex" });
   const interrupted = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
   const pid = await deadProcessId();

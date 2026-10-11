@@ -68,17 +68,19 @@ test("provider controls explain readiness and only offer supported choices", asy
   const claude = { id: "claude", label: "Claude Code", modelProvider: "anthropic", models: ["sonnet", "opus", "haiku"] };
   const anthropic = { ...direct, modelProvider: "anthropic", models: ["claude-opus-5-5"] };
   const providers = [codex, claude, anthropic];
-  assert.match(modelMismatch(providers, { provider: "claude", model: "gpt-5.4" }, { provider: "codex", model: "gpt-5.4" }), /“gpt-5\.4” was chosen for Codex; choose a Claude Code model or clear it/);
-  // A shared vendor does not make Claude Code's aliases or another adapter's names valid for the target.
+  // The third argument is the provider selected when the model was opened or last edited.
+  assert.match(modelMismatch(providers, { provider: "claude", model: "gpt-5.4" }, "codex"), /“gpt-5\.4” was chosen for Codex; choose a Claude Code model or clear it/);
+  // A shared vendor does not make Claude Code's aliases or another adapter's names valid for the target,
+  // even when the alias was entered in this dialog after an earlier switch.
   for (const model of ["sonnet", "opus", "haiku"]) {
-    assert.match(modelMismatch(providers, { provider: "anthropic-api", model }, { provider: "claude", model }), new RegExp(`“${model}” was chosen for Claude Code; choose a Anthropic API model`));
+    assert.match(modelMismatch(providers, { provider: "anthropic-api", model }, "claude"), new RegExp(`“${model}” was chosen for Claude Code; choose a Anthropic API model`));
   }
-  assert.notEqual(modelMismatch(providers, { provider: "claude", model: "claude-opus-5-5" }, { provider: "anthropic-api", model: "claude-opus-5-5" }), "");
-  // An explicit edit, a cleared field, a model the target lists or no switch is a deliberate choice.
-  for (const [next, opened] of [[{ provider: "claude", model: "haiku" }, { provider: "codex", model: "gpt-5.4" }], [{ provider: "claude", model: "" }, { provider: "codex", model: "gpt-5.4" }],
-    [{ provider: "claude", model: "opus" }, { provider: "codex", model: "opus" }], [{ provider: "anthropic-api", model: "claude-opus-5-5" }, { provider: "claude", model: "claude-opus-5-5" }],
-    [{ provider: "codex", model: "gpt-5.4" }, { provider: "codex", model: "gpt-5.4" }]]) {
-    assert.equal(modelMismatch(providers, next, opened), "", JSON.stringify(next));
+  assert.notEqual(modelMismatch(providers, { provider: "claude", model: "claude-opus-5-5" }, "anthropic-api"), "");
+  // A model entered under the selected provider, a cleared field or a model the target lists is a deliberate choice.
+  for (const [next, chosenFor] of [[{ provider: "claude", model: "haiku" }, "claude"], [{ provider: "anthropic-api", model: "claude-custom" }, "anthropic-api"],
+    [{ provider: "claude", model: "" }, "codex"], [{ provider: "claude", model: "opus" }, "codex"], [{ provider: "anthropic-api", model: "claude-opus-5-5" }, "claude"],
+    [{ provider: "codex", model: "gpt-5.4" }, "codex"]]) {
+    assert.equal(modelMismatch(providers, next, chosenFor), "", JSON.stringify(next));
   }
   const [app, settings] = await Promise.all([readFile(new URL("src/App.jsx", root), "utf8"), readFile(new URL("src/components/SettingsDialog.jsx", root), "utf8")]);
   assert.match(settings, /aria-describedby="default-provider-status"/);

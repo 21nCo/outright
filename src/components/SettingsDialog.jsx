@@ -30,7 +30,10 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
   const openedSettingsRef = useRef(settings);
   // A bootstrap refresh can replace settings while the dialog is open.
   // Only opening the dialog starts a new editing session.
-  useEffect(() => { if (open) { openedSettingsRef.current = settings; setDraft(settings); } }, [open]);
+  // The provider the draft's model was chosen for: the opened provider until
+  // the model is edited.
+  const [modelChosenFor, setModelChosenFor] = useState(settings.provider);
+  useEffect(() => { if (open) { openedSettingsRef.current = settings; setDraft(settings); setModelChosenFor(settings.provider); } }, [open]);
   useLayoutEffect(() => { archiveSessionRef.current += 1; capacityRequestRef.current += 1; }, [open]);
   function refreshCapacity() {
     const request = ++capacityRequestRef.current;
@@ -203,14 +206,14 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
     } finally { if (session === archiveSessionRef.current) setDeleting(false); }
   }
   const selectedProvider = providers.find((provider) => provider.id === draft.provider);
-  const modelProblem = modelMismatch(providers, draft, openedSettingsRef.current);
+  const modelProblem = modelMismatch(providers, draft, modelChosenFor);
   const executionProblem = [unsupportedChoices(selectedProvider, draft), modelProblem].filter(Boolean).join(" ");
   const efforts = reasoningOptions(selectedProvider);
   // Each control the status blames is marked invalid and points at it.
   const problemProps = (invalid) => invalid ? { "aria-invalid": true, "aria-describedby": "default-provider-status" } : {};
   return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent className="settings-dialog"><DialogHeader><DialogTitle>Outright settings</DialogTitle><DialogDescription>Defaults for new conversations and local execution.</DialogDescription></DialogHeader><div className="settings-grid">
     <Setting icon={Brain} label="Default provider"><select value={draft.provider} aria-describedby="default-provider-status" onChange={(event) => setDraft({ ...draft, provider: event.target.value })}>{providers.map((provider) => <option key={provider.id} value={provider.id} disabled={!providerReady(provider) && provider.id !== draft.provider}>{providerOptionLabel(provider)}</option>)}</select></Setting>
-    <Setting icon={Brain} label="Default model"><Input value={draft.model ?? ""} list="default-provider-models" {...problemProps(Boolean(modelProblem))} onChange={(event) => setDraft({ ...draft, model: event.target.value })} placeholder="Provider default" /><datalist id="default-provider-models">{(selectedProvider?.models ?? []).map((model) => <option key={model} value={model} />)}</datalist></Setting>
+    <Setting icon={Brain} label="Default model"><Input value={draft.model ?? ""} list="default-provider-models" {...problemProps(Boolean(modelProblem))} onChange={(event) => { setDraft({ ...draft, model: event.target.value }); setModelChosenFor(draft.provider); }} placeholder="Provider default" /><datalist id="default-provider-models">{(selectedProvider?.models ?? []).map((model) => <option key={model} value={model} />)}</datalist></Setting>
     <p id="default-provider-status" className="provider-status" role="status" aria-live="polite">{providerStatusText(selectedProvider)}{executionProblem && ` ${executionProblem}`}</p>
     <Setting icon={ShieldCheck} label="Approval policy"><select value={draft.approvalPolicy} {...problemProps(!supportsPolicy(selectedProvider, draft.approvalPolicy))} onChange={(event) => setDraft({ ...draft, approvalPolicy: event.target.value })}>{APPROVAL_POLICY_OPTIONS.map(({ value, label }) => <option key={value} value={value} disabled={!supportsPolicy(selectedProvider, value)}>{label}{supportsPolicy(selectedProvider, value) ? "" : " (not supported)"}</option>)}</select></Setting>
     <Setting icon={Brain} label="Reasoning effort"><select value={draft.reasoningEffort} {...problemProps(Boolean(selectedProvider?.capabilities) && !efforts.includes(draft.reasoningEffort))} onChange={(event) => setDraft({ ...draft, reasoningEffort: event.target.value })}>{efforts.includes(draft.reasoningEffort) ? null : <option value={draft.reasoningEffort} disabled>{draft.reasoningEffort} (not supported)</option>}{efforts.map((value) => <option key={value}>{value}</option>)}</select></Setting>

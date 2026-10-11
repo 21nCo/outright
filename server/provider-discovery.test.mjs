@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createProviderDiscovery, defaultProbe } from "./provider-discovery.mjs";
@@ -208,6 +208,21 @@ test("successful version checks also close their detached helper tree", { skip: 
     if (descendantPid) try { process.kill(descendantPid, "SIGKILL"); } catch { /* Already gone. */ }
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("the node-command fixture runs from a path holding shell expansion characters", () => {
+  const parent = mkdtempSync(path.join(os.tmpdir(), "outright-node-command-"));
+  // Windows paths cannot hold a double quote; %OS% is defined on every Windows host.
+  const directory = path.join(parent, process.platform === "win32" ? "quote %OS% 'single' $HOME `x` & ^" : "quote $HOME `exit 7` 'single' \"double\" %PATH% \\");
+  mkdirSync(directory);
+  try {
+    writeNodeCommand(directory, "quoted-probe", "console.log(JSON.stringify([__filename, process.argv.slice(2)]));\n");
+    // Run by name from its own directory, so only the wrapper sees the path.
+    const result = spawnSync("quoted-probe a", { cwd: directory, shell: true, encoding: "utf8", env: { ...process.env, PATH: `${directory}${path.delimiter}${process.env.PATH}` } });
+    // Before, sh expanded $HOME and ran the backticks, and cmd expanded %OS%.
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), [realpathSync(path.join(directory, "quoted-probe.cjs")), ["a"]]);
+  } finally { rmSync(parent, { recursive: true, force: true }); }
 });
 
 test("a harness version probe never receives a direct provider's credential", async () => {

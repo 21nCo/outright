@@ -369,6 +369,16 @@ async function providerSwitchChoicesRegression() {
   chooseOption(control("Default provider"), "codex");
   await until(() => !saveButton().disabled, "switching back restores a saveable draft");
   assert(values() === "workspace-write,high,gpt-5.4", "switching back did not keep the original choices");
+  // A model edited under another provider belongs to that provider, on every later switch.
+  chooseOption(control("Default provider"), "claude");
+  setControlValue(control("Default model"), "sonnet");
+  chooseOption(control("Default provider"), "anthropic-api");
+  await until(() => status().includes("“sonnet” was chosen for Claude Code"), "an edited model is revalidated on the next switch");
+  assert(saveButton().disabled && control("Default model").getAttribute("aria-invalid") === "true", "Save allowed a Claude Code alias for the Anthropic API");
+  chooseOption(control("Default provider"), "claude");
+  setControlValue(control("Default model"), "claude-opus-5-5");
+  chooseOption(control("Default provider"), "anthropic-api");
+  await until(() => status().includes("does not support") && !status().includes("was chosen for"), "a model the target lists is kept");
   chooseOption(control("Default provider"), "anthropic-api");
   chooseOption(control("Approval policy"), "read-only");
   chooseOption(control("Reasoning effort"), "medium");
@@ -407,6 +417,17 @@ async function providerSwitchChoicesRegression() {
   assert(chatModel().getAttribute("aria-invalid") === "true" && chatModel().getAttribute("aria-describedby") === "chat-settings-provider-status", "the chat model was not tied to its error");
   setControlValue(document.querySelector('#chat-settings-model'), "sonnet");
   await until(() => !chatSave().disabled, "an explicit model enables Save");
+  // Before, an edited model was compared only with the opened one, so this switch kept the alias.
+  const chatStatus = () => document.querySelector('#chat-settings-provider-status').textContent;
+  chooseOption(document.querySelector('#chat-settings-provider'), "anthropic-api");
+  await until(() => chatStatus().includes("“sonnet” was chosen for Claude Code"), "an edited chat model is revalidated on the next switch");
+  assert(chatSave().disabled && chatModel().getAttribute("aria-invalid") === "true", "a Claude Code alias entered in this session was kept for the Anthropic API");
+  setControlValue(chatModel(), "claude-custom");
+  await until(() => !chatSave().disabled, "an explicit custom model for the target enables Save");
+  chooseOption(document.querySelector('#chat-settings-provider'), "claude");
+  await until(() => chatStatus().includes("“claude-custom” was chosen for Anthropic API") && chatSave().disabled, "a custom model stays with the provider it was entered for");
+  setControlValue(chatModel(), "sonnet");
+  await until(() => !chatSave().disabled, "an explicit model enables Save again");
   chatSave().click();
   await until(() => patches.length === 2, "chat provider saved");
   assert(patches[1].provider === "claude" && patches[1].model === "sonnet", `Unexpected chat patch: ${JSON.stringify(patches[1])}`);
