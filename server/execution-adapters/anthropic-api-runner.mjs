@@ -171,10 +171,24 @@ async function execute(argv, environment, { protect, write, fail }) {
   let textIndex = 0;
   const decoder = new TextDecoder();
   let buffered = "";
-  let data = [];
-  // Bytes of the event being assembled: completed data lines plus the
-  // partial line still buffered.
+  // The event's data lines joined by LF, held as bytes so the 1 MiB bound is
+  // the memory the event retains, however many lines it arrives in.
+  let data = Buffer.alloc(4096);
   let dataBytes = 0;
+  let hasData = false;
+  const append = (value) => {
+    const size = Buffer.byteLength(value) + (hasData ? 1 : 0);
+    if (dataBytes + size > MAX_EVENT_BYTES) return false;
+    if (dataBytes + size > data.length) {
+      const grown = Buffer.alloc(Math.min(MAX_EVENT_BYTES, Math.max(data.length * 2, dataBytes + size)));
+      data.copy(grown, 0, 0, dataBytes);
+      data = grown;
+    }
+    if (hasData) data[dataBytes++] = 0x0a;
+    dataBytes += data.write(value, dataBytes);
+    hasData = true;
+    return true;
+  };
   let stopped = false;
   let errored = false;
   // The adapter fails a message_delta without a valid stop reason; a stream
@@ -183,10 +197,10 @@ async function execute(argv, environment, { protect, write, fail }) {
   // Returns false when the stream can no longer be trusted. Text already
   // written stays in the transcript; the run still fails.
   const dispatch = async () => {
-    if (!data.length) return true;
-    const payload = data.join("\n");
-    data = [];
+    if (!hasData) return true;
+    const payload = data.toString("utf8", 0, dataBytes);
     dataBytes = 0;
+    hasData = false;
     let event;
     try { event = JSON.parse(payload); }
     catch { return false; }
@@ -222,12 +236,7 @@ async function execute(argv, environment, { protect, write, fail }) {
       const line = buffered.slice(0, end.index);
       buffered = buffered.slice(end.index + end[0].length);
       if (!line) { if (!(await dispatch())) return malformedEvent; }
-      else if (line.startsWith("data:")) {
-        const value = line.slice(5).trimStart();
-        data.push(value);
-        dataBytes += Buffer.byteLength(value) + 1;
-        if (dataBytes > MAX_EVENT_BYTES) return overflow;
-      }
+      else if (line.startsWith("data:") && !append(line.slice(5).trimStart())) return overflow;
     }
     return null;
   };

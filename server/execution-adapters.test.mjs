@@ -193,9 +193,9 @@ test("recorded Claude Code streams normalize without erasing provider details", 
   assert.equal(failure.terminal, true);
 });
 
-function runRunner(args, environment) {
+function runRunner(args, environment, nodeOptions = []) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [fileURLToPath(new URL("./execution-adapters/anthropic-api-runner.mjs", import.meta.url)), ...args],
+    const child = spawn(process.execPath, [...nodeOptions, fileURLToPath(new URL("./execution-adapters/anthropic-api-runner.mjs", import.meta.url)), ...args],
       { env: { PATH: process.env.PATH, ...environment }, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
@@ -378,7 +378,7 @@ test("a credential-bearing index never leaves the runner, whichever way the stre
     ["end_turn", `${opening}${event({ type: "content_block_stop", index: [reflectedKey] })}${end}`, 0, null, held],
     ["error event", `${opening}${event({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } })}`, 1, "Overloaded", held],
     ["no message_stop", opening, 1, "Anthropic API stream ended before message_stop", held],
-    ["overflow", `${opening}data: ${"x".repeat(1024 * 1024)}\n`, 1, "Anthropic API stream event exceeded 1 MiB", held],
+    ["overflow", `${opening}data: ${"x".repeat(1024 * 1024 + 1)}\n`, 1, "Anthropic API stream event exceeded 1 MiB", held],
     ["network", opening, 1, /^Anthropic API stream failed: /, held],
     // The held text is released under the last text delta's index, so only a
     // native one is accepted; the rejected delta's text is not kept.
@@ -493,6 +493,59 @@ test("one stream event is bounded across chunks and data lines", async () => {
       assert.equal(result.events.at(-1).payload.message, "Anthropic API stream event exceeded 1 MiB");
       assert.ok(result.stdout.length < 1024, "the oversized event is not echoed");
     });
+  }
+});
+
+test("an event's data lines are bounded by the bytes the event holds, however short they are", async () => {
+  const MAX = 1024 * 1024;
+  const opening = `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `kept ${reflectedKey.slice(0, 5)}` } })}\n\n`;
+  const stream = (ending, line, count) => {
+    const unit = `${line}${ending}`;
+    // Pieces end mid-line, and inside a CRLF when there is one.
+    const size = unit.length * 9362 + unit.length - 1;
+    let body = opening.replaceAll("\n", ending);
+    return (response) => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      let sent = 0;
+      const next = () => {
+        if (response.destroyed) return;
+        while (body.length < size && (count === Infinity || sent < count)) { body += unit; sent += 1; }
+        if (count !== Infinity && sent >= count && body.length <= size) return response.end(`${body}${ending}`);
+        response.write(body.slice(0, size), next);
+        body = body.slice(size);
+      };
+      next();
+    };
+  };
+  const run = (respond, nodeOptions) => withApiFixture(respond, (base) => runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: reflectedKey, OUTRIGHT_ANTHROPIC_BASE_URL: base }, nodeOptions));
+  const answer = (result) => result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join("");
+  // An endless event of empty or one-byte lines stops at the bound in a heap
+  // far smaller than one entry per line would need. Before, the line array
+  // the 1 MiB count did not see exhausted that heap (no exit code).
+  for (const line of ["data:", "data:x"]) {
+    for (const ending of ["\n", "\r", "\r\n"]) {
+      const name = `${JSON.stringify(line)} ${JSON.stringify(ending)}`;
+      const result = await run(stream(ending, line, Infinity), ["--max-old-space-size=8"]);
+      assert.equal(result.code, 1, name);
+      assert.equal(result.events.at(-1).payload.message, "Anthropic API stream event exceeded 1 MiB", name);
+      assert.equal(answer(result), `kept ${reflectedKey.slice(0, 5)}`, `${name}: the earlier text and the held tail are kept`);
+      assert.ok(result.stdout.length < 1024, `${name}: the oversized event is not echoed`);
+      assertNoKey(result, name);
+    }
+  }
+  // The bound is the joined data: MAX + 1 empty lines are MAX separators and
+  // reach dispatch (not JSON); one more line overflows.
+  for (const [count, message] of [[MAX + 1, "Anthropic API sent a malformed stream event"], [MAX + 2, "Anthropic API stream event exceeded 1 MiB"]]) {
+    const result = await run(stream("\n", "data:", count));
+    assert.equal(result.events.at(-1).payload.message, message, `${count} empty lines`);
+  }
+  // An ordinary multiline event and one just under the bound still parse.
+  const end = 'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\ndata: {"type":"message_stop"}\n\n';
+  const head = '{"type":"content_block_delta","index":0,\ndata: "delta":{"type":"text_delta","text":';
+  for (const text of ["two lines", "y".repeat(MAX - 200)]) {
+    const result = await run((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(`data: ${head}"${text}"}}\n\n${end}`); });
+    assert.equal(result.code, 0, `${text.length} characters`);
+    assert.ok(answer(result) === text, `${text.length} characters: the answer is kept whole`);
   }
 });
 
