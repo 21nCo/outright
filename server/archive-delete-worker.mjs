@@ -128,13 +128,15 @@ try {
     }
   }
   shadow.transaction(() => {
-    const taskId = shadow.pragma("table_info(conversations)").some((column) => column.name === "task_id")
-      ? shadow.prepare("SELECT task_id FROM conversations WHERE id = ?").get(conversationId)?.task_id : null;
+    const ready = shadow.pragma("table_info(conversations)").some((column) => column.name === "task_id");
+    const taskId = ready ? shadow.prepare("SELECT task_id FROM conversations WHERE id = ?").get(conversationId)?.task_id : null;
     if (!shadow.prepare("DELETE FROM conversations WHERE id = ? AND deleting = 1").run(conversationId).changes) {
       throw new Error("Archive marker disappeared during shadow cleanup");
     }
-    // Match live retention: an archived task leaves with its last thread.
+    // Match live retention: an archived task leaves with its last thread, and
+    // before the task rebuild a backfilled task reuses its conversation's id.
     if (taskId) shadow.prepare("DELETE FROM tasks WHERE id = ? AND archived = 1 AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = ?)").run(taskId, taskId);
+    else if (!ready) shadow.prepare("DELETE FROM tasks WHERE id = ?").run(conversationId);
     shadow.prepare("UPDATE retained_usage SET legacy_ceiling = MAX(legacy_ceiling, bytes + 1048576) WHERE id = 1").run();
     shadow.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
       .run("retention.archived.deleted", conversationId, "{}", new Date().toISOString());

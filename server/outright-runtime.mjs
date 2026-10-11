@@ -126,11 +126,15 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     return record;
   };
 
-  // A task's derived status follows its threads' run rows. Queue, start,
-  // terminal and recovery-decision events are the transitions that move it.
+  // A task's derived status follows its threads' run rows. Terminal events
+  // are published even when the run event log refuses them, and recovery
+  // decisions always publish run.resolved. Queueing is announced where the
+  // run row commits, because its optional run.queued event may be refused;
+  // starting keeps the task running, so it moves nothing.
   function runStatusTaskId(event) {
     const transition = event.type === "run.resolved"
-      || (event.type === "run.event" && typeof event.payload?.type === "string" && event.payload.type.startsWith("run."));
+      || (event.type === "run.event" && typeof event.payload?.type === "string" && event.payload.type.startsWith("run.")
+        && !["run.queued", "run.started"].includes(event.payload.type));
     if (!transition || !event.conversationId) return null;
     try { return database.getConversation(event.conversationId)?.taskId ?? null; }
     catch { return null; }
@@ -692,6 +696,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (currentInterrupted) throw apiError(409, "Resolve the interrupted run before starting more agent work", { code: "RUN_RECOVERY_REQUIRED", runId: currentInterrupted.id });
         const { run, message: userMessage } = database.submitRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, provider, model: body.model ?? conversation.model ?? settings.model, reasoningEffort: body.reasoningEffort || settings.reasoningEffort, approvalPolicy: body.approvalPolicy || settings.approvalPolicy, prompt }, prompt);
         publish({ type: "message.created", conversationId: conversation.id, payload: userMessage });
+        publishTasksChanged([currentConversation.taskId], "run");
         return json(response, 202, await agents.schedule({ conversation: database.getConversation(conversation.id), run }));
       }
       const runMatch = url.pathname.match(/^\/api\/runs\/([^/]+)$/);

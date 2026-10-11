@@ -2945,6 +2945,8 @@ test("task routes create, page, read and update tasks and announce every change"
     { scopeKind: "project", projectId: "undiscovered", title: "Unknown project" },
     { scopeKind: "worktree", ...target, worktreeId: "other", title: "Wrong worktree" },
     { scopeKind: "worktree", ...target, title: "" },
+    { scopeKind: "constructor", projectId: project.id, title: "Inherited name" },
+    { scopeKind: "__proto__", projectId: project.id, title: "Inherited name" },
     [],
   ]) {
     const refused = await callRuntime(runtime, "POST", "/api/tasks", body);
@@ -3045,7 +3047,7 @@ test("conversation create and move keep every thread in exactly one task", { ski
   assert.equal(returned.body.taskId, named.id);
 }));
 
-test("run transitions announce the owning task's status change", withRuntime(async (runtime) => {
+test("terminal and recovery run events announce the owning task's status change", withRuntime(async (runtime) => {
   const conversation = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Busy", provider: "codex" });
   const events = captureEvents(runtime);
   for (const type of ["run.queued", "run.started", "assistant.delta", "process.stdout", "run.completed"]) {
@@ -3053,7 +3055,26 @@ test("run transitions announce the owning task's status change", withRuntime(asy
   }
   runtime.publish({ type: "run.resolved", conversationId: conversation.id, runId: "r", payload: {} });
   runtime.publish({ type: "run.recovery-updated", conversationId: conversation.id, runId: "r", payload: {} });
-  assert.deepEqual(events.taskChanges(), Array.from({ length: 4 }, () => ({ taskIds: [conversation.taskId], reason: "run" })));
+  assert.deepEqual(events.taskChanges(), Array.from({ length: 2 }, () => ({ taskIds: [conversation.taskId], reason: "run" })));
+}));
+
+test("a queued run announces its task even when the run event log refuses the event", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  runtime.agents.providerAvailable = async () => true;
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Refused log", provider: "codex" });
+  // The optional event log is full: every append is refused, as it is on a
+  // retained-budget 507 or during the events migration.
+  runtime.database.appendRunEvent = () => null;
+  const order = [];
+  runtime.eventHub.connect({ readyState: 1, bufferedAmount: 0, send(encoded) {
+    const event = JSON.parse(encoded);
+    if (event.type === "tasks.changed" || event.type === "run.event") order.push(event.type === "run.event" ? event.payload.type : event.payload);
+  }, close() {} });
+  const submitted = await callRuntime(runtime, "POST", `/api/conversations/${conversation.id}/runs`, { prompt: "go" });
+  assert.equal(submitted.statusCode, 202, submitted.raw);
+  assert.equal(runtime.database.listRuns(conversation.id).length, 1);
+  assert.ok(!order.includes("run.queued"), "the refused run.queued event was not published");
+  assert.deepEqual(order[0], { taskIds: [conversation.taskId], reason: "run" },
+    "the committed queue transition is announced before any terminal event");
 }));
 
 test("tasks and their derived status survive a runtime restart", async () => {

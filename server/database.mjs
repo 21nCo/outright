@@ -41,6 +41,8 @@ const TASK_TITLE_CHARACTERS = 500;
 const TASK_OBJECTIVE_BYTES = 16 * 1024;
 const TASK_RESPONSE_BYTES = 512 * 1024;
 const TASK_THREAD_LIMIT = 200;
+const TASK_THREAD_BYTES = 256 * 1024;
+const TASK_THREAD_FIELD_CHARACTERS = 256;
 const RETAINED_COLUMNS = [
   ["settings", "key, value"],
   ["spaces", "id, name, created_at"],
@@ -726,7 +728,7 @@ export function createOutrightDatabase(options = {}) {
       // titles never crosses the native/JS boundary in full.
       const rows = db.prepare(`SELECT id, substr(title, 1, 257) AS title,
           substr(worktree_path, 1, 257) AS worktreePath, updated_at AS updatedAt FROM conversations
-        WHERE archived = 1 AND deleting = 0 AND NOT EXISTS (SELECT 1 FROM runs WHERE conversation_id = conversations.id
+        WHERE ${archivedConversationSql(db)} AND deleting = 0 AND NOT EXISTS (SELECT 1 FROM runs WHERE conversation_id = conversations.id
           AND (status IN ('queued', 'launching', 'running') OR (status = 'interrupted' AND recovery_decision IS NULL)))
         AND (? IS NULL OR updated_at < ? OR (updated_at = ? AND id < ?))
         ORDER BY updated_at DESC, id DESC LIMIT ?`).all(after?.[0] ?? null, after?.[0] ?? null, after?.[0] ?? null, after?.[1] ?? null, limit + 1);
@@ -755,7 +757,7 @@ export function createOutrightDatabase(options = {}) {
     // deleted conversation to a new run or unarchive operation.
     pruneHistory({ before, limit = 100 } = {}) {
       const cutoff = this.validateRetentionCutoff(before, limit);
-      const ids = db.prepare(`SELECT id FROM conversations WHERE archived = 1 AND (deleting = 1 OR (pinned = 0 AND updated_at < ?))
+      const ids = db.prepare(`SELECT id FROM conversations WHERE ${archivedConversationSql(db)} AND (deleting = 1 OR (pinned = 0 AND updated_at < ?))
           AND NOT EXISTS (SELECT 1 FROM runs WHERE conversation_id = conversations.id
             AND (status IN ('queued', 'launching', 'running') OR (status = 'interrupted' AND recovery_decision IS NULL)))
           ORDER BY updated_at, id LIMIT ?`).all(cutoff, limit).map((row) => row.id);
@@ -938,7 +940,13 @@ export function createOutrightDatabase(options = {}) {
         const changed = db.prepare("UPDATE conversations SET project_id = ?, worktree_id = ?, worktree_path = ?, tab_position = ?, updated_at = ?, task_id = ? WHERE id = ? AND deleting = 0")
           .run(destination.projectId, destination.worktreeId, destination.worktreePath, position, timestamp, taskId, id).changes;
         if (!changed) throw databaseError(409, "Conversation is unavailable for moving");
-        if (taskId !== current.taskId) db.prepare("UPDATE tasks SET updated_at = ? WHERE id IN (?, ?)").run(timestamp, taskId, current.taskId);
+        if (taskId !== current.taskId) {
+          db.prepare("UPDATE tasks SET updated_at = ? WHERE id IN (?, ?)").run(timestamp, taskId, current.taskId);
+          // Like archiving its last visible thread, moving its last thread
+          // away hides the old task instead of listing it empty or deleting it.
+          db.prepare(`UPDATE tasks SET archived = 1 WHERE id = ? AND archived = 0
+            AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id AND deleting = 0)`).run(current.taskId);
+        }
       });
       return this.getConversation(id);
     },
@@ -980,8 +988,22 @@ export function createOutrightDatabase(options = {}) {
       assertTasksReady(db);
       const task = hydrateTask(db.prepare(`${TASK_SELECT_SQL} WHERE t.id = ?`).get(id));
       if (!task || !threads) return task;
-      const listed = db.prepare(`${conversationSource(db).sql} WHERE c.task_id = ? AND c.deleting = 0 ORDER BY c.created_at, c.rowid LIMIT ?`)
-        .all(id, TASK_THREAD_LIMIT);
+      // Thread summaries are projected short in SQLite and capped by bytes,
+      // so legacy multi-MiB titles never reach the response in full. Threads
+      // share the task's scope; complete rows stay on the conversation routes.
+      const rows = db.prepare(`SELECT c.id, c.task_id AS taskId, substr(c.title, 1, ${TASK_TITLE_CHARACTERS}) AS title, substr(c.provider, 1, ${TASK_THREAD_FIELD_CHARACTERS}) AS provider,
+          substr(c.model, 1, ${TASK_THREAD_FIELD_CHARACTERS}) AS model, ${conversationSource(db).archived} AS archived, c.pinned,
+          c.tab_position AS tabPosition, c.created_at AS createdAt, c.updated_at AS updatedAt
+        FROM conversations AS c JOIN tasks AS t ON t.id = c.task_id
+        WHERE c.task_id = ? AND c.deleting = 0 ORDER BY c.created_at, c.rowid LIMIT ?`).all(id, TASK_THREAD_LIMIT);
+      const listed = [];
+      let threadBytes = 0;
+      for (const row of rows) {
+        const bytes = Buffer.byteLength(JSON.stringify(row)) + 1;
+        if (threadBytes + bytes > TASK_THREAD_BYTES) break;
+        listed.push(row);
+        threadBytes += bytes;
+      }
       return { ...task, threads: listed, threadsTruncated: task.threadCount > listed.length };
     },
     createTask(input) {
@@ -1000,7 +1022,7 @@ export function createOutrightDatabase(options = {}) {
       if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw databaseError(400, "Task update must be a JSON object");
       const columns = { title: "title", objective: "objective", status: "user_status", archived: "archived" };
       for (const key of Object.keys(patch)) {
-        if (!columns[key]) throw databaseError(400, ["scopeKind", "spaceId", "projectId", "worktreeId", "worktreePath", "origin"].includes(key)
+        if (!Object.hasOwn(columns, key)) throw databaseError(400, ["scopeKind", "spaceId", "projectId", "worktreeId", "worktreePath", "origin"].includes(key)
           ? "Task scope and origin cannot be changed" : `Unknown task field: ${key}`);
       }
       const values = {};
@@ -2328,14 +2350,17 @@ async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, cut
 
 function markArchivedForDeletion(db, id, automatic, cutoff) {
   db.transaction(() => {
-    const row = db.prepare("SELECT archived, pinned, deleting, updated_at AS updatedAt FROM conversations WHERE id = ?").get(id);
+    const row = db.prepare(`SELECT ${archivedConversationSql(db)} AS archived, pinned, deleting, updated_at AS updatedAt
+      FROM conversations WHERE id = ?`).get(id);
     if (!row) throw databaseError(404, "Conversation not found");
     if (!row.archived || (automatic && !row.deleting && (row.pinned || (cutoff && row.updatedAt >= cutoff)))
       || db.prepare(`SELECT 1 FROM runs WHERE conversation_id = ? AND (status IN ('queued', 'launching', 'running')
         OR (status = 'interrupted' AND recovery_decision IS NULL)) LIMIT 1`).get(id)) {
       throw databaseError(409, "Only archived conversations without active or unresolved recovery work can be deleted");
     }
-    db.prepare("UPDATE conversations SET deleting = 1 WHERE id = ?").run(id);
+    // A thread hidden by its task's archive is marked archived itself, so
+    // every later batch and the shadow worker see one archived marker.
+    db.prepare("UPDATE conversations SET archived = 1, deleting = 1 WHERE id = ?").run(id);
   }).immediate();
 }
 
@@ -2423,10 +2448,13 @@ function deleteArchivedBatch(db, id, filename) {
     const result = deleteArchivedRows(db, id, filename, query, table);
     if (result) return result;
   }
-  const taskId = conversationTasksReady(db) ? db.prepare("SELECT task_id FROM conversations WHERE id = ? AND deleting = 1").get(id)?.task_id : null;
+  const ready = conversationTasksReady(db);
+  const taskId = ready ? db.prepare("SELECT task_id FROM conversations WHERE id = ? AND deleting = 1").get(id)?.task_id : null;
   const deleted = db.prepare("DELETE FROM conversations WHERE id = ? AND deleting = 1").run(id).changes;
   if (deleted) {
-    deleteOrphanedTask(db, taskId);
+    // Before the rebuild, a backfilled task reuses its conversation's id.
+    if (ready) deleteOrphanedTask(db, taskId);
+    else db.prepare("DELETE FROM tasks WHERE id = ?").run(id);
     auditArchivedDeletion(db, id);
   }
   return { done: true };
@@ -2670,6 +2698,10 @@ function rebuildConversationsWithTasks(db, onStep) {
       }
       const checked = ["conversations", "messages", "runs", "tasks"];
       const before = foreignKeyViolationCounts(db, checked);
+      // Task writes are refused until the rebuild commits, so every task is a
+      // backfill. Retention may have deleted its conversation since then.
+      db.prepare(`DELETE FROM tasks WHERE scope_kind = 'worktree' AND origin = 'user'
+        AND NOT EXISTS (SELECT 1 FROM conversations WHERE conversations.id = tasks.id)`).run();
       withMigrationGrowth(db, () => db.prepare(`${TASK_BACKFILL_SQL} WHERE NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.id = conversations.id)`).run());
       const columns = db.pragma("table_info(conversations)").map((column) => `"${column.name.replaceAll('"', '""')}"`).join(", ");
       const dependents = db.prepare(`SELECT sql FROM sqlite_master WHERE tbl_name = 'conversations'
@@ -3159,6 +3191,13 @@ function conversationSource(db) {
     FROM conversations AS c${tasks ? " LEFT JOIN tasks AS t ON t.id = c.task_id" : ""}` };
 }
 
+// The same rule as conversationSource for unaliased deletion queries.
+function archivedConversationSql(db) {
+  return conversationTasksReady(db)
+    ? "(conversations.archived = 1 OR EXISTS (SELECT 1 FROM tasks WHERE tasks.id = conversations.task_id AND tasks.archived = 1))"
+    : "conversations.archived = 1";
+}
+
 // Derived on every read from run rows, so it is correct after a restart.
 // recovery_scope indexes exactly the unsettled runs; joining back to runs
 // reads their current status. Running work wins over a pending recovery
@@ -3204,8 +3243,12 @@ function taskObjective(value) {
 // its kind requires, mirroring the tasks CHECK constraint.
 export function normalizeTaskInput(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw databaseError(400, "Task must be a JSON object");
-  const required = { space: ["spaceId"], project: ["projectId"], worktree: ["projectId", "worktreeId", "worktreePath"] }[input.scopeKind];
-  if (!required) throw databaseError(400, "Task scope kind must be space, project, or worktree");
+  const scopes = { space: ["spaceId"], project: ["projectId"], worktree: ["projectId", "worktreeId", "worktreePath"] };
+  // Own keys only, so a name inherited from Object.prototype is a 400 too.
+  if (typeof input.scopeKind !== "string" || !Object.hasOwn(scopes, input.scopeKind)) {
+    throw databaseError(400, "Task scope kind must be space, project, or worktree");
+  }
+  const required = scopes[input.scopeKind];
   for (const key of ["spaceId", "projectId", "worktreeId", "worktreePath"]) {
     const value = input[key];
     if (required.includes(key)) {
