@@ -785,7 +785,7 @@ test("finishRun keeps the chat resume token within the retained budget while the
     database.updateSettings({ maxRetainedMiB: 64 });
     const roomy = chat(database, "roomy");
     const control = database.createRun(runInput(roomy.id));
-    const copied = database.finishRun(control.id, { status: "completed", finishedAt: new Date().toISOString(), providerSessionId: "session-with-room" });
+    const copied = database.finishRun(control.id, { status: "completed", finishedAt: new Date().toISOString(), providerSessionId: "session-with-room" }, null, { sessionEpoch: roomy.sessionEpoch });
     assert.equal(copied.sessionMetadataRefused, false);
     assert.equal(database.getConversation(roomy.id).providerSessionId, "session-with-room", "control: an available budget copies the token");
 
@@ -796,7 +796,7 @@ test("finishRun keeps the chat resume token within the retained budget while the
     database.upsertMessage({ ...filler, body: `${filler.body}${"x".repeat(remaining - 8)}` });
     assert.throws(() => database.updateConversation(current.id, { providerSessionId: "s".repeat(64) }), (error) => error.statusCode === 507);
     const conversationBytes = (db) => db.prepare("SELECT LENGTH(COALESCE(provider_session_id, '')) AS bytes FROM conversations WHERE id = ?").get(current.id).bytes;
-    const finished = database.finishRun(admitted.id, { status: "completed", finishedAt: new Date().toISOString(), providerSessionId: "s".repeat(64) });
+    const finished = database.finishRun(admitted.id, { status: "completed", finishedAt: new Date().toISOString(), providerSessionId: "s".repeat(64) }, null, { sessionEpoch: current.sessionEpoch });
     assert.equal(finished.run.status, "completed", "the terminal state commits despite the refused optional copy");
     assert.equal(finished.run.providerSessionId, "s".repeat(64), "the run keeps its own resume evidence");
     assert.equal(finished.sessionMetadataRefused, true);
@@ -1090,7 +1090,7 @@ test("optional metadata cannot exhaust terminal and restart recovery space", () 
     assert.ok(database.capacity().availableForNewWorkBytes <= 1);
 
     for (const conversation of conversations.slice(0, 256)) {
-      assert.throws(() => database.updateConversation(conversation.id, { providerSessionId: "s".repeat(4096) }),
+      assert.throws(() => database.updateConversation(conversation.id, { providerSessionId: "s".repeat(256) }),
         (error) => error.statusCode === 507);
       assert.equal(database.getConversation(conversation.id).providerSessionId, null);
     }

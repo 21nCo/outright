@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"01a12627-f09a-7fd1-acee-6058eb376e35"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"loading hooks from both /workspace and /workspace prefer a single representation for this layer"}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"READY"}}
+{"type":"turn.completed","usage":{"input_tokens":124119,"cached_input_tokens":110720,"cache_write_input_tokens":0,"output_tokens":353,"reasoning_output_tokens":20}}

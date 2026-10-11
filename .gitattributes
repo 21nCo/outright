@@ -1,0 +1,2 @@
+# Recorded provider streams keep their native LF line endings on every checkout.
+tests/fixtures/execution-adapters/** text eol=lf

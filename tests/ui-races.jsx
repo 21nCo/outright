@@ -295,6 +295,340 @@ async function chatSettingsArchiveRegression() {
   assert(!host.querySelector('#conversation-panel')?.hasAttribute('aria-labelledby'), "Empty conversation panel still references an archived tab");
 }
 
+async function chatSettingsSessionEditRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  let current = { ...chats.A, providerSessionId: "session-A" };
+  const patches = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [current] });
+    if (url.pathname === "/api/conversations/chat-A" && options.method === "PATCH") {
+      const patch = JSON.parse(options.body);
+      patches.push(patch);
+      current = { ...current, ...patch, providerSessionId: patch.providerSessionId === undefined ? current.providerSessionId : patch.providerSessionId || null };
+      return response(current);
+    }
+    if (url.pathname === "/api/conversations/chat-A") return response(current);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.conversation-header h1')?.textContent === chats.A.title, "session edit fixture loaded");
+  const save = async (edit, label) => {
+    host.querySelector('.conversation-meta button').click();
+    await until(() => document.querySelector('#chat-settings-session')?.value === (current.providerSessionId ?? ""), `${label}: dialog opened`);
+    edit();
+    await settle();
+    [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Save").click();
+    await until(() => patches.length && !document.querySelector('[role="dialog"]'), `${label}: saved`);
+    return patches.splice(0).at(-1);
+  };
+  // Before, every Save sent the session from when the dialog opened, which
+  // discards a session the running agent recorded meanwhile.
+  const renamed = await save(() => setControlValue(document.querySelector('#chat-settings-title'), "Renamed"), "rename");
+  assert(renamed.title === "Renamed" && !("providerSessionId" in renamed), `A rename sent the session field: ${JSON.stringify(renamed)}`);
+  const cleared = await save(() => setControlValue(document.querySelector('#chat-settings-session'), ""), "clear");
+  assert(cleared.providerSessionId === "", `Clearing the session did not send it: ${JSON.stringify(cleared)}`);
+}
+
+function chooseOption(select, value) {
+  Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set.call(select, value);
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+async function providerSwitchChoicesRegression() {
+  root.render(null);
+  await settle();
+  const providers = [
+    { id: "codex", label: "Codex", available: true, compatible: true, modelProvider: "openai", models: ["gpt-5.4"], capabilities: { permissionModes: ["read-only", "workspace-write", "danger-full-access"], reasoningEfforts: ["low", "medium", "high", "xhigh"], resume: true } },
+    { id: "claude", label: "Claude Code", available: true, compatible: true, modelProvider: "anthropic", models: ["sonnet"], capabilities: { permissionModes: ["read-only", "workspace-write", "danger-full-access"], reasoningEfforts: ["low", "medium", "high", "xhigh"], resume: true } },
+    { id: "anthropic-api", label: "Anthropic API", available: true, compatible: true, modelProvider: "anthropic", models: ["claude-opus-5-5"], capabilities: { permissionModes: ["read-only"], reasoningEfforts: ["medium"], resume: false } },
+  ];
+  const initial = { provider: "codex", model: "gpt-5.4", approvalPolicy: "workspace-write", reasoningEffort: "high",
+    editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
+  const patches = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/settings" && options.method === "PATCH") { patches.push(JSON.parse(options.body)); return response({ ...initial, ...patches.at(-1) }); }
+    return response({});
+  };
+  root.render(<TooltipProvider><SettingsDialog open onOpenChange={() => {}} settings={initial} providers={providers} templates={[]} onSaved={() => {}} onError={(error) => { throw error; }} /></TooltipProvider>);
+  const control = (label) => [...document.querySelectorAll('[role="dialog"] .setting-row')].find((row) => row.textContent.startsWith(label))?.querySelector("select, input");
+  const saveButton = () => [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent.includes("Save settings"));
+  const status = () => document.querySelector("#default-provider-status").textContent;
+  const values = () => ["Approval policy", "Reasoning effort", "Default model"].map((label) => control(label).value).join(",");
+  const blamed = () => ["Approval policy", "Reasoning effort", "Default model"].filter((label) => control(label).getAttribute("aria-invalid") === "true"
+    && control(label).getAttribute("aria-describedby") === "default-provider-status").join(",");
+  await until(() => control("Default provider")?.value === "codex", "provider settings opened");
+  // Before, the switch rewrote the global policy and effort to read-only/medium.
+  chooseOption(control("Default provider"), "anthropic-api");
+  await until(() => status().includes("does not support"), "unsupported choices announced");
+  assert(values() === "workspace-write,high,gpt-5.4", `A provider switch changed another choice: ${values()}`);
+  assert(saveButton().disabled && status().includes("was chosen for Codex"), "Save allowed choices the provider cannot honour");
+  assert(blamed() === "Approval policy,Reasoning effort,Default model", `Invalid controls were not tied to the status: ${blamed()}`);
+  chooseOption(control("Default provider"), "codex");
+  await until(() => !saveButton().disabled, "switching back restores a saveable draft");
+  assert(values() === "workspace-write,high,gpt-5.4", "switching back did not keep the original choices");
+  // A model edited under another provider belongs to that provider, on every later switch.
+  chooseOption(control("Default provider"), "claude");
+  setControlValue(control("Default model"), "sonnet");
+  chooseOption(control("Default provider"), "anthropic-api");
+  await until(() => status().includes("“sonnet” was chosen for Claude Code"), "an edited model is revalidated on the next switch");
+  assert(saveButton().disabled && control("Default model").getAttribute("aria-invalid") === "true", "Save allowed a Claude Code alias for the Anthropic API");
+  chooseOption(control("Default provider"), "claude");
+  setControlValue(control("Default model"), "claude-opus-5-5");
+  chooseOption(control("Default provider"), "anthropic-api");
+  await until(() => status().includes("does not support") && !status().includes("was chosen for"), "a model the target lists is kept");
+  chooseOption(control("Default provider"), "anthropic-api");
+  chooseOption(control("Approval policy"), "read-only");
+  chooseOption(control("Reasoning effort"), "medium");
+  setControlValue(control("Default model"), "");
+  await until(() => !saveButton().disabled, "explicit supported choices enable Save");
+  assert(blamed() === "" && !control("Default model").hasAttribute("aria-invalid"), "Corrected controls are still marked invalid");
+  saveButton().click();
+  await until(() => patches.length === 1, "provider settings saved");
+  const expectedPatch = { provider: "anthropic-api", model: "", approvalPolicy: "read-only", reasoningEffort: "medium" };
+  assert(Object.keys(patches[0]).length === Object.keys(expectedPatch).length && Object.entries(expectedPatch).every(([key, value]) => patches[0][key] === value),
+    `Unexpected settings patch: ${JSON.stringify(patches[0])}`);
+
+  // The conversation dialog applies the same rule to its model.
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  let chat = { ...chats.A, model: "gpt-5.4" };
+  const runs = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: initial, providers, templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chat] });
+    if (url.pathname === "/api/conversations/chat-A" && options.method === "PATCH") { patches.push(JSON.parse(options.body)); chat = { ...chat, ...patches.at(-1) }; return response(chat); }
+    if (url.pathname === "/api/conversations/chat-A/runs") { runs.push(JSON.parse(options.body)); return response({ id: "run", status: "queued" }, 202); }
+    if (url.pathname === "/api/conversations/chat-A") return response(chat);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.conversation-header h1')?.textContent === chats.A.title, "chat provider fixture loaded");
+  host.querySelector('.conversation-meta button').click();
+  await until(() => document.querySelector('#chat-settings-model')?.value === "gpt-5.4", "chat settings opened");
+  const chatSave = () => [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Save");
+  chooseOption(document.querySelector('#chat-settings-provider'), "claude");
+  await until(() => document.querySelector('#chat-settings-provider-status').textContent.includes("was chosen for Codex"), "chat model mismatch announced");
+  const chatModel = () => document.querySelector('#chat-settings-model');
+  assert(chatSave().disabled && chatModel().value === "gpt-5.4", "the chat kept a Codex model for Claude Code silently");
+  assert(chatModel().getAttribute("aria-invalid") === "true" && chatModel().getAttribute("aria-describedby") === "chat-settings-provider-status", "the chat model was not tied to its error");
+  setControlValue(document.querySelector('#chat-settings-model'), "sonnet");
+  await until(() => !chatSave().disabled, "an explicit model enables Save");
+  // Before, an edited model was compared only with the opened one, so this switch kept the alias.
+  const chatStatus = () => document.querySelector('#chat-settings-provider-status').textContent;
+  chooseOption(document.querySelector('#chat-settings-provider'), "anthropic-api");
+  await until(() => chatStatus().includes("“sonnet” was chosen for Claude Code"), "an edited chat model is revalidated on the next switch");
+  assert(chatSave().disabled && chatModel().getAttribute("aria-invalid") === "true", "a Claude Code alias entered in this session was kept for the Anthropic API");
+  setControlValue(chatModel(), "claude-custom");
+  await until(() => !chatSave().disabled, "an explicit custom model for the target enables Save");
+  chooseOption(document.querySelector('#chat-settings-provider'), "claude");
+  await until(() => chatStatus().includes("“claude-custom” was chosen for Anthropic API") && chatSave().disabled, "a custom model stays with the provider it was entered for");
+  setControlValue(chatModel(), "sonnet");
+  await until(() => !chatSave().disabled, "an explicit model enables Save again");
+  chatSave().click();
+  await until(() => patches.length === 2, "chat provider saved");
+  assert(patches[1].provider === "claude" && patches[1].model === "sonnet", `Unexpected chat patch: ${JSON.stringify(patches[1])}`);
+  // Before, a shared vendor let a Claude Code alias reach the Messages API.
+  await until(() => !chatModel() && host.querySelector('textarea[placeholder*="Ask claude"]'), "chat saved on Claude Code");
+  host.querySelector('.conversation-meta button').click();
+  await until(() => chatModel()?.value === "sonnet", "chat settings reopened");
+  chooseOption(document.querySelector('#chat-settings-provider'), "anthropic-api");
+  await until(() => document.querySelector('#chat-settings-provider-status').textContent.includes("was chosen for Claude Code"), "alias mismatch announced");
+  assert(chatSave().disabled && chatModel().getAttribute("aria-invalid") === "true", "a Claude Code alias was kept for the Anthropic API");
+  setControlValue(chatModel(), "");
+  await until(() => !chatSave().disabled && !chatModel().hasAttribute("aria-invalid"), "clearing the alias enables Save");
+  chatSave().click();
+  await until(() => patches.length === 3, "chat moved to the direct provider");
+  assert(patches[2].provider === "anthropic-api" && patches[2].model === "", `Unexpected chat patch: ${JSON.stringify(patches[2])}`);
+  // The default model was chosen for Codex; this chat runs its own provider's default.
+  await until(() => !chatModel() && host.querySelector('textarea[placeholder*="Ask anthropic-api"]'), "chat saved on the direct provider");
+  setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "Answer with the provider default");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => runs.length === 1, "direct-provider chat sent");
+  assert(runs[0].provider === "anthropic-api" && runs[0].model === "", `The run inherited another provider's default model: ${JSON.stringify(runs[0])}`);
+}
+
+// Before, widths of 920px or less hid the header's settings button, leaving
+// a conversation's provider and model reachable only by double-click.
+async function conversationSettingsKeyboardRegression() {
+  if (!window.__fixtureSetViewport || !window.__fixtureSendKey) return false;
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const provider = (id, label, ready) => ({ id, label, kind: "harness", version: "9.9.9", available: ready, compatible: ready, reason: ready ? "" : `${label} is not installed`,
+    capabilities: { permissionModes: ["read-only", "workspace-write", "danger-full-access"], reasoningEfforts: ["low", "medium", "high", "xhigh"], resume: true } });
+  const providers = [provider("codex", "Codex", true), provider("claude", "Claude Code", false)];
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers, templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/providers") return response({ providers });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    return response({});
+  };
+  try {
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('.conversation-header h1')?.textContent === chats.A.title, "conversation settings fixture");
+    for (const width of [360, 760, 900]) {
+      await window.__fixtureSetViewport(width);
+      await until(() => window.innerWidth === width, `real ${width}px layout`); // NOSONAR S9382: each width settles before its control is checked
+      window.dispatchEvent(new Event("resize"));
+      await settle(); // NOSONAR S9382: each width settles before its control is checked
+      const manage = host.querySelector('button[aria-label="Conversation settings · codex"]');
+      const bounds = manage?.getBoundingClientRect();
+      assert(bounds && bounds.width >= 24 && bounds.height >= 24 && bounds.right <= window.innerWidth, `No visible conversation settings control at ${width}px: ${JSON.stringify(bounds?.toJSON())}`);
+      host.querySelector('[aria-label="New chat tab"]').focus();
+      await window.__fixtureSendKey("Tab"); // NOSONAR S9382: keys are delivered in order
+      assert(document.activeElement === manage, `Tab did not reach conversation settings at ${width}px: ${document.activeElement?.outerHTML.slice(0, 160)}`);
+      await window.__fixtureSendKey("Enter"); // NOSONAR S9382: keys are delivered in order
+      await until(() => document.querySelector('#chat-settings-provider'), `Enter opened conversation settings at ${width}px`); // NOSONAR S9382: each width opens its own dialog
+      const select = document.querySelector('#chat-settings-provider');
+      await until(() => select.closest('[role="dialog"]').contains(document.activeElement), `focus entered conversation settings at ${width}px`); // NOSONAR S9382: each width opens its own dialog
+      const visited = [];
+      for (let step = 0; step < 6 && document.activeElement !== select; step += 1) {
+        visited.push(document.activeElement?.id || document.activeElement?.outerHTML.slice(0, 60));
+        await window.__fixtureSendKey("Tab"); // NOSONAR S9382: keys are delivered in order
+      }
+      assert(document.activeElement === select, `Tab did not reach the provider select at ${width}px: ${visited.join(" > ")}`);
+      const claude = select.querySelector('option[value="claude"]');
+      assert(claude.disabled && claude.textContent === "Claude Code (unavailable)", `An unready provider was offered at ${width}px: ${claude.outerHTML}`);
+      assert(select.getAttribute("aria-describedby") === "chat-settings-provider-status" && document.querySelector('#chat-settings-provider-status').textContent.startsWith("Codex 9.9.9"), `Provider status was not announced at ${width}px`);
+      await window.__fixtureSendKey("Escape"); // NOSONAR S9382: keys are delivered in order
+      await until(() => !document.querySelector('#chat-settings-provider') && document.activeElement === manage, `Escape restored focus to conversation settings at ${width}px`); // NOSONAR S9382: each width closes its own dialog
+    }
+  } finally {
+    await window.__fixtureSetViewport(1280);
+  }
+}
+
+async function providerReadinessSelectionRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const provider = (id, label, state) => ({ id, label, kind: "harness", version: "9.9.9", available: state === "ready" || state === "incompatible",
+    compatible: state === "ready", checking: state === "checking", capabilities: { permissionModes: ["read-only", "workspace-write", "danger-full-access"], reasoningEfforts: ["low", "medium", "high", "xhigh"], resume: true } });
+  const snapshot = (pi) => [provider("codex", "Codex", "ready"), provider("claude", "Claude Code", "unavailable"),
+    provider("anthropic-api", "Anthropic API", "incompatible"), provider("hermes", "Hermes", "checking"), provider("pi", "Pi", pi)];
+  const unready = { claude: "Claude Code is unavailable", "anthropic-api": "Anthropic API is an unsupported version", hermes: "Hermes is still being checked", gone: "gone is not supported" };
+  let chat = { ...chats.A, model: "" };
+  let piState = "ready";
+  const patches = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: snapshot(piState), templates: [], trustedProjects: [] });
+    // Hermes stays checking, so the app keeps polling this snapshot.
+    if (url.pathname === "/api/providers") return response({ providers: snapshot(piState) });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chat] });
+    if (url.pathname === "/api/conversations/chat-A" && options.method === "PATCH") { patches.push(JSON.parse(options.body)); chat = { ...chat, ...patches.at(-1) }; return response(chat); }
+    if (url.pathname === "/api/conversations/chat-A") return response(chat);
+    return response({});
+  };
+  const socketCount = fixtureSockets.length;
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.conversation-header h1')?.textContent === chats.A.title && fixtureSockets.length > socketCount, "readiness fixture loaded");
+  const publish = (pi) => { piState = pi; fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "providers.changed", payload: { providers: snapshot(pi) } }) })); };
+  const select = () => document.querySelector('#chat-settings-provider');
+  const status = () => document.querySelector('#chat-settings-provider-status').textContent;
+  const save = () => [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Save");
+  const blocked = (reason) => save().disabled && status().includes(reason) && select().getAttribute("aria-invalid") === "true";
+  host.querySelector('.conversation-meta button').click();
+  await until(() => select()?.value === "codex", "chat settings opened");
+  const disabled = () => [...select().options].filter((option) => option.disabled).map((option) => option.value).join(",");
+  assert(disabled() === "claude,anthropic-api,hermes", `Unready providers were selectable: ${disabled()}`);
+  // Before, an unready provider with no model saved and left the chat unable to run.
+  for (const [id, reason] of Object.entries(unready)) {
+    if (id === "gone") select().append(new Option("gone", "gone"));
+    chooseOption(select(), id);
+    await until(() => blocked(reason), `a switch to ${id} blocks Save`);
+    select().closest("form").requestSubmit();
+    await settle();
+    assert(patches.length === 0, `An unready provider was saved: ${JSON.stringify(patches)}`);
+  }
+  chooseOption(select(), "pi");
+  await until(() => !save().disabled && !select().hasAttribute("aria-invalid"), "a ready provider is saveable");
+  publish("unavailable");
+  await until(() => blocked("Pi is unavailable"), "a provider that stops being ready while open blocks Save");
+  publish("ready");
+  await until(() => !save().disabled && !status().includes("choose a ready provider"), "a provider that is ready again is saveable");
+  save().click();
+  await until(() => patches.length === 1, "ready provider saved");
+  assert(patches[0].provider === "pi" && patches[0].model === "", `Unexpected chat patch: ${JSON.stringify(patches[0])}`);
+  await until(() => !select(), "chat settings closed");
+  // The opened provider stays saveable while unready, so unrelated edits still work.
+  publish("unavailable");
+  host.querySelector('.conversation-meta button').click();
+  await until(() => select()?.value === "pi", "chat settings reopened");
+  assert(!select().querySelector('option[value="pi"]').disabled && !save().disabled && !select().hasAttribute("aria-invalid"), "the unready current provider blocked an unrelated edit");
+  setControlValue(document.querySelector('#chat-settings-title'), "Renamed while unready");
+  save().click();
+  await until(() => patches.length === 2, "title saved on an unready provider");
+  assert(patches[1].title === "Renamed while unready" && patches[1].provider === "pi" && !("providerSessionId" in patches[1]), `Unexpected title patch: ${JSON.stringify(patches[1])}`);
+
+  // Settings applies the same rule to the default provider.
+  root.render(null);
+  await settle();
+  const initial = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
+    editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
+  route = async (url, options) => {
+    if (url.pathname === "/api/settings" && options.method === "PATCH") { patches.push(JSON.parse(options.body)); return response({ ...initial, ...patches.at(-1) }); }
+    return response({});
+  };
+  const settings = (pi) => root.render(<TooltipProvider><SettingsDialog open onOpenChange={() => {}} settings={initial} providers={snapshot(pi)} templates={[]} onSaved={() => {}} onError={(error) => { throw error; }} /></TooltipProvider>);
+  settings("ready");
+  const control = () => [...document.querySelectorAll('[role="dialog"] .setting-row')].find((row) => row.textContent.startsWith("Default provider"))?.querySelector("select");
+  const settingsSave = () => [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent.includes("Save settings"));
+  const settingsStatus = () => document.querySelector("#default-provider-status").textContent;
+  await until(() => control()?.value === "codex", "provider settings opened");
+  chooseOption(control(), "pi");
+  await until(() => !settingsSave().disabled, "a ready default provider is saveable");
+  settings("unavailable");
+  await until(() => settingsSave().disabled && settingsStatus().includes("Pi is unavailable") && control().getAttribute("aria-invalid") === "true", "a default provider that stops being ready blocks Save");
+  // Comparing with the draft kept the selected unready provider enabled.
+  assert(control().querySelector('option[value="pi"]').disabled && !control().querySelector('option[value="codex"]').disabled, "options were not compared with the opened provider");
+  settings("ready");
+  await until(() => !settingsSave().disabled && !control().hasAttribute("aria-invalid"), "a ready default provider is saveable again");
+  settingsSave().click();
+  await until(() => patches.length === 3, "default provider saved");
+  assert(patches[2].provider === "pi" && Object.keys(patches[2]).length === 1, `Unexpected settings patch: ${JSON.stringify(patches[2])}`);
+}
+
+async function recoveryModelCorrectionRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const interrupted = { id: "run-legacy-model", conversationId: "chat-A", status: "interrupted", recoveryClass: "exited", provider: "codex", model: "gpt 5 codex" };
+  const recoveryChat = { ...chats.A, runs: [interrupted] };
+  const requests = [];
+  const prompts = [];
+  const confirm = window.confirm;
+  window.confirm = (text) => { prompts.push(text); return prompts.length > 1; };
+  try {
+    route = async (url, options) => {
+      if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+      if (url.pathname === "/api/conversations") return response({ conversations: [recoveryChat] });
+      if (url.pathname === "/api/runs/run-legacy-model/resume") {
+        const body = JSON.parse(options.body);
+        requests.push(body);
+        if (!body.useProviderDefaultModel) return response({ error: "This run's saved model name can no longer be launched safely.", code: "RECOVERY_MODEL_UNLAUNCHABLE" }, 409);
+        return response({ id: "run-replacement" }, 202);
+      }
+      if (url.pathname === "/api/conversations/chat-A") return response(recoveryChat);
+      return response({});
+    };
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelectorAll(".recovery-actions button").length === 3, "legacy recovery actions");
+    const retry = () => [...host.querySelectorAll(".recovery-actions button")].find((button) => button.textContent.includes("Retry from scratch"));
+    // A declined confirmation sends nothing more; an accepted one retries with the default model.
+    retry().click();
+    await until(() => prompts.length === 1 && host.textContent.includes("can no longer be launched safely"), "declined correction surfaces the refusal");
+    assert(requests.length === 1 && prompts[0].includes("“gpt 5 codex”"), "the correction was not explained before replacing the model");
+    retry().click();
+    await until(() => requests.length === 3, "confirmed correction retried");
+    assert(JSON.stringify(requests.slice(1)) === JSON.stringify([{ policy: "retry" }, { policy: "retry", useProviderDefaultModel: true }]), `Unexpected recovery requests: ${JSON.stringify(requests)}`);
+  } finally { window.confirm = confirm; }
+}
+
 async function settingsRetentionDraftRegression() {
   root.render(null);
   await settle();
@@ -4671,9 +5005,11 @@ async function providerBootstrapConvergenceRegression() {
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
   const bootstrap = deferred();
   let providerReads = 0;
+  const ready = (id, label) => ({ id, label, kind: "harness", available: true, compatible: true, checking: false, version: "9.9.9", capabilities: { permissionModes: ["read-only"], resume: true } });
+  const converged = [ready("codex", "Codex"), ready("claude", "Claude Code")];
   route = async (url) => {
     if (url.pathname === "/api/bootstrap") return bootstrap.promise;
-    if (url.pathname === "/api/providers") { providerReads += 1; return response({ providers: [{ id: "codex", label: "Codex", available: true, checking: false }] }); }
+    if (url.pathname === "/api/providers") { providerReads += 1; return response({ providers: converged }); }
     if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
     if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
     return response({});
@@ -4681,11 +5017,16 @@ async function providerBootstrapConvergenceRegression() {
   const socketCount = fixtureSockets.length;
   root.render(<TooltipProvider><App /></TooltipProvider>);
   await until(() => fixtureSockets.length > socketCount, "socket before bootstrap");
-  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "providers.changed", payload: { providers: [{ id: "codex", available: true, checking: false }] } }) }));
-  bootstrap.resolve(response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [{ id: "codex", label: "Codex", available: false, checking: true }], templates: [], trustedProjects: [] }));
+  // This event arrives before bootstrap and is lost; only the refresh can converge.
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "providers.changed", payload: { providers: converged } }) }));
+  const checking = (id, label) => ({ id, label, kind: "harness", available: false, compatible: false, checking: true });
+  bootstrap.resolve(response({ projects: [projects[0]], projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex" }, providers: [checking("codex", "Codex"), checking("claude", "Claude Code")], templates: [], trustedProjects: [] }));
   await until(() => host.querySelector('[aria-label="Settings"]'), "settings after checking bootstrap");
   host.querySelector('[aria-label="Settings"]').click();
-  await until(() => document.querySelector('[role="dialog"] option[value="codex"]')?.disabled === false, "provider converged after missed event");
+  // The selected option is never disabled, so watch the status line and a
+  // non-selected provider, which stay "checking" until the snapshot converges.
+  await until(() => document.querySelector('[role="dialog"] option[value="claude"]')?.disabled === false
+    && document.querySelector("#default-provider-status")?.textContent.startsWith("Codex 9.9.9"), "provider converged after missed event");
   assert(providerReads > 0, "Checking bootstrap did not refresh providers");
   document.querySelector('[role="dialog"] button[aria-label="Close"]')?.click();
 }
@@ -4887,7 +5228,16 @@ async function responsiveSidebarBreakpointCycles(setWidth) {
     await remainsTrue(() => document.activeElement === document.body, 600,
       "sidebar reclaimed intentional BODY focus on a later breakpoint change");
   } catch (error) {
-    throw new Error(`${error.message}; focusTrace=${JSON.stringify(trace.slice(-35))}`);
+    // Bounded diagnosis for an intermittent macOS CI failure that has not
+    // reproduced locally: whether the visible sidebar control could take focus
+    // (the app's transfer gave up) or the browser refused it.
+    const candidate = host.querySelector("#project-sidebar")?.querySelector("button:not(:disabled)");
+    const rect = candidate?.getBoundingClientRect();
+    const layout = { candidate: describe(candidate), rect: rect && [rect.left, rect.width, rect.height].map(Math.round), visibility: candidate && getComputedStyle(candidate).visibility,
+      inert: Boolean(candidate?.closest("[inert]")), documentFocused: document.hasFocus(), visibilityState: document.visibilityState };
+    candidate?.focus({ preventScroll: true });
+    layout.probeFocused = document.activeElement === candidate;
+    throw new Error(`${error.message}; layout=${JSON.stringify(layout)}; focusTrace=${JSON.stringify(trace.slice(-35))}`);
   } finally {
     document.removeEventListener("focusin", record, true);
     document.removeEventListener("focusout", record, true);
@@ -5509,6 +5859,10 @@ try {
     ["space sidebar", spaceSidebarRegression, "sidebar shows spaces and Ungrouped, creates a space and moves a project with space copy and routes"],
     ["chat tab controls", chatTabControlRegression, "chat tab navigation ignores nested archive controls"],
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
+    ["chat settings session edit", chatSettingsSessionEditRegression, "conversation settings send the session only when the user edits it"],
+    ["provider switch choices", providerSwitchChoicesRegression, "a provider switch keeps every other choice and blocks Save until unsupported ones are replaced"],
+    ["provider readiness selection", providerReadinessSelectionRegression, "a dialog switches only to a ready provider and keeps its opened provider saveable"],
+    ["recovery model correction", recoveryModelCorrectionRegression, "a legacy model is replaced with the provider default only after an explicit confirmation"],
     ["settings retention draft", settingsRetentionDraftRegression, "missing archived data stays safe and cancel, cleanup and save use the persisted retention age"],
     ["settings save session fence", settingsSaveSessionFenceRegression, "delayed GET and PATCH save completions cannot change a reopened Settings dialog"],
     ["settings shared refresh order", settingsSharedRefreshOrderRegression, "a settings save preserves an in-flight template refresh without reverting the new quota"],
@@ -5613,6 +5967,7 @@ try {
     ["bootstrap maintenance retry", bootstrapMaintenanceRetryRegression, "a transient archive cutover resumes initial loading"],
     ["bootstrap hard failures", bootstrapHardFailureRegression, "authorization, server, and network failures surface once"],
     ["provider checking rate", providerCheckingRateRegression, "repeated checking snapshots keep a bounded poll cadence"],
+    ["conversation settings keyboard", conversationSettingsKeyboardRegression, "conversation settings stay keyboard reachable at 360, 760 and 900px", "keyboard and width checks require the CDP bridges"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and inspector contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],
   ];
