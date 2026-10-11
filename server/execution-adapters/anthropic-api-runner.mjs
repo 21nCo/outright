@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 
 const MAX_EVENT_BYTES = 1024 * 1024;
 const MAX_ERROR_BYTES = 64 * 1024;
+const BLOCK_EVENTS = new Set(["content_block_start", "content_block_delta", "content_block_stop"]);
 // A fixed output cap; a response that reaches it fails its run (see the adapter).
 export const MAX_OUTPUT_TOKENS = 8192;
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -206,6 +207,23 @@ async function execute(argv, environment, { protect, write, fail }) {
     message_stop: { delta: "stopped" },
   };
   let phase = "before";
+  // Within the content phase one block is open at a time: content_block_start
+  // with an index above every earlier one, deltas for that index only, then
+  // content_block_stop. A start and stop with no deltas is a whole block.
+  // Only the open index and the highest started one are kept.
+  let openBlock = null;
+  let lastBlock = -1;
+  const blockOrder = (event) => {
+    // The held text is later released under the last text delta's index, so
+    // only a native one, a non-negative integer, is accepted.
+    if (!Number.isSafeInteger(event.index) || event.index < 0) return malformedEvent;
+    if (event.type === "content_block_start") {
+      if (openBlock !== null || event.index <= lastBlock) return outOfOrder;
+      openBlock = lastBlock = event.index;
+    } else if (event.index !== openBlock) return outOfOrder;
+    else if (event.type === "content_block_stop") openBlock = null;
+    return null;
+  };
   let errored = false;
   // Returns the failure to report when the stream can no longer be trusted.
   // Text already written stays in the transcript; the run still fails.
@@ -223,11 +241,10 @@ async function execute(argv, environment, { protect, write, fail }) {
       if (!Object.hasOwn(NEXT_PHASE[event.type], phase)) return outOfOrder;
       phase = NEXT_PHASE[event.type][phase];
     }
+    if (BLOCK_EVENTS.has(event.type)) { const failed = blockOrder(event); if (failed) return failed; }
+    if (event.type === "message_delta" && openBlock !== null) return outOfOrder;
     if (event.type === "error") errored = true;
     if (event.type === "content_block_delta" && event.delta?.type === "text_delta" && typeof event.delta.text === "string") {
-      // A native block index is a non-negative integer; the held text is
-      // later released under the last valid one.
-      if (!Number.isSafeInteger(event.index) || event.index < 0) return malformedEvent;
       textIndex = event.index;
       event = { ...event, delta: { ...event.delta, text: text.push(event.delta.text) } };
     }

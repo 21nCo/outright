@@ -279,8 +279,10 @@ async function withApiFixture(respond, callback) {
   finally { await new Promise((resolve) => server.close(resolve)); }
 }
 
-// Synthetic streams open their message as the API does.
+// Synthetic streams open their message, and each content block, as the API does.
 const messageStart = `data: ${JSON.stringify({ type: "message_start", message: { model: "claude-opus-5-5", usage: { input_tokens: 1 } } })}\n\n`;
+const blockStart = (index = 0) => `data: ${JSON.stringify({ type: "content_block_start", index, content_block: { type: "text", text: "" } })}\n\n`;
+const blockStop = (index = 0) => `data: ${JSON.stringify({ type: "content_block_stop", index })}\n\n`;
 
 test("the Outright-managed Anthropic path streams through its own credential", async () => {
   const secret = "sk-ant-fixture-secret";
@@ -416,7 +418,7 @@ test("a key split across text deltas never reaches the assembled answer", async 
   // Held text that turns out not to be the key is delivered unchanged.
   body += `${delta(` ${reflectedKey.slice(0, 9)}`)}${delta("!")}${delta(` ${reflectedKey.slice(0, 12)}`)}`;
   expected += ` ${reflectedKey.slice(0, 9)}! ${reflectedKey.slice(0, 12)}`;
-  for (const [stream, code] of [[`${messageStart}${body}${end}`, 0], [`${messageStart}${body}data: {"index":0}\n\n`, 1]]) {
+  for (const [stream, code] of [[`${messageStart}${blockStart()}${body}${blockStop()}${end}`, 0], [`${messageStart}${blockStart()}${body}data: {"index":0}\n\n`, 1]]) {
     await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(stream); }, async (base) => {
       const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: reflectedKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
       // Before, each record was redacted alone and the answer held the key at every split.
@@ -434,19 +436,21 @@ test("a credential-bearing index never leaves the runner, whichever way the stre
   const end = `${event({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } })}${event({ type: "message_stop" })}`;
   // Block boundaries are forwarded redacted. The text ends in a key prefix,
   // so a suffix is held until the stream ends.
-  const start = `${messageStart}${event({ type: "content_block_start", index: reflectedKey, content_block: { type: "text", text: "" } })}`;
+  const start = `${messageStart}${event({ type: "content_block_start", index: 0, content_block: { type: "text", text: "", [reflectedKey]: reflectedKey } })}`;
   const held = `ok ${reflectedKey.slice(0, 5)}`;
   const opening = `${start}${textDelta(0, held)}`;
   const malformed = "Anthropic API sent a malformed stream event";
   const cases = [
-    ["end_turn", `${opening}${event({ type: "content_block_stop", index: [reflectedKey] })}${end}`, 0, null, held],
+    ["end_turn", `${opening}${event({ type: "content_block_stop", index: 0, echoed: [reflectedKey] })}${end}`, 0, null, held],
     ["error event", `${opening}${event({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } })}`, 1, "Overloaded", held],
     ["no message_stop", opening, 1, "Anthropic API stream ended before message_stop", held],
     ["overflow", `${opening}data: ${"x".repeat(1024 * 1024 + 1)}\n`, 1, "Anthropic API stream event exceeded 1 MiB", held],
     ["network", opening, 1, /^Anthropic API stream failed: /, held],
     // The held text is released under the last text delta's index, so only a
-    // native one is accepted; the rejected delta's text is not kept.
+    // native one is accepted; the rejected delta's text is not kept. A block
+    // boundary with a key for its index fails the same way.
     ...[reflectedKey, { [reflectedKey]: reflectedKey }, [reflectedKey], -1, 0.5].map((index) => [`index ${JSON.stringify(index)}`, `${start}${textDelta(0, "ok ")}${textDelta(index, reflectedKey.slice(0, 5))}${end}`, 1, malformed, "ok "]),
+    ["block stop index", `${opening}${event({ type: "content_block_stop", index: [reflectedKey] })}${end}`, 1, malformed, held],
   ];
   for (const [name, body, code, message, answer] of cases) {
     await withApiFixture((response) => {
@@ -562,7 +566,7 @@ test("one stream event is bounded across chunks and data lines", async () => {
 
 test("an event's data lines are bounded by the bytes the event holds, however short they are", async () => {
   const MAX = 1024 * 1024;
-  const opening = `${messageStart}data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `kept ${reflectedKey.slice(0, 5)}` } })}\n\n`;
+  const opening = `${messageStart}${blockStart()}data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `kept ${reflectedKey.slice(0, 5)}` } })}\n\n`;
   const stream = (ending, line, count) => {
     const unit = `${line}${ending}`;
     // Pieces end mid-line, and inside a CRLF when there is one.
@@ -607,7 +611,7 @@ test("an event's data lines are bounded by the bytes the event holds, however sh
   const end = 'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\ndata: {"type":"message_stop"}\n\n';
   const head = '{"type":"content_block_delta","index":0,\ndata: "delta":{"type":"text_delta","text":';
   for (const text of ["two lines", "y".repeat(MAX - 200)]) {
-    const result = await run((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(`${messageStart}data: ${head}"${text}"}}\n\n${end}`); });
+    const result = await run((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(`${messageStart}${blockStart()}data: ${head}"${text}"}}\n\n${blockStop()}${end}`); });
     assert.equal(result.code, 0, `${text.length} characters`);
     assert.ok(answer(result) === text, `${text.length} characters: the answer is kept whole`);
   }
@@ -618,7 +622,7 @@ test("a malformed stream event fails the run and keeps the text already streamed
   for (const broken of ["data: {broken-json}\n\n", "data: [1]\n\n"]) {
     await withApiFixture((response) => {
       response.writeHead(200, { "content-type": "text/event-stream" });
-      response.end(`${messageStart}${delta("partial")}${broken}${delta(" lost")}data: {"type":"message_stop"}\n\n`);
+      response.end(`${messageStart}${blockStart()}${delta("partial")}${broken}${delta(" lost")}data: {"type":"message_stop"}\n\n`);
     }, async (base) => {
       const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
       // Before, the event was dropped and message_stop completed the run.
@@ -632,27 +636,41 @@ test("a malformed stream event fails the run and keeps the text already streamed
 
 test("a stream that breaks the message lifecycle fails the run and keeps the text before the break", async () => {
   const event = (record) => `data: ${JSON.stringify(record)}\n\n`;
-  const block = event({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-  const text = (value) => event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: value } });
+  const text = (value, index = 0) => event({ type: "content_block_delta", index, delta: { type: "text_delta", text: value } });
   const delta = event({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } });
   const stop = event({ type: "message_stop" });
   const ping = event({ type: "ping" });
   const future = event({ type: "future_event", detail: 1 });
   // The answer ends in a key prefix, so held text is released on every exit.
   const said = `ok ${reflectedKey.slice(0, 5)}`;
+  const opened = `${messageStart}${blockStart()}${text(said)}`;
+  const closed = `${opened}${blockStop()}`;
   const outOfOrder = "Anthropic API sent stream events out of order; the answer may be incomplete";
   for (const [name, body, code, message, answer] of [
     // Before, each of these exited 0 and completed the run.
-    ["no message_start", `${block}${text(said)}${delta}${stop}`, 1, outOfOrder, ""],
+    ["no message_start", `${blockStart()}${text(said)}${blockStop()}${delta}${stop}`, 1, outOfOrder, ""],
     ["only delta and stop", `${delta}${stop}`, 1, outOfOrder, ""],
-    ["stop before delta", `${messageStart}${block}${text(said)}${stop}${delta}`, 1, outOfOrder, said],
-    ["duplicate message_start", `${messageStart}${text(said)}${messageStart}${delta}${stop}`, 1, outOfOrder, said],
-    ["text after message_delta", `${messageStart}${text(said)}${delta}${text(" late")}${stop}`, 1, outOfOrder, said],
-    ["text after message_stop", `${messageStart}${text(said)}${delta}${stop}${text(" late")}`, 1, outOfOrder, said],
-    ["ping after message_stop", `${messageStart}${text(said)}${delta}${stop}${ping}`, 1, outOfOrder, said],
-    ["no message_stop", `${messageStart}${text(said)}${delta}`, 1, "Anthropic API stream ended before message_stop", said],
+    ["stop before delta", `${closed}${stop}${delta}`, 1, outOfOrder, said],
+    ["duplicate message_start", `${closed}${messageStart}${delta}${stop}`, 1, outOfOrder, said],
+    ["text after message_delta", `${closed}${delta}${text(" late")}${stop}`, 1, outOfOrder, said],
+    ["text after message_stop", `${closed}${delta}${stop}${text(" late")}`, 1, outOfOrder, said],
+    ["ping after message_stop", `${closed}${delta}${stop}${ping}`, 1, outOfOrder, said],
+    ["no message_stop", `${closed}${delta}`, 1, "Anthropic API stream ended before message_stop", said],
+    // Each content block is its start, deltas for its index only, then its
+    // stop. Before, each of these exited 0 and completed the run.
+    ["delta before its block starts", `${messageStart}${text(" late")}${blockStart()}${blockStop()}${delta}${stop}`, 1, outOfOrder, ""],
+    ["delta before the next block starts", `${closed}${text(" late", 1)}${delta}${stop}`, 1, outOfOrder, said],
+    ["delta after its block stops", `${closed}${text(" late")}${delta}${stop}`, 1, outOfOrder, said],
+    ["block open at message_delta", `${opened}${delta}${stop}`, 1, outOfOrder, said],
+    ["reused index", `${closed}${blockStart()}${text(" late")}${blockStop()}${delta}${stop}`, 1, outOfOrder, said],
+    ["stop without start", `${closed}${blockStop(1)}${delta}${stop}`, 1, outOfOrder, said],
+    ["delta for another index than the open one", `${opened}${text(" late", 1)}${blockStop()}${delta}${stop}`, 1, outOfOrder, said],
+    ["block starts while another is open", `${opened}${blockStart(1)}${text(" late", 1)}${blockStop(1)}${delta}${stop}`, 1, outOfOrder, said],
+    // Several blocks in order, and a block with no deltas (a server-side
+    // fallback), complete.
+    ["blocks in order", `${closed}${blockStart(1)}${blockStop(1)}${blockStart(2)}${text(" more", 2)}${blockStop(2)}${delta}${stop}`, 0, null, `${said} more`],
     // Pings, unknown event types and repeated deltas before message_stop are kept compatible.
-    ["pings and unknown events", `${ping}${messageStart}${future}${block}${ping}${text(said)}${future}${delta}${ping}${delta}${stop}`, 0, null, said],
+    ["pings and unknown events", `${ping}${messageStart}${future}${blockStart()}${ping}${text(said)}${future}${blockStop()}${delta}${ping}${delta}${stop}`, 0, null, said],
     ["error before message_start", event({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }), 1, "Overloaded", ""],
   ]) {
     await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(body); }, async (base) => {
@@ -676,10 +694,10 @@ test("the direct runner stops reading the API while its consumer is stalled", as
   await withApiFixture((response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
     let index = 0;
-    response.write(messageStart);
+    response.write(`${messageStart}${blockStart()}`);
     const pump = () => {
       while (index < events) { index += 1; if (!response.write(event)) { response.once("drain", pump); return; } }
-      response.end('data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\ndata: {"type":"message_stop"}\n\n', () => { flushed = true; });
+      response.end(`${blockStop()}` + 'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\ndata: {"type":"message_stop"}\n\n', () => { flushed = true; });
     };
     pump();
   }, async (base) => {
