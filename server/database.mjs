@@ -262,11 +262,12 @@ export function createOutrightDatabase(options = {}) {
         reserveRecoveryHeadroom(db);
         captureTaskChanges(db, queueTaskChanges);
       }
-      // The shadow cutover changed its thread's task on another connection.
-      if (taskIds.length && !closing) options.onTasksChanged?.({ taskIds, truncated: false });
       maintenance = false;
       maintenanceCapacity = undefined;
       maintenanceError = undefined;
+      // A committed shadow cutover changed its thread's task on another
+      // connection. It is announced once the reopened store can be read.
+      if (taskIds.length && !closing) options.onTasksChanged?.({ taskIds, truncated: false });
       releaseLeaseIfIdle();
       if (cleanupReconciliationPending) scheduleCleanupReconciliation();
       if (!closing) { continueMigrations(); scheduleDeletionResume(); }
@@ -2396,11 +2397,12 @@ async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, cut
   if (workers.size || !canMaintain() || db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
     return { deleted: 0, deferred: true, id };
   }
-  // Before the rebuild, a backfilled task reuses its conversation's id.
-  const taskId = conversationTasksReady(db) ? db.prepare("SELECT task_id FROM conversations WHERE id = ?").get(id)?.task_id : id;
+  // Only a committed cutover changes a task. Before the rebuild, task reads
+  // are unavailable and, like the storage hook, nothing is announced.
+  const taskId = conversationTasksReady(db) ? db.prepare("SELECT task_id FROM conversations WHERE id = ?").get(id)?.task_id : null;
   try {
     await deleteOversizedArchivedRow(filename, id, step.oversized, { workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase,
-      onWorkerStart, onWorkerReady, onWorkerExit: () => onWorkerExit(taskId ? [taskId] : []), onWorkerRecoveryFailure });
+      onWorkerStart, onWorkerReady, onWorkerExit: (committed) => onWorkerExit(committed && taskId ? [taskId] : []), onWorkerRecoveryFailure });
   }
   catch (error) {
     if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
@@ -2556,7 +2558,7 @@ function deleteOversizedArchivedRow(filename, conversationId, oversized, lifecyc
         if (problem) await recoverArchiveOnWorker(filename,
           ["ARCHIVE_SNAPSHOT_CHANGED", "ARCHIVE_DEFERRED", "ARCHIVE_SOURCE_BUSY"].includes(problem.code));
         workers.delete(worker);
-        onWorkerExit();
+        onWorkerExit(!problem);
         if (problem) reject(problem);
         else resolve();
       } catch (error) {
@@ -3441,7 +3443,8 @@ function deleteOrphanedTask(db, taskId) {
 
 // An archived task left without threads (a moved-away source, a standalone
 // task) ages for retention like an archived thread. Each short transaction
-// checks one page of candidates; the delete re-checks every condition, so a
+// takes one page of threadless candidates, so archived tasks that keep their
+// threads cost no pages; the delete re-checks every condition, so a
 // concurrent restore or a new thread keeps its task.
 async function deleteThreadlessArchivedTasks(currentDb, cutoff, limit) {
   let deleted = 0;
@@ -3451,7 +3454,8 @@ async function deleteThreadlessArchivedTasks(currentDb, cutoff, limit) {
     if (!db || !conversationTasksReady(db)) break;
     const page = db.transaction(() => {
       const rows = db.prepare(`SELECT id, updated_at AS updatedAt FROM tasks WHERE archived = 1 AND updated_at < ?
-        AND (updated_at, id) > (?, ?) ORDER BY updated_at, id LIMIT 64`).all(cutoff, after[0], after[1]);
+        AND (updated_at, id) > (?, ?) AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id)
+        ORDER BY updated_at, id LIMIT 64`).all(cutoff, after[0], after[1]);
       const remove = db.prepare(`DELETE FROM tasks WHERE id = ? AND archived = 1 AND updated_at < ?
         AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id)`);
       let count = 0;

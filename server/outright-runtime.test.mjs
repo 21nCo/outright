@@ -3004,11 +3004,13 @@ test("task routes create, page, read and update tasks and announce every change"
 
 test("conversation create and move keep every thread in exactly one task", withWorktreeRuntime(async (runtime, { project, worktree }) => {
   const events = captureEvents(runtime);
-  const target = { projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path };
+  // Direct database fixtures store the canonical path the routes produce;
+  // git's path is not canonical on Windows.
+  const target = { projectId: project.id, worktreeId: worktree.id, worktreePath: realpathSync.native(worktree.path) };
   const created = await callRuntime(runtime, "POST", "/api/conversations", { ...target, title: "Legacy flow", provider: "codex" });
   assert.equal(created.statusCode, 201, created.raw);
   const own = runtime.database.getTask(created.body.taskId, { threads: true });
-  assert.deepEqual([own.scopeKind, own.title, own.worktreePath, own.threads.map((thread) => thread.id)], ["worktree", "Legacy flow", realpathSync.native(worktree.path), [created.body.id]]);
+  assert.deepEqual([own.scopeKind, own.title, own.worktreePath, own.threads.map((thread) => thread.id)], ["worktree", "Legacy flow", target.worktreePath, [created.body.id]]);
   assert.deepEqual(events.taskChanges(), [{ taskIds: [created.body.taskId], truncated: false }]);
 
   events.clear();
@@ -3034,7 +3036,7 @@ test("conversation create and move keep every thread in exactly one task", withW
   const added = spawnSync("git", ["-C", project.path, "worktree", "add", "-b", "linked", linkedPath], { encoding: "utf8" });
   assert.equal(added.status, 0, added.stderr);
   const linked = (await runtime.projects(true)).projects.find((item) => item.id === project.id).worktrees.find((item) => item.isLinked);
-  const destination = { projectId: project.id, worktreeId: linked.id, worktreePath: linked.path };
+  const destination = { projectId: project.id, worktreeId: linked.id, worktreePath: realpathSync.native(linked.path) };
   events.clear();
   const moved = await callRuntime(runtime, "POST", `/api/conversations/${attached.body.id}/move`, destination);
   assert.equal(moved.statusCode, 200, moved.raw);

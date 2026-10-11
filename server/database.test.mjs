@@ -2236,13 +2236,16 @@ test("retention during a pending task backfill leaves no task without its conver
     // legacy table is still in place. The oversized row takes the shadow
     // worker, which removes the backfilled task by its conversation id.
     let batches = 0;
-    database = createOutrightDatabase({ filename, onMigrationError: () => {}, tasksMigrationStep: (step) => {
+    const reported = [];
+    database = createOutrightDatabase({ filename, onMigrationError: () => {}, onTasksChanged: (change) => reported.push(change), tasksMigrationStep: (step) => {
       if (step === "tasks-backfilled" && ++batches > 1) throw new Error("hold the backfill");
     } });
     try {
       assert.equal(database.capacity().migrationStatus, "migrating");
       assert.equal((await database.deleteArchivedConversation(doomed.id, doomed.id)).deleted, 1);
       assert.equal((await database.deleteArchivedConversation(oversized.id, oversized.id)).deleted, 1);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(reported, [], "nothing is announced while task reads are unavailable");
     } finally { await database.close(); }
     const raw = new Database(filename);
     try {
@@ -2264,6 +2267,58 @@ test("retention during a pending task backfill leaves no task without its conver
       } finally { probe.close(); }
     } finally { await database.close(); }
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("a shadow cutover announces its task only once committed, after the store reopens", { timeout: 60000 }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-task-shadow-exit-"));
+  const filename = path.join(directory, "outright.db");
+  const copyGate = new Int32Array(new SharedArrayBuffer(4));
+  // Each announcement of the thread's task records what a reader then sees.
+  const reads = [];
+  let kept;
+  const database = createOutrightDatabase({ filename, runtimeLease: true, deletionCopyGate: copyGate.buffer, onTasksChanged: (change) => {
+    if (!kept || !change.taskIds.includes(kept.taskId)) return;
+    try { reads.push(database.getTask(kept.taskId)?.threadCount ?? "deleted"); } catch (error) { reads.push(error.statusCode); }
+  } });
+  const until = async (predicate, message) => {
+    const deadline = Date.now() + 15000;
+    while (!predicate()) {
+      assert.ok(Date.now() < deadline, message);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
+  const gone = () => { try { return database.getTask(kept.taskId) === undefined; } catch { return false; } };
+  try {
+    const other = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Other", provider: "codex" });
+    kept = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Kept", provider: "codex" });
+    const message = database.addMessage({ conversationId: kept.id, role: "assistant", body: "small" });
+    const writer = new Database(filename);
+    try { writer.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id); }
+    finally { writer.close(); }
+    database.updateConversation(kept.id, { archived: true });
+    // A copy that never finishes fails the worker; the store is unchanged.
+    const failed = database.deleteArchivedConversation(kept.id, kept.id);
+    await until(() => Atomics.load(copyGate, 0) === 1, "the shadow copy did not start");
+    reads.length = 0;
+    await assert.rejects(failed, /Archive copy probe timed out/);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(reads, [], "a failed cutover announces nothing");
+    // The automatic retry is deferred by a write during its copy, then the
+    // next retry commits.
+    Atomics.store(copyGate, 0, 0);
+    await until(() => Atomics.load(copyGate, 0) === 1, "the retry did not start a shadow copy");
+    database.updateTask(other.taskId, { objective: "Written during the copy" });
+    Atomics.store(copyGate, 0, 2);
+    Atomics.notify(copyGate, 0);
+    await until(gone, "the deferred cutover was not retried");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(reads, ["deleted"], "only the committed cutover is announced, and it can be read");
+  } finally {
+    Atomics.store(copyGate, 0, 2);
+    Atomics.notify(copyGate, 0);
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("threads hidden by an archived task are listed, deleted and pruned like archived threads", async () => {
@@ -2387,11 +2442,38 @@ test("retention reclaims archived threadless tasks after the retention window, a
     assert.equal((await database.pruneHistory({ before: cutoff() })).tasksDeleted, 1);
     for (const id of archivedIds) assert.equal(database.getTask(id), undefined);
     assert.ok(before - database.capacity().retainedBytes >= 3 * 16 * 1024, "retained bytes are released");
+
     assert.equal(database.getTask(open.id).archived, false, "an open threadless task is never touched");
     assert.equal(database.getTask(pinned.taskId).archived, true, "an archived task with a thread is never touched");
     assert.equal(database.getTask(database.getConversation(thread.id).taskId).archived, false);
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual([...new Set(reported)].sort(), [...archivedIds].sort(), "tasks.changed names each reclaimed task");
+    // Archived tasks that keep their threads cost no candidate pages.
+    for (let index = 0; index < 200; index += 1) {
+      const kept = database.createConversation({ ...where, title: `Pinned ${index}`, provider: "codex" });
+      database.updateConversation(kept.id, { pinned: true });
+      database.updateConversation(kept.id, { archived: true });
+    }
+    const eligible = [0, 1].map((index) => database.createTask({ scopeKind: "project", projectId: "p", title: `Eligible ${index}` }));
+    for (const task of eligible) database.updateTask(task.id, { archived: true });
+    const ager = new Database(filename);
+    try {
+      ager.prepare("UPDATE tasks SET updated_at = ? WHERE archived = 1").run(new Date(Date.now() - 100 * 86_400_000).toISOString());
+      for (const task of eligible) ager.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(new Date(Date.now() - 99 * 86_400_000).toISOString(), task.id);
+    } finally { ager.close(); }
+    await new Promise((resolve) => setImmediate(resolve));
+    reported.length = 0;
+    const transaction = Database.prototype.transaction;
+    let pages = 0;
+    Database.prototype.transaction = function countedTransaction(...args) { pages += 1; return transaction.apply(this, args); };
+    let bounded;
+    try { bounded = await database.pruneHistory({ before: cutoff(), limit: 1 }); }
+    finally { Database.prototype.transaction = transaction; }
+    assert.deepEqual([bounded.deleted, bounded.tasksDeleted, pages], [0, 1, 1], "one page reaches the eligible task behind 200 protected ones");
+    assert.equal((await database.pruneHistory({ before: cutoff() })).tasksDeleted, 1);
+    assert.equal(eligible.filter((task) => database.getTask(task.id)).length, 0);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual([...new Set(reported)].sort(), eligible.map((task) => task.id).sort());
   } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
