@@ -5,7 +5,7 @@ import { PassThrough, Readable } from "node:stream";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -16,6 +16,7 @@ import { AGENT_SUPERVISOR, createAgentManager, LAUNCH_AUTHORIZED_CONTROL } from 
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { randomUUID } from "node:crypto";
+import { writeNodeCommand } from "../tests/fixtures/node-command.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -1142,11 +1143,12 @@ function seedLegacyRunningUnknownTargetDatabase(filename, { secondRun = false } 
 
 // A full harness with a real discovered, trusted git worktree and a fake
 // provider CLI on PATH, so successful submissions and replacement runs can be
-// exercised end-to-end through the HTTP surface. POSIX-only: the fake provider
-// CLI is a shell script, so callers must skip on win32.
+// exercised end-to-end through the HTTP surface. A test that writes its own
+// shell-script CLI must skip on win32.
 function withWorktreeRuntime(fn, options = {}) {
   return async () => {
-    const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "outright-e2e-")));
+    // Native, so a Windows short-path temporary directory matches Git's long path.
+    const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-e2e-")));
     const repo = path.join(root, "repo");
     const bin = path.join(root, "bin");
     const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-test-"));
@@ -1164,15 +1166,15 @@ function withWorktreeRuntime(fn, options = {}) {
       }
       mkdirSync(bin, { recursive: true });
       // A supported version keeps compatibility gating out of unrelated fixtures.
-      writeFileSync(path.join(bin, "codex"), "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.162.1'; fi\nexit 0\n");
-      chmodSync(path.join(bin, "codex"), 0o755);
+      writeCodexVersion(bin, "0.162.1");
       const configFile = path.join(root, "outright.config.json");
       writeFileSync(configFile, JSON.stringify({ scanRoots: [root], maxDepth: 2, maxProjects: 8 }));
       process.env.OUTRIGHT_DATA_DIR = dataDirectory;
       process.env.PATH = `${bin}${path.delimiter}${previousPath}`;
       runtime = createOutrightRuntime({ configUrl: pathToFileURL(configFile), ...options });
       const scan = await runtime.projects();
-      const project = scan.projects.find((item) => item.path === repo);
+      // Git reports a Windows worktree path with forward slashes.
+      const project = scan.projects.find((item) => path.resolve(item.path) === repo);
       const worktree = project?.worktrees.find((item) => !item.isLinked);
       if (!project || !worktree) throw new Error("the temp repo was not discovered as a project worktree");
       runtime.database.trustProject(project.id, project.path);
@@ -1187,6 +1189,10 @@ function withWorktreeRuntime(fn, options = {}) {
       rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     }
   };
+}
+
+function writeCodexVersion(bin, version) {
+  writeNodeCommand(bin, "codex", `if (process.argv[2] === "--version") console.log(${JSON.stringify(`codex-cli ${version}`)});\n`);
 }
 
 const worktreeRefreshBehavior = { blockScan: false };
@@ -1461,7 +1467,7 @@ for (const operation of ["send", "recovery"]) {
   }));
 }
 
-test("unsupported provider configurations are rejected before probing or durable side effects", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("unsupported provider configurations are rejected before probing or durable side effects", { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
   runtime.agents.providerAvailable = async () => { throw new Error("static validation must precede discovery"); };
   const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Direct", provider: "anthropic-api" });
   const send = async (body) => {
@@ -1483,7 +1489,7 @@ test("unsupported provider configurations are rejected before probing or durable
   assert.deepEqual(runtime.database.listRuns(conversation.id), []);
 }));
 
-test("explicitly supplied false, 0 or empty run settings are rejected instead of taking the defaults", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("explicitly supplied false, 0 or empty run settings are rejected instead of taking the defaults", { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
   runtime.database.updateSettings({ provider: "codex", model: "gpt-5.4", approvalPolicy: "danger-full-access", reasoningEffort: "high" });
   let probes = 0;
   runtime.agents.providerAvailable = async () => { probes += 1; return true; };
@@ -1518,13 +1524,13 @@ test("explicitly supplied false, 0 or empty run settings are rejected instead of
   }
 }));
 
-test("an installed but incompatible CLI is reported before enqueueing", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
+test("an installed but incompatible CLI is reported before enqueueing", { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
   // Settle the startup probe so authorization cannot reuse its in-flight result.
   assert.equal(await runtime.agents.providerAvailable("codex"), true);
   const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Old CLI", provider: "codex" });
   for (const [version, reason] of [["0.20.0", /Codex 0\.20\.0 is not supported; Outright supports 0\.162\.1 or newer/],
     ["0.162.1-rc.1", /Codex 0\.162\.1-rc\.1 is a prerelease; Outright supports stable releases 0\.162\.1 or newer/]]) {
-    writeFileSync(path.join(bin, "codex"), `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 'codex-cli ${version}'; fi\n`);
+    writeCodexVersion(bin, version);
     const result = responseCapture();
     await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "must not persist" }), result);
     assert.equal(result.statusCode, 409, version);
@@ -1537,7 +1543,7 @@ test("an installed but incompatible CLI is reported before enqueueing", { skip: 
   assert.deepEqual(runtime.database.listRuns(conversation.id), []);
 }));
 
-test("an unusable direct-provider endpoint is reported before enqueueing", { skip: process.platform === "win32", timeout: 20000 }, async () => {
+test("an unusable direct-provider endpoint is reported before enqueueing", { timeout: 20000 }, async () => {
   const saved = { key: process.env.OUTRIGHT_ANTHROPIC_API_KEY, base: process.env.OUTRIGHT_ANTHROPIC_BASE_URL };
   process.env.OUTRIGHT_ANTHROPIC_API_KEY = "sk-ant-endpoint";
   try {
@@ -1563,7 +1569,7 @@ test("an unusable direct-provider endpoint is reported before enqueueing", { ski
   }
 });
 
-test("a conversation cannot store a session its adapter cannot resume", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("a conversation cannot store a session its adapter cannot resume", { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
   const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Direct session", provider: "anthropic-api" });
   const result = responseCapture();
   await runtime.handleRequest(requestStream("PATCH", `/api/conversations/${conversation.id}`, { providerSessionId: "msg-session" }), result);
@@ -1572,7 +1578,7 @@ test("a conversation cannot store a session its adapter cannot resume", { skip: 
   assert.equal(runtime.database.getConversation(conversation.id).providerSessionId, null);
 }));
 
-test("session recovery is refused for an adapter that cannot resume", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("session recovery is refused for an adapter that cannot resume", { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
   runtime.agents.providerAvailable = async () => true;
   const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Direct recovery", provider: "anthropic-api" });
   const interrupted = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "anthropic-api", approvalPolicy: "read-only", reasoningEffort: "medium", prompt: "unfinished", providerSessionId: "msg-session" });
@@ -1585,7 +1591,7 @@ test("session recovery is refused for an adapter that cannot resume", { skip: pr
   assert.equal(runtime.database.listRuns(conversation.id).length, 1);
 }));
 
-test("a run saved before model and session validation can be continued with an explicit correction", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("a run saved before model and session validation can be continued with an explicit correction", { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
   runtime.agents.providerAvailable = async () => true;
   const scheduled = [];
   runtime.agents.schedule = async (entry) => { scheduled.push(entry); return entry.run; };
@@ -1620,16 +1626,24 @@ test("a run saved before model and session validation can be continued with an e
   assert.equal(runtime.database.getRun(other.id).recoveryDecision, null);
 }));
 
-test("a direct-provider run streams through the supervised runtime with its scoped credential", { skip: process.platform === "win32", timeout: 30000 }, async () => {
+test("a direct-provider run streams through the supervised runtime with its scoped credential", { timeout: 30000 }, async () => {
   const stream = readFileSync(new URL("../tests/fixtures/execution-adapters/anthropic-api/stream.sse", import.meta.url), "utf8");
   const unauthorized = readFileSync(new URL("../tests/fixtures/execution-adapters/anthropic-api/unauthorized.json", import.meta.url), "utf8");
   const requests = [];
+  const reflectedKey = 'fixture-"runtime"\\reflected-key';
   const server = (await import("node:http")).createServer((request, response) => {
     request.resume();
     request.on("end", () => {
       requests.push(request.headers["x-api-key"]);
-      if (request.headers["x-api-key"] === "sk-ant-runtime") { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(stream); }
-      else { response.writeHead(401, { "content-type": "application/json" }); response.end(unauthorized); }
+      const key = request.headers["x-api-key"];
+      if (key === "sk-ant-runtime") { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(stream); }
+      else if (key === reflectedKey) {
+        // A gateway that echoes the key split across text deltas, then nested in an error.
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        const event = (data) => `data: ${JSON.stringify(data)}\n\n`;
+        const delta = (text) => event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
+        response.end(`${delta(`key ${key.slice(0, 7)}`)}${delta(key.slice(7, 15))}${delta(`${key.slice(15)} kept`)}${event({ type: "error", error: { type: "api_error", message: JSON.stringify({ echoed: key }) } })}`);
+      } else { response.writeHead(401, { "content-type": "application/json" }); response.end(unauthorized); }
     });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -1653,7 +1667,16 @@ test("a direct-provider run streams through the supervised runtime with its scop
       const failed = await send();
       assert.equal(failed.status, "failed");
       assert.equal(failed.error, "invalid x-api-key", "the native failure explains the exit");
-      assert.deepEqual(requests, ["sk-ant-runtime", "sk-ant-revoked"]);
+      process.env.OUTRIGHT_ANTHROPIC_API_KEY = reflectedKey;
+      const reflected = await send();
+      assert.equal(reflected.status, "failed");
+      assert.equal(reflected.error, JSON.stringify({ echoed: "[redacted]" }));
+      const answer = runtime.database.listMessages(conversation.id).filter((message) => message.role === "assistant").map((message) => message.body).join("\n");
+      assert.match(answer, /key \[redacted\] kept/);
+      // Before, the stored answer held the key and the stored error its escape.
+      const stored = JSON.stringify([runtime.database.listMessages(conversation.id), runtime.database.listRunEvents(reflected.id), reflected]);
+      for (const form of [reflectedKey, JSON.stringify(reflectedKey).slice(1, -1)]) assert.equal(stored.includes(form) || stored.includes(JSON.stringify(form).slice(1, -1)), false);
+      assert.deepEqual(requests, ["sk-ant-runtime", "sk-ant-revoked", reflectedKey]);
     })();
   } finally {
     for (const [name, value] of [["OUTRIGHT_ANTHROPIC_API_KEY", saved.key], ["OUTRIGHT_ANTHROPIC_BASE_URL", saved.base]]) {

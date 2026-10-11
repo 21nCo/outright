@@ -55,9 +55,11 @@ export const anthropicApiAdapter = defineAdapter({
   },
   normalize(raw) {
     if (raw.type === "content_block_delta") {
-      // A text delta without text would otherwise drop part of the answer
-      // and still complete. Other delta types are ignored.
-      if (!raw.delta || typeof raw.delta !== "object" || (raw.delta.type === "text_delta" && typeof raw.delta.text !== "string")) {
+      // A delta without a type, or a text delta without text, would otherwise
+      // drop part of the answer and still complete. Other delta types are
+      // ignored.
+      if (!raw.delta || typeof raw.delta !== "object" || typeof raw.delta.type !== "string" || !raw.delta.type
+        || (raw.delta.type === "text_delta" && typeof raw.delta.text !== "string")) {
         return [{ type: "provider.failure", payload: { message: "Anthropic API sent a malformed text delta; the answer is incomplete", terminal: true, native: { type: "malformed_delta" } } }];
       }
       return raw.delta.type === "text_delta" && raw.delta.text ? [{ type: "assistant.delta", payload: { text: raw.delta.text } }] : [];
@@ -68,7 +70,7 @@ export const anthropicApiAdapter = defineAdapter({
       // A cut-off answer must not look complete, and neither may one whose
       // final delta has no stop reason. The text and usage so far are kept.
       const stopReason = raw.delta?.stop_reason;
-      if (typeof stopReason !== "string") return [usage, { type: "provider.failure", payload: { message: "Anthropic API ended the message without a stop reason; the answer may be incomplete", terminal: true, native: { type: "malformed_stop_reason" } } }];
+      if (typeof stopReason !== "string" || !stopReason) return [usage, { type: "provider.failure", payload: { message: "Anthropic API ended the message without a stop reason; the answer may be incomplete", terminal: true, native: { type: "malformed_stop_reason" } } }];
       if (!Object.hasOwn(TRUNCATING_STOP_REASONS, stopReason)) return [usage];
       return [usage, { type: "provider.failure", payload: { message: `Anthropic API stopped at ${TRUNCATING_STOP_REASONS[stopReason]}; the answer is truncated`, terminal: true, native: { stop_reason: stopReason } } }];
     }

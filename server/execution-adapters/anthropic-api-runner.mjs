@@ -12,14 +12,51 @@ export const MAX_OUTPUT_TOKENS = 8192;
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 export const ENDPOINT_REQUIREMENT = "OUTRIGHT_ANTHROPIC_BASE_URL must be an https URL or a loopback http address, without a user name or password";
 
+// A provider or gateway can reflect the key in any field it controls, either
+// verbatim or inside JSON-encoded text it nests in a message. These are the
+// key and each further JSON string escape of it.
+function secretForms(secret) {
+  const forms = [];
+  for (let form = secret; form && !forms.includes(form) && forms.length < 4; form = JSON.stringify(form).slice(1, -1)) forms.unshift(form);
+  return forms;
+}
+
+function redactText(text, forms) {
+  return forms.reduce((result, form) => result.replaceAll(form, "[redacted]"), text);
+}
+
+// Provider values are redacted before serialization, so no decoding of a
+// written record can recover the key.
+function redact(value, forms) {
+  if (typeof value === "string") return redactText(value, forms);
+  if (!value || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item) => redact(item, forms));
+  return Object.fromEntries(Object.entries(value).map(([name, item]) => [redactText(name, forms), redact(item, forms)]));
+}
+
+// The manager concatenates every text delta of a run into one answer, so
+// text is redacted as a single stream. A suffix that could begin the key is
+// held until the next delta shows otherwise, and is released when the
+// stream ends.
+function textRedactor(forms) {
+  let held = "";
+  const longest = Math.max(...forms.map((form) => form.length));
+  return {
+    push(text) {
+      const combined = redactText(held + text, forms);
+      let keep = Math.min(longest - 1, combined.length);
+      while (keep > 0 && !forms.some((form) => form.startsWith(combined.slice(combined.length - keep)))) keep -= 1;
+      held = combined.slice(combined.length - keep);
+      return combined.slice(0, combined.length - keep);
+    },
+    flush() { const text = held; held = ""; return text; },
+  };
+}
+
 // The manager may stop reading; wait for it instead of buffering the whole
-// stream in this process. A provider or gateway can reflect the key in any
-// field it controls, so a record that carries provider text is written with
-// every JSON-escaped occurrence of the key replaced.
-function write(record, secret = "") {
-  let line = JSON.stringify(record);
-  if (secret) line = line.replaceAll(JSON.stringify(secret).slice(1, -1), "[redacted]");
-  if (process.stdout.write(`${line}\n`)) return undefined;
+// stream in this process.
+function write(record) {
+  if (process.stdout.write(`${JSON.stringify(record)}\n`)) return undefined;
   return new Promise((resolve) => {
     const done = () => { process.stdout.off("drain", done); process.stdout.off("close", done); process.stdout.off("error", done); resolve(); };
     process.stdout.on("drain", done);
@@ -28,8 +65,8 @@ function write(record, secret = "") {
   });
 }
 
-async function fail(type, message, code = 1, secret = "") {
-  await write({ type: "error", error: { type, message } }, secret);
+async function fail(type, message, code = 1) {
+  await write({ type: "error", error: { type, message } });
   process.exitCode = code;
 }
 
@@ -83,6 +120,7 @@ export async function run(argv = process.argv.slice(2), environment = process.en
   if (!apiKey) return fail("authentication_error", "OUTRIGHT_ANTHROPIC_API_KEY is not set", 2);
   const url = anthropicEndpoint(environment);
   if (!url) return fail("invalid_request_error", ENDPOINT_REQUIREMENT, 2);
+  const forms = secretForms(apiKey);
   let response;
   try {
     response = await fetch(url, {
@@ -110,8 +148,10 @@ export async function run(argv = process.argv.slice(2), environment = process.en
       if (typeof parsed?.error?.message === "string") message = parsed.error.message;
       if (typeof parsed?.error?.type === "string") type = parsed.error.type;
     } catch { /* Keep the status summary. */ }
-    return fail(type, message, 1, apiKey);
+    return fail(redactText(type, forms), redactText(message, forms));
   }
+  const text = textRedactor(forms);
+  let textIndex = 0;
   const decoder = new TextDecoder();
   let buffered = "";
   let data = [];
@@ -133,15 +173,25 @@ export async function run(argv = process.argv.slice(2), environment = process.en
     let event;
     try { event = JSON.parse(payload); }
     catch { return false; }
-    if (!event || typeof event !== "object" || Array.isArray(event)) return false;
+    if (!event || typeof event !== "object" || Array.isArray(event) || typeof event.type !== "string" || !event.type) return false;
     if (event.type === "message_stop") stopped = true;
     if (event.type === "message_delta") delta = true;
     if (event.type === "error") errored = true;
-    await write(event, apiKey);
+    if (event.type === "content_block_delta" && event.delta?.type === "text_delta" && typeof event.delta.text === "string") {
+      textIndex = event.index;
+      event = { ...event, delta: { ...event.delta, text: text.push(event.delta.text) } };
+    }
+    await write(redact(event, forms));
     return true;
   };
+  // Every exit releases the held text before its final record, so the
+  // answer keeps everything that was not the key.
+  const release = async () => {
+    const rest = text.flush();
+    if (rest) await write({ type: "content_block_delta", index: textIndex, delta: { type: "text_delta", text: rest } });
+  };
   const malformedEvent = () => fail("api_error", "Anthropic API sent a malformed stream event");
-  // Returning from the read loop cancels the response body.
+  // Leaving the read loop cancels the response body.
   const overflow = () => fail("api_error", "Anthropic API stream event exceeded 1 MiB");
   // SSE lines end in CRLF, LF or CR. A CR that ends a chunk may be the first
   // half of a CRLF, so it waits for the next chunk unless the stream ended.
@@ -161,17 +211,19 @@ export async function run(argv = process.argv.slice(2), environment = process.en
     }
     return null;
   };
+  let failure;
   try {
     for await (const chunk of response.body) {
       buffered += decoder.decode(chunk, { stream: true });
-      const failure = await readLines(false);
-      if (failure) return failure();
-      if (dataBytes + Buffer.byteLength(buffered) > MAX_EVENT_BYTES) return overflow();
+      failure = await readLines(false);
+      if (failure) break;
+      if (dataBytes + Buffer.byteLength(buffered) > MAX_EVENT_BYTES) { failure = overflow; break; }
     }
-    const failure = await readLines(true);
-    if (failure) return failure();
-    if (!(await dispatch())) return malformedEvent();
-  } catch (error) { return fail("network_error", `Anthropic API stream failed: ${networkCode(error)}`); }
+    failure ??= await readLines(true);
+    if (!failure && !(await dispatch())) failure = malformedEvent;
+  } catch (error) { failure = () => fail("network_error", `Anthropic API stream failed: ${networkCode(error)}`); }
+  await release();
+  if (failure) return failure();
   if (errored) process.exitCode = 1;
   else if (!stopped) await fail("api_error", "Anthropic API stream ended before message_stop");
   else if (!delta) await fail("api_error", "Anthropic API stream ended without a stop reason; the answer may be incomplete");

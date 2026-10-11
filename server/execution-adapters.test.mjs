@@ -279,26 +279,83 @@ test("a recognized Anthropic text delta without text fails the run instead of dr
     assert.deepEqual(failures.map((event) => [event.payload.terminal, event.payload.message]), [[true, "Anthropic API sent a malformed text delta; the answer is incomplete"]]);
     assert.equal(JSON.stringify(failures).includes("424242"), false, "the malformed payload is not echoed");
   });
+  // Without a native type the delta cannot be shown to carry no answer text.
+  const source = fixture("anthropic-api", "malformed-delta.sse");
+  for (const delta of ['{"text":" lost"}', '{"type":7,"text":" lost"}', '{"type":"","text":" lost"}']) {
+    await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(source.replace('{"type":"text_delta","text":424242}', delta)); }, async (base) => {
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      assert.equal(result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join(""), "READY", delta);
+      assert.deepEqual(result.events.filter((event) => event.type === "provider.failure").map((event) => event.payload.terminal), [true], delta);
+      assert.equal(result.events.find((event) => event.type === "usage" && event.payload.outputTokens !== undefined)?.payload.outputTokens, 3, delta);
+    });
+  }
   // A delta type Outright does not consume stays ignored for forward compatibility.
   assert.deepEqual(anthropic.normalize({ type: "content_block_delta", index: 0, delta: { type: "future_delta", value: 1 } }), []);
   assert.equal(anthropic.normalize({ type: "content_block_delta", index: 0 })[0].type, "provider.failure");
 });
 
+// A key with characters JSON escapes, so a nested reflection differs from it.
+const reflectedKey = 'fixture-"reflected"\\direct-key';
+// Every form of the key a reader could recover by decoding once or more.
+const keyForms = [reflectedKey, JSON.stringify(reflectedKey).slice(1, -1), JSON.stringify(JSON.stringify(reflectedKey)).slice(1, -1)];
+function assertNoKey(result, label) {
+  const strings = [result.stdout, result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join("")];
+  const collect = (value) => {
+    if (typeof value === "string") strings.push(value);
+    else if (value && typeof value === "object") for (const [name, item] of Object.entries(value)) { strings.push(name); collect(item); }
+  };
+  collect(result.events);
+  assert.equal(strings.some((text) => keyForms.some((form) => text.includes(form))), false, `${label}: the key left the runner`);
+}
+
 test("a reflected API key never leaves the runner in provider error text", async () => {
-  const secret = "sk-ant-reflected/fixture+key";
-  const reflected = `invalid x-api-key ${secret}`;
-  const sseError = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "overloaded_error", message: reflected, echoed: secret } })}\n\n`;
-  for (const respond of [
-    (response) => { response.writeHead(401, { "content-type": "application/json" }); response.end(JSON.stringify({ type: "error", error: { type: `authentication_error ${secret}`, message: reflected } })); },
-    (response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(sseError); },
+  const reflected = `invalid x-api-key ${reflectedKey}`;
+  const nested = JSON.stringify({ echoed: reflectedKey });
+  const twiceNested = JSON.stringify({ inner: nested });
+  const sseError = (error) => `event: error\ndata: ${JSON.stringify({ type: "error", error })}\n\n`;
+  for (const [respond, message] of [
+    [(response) => { response.writeHead(401, { "content-type": "application/json" }); response.end(JSON.stringify({ type: "error", error: { type: `authentication_error ${reflectedKey}`, message: reflected } })); }, "invalid x-api-key [redacted]"],
+    [(response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(sseError({ type: "overloaded_error", message: reflected, echoed: reflectedKey, [reflectedKey]: 1 })); }, "invalid x-api-key [redacted]"],
+    // A gateway can nest the key inside JSON-encoded text, once or more.
+    [(response) => { response.writeHead(401, { "content-type": "application/json" }); response.end(JSON.stringify({ type: "error", error: { type: "authentication_error", message: nested } })); }, JSON.stringify({ echoed: "[redacted]" })],
+    [(response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(sseError({ type: "api_error", message: twiceNested })); }, JSON.stringify({ inner: JSON.stringify({ echoed: "[redacted]" }) })],
   ]) {
     await withApiFixture(respond, async (base) => {
-      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: secret, OUTRIGHT_ANTHROPIC_BASE_URL: base });
-      // Before, the gateway's message reached stdout, run events and the run error verbatim.
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: reflectedKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      // Before, the gateway's message reached stdout, run events and the run
+      // error verbatim, and a nested reflection kept its escaped form.
       assert.equal(result.code, 1);
-      assert.equal(result.stdout.includes(secret) || result.stdout.includes(JSON.stringify(secret).slice(1, -1)), false, "the key is never echoed");
+      assertNoKey(result, message);
       const failure = result.events.at(-1);
-      assert.deepEqual([failure.type, failure.payload.terminal, failure.payload.message], ["provider.failure", true, "invalid x-api-key [redacted]"]);
+      assert.deepEqual([failure.type, failure.payload.terminal, failure.payload.message], ["provider.failure", true, message], "the rest of the diagnostic is kept");
+    });
+  }
+});
+
+test("a key split across text deltas never reaches the assembled answer", async () => {
+  const delta = (text) => `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })}\n\n`;
+  const ping = 'event: ping\ndata: {"type":"ping"}\n\n';
+  const end = 'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n';
+  // Every two-way split position, and three-way splits with a ping between.
+  let body = "";
+  let expected = "";
+  for (let index = 1; index < reflectedKey.length; index += 1) {
+    body += `${delta(`<${reflectedKey.slice(0, index)}`)}${delta(`${reflectedKey.slice(index)}>`)}`;
+    const third = Math.min(index + 3, reflectedKey.length - 1);
+    if (third > index) body += `${delta(`(${reflectedKey.slice(0, index)}`)}${ping}${delta(reflectedKey.slice(index, third))}${delta(`${reflectedKey.slice(third)})`)}`;
+    expected += third > index ? "<[redacted]>([redacted])" : "<[redacted]>";
+  }
+  // Held text that turns out not to be the key is delivered unchanged.
+  body += `${delta(` ${reflectedKey.slice(0, 9)}`)}${delta("!")}${delta(` ${reflectedKey.slice(0, 12)}`)}`;
+  expected += ` ${reflectedKey.slice(0, 9)}! ${reflectedKey.slice(0, 12)}`;
+  for (const [stream, code] of [[`${body}${end}`, 0], [`${body}data: {"index":0}\n\n`, 1]]) {
+    await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(stream); }, async (base) => {
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: reflectedKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      // Before, each record was redacted alone and the answer held the key at every split.
+      assertNoKey(result, `exit ${code}`);
+      assert.equal(result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join(""), expected);
+      assert.equal(result.code, code);
+      if (code) assert.equal(result.events.at(-1).payload.message, "Anthropic API sent a malformed stream event", "an event without a type fails after the held text");
     });
   }
 });
@@ -306,7 +363,8 @@ test("a reflected API key never leaves the runner in provider error text", async
 test("a message that ends without a valid stop reason fails and keeps its text and usage", async () => {
   const text = (result) => result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join("");
   const withoutReason = fixture("anthropic-api", "missing-stop-reason.sse");
-  for (const [name, body] of [["missing", withoutReason], ["numeric", withoutReason.replace('"delta":{"stop_sequence":null}', '"delta":{"stop_reason":7}')]]) {
+  for (const [name, body] of [["missing", withoutReason], ["numeric", withoutReason.replace('"delta":{"stop_sequence":null}', '"delta":{"stop_reason":7}')],
+    ["empty", withoutReason.replace('"delta":{"stop_sequence":null}', '"delta":{"stop_reason":""}')]]) {
     await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(body); }, async (base) => {
       const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
       assert.equal(text(result), "READY now", name);
@@ -317,8 +375,12 @@ test("a message that ends without a valid stop reason fails and keeps its text a
         [[true, "Anthropic API ended the message without a stop reason; the answer may be incomplete", { type: "malformed_stop_reason" }]], name);
     });
   }
-  // A stream with no message_delta at all reaches message_stop without any stop reason.
-  const noDelta = withoutReason.replace(/event: message_delta\n.*\n\n/, "");
+  // A non-empty stop reason Outright does not know still completes.
+  assert.deepEqual(anthropic.normalize({ type: "message_delta", delta: { stop_reason: "future_reason" }, usage: { output_tokens: 1 } }).map((event) => event.type), ["usage"]);
+  // A stream with no message_delta at all reaches message_stop without any
+  // stop reason. A Windows checkout may end the fixture's lines in CRLF.
+  const noDelta = withoutReason.replace(/event: message_delta\r?\n.*\r?\n\r?\n/, "");
+  assert.equal(noDelta.includes("message_delta"), false);
   await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(noDelta); }, async (base) => {
     const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
     assert.deepEqual([result.code, text(result), result.events.at(-1).payload.message], [1, "READY now", "Anthropic API stream ended without a stop reason; the answer may be incomplete"]);
@@ -391,8 +453,9 @@ test("a malformed stream event fails the run and keeps the text already streamed
   }
 });
 
-test("the direct runner stops reading the API while its consumer is stalled", { skip: process.platform === "win32" }, async () => {
-  // Pipes are synchronous on Linux, so only asynchronous stdout can buffer.
+test("the direct runner stops reading the API while its consumer is stalled", async () => {
+  // Pipes are synchronous on Linux and Windows, so only asynchronous stdout
+  // can buffer; either way the stalled consumer must hold the API stream back.
   const event = `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "x".repeat(60 * 1024) } })}\n\n`;
   const events = 512;
   let flushed = false;

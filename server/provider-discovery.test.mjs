@@ -5,6 +5,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import os from "node:os";
 import path from "node:path";
 import { createProviderDiscovery, defaultProbe } from "./provider-discovery.mjs";
+import { writeNodeCommand } from "../tests/fixtures/node-command.mjs";
 
 function probeProcessRunning(pid, inspect = spawnSync) {
   const result = inspect("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8", timeout: 1000 });
@@ -209,17 +210,18 @@ test("successful version checks also close their detached helper tree", { skip: 
   }
 });
 
-test("a harness version probe never receives a direct provider's credential", { skip: process.platform === "win32" }, async () => {
+test("a harness version probe never receives a direct provider's credential", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-env-"));
-  const executable = path.join(directory, "env-probe");
-  writeFileSync(executable, "#!/bin/sh\necho \"version ${OUTRIGHT_ANTHROPIC_API_KEY:-absent} ${OUTRIGHT_ANTHROPIC_BASE_URL:-absent} ${outright_anthropic_api_key:-absent} ${ANTHROPIC_API_KEY:-absent}\"\n");
-  chmodSync(executable, 0o755);
-  const variables = { OUTRIGHT_ANTHROPIC_API_KEY: "direct-key", OUTRIGHT_ANTHROPIC_BASE_URL: "https://direct.example", outright_anthropic_api_key: "direct-lower", ANTHROPIC_API_KEY: "harness-own-key" };
+  const names = ["OUTRIGHT_ANTHROPIC_API_KEY", "OUTRIGHT_ANTHROPIC_BASE_URL", "outright_anthropic_api_key", "ANTHROPIC_API_KEY"];
+  // A registered harness name on PATH, the only probe Windows accepts.
+  writeNodeCommand(directory, "codex", `console.log(["version", ...${JSON.stringify(names)}.map((name) => process.env[name] ?? "absent")].join(" "));\n`);
+  const variables = { OUTRIGHT_ANTHROPIC_API_KEY: "direct-key", OUTRIGHT_ANTHROPIC_BASE_URL: "https://direct.example", outright_anthropic_api_key: "direct-lower", ANTHROPIC_API_KEY: "harness-own-key",
+    PATH: `${directory}${path.delimiter}${process.env.PATH}` };
   const saved = Object.fromEntries(Object.keys(variables).map((name) => [name, process.env[name]]));
   Object.assign(process.env, variables);
   try {
     // Before the shared filter the probe inherited the runtime's whole environment.
-    assert.equal((await defaultProbe(executable)).trim(), "version absent absent absent harness-own-key");
+    assert.equal((await defaultProbe("codex")).trim(), "version absent absent absent harness-own-key");
   } finally {
     for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
     rmSync(directory, { recursive: true, force: true });

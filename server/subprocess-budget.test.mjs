@@ -55,15 +55,16 @@ test("Git and scanner share admission, reject bursts before spawn, and recover a
   } finally { rmSync(holdFile, { force: true }); rmSync(root, { recursive: true, force: true }); }
 });
 
-test("git utilities and the repository hooks they run never receive a direct provider's credential", { skip: process.platform === "win32" }, async () => {
+test("git utilities and the repository hooks they run never receive a direct provider's credential", async () => {
   const root = await realpath(mkdtempSync(path.join(os.tmpdir(), "outright-utility-env-")));
   const repository = path.join(root, "repo");
   const report = path.join(root, "hook-env");
   execFileSync("git", ["init", "-q", repository]);
   execFileSync("git", ["-C", repository, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "init"]);
-  // An agent with workspace-write can author a hook like this one.
+  // An agent with workspace-write can author a hook like this one. Git for
+  // Windows runs it with its own sh, which takes a forward-slash path.
   writeFileSync(path.join(repository, ".git", "hooks", "post-checkout"),
-    `#!/bin/sh\necho "\${OUTRIGHT_ANTHROPIC_API_KEY:-absent} \${OUTRIGHT_ANTHROPIC_BASE_URL:-absent} \${ANTHROPIC_API_KEY:-absent}" >> ${JSON.stringify(report)}\n`, { mode: 0o755 });
+    `#!/bin/sh\necho "\${OUTRIGHT_ANTHROPIC_API_KEY:-absent} \${OUTRIGHT_ANTHROPIC_BASE_URL:-absent} \${ANTHROPIC_API_KEY:-absent}" >> ${JSON.stringify(report.replaceAll(path.sep, "/"))}\n`, { mode: 0o755 });
   const direct = { OUTRIGHT_ANTHROPIC_API_KEY: "direct-key", OUTRIGHT_ANTHROPIC_BASE_URL: "https://direct.example" };
   const saved = Object.fromEntries(Object.keys(direct).map((name) => [name, process.env[name]]));
   Object.assign(process.env, direct);

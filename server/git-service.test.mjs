@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { access, chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -120,7 +120,7 @@ test("editor launch releases utility capacity when a GUI stays open and records 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("an editor and the worktree code it runs never receive a direct provider's credential", { skip: process.platform === "win32" }, async () => {
+test("an editor and the worktree code it runs never receive a direct provider's credential", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "outright-editor-env-"));
   const variables = { OUTRIGHT_ANTHROPIC_API_KEY: "direct-key", OUTRIGHT_ANTHROPIC_BASE_URL: "https://direct.example", outright_anthropic_api_key: "direct-lower",
     ANTHROPIC_API_KEY: "harness-own-key", PATH: `${root}${path.delimiter}${process.env.PATH}` };
@@ -128,8 +128,15 @@ test("an editor and the worktree code it runs never receive a direct provider's 
   try {
     const cwd = await realpath(root);
     const report = path.join(cwd, "editor-env.txt");
-    await writeFile(path.join(cwd, "code"), `#!/bin/sh\necho "\${OUTRIGHT_ANTHROPIC_API_KEY:-absent} \${OUTRIGHT_ANTHROPIC_BASE_URL:-absent} \${outright_anthropic_api_key:-absent} \${ANTHROPIC_API_KEY:-absent}" > ${JSON.stringify(report)}.tmp && mv ${JSON.stringify(report)}.tmp ${JSON.stringify(report)}\n`);
-    await chmod(path.join(cwd, "code"), 0o755);
+    // The editor is this Node under the editor's name, so the launcher spawns
+    // it directly on every platform; opening the worktree runs its index.js.
+    if (process.platform === "win32") await copyFile(process.execPath, path.join(cwd, "code.exe"));
+    else await symlink(process.execPath, path.join(cwd, "code"));
+    const names = ["OUTRIGHT_ANTHROPIC_API_KEY", "OUTRIGHT_ANTHROPIC_BASE_URL", "outright_anthropic_api_key", "ANTHROPIC_API_KEY"];
+    await writeFile(path.join(cwd, "index.js"), `const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(`${report}.tmp`)}, ${JSON.stringify(names)}.map((name) => process.env[name] ?? "absent").join(" "));
+fs.renameSync(${JSON.stringify(`${report}.tmp`)}, ${JSON.stringify(report)});
+`);
     Object.assign(process.env, variables);
     // The real default launcher; before, it inherited the runtime environment.
     const service = createGitService({ database: { getSettings: () => ({ editor: "code" }), auditAdmission() {}, auditCritical() {} },
@@ -144,7 +151,8 @@ test("an editor and the worktree code it runs never receive a direct provider's 
     assert.equal(observed?.trim(), "absent absent absent harness-own-key");
   } finally {
     for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
-    await rm(root, { recursive: true, force: true });
+    // Windows keeps a running executable's file locked until it exits.
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
