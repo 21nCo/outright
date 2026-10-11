@@ -1153,8 +1153,10 @@ test("space routes and their group aliases share data, payload shapes, and side 
       runtime.agents.resumeQueued = () => { wakeups += 1; };
       const bootstrap = await call("GET", "/api/bootstrap");
       assert.equal(bootstrap.statusCode, 200);
-      assert.deepEqual(bootstrap.body.projectGroups, { groups: bootstrap.body.spaces.spaces, memberships: bootstrap.body.spaces.memberships });
-      const seeded = (await assertEquivalent("bootstrap")).spaces.length;
+      const listed = await assertEquivalent("bootstrap");
+      assert.deepEqual(bootstrap.body.spaces, listed, "bootstrap spaces match /api/spaces");
+      assert.deepEqual(bootstrap.body.projectGroups, { groups: listed.spaces, memberships: listed.memberships });
+      const seeded = listed.spaces.length;
 
       const alpha = await call("POST", "/api/spaces", { name: "  Alpha  " });
       const beta = await call("POST", "/api/groups", { name: "Beta" });
@@ -1189,6 +1191,19 @@ test("space routes and their group aliases share data, payload shapes, and side 
       assert.ok(legacyMoved.body.groups);
       assert.equal(wakeups, 0, "assigning a project does not wake deferred work");
       await assertEquivalent("move");
+      // Malformed membership requests are refused without unassigning anything.
+      for (const [route, field, noun] of [["/api/space-memberships", "spaceId", "space"], ["/api/project-memberships", "groupId", "group"]]) {
+        for (const body of [null, [], {}, { [field]: null }, { projectId: "", [field]: null }, { projectId: 7, [field]: null }, { projectId: "p1" }, { projectId: "p1", [field]: "" }, { projectId: "p1", [field]: 7 }]) {
+          const invalid = await call("PUT", route, body);
+          assert.equal(invalid.statusCode, 400, `${route} ${JSON.stringify(body)}`);
+          assert.match(invalid.body.error, new RegExp(`Project id and ${noun} id are required`));
+        }
+        const unknown = await call("PUT", route, { projectId: "p1", [field]: "missing-space" });
+        assert.equal(unknown.statusCode, 404, `${route} unknown ${noun}`);
+        assert.match(unknown.body.error, new RegExp(`${noun} not found`, "i"));
+      }
+      assert.equal(wakeups, 0, "refused membership requests do not wake deferred work");
+      assert.deepEqual((await assertEquivalent("refused move")).memberships, { p1: alpha.body.id, p2: beta.body.id });
       await call("PUT", "/api/space-memberships", { projectId: "p2", spaceId: null });
       await call("PUT", "/api/project-memberships", { projectId: "p1", groupId: null });
       assert.equal(wakeups, 2, "unassigning through either route wakes deferred work");

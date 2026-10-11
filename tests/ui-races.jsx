@@ -4913,14 +4913,57 @@ async function spaceSidebarRegression() {
     return response({});
   };
 
-  // A bootstrap from an older runtime carries only the projectGroups alias.
+  const moveTo = async (projectName, target) => {
+    host.querySelector(`[aria-label="Project options for ${projectName}"]`).click();
+    await until(() => [...document.querySelectorAll('[role="menuitem"]')].some((item) => item.textContent === target), `${target} menu item`);
+    const menu = document.querySelector('[role="menu"]');
+    [...menu.querySelectorAll('[role="menuitem"]')].find((item) => item.textContent === target).click();
+    return menu;
+  };
+
+  // A bootstrap from an older runtime carries only the projectGroups alias,
+  // and that runtime serves only the group routes and payloads.
   root.render(null);
   await settle();
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
-  route = fixtureRoute({ projectGroups: { groups: [{ id: "legacy", name: "Legacy space" }], memberships: { A: "legacy" } } });
+  let legacy = { groups: [{ id: "legacy", name: "Legacy space", position: 0 }], memberships: { A: "legacy" } };
+  const legacyRequests = [];
+  route = fixtureRoute({ projectGroups: legacy }, async (url, options) => {
+    if (/^\/api\/(?:spaces|space-memberships)/.test(url.pathname)) return response({ error: "Unknown API route" }, 404);
+    if (url.pathname === "/api/groups" && options.method === "POST") {
+      const body = JSON.parse(options.body);
+      legacyRequests.push(["create", body]);
+      const created = { id: "legacy-2", name: body.name.trim(), position: 1 };
+      legacy = { ...legacy, groups: [...legacy.groups, created] };
+      return response(created, 201);
+    }
+    if (url.pathname === "/api/groups") return response(legacy);
+    if (url.pathname === "/api/project-memberships" && options.method === "PUT") {
+      const body = JSON.parse(options.body);
+      legacyRequests.push(["move", body]);
+      const { [body.projectId]: _previous, ...memberships } = legacy.memberships;
+      legacy = { ...legacy, memberships: body.groupId ? { ...memberships, [body.projectId]: body.groupId } : memberships };
+      return response(legacy);
+    }
+    return null;
+  });
   root.render(<TooltipProvider><App /></TooltipProvider>);
   await until(() => headings().length === 2, "legacy alias sidebar");
   assert(headings().join() === "Legacy space:1,Ungrouped:1", `Legacy alias sidebar: ${headings()}`);
+  host.querySelector('[aria-label="New space"]').click();
+  await until(() => document.querySelector("#space-name"), "legacy new space dialog");
+  setControlValue(document.querySelector("#space-name"), "Legacy launches");
+  await settle();
+  [...document.querySelector('[role="dialog"]').querySelectorAll("button")].find((button) => button.textContent === "Create space").click();
+  await until(() => headings().join() === "Legacy space:1,Legacy launches:0,Ungrouped:1", "legacy created space");
+  await until(() => host.querySelector(".toast")?.textContent === "Space created", "legacy create toast");
+  await moveTo("Review B", "Legacy launches");
+  await until(() => headings().join() === "Legacy space:1,Legacy launches:1", "legacy moved project");
+  await moveTo("Review A", "Ungrouped");
+  await until(() => headings().join() === "Legacy space:0,Legacy launches:1,Ungrouped:1", "legacy unassigned project");
+  assert(JSON.stringify(legacyRequests) === JSON.stringify([["create", { name: "Legacy launches" }], ["move", { projectId: "B", groupId: "legacy-2" }], ["move", { projectId: "A", groupId: null }]]),
+    `Legacy requests: ${JSON.stringify(legacyRequests)}`);
+  assert(!host.querySelector(".error-toast"), `Legacy sidebar showed an error: ${host.querySelector(".error-toast")?.textContent}`);
 
   root.render(null);
   await until(() => !host.querySelector(".space-heading"), "legacy alias sidebar unmounted");
@@ -4972,12 +5015,9 @@ async function spaceSidebarRegression() {
   assert(JSON.stringify(requests[0]) === JSON.stringify(["create", { name: "  Launches  " }]), `Create request: ${JSON.stringify(requests)}`);
   assert(host.querySelector(".toast")?.textContent === "Space created", "Create toast is not Space created");
 
-  host.querySelector('[aria-label="Project options for Review B"]').click();
-  await until(() => [...document.querySelectorAll('[role="menuitem"]')].some((item) => item.textContent === "Launches"), "move to space menu");
-  const menu = document.querySelector('[role="menu"]');
+  const menu = await moveTo("Review B", "Launches");
   assert(menu.textContent.includes("Move to space"), "Project menu is not labeled Move to space");
   assertNoGroupCopy(menu.textContent, "Project menu");
-  [...menu.querySelectorAll('[role="menuitem"]')].find((item) => item.textContent === "Launches").click();
   await until(() => headings().join() === "Fixture space:1,Launches:1", "moved project into its space");
   assert(JSON.stringify(requests[1]) === JSON.stringify(["move", { projectId: "B", spaceId: "space-2" }]), `Move request: ${JSON.stringify(requests)}`);
   await until(() => host.querySelector(".toast")?.textContent === "Space updated", "move toast");

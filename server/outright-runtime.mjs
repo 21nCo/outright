@@ -455,7 +455,15 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       }
       if (["/api/space-memberships", "/api/project-memberships"].includes(url.pathname) && request.method === "PUT") {
         const body = await readJson(request);
-        const spaceId = legacyGroups ? body.groupId : body.spaceId;
+        const field = legacyGroups ? "groupId" : "spaceId";
+        const noun = legacyGroups ? "group" : "space";
+        // Unassigning needs an explicit null; an omitted id must not delete the membership.
+        if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.projectId !== "string" || !body.projectId
+          || !Object.hasOwn(body, field) || (body[field] !== null && (typeof body[field] !== "string" || !body[field]))) {
+          throw apiError(400, `Project id and ${noun} id are required`);
+        }
+        const spaceId = body[field];
+        if (spaceId && !database.listSpaces().spaces.some((space) => space.id === spaceId)) throw apiError(404, `${legacyGroups ? "Group" : "Space"} not found`);
         database.setProjectSpace(body.projectId, spaceId);
         if (!spaceId) agents.resumeQueued();
         return json(response, 200, spaceListing());
