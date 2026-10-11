@@ -53,3 +53,21 @@ export function modelMismatch(providers, draft, chosenFor) {
   if (!target || target.models?.includes(draft.model)) return "";
   return `The model “${draft.model}” was chosen for ${source?.label ?? chosenFor}; choose a ${target.label} model or clear it to use the provider default before saving.`;
 }
+
+// A dialog may switch only to a ready provider. The provider it opened on
+// stays saveable, so a title or move edit still works while that provider is
+// unready; the runtime refuses to run it either way. Readiness is read at
+// render, so a provider that stops being ready while the dialog is open
+// blocks saving until it is ready again.
+export function providerSwitchProblem(providers, draft, openedProvider) {
+  if (draft.provider === openedProvider) return "";
+  const target = providers.find((item) => item.id === draft.provider);
+  if (providerReady(target)) return "";
+  return `${target?.label ?? draft.provider} is ${unreadyState(target)}; choose a ready provider before saving.`;
+}
+
+function unreadyState(provider) {
+  if (!provider) return "not supported by this Outright runtime";
+  if (provider.checking) return "still being checked";
+  return provider.available ? "an unsupported version" : "unavailable";
+}

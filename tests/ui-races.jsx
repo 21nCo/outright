@@ -451,6 +451,96 @@ async function providerSwitchChoicesRegression() {
   assert(runs[0].provider === "anthropic-api" && runs[0].model === "", `The run inherited another provider's default model: ${JSON.stringify(runs[0])}`);
 }
 
+async function providerReadinessSelectionRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const provider = (id, label, state) => ({ id, label, kind: "harness", version: "9.9.9", available: state === "ready" || state === "incompatible",
+    compatible: state === "ready", checking: state === "checking", capabilities: { permissionModes: ["read-only", "workspace-write", "danger-full-access"], reasoningEfforts: ["low", "medium", "high", "xhigh"], resume: true } });
+  const snapshot = (pi) => [provider("codex", "Codex", "ready"), provider("claude", "Claude Code", "unavailable"),
+    provider("anthropic-api", "Anthropic API", "incompatible"), provider("hermes", "Hermes", "checking"), provider("pi", "Pi", pi)];
+  const unready = { claude: "Claude Code is unavailable", "anthropic-api": "Anthropic API is an unsupported version", hermes: "Hermes is still being checked", gone: "gone is not supported" };
+  let chat = { ...chats.A, model: "" };
+  let piState = "ready";
+  const patches = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: snapshot(piState), templates: [], trustedProjects: [] });
+    // Hermes stays checking, so the app keeps polling this snapshot.
+    if (url.pathname === "/api/providers") return response({ providers: snapshot(piState) });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chat] });
+    if (url.pathname === "/api/conversations/chat-A" && options.method === "PATCH") { patches.push(JSON.parse(options.body)); chat = { ...chat, ...patches.at(-1) }; return response(chat); }
+    if (url.pathname === "/api/conversations/chat-A") return response(chat);
+    return response({});
+  };
+  const socketCount = fixtureSockets.length;
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.conversation-header h1')?.textContent === chats.A.title && fixtureSockets.length > socketCount, "readiness fixture loaded");
+  const publish = (pi) => { piState = pi; fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "providers.changed", payload: { providers: snapshot(pi) } }) })); };
+  const select = () => document.querySelector('#chat-settings-provider');
+  const status = () => document.querySelector('#chat-settings-provider-status').textContent;
+  const save = () => [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Save");
+  const blocked = (reason) => save().disabled && status().includes(reason) && select().getAttribute("aria-invalid") === "true";
+  host.querySelector('.conversation-meta button').click();
+  await until(() => select()?.value === "codex", "chat settings opened");
+  const disabled = () => [...select().options].filter((option) => option.disabled).map((option) => option.value).join(",");
+  assert(disabled() === "claude,anthropic-api,hermes", `Unready providers were selectable: ${disabled()}`);
+  // Before, an unready provider with no model saved and left the chat unable to run.
+  for (const [id, reason] of Object.entries(unready)) {
+    if (id === "gone") select().append(new Option("gone", "gone"));
+    chooseOption(select(), id);
+    await until(() => blocked(reason), `a switch to ${id} blocks Save`);
+    select().closest("form").requestSubmit();
+    await settle();
+    assert(patches.length === 0, `An unready provider was saved: ${JSON.stringify(patches)}`);
+  }
+  chooseOption(select(), "pi");
+  await until(() => !save().disabled && !select().hasAttribute("aria-invalid"), "a ready provider is saveable");
+  publish("unavailable");
+  await until(() => blocked("Pi is unavailable"), "a provider that stops being ready while open blocks Save");
+  publish("ready");
+  await until(() => !save().disabled && !status().includes("choose a ready provider"), "a provider that is ready again is saveable");
+  save().click();
+  await until(() => patches.length === 1, "ready provider saved");
+  assert(patches[0].provider === "pi" && patches[0].model === "", `Unexpected chat patch: ${JSON.stringify(patches[0])}`);
+  await until(() => !select(), "chat settings closed");
+  // The opened provider stays saveable while unready, so unrelated edits still work.
+  publish("unavailable");
+  host.querySelector('.conversation-meta button').click();
+  await until(() => select()?.value === "pi", "chat settings reopened");
+  assert(!select().querySelector('option[value="pi"]').disabled && !save().disabled && !select().hasAttribute("aria-invalid"), "the unready current provider blocked an unrelated edit");
+  setControlValue(document.querySelector('#chat-settings-title'), "Renamed while unready");
+  save().click();
+  await until(() => patches.length === 2, "title saved on an unready provider");
+  assert(patches[1].title === "Renamed while unready" && patches[1].provider === "pi" && !("providerSessionId" in patches[1]), `Unexpected title patch: ${JSON.stringify(patches[1])}`);
+
+  // Settings applies the same rule to the default provider.
+  root.render(null);
+  await settle();
+  const initial = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
+    editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
+  route = async (url, options) => {
+    if (url.pathname === "/api/settings" && options.method === "PATCH") { patches.push(JSON.parse(options.body)); return response({ ...initial, ...patches.at(-1) }); }
+    return response({});
+  };
+  const settings = (pi) => root.render(<TooltipProvider><SettingsDialog open onOpenChange={() => {}} settings={initial} providers={snapshot(pi)} templates={[]} onSaved={() => {}} onError={(error) => { throw error; }} /></TooltipProvider>);
+  settings("ready");
+  const control = () => [...document.querySelectorAll('[role="dialog"] .setting-row')].find((row) => row.textContent.startsWith("Default provider"))?.querySelector("select");
+  const settingsSave = () => [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent.includes("Save settings"));
+  const settingsStatus = () => document.querySelector("#default-provider-status").textContent;
+  await until(() => control()?.value === "codex", "provider settings opened");
+  chooseOption(control(), "pi");
+  await until(() => !settingsSave().disabled, "a ready default provider is saveable");
+  settings("unavailable");
+  await until(() => settingsSave().disabled && settingsStatus().includes("Pi is unavailable") && control().getAttribute("aria-invalid") === "true", "a default provider that stops being ready blocks Save");
+  // Comparing with the draft kept the selected unready provider enabled.
+  assert(control().querySelector('option[value="pi"]').disabled && !control().querySelector('option[value="codex"]').disabled, "options were not compared with the opened provider");
+  settings("ready");
+  await until(() => !settingsSave().disabled && !control().hasAttribute("aria-invalid"), "a ready default provider is saveable again");
+  settingsSave().click();
+  await until(() => patches.length === 3, "default provider saved");
+  assert(patches[2].provider === "pi" && Object.keys(patches[2]).length === 1, `Unexpected settings patch: ${JSON.stringify(patches[2])}`);
+}
+
 async function recoveryModelCorrectionRegression() {
   root.render(null);
   await settle();
@@ -5719,6 +5809,7 @@ try {
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
     ["chat settings session edit", chatSettingsSessionEditRegression, "conversation settings send the session only when the user edits it"],
     ["provider switch choices", providerSwitchChoicesRegression, "a provider switch keeps every other choice and blocks Save until unsupported ones are replaced"],
+    ["provider readiness selection", providerReadinessSelectionRegression, "a dialog switches only to a ready provider and keeps its opened provider saveable"],
     ["recovery model correction", recoveryModelCorrectionRegression, "a legacy model is replaced with the provider default only after an explicit confirmation"],
     ["settings retention draft", settingsRetentionDraftRegression, "missing archived data stays safe and cancel, cleanup and save use the persisted retention age"],
     ["settings save session fence", settingsSaveSessionFenceRegression, "delayed GET and PATCH save completions cannot change a reopened Settings dialog"],

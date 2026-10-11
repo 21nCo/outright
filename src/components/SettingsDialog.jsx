@@ -3,7 +3,7 @@ import { Bell, Brain, Code, ShieldCheck, Trash } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { APPROVAL_POLICY_OPTIONS, modelMismatch, providerOptionLabel, providerReady, providerStatusText, reasoningOptions, supportsPolicy, unsupportedChoices } from "@/lib/providers";
+import { APPROVAL_POLICY_OPTIONS, modelMismatch, providerOptionLabel, providerReady, providerStatusText, providerSwitchProblem, reasoningOptions, supportsPolicy, unsupportedChoices } from "@/lib/providers";
 import { api } from "@/lib/runtime-api";
 
 export function SettingsDialog({ open, onOpenChange, settings, providers, templates, runtimeEvent, onSaved, onError }) {
@@ -207,12 +207,14 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
   }
   const selectedProvider = providers.find((provider) => provider.id === draft.provider);
   const modelProblem = modelMismatch(providers, draft, modelChosenFor);
-  const executionProblem = [unsupportedChoices(selectedProvider, draft), modelProblem].filter(Boolean).join(" ");
+  const openedProvider = openedSettingsRef.current.provider;
+  const switchProblem = providerSwitchProblem(providers, draft, openedProvider);
+  const executionProblem = [switchProblem, unsupportedChoices(selectedProvider, draft), modelProblem].filter(Boolean).join(" ");
   const efforts = reasoningOptions(selectedProvider);
   // Each control the status blames is marked invalid and points at it.
   const problemProps = (invalid) => invalid ? { "aria-invalid": true, "aria-describedby": "default-provider-status" } : {};
   return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent className="settings-dialog"><DialogHeader><DialogTitle>Outright settings</DialogTitle><DialogDescription>Defaults for new conversations and local execution.</DialogDescription></DialogHeader><div className="settings-grid">
-    <Setting icon={Brain} label="Default provider"><select value={draft.provider} aria-describedby="default-provider-status" onChange={(event) => setDraft({ ...draft, provider: event.target.value })}>{providers.map((provider) => <option key={provider.id} value={provider.id} disabled={!providerReady(provider) && provider.id !== draft.provider}>{providerOptionLabel(provider)}</option>)}</select></Setting>
+    <Setting icon={Brain} label="Default provider"><select value={draft.provider} aria-describedby="default-provider-status" {...problemProps(Boolean(switchProblem))} onChange={(event) => setDraft({ ...draft, provider: event.target.value })}>{providers.map((provider) => <option key={provider.id} value={provider.id} disabled={!providerReady(provider) && provider.id !== openedProvider}>{providerOptionLabel(provider)}</option>)}</select></Setting>
     <Setting icon={Brain} label="Default model"><Input value={draft.model ?? ""} list="default-provider-models" {...problemProps(Boolean(modelProblem))} onChange={(event) => { setDraft({ ...draft, model: event.target.value }); setModelChosenFor(draft.provider); }} placeholder="Provider default" /><datalist id="default-provider-models">{(selectedProvider?.models ?? []).map((model) => <option key={model} value={model} />)}</datalist></Setting>
     <p id="default-provider-status" className="provider-status" role="status" aria-live="polite">{providerStatusText(selectedProvider)}{executionProblem && ` ${executionProblem}`}</p>
     <Setting icon={ShieldCheck} label="Approval policy"><select value={draft.approvalPolicy} {...problemProps(!supportsPolicy(selectedProvider, draft.approvalPolicy))} onChange={(event) => setDraft({ ...draft, approvalPolicy: event.target.value })}>{APPROVAL_POLICY_OPTIONS.map(({ value, label }) => <option key={value} value={value} disabled={!supportsPolicy(selectedProvider, value)}>{label}{supportsPolicy(selectedProvider, value) ? "" : " (not supported)"}</option>)}</select></Setting>

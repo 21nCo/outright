@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { domId, nextTabIndex } from "../src/lib/accessibility.js";
-import { modelMismatch, providerOptionLabel, providerStatusText, supportsPolicy, unsupportedChoices } from "../src/lib/providers.js";
+import { modelMismatch, providerOptionLabel, providerStatusText, providerSwitchProblem, supportsPolicy, unsupportedChoices } from "../src/lib/providers.js";
 
 const root = new URL("../", import.meta.url);
 
@@ -81,6 +81,15 @@ test("provider controls explain readiness and only offer supported choices", asy
     [{ provider: "claude", model: "" }, "codex"], [{ provider: "claude", model: "opus" }, "codex"], [{ provider: "anthropic-api", model: "claude-opus-5-5" }, "claude"],
     [{ provider: "codex", model: "gpt-5.4" }, "codex"]]) {
     assert.equal(modelMismatch(providers, next, chosenFor), "", JSON.stringify(next));
+  }
+  // A dialog switches only to a ready provider; the one it opened on stays saveable in any state.
+  const states = [{ ...codex, available: true, compatible: true }, { ...claude, available: false, compatible: false },
+    { ...anthropic, compatible: false }, { id: "hermes", label: "Hermes", available: false, compatible: false, checking: true }];
+  for (const opened of states) assert.equal(providerSwitchProblem(states, { provider: opened.id }, opened.id), "", opened.id);
+  assert.equal(providerSwitchProblem(states, { provider: "codex" }, "claude"), "");
+  for (const [target, reason] of [["claude", "Claude Code is unavailable"], ["anthropic-api", "Anthropic API is an unsupported version"],
+    ["hermes", "Hermes is still being checked"], ["gone", "gone is not supported by this Outright runtime"]]) {
+    assert.equal(providerSwitchProblem(states, { provider: target, model: "" }, "codex"), `${reason}; choose a ready provider before saving.`);
   }
   const [app, settings] = await Promise.all([readFile(new URL("src/App.jsx", root), "utf8"), readFile(new URL("src/components/SettingsDialog.jsx", root), "utf8")]);
   assert.match(settings, /aria-describedby="default-provider-status"/);
