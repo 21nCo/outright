@@ -1,0 +1,39 @@
+server/execution-adapters.test.mjs
+  s_1900bb15a7199a::t_054045bc6f3e54 200,202,204,304-305,366-403
+server/execution-adapters/anthropic-api-runner.mjs
+  s_1900bb15a7199a::t_e19521e1e3f329 56-57,60-61,70-71,153,183-185,189,196,198,200,229,233-234
+server/outright-runtime.test.mjs
+  s_1900bb15a7199a::t_818fdc0cde6731 1420,1452,1645-1647,1681-1686,1697,1704,2645
+server/provider-discovery.mjs
+  s_1900bb15a7199a::t_0b157a9d2613bd 52-55
+server/provider-discovery.test.mjs
+  s_1900bb15a7199a::t_8c888eed53a207 4,213-227
+src/App.jsx
+  s_1900bb15a7199a::t_f23950c8d65fe4 105,1349,1820,1867,1939
+src/components/SettingsDialog.jsx
+  s_1900bb15a7199a::t_f00a282043f190 33-36,209,216
+src/lib/providers.js
+  s_1900bb15a7199a::t_8bdffb849d061b 46-51,54
+tests/fixtures/node-command.mjs
+  s_1900bb15a7199a::t_319c05967f65ed 6-11,17,21
+tests/ui-accessibility.test.mjs
+  s_1900bb15a7199a::t_af9b913ec382c2 71-74,76,78-83
+tests/ui-races.jsx
+  s_1900bb15a7199a::t_423ca0ae5b2814 372-381,420-430
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "46874552903b9fa6270c3a67a55033c0dd5a0619",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
