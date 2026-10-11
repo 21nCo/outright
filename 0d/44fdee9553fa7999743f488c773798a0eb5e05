@@ -1,0 +1,37 @@
+.gitattributes
+  s_1900bb15a7199a::t_af349ad4eb0e65 1-2
+docs/out-3-execution-adapters.md
+  s_1900bb15a7199a::t_8539595a57bc62 40
+server/execution-adapters.test.mjs
+  s_1900bb15a7199a::t_261959d980fcc0 282-291,297-310,312-321,324-326,328,330-358,366-367,378-383,456-458
+server/execution-adapters/anthropic-api-runner.mjs
+  s_1900bb15a7199a::t_45075006ecbd90 15-55,57-59,68-69,123,151,153-154,176,180-184,187-192,194,214,218-220,222-226
+server/execution-adapters/anthropic-api.mjs
+  s_1900bb15a7199a::t_84e0d31d4b3f65 58-62,73
+server/git-service.test.mjs
+  s_1900bb15a7199a::t_a733b7cb4280d0 4,123,131-139,154-155
+server/outright-runtime.test.mjs
+  s_1900bb15a7199a::t_72cb30fff6de30 8,19,1146-1147,1150-1151,1169,1176-1177,1194-1197,1470,1492,1527,1533,1546,1572,1581,1594,1629,1633,1638-1646,1670-1679
+server/provider-discovery.test.mjs
+  s_1900bb15a7199a::t_267a23c6926475 8,213,215-219,224
+server/subprocess-budget.test.mjs
+  s_1900bb15a7199a::t_99e95f620f4ecd 58,64-65,67
+tests/fixtures/node-command.mjs
+  s_1900bb15a7199a::t_a68a07208b6248 1-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0d44fdee9553fa7999743f488c773798a0eb5e05",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
