@@ -243,6 +243,23 @@ test("a harness version probe never receives a direct provider's credential", as
   }
 });
 
+test("a failed version probe reports the end of its output within a bound", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-failure-"));
+  // A registered harness name on PATH, the only probe Windows accepts.
+  writeNodeCommand(directory, "codex", 'process.stderr.write(`${"x".repeat(5000)}\\nunsupported\\tflag\\n`); process.exit(3);\n');
+  const saved = process.env.PATH;
+  process.env.PATH = `${directory}${path.delimiter}${saved}`;
+  try {
+    // Before, only the exit code was reported, so a Windows CI failure could not say why.
+    const error = await defaultProbe("codex").then(() => null, (failure) => failure);
+    assert.match(error?.message, /^Provider version check exited 3: codex \(\.\.\.x+ unsupported flag\)$/);
+    assert.ok(error.message.length < 460, "the excerpt is bounded");
+  } finally {
+    process.env.PATH = saved;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("a new-session helper cannot survive a completed provider probe", { skip: process.platform === "win32" }, async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-session-"));
   const executable = path.join(directory, "session-probe");

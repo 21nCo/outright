@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { ADAPTER_CONTRACT_VERSION, defineAdapter, NORMALIZED_EVENT_TYPES, validateRunConfiguration } from "./execution-adapters/contract.mjs";
 import { buildExecutionLaunch, describeAdapter, EXECUTION_ADAPTERS, findExecutionAdapter, validateExecutionConfiguration, versionCompatibility } from "./execution-adapters/index.mjs";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
+import { ENDPOINT_REQUIREMENT } from "./execution-adapters/anthropic-api-runner.mjs";
 
 const fixtures = new URL("../tests/fixtures/execution-adapters/", import.meta.url);
 const fixture = (adapter, name) => readFileSync(new URL(`${adapter}/${name}`, fixtures), "utf8");
@@ -299,8 +300,8 @@ test("a recognized Anthropic text delta without text fails the run instead of dr
 // A key with characters JSON escapes, so a nested reflection differs from it.
 const reflectedKey = 'fixture-"reflected"\\direct-key';
 // Every form of the key a reader could recover by decoding once or more.
-const keyForms = [reflectedKey, JSON.stringify(reflectedKey).slice(1, -1), JSON.stringify(JSON.stringify(reflectedKey)).slice(1, -1)];
-function assertNoKey(result, label) {
+const formsOf = (key) => [key, JSON.stringify(key).slice(1, -1), JSON.stringify(JSON.stringify(key)).slice(1, -1)];
+function assertNoKey(result, label, keyForms = formsOf(reflectedKey)) {
   // The manager persists stderr as process events and as a fallback run error.
   const strings = [result.stdout, result.stderr, result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join("")];
   const collect = (value) => {
@@ -439,6 +440,24 @@ test("the direct provider never forwards its key across a redirect", async () =>
       });
     }
     assert.equal(followed.length, 0, "the cross-origin hop never received the key");
+  });
+});
+
+test("the runner's own failure messages are redacted once the key is read", async () => {
+  // Each key is text its exit writes itself, so a call site that skipped
+  // redaction would print it.
+  const closed = await new Promise((resolve) => { const server = createServer(); server.listen(0, "127.0.0.1", () => { const { port } = server.address(); server.close(() => resolve(port)); }); });
+  await withApiFixture((response) => { response.writeHead(307, { location: "/elsewhere" }); response.end(); }, async (redirecting) => {
+    for (const [name, key, base, code, message] of [
+      ["fetch rejection", "ECONNREFUSED", `http://127.0.0.1:${closed}`, 1, "Anthropic API request failed: [redacted]"],
+      ["redirect", "HTTP 307", redirecting, 1, "Anthropic API redirected the request ([redacted]); Outright does not forward credentials across redirects"],
+      ["unusable endpoint", "loopback http address", "http://example.com", 2, ENDPOINT_REQUIREMENT.replace("loopback http address", "[redacted]")],
+    ]) {
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: key, OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      // Before, these three exits wrote their message without redaction.
+      assertNoKey(result, name, formsOf(key));
+      assert.deepEqual([result.code, result.events.at(-1).payload.message], [code, message], name);
+    }
   });
 });
 

@@ -65,6 +65,13 @@ export function probeCommand(id, providerPath) {
   return { executable: supervisor, args: [handshakePath, providerPath, "--version"], cleanupPath: handshakePath, stdio: ["pipe", "pipe", "pipe", "pipe"], env };
 }
 
+// A failed probe says why within a bound: the end of its stderr, or of its
+// stdout when stderr is empty. Its environment holds no direct-provider key.
+function probeOutputExcerpt(stdout, stderr) {
+  const text = (stderr.length ? stderr : stdout).toString("utf8").replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  return text ? ` (${text.length > 400 ? `...${text.slice(-400)}` : text})` : "";
+}
+
 // A detached child leaves its parent's process group but remains in the
 // parent's tree. Inspect that tree while the owner is still alive, then kill
 // descendants before the owner so a forced shutdown cannot orphan a helper.
@@ -296,7 +303,7 @@ export async function defaultProbe(id, { signal, resolveExecutable = providerExe
       let artifactError;
       try { if (command.cleanupPath && terminationError?.code !== "OUTRIGHT_PROBE_CLEANUP_UNCERTAIN") rmSync(command.cleanupPath, { force: true }); }
       catch (error) { artifactError = error; }
-      settle(terminationError ?? spawnError ?? artifactError ?? (code === 0 ? null : new Error(`Provider version check exited ${code ?? childSignal}: ${id}`)), (stdout.length ? stdout : stderr).toString("utf8"));
+      settle(terminationError ?? spawnError ?? artifactError ?? (code === 0 ? null : new Error(`Provider version check exited ${code ?? childSignal}: ${id}${probeOutputExcerpt(stdout, stderr)}`)), (stdout.length ? stdout : stderr).toString("utf8"));
     });
     const terminateTree = (hard = false) => {
       // Let the native owner reap its tree. Killing the owner first can leave

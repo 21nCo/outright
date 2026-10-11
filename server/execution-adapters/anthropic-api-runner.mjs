@@ -53,23 +53,30 @@ function textRedactor(forms) {
   };
 }
 
-// The only way a record leaves the runner. Once the key is known every
-// record, synthetic ones included, is redacted here before serialization.
-// The manager may stop reading; wait for it instead of buffering the whole
-// stream in this process.
-function write(record, forms = []) {
-  if (process.stdout.write(`${JSON.stringify(redact(record, forms))}\n`)) return undefined;
-  return new Promise((resolve) => {
-    const done = () => { process.stdout.off("drain", done); process.stdout.off("close", done); process.stdout.off("error", done); resolve(); };
-    process.stdout.on("drain", done);
-    process.stdout.once("close", done);
-    process.stdout.once("error", done);
-  });
-}
-
-async function fail(type, message, code = 1, forms = []) {
-  await write({ type: "error", error: { type, message } }, forms);
-  process.exitCode = code;
+// The only way a record leaves the runner. protect() binds the key's forms
+// as soon as the key is read; from then on every record, synthetic ones
+// included, is redacted here before serialization and no call site can omit
+// it. The manager may stop reading; wait for it instead of buffering the
+// whole stream in this process.
+function createOutput() {
+  let forms = [];
+  const write = (record) => {
+    if (process.stdout.write(`${JSON.stringify(redact(record, forms))}\n`)) return undefined;
+    return new Promise((resolve) => {
+      const done = () => { process.stdout.off("drain", done); process.stdout.off("close", done); process.stdout.off("error", done); resolve(); };
+      process.stdout.on("drain", done);
+      process.stdout.once("close", done);
+      process.stdout.once("error", done);
+    });
+  };
+  return {
+    protect(secret) { forms = secretForms(secret); return forms; },
+    write,
+    async fail(type, message, code = 1) {
+      await write({ type: "error", error: { type, message } });
+      process.exitCode = code;
+    },
+  };
 }
 
 function parseArguments(argv) {
@@ -116,13 +123,21 @@ async function readBounded(body, limit) {
 }
 
 export async function run(argv = process.argv.slice(2), environment = process.env) {
+  const output = createOutput();
+  // An unexpected error's text, which Node would print to stderr, may quote
+  // the key; only a fixed message leaves through the redacting writer.
+  try { await execute(argv, environment, output); }
+  catch { await output.fail("api_error", "Anthropic API runner failed unexpectedly"); }
+}
+
+async function execute(argv, environment, { protect, write, fail }) {
   const request = parseArguments(argv);
   if (!request) return fail("invalid_request_error", "Usage: anthropic-api-runner --model <model> -- <prompt>", 2);
   const apiKey = environment.OUTRIGHT_ANTHROPIC_API_KEY;
   if (!apiKey) return fail("authentication_error", "OUTRIGHT_ANTHROPIC_API_KEY is not set", 2);
+  const forms = protect(apiKey);
   const url = anthropicEndpoint(environment);
   if (!url) return fail("invalid_request_error", ENDPOINT_REQUIREMENT, 2);
-  const forms = secretForms(apiKey);
   let response;
   try {
     response = await fetch(url, {
@@ -150,7 +165,7 @@ export async function run(argv = process.argv.slice(2), environment = process.en
       if (typeof parsed?.error?.message === "string") message = parsed.error.message;
       if (typeof parsed?.error?.type === "string") type = parsed.error.type;
     } catch { /* Keep the status summary. */ }
-    return fail(type, message, 1, forms);
+    return fail(type, message);
   }
   const text = textRedactor(forms);
   let textIndex = 0;
@@ -186,18 +201,18 @@ export async function run(argv = process.argv.slice(2), environment = process.en
       textIndex = event.index;
       event = { ...event, delta: { ...event.delta, text: text.push(event.delta.text) } };
     }
-    await write(event, forms);
+    await write(event);
     return true;
   };
   // Every exit releases the held text before its final record, so the
   // answer keeps everything that was not the key.
   const release = async () => {
     const rest = text.flush();
-    if (rest) await write({ type: "content_block_delta", index: textIndex, delta: { type: "text_delta", text: rest } }, forms);
+    if (rest) await write({ type: "content_block_delta", index: textIndex, delta: { type: "text_delta", text: rest } });
   };
-  const malformedEvent = () => fail("api_error", "Anthropic API sent a malformed stream event", 1, forms);
+  const malformedEvent = () => fail("api_error", "Anthropic API sent a malformed stream event");
   // Leaving the read loop cancels the response body.
-  const overflow = () => fail("api_error", "Anthropic API stream event exceeded 1 MiB", 1, forms);
+  const overflow = () => fail("api_error", "Anthropic API stream event exceeded 1 MiB");
   // SSE lines end in CRLF, LF or CR. A CR that ends a chunk may be the first
   // half of a CRLF, so it waits for the next chunk unless the stream ended.
   // Returns the failure to report, if any.
@@ -226,12 +241,12 @@ export async function run(argv = process.argv.slice(2), environment = process.en
     }
     failure ??= await readLines(true);
     if (!failure && !(await dispatch())) failure = malformedEvent;
-  } catch (error) { failure = () => fail("network_error", `Anthropic API stream failed: ${networkCode(error)}`, 1, forms); }
+  } catch (error) { failure = () => fail("network_error", `Anthropic API stream failed: ${networkCode(error)}`); }
   await release();
   if (failure) return failure();
   if (errored) process.exitCode = 1;
-  else if (!stopped) await fail("api_error", "Anthropic API stream ended before message_stop", 1, forms);
-  else if (!delta) await fail("api_error", "Anthropic API stream ended without a stop reason; the answer may be incomplete", 1, forms);
+  else if (!stopped) await fail("api_error", "Anthropic API stream ended before message_stop");
+  else if (!delta) await fail("api_error", "Anthropic API stream ended without a stop reason; the answer may be incomplete");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await run();
