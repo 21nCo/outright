@@ -2170,19 +2170,27 @@ test("retention during a pending task backfill leaves no task without its conver
   try {
     let database = createOutrightDatabase({ filename });
     let doomed;
+    let oversized;
     let vanished;
+    let oversizedMessage;
     try {
       doomed = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Doomed", provider: "codex" });
+      oversized = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Oversized", provider: "codex" });
       vanished = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Vanished", provider: "codex" });
       database.addMessage({ conversationId: doomed.id, role: "user", body: "remove me" });
+      oversizedMessage = database.addMessage({ conversationId: oversized.id, role: "user", body: "grow me" });
       database.updateConversation(doomed.id, { archived: true });
+      database.updateConversation(oversized.id, { archived: true });
       for (let index = 0; index < 70; index += 1) {
         database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: `Chat ${index}`, provider: "codex" });
       }
     } finally { database.close(); }
     seedPreTaskStore(filename);
+    const grow = new Database(filename);
+    try { grow.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), oversizedMessage.id); } finally { grow.close(); }
     // Hold the backfill after its first batch, so deletion runs while the
-    // legacy table is still in place.
+    // legacy table is still in place. The oversized row takes the shadow
+    // worker, which removes the backfilled task by its conversation id.
     let batches = 0;
     database = createOutrightDatabase({ filename, onMigrationError: () => {}, tasksMigrationStep: (step) => {
       if (step === "tasks-backfilled" && ++batches > 1) throw new Error("hold the backfill");
@@ -2190,13 +2198,15 @@ test("retention during a pending task backfill leaves no task without its conver
     try {
       assert.equal(database.capacity().migrationStatus, "migrating");
       assert.equal((await database.deleteArchivedConversation(doomed.id, doomed.id)).deleted, 1);
+      assert.equal((await database.deleteArchivedConversation(oversized.id, oversized.id)).deleted, 1);
     } finally { await database.close(); }
     const raw = new Database(filename);
     try {
       assert.equal(raw.pragma("table_info(conversations)").some((column) => column.name === "task_id"), false);
       // Both conversations were in the first backfilled batch. A conversation
       // removed by another path, such as a shadow cutover, is swept on rebuild.
-      assert.deepEqual(raw.prepare("SELECT id FROM tasks WHERE id IN (?, ?)").all(doomed.id, vanished.id).map((row) => row.id), [vanished.id]);
+      assert.deepEqual(raw.prepare("SELECT id FROM tasks WHERE id IN (?, ?, ?)").all(doomed.id, oversized.id, vanished.id).map((row) => row.id), [vanished.id]);
+      assert.equal(raw.prepare("SELECT 1 FROM conversations WHERE id = ?").get(oversized.id), undefined);
       raw.prepare("DELETE FROM conversations WHERE id = ?").run(vanished.id);
     } finally { raw.close(); }
     database = createOutrightDatabase({ filename });
@@ -2354,9 +2364,8 @@ test("a task without a visible thread is hidden by moving, archiving and retenti
     const second = database.createConversation({ projectId: "p", worktreeId: "a", worktreePath: "/tmp/a", title: "Moved", provider: "codex", taskId: first.taskId });
     database.updateConversation(first.id, { archived: true });
     assert.equal(database.getTask(first.taskId).archived, false, "a visible thread keeps its task open");
-    const moved = database.moveConversation(second.id, { projectId: "p", worktreeId: "b", worktreePath: "/tmp/b" });
+    database.moveConversation(second.id, { projectId: "p", worktreeId: "b", worktreePath: "/tmp/b" });
     assert.deepEqual([database.getTask(first.taskId).archived, database.getTask(first.taskId).threadCount], [true, 1]);
-    assert.equal(moved.previousTaskId, first.taskId, "the move reports the task it committed the thread away from");
     await database.deleteArchivedConversation(first.id, first.id);
     assert.equal(database.getTask(first.taskId), undefined, "the hidden task leaves with its last thread");
 
@@ -2397,5 +2406,113 @@ test("archive changes that reach threads through their task are announced once a
       "restoring one thread restores its task and every sibling it hid");
     assert.equal(database.getConversation(first.id).archived, 0);
     assert.equal(database.getConversation(own.id).archived, 1);
+  } finally { database.close(); }
+});
+
+test("a journaled outcome replayed while the task migration is pending keeps its transcript", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-task-outcome-"));
+  const filename = path.join(directory, "outright.db");
+  try {
+    let database = createOutrightDatabase({ filename });
+    const outcomes = {};
+    try {
+      for (let index = 0; index < 100; index += 1) {
+        database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: `Chat ${index}`, provider: "codex" });
+      }
+      // The second final answer is larger than the recovery reserve.
+      for (const [name, body] of [["kept", "FINAL ANSWER"], ["omitted", "y".repeat(1536 * 1024)]]) {
+        const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: name, provider: "codex" });
+        const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "x" });
+        database.updateRun(run.id, { status: "running" });
+        const finishedAt = new Date().toISOString();
+        database.savePendingRunOutcome(run.id, { status: "completed", finishedAt, exitCode: 0, message: "",
+          transcriptMessage: { id: `${run.id}:1`, conversationId: conversation.id, role: "assistant", kind: "text", body, payload: { runId: run.id }, createdAt: finishedAt } });
+        outcomes[name] = { conversation, run, body };
+      }
+    } finally { database.close(); }
+    seedPreTaskStore(filename);
+    const raw = new Database(filename);
+    try { raw.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('maxRetainedMiB', '1')").run(); } finally { raw.close(); }
+    database = createOutrightDatabase({ filename });
+    try {
+      assert.equal(database.capacity().migrationStatus, "migrating", "the reconcile runs while the task backfill is pending");
+      database.reconcileInterruptedRuns();
+      const kept = database.getRun(outcomes.kept.run.id);
+      assert.deepEqual([kept.status, kept.transcriptOmitted], ["completed", 0]);
+      assert.deepEqual(database.listMessages(outcomes.kept.conversation.id).map((message) => message.body), ["FINAL ANSWER"]);
+      // A real quota refusal still records the omission.
+      const omitted = database.getRun(outcomes.omitted.run.id);
+      assert.deepEqual([omitted.status, omitted.transcriptOmitted], ["completed", 1]);
+      assert.deepEqual(database.listMessages(outcomes.omitted.conversation.id), []);
+    } finally { database.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("storage reports each committed task change once after commit, and never a rolled-back one", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-task-changes-"));
+  const filename = path.join(directory, "outright.db");
+  const reported = [];
+  const take = async () => {
+    await new Promise((resolve) => setImmediate(resolve));
+    const taken = reported.map((change) => ({ ...change, taskIds: [...change.taskIds].sort() }));
+    reported.length = 0;
+    return taken;
+  };
+  const where = { projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", provider: "codex" };
+  try {
+    let database = createOutrightDatabase({ filename, onTasksChanged: (change) => reported.push(change) });
+    let recovering;
+    try {
+      const thread = database.createConversation({ ...where, title: "First" });
+      assert.equal(reported.length, 0, "nothing is announced inside the writing call");
+      assert.deepEqual(await take(), [{ taskIds: [thread.taskId], truncated: false }]);
+      database.updateConversation(thread.id, { pinned: true, tabPosition: 3 });
+      database.addMessage({ conversationId: thread.id, role: "user", body: "no task state" });
+      assert.deepEqual(await take(), [], "tab and transcript writes leave the task alone");
+      const tasks = Array.from({ length: 201 }, (_, index) => database.createTask({ scopeKind: "project", projectId: "bulk", title: `Bulk ${index}` }));
+      const [bulk] = await take();
+      assert.deepEqual([bulk.taskIds.length, bulk.truncated], [200, true], "one bounded change covers a large commit");
+      assert.ok(bulk.taskIds.every((id) => tasks.some((task) => task.id === id)));
+      recovering = database.createConversation({ ...where, title: "Recovering" });
+      const run = database.createRun({ conversationId: recovering.id, provider: "codex", approvalPolicy: "read-only", prompt: "x" });
+      database.updateRun(run.id, { status: "running" });
+      await take();
+    } finally { database.close(); }
+    const raw = new Database(filename);
+    try { raw.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('maxRetainedMiB', '1')").run(); } finally { raw.close(); }
+    database = createOutrightDatabase({ filename, onTasksChanged: (change) => reported.push(change) });
+    try {
+      database.reconcileInterruptedRuns();
+      assert.deepEqual(await take(), [{ taskIds: [recovering.taskId], truncated: false }], "a reconcile batch announces the task it left waiting");
+      const run = database.listRuns(recovering.id)[0];
+      database.resolveInterruptedRun(run.id, "discard");
+      assert.deepEqual(await take(), [{ taskIds: [recovering.taskId], truncated: false }]);
+      // The queued run is inserted, then its transaction is refused at quota.
+      assert.throws(() => database.submitRun({ conversationId: recovering.id, provider: "codex", approvalPolicy: "read-only", prompt: "p" }, "z".repeat(2 * 1024 * 1024)),
+        (error) => error.statusCode === 507);
+      assert.equal(database.listRuns(recovering.id).length, 1);
+      assert.deepEqual(await take(), [], "a rolled-back run is never announced");
+    } finally { database.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("task pages stop at their byte bound and continue by cursor", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const created = Array.from({ length: 40 }, (_, index) => database.createTask({ scopeKind: "project",
+      projectId: `${index}-${"p".repeat(16 * 1024 - 8)}`, title: `Large ${index}`, objective: "o".repeat(16 * 1024) }));
+    const seen = [];
+    let cursor = null;
+    let pages = 0;
+    do {
+      const page = database.listTasks({ limit: 100, cursor });
+      assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 512 * 1024, "each page fits the response bound");
+      assert.ok(page.tasks.length > 0);
+      seen.push(...page.tasks.map((task) => task.id));
+      cursor = page.nextCursor;
+      pages += 1;
+    } while (cursor);
+    assert.ok(pages > 1, "the byte bound, not the page size, ended the first page");
+    assert.deepEqual(seen.sort(), created.map((task) => task.id).sort());
   } finally { database.close(); }
 });

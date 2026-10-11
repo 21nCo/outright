@@ -191,6 +191,22 @@ export function createOutrightDatabase(options = {}) {
     ? options.deletionRetryBaseMs : 1000;
   const deletionIdleWaiters = new Set();
   const closeWaiters = new Set();
+  // Task changes are announced once their transaction has committed: a
+  // microtask runs after the synchronous transaction that recorded them.
+  let taskChangesQueued = false;
+  const queueTaskChanges = () => {
+    if (taskChangesQueued) return;
+    taskChangesQueued = true;
+    queueMicrotask(announceTaskChanges);
+  };
+  function announceTaskChanges() {
+    taskChangesQueued = false;
+    if (!db?.open) return;
+    if (db.inTransaction) { taskChangesQueued = true; setImmediate(announceTaskChanges); return; }
+    const change = takeTaskChanges(db);
+    if (change) options.onTasksChanged?.(change);
+  }
+  captureTaskChanges(db, queueTaskChanges);
   const releaseLeaseIfIdle = () => {
     if (!closing && !deletionWorkers.size && !maintenance) db.pragma("busy_timeout = 5000");
     if (closing && !deletionWorkers.size && leaseDb) { leaseDb.close(); leaseDb = undefined; }
@@ -240,11 +256,14 @@ export function createOutrightDatabase(options = {}) {
       db = undefined;
       options.onDeletionWorkerStart?.();
     },
-    onWorkerExit: () => {
+    onWorkerExit: (taskIds = []) => {
       if (!closing && !db) {
         db = openDataConnection(storageFilename);
         reserveRecoveryHeadroom(db);
+        captureTaskChanges(db, queueTaskChanges);
       }
+      // The shadow cutover changed its thread's task on another connection.
+      if (taskIds.length && !closing) options.onTasksChanged?.({ taskIds, truncated: false });
       maintenance = false;
       maintenanceCapacity = undefined;
       maintenanceError = undefined;
@@ -263,7 +282,7 @@ export function createOutrightDatabase(options = {}) {
     migrationTick = setImmediate(() => {
       migrationTick = undefined;
       if (closing || maintenance) return;
-      try { advanceMigrations(db, migrationHooks); migrationError = null; }
+      try { advanceMigrations(db, migrationHooks); captureTaskChanges(db, queueTaskChanges); migrationError = null; }
       catch (error) {
         migrationError = error;
         options.onMigrationError?.(error);
@@ -405,6 +424,37 @@ export function createOutrightDatabase(options = {}) {
     }).immediate(); }
     catch (error) {
       if (error?.message?.includes("OUTRIGHT_RETAINED_LIMIT")) throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
+      throw error;
+    }
+  }
+
+  function writeMessage(message) {
+    db.prepare(`INSERT INTO messages (id, conversation_id, role, kind, body, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET role = excluded.role, kind = excluded.kind, body = excluded.body, payload = excluded.payload`)
+      .run(message.id, message.conversationId, message.role, message.kind ?? "text", message.body ?? "", JSON.stringify(message.payload ?? null), message.createdAt);
+    // Assistant checkpoints reuse one stable createdAt across the whole
+    // stream, so the plain overwrite could regress updated_at after a newer
+    // tool/user message advanced it; clamp to the newer timestamp instead.
+    db.prepare("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?").run(message.createdAt, message.conversationId);
+    return hydratePayload(db.prepare(`SELECT search_order AS searchOrder, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
+      FROM messages WHERE id = ?`).get(message.id));
+  }
+
+  // A journaled terminal outcome is recovery evidence. A migration pauses
+  // optional history, so replay writes its final transcript inside the
+  // recovery reserve, like a critical audit; retained-scan triggers count it
+  // either side of each cursor. Only a real quota refusal omits it.
+  function replayOutcomeTranscript(message) {
+    try {
+      if (!migrationPending(db)) return api.upsertMessage(message);
+      return db.transaction(() => {
+        reserveRecoveryHeadroom(db, undefined, true);
+        const written = writeMessage(message);
+        reserveRecoveryHeadroom(db);
+        return written;
+      })();
+    } catch (error) {
+      if (error.statusCode === 507 || error?.message?.includes("OUTRIGHT_RETAINED_LIMIT")) return null;
       throw error;
     }
   }
@@ -866,11 +916,15 @@ export function createOutrightDatabase(options = {}) {
     },
     listConversations(filters = {}) {
       const source = conversationSource(db);
-      const where = [`${source.archived} = ?`, "c.deleting = 0"];
-      const values = [filters.archived ? 1 : 0];
+      // Visible tabs filter the thread's own archived column first, so the
+      // scope index skips the archive backlog before the task check.
+      const tasks = conversationTasksReady(db);
+      const where = [filters.archived ? (tasks ? "(c.archived = 1 OR t.archived = 1)" : "c.archived = 1")
+        : (tasks ? "c.archived = 0 AND t.archived = 0" : "c.archived = 0"), "c.deleting = 0"];
+      const values = [];
       if (filters.projectId) { where.push("c.project_id = ?"); values.push(filters.projectId); }
       if (filters.worktreeId) { where.push("c.worktree_id = ?"); values.push(filters.worktreeId); }
-      if (filters.taskId && !conversationTasksReady(db)) return [];
+      if (filters.taskId && !tasks) return [];
       if (filters.taskId) { where.push("c.task_id = ?"); values.push(filters.taskId); }
       return db.prepare(`${source.sql} WHERE ${where.join(" AND ")} ORDER BY c.pinned DESC, c.tab_position, c.updated_at DESC`).all(...values);
     },
@@ -924,8 +978,6 @@ export function createOutrightDatabase(options = {}) {
       }
       return this.getConversation(id);
     },
-    // The result names the task the thread left, read in the same
-    // transaction as the reassignment.
     moveConversation(id, destination) {
       if (db.prepare("SELECT deleting FROM conversations WHERE id = ?").get(id)?.deleting) {
         throw databaseError(409, "Archived conversation deletion is in progress");
@@ -935,7 +987,7 @@ export function createOutrightDatabase(options = {}) {
         throw databaseError(409, "Resolve the interrupted run before moving this conversation away from its recovery worktree");
       }
       const position = db.prepare("SELECT COALESCE(MAX(tab_position), -1) + 1 AS position FROM conversations WHERE project_id = ? AND worktree_id = ?").get(destination.projectId, destination.worktreeId).position;
-      const previousTaskId = withinRetainedBudget(() => {
+      withinRetainedBudget(() => {
         const timestamp = now();
         const current = db.prepare(`SELECT c.task_id AS taskId, c.project_id AS projectId, c.worktree_id AS worktreeId,
           c.worktree_path AS worktreePath, c.title, c.archived, t.archived AS taskArchived
@@ -958,10 +1010,18 @@ export function createOutrightDatabase(options = {}) {
           // thread away hides the old task instead of listing it empty.
           archiveTaskWithoutVisibleThreads(db, current.taskId, timestamp);
         }
-        return current.taskId;
       });
-      return { ...this.getConversation(id), previousTaskId };
+      return this.getConversation(id);
     },
+    // Task contract for dependents. A task row carries its immutable scope,
+    // title, objective, origin, userStatus and archived flag, plus a status
+    // derived from its threads' runs on every read: running, waiting, idle,
+    // or done when the user finished it. tasks.changed names the ids whose
+    // row, threads or derived status changed. A task's lifecycle follows its
+    // last visible thread whatever its origin: archiving or moving away that
+    // thread hides the task, and retention deletes an archived task with its
+    // last thread. A move without taskId keeps the thread's task when the
+    // destination is its current location, and otherwise starts a new task.
     listTasks(filters = {}) {
       assertTasksReady(db);
       const limit = filters.limit ?? 50;
@@ -1486,17 +1546,7 @@ export function createOutrightDatabase(options = {}) {
     },
     upsertMessage(input, { omissionRunId } = {}) {
       const message = { id: input.id ?? randomUUID(), createdAt: input.createdAt ?? now(), ...input };
-      const upsert = () => withinRetainedBudget(() => {
-        db.prepare(`INSERT INTO messages (id, conversation_id, role, kind, body, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET role = excluded.role, kind = excluded.kind, body = excluded.body, payload = excluded.payload`)
-        .run(message.id, message.conversationId, message.role, message.kind ?? "text", message.body ?? "", JSON.stringify(message.payload ?? null), message.createdAt);
-      // Assistant checkpoints reuse one stable createdAt across the whole
-      // stream, so the plain overwrite could regress updated_at after a newer
-      // tool/user message advanced it; clamp to the newer timestamp instead.
-      db.prepare("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?").run(message.createdAt, message.conversationId);
-        return hydratePayload(db.prepare(`SELECT search_order AS searchOrder, id, conversation_id AS conversationId, role, kind, body, payload, created_at AS createdAt
-        FROM messages WHERE id = ?`).get(message.id));
-      });
+      const upsert = () => withinRetainedBudget(() => writeMessage(message));
       if (!omissionRunId) return upsert();
       return db.transaction(() => {
         try { return upsert(); }
@@ -1662,14 +1712,7 @@ export function createOutrightDatabase(options = {}) {
           }
           if (outcome) {
             let transcriptOmitted = Boolean(outcome.transcriptOmitted);
-            if (outcome.transcriptMessage) {
-              try {
-                if (!this.upsertMessage(outcome.transcriptMessage)) transcriptOmitted = true;
-              } catch (error) {
-                if (error.statusCode !== 507) throw error;
-                transcriptOmitted = true;
-              }
-            }
+            if (outcome.transcriptMessage && !replayOutcomeTranscript(outcome.transcriptMessage)) transcriptOmitted = true;
             const result = db.prepare(`UPDATE runs SET status = ?, pid = NULL, finished_at = ?, exit_code = ?, error = ?,
               transcript_omitted = CASE WHEN transcript_omitted = 1 OR ? THEN 1 ELSE 0 END
               WHERE id = ? AND status IN ('queued', 'running', 'launching')`).run(
@@ -1781,14 +1824,7 @@ export function createOutrightDatabase(options = {}) {
       }
       const settle = db.transaction(() => {
         let transcriptOmitted = Boolean(outcome.transcriptOmitted);
-        if (outcome.transcriptMessage) {
-          try {
-            if (!this.upsertMessage(outcome.transcriptMessage)) transcriptOmitted = true;
-          } catch (error) {
-            if (error.statusCode !== 507) throw error;
-            transcriptOmitted = true;
-          }
-        }
+        if (outcome.transcriptMessage && !replayOutcomeTranscript(outcome.transcriptMessage)) transcriptOmitted = true;
         const updated = db.prepare(`UPDATE runs SET status = ?, pid = NULL, finished_at = ?, exit_code = ?, error = ?,
           transcript_omitted = CASE WHEN transcript_omitted = 1 OR ? THEN 1 ELSE 0 END
           WHERE id = ? AND status = 'interrupted' AND recovery_class = ? AND recovery_decision IS NULL`)
@@ -2358,7 +2394,12 @@ async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, cut
   if (workers.size || !canMaintain() || db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
     return { deleted: 0, deferred: true, id };
   }
-  try { await deleteOversizedArchivedRow(filename, id, step.oversized, { workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure }); }
+  // Before the rebuild, a backfilled task reuses its conversation's id.
+  const taskId = conversationTasksReady(db) ? db.prepare("SELECT task_id FROM conversations WHERE id = ?").get(id)?.task_id : id;
+  try {
+    await deleteOversizedArchivedRow(filename, id, step.oversized, { workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase,
+      onWorkerStart, onWorkerReady, onWorkerExit: () => onWorkerExit(taskId ? [taskId] : []), onWorkerRecoveryFailure });
+  }
   catch (error) {
     if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
     if (["ARCHIVE_SNAPSHOT_CHANGED", "ARCHIVE_DEFERRED", "ARCHIVE_SOURCE_BUSY"].includes(error.code)) {
@@ -3190,6 +3231,46 @@ function reserveRecoveryHeadroom(db, configured = Number(db.prepare("SELECT valu
   const headroom = criticalAudit || recoveryPending || unsettled || bytes > configured ? Math.max(1024 * 1024, unsettled * 256) : 0;
   const ceiling = bytes + headroom > configured ? bytes + headroom : 0;
   db.prepare("UPDATE retained_usage SET legacy_ceiling = ? WHERE id = 1").run(ceiling);
+}
+
+// Every committed change to a task row, its threads or its derived status is
+// recorded by connection-local triggers, so storage paths cannot forget to
+// announce one. The rows are rolled back with their transaction and read
+// only after it commits. Installed once the conversations rebuild has given
+// threads a task.
+const TASK_RUN_LEVEL = (row) => `CASE WHEN ${row}.status IN ('queued', 'launching', 'running') THEN 2
+  WHEN ${row}.status = 'interrupted' AND ${row}.recovery_decision IS NULL THEN 1 ELSE 0 END`;
+const taskChangeCapture = new WeakSet();
+function captureTaskChanges(db, onRecorded) {
+  if (taskChangeCapture.has(db) || !conversationTasksReady(db)) return;
+  db.function("outright_task_recorded", { deterministic: false }, () => { onRecorded(); return null; });
+  const record = (taskId) => `INSERT OR IGNORE INTO task_changes (task_id) SELECT ${taskId} WHERE ${taskId} IS NOT NULL;
+    SELECT outright_task_recorded();`;
+  const runTask = (row) => record(`(SELECT task_id FROM conversations WHERE id = ${row}.conversation_id)`);
+  db.exec(`CREATE TEMP TABLE IF NOT EXISTS task_changes (task_id TEXT PRIMARY KEY) WITHOUT ROWID;
+    CREATE TEMP TRIGGER IF NOT EXISTS task_change_insert AFTER INSERT ON tasks BEGIN ${record("NEW.id")} END;
+    CREATE TEMP TRIGGER IF NOT EXISTS task_change_update AFTER UPDATE ON tasks BEGIN ${record("NEW.id")} END;
+    CREATE TEMP TRIGGER IF NOT EXISTS task_change_delete AFTER DELETE ON tasks BEGIN ${record("OLD.id")} END;
+    CREATE TEMP TRIGGER IF NOT EXISTS task_change_thread_insert AFTER INSERT ON conversations BEGIN ${record("NEW.task_id")} END;
+    CREATE TEMP TRIGGER IF NOT EXISTS task_change_thread_update AFTER UPDATE OF task_id, title, archived, deleting ON conversations
+      WHEN OLD.task_id IS NOT NEW.task_id OR OLD.title IS NOT NEW.title OR OLD.archived IS NOT NEW.archived OR OLD.deleting IS NOT NEW.deleting
+      BEGIN ${record("OLD.task_id")} ${record("NEW.task_id")} END;
+    CREATE TEMP TRIGGER IF NOT EXISTS task_change_thread_delete AFTER DELETE ON conversations BEGIN ${record("OLD.task_id")} END;
+    CREATE TEMP TRIGGER IF NOT EXISTS task_change_run_insert AFTER INSERT ON runs WHEN ${TASK_RUN_LEVEL("NEW")} > 0 BEGIN ${runTask("NEW")} END;
+    CREATE TEMP TRIGGER IF NOT EXISTS task_change_run_update AFTER UPDATE OF status, recovery_decision, conversation_id ON runs
+      WHEN ${TASK_RUN_LEVEL("OLD")} != ${TASK_RUN_LEVEL("NEW")} OR (OLD.conversation_id IS NOT NEW.conversation_id AND ${TASK_RUN_LEVEL("NEW")} > 0)
+      BEGIN ${runTask("OLD")} ${runTask("NEW")} END;`);
+  taskChangeCapture.add(db);
+}
+
+// Returns at most 200 committed task ids and clears the record; a larger
+// change reports truncated so consumers reload their task lists.
+function takeTaskChanges(db) {
+  if (!taskChangeCapture.has(db)) return null;
+  const taskIds = db.prepare("SELECT task_id FROM task_changes LIMIT 201").pluck().all();
+  if (!taskIds.length) return null;
+  db.prepare("DELETE FROM task_changes").run();
+  return { taskIds: taskIds.slice(0, 200), truncated: taskIds.length > 200 };
 }
 
 const tasksReady = new WeakSet();

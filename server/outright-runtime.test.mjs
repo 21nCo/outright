@@ -2923,7 +2923,9 @@ test("rejects non-loopback sockets even with an allowed Host header", () => {
 function captureEvents(runtime) {
   const events = [];
   runtime.eventHub.connect({ readyState: 1, bufferedAmount: 0, send(encoded) { events.push(JSON.parse(encoded)); }, close() {} });
-  return { taskChanges: () => events.filter((event) => event.type === "tasks.changed").map((event) => event.payload),
+  // Storage reports each committed change's task ids as a set.
+  return { taskChanges: () => events.filter((event) => event.type === "tasks.changed")
+    .map((event) => ({ ...event.payload, taskIds: [...event.payload.taskIds].sort() })),
     of: (type) => events.filter((event) => event.type === type), clear: () => { events.length = 0; } };
 }
 
@@ -2960,7 +2962,7 @@ test("task routes create, page, read and update tasks and announce every change"
   const worktreeTask = await callRuntime(runtime, "POST", "/api/tasks", { scopeKind: "worktree", ...target, title: "Ship", objective: "Land the change" });
   assert.equal(worktreeTask.statusCode, 201, worktreeTask.raw);
   assert.equal(worktreeTask.body.worktreePath, worktree.path);
-  assert.deepEqual(events.taskChanges(), [spaceTask, projectTask, worktreeTask].map((task) => ({ taskIds: [task.body.id], reason: "created" })));
+  assert.deepEqual(events.taskChanges(), [spaceTask, projectTask, worktreeTask].map((task) => ({ taskIds: [task.body.id], truncated: false })));
 
   for (const query of ["limit=0", "limit=101", "limit=two", "archived=maybe", "status=busy", "scopeKind=branch", "cursor=%25"]) {
     assert.equal((await callRuntime(runtime, "GET", `/api/tasks?${query}`)).statusCode, 400, query);
@@ -2983,7 +2985,7 @@ test("task routes create, page, read and update tasks and announce every change"
   assert.equal((await callRuntime(runtime, "PATCH", "/api/tasks/missing", { title: "Nope" })).statusCode, 404);
   const updated = await callRuntime(runtime, "PATCH", `/api/tasks/${worktreeTask.body.id}`, { title: "Ship it", objective: "Merged", status: "done" });
   assert.deepEqual([updated.body.title, updated.body.objective, updated.body.status, updated.body.userStatus], ["Ship it", "Merged", "done", "done"]);
-  assert.deepEqual(events.taskChanges(), [{ taskIds: [worktreeTask.body.id], reason: "updated" }]);
+  assert.deepEqual(events.taskChanges(), [{ taskIds: [worktreeTask.body.id], truncated: false }]);
   assert.equal((await callRuntime(runtime, "GET", "/api/tasks?status=done")).body.tasks[0].id, worktreeTask.body.id);
   const archived = await callRuntime(runtime, "PATCH", `/api/tasks/${projectTask.body.id}`, { archived: true });
   assert.equal(archived.body.archived, true);
@@ -3004,13 +3006,13 @@ test("conversation create and move keep every thread in exactly one task", { ski
   assert.equal(created.statusCode, 201, created.raw);
   const own = runtime.database.getTask(created.body.taskId, { threads: true });
   assert.deepEqual([own.scopeKind, own.title, own.worktreePath, own.threads.map((thread) => thread.id)], ["worktree", "Legacy flow", worktree.path, [created.body.id]]);
-  assert.deepEqual(events.taskChanges(), [{ taskIds: [created.body.taskId], reason: "created" }]);
+  assert.deepEqual(events.taskChanges(), [{ taskIds: [created.body.taskId], truncated: false }]);
 
   events.clear();
   const attached = await callRuntime(runtime, "POST", "/api/conversations", { ...target, title: "Second thread", provider: "codex", taskId: created.body.taskId });
   assert.equal(attached.statusCode, 201, attached.raw);
   assert.equal(attached.body.taskId, created.body.taskId);
-  assert.deepEqual(events.taskChanges(), [{ taskIds: [created.body.taskId], reason: "thread" }]);
+  assert.deepEqual(events.taskChanges(), [{ taskIds: [created.body.taskId], truncated: false }]);
   const detail = await callRuntime(runtime, "GET", `/api/tasks/${created.body.taskId}`);
   assert.deepEqual(detail.body.threads.map((thread) => thread.id), [created.body.id, attached.body.id]);
   const listed = await callRuntime(runtime, "GET", `/api/conversations?taskId=${created.body.taskId}`);
@@ -3037,7 +3039,7 @@ test("conversation create and move keep every thread in exactly one task", { ski
   const destinationTask = runtime.database.getTask(moved.body.taskId);
   assert.deepEqual([destinationTask.worktreeId, destinationTask.title, destinationTask.threadCount], [linked.id, "Second thread", 1]);
   assert.equal(runtime.database.getTask(created.body.taskId).threadCount, 1);
-  assert.deepEqual(events.taskChanges(), [{ taskIds: [created.body.taskId, moved.body.taskId], reason: "thread" }]);
+  assert.deepEqual(events.taskChanges(), [{ taskIds: [created.body.taskId, moved.body.taskId].sort(), truncated: false }]);
 
   const named = runtime.database.createTask({ scopeKind: "worktree", ...target, title: "Named home" });
   const mismatched = await callRuntime(runtime, "POST", `/api/conversations/${attached.body.id}/move`, { ...destination, taskId: named.id });
@@ -3047,15 +3049,28 @@ test("conversation create and move keep every thread in exactly one task", { ski
   assert.equal(returned.body.taskId, named.id);
 }));
 
-test("terminal and recovery run events announce the owning task's status change", withRuntime(async (runtime) => {
-  const conversation = runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Busy", provider: "codex" });
+test("run rows that change a task's derived status announce it, whatever events are published", withRuntime(async (runtime) => {
+  await runtime.whenRunRecoveryComplete();
+  const database = runtime.database;
+  const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Busy", provider: "codex" });
+  // Creating the thread is announced after its commit.
+  await new Promise((resolve) => setImmediate(resolve));
   const events = captureEvents(runtime);
-  for (const type of ["run.queued", "run.started", "assistant.delta", "process.stdout", "run.completed"]) {
-    runtime.publish({ type: "run.event", conversationId: conversation.id, runId: "r", payload: { type } });
-  }
-  runtime.publish({ type: "run.resolved", conversationId: conversation.id, runId: "r", payload: {} });
-  runtime.publish({ type: "run.recovery-updated", conversationId: conversation.id, runId: "r", payload: {} });
-  assert.deepEqual(events.taskChanges(), Array.from({ length: 2 }, () => ({ taskIds: [conversation.taskId], reason: "run" })));
+  const announced = async (change) => {
+    events.clear();
+    change();
+    await new Promise((resolve) => setImmediate(resolve));
+    return events.taskChanges().map((payload) => payload.taskIds);
+  };
+  // Published run events carry no task state; the run rows do.
+  assert.deepEqual(await announced(() => runtime.publish({ type: "run.event", conversationId: conversation.id, runId: "r", payload: { type: "run.completed" } })), []);
+  let run;
+  assert.deepEqual(await announced(() => { run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "go" }); }), [[conversation.taskId]]);
+  assert.deepEqual(await announced(() => database.updateRun(run.id, { status: "running", pid: 4242 })), [], "starting keeps the task running");
+  assert.deepEqual(await announced(() => database.updateRun(run.id, { status: "interrupted", recoveryClass: "unknown" })), [[conversation.taskId]]);
+  assert.equal(database.getTask(conversation.taskId).status, "waiting");
+  assert.deepEqual(await announced(() => database.resolveInterruptedRun(run.id, "discard")), [[conversation.taskId]]);
+  assert.equal(database.getTask(conversation.taskId).status, "idle");
 }));
 
 test("a queued run announces its task even when the run event log refuses the event", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
@@ -3073,7 +3088,7 @@ test("a queued run announces its task even when the run event log refuses the ev
   assert.equal(submitted.statusCode, 202, submitted.raw);
   assert.equal(runtime.database.listRuns(conversation.id).length, 1);
   assert.ok(!order.includes("run.queued"), "the refused run.queued event was not published");
-  assert.deepEqual(order[0], { taskIds: [conversation.taskId], reason: "run" },
+  assert.deepEqual(order[0], { taskIds: [conversation.taskId], truncated: false },
     "the committed queue transition is announced before any terminal event");
 }));
 
@@ -3152,9 +3167,57 @@ test("overlapping moves announce the task each move actually committed the threa
   await slowMove;
   assert.equal(slowResponse.statusCode, 200, slowResponse.raw);
   assert.deepEqual(events.taskChanges(), [
-    { taskIds: [conversation.taskId, fast.body.taskId], reason: "thread" },
-    { taskIds: [fast.body.taskId, slowResponse.body.taskId], reason: "thread" },
+    { taskIds: [conversation.taskId, fast.body.taskId].sort(), truncated: false },
+    { taskIds: [fast.body.taskId, slowResponse.body.taskId].sort(), truncated: false },
   ]);
   assert.equal(slowResponse.body.previousTaskId, undefined, "the committed previous task stays out of the conversation payload");
   assert.equal(runtime.database.getTask(fast.body.taskId).archived, true);
 }));
+
+test("retention, automatic cleanup and startup recovery announce the tasks they change", (() => {
+  const reported = [];
+  let seeded;
+  return withRuntime(async (runtime) => {
+    await runtime.whenRunRecoveryComplete();
+    // The first reconcile batch commits while the runtime is constructed.
+    assert.ok(reported.some((change) => change.taskIds.includes(seeded.recovering.taskId)), "the reconcile batch announced its waiting task");
+    assert.equal(runtime.database.getTask(seeded.recovering.taskId).status, "waiting");
+    const events = captureEvents(runtime);
+    // Immediate deletion and the shadow worker for an oversized row.
+    for (const name of ["small", "oversized"]) {
+      events.clear();
+      const { id, taskId } = seeded[name];
+      const deleted = await callRuntime(runtime, "POST", "/api/retention/delete-archived", { id, confirmation: id });
+      assert.deepEqual([deleted.statusCode, deleted.body.deleted], [200, 1], deleted.raw);
+      assert.equal(runtime.database.getTask(taskId), undefined);
+      assert.ok(events.taskChanges().some((change) => change.taskIds.includes(taskId)), `${name} deletion announced its task`);
+    }
+    events.clear();
+    const cleaned = await callRuntime(runtime, "POST", "/api/retention/cleanup", { before: "2010-01-01T00:00:00.000Z" });
+    assert.deepEqual([cleaned.statusCode, cleaned.body.deleted], [200, 1], cleaned.raw);
+    assert.equal(runtime.database.getTask(seeded.stale.taskId), undefined);
+    assert.ok(events.taskChanges().some((change) => change.taskIds.includes(seeded.stale.taskId)), "automatic cleanup announced its task");
+  }, {
+    databaseFactory: (options) => createOutrightDatabase({ ...options, onTasksChanged: (change) => {
+      reported.push(change);
+      options.onTasksChanged(change);
+    } }),
+    seed(dataDirectory) {
+      const filename = path.join(dataDirectory, "outright.db");
+      const database = createOutrightDatabase({ filename });
+      try {
+        const make = (title) => database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title, provider: "codex" });
+        seeded = Object.fromEntries(["recovering", "small", "oversized", "stale"].map((title) => [title, make(title)]));
+        const run = database.createRun({ conversationId: seeded.recovering.id, provider: "codex", approvalPolicy: "read-only", prompt: "work" });
+        database.updateRun(run.id, { status: "running" });
+        const message = database.addMessage({ conversationId: seeded.oversized.id, role: "assistant", body: "small" });
+        for (const name of ["small", "oversized", "stale"]) database.updateConversation(seeded[name].id, { archived: true });
+        const raw = new Database(filename);
+        try {
+          raw.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), message.id);
+          raw.prepare("UPDATE conversations SET updated_at = '2001-01-01T00:00:00.000Z' WHERE id = ?").run(seeded.stale.id);
+        } finally { raw.close(); }
+      } finally { database.close(); }
+    },
+  });
+})());

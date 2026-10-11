@@ -71,6 +71,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     // reloads that worktree's tabs, so one event covers them all. It names no
     // single conversation, so the open tab stays selected.
     publish({ type: "conversation.updated", payload: change });
+  }, onTasksChanged: (change) => {
+    // Storage records every committed task, thread and run-status change,
+    // so routes, retention, recovery and migrations never announce their own.
+    publish?.({ type: "tasks.changed", payload: change });
   }, onMigrationComplete: () => {
     resumeQueuedAfterRecovery();
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
@@ -125,30 +129,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   void shutdownCompletion.catch(() => {});
 
   publish = function publish(event) {
-    const record = eventHub.publish(event);
-    const taskId = runStatusTaskId(event);
-    if (taskId) publishTasksChanged([taskId], "run");
-    return record;
+    return eventHub.publish(event);
   };
-
-  // A task's derived status follows its threads' run rows. Terminal events
-  // are published even when the run event log refuses them, and recovery
-  // decisions always publish run.resolved. Queueing is announced where the
-  // run row commits, because its optional run.queued event may be refused;
-  // starting keeps the task running, so it moves nothing.
-  function runStatusTaskId(event) {
-    const transition = event.type === "run.resolved"
-      || (event.type === "run.event" && typeof event.payload?.type === "string" && event.payload.type.startsWith("run.")
-        && !["run.queued", "run.started"].includes(event.payload.type));
-    if (!transition || !event.conversationId) return null;
-    try { return database.getConversation(event.conversationId)?.taskId ?? null; }
-    catch { return null; }
-  }
-
-  function publishTasksChanged(taskIds, reason) {
-    const unique = [...new Set(taskIds.filter(Boolean))];
-    if (unique.length) eventHub.publish({ type: "tasks.changed", payload: { taskIds: unique, reason } });
-  }
 
   terminals = terminalManagerFactory({ database, publish, subprocesses });
   const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl), subprocesses });
@@ -491,9 +473,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (input.scopeKind === "project" && !(await projects()).projects.some((project) => project.id === input.projectId)) {
           throw apiError(400, "Project is not a discovered project");
         }
-        const task = database.createTask(input);
-        publishTasksChanged([task.id], "created");
-        return json(response, 201, task);
+        return json(response, 201, database.createTask(input));
       }
       const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)$/);
       if (taskMatch && request.method === "GET") {
@@ -505,7 +485,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const patch = await readJson(request);
         const task = editRetainedData(() => database.updateTask(taskMatch[1], patch));
         if (!task) throw apiError(404, "Task not found");
-        publishTasksChanged([task.id], "updated");
         return json(response, 200, task);
       }
       if (spaceMatch && request.method === "DELETE") {
@@ -544,7 +523,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const conversation = database.createConversation({ ...body, taskId, worktreePath });
         database.audit("conversation.created", { target: conversation.id, projectId: body.projectId, worktreeId: body.worktreeId, taskId: conversation.taskId });
         publish({ type: "conversation.created", conversationId: conversation.id, payload: conversation });
-        publishTasksChanged([conversation.taskId], taskId ? "thread" : "created");
         return json(response, 201, conversation);
       }
       const conversationMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)$/);
@@ -579,7 +557,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const patch = await readJson(request);
         const conversation = editRetainedData(() => database.updateConversation(conversationMatch[1], patch));
         publish({ type: "conversation.updated", conversationId: conversationMatch[1], payload: conversation });
-        if (patch?.archived !== undefined) publishTasksChanged([conversation?.taskId], "updated");
         return json(response, conversation ? 200 : 404, conversation);
       }
       const conversationMessagesMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages$/);
@@ -662,11 +639,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           throw apiError(409, "Resolve the interrupted run before moving this conversation away from its recovery worktree", { code: "RUN_RECOVERY_REQUIRED" });
         }
         const { worktreePath: destinationPath } = await resolveWorktreeTarget(body);
-        const { previousTaskId, ...conversation } = editRetainedData(() => database.moveConversation(conversationMoveMatch[1],
+        const conversation = editRetainedData(() => database.moveConversation(conversationMoveMatch[1],
           { projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath, taskId }));
         database.audit("conversation.moved", { target: conversation.id, projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath, taskId: conversation.taskId });
         publish({ type: "conversation.updated", conversationId: conversation.id, payload: conversation });
-        if (conversation.taskId !== previousTaskId) publishTasksChanged([previousTaskId, conversation.taskId], "thread");
         return json(response, 200, conversation);
       }
       const runCreateMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/runs$/);
@@ -700,7 +676,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (currentInterrupted) throw apiError(409, "Resolve the interrupted run before starting more agent work", { code: "RUN_RECOVERY_REQUIRED", runId: currentInterrupted.id });
         const { run, message: userMessage } = database.submitRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, provider, model: body.model ?? conversation.model ?? settings.model, reasoningEffort: body.reasoningEffort || settings.reasoningEffort, approvalPolicy: body.approvalPolicy || settings.approvalPolicy, prompt }, prompt);
         publish({ type: "message.created", conversationId: conversation.id, payload: userMessage });
-        publishTasksChanged([currentConversation.taskId], "run");
         return json(response, 202, await agents.schedule({ conversation: database.getConversation(conversation.id), run }));
       }
       const runMatch = url.pathname.match(/^\/api\/runs\/([^/]+)$/);
