@@ -1,0 +1,43 @@
+docs/out-3-execution-adapters.md
+  s_1900bb15a7199a::t_10cdfe54ea7be3 40,54
+server/agent-manager.test.mjs
+  s_1900bb15a7199a::t_ed721c88f59e52 1656-1660
+server/child-process.mjs
+  s_1900bb15a7199a::t_8140501d464853 10-11,13,17-32,36,40,44,48,51
+server/child-process.test.mjs
+  s_1900bb15a7199a::t_bb2f8aa567871c 8-9,143-168
+server/execution-adapters.test.mjs
+  s_1900bb15a7199a::t_feb630c7f24a7a 19-20,243,248,261,275,287-327,349,369,384,404,409,432,440,450,454,465,470,490
+server/execution-adapters/anthropic-api-runner.mjs
+  s_1900bb15a7199a::t_b6b936864ac158 16-22,31-32,113,123-125,138,140,177
+server/execution-adapters/anthropic-api.mjs
+  s_1900bb15a7199a::t_3de5b5a92a3353 68-69,71-72
+src/App.jsx
+  s_1900bb15a7199a::t_735081805e1079 1508-1511,1939
+src/components/SettingsDialog.jsx
+  s_1900bb15a7199a::t_6475c05d56adfb 206-207,209-210,213,215-216
+src/lib/providers.js
+  s_1900bb15a7199a::t_34ddaf99f84ec2 44-46,51
+tests/fixtures/execution-adapters/anthropic-api/missing-stop-reason.sse
+  s_1900bb15a7199a::t_faec7c8161320e 1-24
+tests/ui-accessibility.test.mjs
+  s_1900bb15a7199a::t_7a6d0f95e6d6cc 72-80
+tests/ui-races.jsx
+  s_1900bb15a7199a::t_c976f37b970a54 360-361,368,377,380-382,388-389,393-394,405-407,413-430,5068-5077
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bb0aff5175609977e376cf61dd1bf1db19a35b5e",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
