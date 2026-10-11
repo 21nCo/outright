@@ -1,0 +1,37 @@
+docs/out-3-execution-adapters.md
+  s_1900bb15a7199a::t_b23701f6f55d53 40
+server/agent-manager.mjs
+  s_1900bb15a7199a::t_1e71b348591810 6,1118-1120,1122-1123,1128-1129
+server/agent-manager.test.mjs
+  s_1900bb15a7199a::t_d7a6c66629f44d 1696-1703,1705,1721-1722
+server/execution-adapters.test.mjs
+  s_1900bb15a7199a::t_4b5af923bb90c4 7,83-84,86-90,92-98,253-254,282-284,419,437,487,492,565,610,621,626,633-669,679
+server/execution-adapters/anthropic-api-runner.mjs
+  s_1900bb15a7199a::t_01d6f3e165b584 192-208,210-211,213,219-225,230,235,251,265,270
+server/execution-adapters/anthropic-api.mjs
+  s_1900bb15a7199a::t_4fc07406ae95e9 3,40,48-50
+server/execution-adapters/claude.mjs
+  s_1900bb15a7199a::t_1402d6891fda15 28-30,65-67
+server/execution-adapters/contract.mjs
+  s_1900bb15a7199a::t_22f3bb483b8f93 83-88,94,189-194,196-198,200-202
+server/execution-adapters/index.mjs
+  s_1900bb15a7199a::t_f2699495e36e40 6
+server/outright-runtime.test.mjs
+  s_1900bb15a7199a::t_e6b9d0dd5fb162 1765-1766,1768-1770,1791-1792,1811-1817
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b6fa7d51046242a51f98cb5bd34ed19e151bf5ef",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
