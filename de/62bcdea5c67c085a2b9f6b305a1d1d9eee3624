@@ -1,0 +1,63 @@
+server/agent-manager.test.mjs
+  s_3c118eff5157cd::t_c4d8d08b8f7a39 1649-1652
+server/execution-adapters/anthropic-api-runner.mjs
+  s_3c118eff5157cd::t_fcfb66e306a593 138-155,159-160,163-164
+server/execution-adapters/anthropic-api.mjs
+  s_3c118eff5157cd::t_79e2dcc595d105 8-12,69-71
+server/outright-runtime.test.mjs
+  s_1900bb15a7199a::t_52408a806ed4de 1525-1535,1588-1622,2816-2819,2826
+src/App.jsx
+  s_3c118eff5157cd::t_261dbd3dab8c2e 31,1349,1357,1360,1363-1367,1816,1936
+src/components/SettingsDialog.jsx
+  s_3c118eff5157cd::t_3f1c5fc6303884 6,126,206-207,209,211,213,242
+src/lib/providers.js
+  s_3c118eff5157cd::t_2d8c50a0468135 34-51
+tests/fixtures/execution-adapters/anthropic-api/context-window.sse
+  s_3c118eff5157cd::t_602edd5f0626dc 1-24
+tests/ui-races.jsx
+  s_1900bb15a7199a::t_b39442bf8d5a47 335-440,5533-5534
+tests/ui-races.test.mjs
+  s_1900bb15a7199a::t_1d880881b48029 899
+docs/out-3-execution-adapters.md
+  s_1900bb15a7199a::t_949f3b6e4b8d8e 13,26-27,36,40,46,54
+server/child-process.mjs
+  s_1900bb15a7199a::t_2c5aba65731a67 14-24,26,31,36,42,47
+server/child-process.test.mjs
+  s_1900bb15a7199a::t_aeddfa770f5b05 3-4,13-15,114-140
+server/database.mjs
+  s_1900bb15a7199a::t_fee7fc33c1cb86 1670-1672,1674-1675,1677,1695,1701-1702
+server/execution-adapters.test.mjs
+  s_1900bb15a7199a::t_ec6f3f216d7837 73-77,154-164,255-268,299-316,368-381
+server/execution-adapters/codex.mjs
+  s_1900bb15a7199a::t_797addd31835f0 5-7,48-51,53-54
+server/execution-adapters/contract.mjs
+  s_1900bb15a7199a::t_b87f86b9666a7d 37,39-40,126-128
+server/outright-runtime.mjs
+  s_1900bb15a7199a::t_44a8ee92630e8f 9,801-811,821-824
+tests/ui-accessibility.test.mjs
+  s_1900bb15a7199a::t_0cf0ace0397352 5,63-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "de62bcdea5c67c085a2b9f6b305a1d1d9eee3624",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_3c118eff5157cd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5afb4b84-61d1-439b-beda-402ef202b646",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
