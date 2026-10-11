@@ -5,7 +5,7 @@ import Database from "better-sqlite3";
 import { existsSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createOutrightDatabase, defaultProbeRun } from "./database.mjs";
+import { createOutrightDatabase, defaultProbeRun, taskSelectSql } from "./database.mjs";
 
 function cpuMilliseconds(since) {
   const used = process.cpuUsage(since);
@@ -2270,4 +2270,132 @@ test("task detail bounds each thread summary and the serialized thread list", ()
     const few = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Few", provider: "codex" });
     assert.deepEqual([database.getTask(few.taskId, { threads: true }).threads.length, database.getTask(few.taskId, { threads: true }).threadsTruncated], [1, false]);
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("a thread hidden by its task's archive ages for retention from that archive, like a directly archived thread", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-task-archive-age-"));
+  const filename = path.join(directory, "outright.db");
+  const database = createOutrightDatabase({ filename, runtimeLease: true });
+  try {
+    const thread = (title) => database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title, provider: "codex" });
+    const viaTask = thread("Hidden by task");
+    const direct = thread("Archived directly");
+    const age = (ids) => {
+      const writer = new Database(filename);
+      try { writer.prepare(`UPDATE conversations SET updated_at = ? WHERE id IN (${ids.map(() => "?").join(", ")})`).run(new Date(Date.now() - 100 * 86_400_000).toISOString(), ...ids); }
+      finally { writer.close(); }
+    };
+    age([viaTask.id, direct.id]);
+    database.updateTask(viaTask.taskId, { archived: true });
+    database.updateConversation(direct.id, { archived: true });
+    const cutoff = () => new Date(Date.now() - (database.getSettings().retentionDays * 86_400_000) - 1000).toISOString();
+    assert.deepEqual((await database.pruneHistory({ before: cutoff() })).ids, [], "neither thread is stale right after its archive");
+    assert.equal(database.getConversation(viaTask.id).archived, 1);
+    age([viaTask.id, direct.id]);
+    assert.deepEqual((await database.pruneHistory({ before: cutoff() })).ids.sort(), [viaTask.id, direct.id].sort(),
+      "both become eligible once the retention window has passed since the archive");
+    assert.equal(database.getTask(viaTask.taskId), undefined);
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("task status reads only unsettled runs, whatever the settled run history", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-task-status-plan-"));
+  const filename = path.join(directory, "outright.db");
+  const database = createOutrightDatabase({ filename });
+  try {
+    const history = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Long history", provider: "codex" });
+    const busy = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Busy", provider: "codex" });
+    const template = database.createRun({ conversationId: history.id, provider: "codex", approvalPolicy: "read-only", prompt: "done" });
+    database.updateRun(template.id, { status: "completed" });
+    database.createRun({ conversationId: busy.id, provider: "codex", approvalPolicy: "read-only", prompt: "queued" });
+    const writer = new Database(filename);
+    try {
+      const row = writer.prepare("SELECT * FROM runs WHERE id = ?").get(template.id);
+      const columns = Object.keys(row);
+      const insert = writer.prepare(`INSERT INTO runs (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`);
+      writer.transaction(() => {
+        for (let index = 0; index < 20_000; index += 1) insert.run(...columns.map((column) => column === "id" ? `settled-${index}` : row[column]));
+      })();
+      for (const [sql, values] of [[`${taskSelectSql()} WHERE t.archived = 0 AND u.level IS NOT NULL`, []], [`${taskSelectSql(true)} WHERE t.id = ?`, [busy.taskId, busy.taskId]]]) {
+        const plan = writer.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...values).map((step) => step.detail).join("\n");
+        assert.match(plan, /SCAN s\b/, plan);
+        assert.doesNotMatch(plan, /SCAN (r|runs|c|conversations)\b/, plan);
+      }
+    } finally { writer.close(); }
+    assert.equal(database.getTask(busy.taskId).status, "running");
+    assert.equal(database.getTask(history.taskId).status, "idle");
+    assert.deepEqual(database.listTasks({ status: "running" }).tasks.map((task) => task.id), [busy.taskId]);
+    assert.deepEqual(database.listTasks({ status: "idle" }).tasks.map((task) => task.id), [history.taskId]);
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("a discovered scope id longer than 512 characters can be created, migrated and filtered", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    // project-scanner ids are slugs of commonPath:projectPath, as long as the paths.
+    const projectId = `users-ar-${"deep-directory-".repeat(60)}repo-git-users-ar-${"deep-directory-".repeat(60)}repo`;
+    const worktreeId = `${projectId}-main`;
+    assert.ok(projectId.length > 1500);
+    const thread = database.createConversation({ projectId, worktreeId, worktreePath: "/tmp/deep", title: "Deep", provider: "codex" });
+    const task = database.createTask({ scopeKind: "project", projectId, title: "Deep project" });
+    assert.deepEqual(database.listTasks({ projectId }).tasks.map((row) => row.id).sort(), [thread.taskId, task.id].sort());
+    assert.deepEqual(database.listTasks({ worktreeId }).tasks.map((row) => row.id), [thread.taskId]);
+    assert.throws(() => database.listTasks({ projectId: "p".repeat(16 * 1024 + 1) }), (error) => error.statusCode === 400);
+    assert.throws(() => database.createTask({ scopeKind: "project", projectId: "p".repeat(16 * 1024 + 1), title: "Too long" }), (error) => error.statusCode === 400);
+  } finally { database.close(); }
+});
+
+test("a task without a visible thread is hidden by moving, archiving and retention alike", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-task-visible-rule-"));
+  const filename = path.join(directory, "outright.db");
+  const database = createOutrightDatabase({ filename, runtimeLease: true });
+  try {
+    const first = database.createConversation({ projectId: "p", worktreeId: "a", worktreePath: "/tmp/a", title: "Archived", provider: "codex" });
+    const second = database.createConversation({ projectId: "p", worktreeId: "a", worktreePath: "/tmp/a", title: "Moved", provider: "codex", taskId: first.taskId });
+    database.updateConversation(first.id, { archived: true });
+    assert.equal(database.getTask(first.taskId).archived, false, "a visible thread keeps its task open");
+    const moved = database.moveConversation(second.id, { projectId: "p", worktreeId: "b", worktreePath: "/tmp/b" });
+    assert.deepEqual([database.getTask(first.taskId).archived, database.getTask(first.taskId).threadCount], [true, 1]);
+    assert.equal(moved.previousTaskId, first.taskId, "the move reports the task it committed the thread away from");
+    await database.deleteArchivedConversation(first.id, first.id);
+    assert.equal(database.getTask(first.taskId), undefined, "the hidden task leaves with its last thread");
+
+    // The live batch path and the shadow worker for an oversized row agree.
+    for (const body of ["small", "x".repeat(4 * 1024 * 1024)]) {
+      const kept = database.createConversation({ projectId: "p", worktreeId: "a", worktreePath: "/tmp/a", title: "Kept", provider: "codex" });
+      const message = database.addMessage({ conversationId: kept.id, role: "assistant", body: "small" });
+      const writer = new Database(filename);
+      try { writer.prepare("UPDATE messages SET body = ? WHERE id = ?").run(body, message.id); }
+      finally { writer.close(); }
+      database.updateConversation(kept.id, { archived: true });
+      database.updateTask(kept.taskId, { archived: false, objective: "Still planned" });
+      assert.equal((await database.deleteArchivedConversation(kept.id, kept.id)).deleted, 1);
+      const emptied = database.getTask(kept.taskId);
+      assert.deepEqual([emptied.archived, emptied.threadCount, emptied.objective], [true, 0, "Still planned"],
+        "an open task left without threads is hidden, not deleted");
+      assert.equal(database.listTasks().tasks.some((task) => task.id === kept.taskId), false);
+    }
+  } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("archive changes that reach threads through their task are announced once after commit", () => {
+  const changes = [];
+  const database = createOutrightDatabase({ filename: ":memory:", onTaskArchiveChanged: (change) => changes.push(change) });
+  try {
+    const first = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "One", provider: "codex" });
+    const second = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Two", provider: "codex", taskId: first.taskId });
+    const own = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Own", provider: "codex", taskId: first.taskId });
+    database.updateConversation(own.id, { archived: true });
+    database.updateTask(first.taskId, { title: "Renamed" });
+    assert.deepEqual(changes, [], "neither an own-thread archive nor a rename changes another thread's visibility");
+    database.updateTask(first.taskId, { archived: true });
+    database.updateTask(first.taskId, { archived: true });
+    assert.deepEqual(changes, [{ taskId: first.taskId, archived: true, conversationIds: [first.id, second.id], conversationIdsTruncated: false }]);
+    changes.length = 0;
+    database.updateConversation(second.id, { archived: false });
+    assert.deepEqual(changes, [{ taskId: first.taskId, archived: false, conversationIds: [first.id, second.id], conversationIdsTruncated: false }],
+      "restoring one thread restores its task and every sibling it hid");
+    assert.equal(database.getConversation(first.id).archived, 0);
+    assert.equal(database.getConversation(own.id).archived, 1);
+  } finally { database.close(); }
 });

@@ -133,10 +133,14 @@ try {
     if (!shadow.prepare("DELETE FROM conversations WHERE id = ? AND deleting = 1").run(conversationId).changes) {
       throw new Error("Archive marker disappeared during shadow cleanup");
     }
-    // Match live retention: an archived task leaves with its last thread, and
-    // before the task rebuild a backfilled task reuses its conversation's id.
-    if (taskId) shadow.prepare("DELETE FROM tasks WHERE id = ? AND archived = 1 AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = ?)").run(taskId, taskId);
-    else if (!ready) shadow.prepare("DELETE FROM tasks WHERE id = ?").run(conversationId);
+    // Match live retention: an archived task leaves with its last thread, an
+    // open one left without visible threads is hidden, and before the task
+    // rebuild a backfilled task reuses its conversation's id.
+    if (taskId) {
+      shadow.prepare("DELETE FROM tasks WHERE id = ? AND archived = 1 AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = ?)").run(taskId, taskId);
+      shadow.prepare(`UPDATE tasks SET archived = 1, updated_at = ? WHERE id = ? AND archived = 0
+        AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id AND archived = 0 AND deleting = 0)`).run(new Date().toISOString(), taskId);
+    } else if (!ready) shadow.prepare("DELETE FROM tasks WHERE id = ?").run(conversationId);
     shadow.prepare("UPDATE retained_usage SET legacy_ceiling = MAX(legacy_ceiling, bytes + 1048576) WHERE id = 1").run();
     shadow.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
       .run("retention.archived.deleted", conversationId, "{}", new Date().toISOString());

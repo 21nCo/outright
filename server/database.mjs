@@ -43,6 +43,10 @@ const TASK_RESPONSE_BYTES = 512 * 1024;
 const TASK_THREAD_LIMIT = 200;
 const TASK_THREAD_BYTES = 256 * 1024;
 const TASK_THREAD_FIELD_CHARACTERS = 256;
+// Scope ids come from discovered paths. One bound serves creation and list
+// filters; it matches Node's default request header limit, so any id a URL
+// can carry is accepted, and slugs of PATH_MAX paths fit with room to spare.
+const TASK_SCOPE_ID_BYTES = 16 * 1024;
 const RETAINED_COLUMNS = [
   ["settings", "key, value"],
   ["spaces", "id, name, created_at"],
@@ -403,6 +407,12 @@ export function createOutrightDatabase(options = {}) {
       if (error?.message?.includes("OUTRIGHT_RETAINED_LIMIT")) throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
       throw error;
     }
+  }
+
+  // Effective thread visibility changed through a task. Announced only after
+  // the change commits.
+  function announceTaskArchive(change) {
+    if (change?.conversationIds.length) options.onTaskArchiveChanged?.(change);
   }
 
   function configuredRetainedLimitBytes() {
@@ -905,15 +915,17 @@ export function createOutrightDatabase(options = {}) {
         values.push(now(), id);
         const update = () => {
           db.prepare(`UPDATE conversations SET ${fields.join(", ")} WHERE id = ?`).run(...values);
-          if (patch.archived !== undefined) syncTaskArchive(db, id, patch.archived);
+          return patch.archived === undefined ? null : syncTaskArchive(db, id, patch.archived);
         };
         // Archiving makes old history eligible for cleanup even after the
         // physical new-work gate closes. Use only half of the separate
         // recovery headroom so run and audit outcomes retain space.
-        withinRetainedBudget(update, retainedReserveBytes, archiveOnly);
+        announceTaskArchive(withinRetainedBudget(update, retainedReserveBytes, archiveOnly));
       }
       return this.getConversation(id);
     },
+    // The result names the task the thread left, read in the same
+    // transaction as the reassignment.
     moveConversation(id, destination) {
       if (db.prepare("SELECT deleting FROM conversations WHERE id = ?").get(id)?.deleting) {
         throw databaseError(409, "Archived conversation deletion is in progress");
@@ -923,7 +935,7 @@ export function createOutrightDatabase(options = {}) {
         throw databaseError(409, "Resolve the interrupted run before moving this conversation away from its recovery worktree");
       }
       const position = db.prepare("SELECT COALESCE(MAX(tab_position), -1) + 1 AS position FROM conversations WHERE project_id = ? AND worktree_id = ?").get(destination.projectId, destination.worktreeId).position;
-      withinRetainedBudget(() => {
+      const previousTaskId = withinRetainedBudget(() => {
         const timestamp = now();
         const current = db.prepare(`SELECT c.task_id AS taskId, c.project_id AS projectId, c.worktree_id AS worktreeId,
           c.worktree_path AS worktreePath, c.title, c.archived, t.archived AS taskArchived
@@ -942,13 +954,13 @@ export function createOutrightDatabase(options = {}) {
         if (!changed) throw databaseError(409, "Conversation is unavailable for moving");
         if (taskId !== current.taskId) {
           db.prepare("UPDATE tasks SET updated_at = ? WHERE id IN (?, ?)").run(timestamp, taskId, current.taskId);
-          // Like archiving its last visible thread, moving its last thread
-          // away hides the old task instead of listing it empty or deleting it.
-          db.prepare(`UPDATE tasks SET archived = 1 WHERE id = ? AND archived = 0
-            AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id AND deleting = 0)`).run(current.taskId);
+          // Like archiving its last visible thread, moving its last visible
+          // thread away hides the old task instead of listing it empty.
+          archiveTaskWithoutVisibleThreads(db, current.taskId, timestamp);
         }
+        return current.taskId;
       });
-      return this.getConversation(id);
+      return { ...this.getConversation(id), previousTaskId };
     },
     listTasks(filters = {}) {
       assertTasksReady(db);
@@ -958,7 +970,7 @@ export function createOutrightDatabase(options = {}) {
       const where = ["t.archived = ?"];
       const values = [filters.archived ? 1 : 0];
       for (const key of ["spaceId", "projectId", "worktreeId", "scopeKind", "status"]) {
-        if (filters[key] !== undefined && filters[key] !== null && (typeof filters[key] !== "string" || !filters[key] || filters[key].length > 512)) {
+        if (filters[key] !== undefined && filters[key] !== null && (typeof filters[key] !== "string" || !filters[key] || Buffer.byteLength(filters[key]) > TASK_SCOPE_ID_BYTES)) {
           throw databaseError(400, `Task ${key} filter is invalid`);
         }
       }
@@ -977,16 +989,18 @@ export function createOutrightDatabase(options = {}) {
       if (filters.status === "open") where.push("t.user_status = 'open'");
       else if (filters.status) {
         if (!["running", "waiting", "idle", "done"].includes(filters.status)) throw databaseError(400, "Task status must be running, waiting, idle, done, or open");
+        // Running and waiting tasks are found from the unsettled runs alone.
+        if (filters.status === "running" || filters.status === "waiting") where.push("u.level IS NOT NULL");
         where.push(`${TASK_STATUS_SQL} = ?`);
         values.push(filters.status);
       }
       if (after) { where.push("(t.updated_at < ? OR (t.updated_at = ? AND t.id < ?))"); values.push(after[0], after[0], after[1]); }
-      const rows = db.prepare(`${TASK_SELECT_SQL} WHERE ${where.join(" AND ")} ORDER BY t.updated_at DESC, t.id DESC LIMIT ?`).all(...values, limit + 1);
+      const rows = db.prepare(`${taskSelectSql()} WHERE ${where.join(" AND ")} ORDER BY t.updated_at DESC, t.id DESC LIMIT ?`).all(...values, limit + 1);
       return boundedTaskPage(rows, limit);
     },
     getTask(id, { threads = false } = {}) {
       assertTasksReady(db);
-      const task = hydrateTask(db.prepare(`${TASK_SELECT_SQL} WHERE t.id = ?`).get(id));
+      const task = hydrateTask(db.prepare(`${taskSelectSql(true)} WHERE t.id = ?`).get(id, id));
       if (!task || !threads) return task;
       // Thread summaries are projected short in SQLite and capped by bytes,
       // so legacy multi-MiB titles never reach the response in full. Threads
@@ -1040,14 +1054,21 @@ export function createOutrightDatabase(options = {}) {
       const entries = Object.entries(values);
       if (!entries.length) return this.getTask(id);
       const archiveOnly = entries.length === 1 && values.archived === 1;
-      withinRetainedBudget(() => {
+      announceTaskArchive(withinRetainedBudget(() => {
         if (values.archived === 1 && db.prepare(`SELECT 1 FROM conversations AS c JOIN runs AS r ON r.conversation_id = c.id
           WHERE c.task_id = ? AND r.status = 'interrupted' AND r.recovery_decision IS NULL LIMIT 1`).get(id)) {
           throw databaseError(409, "Resolve the interrupted run before archiving this task", { code: "RUN_RECOVERY_REQUIRED" });
         }
+        const timestamp = now();
+        const wasArchived = db.prepare("SELECT archived FROM tasks WHERE id = ?").get(id)?.archived;
         db.prepare(`UPDATE tasks SET ${entries.map(([key]) => `${columns[key]} = ?`).join(", ")}, updated_at = ? WHERE id = ?`)
-          .run(...entries.map(([, value]) => value), now(), id);
-      }, retainedReserveBytes, archiveOnly);
+          .run(...entries.map(([, value]) => value), timestamp, id);
+        if (wasArchived === undefined || values.archived === undefined || values.archived === wasArchived) return null;
+        // Hiding or showing threads through their task stamps them like a
+        // direct archive or restore, so retention ages both the same way.
+        db.prepare("UPDATE conversations SET updated_at = ? WHERE task_id = ? AND archived = 0 AND deleting = 0").run(timestamp, id);
+        return taskArchiveChange(db, id, values.archived === 1);
+      }, retainedReserveBytes, archiveOnly));
       return this.getTask(id);
     },
     listMessages(conversationId) {
@@ -3203,19 +3224,24 @@ function archivedConversationSql(db) {
 // reads their current status. Running work wins over a pending recovery
 // choice, and a user's done overrides both. A later waiting cause (OUT-63
 // awaiting_input) adds a level here without a schema change.
-const TASK_UNSETTLED_SQL = `unsettled AS MATERIALIZED (SELECT c.task_id AS task_id,
-    MAX(CASE WHEN r.status IN ('queued', 'launching', 'running') THEN 2 ELSE 1 END) AS level
-  FROM recovery_scope AS s JOIN runs AS r ON r.id = s.run_id JOIN conversations AS c ON c.id = r.conversation_id
-  WHERE r.status IN ('queued', 'launching', 'running') OR (r.status = 'interrupted' AND r.recovery_decision IS NULL)
-  GROUP BY c.task_id)`;
+// CROSS JOIN fixes the loop order: the scan visits only recovery_scope's
+// unsettled runs and reaches runs and conversations by primary key, so its
+// cost never grows with settled run history. A detail read also keeps only
+// the requested task's runs.
 const TASK_STATUS_SQL = `CASE WHEN t.user_status = 'done' THEN 'done' WHEN u.level = 2 THEN 'running'
   WHEN u.level = 1 THEN 'waiting' ELSE 'idle' END`;
-const TASK_SELECT_SQL = `WITH ${TASK_UNSETTLED_SQL}
+export function taskSelectSql(single = false) {
+  return `WITH unsettled AS MATERIALIZED (SELECT c.task_id AS task_id,
+    MAX(CASE WHEN r.status IN ('queued', 'launching', 'running') THEN 2 ELSE 1 END) AS level
+  FROM recovery_scope AS s CROSS JOIN runs AS r ON r.id = s.run_id CROSS JOIN conversations AS c ON c.id = r.conversation_id
+  WHERE (r.status IN ('queued', 'launching', 'running') OR (r.status = 'interrupted' AND r.recovery_decision IS NULL))${single ? " AND c.task_id = ?" : ""}
+  GROUP BY c.task_id)
   SELECT t.id, t.scope_kind AS scopeKind, t.space_id AS spaceId, t.project_id AS projectId, t.worktree_id AS worktreeId,
     t.worktree_path AS worktreePath, t.title, t.objective, t.origin, t.user_status AS userStatus, ${TASK_STATUS_SQL} AS status,
     t.archived, (SELECT COUNT(*) FROM conversations WHERE task_id = t.id AND deleting = 0) AS threadCount,
     t.created_at AS createdAt, t.updated_at AS updatedAt
   FROM tasks AS t LEFT JOIN unsettled AS u ON u.task_id = t.id`;
+}
 
 function hydrateTask(row) { return row ? { ...row, archived: row.archived === 1 } : row; }
 
@@ -3252,7 +3278,7 @@ export function normalizeTaskInput(input) {
   for (const key of ["spaceId", "projectId", "worktreeId", "worktreePath"]) {
     const value = input[key];
     if (required.includes(key)) {
-      if (typeof value !== "string" || !value || Buffer.byteLength(value) > 4096) throw databaseError(400, `A ${input.scopeKind} task requires ${key}`);
+      if (typeof value !== "string" || !value || Buffer.byteLength(value) > TASK_SCOPE_ID_BYTES) throw databaseError(400, `A ${input.scopeKind} task requires ${key}`);
     } else if (value !== undefined && value !== null) throw databaseError(400, `A ${input.scopeKind} task cannot name ${key}`);
   }
   if (input.origin !== undefined && !["user", "outbot"].includes(input.origin)) throw databaseError(400, "Task origin must be user or outbot");
@@ -3293,19 +3319,41 @@ function requireThreadTask(db, taskId, target) {
 // A thread archived or restored through the conversation flow keeps a
 // single-thread task in step: restoring makes its task visible, and archiving
 // the last visible thread archives the task.
+// Restoring a thread that its task hid also unhides its siblings, so the
+// change is returned for announcement.
 function syncTaskArchive(db, conversationId, archived) {
-  if (!conversationTasksReady(db)) return;
+  if (!conversationTasksReady(db)) return null;
   const taskId = db.prepare("SELECT task_id FROM conversations WHERE id = ?").get(conversationId)?.task_id;
-  if (!taskId) return;
-  if (!archived) db.prepare("UPDATE tasks SET archived = 0, updated_at = ? WHERE id = ? AND archived = 1").run(now(), taskId);
-  else db.prepare(`UPDATE tasks SET archived = 1, updated_at = ? WHERE id = ? AND archived = 0
-    AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id AND archived = 0 AND deleting = 0)`).run(now(), taskId);
+  if (!taskId) return null;
+  if (archived) {
+    archiveTaskWithoutVisibleThreads(db, taskId, now());
+    return null;
+  }
+  if (!db.prepare("UPDATE tasks SET archived = 0, updated_at = ? WHERE id = ? AND archived = 1").run(now(), taskId).changes) return null;
+  return taskArchiveChange(db, taskId, false);
 }
 
-// Retention removes an archived thread; its task goes with it only when the
-// task is archived too and has no other thread.
+// The one "no visible thread" rule: a task whose threads are all archived,
+// deleting or gone is hidden, never deleted.
+function archiveTaskWithoutVisibleThreads(db, taskId, timestamp) {
+  db.prepare(`UPDATE tasks SET archived = 1, updated_at = ? WHERE id = ? AND archived = 0
+    AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id AND archived = 0 AND deleting = 0)`).run(timestamp, taskId);
+}
+
+// The threads whose visibility follows the task, bounded for one event.
+function taskArchiveChange(db, taskId, archived) {
+  const rows = db.prepare(`SELECT id FROM conversations WHERE task_id = ? AND archived = 0 AND deleting = 0
+    ORDER BY tab_position, rowid LIMIT ?`).all(taskId, TASK_THREAD_LIMIT + 1);
+  return { taskId, archived, conversationIds: rows.slice(0, TASK_THREAD_LIMIT).map((row) => row.id),
+    conversationIdsTruncated: rows.length > TASK_THREAD_LIMIT };
+}
+
+// Retention removes an archived thread. A task left without threads goes
+// with it when archived; an open one is hidden, never left listed empty.
 function deleteOrphanedTask(db, taskId) {
-  if (taskId) db.prepare("DELETE FROM tasks WHERE id = ? AND archived = 1 AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = ?)").run(taskId, taskId);
+  if (!taskId) return;
+  db.prepare("DELETE FROM tasks WHERE id = ? AND archived = 1 AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = ?)").run(taskId, taskId);
+  archiveTaskWithoutVisibleThreads(db, taskId, now());
 }
 
 function decodePageCursor(cursor, message) {

@@ -66,7 +66,12 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     if (runRecovery.phase !== "complete") { runRecovery.resumeDeferred = true; return; }
     if (!shuttingDown) agents.resumeQueued();
   }
-  const database = databaseFactory({ runtimeLease: true, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, onMigrationComplete: () => {
+  const database = databaseFactory({ runtimeLease: true, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, onTaskArchiveChanged: (change) => {
+    // A task's threads share its worktree, and the conversation consumer
+    // reloads that worktree's tabs, so one event covers them all. It names no
+    // single conversation, so the open tab stays selected.
+    publish({ type: "conversation.updated", payload: change });
+  }, onMigrationComplete: () => {
     resumeQueuedAfterRecovery();
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
   }, onDeletionWorkerStart: () => {
@@ -648,8 +653,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       }
       const conversationMoveMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/move$/);
       if (conversationMoveMatch && request.method === "POST") {
-        const original = database.getConversation(conversationMoveMatch[1]);
-        if (!original) throw apiError(404, "Conversation not found");
+        if (!database.getConversation(conversationMoveMatch[1])) throw apiError(404, "Conversation not found");
         const body = await readJson(request);
         if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Move request must be a JSON object");
         const taskId = requestTaskId(body);
@@ -658,11 +662,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           throw apiError(409, "Resolve the interrupted run before moving this conversation away from its recovery worktree", { code: "RUN_RECOVERY_REQUIRED" });
         }
         const { worktreePath: destinationPath } = await resolveWorktreeTarget(body);
-        const conversation = editRetainedData(() => database.moveConversation(conversationMoveMatch[1],
+        const { previousTaskId, ...conversation } = editRetainedData(() => database.moveConversation(conversationMoveMatch[1],
           { projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath, taskId }));
         database.audit("conversation.moved", { target: conversation.id, projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath, taskId: conversation.taskId });
         publish({ type: "conversation.updated", conversationId: conversation.id, payload: conversation });
-        if (conversation.taskId !== original.taskId) publishTasksChanged([original.taskId, conversation.taskId], "thread");
+        if (conversation.taskId !== previousTaskId) publishTasksChanged([previousTaskId, conversation.taskId], "thread");
         return json(response, 200, conversation);
       }
       const runCreateMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/runs$/);

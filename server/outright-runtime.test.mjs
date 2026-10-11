@@ -2924,7 +2924,7 @@ function captureEvents(runtime) {
   const events = [];
   runtime.eventHub.connect({ readyState: 1, bufferedAmount: 0, send(encoded) { events.push(JSON.parse(encoded)); }, close() {} });
   return { taskChanges: () => events.filter((event) => event.type === "tasks.changed").map((event) => event.payload),
-    clear: () => { events.length = 0; } };
+    of: (type) => events.filter((event) => event.type === type), clear: () => { events.length = 0; } };
 }
 
 async function callRuntime(runtime, method, url, body) {
@@ -3105,3 +3105,56 @@ test("tasks and their derived status survive a runtime restart", async () => {
     rmSync(dataDirectory, { recursive: true, force: true });
   }
 });
+
+test("task archive changes notify the conversation consumer once without moving the open tab", withRuntime(async (runtime) => {
+  const thread = (title, taskId) => runtime.database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title, provider: "codex", taskId });
+  const first = thread("First");
+  const second = thread("Second", first.taskId);
+  const events = captureEvents(runtime);
+  const archived = await callRuntime(runtime, "PATCH", `/api/tasks/${first.taskId}`, { archived: true });
+  assert.equal(archived.statusCode, 200, archived.raw);
+  const hidden = events.of("conversation.updated");
+  assert.equal(hidden.length, 1);
+  assert.equal(hidden[0].conversationId, undefined, "no single conversation is named, so the consumer keeps its selection");
+  assert.deepEqual(hidden[0].payload, { taskId: first.taskId, archived: true, conversationIds: [first.id, second.id], conversationIdsTruncated: false });
+  assert.deepEqual((await callRuntime(runtime, "GET", "/api/conversations?projectId=p&worktreeId=w")).body.conversations, []);
+
+  events.clear();
+  const restored = await callRuntime(runtime, "PATCH", `/api/conversations/${second.id}`, { archived: false });
+  assert.equal(restored.statusCode, 200, restored.raw);
+  // One event for every sibling its task hid, then the restored thread's
+  // own event, which selects it as a direct restore always has.
+  assert.deepEqual(events.of("conversation.updated").map((event) => [event.conversationId, event.payload.conversationIds]),
+    [[undefined, [first.id, second.id]], [second.id, undefined]]);
+  assert.equal((await callRuntime(runtime, "GET", "/api/conversations?projectId=p&worktreeId=w")).body.conversations.length, 2);
+  events.clear();
+  await callRuntime(runtime, "PATCH", `/api/tasks/${first.taskId}`, { title: "Renamed" });
+  assert.deepEqual(events.of("conversation.updated"), [], "a task edit that hides nothing leaves the tabs alone");
+}));
+
+test("overlapping moves announce the task each move actually committed the thread away from", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const target = { projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path };
+  const conversation = runtime.database.createConversation({ ...target, title: "Contested", provider: "codex" });
+  const linkedPath = path.join(path.dirname(project.path), "linked");
+  const added = spawnSync("git", ["-C", project.path, "worktree", "add", "-b", "linked", linkedPath], { encoding: "utf8" });
+  assert.equal(added.status, 0, added.stderr);
+  const linked = (await runtime.projects(true)).projects.find((item) => item.id === project.id).worktrees.find((item) => item.isLinked);
+  const events = captureEvents(runtime);
+  // The first move reads its request body only after a second move commits.
+  const slow = new Readable({ read() {} });
+  Object.assign(slow, { method: "POST", url: `/api/conversations/${conversation.id}/move`, headers: { host: "localhost:4173" } });
+  const slowResponse = responseCapture();
+  const slowMove = runtime.handleRequest(slow, slowResponse);
+  const fast = await callRuntime(runtime, "POST", `/api/conversations/${conversation.id}/move`, { projectId: project.id, worktreeId: linked.id, worktreePath: linked.path });
+  assert.equal(fast.statusCode, 200, fast.raw);
+  slow.push(JSON.stringify(target));
+  slow.push(null);
+  await slowMove;
+  assert.equal(slowResponse.statusCode, 200, slowResponse.raw);
+  assert.deepEqual(events.taskChanges(), [
+    { taskIds: [conversation.taskId, fast.body.taskId], reason: "thread" },
+    { taskIds: [fast.body.taskId, slowResponse.body.taskId], reason: "thread" },
+  ]);
+  assert.equal(slowResponse.body.previousTaskId, undefined, "the committed previous task stays out of the conversation payload");
+  assert.equal(runtime.database.getTask(fast.body.taskId).archived, true);
+}));
