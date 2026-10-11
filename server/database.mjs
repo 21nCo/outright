@@ -181,6 +181,8 @@ export function createOutrightDatabase(options = {}) {
   let deletionTickKind;
   let deletionCursor = 0;
   let deletionScanWrapped = false;
+  // Where the last task retention scan stopped, so the next one continues.
+  const taskRetentionCursor = { after: ["", ""] };
   let migrationError = null;
   const deletionsInFlight = new Set();
   const deletionWorkers = new Set();
@@ -222,7 +224,7 @@ export function createOutrightDatabase(options = {}) {
   };
   const deletionContext = { isClosing: () => closing, filename: storageFilename, currentDb: () => db,
     workers: deletionWorkers, lockGate: options.deletionWorkerGate, cutoverStatGate: options.deletionCutoverStatGate,
-    cutoverCloseGate: options.deletionCutoverCloseGate, copyGate: options.deletionCopyGate,
+    cutoverCloseGate: options.deletionCutoverCloseGate, cutoverPromoteGate: options.deletionCutoverPromoteGate, copyGate: options.deletionCopyGate,
     copyStepGate: options.deletionCopyStepGate, copyPhase: options.deletionCopyPhase,
     canMaintain: () => activeMessageFinds === 0 && deletionsInFlight.size === 1,
     onWorkerStart: () => {
@@ -256,7 +258,7 @@ export function createOutrightDatabase(options = {}) {
       db = undefined;
       options.onDeletionWorkerStart?.();
     },
-    onWorkerExit: (taskIds = []) => {
+    onWorkerExit: (cutover) => {
       if (!closing && !db) {
         db = openDataConnection(storageFilename);
         reserveRecoveryHeadroom(db);
@@ -265,9 +267,12 @@ export function createOutrightDatabase(options = {}) {
       maintenance = false;
       maintenanceCapacity = undefined;
       maintenanceError = undefined;
-      // A committed shadow cutover changed its thread's task on another
-      // connection. It is announced once the reopened store can be read.
-      if (taskIds.length && !closing) options.onTasksChanged?.({ taskIds, truncated: false });
+      // A shadow cutover changes its thread's task on another connection.
+      // Recovery may have kept or rolled back a failed one, so the reopened
+      // store, not the worker's result, shows whether the thread is gone.
+      if (cutover && !closing && !db.prepare("SELECT 1 FROM conversations WHERE id = ?").get(cutover.id)) {
+        options.onTasksChanged?.({ taskIds: [cutover.taskId], truncated: false });
+      }
       releaseLeaseIfIdle();
       if (cleanupReconciliationPending) scheduleCleanupReconciliation();
       if (!closing) { continueMigrations(); scheduleDeletionResume(); }
@@ -842,7 +847,7 @@ export function createOutrightDatabase(options = {}) {
             }
           }
         }
-        const tasksDeleted = await deleteThreadlessArchivedTasks(() => (closing || maintenance ? null : db), cutoff, limit);
+        const tasksDeleted = await deleteThreadlessArchivedTasks(() => (closing || maintenance ? null : db), cutoff, limit, taskRetentionCursor);
         return { deleted: deleted.length, deferred, ids: deleted, tasksDeleted };
       })();
     },
@@ -2369,7 +2374,7 @@ function runPatchAssignments(patch) {
 // runtime connection; a giant legacy row is reclaimed in a shadow database
 // while the primary stays available for unrelated work. Only the final
 // cutover closes it behind the process lease.
-function deleteArchivedInBatches(db, id, inFlight, { automatic = false, cutoff, isClosing, filename, workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase, currentDb, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure }) {
+function deleteArchivedInBatches(db, id, inFlight, { automatic = false, cutoff, isClosing, filename, workers, lockGate, cutoverStatGate, cutoverCloseGate, cutoverPromoteGate, copyGate, copyStepGate, copyPhase, currentDb, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure }) {
   if (inFlight.has(id)) throw databaseError(409, "Archived conversation deletion is in progress");
   inFlight.add(id);
   const run = async () => {
@@ -2379,7 +2384,7 @@ function deleteArchivedInBatches(db, id, inFlight, { automatic = false, cutoff, 
         if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
         db = currentDb();
         const result = await advanceArchiveDeletion(db, id,
-          { filename, workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing });
+          { filename, workers, lockGate, cutoverStatGate, cutoverCloseGate, cutoverPromoteGate, copyGate, copyStepGate, copyPhase, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing });
         if (result) return result;
         await new Promise((resolve) => setImmediate(resolve)); // NOSONAR S9382: yields between dependent archive deletion steps
       }
@@ -2388,7 +2393,7 @@ function deleteArchivedInBatches(db, id, inFlight, { automatic = false, cutoff, 
   return run();
 }
 
-async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing }) {
+async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, cutoverStatGate, cutoverCloseGate, cutoverPromoteGate, copyGate, copyStepGate, copyPhase, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing }) {
   const step = db.transaction(() => deleteArchivedBatch(db, id, filename)).immediate();
   if (step.done) { onWorkerExit(); return { deleted: 1, id }; }
   if (!step.oversized) return null;
@@ -2401,8 +2406,8 @@ async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, cut
   // are unavailable and, like the storage hook, nothing is announced.
   const taskId = conversationTasksReady(db) ? db.prepare("SELECT task_id FROM conversations WHERE id = ?").get(id)?.task_id : null;
   try {
-    await deleteOversizedArchivedRow(filename, id, step.oversized, { workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase,
-      onWorkerStart, onWorkerReady, onWorkerExit: (committed) => onWorkerExit(committed && taskId ? [taskId] : []), onWorkerRecoveryFailure });
+    await deleteOversizedArchivedRow(filename, id, step.oversized, { workers, lockGate, cutoverStatGate, cutoverCloseGate, cutoverPromoteGate, copyGate, copyStepGate, copyPhase,
+      onWorkerStart, onWorkerReady, onWorkerExit: () => onWorkerExit(taskId ? { id, taskId } : undefined), onWorkerRecoveryFailure });
   }
   catch (error) {
     if (isClosing()) throw databaseError(503, "Runtime closed during archived conversation deletion; cleanup will resume on restart");
@@ -2527,12 +2532,12 @@ function deleteArchivedBatch(db, id, filename) {
 }
 
 function deleteOversizedArchivedRow(filename, conversationId, oversized, lifecycle) {
-  const { workers, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure } = lifecycle;
+  const { workers, lockGate, cutoverStatGate, cutoverCloseGate, cutoverPromoteGate, copyGate, copyStepGate, copyPhase, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure } = lifecycle;
   return new Promise((resolve, reject) => {
     let worker;
     try {
       worker = new Worker(new URL("./archive-delete-worker.mjs", import.meta.url),
-        { workerData: { filename, conversationId, ...oversized, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase } });
+        { workerData: { filename, conversationId, ...oversized, lockGate, cutoverStatGate, cutoverCloseGate, cutoverPromoteGate, copyGate, copyStepGate, copyPhase } });
     } catch (error) { reject(error); return; }
     workers.add(worker);
     let reply;
@@ -2558,7 +2563,7 @@ function deleteOversizedArchivedRow(filename, conversationId, oversized, lifecyc
         if (problem) await recoverArchiveOnWorker(filename,
           ["ARCHIVE_SNAPSHOT_CHANGED", "ARCHIVE_DEFERRED", "ARCHIVE_SOURCE_BUSY"].includes(problem.code));
         workers.delete(worker);
-        onWorkerExit(!problem);
+        onWorkerExit();
         if (problem) reject(problem);
         else resolve();
       } catch (error) {
@@ -3443,31 +3448,43 @@ function deleteOrphanedTask(db, taskId) {
 
 // An archived task left without threads (a moved-away source, a standalone
 // task) ages for retention like an archived thread. Each short transaction
-// takes one page of threadless candidates, so archived tasks that keep their
-// threads cost no pages; the delete re-checks every condition, so a
-// concurrent restore or a new thread keeps its task.
-async function deleteThreadlessArchivedTasks(currentDb, cutoff, limit) {
+// examines one page of stale archived tasks, threadless or not, and a call
+// examines at most one page per task it may delete. The cursor continues
+// from the previous call and wraps at the end, so tasks behind a large
+// archive that keeps its threads are reached by later calls. The delete
+// re-checks every condition, so a concurrent restore or a new thread keeps
+// its task.
+async function deleteThreadlessArchivedTasks(currentDb, cutoff, limit, cursor) {
+  const pageSize = 64;
   let deleted = 0;
-  let after = ["", ""];
-  while (deleted < limit) {
+  let examined = 0;
+  let wrapped = cursor.after[0] === "";
+  while (deleted < limit && examined < limit * pageSize) {
     const db = currentDb();
     if (!db || !conversationTasksReady(db)) break;
     const page = db.transaction(() => {
-      const rows = db.prepare(`SELECT id, updated_at AS updatedAt FROM tasks WHERE archived = 1 AND updated_at < ?
-        AND (updated_at, id) > (?, ?) AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id)
-        ORDER BY updated_at, id LIMIT 64`).all(cutoff, after[0], after[1]);
+      const rows = db.prepare(`SELECT id, updated_at AS updatedAt, NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id) AS threadless
+        FROM tasks WHERE archived = 1 AND updated_at < ? AND (updated_at, id) > (?, ?)
+        ORDER BY updated_at, id LIMIT ${pageSize}`).all(cutoff, ...cursor.after);
       const remove = db.prepare(`DELETE FROM tasks WHERE id = ? AND archived = 1 AND updated_at < ?
         AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id)`);
       let count = 0;
+      let scanned = 0;
       for (const row of rows) {
         if (deleted + count >= limit) break;
-        count += remove.run(row.id, cutoff).changes;
+        scanned += 1;
+        if (row.threadless) count += remove.run(row.id, cutoff).changes;
       }
-      return { rows, count };
+      return { rows, count, scanned };
     }).immediate();
     deleted += page.count;
-    if (page.rows.length < 64) break;
-    after = [page.rows.at(-1).updatedAt, page.rows.at(-1).id];
+    examined += page.scanned;
+    if (page.scanned) cursor.after = [page.rows[page.scanned - 1].updatedAt, page.rows[page.scanned - 1].id];
+    if (page.scanned === page.rows.length && page.rows.length < pageSize) {
+      cursor.after = ["", ""];
+      if (wrapped) break;
+      wrapped = true;
+    }
     await new Promise((resolve) => setImmediate(resolve)); // NOSONAR S9382: yields between task retention pages
   }
   return deleted;

@@ -2273,10 +2273,14 @@ test("a shadow cutover announces its task only once committed, after the store r
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-task-shadow-exit-"));
   const filename = path.join(directory, "outright.db");
   const copyGate = new Int32Array(new SharedArrayBuffer(4));
+  // Cutovers pass the promotion gate until it is armed with 0.
+  const promoteGate = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.store(promoteGate, 0, 2);
   // Each announcement of the thread's task records what a reader then sees.
   const reads = [];
   let kept;
-  const database = createOutrightDatabase({ filename, runtimeLease: true, deletionCopyGate: copyGate.buffer, onTasksChanged: (change) => {
+  const database = createOutrightDatabase({ filename, runtimeLease: true, deletionCopyGate: copyGate.buffer,
+    deletionCutoverPromoteGate: promoteGate.buffer, onTasksChanged: (change) => {
     if (!kept || !change.taskIds.includes(kept.taskId)) return;
     try { reads.push(database.getTask(kept.taskId)?.threadCount ?? "deleted"); } catch (error) { reads.push(error.statusCode); }
   } });
@@ -2313,9 +2317,28 @@ test("a shadow cutover announces its task only once committed, after the store r
     await until(gone, "the deferred cutover was not retried");
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(reads, ["deleted"], "only the committed cutover is announced, and it can be read");
+    // A cutover that fails after promoting its candidate is completed by
+    // recovery, so the deletion it committed is announced all the same.
+    kept = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Promoted", provider: "codex" });
+    const promotedMessage = database.addMessage({ conversationId: kept.id, role: "assistant", body: "small" });
+    const promotedWriter = new Database(filename);
+    try { promotedWriter.prepare("UPDATE messages SET body = ? WHERE id = ?").run("x".repeat(4 * 1024 * 1024), promotedMessage.id); }
+    finally { promotedWriter.close(); }
+    database.updateConversation(kept.id, { archived: true });
+    Atomics.store(promoteGate, 0, 0);
+    const promoted = database.deleteArchivedConversation(kept.id, kept.id);
+    await until(() => Atomics.load(promoteGate, 0) === 1, "the cutover did not promote its candidate");
+    reads.length = 0;
+    await assert.rejects(promoted, /Archive promotion probe timed out/);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(database.getConversation(kept.id), undefined, "recovery kept the promoted deletion");
+    assert.equal(database.getTask(kept.taskId), undefined, "its task left with its last thread");
+    assert.deepEqual(reads, ["deleted"], "the recovered cutover is announced once, after the store reopens");
   } finally {
     Atomics.store(copyGate, 0, 2);
     Atomics.notify(copyGate, 0);
+    Atomics.store(promoteGate, 0, 2);
+    Atomics.notify(promoteGate, 0);
     await database.close();
     rmSync(directory, { recursive: true, force: true });
   }
@@ -2448,13 +2471,15 @@ test("retention reclaims archived threadless tasks after the retention window, a
     assert.equal(database.getTask(database.getConversation(thread.id).taskId).archived, false);
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual([...new Set(reported)].sort(), [...archivedIds].sort(), "tasks.changed names each reclaimed task");
-    // Archived tasks that keep their threads cost no candidate pages.
+    // Archived tasks that keep their threads still cost examined rows, so
+    // each step reads one bounded page and a call one page per deletion it
+    // may make; later calls continue past them to eligible tasks.
     for (let index = 0; index < 200; index += 1) {
       const kept = database.createConversation({ ...where, title: `Pinned ${index}`, provider: "codex" });
       database.updateConversation(kept.id, { pinned: true });
       database.updateConversation(kept.id, { archived: true });
     }
-    const eligible = [0, 1].map((index) => database.createTask({ scopeKind: "project", projectId: "p", title: `Eligible ${index}` }));
+    const eligible = [0, 1].map((index) => database.createTask({ scopeKind: "project", projectId: "p", title: `Eligible ${index}`, objective: "o".repeat(16 * 1024) }));
     for (const task of eligible) database.updateTask(task.id, { archived: true });
     const ager = new Database(filename);
     try {
@@ -2463,15 +2488,47 @@ test("retention reclaims archived threadless tasks after the retention window, a
     } finally { ager.close(); }
     await new Promise((resolve) => setImmediate(resolve));
     reported.length = 0;
-    const transaction = Database.prototype.transaction;
-    let pages = 0;
-    Database.prototype.transaction = function countedTransaction(...args) { pages += 1; return transaction.apply(this, args); };
-    let bounded;
-    try { bounded = await database.pruneHistory({ before: cutoff(), limit: 1 }); }
-    finally { Database.prototype.transaction = transaction; }
-    assert.deepEqual([bounded.deleted, bounded.tasksDeleted, pages], [0, 1, 1], "one page reaches the eligible task behind 200 protected ones");
-    assert.equal((await database.pruneHistory({ before: cutoff() })).tasksDeleted, 1);
+    const retainedBefore = database.capacity().retainedBytes;
+    // Each candidate page records the rows it examined and the event-loop
+    // turn it ran on.
+    const prepare = Database.prototype.prepare;
+    let pages = [];
+    let turn = 0;
+    let ticking = true;
+    const tick = () => { turn += 1; if (ticking) setImmediate(tick); };
+    setImmediate(tick);
+    Database.prototype.prepare = function examinedRows(sql, ...rest) {
+      const statement = prepare.call(this, sql, ...rest);
+      if (!/^SELECT id, updated_at AS updatedAt\b[^;]*FROM tasks WHERE archived = 1 AND updated_at < \?/.test(sql)) return statement;
+      const all = statement.all.bind(statement);
+      statement.all = (...args) => { const rows = all(...args); pages.push({ rows: rows.length, turn }); return rows; };
+      return statement;
+    };
+    const calls = [];
+    try {
+      for (let call = 0; call < 8 && eligible.some((task) => database.getTask(task.id)); call += 1) {
+        pages = [];
+        calls.push({ tasksDeleted: (await database.pruneHistory({ before: cutoff(), limit: 1 })).tasksDeleted, pages });
+      }
+      pages = [];
+      calls.push({ tasksDeleted: (await database.pruneHistory({ before: cutoff(), limit: 4 })).tasksDeleted, pages });
+    } finally { Database.prototype.prepare = prepare; ticking = false; }
+    assert.deepEqual(calls[0].pages.map((page) => page.rows), [64], "a limit-1 call examines one page of protected tasks");
+    assert.equal(calls[0].tasksDeleted, 0, "eligible tasks behind the protected ones wait for later calls");
+    for (const { pages: steps } of calls) {
+      assert.ok(steps.every((page) => page.rows <= 64), "every step examines one bounded page");
+      for (let index = 1; index < steps.length; index += 1) assert.ok(steps[index].turn > steps[index - 1].turn, "a call yields between pages");
+    }
+    const examined = calls.at(-1).pages.map((page) => page.rows);
+    assert.ok(examined.length > 1 && examined.reduce((sum, rows) => sum + rows, 0) <= 4 * 64, `${examined} rows within a limit-4 budget`);
+    assert.deepEqual(calls.map((call) => call.tasksDeleted).reduce((sum, count) => sum + count, 0), 2, "later calls reach both eligible tasks");
     assert.equal(eligible.filter((task) => database.getTask(task.id)).length, 0);
+    assert.ok(retainedBefore - database.capacity().retainedBytes >= 2 * 16 * 1024, "their retained bytes are released");
+    assert.equal(database.getTask(pinned.taskId).archived, true, "archived tasks with threads are kept");
+    const probe = new Database(filename, { readonly: true });
+    try {
+      assert.equal(probe.prepare("SELECT COUNT(*) AS count FROM tasks WHERE archived = 1 AND EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id)").get().count, 201);
+    } finally { probe.close(); }
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual([...new Set(reported)].sort(), eligible.map((task) => task.id).sort());
   } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }

@@ -4,7 +4,7 @@ import { parentPort, workerData } from "node:worker_threads";
 import { archiveShadowPaths, cutoverArchiveShadow, fenceArchiveSource, prepareArchiveShadowCutover } from "./archive-shadow.mjs";
 import { trimAuditPage } from "./audit-retention.mjs";
 
-const { filename, conversationId, table, rowId, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase } = workerData;
+const { filename, conversationId, table, rowId, lockGate, cutoverStatGate, cutoverCloseGate, cutoverPromoteGate, copyGate, copyStepGate, copyPhase } = workerData;
 const ownership = {
   run_events: `SELECT 1 FROM run_events AS item JOIN runs ON runs.id = item.run_id
     WHERE item.id = ? AND runs.conversation_id = ?`,
@@ -222,7 +222,7 @@ try {
     Atomics.notify(signal, 0);
     if (Atomics.wait(signal, 0, 1, 5000) === "timed-out") throw new Error("Archive close-gap probe timed out");
   }
-  cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate });
+  cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate, cutoverPromoteGate });
   parentPort.postMessage({ ok: true });
 } catch (error) {
   parentPort.postMessage({ ok: false, error: error.message, code: error.code });
