@@ -1693,8 +1693,16 @@ test("a model the provider reports in place of the requested one is recorded vis
     { provider: "claude", model: "", lines: fixture, reported: "" },
     { provider: "anthropic-api", model: "claude-opus-5-5", lines: [start("claude-sonnet-5-5")], reported: "claude-sonnet-5-5" },
     { provider: "anthropic-api", model: "claude-opus-5-5", lines: [start("claude-opus-5-5")], reported: "" },
+    // Before, a different release sharing the requested prefix, and anything
+    // answering a blank direct request, matched and raised no notice.
+    { provider: "anthropic-api", model: "claude-opus-5", lines: [start("claude-opus-5-5")], reported: "claude-opus-5-5" },
+    { provider: "anthropic-api", model: "", lines: [start("claude-sonnet-5-5"), start("claude-sonnet-5-5")], reported: "claude-sonnet-5-5", requested: "claude-opus-5-5" },
+    { provider: "anthropic-api", model: "", lines: [start("claude-opus-5-5-20261001")], reported: "" },
+    { provider: "claude", model: "haiku", lines: [assistant("claude-haiku-4-5"), result], reported: "claude-haiku-4-5" },
+    // A missing-model failure is a CLI-written message, not another model answering.
+    { provider: "claude", model: "outright-missing-model", lines: readFileSync(new URL("../tests/fixtures/execution-adapters/claude/error-result.jsonl", import.meta.url), "utf8").split("\n").filter(Boolean), reported: "" },
   ];
-  for (const { provider, model, lines, reported } of cases) {
+  for (const { provider, model, lines, reported, requested = model } of cases) {
     const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider });
     const child = fakeChild();
     const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child,
@@ -1710,8 +1718,8 @@ test("a model the provider reports in place of the requested one is recorded vis
       const label = `${provider} ${model || "default"}`;
       assert.equal(notices.map((message) => message.payload.substitution.reported).join(","), reported, label);
       for (const notice of notices) {
-        assert.equal(notice.payload.substitution.requested, model, label);
-        assert.match(notice.body, new RegExp(`${notice.payload.substitution.reported} answered, not the requested model ${model}`), label);
+        assert.equal(notice.payload.substitution.requested, requested, label);
+        assert.match(notice.body, new RegExp(`${notice.payload.substitution.reported} answered, not the requested model ${requested}\\.`), label);
       }
       if (lines === fixture) assert.equal(database.messages.filter((message) => message.body === "Only README.md.").length, 1, `${label} keeps one final answer`);
     } finally { await manager.shutdown(); }

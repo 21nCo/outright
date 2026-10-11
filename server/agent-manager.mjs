@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildExecutionEnvironment, buildExecutionLaunch, DIRECT_PROVIDER_VARIABLES, isProviderSessionId, modelMatches, requireExecutionAdapter, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
+import { buildExecutionEnvironment, buildExecutionLaunch, DIRECT_PROVIDER_VARIABLES, isProviderSessionId, modelMatches, requestedModel, requireExecutionAdapter, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
 import { RESOURCE_BUDGETS, retainedTranscriptMessageBytes } from "./resource-budgets.mjs";
 
@@ -1115,16 +1115,18 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     }
   }
 
-  // A run records the model it asked for. When the provider reports that
-  // another model answered, the transcript says so durably, never silently.
+  // A run records the model it asked for, the adapter's default included.
+  // When the provider reports that another model answered, the transcript
+  // says so durably, never silently.
   function reportModelSubstitution(state, reported) {
-    if (typeof reported !== "string" || !reported || modelMatches(state.adapter, state.run.model, reported)) return;
+    const requested = requestedModel(state.adapter, state.run.model);
+    if (typeof reported !== "string" || !reported || !requested || modelMatches(state.adapter, requested, reported)) return;
     const model = truncateUtf8(reported, 200);
     state.substitutedModels ??= new Set();
     if (state.substitutedModels.has(model) || state.substitutedModels.size >= MAX_MODEL_SUBSTITUTION_NOTICES) return;
     state.substitutedModels.add(model);
-    persistTranscriptItem(state, { kind: "text", body: `${state.adapter.label} reported that ${model} answered, not the requested model ${state.run.model}.`,
-      payload: { substitution: { requested: state.run.model, reported: model } } });
+    persistTranscriptItem(state, { kind: "text", body: `${state.adapter.label} reported that ${model} answered, not the requested model ${requested}.`,
+      payload: { substitution: { requested, reported: model } } });
   }
 
   // Persists one completed ordered transcript item immediately. Assistant

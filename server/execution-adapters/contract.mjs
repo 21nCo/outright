@@ -80,12 +80,18 @@ export function defineAdapter(spec) {
   const unhonored = capabilities.unhonoredModels ?? {};
   if (Object.entries(unhonored).some(([mode, models]) => !modes.includes(mode) || !Array.isArray(models)
     || models.some((model) => !capabilities.models.includes(model)))) throw contractError(`${spec.id} unhonored models must be advertised models under supported policies`);
-  if (spec.modelAliases !== undefined && typeof spec.modelAliases !== "function") throw contractError(`${spec.id} modelAliases must be a function`);
+  // The model a blank request launches, when the adapter rather than its CLI picks it.
+  if (spec.defaultModel !== undefined && !capabilities.models.includes(spec.defaultModel)) throw contractError(`${spec.id} default model must be an advertised model`);
+  // Advertised aliases and the full ids the verified CLI resolves them to.
+  const aliases = spec.modelAliases ?? {};
+  if (!aliases || typeof aliases !== "object" || Object.entries(aliases).some(([alias, ids]) => !capabilities.models.includes(alias)
+    || !Array.isArray(ids) || !ids.length || ids.some((id) => !MODEL_PATTERN.test(id)))) throw contractError(`${spec.id} model aliases must map advertised models to model ids`);
   if (capabilities.structuredOutput !== "jsonl") throw contractError(`${spec.id} must stream JSON lines`);
   if (capabilities.resume && !spec.sessionIdentity?.nativeField) throw contractError(`${spec.id} resumes sessions but names no native session field`);
   for (const method of ["buildLaunch", "normalize"]) if (typeof spec[method] !== "function") throw contractError(`${spec.id} must implement ${method}`);
   return Object.freeze({
     ...spec,
+    modelAliases: Object.freeze(Object.fromEntries(Object.entries(aliases).map(([alias, ids]) => [alias, Object.freeze([...ids])]))),
     environment: Object.freeze([...(spec.kind === "harness" ? [] : spec.environment)]),
     capabilities: Object.freeze({
       ...capabilities,
@@ -180,9 +186,18 @@ export function validateRunConfiguration(adapter, { model = "", reasoningEffort,
   }
 }
 
+// The model a run asks for: its own, else the adapter's default. Empty when
+// the CLI picks, which leaves nothing to compare a reported model with.
+export function requestedModel(adapter, model) {
+  return model || adapter.defaultModel || "";
+}
+
 // Whether a model the provider reports answering is the requested one: the
-// same id, a dated snapshot of it, or one of the adapter's own aliases for it.
+// same id, a dated snapshot of it (-YYYYMMDD), or an id the adapter
+// documents for the alias. Any other suffix names another release. Resolve
+// the request with requestedModel first; an empty one matches nothing.
 export function modelMatches(adapter, requested, reported) {
-  if (!requested || reported === requested || reported.startsWith(`${requested}-`)) return true;
-  return Boolean(adapter.modelAliases?.(requested)?.some((prefix) => reported.startsWith(prefix)));
+  if (!requested) return false;
+  const aliased = Object.hasOwn(adapter.modelAliases, requested) ? adapter.modelAliases[requested] : [];
+  return [requested, ...aliased].some((id) => reported === id || (reported.startsWith(`${id}-`) && /^\d{8}$/.test(reported.slice(id.length + 1))));
 }

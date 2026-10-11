@@ -1762,9 +1762,12 @@ test("a direct-provider run streams through the supervised runtime with its scop
         response.writeHead(200, { "content-type": "text/event-stream" });
         const event = (data) => `data: ${JSON.stringify(data)}\n\n`;
         const delta = (text) => event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
-        if (requests.length === 3) response.end(`${delta(`key ${key.slice(0, 7)}`)}${delta(key.slice(7, 15))}${delta(`${key.slice(15)} kept`)}${event({ type: "error", error: { type: "api_error", message: JSON.stringify({ echoed: key }) } })}`);
+        const start = event({ type: "message_start", message: { model: "claude-opus-5-5", usage: { input_tokens: 1 } } });
+        if (requests.length === 3) response.end(`${start}${delta(`key ${key.slice(0, 7)}`)}${delta(key.slice(7, 15))}${delta(`${key.slice(15)} kept`)}${event({ type: "error", error: { type: "api_error", message: JSON.stringify({ echoed: key }) } })}`);
         // Then a key-bearing index on a delta that leaves a key prefix held.
-        else response.end(`${delta("index ")}${event({ type: "content_block_delta", index: key, delta: { type: "text_delta", text: key.slice(0, 5) } })}${event({ type: "message_stop" })}`);
+        else if (requests.length === 4) response.end(`${start}${delta("index ")}${event({ type: "content_block_delta", index: key, delta: { type: "text_delta", text: key.slice(0, 5) } })}${event({ type: "message_stop" })}`);
+        // Then text after the message's final event.
+        else response.end(`${start}${delta("whole")}${event({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } })}${event({ type: "message_stop" })}${delta(" late")}`);
       } else { response.writeHead(401, { "content-type": "application/json" }); response.end(unauthorized); }
     });
   });
@@ -1785,6 +1788,8 @@ test("a direct-provider run streams through the supervised runtime with its scop
       const completed = await send();
       assert.equal(completed.status, "completed", completed.error);
       assert.ok(runtime.database.listMessages(conversation.id).some((message) => message.role === "assistant" && JSON.stringify(message).includes("READY now")));
+      // A blank model launches the default, which is the model that answered.
+      assert.equal(runtime.database.listMessages(conversation.id).some((message) => message.payload?.substitution), false, "the defaulted model raises no notice");
       process.env.OUTRIGHT_ANTHROPIC_API_KEY = "sk-ant-revoked";
       const failed = await send();
       assert.equal(failed.status, "failed");
@@ -1803,7 +1808,13 @@ test("a direct-provider run streams through the supervised runtime with its scop
       const indexedStored = JSON.stringify([runtime.database.listMessages(conversation.id), runtime.database.listRunEvents(indexed.id), indexed]);
       assert.match(indexedStored, /index /, "the text before the malformed delta is kept");
       for (const form of [reflectedKey, JSON.stringify(reflectedKey).slice(1, -1)]) assert.equal(indexedStored.includes(form) || indexedStored.includes(JSON.stringify(form).slice(1, -1)), false);
-      assert.deepEqual(requests, ["sk-ant-runtime", "sk-ant-revoked", reflectedKey, reflectedKey]);
+      // Before, text after message_stop was stored and the run completed.
+      const late = await send();
+      assert.deepEqual([late.status, late.error], ["failed", "Anthropic API sent stream events out of order; the answer may be incomplete"]);
+      const lateStored = JSON.stringify(runtime.database.listMessages(conversation.id));
+      assert.match(lateStored, /whole/, "the answer before the break is kept");
+      assert.equal(lateStored.includes(" late"), false, "nothing after message_stop is stored");
+      assert.deepEqual(requests, ["sk-ant-runtime", "sk-ant-revoked", reflectedKey, reflectedKey, reflectedKey]);
     })();
   } finally {
     for (const [name, value] of [["OUTRIGHT_ANTHROPIC_API_KEY", saved.key], ["OUTRIGHT_ANTHROPIC_BASE_URL", saved.base]]) {

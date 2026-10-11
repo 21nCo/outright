@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { anthropicEndpoint, ENDPOINT_REQUIREMENT, MAX_OUTPUT_TOKENS } from "./anthropic-api-runner.mjs";
-import { ADAPTER_CONTRACT_VERSION, defineAdapter } from "./contract.mjs";
+import { ADAPTER_CONTRACT_VERSION, defineAdapter, requestedModel } from "./contract.mjs";
 
 // Bumped whenever the runner's argv or output stream changes.
 export const ANTHROPIC_RUNNER_VERSION = "1.0.0";
@@ -37,6 +37,7 @@ export const anthropicApiAdapter = defineAdapter({
     structuredOutput: "jsonl",
     hosted: true,
   },
+  defaultModel: "claude-opus-5-5",
   detect(environment = process.env) {
     if (!environment.OUTRIGHT_ANTHROPIC_API_KEY) return { available: false, version: "", reason: "Set OUTRIGHT_ANTHROPIC_API_KEY to enable Outright-managed Anthropic API runs" };
     if (!anthropicEndpoint(environment)) return { available: false, version: "", reason: `${ENDPOINT_REQUIREMENT}; fix or unset it to use api.anthropic.com` };
@@ -44,9 +45,9 @@ export const anthropicApiAdapter = defineAdapter({
   },
   buildLaunch({ run }) {
     // The key reaches the runner only through its scoped environment, never
-    // argv. A blank
-    // model means the adapter's advertised default, the first listed model.
-    const model = run.model || this.capabilities.models[0];
+    // argv. A blank model means the adapter's default, which is also what a
+    // reported model is compared with.
+    const model = requestedModel(this, run.model);
     return {
       executable: process.execPath,
       args: [RUNNER_PATH, "--model", model, "--", run.prompt],

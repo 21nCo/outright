@@ -25,9 +25,9 @@ export const claudeAdapter = defineAdapter({
   },
   sessionIdentity: { nativeField: "session_id" },
   parseVersion: parseSemanticVersion,
-  modelAliases(model) {
-    return this.capabilities.models.includes(model) ? [`claude-${model}-`] : [];
-  },
+  // What Claude Code 2.1.296 resolves each alias to. Another release
+  // answering for an alias is reported, not assumed equivalent.
+  modelAliases: { haiku: ["claude-haiku-5-5"], sonnet: ["claude-sonnet-5-5"], opus: ["claude-opus-5-5"] },
   buildLaunch({ run, sessionId }) {
     const mode = this.capabilities.permissionModes[run.approvalPolicy];
     const args = ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-prompts", "none", "--permission-mode", mode];
@@ -62,8 +62,9 @@ export const claudeAdapter = defineAdapter({
     }
     if (!events.length && raw.type !== "stream_event") events.push({ type: "provider.event", payload: raw });
     // The run's model is the one its own messages report, not system/init.
-    // Subagent messages and extra modelUsage entries may use other models.
-    if (raw.type === "assistant" && raw.parent_tool_use_id == null && typeof raw.message?.model === "string" && raw.message.model) {
+    // Subagent messages and extra modelUsage entries may use other models, and
+    // "<synthetic>" marks a message the CLI wrote itself, not a model answer.
+    if (raw.type === "assistant" && raw.parent_tool_use_id == null && typeof raw.message?.model === "string" && raw.message.model && raw.message.model !== "<synthetic>") {
       events.push({ type: "model", payload: { model: raw.message.model } });
     }
     return events;

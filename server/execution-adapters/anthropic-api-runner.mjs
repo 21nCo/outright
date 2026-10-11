@@ -189,34 +189,50 @@ async function execute(argv, environment, { protect, write, fail }) {
     hasData = true;
     return true;
   };
-  let stopped = false;
+  const malformedEvent = () => fail("api_error", "Anthropic API sent a malformed stream event");
+  const outOfOrder = () => fail("api_error", "Anthropic API sent stream events out of order; the answer may be incomplete");
+  // Leaving the read loop cancels the response body.
+  const overflow = () => fail("api_error", "Anthropic API stream event exceeded 1 MiB");
+  // A message is message_start, its content blocks, message_delta (whose
+  // stop reason the adapter checks), then message_stop as the last event.
+  // Pings, errors and event types Outright does not know may come anywhere
+  // before message_stop.
+  const NEXT_PHASE = {
+    message_start: { before: "content" },
+    content_block_start: { content: "content" },
+    content_block_delta: { content: "content" },
+    content_block_stop: { content: "content" },
+    message_delta: { content: "delta", delta: "delta" },
+    message_stop: { delta: "stopped" },
+  };
+  let phase = "before";
   let errored = false;
-  // The adapter fails a message_delta without a valid stop reason; a stream
-  // with none at all must not complete either.
-  let delta = false;
-  // Returns false when the stream can no longer be trusted. Text already
-  // written stays in the transcript; the run still fails.
+  // Returns the failure to report when the stream can no longer be trusted.
+  // Text already written stays in the transcript; the run still fails.
   const dispatch = async () => {
-    if (!hasData) return true;
+    if (!hasData) return null;
     const payload = data.toString("utf8", 0, dataBytes);
     dataBytes = 0;
     hasData = false;
     let event;
     try { event = JSON.parse(payload); }
-    catch { return false; }
-    if (!event || typeof event !== "object" || Array.isArray(event) || typeof event.type !== "string" || !event.type) return false;
-    if (event.type === "message_stop") stopped = true;
-    if (event.type === "message_delta") delta = true;
+    catch { return malformedEvent; }
+    if (!event || typeof event !== "object" || Array.isArray(event) || typeof event.type !== "string" || !event.type) return malformedEvent;
+    if (phase === "stopped") return outOfOrder;
+    if (Object.hasOwn(NEXT_PHASE, event.type)) {
+      if (!Object.hasOwn(NEXT_PHASE[event.type], phase)) return outOfOrder;
+      phase = NEXT_PHASE[event.type][phase];
+    }
     if (event.type === "error") errored = true;
     if (event.type === "content_block_delta" && event.delta?.type === "text_delta" && typeof event.delta.text === "string") {
       // A native block index is a non-negative integer; the held text is
       // later released under the last valid one.
-      if (!Number.isSafeInteger(event.index) || event.index < 0) return false;
+      if (!Number.isSafeInteger(event.index) || event.index < 0) return malformedEvent;
       textIndex = event.index;
       event = { ...event, delta: { ...event.delta, text: text.push(event.delta.text) } };
     }
     await write(event);
-    return true;
+    return null;
   };
   // Every exit releases the held text before its final record, so the
   // answer keeps everything that was not the key.
@@ -224,9 +240,6 @@ async function execute(argv, environment, { protect, write, fail }) {
     const rest = text.flush();
     if (rest) await write({ type: "content_block_delta", index: textIndex, delta: { type: "text_delta", text: rest } });
   };
-  const malformedEvent = () => fail("api_error", "Anthropic API sent a malformed stream event");
-  // Leaving the read loop cancels the response body.
-  const overflow = () => fail("api_error", "Anthropic API stream event exceeded 1 MiB");
   // SSE lines end in CRLF, LF or CR. A CR that ends a chunk may be the first
   // half of a CRLF, so it waits for the next chunk unless the stream ended.
   // Returns the failure to report, if any.
@@ -235,7 +248,7 @@ async function execute(argv, environment, { protect, write, fail }) {
       if (!ended && end[0] === "\r" && end.index === buffered.length - 1) break;
       const line = buffered.slice(0, end.index);
       buffered = buffered.slice(end.index + end[0].length);
-      if (!line) { if (!(await dispatch())) return malformedEvent; }
+      if (!line) { const failed = await dispatch(); if (failed) return failed; }
       else if (line.startsWith("data:") && !append(line.slice(5).trimStart())) return overflow;
     }
     return null;
@@ -249,13 +262,12 @@ async function execute(argv, environment, { protect, write, fail }) {
       if (dataBytes + Buffer.byteLength(buffered) > MAX_EVENT_BYTES) { failure = overflow; break; }
     }
     failure ??= await readLines(true);
-    if (!failure && !(await dispatch())) failure = malformedEvent;
+    failure ??= await dispatch();
   } catch (error) { failure = () => fail("network_error", `Anthropic API stream failed: ${networkCode(error)}`); }
   await release();
   if (failure) return failure();
   if (errored) process.exitCode = 1;
-  else if (!stopped) await fail("api_error", "Anthropic API stream ended before message_stop");
-  else if (!delta) await fail("api_error", "Anthropic API stream ended without a stop reason; the answer may be incomplete");
+  else if (phase !== "stopped") await fail("api_error", "Anthropic API stream ended before message_stop");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await run();

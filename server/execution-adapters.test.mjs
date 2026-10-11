@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { ADAPTER_CONTRACT_VERSION, defineAdapter, modelMatches, NORMALIZED_EVENT_TYPES, validateRunConfiguration } from "./execution-adapters/contract.mjs";
+import { ADAPTER_CONTRACT_VERSION, defineAdapter, modelMatches, NORMALIZED_EVENT_TYPES, requestedModel, validateRunConfiguration } from "./execution-adapters/contract.mjs";
 import { buildExecutionLaunch, describeAdapter, EXECUTION_ADAPTERS, findExecutionAdapter, validateExecutionConfiguration, versionCompatibility } from "./execution-adapters/index.mjs";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
 import { ENDPOINT_REQUIREMENT } from "./execution-adapters/anthropic-api-runner.mjs";
@@ -80,10 +80,22 @@ test("every advertised Claude model and approval policy runs that model or is re
 
 test("a reported model matches the requested id, its dated snapshot or the adapter's alias", () => {
   for (const [adapter, requested, reported, expected] of [
-    [claude, "haiku", "claude-haiku-5-5", true], [claude, "haiku", "claude-sonnet-5-5", false], [claude, "sonnet", "claude-sonnet-5-5", true],
-    [claude, "claude-haiku-5-5", "claude-haiku-5-5", true], [claude, "claude-haiku-5-5", "claude-sonnet-5-5", false], [claude, "", "claude-sonnet-5-5", true],
+    [claude, "haiku", "claude-haiku-5-5", true], [claude, "haiku", "claude-haiku-5-5-20261001", true], [claude, "haiku", "claude-sonnet-5-5", false], [claude, "sonnet", "claude-sonnet-5-5", true],
+    [claude, "claude-haiku-5-5", "claude-haiku-5-5", true], [claude, "claude-haiku-5-5", "claude-sonnet-5-5", false],
     [claude, "my-model", "claude-my-model-1", false], [anthropic, "claude-opus-5-5", "claude-opus-5-5-20261001", true], [anthropic, "claude-opus-5-5", "claude-sonnet-5-5", false],
+    // Before, any hyphenated extension matched: another release, generation or custom model hid the substitution.
+    [anthropic, "claude-opus-5", "claude-opus-5-5", false], [anthropic, "claude-haiku-5", "claude-haiku-5-5", false], [anthropic, "my-model", "my-model-large", false],
+    [anthropic, "claude-opus-5-5", "claude-opus-5-5-preview", false], [anthropic, "claude-opus-5-5", "claude-opus-5-5-2026100", false], [claude, "haiku", "claude-haiku-4-5", false],
+    // Only the documented alias table applies, and an empty request is resolved before comparing.
+    [anthropic, "haiku", "claude-haiku-5-5", false], [claude, "constructor", "claude-constructor", false], [claude, "", "claude-sonnet-5-5", false],
   ]) assert.equal(modelMatches(adapter, requested, reported), expected, `${adapter.id} ${requested} -> ${reported}`);
+  assert.deepEqual([requestedModel(anthropic, ""), requestedModel(anthropic, "claude-haiku-5-5"), requestedModel(claude, ""), requestedModel(codex, "")], ["claude-opus-5-5", "claude-haiku-5-5", "", ""]);
+  // A blank direct-provider run launches exactly the model it is compared with.
+  const { args } = buildExecutionLaunch({ conversation: { worktreePath: "/w" }, run: { provider: "anthropic-api", ...baseRun } });
+  assert.equal(args[args.indexOf("--model") + 1], requestedModel(anthropic, ""));
+  assert.throws(() => defineAdapter(harnessSpec({ defaultModel: "unlisted" })), /default model must be an advertised model/);
+  assert.throws(() => defineAdapter(harnessSpec({ modelAliases: { unlisted: ["m-1"] } })), /model aliases must map advertised models/);
+  assert.throws(() => defineAdapter(harnessSpec({ modelAliases: { m: ["--flag"] } })), /model aliases must map advertised models/);
 });
 
 test("every registered adapter has fixtures and a serializable description without secrets", () => {
@@ -238,6 +250,8 @@ test("Claude Code reports the model its own messages ran, not its init event or 
   const usage = events.find((event) => event.type === "usage").payload;
   assert.deepEqual(Object.keys(usage.modelUsage), ["claude-sonnet-5-5", "claude-haiku-5-5"], "per-model usage is kept");
   assert.deepEqual(anthropic.normalize({ type: "message_start", message: { model: "claude-sonnet-5-5", usage: { input_tokens: 1 } } }).map((event) => event.type === "model" ? event.payload.model : event.type), ["usage", "claude-sonnet-5-5"]);
+  // The CLI's own error message carries model "<synthetic>"; no model answered it.
+  assert.equal(normalizeFixture(claude, "error-result.jsonl").some((event) => event.type === "model"), false);
 });
 
 function runRunner(args, environment, nodeOptions = []) {
@@ -264,6 +278,9 @@ async function withApiFixture(respond, callback) {
   try { return await callback(`http://127.0.0.1:${server.address().port}`, requests); }
   finally { await new Promise((resolve) => server.close(resolve)); }
 }
+
+// Synthetic streams open their message as the API does.
+const messageStart = `data: ${JSON.stringify({ type: "message_start", message: { model: "claude-opus-5-5", usage: { input_tokens: 1 } } })}\n\n`;
 
 test("the Outright-managed Anthropic path streams through its own credential", async () => {
   const secret = "sk-ant-fixture-secret";
@@ -399,7 +416,7 @@ test("a key split across text deltas never reaches the assembled answer", async 
   // Held text that turns out not to be the key is delivered unchanged.
   body += `${delta(` ${reflectedKey.slice(0, 9)}`)}${delta("!")}${delta(` ${reflectedKey.slice(0, 12)}`)}`;
   expected += ` ${reflectedKey.slice(0, 9)}! ${reflectedKey.slice(0, 12)}`;
-  for (const [stream, code] of [[`${body}${end}`, 0], [`${body}data: {"index":0}\n\n`, 1]]) {
+  for (const [stream, code] of [[`${messageStart}${body}${end}`, 0], [`${messageStart}${body}data: {"index":0}\n\n`, 1]]) {
     await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(stream); }, async (base) => {
       const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: reflectedKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
       // Before, each record was redacted alone and the answer held the key at every split.
@@ -417,7 +434,7 @@ test("a credential-bearing index never leaves the runner, whichever way the stre
   const end = `${event({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } })}${event({ type: "message_stop" })}`;
   // Block boundaries are forwarded redacted. The text ends in a key prefix,
   // so a suffix is held until the stream ends.
-  const start = event({ type: "content_block_start", index: reflectedKey, content_block: { type: "text", text: "" } });
+  const start = `${messageStart}${event({ type: "content_block_start", index: reflectedKey, content_block: { type: "text", text: "" } })}`;
   const held = `ok ${reflectedKey.slice(0, 5)}`;
   const opening = `${start}${textDelta(0, held)}`;
   const malformed = "Anthropic API sent a malformed stream event";
@@ -467,12 +484,12 @@ test("a message that ends without a valid stop reason fails and keeps its text a
   // A non-empty stop reason Outright does not know still completes.
   assert.deepEqual(anthropic.normalize({ type: "message_delta", delta: { stop_reason: "future_reason" }, usage: { output_tokens: 1 } }).map((event) => event.type), ["usage"]);
   // A stream with no message_delta at all reaches message_stop without any
-  // stop reason. A Windows checkout may end the fixture's lines in CRLF.
+  // stop reason, out of order. A Windows checkout may end the fixture's lines in CRLF.
   const noDelta = withoutReason.replace(/event: message_delta\r?\n.*\r?\n\r?\n/, "");
   assert.equal(noDelta.includes("message_delta"), false);
   await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(noDelta); }, async (base) => {
     const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
-    assert.deepEqual([result.code, text(result), result.events.at(-1).payload.message], [1, "READY now", "Anthropic API stream ended without a stop reason; the answer may be incomplete"]);
+    assert.deepEqual([result.code, text(result), result.events.at(-1).payload.message], [1, "READY now", "Anthropic API sent stream events out of order; the answer may be incomplete"]);
   });
 });
 
@@ -545,7 +562,7 @@ test("one stream event is bounded across chunks and data lines", async () => {
 
 test("an event's data lines are bounded by the bytes the event holds, however short they are", async () => {
   const MAX = 1024 * 1024;
-  const opening = `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `kept ${reflectedKey.slice(0, 5)}` } })}\n\n`;
+  const opening = `${messageStart}data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `kept ${reflectedKey.slice(0, 5)}` } })}\n\n`;
   const stream = (ending, line, count) => {
     const unit = `${line}${ending}`;
     // Pieces end mid-line, and inside a CRLF when there is one.
@@ -590,7 +607,7 @@ test("an event's data lines are bounded by the bytes the event holds, however sh
   const end = 'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\ndata: {"type":"message_stop"}\n\n';
   const head = '{"type":"content_block_delta","index":0,\ndata: "delta":{"type":"text_delta","text":';
   for (const text of ["two lines", "y".repeat(MAX - 200)]) {
-    const result = await run((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(`data: ${head}"${text}"}}\n\n${end}`); });
+    const result = await run((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(`${messageStart}data: ${head}"${text}"}}\n\n${end}`); });
     assert.equal(result.code, 0, `${text.length} characters`);
     assert.ok(answer(result) === text, `${text.length} characters: the answer is kept whole`);
   }
@@ -601,14 +618,51 @@ test("a malformed stream event fails the run and keeps the text already streamed
   for (const broken of ["data: {broken-json}\n\n", "data: [1]\n\n"]) {
     await withApiFixture((response) => {
       response.writeHead(200, { "content-type": "text/event-stream" });
-      response.end(`${delta("partial")}${broken}${delta(" lost")}data: {"type":"message_stop"}\n\n`);
+      response.end(`${messageStart}${delta("partial")}${broken}${delta(" lost")}data: {"type":"message_stop"}\n\n`);
     }, async (base) => {
       const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
       // Before, the event was dropped and message_stop completed the run.
       assert.equal(result.code, 1, broken);
-      assert.deepEqual(result.events.map((event) => [event.type, event.payload.text ?? event.payload.message]),
+      assert.deepEqual(result.events.filter((event) => !["usage", "model"].includes(event.type)).map((event) => [event.type, event.payload.text ?? event.payload.message]),
         [["assistant.delta", "partial"], ["provider.failure", "Anthropic API sent a malformed stream event"]]);
       assert.equal(result.events.at(-1).payload.terminal, true);
+    });
+  }
+});
+
+test("a stream that breaks the message lifecycle fails the run and keeps the text before the break", async () => {
+  const event = (record) => `data: ${JSON.stringify(record)}\n\n`;
+  const block = event({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+  const text = (value) => event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: value } });
+  const delta = event({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } });
+  const stop = event({ type: "message_stop" });
+  const ping = event({ type: "ping" });
+  const future = event({ type: "future_event", detail: 1 });
+  // The answer ends in a key prefix, so held text is released on every exit.
+  const said = `ok ${reflectedKey.slice(0, 5)}`;
+  const outOfOrder = "Anthropic API sent stream events out of order; the answer may be incomplete";
+  for (const [name, body, code, message, answer] of [
+    // Before, each of these exited 0 and completed the run.
+    ["no message_start", `${block}${text(said)}${delta}${stop}`, 1, outOfOrder, ""],
+    ["only delta and stop", `${delta}${stop}`, 1, outOfOrder, ""],
+    ["stop before delta", `${messageStart}${block}${text(said)}${stop}${delta}`, 1, outOfOrder, said],
+    ["duplicate message_start", `${messageStart}${text(said)}${messageStart}${delta}${stop}`, 1, outOfOrder, said],
+    ["text after message_delta", `${messageStart}${text(said)}${delta}${text(" late")}${stop}`, 1, outOfOrder, said],
+    ["text after message_stop", `${messageStart}${text(said)}${delta}${stop}${text(" late")}`, 1, outOfOrder, said],
+    ["ping after message_stop", `${messageStart}${text(said)}${delta}${stop}${ping}`, 1, outOfOrder, said],
+    ["no message_stop", `${messageStart}${text(said)}${delta}`, 1, "Anthropic API stream ended before message_stop", said],
+    // Pings, unknown event types and repeated deltas before message_stop are kept compatible.
+    ["pings and unknown events", `${ping}${messageStart}${future}${block}${ping}${text(said)}${future}${delta}${ping}${delta}${stop}`, 0, null, said],
+    ["error before message_start", event({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }), 1, "Overloaded", ""],
+  ]) {
+    await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(body); }, async (base) => {
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: reflectedKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      assertNoKey(result, name);
+      assert.equal(result.code, code, name);
+      assert.equal(result.events.filter((item) => item.type === "assistant.delta").map((item) => item.payload.text).join(""), answer, name);
+      const failures = result.events.filter((item) => item.type === "provider.failure");
+      assert.deepEqual(failures.map((item) => [item.payload.terminal, item.payload.message]), message ? [[true, message]] : [], name);
+      assert.equal(result.stdout.includes("late"), false, `${name}: nothing after the break is forwarded`);
     });
   }
 });
@@ -622,6 +676,7 @@ test("the direct runner stops reading the API while its consumer is stalled", as
   await withApiFixture((response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
     let index = 0;
+    response.write(messageStart);
     const pump = () => {
       while (index < events) { index += 1; if (!response.write(event)) { response.once("drain", pump); return; } }
       response.end('data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\ndata: {"type":"message_stop"}\n\n', () => { flushed = true; });
