@@ -284,7 +284,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         .then(async (result) => {
           latestScan = result;
           latestScanAt = Date.now();
-          ensureDefaultGroups(result.projects);
+          ensureDefaultSpaces(result.projects);
           await refreshWatcher(result.projects);
           return result;
         })
@@ -332,9 +332,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     });
   }
 
-  function ensureDefaultGroups(projectList) {
+  function ensureDefaultSpaces(projectList) {
     try {
-      database.ensureDefaultGroups(projectList);
+      database.ensureDefaultSpaces(projectList);
     } catch (error) {
       // An over-quota legacy database still needs bootstrap and retention UI.
       // The next scan can finish creating defaults once space is reclaimed.
@@ -382,9 +382,12 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       }
       if (url.pathname === "/api/bootstrap" && request.method === "GET") {
         const scan = await projects();
+        const spaces = database.listSpaces();
         return json(response, 200, {
           ...scan,
-          projectGroups: database.listGroups(),
+          spaces,
+          // Compatibility alias for one release; clients read `spaces`.
+          projectGroups: { groups: spaces.spaces, memberships: spaces.memberships },
           settings: database.getSettings(),
           providers: agents.providers(),
           trustedProjects: database.listTrustedProjects(),
@@ -437,28 +440,45 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         return json(response, 200, { deleted: result.deleted, deferred: result.deferred, capacity: runtimeCapacity() });
       }
 
-      if (url.pathname === "/api/groups" && request.method === "GET") return json(response, 200, database.listGroups());
-      if (url.pathname === "/api/groups" && request.method === "POST") {
+      // Spaces replaced project groups. The /api/groups and
+      // /api/project-memberships aliases keep their old payload shape for one
+      // release; both route families share one implementation.
+      const legacyGroups = url.pathname === "/api/groups" || url.pathname.startsWith("/api/groups/") || url.pathname === "/api/project-memberships";
+      const spaceListing = () => {
+        const listing = database.listSpaces();
+        return legacyGroups ? { groups: listing.spaces, memberships: listing.memberships } : listing;
+      };
+      if (["/api/spaces", "/api/groups"].includes(url.pathname) && request.method === "GET") return json(response, 200, spaceListing());
+      if (["/api/spaces", "/api/groups"].includes(url.pathname) && request.method === "POST") {
         const body = await readJson(request);
-        if (!body.name?.trim()) throw apiError(400, "Group name is required");
-        return json(response, 201, database.createGroup(body.name));
+        if (typeof body?.name !== "string" || !body.name.trim()) throw apiError(400, legacyGroups ? "Group name is required" : "Space name is required");
+        return json(response, 201, database.createSpace(body.name));
       }
-      const groupMatch = url.pathname.match(/^\/api\/groups\/([^/]+)$/);
-      if (groupMatch && request.method === "PATCH") {
+      const spaceMatch = url.pathname.match(/^\/api\/(?:spaces|groups)\/([^/]+)$/);
+      if (spaceMatch && request.method === "PATCH") {
         const patch = await readJson(request);
-        const group = editRetainedData(() => database.updateGroup(groupMatch[1], patch));
-        return json(response, 200, group);
+        const space = editRetainedData(() => database.updateSpace(spaceMatch[1], patch));
+        return json(response, 200, space);
       }
-      if (groupMatch && request.method === "DELETE") {
-        const deleted = database.deleteGroup(groupMatch[1]);
+      if (spaceMatch && request.method === "DELETE") {
+        const deleted = database.deleteSpace(spaceMatch[1]);
         if (deleted) agents.resumeQueued();
         return json(response, deleted ? 204 : 404, null);
       }
-      if (url.pathname === "/api/project-memberships" && request.method === "PUT") {
+      if (["/api/space-memberships", "/api/project-memberships"].includes(url.pathname) && request.method === "PUT") {
         const body = await readJson(request);
-        database.setProjectGroup(body.projectId, body.groupId);
-        if (!body.groupId) agents.resumeQueued();
-        return json(response, 200, database.listGroups());
+        const field = legacyGroups ? "groupId" : "spaceId";
+        const noun = legacyGroups ? "group" : "space";
+        // Unassigning needs an explicit null; an omitted id must not delete the membership.
+        if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.projectId !== "string" || !body.projectId
+          || !Object.hasOwn(body, field) || (body[field] !== null && (typeof body[field] !== "string" || !body[field]))) {
+          throw apiError(400, `Project id and ${noun} id are required`);
+        }
+        const spaceId = body[field];
+        if (spaceId && !database.listSpaces().spaces.some((space) => space.id === spaceId)) throw apiError(404, `${legacyGroups ? "Group" : "Space"} not found`);
+        database.setProjectSpace(body.projectId, spaceId);
+        if (!spaceId) agents.resumeQueued();
+        return json(response, 200, spaceListing());
       }
 
       if (url.pathname === "/api/conversations" && request.method === "GET") return json(response, 200, { conversations: database.listConversations({ projectId: url.searchParams.get("projectId"), worktreeId: url.searchParams.get("worktreeId"), archived: url.searchParams.get("archived") === "true" }) });

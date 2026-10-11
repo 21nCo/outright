@@ -34,8 +34,8 @@ function retainedReadback(db) {
   // trigger counter. The 128-byte row allowance is part of the quota policy.
   const retained = {
     settings: "key value",
-    project_groups: "id name created_at",
-    project_memberships: "project_id group_id",
+    spaces: "id name created_at",
+    project_memberships: "project_id space_id",
     conversations: "id project_id worktree_id worktree_path title provider model provider_session_id created_at updated_at",
     messages: "id conversation_id role kind body payload created_at",
     runs: "id conversation_id worktree_path provider model reasoning_effort approval_policy prompt status pid provider_session_id created_at started_at finished_at exit_code error cost_usd input_tokens output_tokens recovery_class recovery_decision transcript_omitted",
@@ -344,21 +344,21 @@ test("burst admission is bounded and a refused run leaves no user message", () =
 test("legacy partial default setup resumes memberships once and preserves later user edits", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
-    const core = database.createGroup("Core systems");
-    database.setProjectGroup("already-set", core.id);
-    database.ensureDefaultGroups([
+    const core = database.createSpace("Core systems");
+    database.setProjectSpace("already-set", core.id);
+    database.ensureDefaultSpaces([
       { id: "already-set", name: "Existing", path: "/work/existing" },
       { id: "new-core", name: "Application", path: "/work/application" },
       { id: "new-experiment", name: "Prototype", path: "/work/prototype" },
     ]);
-    const { groups, memberships } = database.listGroups();
-    assert.deepEqual(groups.map((group) => group.name), ["Core systems", "Experiments"]);
+    const { spaces, memberships } = database.listSpaces();
+    assert.deepEqual(spaces.map((space) => space.name), ["Core systems", "Experiments"]);
     assert.equal(memberships["already-set"], core.id);
     assert.equal(memberships["new-core"], core.id);
-    assert.equal(memberships["new-experiment"], groups[1].id);
-    database.deleteGroup(groups[1].id);
-    database.ensureDefaultGroups([{ id: "new-experiment", name: "Prototype", path: "/work/prototype" }]);
-    assert.deepEqual(database.listGroups().groups.map((group) => group.name), ["Core systems"], "later user deletion is not undone by scanning");
+    assert.equal(memberships["new-experiment"], spaces[1].id);
+    database.deleteSpace(spaces[1].id);
+    database.ensureDefaultSpaces([{ id: "new-experiment", name: "Prototype", path: "/work/prototype" }]);
+    assert.deepEqual(database.listSpaces().spaces.map((space) => space.name), ["Core systems"], "later user deletion is not undone by scanning");
   } finally { database.close(); }
 });
 
@@ -753,7 +753,7 @@ test("aggregate retained history denies new work until eligible history is clean
     assert.equal(database.getConversation(current.id).title, "current");
     assert.throws(() => database.saveTemplate({ id: template.id, title: "saved", prompt: "x".repeat(1024) }), (error) => error.statusCode === 507);
     assert.equal(database.listTemplates()[0].prompt, "original");
-    assert.throws(() => database.createGroup("too much"), (error) => error.statusCode === 507);
+    assert.throws(() => database.createSpace("too much"), (error) => error.statusCode === 507);
     assert.throws(() => database.saveTemplate({ title: "too much", prompt: "work" }), (error) => error.statusCode === 507);
     assert.equal(database.messageCount(current.id), 0);
     const finished = database.finishRun(admitted.id, { status: "completed", finishedAt: new Date().toISOString() },

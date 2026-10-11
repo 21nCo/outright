@@ -25,13 +25,13 @@ async function waitForSearchMigration(filename, kind) {
   }
 }
 
-test("persists settings, groups, conversations, messages, runs, and search", () => {
+test("persists settings, spaces, conversations, messages, runs, and search", () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
     assert.equal(database.updateSettings({ provider: "claude", maxConcurrentRuns: 5 }).provider, "claude");
-    const group = database.createGroup("Client work");
-    database.setProjectGroup("project-1", group.id);
-    assert.equal(database.listGroups().memberships["project-1"], group.id);
+    const space = database.createSpace("Client work");
+    database.setProjectSpace("project-1", space.id);
+    assert.equal(database.listSpaces().memberships["project-1"], space.id);
 
     const conversation = database.createConversation({ projectId: "project-1", worktreeId: "tree-1", worktreePath: "/tmp/tree-1", title: "Durable chat", provider: "codex" });
     const message = database.addMessage({ conversationId: conversation.id, role: "user", body: "Find the scanner boundary" });
@@ -1746,4 +1746,143 @@ test("bounds oversized run event payloads before storage and publication", () =>
   } finally {
     database.close();
   }
+});
+
+// Rebuild the pre-spaces schema from a current store: the old table and
+// column names, and retained triggers under their old names, exactly as the
+// pre-rename runtime installed them.
+function seedPreSpacesStore(filename) {
+  createOutrightDatabase({ filename }).close();
+  const legacy = new Database(filename);
+  try {
+    legacy.pragma("foreign_keys = ON");
+    const triggers = legacy.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'retained_spaces_%'").all();
+    legacy.transaction(() => {
+      for (const { name } of triggers) legacy.exec(`DROP TRIGGER ${name}`);
+      legacy.exec("ALTER TABLE spaces RENAME TO project_groups");
+      legacy.exec("ALTER TABLE project_memberships RENAME COLUMN space_id TO group_id");
+      for (const { sql } of triggers) {
+        legacy.exec(sql.replace(/retained_spaces_/g, "retained_project_groups_").replace(" ON spaces", " ON project_groups")
+          .replace(/table_name = 'spaces'/g, "table_name = 'project_groups'"));
+      }
+      legacy.prepare("INSERT INTO project_groups (id, name, position, created_at) VALUES (?, ?, ?, ?)").run("group-late", "Clients", 7, "2026-01-02T00:00:00.000Z");
+      legacy.prepare("INSERT INTO project_groups (id, name, position, created_at) VALUES (?, ?, ?, ?)").run("group-early", "Core systems", 3, "2026-01-01T00:00:00.000Z");
+      const member = legacy.prepare("INSERT INTO project_memberships (project_id, group_id) VALUES (?, ?)");
+      member.run("project-a", "group-late");
+      member.run("project-b", "group-early");
+      member.run("project-c", "group-early");
+      legacy.prepare("INSERT INTO settings (key, value) VALUES ('_defaultGroupsInitialized', 'true')").run();
+    })();
+    assert.ok(legacy.prepare("SELECT 1 FROM sqlite_master WHERE name = 'retained_project_groups_insert'").get());
+  } finally { legacy.close(); }
+}
+
+function spaceSchema(filename) {
+  const probe = new Database(filename, { readonly: true });
+  try {
+    return {
+      tables: probe.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('project_groups', 'spaces') ORDER BY name").all().map((row) => row.name),
+      columns: probe.pragma("table_info(project_memberships)").map((column) => column.name),
+      foreignKeys: probe.pragma("foreign_key_list(project_memberships)").map(({ table, from, to, on_delete: onDelete }) => ({ table, from, to, onDelete })),
+      triggers: probe.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND (tbl_name IN ('project_groups', 'spaces') OR name LIKE 'retained_project_groups_%') ORDER BY name").all().map((row) => row.name),
+      retainedBytes: probe.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes,
+    };
+  } finally { probe.close(); }
+}
+
+const MIGRATED_SPACES = [
+  { id: "group-early", name: "Core systems", position: 3, createdAt: "2026-01-01T00:00:00.000Z" },
+  { id: "group-late", name: "Clients", position: 7, createdAt: "2026-01-02T00:00:00.000Z" },
+];
+const MIGRATED_MEMBERSHIPS = { "project-a": "group-late", "project-b": "group-early", "project-c": "group-early" };
+
+test("a pre-spaces store opens with identical spaces and memberships, once", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-spaces-upgrade-"));
+  const filename = path.join(directory, "outright.db");
+  try {
+    seedPreSpacesStore(filename);
+    const legacyBytes = spaceSchema(filename).retainedBytes;
+    let database = createOutrightDatabase({ filename });
+    try {
+      assert.deepEqual(database.listSpaces(), { spaces: MIGRATED_SPACES, memberships: MIGRATED_MEMBERSHIPS });
+      const schema = spaceSchema(filename);
+      assert.deepEqual(schema.tables, ["spaces"]);
+      assert.deepEqual(schema.columns, ["project_id", "space_id"]);
+      assert.deepEqual(schema.foreignKeys, [{ table: "spaces", from: "space_id", to: "id", onDelete: "CASCADE" }]);
+      assert.deepEqual(schema.triggers, ["retained_spaces_delete", "retained_spaces_insert", "retained_spaces_update"]);
+      assert.equal(schema.retainedBytes, legacyBytes, "renaming must not change retained usage");
+      // A trigger left behind under its old name would count this write twice.
+      const added = database.createSpace("Added");
+      const row = 128 + Buffer.byteLength(`${added.id}${added.name}${added.createdAt}`);
+      assert.equal(spaceSchema(filename).retainedBytes, legacyBytes + row);
+      assert.equal(added.position, 8);
+      database.deleteSpace(added.id);
+      assert.equal(spaceSchema(filename).retainedBytes, legacyBytes);
+      database.ensureDefaultSpaces([{ id: "project-new", name: "Prototype", path: "/work/prototype" }]);
+      assert.deepEqual(database.listSpaces(), { spaces: MIGRATED_SPACES, memberships: MIGRATED_MEMBERSHIPS }, "default spaces are not re-seeded");
+      assert.equal("_defaultGroupsInitialized" in database.getSettings(), false);
+    } finally { database.close(); }
+    const migrated = spaceSchema(filename);
+    database = createOutrightDatabase({ filename });
+    try {
+      assert.deepEqual(database.listSpaces(), { spaces: MIGRATED_SPACES, memberships: MIGRATED_MEMBERSHIPS });
+      assert.deepEqual(spaceSchema(filename), migrated, "a second open is a no-op");
+      database.deleteSpace("group-early");
+      assert.deepEqual(database.listSpaces().memberships, { "project-a": "group-late" }, "memberships still cascade");
+    } finally { database.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("an interrupted spaces migration leaves the old schema, and the next open completes it", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-spaces-atomic-"));
+  const filename = path.join(directory, "outright.db");
+  try {
+    seedPreSpacesStore(filename);
+    const before = spaceSchema(filename);
+    assert.throws(() => createOutrightDatabase({ filename, spacesMigrationStep: (step) => {
+      if (step === "table-renamed") throw new Error("injected spaces migration failure");
+    } }), /injected spaces migration failure/);
+    assert.deepEqual(spaceSchema(filename), before, "a failed rename must not leave a mixed schema");
+    const raw = new Database(filename, { readonly: true });
+    try {
+      assert.equal(raw.prepare("SELECT COUNT(*) AS count FROM project_groups").get().count, 2);
+      assert.equal(raw.prepare("SELECT COUNT(*) AS count FROM project_memberships WHERE group_id IS NOT NULL").get().count, 3);
+    } finally { raw.close(); }
+    const database = createOutrightDatabase({ filename });
+    try {
+      assert.deepEqual(database.listSpaces(), { spaces: MIGRATED_SPACES, memberships: MIGRATED_MEMBERSHIPS });
+      assert.deepEqual(spaceSchema(filename).tables, ["spaces"]);
+    } finally { database.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("an unfinished retained scan of project groups resumes under spaces", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-spaces-scan-"));
+  const filename = path.join(directory, "outright.db");
+  try {
+    seedPreSpacesStore(filename);
+    const measuredBytes = spaceSchema(filename).retainedBytes;
+    const legacy = new Database(filename);
+    try {
+      legacy.transaction(() => {
+        legacy.prepare("UPDATE retained_usage SET bytes = 0, measured = 0 WHERE id = 1").run();
+        const insert = legacy.prepare("INSERT INTO retained_scans (table_name) VALUES (?)");
+        for (const { name } of legacy.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'retained_%_insert'").all()) {
+          insert.run(name.slice("retained_".length, -"_insert".length));
+        }
+      })();
+      assert.ok(legacy.prepare("SELECT 1 FROM retained_scans WHERE table_name = 'project_groups'").get());
+    } finally { legacy.close(); }
+    const database = createOutrightDatabase({ filename });
+    try {
+      const deadline = Date.now() + 5_000;
+      while (database.capacity().migrationStatus !== "ready" || spaceSchema(filename).retainedBytes !== measuredBytes) {
+        assert.ok(Date.now() < deadline, `retained scan did not finish: ${JSON.stringify(database.capacity())}`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const probe = new Database(filename, { readonly: true });
+      try { assert.equal(probe.prepare("SELECT COUNT(*) AS count FROM retained_scans").get().count, 0); }
+      finally { probe.close(); }
+    } finally { await database.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });
