@@ -39,8 +39,8 @@ const SEARCH_QUERY_BYTES = 256;
 const SEARCH_RESPONSE_BYTES = 128 * 1024;
 const RETAINED_COLUMNS = [
   ["settings", "key, value"],
-  ["project_groups", "id, name, created_at"],
-  ["project_memberships", "project_id, group_id"],
+  ["spaces", "id, name, created_at"],
+  ["project_memberships", "project_id, space_id"],
   ["conversations", "id, project_id, worktree_id, worktree_path, title, provider, model, provider_session_id, created_at, updated_at"],
   ["messages", RETAINED_MESSAGE_FIELDS.join(", ")],
   ["runs", "id, conversation_id, worktree_path, provider, model, reasoning_effort, approval_policy, prompt, status, pid, provider_session_id, created_at, started_at, finished_at, exit_code, error, cost_usd, input_tokens, output_tokens, recovery_class, recovery_decision, transcript_omitted"],
@@ -141,7 +141,8 @@ export function createOutrightDatabase(options = {}) {
   if (filename && path.isAbsolute(filename)) mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
   if (filename !== ":memory:" || options.launchDirectory) preparePrivateLaunchDirectory(launchDirectory);
   const storageFilename = filename;
-  let { db, leaseDb } = openRuntimeStorage(filename, storageFilename, Boolean(options.runtimeLease));
+  let { db, leaseDb } = openRuntimeStorage(filename, storageFilename, Boolean(options.runtimeLease),
+    options.spacesMigrationStep);
   let maintenance = false;
   let maintenanceCapacity;
   let maintenanceError;
@@ -789,50 +790,51 @@ export function createOutrightDatabase(options = {}) {
       if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw databaseError(400, "Retention limit must be 1 to 1000");
       return cutoff;
     },
-    listGroups() {
-      const groups = db.prepare("SELECT id, name, position, created_at AS createdAt FROM project_groups ORDER BY position, created_at").all();
-      const memberships = Object.fromEntries(db.prepare("SELECT project_id, group_id FROM project_memberships").all().map((row) => [row.project_id, row.group_id]));
-      return { groups, memberships };
+    listSpaces() {
+      const spaces = db.prepare("SELECT id, name, position, created_at AS createdAt FROM spaces ORDER BY position, created_at").all();
+      const memberships = Object.fromEntries(db.prepare("SELECT project_id, space_id FROM project_memberships").all().map((row) => [row.project_id, row.space_id]));
+      return { spaces, memberships };
     },
-    ensureDefaultGroups(projects) {
+    ensureDefaultSpaces(projects) {
+      // The marker keeps its pre-spaces key so upgraded stores never reseed.
       if (db.prepare("SELECT 1 FROM settings WHERE key = '_defaultGroupsInitialized'").get()) return;
-      const existing = this.listGroups().groups;
-      if (existing.length && !existing.some((group) => ["Core systems", "Experiments"].includes(group.name))) return;
-      // Keep both groups, every discovered membership, and the completion
+      const existing = this.listSpaces().spaces;
+      if (existing.length && !existing.some((space) => ["Core systems", "Experiments"].includes(space.name))) return;
+      // Keep both spaces, every discovered membership, and the completion
       // marker in one quota-checked transaction. A failed first scan can be
       // retried after cleanup without leaving a partial default hierarchy.
       withinRetainedBudget(() => {
-        const groups = this.listGroups().groups;
-        const core = groups.find((group) => group.name === "Core systems") ?? this.createGroup("Core systems");
-        const experiments = groups.find((group) => group.name === "Experiments") ?? this.createGroup("Experiments");
-        const memberships = this.listGroups().memberships;
+        const spaces = this.listSpaces().spaces;
+        const core = spaces.find((space) => space.name === "Core systems") ?? this.createSpace("Core systems");
+        const experiments = spaces.find((space) => space.name === "Experiments") ?? this.createSpace("Experiments");
+        const memberships = this.listSpaces().memberships;
         for (const project of projects) {
           if (memberships[project.id]) continue;
-          this.setProjectGroup(project.id, /experiment|prototype|playground/i.test(`${project.name} ${project.path}`) ? experiments.id : core.id);
+          this.setProjectSpace(project.id, /experiment|prototype|playground/i.test(`${project.name} ${project.path}`) ? experiments.id : core.id);
         }
         db.prepare("INSERT INTO settings (key, value) VALUES ('_defaultGroupsInitialized', 'true')").run();
       });
     },
-    createGroup(name) {
+    createSpace(name) {
       if (retainedBytes(db) >= this.getSettings().maxRetainedMiB * 1024 * 1024) {
         throw databaseError(507, "Retained history is full; archive conversations, then delete selected archived chats or clean up older history");
       }
       const id = randomUUID();
-      const position = db.prepare("SELECT COALESCE(MAX(position), -1) + 1 AS position FROM project_groups").get().position;
-      withinRetainedBudget(() => db.prepare("INSERT INTO project_groups (id, name, position, created_at) VALUES (?, ?, ?, ?)").run(id, name.trim(), position, now()));
-      return db.prepare("SELECT id, name, position, created_at AS createdAt FROM project_groups WHERE id = ?").get(id);
+      const position = db.prepare("SELECT COALESCE(MAX(position), -1) + 1 AS position FROM spaces").get().position;
+      withinRetainedBudget(() => db.prepare("INSERT INTO spaces (id, name, position, created_at) VALUES (?, ?, ?, ?)").run(id, name.trim(), position, now()));
+      return db.prepare("SELECT id, name, position, created_at AS createdAt FROM spaces WHERE id = ?").get(id);
     },
-    updateGroup(id, patch) {
-      if (typeof patch.name === "string" && patch.name.trim()) withinRetainedBudget(() => db.prepare("UPDATE project_groups SET name = ? WHERE id = ?").run(patch.name.trim(), id));
-      if (Number.isInteger(patch.position)) db.prepare("UPDATE project_groups SET position = ? WHERE id = ?").run(patch.position, id);
-      return db.prepare("SELECT id, name, position, created_at AS createdAt FROM project_groups WHERE id = ?").get(id);
+    updateSpace(id, patch) {
+      if (typeof patch.name === "string" && patch.name.trim()) withinRetainedBudget(() => db.prepare("UPDATE spaces SET name = ? WHERE id = ?").run(patch.name.trim(), id));
+      if (Number.isInteger(patch.position)) db.prepare("UPDATE spaces SET position = ? WHERE id = ?").run(patch.position, id);
+      return db.prepare("SELECT id, name, position, created_at AS createdAt FROM spaces WHERE id = ?").get(id);
     },
-    deleteGroup(id) {
-      return db.prepare("DELETE FROM project_groups WHERE id = ?").run(id).changes > 0;
+    deleteSpace(id) {
+      return db.prepare("DELETE FROM spaces WHERE id = ?").run(id).changes > 0;
     },
-    setProjectGroup(projectId, groupId) {
-      if (!groupId) db.prepare("DELETE FROM project_memberships WHERE project_id = ?").run(projectId);
-      else withinRetainedBudget(() => db.prepare("INSERT INTO project_memberships (project_id, group_id) VALUES (?, ?) ON CONFLICT(project_id) DO UPDATE SET group_id = excluded.group_id").run(projectId, groupId));
+    setProjectSpace(projectId, spaceId) {
+      if (!spaceId) db.prepare("DELETE FROM project_memberships WHERE project_id = ?").run(projectId);
+      else withinRetainedBudget(() => db.prepare("INSERT INTO project_memberships (project_id, space_id) VALUES (?, ?) ON CONFLICT(project_id) DO UPDATE SET space_id = excluded.space_id").run(projectId, spaceId));
     },
     listConversations(filters = {}) {
       const where = ["archived = ?", "deleting = 0"];
@@ -2094,7 +2096,7 @@ function openDataConnection(filename) {
   return db;
 }
 
-function openRuntimeStorage(filename, storageFilename, runtimeLease) {
+function openRuntimeStorage(filename, storageFilename, runtimeLease, onSpacesMigrationStep) {
   let db;
   let leaseDb;
   try {
@@ -2116,7 +2118,7 @@ function openRuntimeStorage(filename, storageFilename, runtimeLease) {
       if (source && (source.nlink !== 1 || !source.isFile())) throw new Error("A runtime database must be a private regular file");
     }
     db = openDataConnection(filename);
-    migrate(db);
+    migrate(db, onSpacesMigrationStep);
     advanceMigrations(db);
     return { db, leaseDb };
   } catch (error) {
@@ -2352,14 +2354,17 @@ function recoverArchiveOnWorker(filename, sourceUnmoved = false, runtimeLease = 
   });
 }
 
-function migrate(db) {
+function migrate(db, onSpacesMigrationStep) {
+  // The rename must precede table creation: creating an empty spaces table
+  // first would make a legacy store look already migrated.
+  migrateProjectGroupsToSpaces(db, onSpacesMigrationStep);
   const hadAudit = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'audit_log'").get());
   const hadRuns = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").get());
   const hadMessages = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'").get());
   db.exec(`
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS project_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS project_memberships (project_id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES project_groups(id) ON DELETE CASCADE);
+    CREATE TABLE IF NOT EXISTS spaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS project_memberships (project_id TEXT PRIMARY KEY, space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE);
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, worktree_path TEXT NOT NULL,
       title TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', provider_session_id TEXT, tab_position INTEGER NOT NULL DEFAULT 0,
@@ -2430,6 +2435,28 @@ function migrate(db) {
     WHEN OLD.measured = 1 AND NEW.bytes > MAX(COALESCE((SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'maxRetainedMiB'), ${DEFAULT_SETTINGS.maxRetainedMiB}) * 1048576, OLD.legacy_ceiling)
     BEGIN SELECT RAISE(ABORT, 'OUTRIGHT_RETAINED_LIMIT'); END`);
   if (!migrationPending(db)) db.pragma("user_version = 4");
+}
+
+// Project groups became spaces. Schema state, not user_version, gates the
+// rename so it stays idempotent. One transaction moves the table, its
+// membership column, and any unfinished retained-byte scan, so an interrupted
+// upgrade leaves either the old or the new schema. SQLite carries rows, ids,
+// the cascading foreign key and trigger bodies across ALTER TABLE RENAME.
+function migrateProjectGroupsToSpaces(db, onStep) {
+  const hasTable = (name) => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
+  if (!hasTable("project_groups") || hasTable("spaces")) return;
+  db.transaction(() => {
+    // These triggers follow the renamed table under their old names; the
+    // retained trigger install recreates them as retained_spaces_*. Leaving
+    // them would count every space write twice.
+    for (const action of ["insert", "update", "delete"]) db.exec(`DROP TRIGGER IF EXISTS retained_project_groups_${action}`);
+    db.exec("ALTER TABLE project_groups RENAME TO spaces");
+    onStep?.("table-renamed");
+    if (db.pragma("table_info(project_memberships)").some((column) => column.name === "group_id")) {
+      db.exec("ALTER TABLE project_memberships RENAME COLUMN group_id TO space_id");
+    }
+    if (hasTable("retained_scans")) db.prepare("UPDATE retained_scans SET table_name = 'spaces' WHERE table_name = 'project_groups'").run();
+  }).immediate();
 }
 
 function prepareRecoveryLookup(db, hadRuns, version) {

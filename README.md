@@ -1,6 +1,6 @@
 # Outright
 
-Outright is a local-first workspace for running coding agents across Git projects and worktrees. Projects and worktrees are discovered automatically, project groups live in SQLite, and agent conversations appear as tabs for the selected worktree.
+Outright is a local-first workspace for running coding agents across Git projects and worktrees. Projects and worktrees are discovered automatically, spaces (groups of projects) live in SQLite, and agent conversations appear as tabs for the selected worktree.
 
 ## What works
 
@@ -10,7 +10,7 @@ Outright is a local-first workspace for running coding agents across Git project
 - Project trust, sandbox/approval choices, exact-path guards, same-origin runtime access, and an audit log
 - Real PTY terminals with multiple tabs, resize/input/output streaming, and reconnectable scrollback
 - Git status, diffs, stage/unstage, commits, guarded worktree creation/removal, and editor launching
-- Project grouping, searchable conversations/messages, draggable/pinnable/renamable/archivable tabs, cross-worktree conversation moves, prompt templates, notifications, and keyboard shortcuts
+- Project spaces, searchable conversations/messages, draggable/pinnable/renamable/archivable tabs, cross-worktree conversation moves, prompt templates, notifications, and keyboard shortcuts
 - Repository context for AGENTS/Claude/Copilot instructions, local skills, and the current GitHub pull request
 - Light, dark, and system themes using DM Sans, Tailwind, shadcn/Base UI, and Phosphor icons
 
