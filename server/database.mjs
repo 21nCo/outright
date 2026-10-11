@@ -3448,8 +3448,9 @@ function deleteOrphanedTask(db, taskId) {
 
 // An archived task left without threads (a moved-away source, a standalone
 // task) ages for retention like an archived thread. Each short transaction
-// examines one page of stale archived tasks, threadless or not, and a call
-// examines at most one page per task it may delete. The cursor continues
+// reads at most one page of stale archived tasks, threadless or not, and a
+// call reads at most one page's worth of rows per task it may delete, even
+// across a wrap. The cursor continues
 // from the previous call and wraps at the end, so tasks behind a large
 // archive that keeps its threads are reached by later calls. The delete
 // re-checks every condition, so a concurrent restore or a new thread keeps
@@ -3462,10 +3463,11 @@ async function deleteThreadlessArchivedTasks(currentDb, cutoff, limit, cursor) {
   while (deleted < limit && examined < limit * pageSize) {
     const db = currentDb();
     if (!db || !conversationTasksReady(db)) break;
+    const size = Math.min(pageSize, limit * pageSize - examined);
     const page = db.transaction(() => {
       const rows = db.prepare(`SELECT id, updated_at AS updatedAt, NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id) AS threadless
         FROM tasks WHERE archived = 1 AND updated_at < ? AND (updated_at, id) > (?, ?)
-        ORDER BY updated_at, id LIMIT ${pageSize}`).all(cutoff, ...cursor.after);
+        ORDER BY updated_at, id LIMIT ?`).all(cutoff, ...cursor.after, size);
       const remove = db.prepare(`DELETE FROM tasks WHERE id = ? AND archived = 1 AND updated_at < ?
         AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id)`);
       let count = 0;
@@ -3478,9 +3480,9 @@ async function deleteThreadlessArchivedTasks(currentDb, cutoff, limit, cursor) {
       return { rows, count, scanned };
     }).immediate();
     deleted += page.count;
-    examined += page.scanned;
+    examined += page.rows.length;
     if (page.scanned) cursor.after = [page.rows[page.scanned - 1].updatedAt, page.rows[page.scanned - 1].id];
-    if (page.scanned === page.rows.length && page.rows.length < pageSize) {
+    if (page.scanned === page.rows.length && page.rows.length < size) {
       cursor.after = ["", ""];
       if (wrapped) break;
       wrapped = true;

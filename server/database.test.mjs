@@ -2531,6 +2531,45 @@ test("retention reclaims archived threadless tasks after the retention window, a
     } finally { probe.close(); }
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual([...new Set(reported)].sort(), eligible.map((task) => task.id).sort());
+    // From a cursor inside the protected range, a limit-1 call that reaches
+    // the short tail wraps and reads only the rest of its budget; a task at
+    // the start of the range is reached only after that wrap.
+    Database.prototype.prepare = function examinedRows(sql, ...rest) {
+      const statement = prepare.call(this, sql, ...rest);
+      if (!/^SELECT id, updated_at AS updatedAt\b[^;]*FROM tasks WHERE archived = 1 AND updated_at < \?/.test(sql)) return statement;
+      const all = statement.all.bind(statement);
+      statement.all = (...args) => { const rows = all(...args); pages.push(rows.length); return rows; };
+      return statement;
+    };
+    const wrapCalls = [];
+    let first;
+    try {
+      pages = [];
+      await database.pruneHistory({ before: cutoff(), limit: 1 });
+      wrapCalls.push(pages);
+      first = database.createTask({ scopeKind: "project", projectId: "p", title: "First in range", objective: "o".repeat(16 * 1024) });
+      database.updateTask(first.id, { archived: true });
+      const writer = new Database(filename);
+      try { writer.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(new Date(Date.now() - 101 * 86_400_000).toISOString(), first.id); }
+      finally { writer.close(); }
+      await new Promise((resolve) => setImmediate(resolve));
+      reported.length = 0;
+      const released = database.capacity().retainedBytes;
+      for (let call = 0; call < 8 && database.getTask(first.id); call += 1) {
+        pages = [];
+        await database.pruneHistory({ before: cutoff(), limit: 1 });
+        wrapCalls.push(pages);
+      }
+      assert.ok(released - database.capacity().retainedBytes >= 16 * 1024, "the wrapped-to task's bytes are released");
+    } finally { Database.prototype.prepare = prepare; }
+    for (const steps of wrapCalls) {
+      assert.ok(steps.every((rows) => rows <= 64), `${steps}: every page reads at most 64 rows`);
+      assert.ok(steps.reduce((sum, rows) => sum + rows, 0) <= 64, `${steps}: a limit-1 call reads at most 64 rows, even across a wrap`);
+    }
+    assert.ok(wrapCalls.some((steps) => steps.length > 1 && steps[0] < 64), `${JSON.stringify(wrapCalls)} include a short tail and a wrap`);
+    assert.equal(database.getTask(first.id), undefined, "the task at the start of the range is reclaimed after the wrap");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual([...new Set(reported)], [first.id]);
   } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
