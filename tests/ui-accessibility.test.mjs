@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { domId, nextTabIndex } from "../src/lib/accessibility.js";
-import { providerOptionLabel, providerStatusText, supportsPolicy, withProvider } from "../src/lib/providers.js";
+import { modelMismatch, providerOptionLabel, providerStatusText, supportsPolicy, unsupportedChoices } from "../src/lib/providers.js";
 
 const root = new URL("../", import.meta.url);
 
@@ -60,8 +60,20 @@ test("provider controls explain readiness and only offer supported choices", asy
   assert.equal(providerStatusText(oldCodex), "Codex 0.20.0 is not supported");
   assert.match(providerStatusText(direct), /Outright-managed via OUTRIGHT_ANTHROPIC_API_KEY · Read only · no session resume/);
   assert.equal(supportsPolicy(direct, "workspace-write"), false);
-  assert.deepEqual(withProvider({ provider: "codex", approvalPolicy: "workspace-write", reasoningEffort: "high" }, [direct], "anthropic-api"),
-    { provider: "anthropic-api", approvalPolicy: "read-only", reasoningEffort: "medium" });
+  // Before, switching to a read-only provider rewrote the global policy and effort.
+  const draft = { provider: "anthropic-api", approvalPolicy: "workspace-write", reasoningEffort: "high" };
+  assert.equal(unsupportedChoices(direct, draft), "Anthropic API does not support the Workspace write approval policy or high reasoning effort; choose a supported value before saving.");
+  assert.equal(unsupportedChoices(direct, { ...draft, approvalPolicy: "read-only", reasoningEffort: "medium" }), "");
+  const codex = { id: "codex", label: "Codex", modelProvider: "openai", models: ["gpt-5.4"] };
+  const claude = { id: "claude", label: "Claude Code", modelProvider: "anthropic", models: ["sonnet", "opus", "haiku"] };
+  const anthropic = { ...direct, modelProvider: "anthropic", models: ["claude-opus-5-5"] };
+  const providers = [codex, claude, anthropic];
+  assert.match(modelMismatch(providers, { provider: "claude", model: "gpt-5.4" }, { provider: "codex", model: "gpt-5.4" }), /“gpt-5\.4” was chosen for Codex; choose a Claude Code model or clear it/);
+  // An explicit edit, a cleared field, a listed model or the same model provider is a deliberate choice.
+  for (const [next, opened] of [[{ provider: "claude", model: "opus" }, { provider: "codex", model: "gpt-5.4" }], [{ provider: "claude", model: "" }, { provider: "codex", model: "gpt-5.4" }],
+    [{ provider: "claude", model: "claude-opus-5-5" }, { provider: "anthropic-api", model: "claude-opus-5-5" }], [{ provider: "codex", model: "gpt-5.4" }, { provider: "codex", model: "gpt-5.4" }]]) {
+    assert.equal(modelMismatch(providers, next, opened), "", JSON.stringify(next));
+  }
   const [app, settings] = await Promise.all([readFile(new URL("src/App.jsx", root), "utf8"), readFile(new URL("src/components/SettingsDialog.jsx", root), "utf8")]);
   assert.match(settings, /aria-describedby="default-provider-status"/);
   assert.match(settings, /id="default-provider-status" className="provider-status" role="status" aria-live="polite"/);

@@ -31,13 +31,22 @@ export function reasoningOptions(provider) {
   return provider?.capabilities?.reasoningEfforts ?? ["low", "medium", "high", "xhigh"];
 }
 
-// A provider switch keeps only choices the new provider can honour; the
-// adjusted values stay visible in the form before anything is saved.
-export function withProvider(draft, providers, id) {
-  const provider = providers.find((item) => item.id === id);
-  const next = { ...draft, provider: id };
-  if (!supportsPolicy(provider, next.approvalPolicy)) next.approvalPolicy = provider.capabilities.permissionModes[0];
-  const efforts = reasoningOptions(provider);
-  if (!efforts.includes(next.reasoningEffort)) next.reasoningEffort = efforts.includes("medium") ? "medium" : efforts[0];
-  return next;
+// A provider switch never changes another choice. Choices the selected
+// provider cannot honour stay visible and block saving until the user picks
+// supported ones; these explain why.
+export function unsupportedChoices(provider, draft) {
+  const choices = [];
+  if (!supportsPolicy(provider, draft.approvalPolicy)) choices.push(`the ${POLICY_LABELS[draft.approvalPolicy] ?? draft.approvalPolicy} approval policy`);
+  if (provider?.capabilities && !reasoningOptions(provider).includes(draft.reasoningEffort)) choices.push(`${draft.reasoningEffort} reasoning effort`);
+  return choices.length ? `${provider.label} does not support ${choices.join(" or ")}; choose a supported value before saving.` : "";
+}
+
+// A model belongs to its model provider. One chosen for another provider's
+// models must be replaced or cleared explicitly after a provider switch.
+export function modelMismatch(providers, draft, opened) {
+  if (!draft.model || draft.model !== opened.model || draft.provider === opened.provider) return "";
+  const source = providers.find((item) => item.id === opened.provider);
+  const target = providers.find((item) => item.id === draft.provider);
+  if (!target || target.models?.includes(draft.model) || (source?.modelProvider && source.modelProvider === target.modelProvider)) return "";
+  return `The model “${draft.model}” was chosen for ${source?.label ?? opened.provider}; choose a ${target.label} model or clear it to use the provider default before saving.`;
 }

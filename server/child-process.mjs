@@ -11,31 +11,40 @@ function scoped(options) {
   return { ...options, env: withoutDirectProviderCredentials(options?.env ?? process.env) };
 }
 
-// Each primitive accepts Node's optional-args overloads.
+// Node's optional-args overloads: nullish args means no arguments and keeps
+// the options and callback in place; only an object in the args slot is the
+// options, and a function in either slot is the callback.
+function overload(args, options, callback) {
+  if (typeof args === "function") return [[], undefined, args];
+  if (args == null) args = [];
+  else if (!Array.isArray(args) && typeof args === "object") [args, options, callback] = [[], args, options];
+  if (typeof options === "function") [options, callback] = [undefined, options];
+  return [args, options, callback];
+}
+
 export function spawn(file, args, options) {
-  if (!Array.isArray(args)) [args, options] = [[], args];
+  [args, options] = overload(args, options);
   return childProcess.spawn(file, args, scoped(options));
 }
 
 export function spawnSync(file, args, options) {
-  if (!Array.isArray(args)) [args, options] = [[], args];
+  [args, options] = overload(args, options);
   return childProcess.spawnSync(file, args, scoped(options));
 }
 
 export function execFile(file, args, options, callback) {
-  if (!Array.isArray(args)) [args, options, callback] = [[], args, options];
-  if (typeof options === "function") [options, callback] = [undefined, options];
+  [args, options, callback] = overload(args, options, callback);
   return childProcess.execFile(file, args, scoped(options), callback);
 }
 // Keeps promisify(execFile) resolving { stdout, stderr } like Node's.
 const execFileAsync = promisify(childProcess.execFile);
 execFile[promisify.custom] = (file, args, options) => {
-  if (!Array.isArray(args)) [args, options] = [[], args];
+  [args, options] = overload(args, options);
   return execFileAsync(file, args, scoped(options));
 };
 
 export function execFileSync(file, args, options) {
-  if (!Array.isArray(args)) [args, options] = [[], args];
+  [args, options] = overload(args, options);
   return childProcess.execFileSync(file, args, scoped(options));
 }
 

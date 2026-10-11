@@ -6,7 +6,7 @@ import path from "node:path";
 import { realpath } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { createOutrightDatabase } from "./database.mjs";
-import { validateExecutionConfiguration, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
+import { isModelName, validateExecutionConfiguration, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
 import { AGENT_SUPERVISOR, createAgentManager, defaultGroupMembers, hardenWindowsLaunchDirectory, terminateTree } from "./agent-manager.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { createGitService } from "./git-service.mjs";
@@ -798,7 +798,17 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const sessionId = interrupted.providerSessionId
           || (conversation.provider === interrupted.provider ? conversation.providerSessionId : null);
         if (policy === "resume-session" && !sessionId) throw apiError(409, "No provider session is available to resume", { code: "NO_PROVIDER_SESSION" });
-        await preflightProvider({ provider: interrupted.provider, model: interrupted.model, reasoningEffort: interrupted.reasoningEffort,
+        // A model saved before model names were validated may no longer be
+        // safe to launch. Only an explicit request replaces it, and only with
+        // the provider default; nothing else about the run changes.
+        let model = interrupted.model ?? "";
+        if (!isModelName(model)) {
+          if (body.useProviderDefaultModel !== true) {
+            throw apiError(409, "This run's saved model name can no longer be launched safely. Continue it with the provider's default model, or discard it.", { code: "RECOVERY_MODEL_UNLAUNCHABLE", runId: interrupted.id });
+          }
+          model = "";
+        }
+        await preflightProvider({ provider: interrupted.provider, model, reasoningEffort: interrupted.reasoningEffort,
           approvalPolicy: interrupted.approvalPolicy, sessionId: policy === "resume-session" ? sessionId : null });
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         const currentRecoveryConversation = database.getConversation(conversation.id);
@@ -808,7 +818,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (["projectId", "worktreeId", "worktreePath"].some((key) => currentRecoveryConversation[key] !== conversation[key])) {
           throw apiError(409, "Conversation target changed while preparing recovery", { code: "RECOVERY_TARGET_CHANGED", runId: interrupted.id });
         }
-        const recovery = database.beginInterruptedRunRecovery(interrupted.id, policy, { providerSessionId: sessionId });
+        const recovery = database.beginInterruptedRunRecovery(interrupted.id, policy, {
+          providerSessionId: policy === "resume-session" ? sessionId : null,
+          ...(model === (interrupted.model ?? "") ? {} : { model }),
+        });
         if (!recovery) throw apiError(409, "Run is not waiting for a recovery decision");
         publish({ type: "run.resolved", conversationId: conversation.id, runId: interrupted.id, payload: recovery.interrupted });
         return json(response, 202, await agents.schedule({

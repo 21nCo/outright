@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -9,7 +10,9 @@ import { LAUNCH_WRAPPER_SOURCE } from "./agent-manager.mjs";
 import { DIRECT_PROVIDER_VARIABLES } from "./execution-adapters/index.mjs";
 
 const serverDirectory = path.dirname(fileURLToPath(import.meta.url));
-const direct = { OUTRIGHT_ANTHROPIC_API_KEY: "direct-key", OUTRIGHT_ANTHROPIC_BASE_URL: "https://direct.example", outright_anthropic_api_key: "direct-lower" };
+// Windows environment names are case-insensitive, so both spellings name one
+// variable there and must carry the same value.
+const direct = { OUTRIGHT_ANTHROPIC_API_KEY: "direct-key", OUTRIGHT_ANTHROPIC_BASE_URL: "https://direct.example", outright_anthropic_api_key: "direct-key" };
 const kept = { OUTRIGHT_SCOPE_KEPT: "kept", ANTHROPIC_API_KEY: "harness-own-key" };
 const names = [...Object.keys(direct), ...Object.keys(kept)];
 const printer = ["-e", `process.stdout.write(JSON.stringify(Object.fromEntries(${JSON.stringify(names)}.map((name) => [name, process.env[name] ?? null]))))`];
@@ -107,4 +110,31 @@ test("every scoped primitive removes direct credentials from inherited and expli
     const execution = JSON.parse(await collect(spawnExecution(process.execPath, printer, { env: { ...process.env } })));
     assert.equal(execution.OUTRIGHT_ANTHROPIC_API_KEY, "direct-key");
   });
+});
+
+test("nullish args keep the options and callback in place for every scoped primitive", async () => {
+  // With no arguments node reads its script from stdin, so cwd, input,
+  // encoding and env each change what the child prints. The unique directory
+  // name survives Windows short-path and macOS /private aliases.
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "outright-overload-"));
+  const script = "process.stdout.write(JSON.stringify([require('node:path').basename(process.cwd()), process.env.OUTRIGHT_SCOPE_KEPT, process.env.OUTRIGHT_ANTHROPIC_API_KEY ?? null]))";
+  const options = { cwd, encoding: "utf8", env: { ...process.env, ...direct, ...kept } };
+  const expected = JSON.stringify([path.basename(cwd), "kept", null]);
+  const viaStdin = (child) => { child.stdin.end(script); return child; };
+  try {
+    for (const args of [null, undefined]) {
+      const results = {
+        spawn: await collect(viaStdin(spawn(process.execPath, args, options))),
+        spawnSync: spawnSync(process.execPath, args, { ...options, input: script }).stdout,
+        execFile: await new Promise((resolve, reject) => viaStdin(execFile(process.execPath, args, options, (error, stdout) => error ? reject(error) : resolve(stdout)))),
+        execFileAsync: await (async () => { const pending = promisify(execFile)(process.execPath, args, options); viaStdin(pending.child); return (await pending).stdout; })(),
+        execFileSync: execFileSync(process.execPath, args, { ...options, input: script }),
+      };
+      for (const [primitive, output] of Object.entries(results)) assert.equal(output, expected, `${primitive} with ${args} args`);
+    }
+    // The options-only and callback-only overloads still resolve.
+    assert.equal(spawnSync(process.execPath, { ...options, input: script }).stdout, expected);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+  const version = await new Promise((resolve) => execFile(process.execPath, ["--version"], (error, stdout) => resolve(error ? null : stdout)));
+  assert.equal(version.trim(), process.version);
 });

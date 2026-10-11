@@ -2,6 +2,9 @@ import { ADAPTER_CONTRACT_VERSION, defineAdapter, parseSemanticVersion } from ".
 
 const SANDBOX_MODES = { "read-only": "read-only", "workspace-write": "workspace-write", "danger-full-access": "danger-full-access" };
 
+// Item types `codex exec --json` emits for tool calls.
+const TOOL_ITEM_TYPES = Object.freeze(["command_execution", "file_change", "mcp_tool_call", "web_search"]);
+
 export const codexAdapter = defineAdapter({
   id: "codex",
   label: "Codex",
@@ -42,14 +45,13 @@ export const codexAdapter = defineAdapter({
   normalize(raw) {
     const events = [];
     if (raw.type === "thread.started" && raw.thread_id) events.push({ type: "session", payload: { sessionId: raw.thread_id } });
-    if (raw.type === "item.started") events.push({ type: "tool.started", payload: { item: raw.item } });
+    // Only tool calls become tool rows. Reasoning, plans, error notices
+    // and future item types stay native events outside the transcript.
+    const tool = TOOL_ITEM_TYPES.includes(raw.item?.type);
+    if (raw.type === "item.started" && tool) events.push({ type: "tool.started", payload: { item: raw.item } });
     if (raw.type === "item.completed") {
-      const item = raw.item ?? {};
-      if (item.type === "agent_message" && item.text) events.push({ type: "assistant.message", payload: { text: item.text } });
-      // Error items are non-fatal CLI notices (configuration, model metadata),
-      // not tool calls; keep them as native events outside the transcript.
-      else if (item.type === "error") events.push({ type: "provider.event", payload: raw });
-      else events.push({ type: "tool.completed", payload: { item } });
+      if (raw.item?.type === "agent_message" && raw.item.text) events.push({ type: "assistant.message", payload: { text: raw.item.text } });
+      else if (tool) events.push({ type: "tool.completed", payload: { item: raw.item } });
     }
     if (raw.type === "turn.completed" && raw.usage) {
       events.push({ type: "usage", payload: { inputTokens: raw.usage.input_tokens, outputTokens: raw.usage.output_tokens, native: raw.usage } });

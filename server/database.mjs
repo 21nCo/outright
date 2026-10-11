@@ -1667,11 +1667,14 @@ export function createOutrightDatabase(options = {}) {
       try { removeRunOutcome(launchDirectory, id); } catch { /* Retry at startup. */ }
       return this.getRun(id);
     },
-    beginInterruptedRunRecovery(id, decision, { providerSessionId } = {}) {
+    // `model` replaces a stored model only when the caller corrects one that
+    // can no longer launch; the interrupted run keeps its original record.
+    beginInterruptedRunRecovery(id, decision, { providerSessionId, model } = {}) {
       if (!["resume-session", "retry"].includes(decision)) return null;
-      if (providerSessionId != null && (typeof providerSessionId !== "string" || Buffer.byteLength(providerSessionId) > 4096)) {
-        throw databaseError(400, "Provider session id is invalid");
+      if (providerSessionId != null && !isProviderSessionId(providerSessionId)) {
+        throw databaseError(400, "Provider session id is invalid", { code: "PROVIDER_SESSION_INVALID" });
       }
+      if (model !== undefined && !isModelName(model)) throw databaseError(400, MODEL_NAME_REQUIREMENT, { code: "PROVIDER_CONFIGURATION_INVALID" });
       const recover = db.transaction(() => {
         const interrupted = this.getRun(id);
         if (!interrupted || interrupted.status !== "interrupted" || interrupted.recoveryDecision) return null;
@@ -1689,13 +1692,14 @@ export function createOutrightDatabase(options = {}) {
           conversationId: interrupted.conversationId,
           worktreePath: interrupted.worktreePath,
           provider: interrupted.provider,
-          model: interrupted.model,
+          model: model ?? interrupted.model,
           reasoningEffort: interrupted.reasoningEffort,
           approvalPolicy: interrupted.approvalPolicy,
           prompt: interrupted.prompt,
           providerSessionId: decision === "resume-session" ? providerSessionId : null,
         });
-        writeCriticalAudit(`agent.run.recovery.${decision}`, { target: run.id, recoveredFrom: id, conversationId: interrupted.conversationId, recoveryClass: interrupted.recoveryClass });
+        writeCriticalAudit(`agent.run.recovery.${decision}`, { target: run.id, recoveredFrom: id, conversationId: interrupted.conversationId, recoveryClass: interrupted.recoveryClass,
+          ...(model !== undefined && model !== interrupted.model ? { modelCorrected: true } : {}) });
         return { interrupted: this.getRun(id), run, conversation: this.getConversation(interrupted.conversationId) };
       });
       const result = recover.immediate();

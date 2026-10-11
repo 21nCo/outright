@@ -70,6 +70,11 @@ test("CLI versions are gated to the verified supported range", () => {
   // No evidence exists below the recorded fixtures, so older CLIs are not enqueued.
   assert.equal(versionCompatibility(codex, codex.parseVersion("codex-cli 0.162.0")).compatible, false);
   assert.equal(versionCompatibility(codex, codex.parseVersion("codex-cli 0.145.0")).compatible, false);
+  // A prerelease at or above the floor is not the stable release the fixtures were recorded from.
+  for (const [adapter, text, version] of [[codex, "codex-cli 0.162.1-rc.1", "0.162.1-rc.1"], [codex, "codex 0.163.0-nightly.20261001", "0.163.0-nightly.20261001"], [claude, "2.1.296-beta.4 (Claude Code)", "2.1.296-beta.4"]]) {
+    assert.deepEqual(versionCompatibility(adapter, adapter.parseVersion(text)),
+      { version, compatible: false, reason: `${adapter.label} ${version} is a prerelease; Outright supports stable releases ${adapter.versions.minimum} or newer below ${adapter.versions.belowMajor}.0.0` });
+  }
   assert.equal(versionCompatibility(claude, claude.parseVersion("3.0.0 (Claude Code)")).compatible, false, "an unverified major is incompatible");
   assert.match(versionCompatibility(codex, codex.parseVersion("codex development build")).reason, /unrecognized version/);
 });
@@ -146,6 +151,17 @@ test("recorded Codex streams normalize without erasing provider details", () => 
   const resumed = normalizeFixture(codex, "resume.jsonl");
   assert.equal(resumed.find((event) => event.type === "session").payload.sessionId, session, "resume continues the native thread");
   assert.equal(resumed.find((event) => event.type === "assistant.message").payload.text, "READY");
+  assert.ok(fresh.some((event) => event.type === "tool.started" && event.payload.item.type === "command_execution"));
+  // Reasoning, plans and other non-tool items are native events, not tool rows.
+  for (const type of ["reasoning", "todo_list", "error", "future_status"]) {
+    for (const phase of ["item.started", "item.completed"]) {
+      assert.deepEqual(codex.normalize({ type: phase, item: { id: "item_9", type, text: "thinking" } }).map((event) => event.type), ["provider.event"], `${phase} ${type}`);
+    }
+  }
+  for (const type of ["file_change", "mcp_tool_call", "web_search"]) {
+    assert.equal(codex.normalize({ type: "item.started", item: { id: "item_9", type } })[0].type, "tool.started", type);
+    assert.equal(codex.normalize({ type: "item.completed", item: { id: "item_9", type } })[0].type, "tool.completed", type);
+  }
   const failedTurn = normalizeFixture(codex, "failed-turn.jsonl");
   assert.equal(failedTurn.some((event) => event.type === "tool.completed"), false, "CLI notices are not tool calls");
   assert.ok(failedTurn.some((event) => event.type === "provider.event" && event.payload.item?.type === "error"), "CLI notices stay as native events");
@@ -236,16 +252,20 @@ test("Anthropic API failures are normalized and fail the run", async () => {
   assert.match(missing.events[0].payload.message, /OUTRIGHT_ANTHROPIC_API_KEY is not set/);
 });
 
-test("an Anthropic answer cut off at the output cap fails visibly and keeps its text", async () => {
-  await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", "max-tokens.sse")); }, async (base, requests) => {
-    const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
-    assert.equal(requests[0].body.max_tokens, 8192, "the declared cap is the one requested");
-    assert.equal(result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join(""), "READY now");
-    // Before, a max_tokens stop normalized to usage only and the run completed.
-    const failure = result.events.find((event) => event.type === "provider.failure");
-    assert.deepEqual([failure?.payload.terminal, failure?.payload.native], [true, { stop_reason: "max_tokens" }]);
-    assert.match(failure.payload.message, /8192-token output limit; the answer is truncated/);
-  });
+test("an Anthropic answer cut off at the output cap or context window fails visibly and keeps its text", async () => {
+  for (const [file, stopReason, message] of [["max-tokens.sse", "max_tokens", /8192-token output limit; the answer is truncated/],
+    ["context-window.sse", "model_context_window_exceeded", /the model's context window; the answer is truncated/]]) {
+    await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", file)); }, async (base, requests) => {
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      assert.equal(requests[0].body.max_tokens, 8192, "the declared cap is the one requested");
+      assert.equal(result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join(""), "READY now");
+      // Before, a truncating stop normalized to usage only and the run completed.
+      const failure = result.events.find((event) => event.type === "provider.failure");
+      assert.deepEqual([failure?.payload.terminal, failure?.payload.native], [true, { stop_reason: stopReason }], file);
+      assert.match(failure.payload.message, message);
+      assert.equal(result.events.find((event) => event.type === "usage" && event.payload.outputTokens !== undefined)?.payload.native.stop_reason, stopReason, "usage keeps the native stop reason");
+    });
+  }
 });
 
 test("a recognized Anthropic text delta without text fails the run instead of dropping it", async () => {
@@ -274,6 +294,24 @@ test("the direct provider never forwards its key across a redirect", async () =>
     }
     assert.equal(followed.length, 0, "the cross-origin hop never received the key");
   });
+});
+
+test("CR, LF and CRLF line endings stream the same answer, even split across chunks", async () => {
+  const runWith = (body, pieces) => withApiFixture((response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    // Each piece ends right after a CR, so a CRLF arrives split in two.
+    const parts = pieces ? body.split(/(?<=\r)/) : [body];
+    const next = () => { const part = parts.shift(); if (parts.length) response.write(part, () => setTimeout(next, 5)); else response.end(part); };
+    next();
+  }, (base) => runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base }));
+  const source = fixture("anthropic-api", "stream.sse");
+  const expected = await runWith(source, false);
+  assert.equal(expected.code, 0);
+  for (const ending of ["\r", "\r\n"]) {
+    // Before, a CR-only stream never ended a line and never saw message_stop.
+    const result = await runWith(source.replaceAll("\n", ending), true);
+    assert.deepEqual([result.code, result.events], [0, expected.events], JSON.stringify(ending));
+  }
 });
 
 test("one stream event is bounded across chunks and data lines", async () => {
@@ -326,16 +364,21 @@ test("the direct runner stops reading the API while its consumer is stalled", { 
   }, async (base) => {
     const child = spawn(process.execPath, [fileURLToPath(new URL("./execution-adapters/anthropic-api-runner.mjs", import.meta.url)), "--model", "m", "--", "hi"],
       { env: { PATH: process.env.PATH, OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base }, stdio: ["ignore", "pipe", "ignore"] });
-    child.stdout.pause();
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    // Without waiting for drain the runner read all 30 MiB into its own memory.
-    assert.equal(flushed, false, "the API stream is held back while stdout is full");
-    let bytes = 0;
     const closed = new Promise((resolve) => child.on("close", resolve));
-    child.stdout.on("data", (chunk) => { bytes += chunk.length; });
-    child.stdout.resume();
-    const code = await closed;
-    assert.equal(code, 0);
+    let bytes = 0;
+    child.stdout.pause();
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      // Without waiting for drain the runner read all 30 MiB into its own memory.
+      assert.equal(flushed, false, "the API stream is held back while stdout is full");
+      child.stdout.on("data", (chunk) => { bytes += chunk.length; });
+      child.stdout.resume();
+      assert.equal(await closed, 0);
+    } finally {
+      // A failed assertion must not leave the runner blocked on its pipe and
+      // the fixture server open.
+      if (child.exitCode === null && child.signalCode === null) { child.stdout.resume(); child.kill(); await closed; }
+    }
     assert.equal(flushed, true);
     assert.ok(bytes > events * 60 * 1024, "every event was delivered once the consumer resumed");
   });

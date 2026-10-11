@@ -332,6 +332,112 @@ async function chatSettingsSessionEditRegression() {
   assert(cleared.providerSessionId === "", `Clearing the session did not send it: ${JSON.stringify(cleared)}`);
 }
 
+function chooseOption(select, value) {
+  Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set.call(select, value);
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+async function providerSwitchChoicesRegression() {
+  root.render(null);
+  await settle();
+  const providers = [
+    { id: "codex", label: "Codex", available: true, compatible: true, modelProvider: "openai", models: ["gpt-5.4"], capabilities: { permissionModes: ["read-only", "workspace-write", "danger-full-access"], reasoningEfforts: ["low", "medium", "high", "xhigh"], resume: true } },
+    { id: "claude", label: "Claude Code", available: true, compatible: true, modelProvider: "anthropic", models: ["sonnet"], capabilities: { permissionModes: ["read-only", "workspace-write", "danger-full-access"], reasoningEfforts: ["low", "medium", "high", "xhigh"], resume: true } },
+    { id: "anthropic-api", label: "Anthropic API", available: true, compatible: true, modelProvider: "anthropic", models: ["claude-opus-5-5"], capabilities: { permissionModes: ["read-only"], reasoningEfforts: ["medium"], resume: false } },
+  ];
+  const initial = { provider: "codex", model: "gpt-5.4", approvalPolicy: "workspace-write", reasoningEffort: "high",
+    editor: "code", notifications: false, maxConcurrentRuns: 2, maxQueuedRuns: 32, maxRetainedMiB: 64, retentionDays: 90 };
+  const patches = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/settings" && options.method === "PATCH") { patches.push(JSON.parse(options.body)); return response({ ...initial, ...patches.at(-1) }); }
+    return response({});
+  };
+  root.render(<TooltipProvider><SettingsDialog open onOpenChange={() => {}} settings={initial} providers={providers} templates={[]} onSaved={() => {}} onError={(error) => { throw error; }} /></TooltipProvider>);
+  const control = (label) => [...document.querySelectorAll('[role="dialog"] .setting-row')].find((row) => row.textContent.startsWith(label))?.querySelector("select, input");
+  const saveButton = () => [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent.includes("Save settings"));
+  const status = () => document.querySelector("#default-provider-status").textContent;
+  const values = () => ["Approval policy", "Reasoning effort", "Default model"].map((label) => control(label).value).join(",");
+  await until(() => control("Default provider")?.value === "codex", "provider settings opened");
+  // Before, the switch rewrote the global policy and effort to read-only/medium.
+  chooseOption(control("Default provider"), "anthropic-api");
+  await until(() => status().includes("does not support"), "unsupported choices announced");
+  assert(values() === "workspace-write,high,gpt-5.4", `A provider switch changed another choice: ${values()}`);
+  assert(saveButton().disabled && status().includes("was chosen for Codex"), "Save allowed choices the provider cannot honour");
+  chooseOption(control("Default provider"), "codex");
+  await until(() => !saveButton().disabled, "switching back restores a saveable draft");
+  assert(values() === "workspace-write,high,gpt-5.4", "switching back did not keep the original choices");
+  chooseOption(control("Default provider"), "anthropic-api");
+  chooseOption(control("Approval policy"), "read-only");
+  chooseOption(control("Reasoning effort"), "medium");
+  setControlValue(control("Default model"), "");
+  await until(() => !saveButton().disabled, "explicit supported choices enable Save");
+  saveButton().click();
+  await until(() => patches.length === 1, "provider settings saved");
+  assert(JSON.stringify(Object.entries(patches[0]).sort()) === JSON.stringify(Object.entries({ provider: "anthropic-api", model: "", approvalPolicy: "read-only", reasoningEffort: "medium" }).sort()), `Unexpected settings patch: ${JSON.stringify(patches[0])}`);
+
+  // The conversation dialog applies the same rule to its model.
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const chat = { ...chats.A, model: "gpt-5.4" };
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: initial, providers, templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chat] });
+    if (url.pathname === "/api/conversations/chat-A" && options.method === "PATCH") { patches.push(JSON.parse(options.body)); return response({ ...chat, ...patches.at(-1) }); }
+    if (url.pathname === "/api/conversations/chat-A") return response(chat);
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('.conversation-header h1')?.textContent === chats.A.title, "chat provider fixture loaded");
+  host.querySelector('.conversation-meta button').click();
+  await until(() => document.querySelector('#chat-settings-model')?.value === "gpt-5.4", "chat settings opened");
+  const chatSave = () => [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Save");
+  chooseOption(document.querySelector('#chat-settings-provider'), "claude");
+  await until(() => document.querySelector('#chat-settings-provider-status').textContent.includes("was chosen for Codex"), "chat model mismatch announced");
+  assert(chatSave().disabled && document.querySelector('#chat-settings-model').value === "gpt-5.4", "the chat kept a Codex model for Claude Code silently");
+  setControlValue(document.querySelector('#chat-settings-model'), "sonnet");
+  await until(() => !chatSave().disabled, "an explicit model enables Save");
+  chatSave().click();
+  await until(() => patches.length === 2, "chat provider saved");
+  assert(patches[1].provider === "claude" && patches[1].model === "sonnet", `Unexpected chat patch: ${JSON.stringify(patches[1])}`);
+}
+
+async function recoveryModelCorrectionRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const interrupted = { id: "run-legacy-model", conversationId: "chat-A", status: "interrupted", recoveryClass: "exited", provider: "codex", model: "gpt 5 codex" };
+  const recoveryChat = { ...chats.A, runs: [interrupted] };
+  const requests = [];
+  const prompts = [];
+  const confirm = window.confirm;
+  window.confirm = (text) => { prompts.push(text); return prompts.length > 1; };
+  try {
+    route = async (url, options) => {
+      if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+      if (url.pathname === "/api/conversations") return response({ conversations: [recoveryChat] });
+      if (url.pathname === "/api/runs/run-legacy-model/resume") {
+        const body = JSON.parse(options.body);
+        requests.push(body);
+        if (!body.useProviderDefaultModel) return response({ error: "This run's saved model name can no longer be launched safely.", code: "RECOVERY_MODEL_UNLAUNCHABLE" }, 409);
+        return response({ id: "run-replacement" }, 202);
+      }
+      if (url.pathname === "/api/conversations/chat-A") return response(recoveryChat);
+      return response({});
+    };
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelectorAll(".recovery-actions button").length === 3, "legacy recovery actions");
+    const retry = () => [...host.querySelectorAll(".recovery-actions button")].find((button) => button.textContent.includes("Retry from scratch"));
+    // A declined confirmation sends nothing more; an accepted one retries with the default model.
+    retry().click();
+    await until(() => prompts.length === 1 && host.textContent.includes("can no longer be launched safely"), "declined correction surfaces the refusal");
+    assert(requests.length === 1 && prompts[0].includes("“gpt 5 codex”"), "the correction was not explained before replacing the model");
+    retry().click();
+    await until(() => requests.length === 3, "confirmed correction retried");
+    assert(JSON.stringify(requests.slice(1)) === JSON.stringify([{ policy: "retry" }, { policy: "retry", useProviderDefaultModel: true }]), `Unexpected recovery requests: ${JSON.stringify(requests)}`);
+  } finally { window.confirm = confirm; }
+}
+
 async function settingsRetentionDraftRegression() {
   root.render(null);
   await settle();
@@ -5424,6 +5530,8 @@ try {
     ["chat tab controls", chatTabControlRegression, "chat tab navigation ignores nested archive controls"],
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
     ["chat settings session edit", chatSettingsSessionEditRegression, "conversation settings send the session only when the user edits it"],
+    ["provider switch choices", providerSwitchChoicesRegression, "a provider switch keeps every other choice and blocks Save until unsupported ones are replaced"],
+    ["recovery model correction", recoveryModelCorrectionRegression, "a legacy model is replaced with the provider default only after an explicit confirmation"],
     ["settings retention draft", settingsRetentionDraftRegression, "missing archived data stays safe and cancel, cleanup and save use the persisted retention age"],
     ["settings save session fence", settingsSaveSessionFenceRegression, "delayed GET and PATCH save completions cannot change a reopened Settings dialog"],
     ["settings shared refresh order", settingsSharedRefreshOrderRegression, "a settings save preserves an in-flight template refresh without reverting the new quota"],

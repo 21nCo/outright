@@ -1521,15 +1521,18 @@ test("explicitly supplied false, 0 or empty run settings are rejected instead of
 test("an installed but incompatible CLI is reported before enqueueing", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
   // Settle the startup probe so authorization cannot reuse its in-flight result.
   assert.equal(await runtime.agents.providerAvailable("codex"), true);
-  writeFileSync(path.join(bin, "codex"), "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.20.0'; fi\n");
   const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Old CLI", provider: "codex" });
-  const result = responseCapture();
-  await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "must not persist" }), result);
-  assert.equal(result.statusCode, 409);
-  assert.equal(result.body.code, "PROVIDER_INCOMPATIBLE");
-  assert.match(result.body.error, /Codex 0\.20\.0 is not supported; Outright supports 0\.162\.1 or newer/);
-  const status = runtime.agents.providers().find((entry) => entry.id === "codex");
-  assert.deepEqual([status.available, status.compatible, status.version], [true, false, "0.20.0"]);
+  for (const [version, reason] of [["0.20.0", /Codex 0\.20\.0 is not supported; Outright supports 0\.162\.1 or newer/],
+    ["0.162.1-rc.1", /Codex 0\.162\.1-rc\.1 is a prerelease; Outright supports stable releases 0\.162\.1 or newer/]]) {
+    writeFileSync(path.join(bin, "codex"), `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 'codex-cli ${version}'; fi\n`);
+    const result = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "must not persist" }), result);
+    assert.equal(result.statusCode, 409, version);
+    assert.equal(result.body.code, "PROVIDER_INCOMPATIBLE");
+    assert.match(result.body.error, reason);
+    const status = runtime.agents.providers().find((entry) => entry.id === "codex");
+    assert.deepEqual([status.available, status.compatible, status.version], [true, false, version]);
+  }
   assert.deepEqual(runtime.database.listMessages(conversation.id), []);
   assert.deepEqual(runtime.database.listRuns(conversation.id), []);
 }));
@@ -1580,6 +1583,41 @@ test("session recovery is refused for an adapter that cannot resume", { skip: pr
   assert.equal(result.body.code, "PROVIDER_RESUME_UNSUPPORTED");
   assert.equal(runtime.database.getRun(interrupted.id).recoveryDecision, null);
   assert.equal(runtime.database.listRuns(conversation.id).length, 1);
+}));
+
+test("a run saved before model and session validation can be continued with an explicit correction", { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  runtime.agents.providerAvailable = async () => true;
+  const scheduled = [];
+  runtime.agents.schedule = async (entry) => { scheduled.push(entry); return entry.run; };
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Legacy recovery", provider: "codex" });
+  // Both values were accepted before this release: a free-form model and a long session id.
+  const legacySession = `legacy ${"s".repeat(300)}`;
+  const interrupted = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "codex", model: "gpt 5 codex",
+    approvalPolicy: "workspace-write", reasoningEffort: "medium", prompt: "unfinished", providerSessionId: legacySession });
+  runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+  const recover = async (body) => { const result = responseCapture(); await runtime.handleRequest(requestStream("POST", `/api/runs/${interrupted.id}/resume`, body), result); return result; };
+  // Before, both policies failed validation forever and only discard remained.
+  for (const policy of ["resume-session", "retry"]) {
+    const refused = await recover({ policy });
+    assert.deepEqual([refused.statusCode, refused.body.code], [409, "RECOVERY_MODEL_UNLAUNCHABLE"], policy);
+    assert.equal(refused.body.error.includes("gpt 5 codex"), false, "the stored value is not echoed");
+  }
+  // The legacy session cannot reach argv, even with the model corrected.
+  const resumed = await recover({ policy: "resume-session", useProviderDefaultModel: true });
+  assert.deepEqual([resumed.statusCode, resumed.body.code], [400, "PROVIDER_SESSION_INVALID"]);
+  assert.equal(runtime.database.getRun(interrupted.id).recoveryDecision, null);
+  assert.equal(runtime.database.listRuns(conversation.id).length, 1);
+  const retried = await recover({ policy: "retry", useProviderDefaultModel: true });
+  assert.equal(retried.statusCode, 202);
+  assert.deepEqual([scheduled.length, scheduled[0].run.model, scheduled[0].run.providerSessionId, scheduled[0].forceFreshSession], [1, "", null, true]);
+  assert.deepEqual([scheduled[0].run.approvalPolicy, scheduled[0].run.reasoningEffort, scheduled[0].run.prompt], ["workspace-write", "medium", "unfinished"], "authority is unchanged");
+  const evidence = runtime.database.getRun(interrupted.id);
+  assert.deepEqual([evidence.recoveryDecision, evidence.model, evidence.providerSessionId], ["retry", "gpt 5 codex", legacySession], "the interrupted run keeps its record");
+  // The database applies the same session rule as launch, whatever the caller.
+  const other = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium", prompt: "second" });
+  runtime.database.updateRun(other.id, { status: "interrupted" });
+  assert.throws(() => runtime.database.beginInterruptedRunRecovery(other.id, "resume-session", { providerSessionId: legacySession }), (error) => error.details?.code === "PROVIDER_SESSION_INVALID");
+  assert.equal(runtime.database.getRun(other.id).recoveryDecision, null);
 }));
 
 test("a direct-provider run streams through the supervised runtime with its scoped credential", { skip: process.platform === "win32", timeout: 30000 }, async () => {
@@ -2775,12 +2813,17 @@ test("recovery supervisor control never receives a direct provider credential", 
   const saved = { key: process.env.OUTRIGHT_ANTHROPIC_API_KEY, base: process.env.OUTRIGHT_ANTHROPIC_BASE_URL };
   process.env.OUTRIGHT_ANTHROPIC_API_KEY = "sk-ant-recovery";
   process.env.OUTRIGHT_ANTHROPIC_BASE_URL = "https://gateway.example";
+  // The launchd target needs a user id; simulate the macOS host's, since
+  // Windows has no process.getuid.
+  const getuid = Object.getOwnPropertyDescriptor(process, "getuid");
+  Object.defineProperty(process, "getuid", { value: () => 501, configurable: true, writable: true });
   const calls = [];
   try {
     const run = (executable, args, options) => { calls.push([executable, args[0], options?.env]); return { status: 3, stdout: "absent\n" }; };
     defaultRecoveryProcessAlive(123, "darwin", () => null, () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); }, handshake, run);
     defaultTerminateRecoveryProcess(123, "SIGTERM", handshake, "darwin", (executable, args, options) => { calls.push([executable, args[0], options?.env]); return { status: 0 }; });
   } finally {
+    if (getuid) Object.defineProperty(process, "getuid", getuid); else delete process.getuid;
     for (const [name, value] of [["OUTRIGHT_ANTHROPIC_API_KEY", saved.key], ["OUTRIGHT_ANTHROPIC_BASE_URL", saved.base]]) {
       if (value === undefined) delete process.env[name]; else process.env[name] = value;
     }

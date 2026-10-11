@@ -5,6 +5,11 @@ import { ADAPTER_CONTRACT_VERSION, defineAdapter } from "./contract.mjs";
 // Bumped whenever the runner's argv or output stream changes.
 export const ANTHROPIC_RUNNER_VERSION = "1.0.0";
 const RUNNER_PATH = fileURLToPath(new URL("./anthropic-api-runner.mjs", import.meta.url));
+// Stop reasons that end an answer before the model finished it.
+const TRUNCATING_STOP_REASONS = Object.freeze({
+  max_tokens: `the ${MAX_OUTPUT_TOKENS}-token output limit`,
+  model_context_window_exceeded: "the model's context window",
+});
 
 // Outright-managed execution: Outright itself calls the Messages API with an
 // explicitly configured key. It has no tools, so it can only answer from the
@@ -61,8 +66,9 @@ export const anthropicApiAdapter = defineAdapter({
     if (raw.type === "message_delta") {
       const usage = { type: "usage", payload: { outputTokens: raw.usage?.output_tokens, native: { ...raw.usage, stop_reason: raw.delta?.stop_reason } } };
       // A cut-off answer must not look complete. The text so far is kept.
-      if (raw.delta?.stop_reason !== "max_tokens") return [usage];
-      return [usage, { type: "provider.failure", payload: { message: `Anthropic API stopped at the ${MAX_OUTPUT_TOKENS}-token output limit; the answer is truncated`, terminal: true, native: { stop_reason: "max_tokens" } } }];
+      const stopReason = raw.delta?.stop_reason;
+      if (typeof stopReason !== "string" || !Object.hasOwn(TRUNCATING_STOP_REASONS, stopReason)) return [usage];
+      return [usage, { type: "provider.failure", payload: { message: `Anthropic API stopped at ${TRUNCATING_STOP_REASONS[stopReason]}; the answer is truncated`, terminal: true, native: { stop_reason: stopReason } } }];
     }
     if (raw.type === "error") return [{ type: "provider.failure", payload: { message: String(raw.error?.message ?? "Anthropic API request failed"), terminal: true, native: raw.error ?? null } }];
     // Pings, block boundaries and thinking deltas carry no user-visible state.

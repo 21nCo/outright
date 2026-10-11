@@ -135,23 +135,33 @@ export async function run(argv = process.argv.slice(2), environment = process.en
   const malformedEvent = () => fail("api_error", "Anthropic API sent a malformed stream event");
   // Returning from the read loop cancels the response body.
   const overflow = () => fail("api_error", "Anthropic API stream event exceeded 1 MiB");
+  // SSE lines end in CRLF, LF or CR. A CR that ends a chunk may be the first
+  // half of a CRLF, so it waits for the next chunk unless the stream ended.
+  // Returns the failure to report, if any.
+  const readLines = async (ended) => {
+    for (let end; (end = /\r\n|\r|\n/.exec(buffered));) {
+      if (!ended && end[0] === "\r" && end.index === buffered.length - 1) break;
+      const line = buffered.slice(0, end.index);
+      buffered = buffered.slice(end.index + end[0].length);
+      if (!line) { if (!(await dispatch())) return malformedEvent; }
+      else if (line.startsWith("data:")) {
+        const value = line.slice(5).trimStart();
+        data.push(value);
+        dataBytes += Buffer.byteLength(value) + 1;
+        if (dataBytes > MAX_EVENT_BYTES) return overflow;
+      }
+    }
+    return null;
+  };
   try {
     for await (const chunk of response.body) {
       buffered += decoder.decode(chunk, { stream: true });
-      let newline;
-      while ((newline = buffered.indexOf("\n")) >= 0) {
-        const line = buffered.slice(0, newline).replace(/\r$/, "");
-        buffered = buffered.slice(newline + 1);
-        if (!line) { if (!(await dispatch())) return malformedEvent(); }
-        else if (line.startsWith("data:")) {
-          const value = line.slice(5).trimStart();
-          data.push(value);
-          dataBytes += Buffer.byteLength(value) + 1;
-          if (dataBytes > MAX_EVENT_BYTES) return overflow();
-        }
-      }
+      const failure = await readLines(false);
+      if (failure) return failure();
       if (dataBytes + Buffer.byteLength(buffered) > MAX_EVENT_BYTES) return overflow();
     }
+    const failure = await readLines(true);
+    if (failure) return failure();
     if (!(await dispatch())) return malformedEvent();
   } catch (error) { return fail("network_error", `Anthropic API stream failed: ${networkCode(error)}`); }
   if (errored) process.exitCode = 1;

@@ -1646,6 +1646,10 @@ test("a terminal provider failure fails the run even when the process exits 0", 
     // An answer cut off at the output cap is not a completed run.
     { provider: "anthropic-api", lines: [{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial" } }, { type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: { output_tokens: 8192 } }, { type: "message_stop" }],
       status: "failed", error: "Anthropic API stopped at the 8192-token output limit; the answer is truncated" },
+    { provider: "anthropic-api", lines: [{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial" } }, { type: "message_delta", delta: { stop_reason: "model_context_window_exceeded" }, usage: { output_tokens: 90 } }, { type: "message_stop" }],
+      status: "failed", error: "Anthropic API stopped at the model's context window; the answer is truncated" },
+    { provider: "anthropic-api", lines: [{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "whole" } }, { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }, { type: "message_stop" }],
+      status: "completed", error: null },
     // A text delta without text is an incomplete answer, not a completed one.
     { provider: "anthropic-api", lines: [{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial" } }, { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: 7 } }, { type: "message_stop" }],
       status: "failed", error: "Anthropic API sent a malformed text delta; the answer is incomplete" },

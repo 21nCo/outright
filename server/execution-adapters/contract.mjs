@@ -34,9 +34,10 @@ export function configurationError(message, code = "PROVIDER_CONFIGURATION_UNSUP
   return error;
 }
 
+// Keeps a prerelease suffix, so "0.162.1-rc.1" is never read as 0.162.1.
 export function parseSemanticVersion(text) {
-  const match = String(text ?? "").match(/(?:^|[^\d.])(\d+)\.(\d+)\.(\d+)(?![\d.])/);
-  return match ? match.slice(1, 4).join(".") : null;
+  const match = String(text ?? "").match(/(?:^|[^\d.])(\d+\.\d+\.\d+)(-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?![\d.-])/);
+  return match ? match[1] + (match[2] ?? "") : null;
 }
 
 function compareVersions(left, right) {
@@ -122,6 +123,9 @@ export function describeAdapter(adapter) {
 export function versionCompatibility(adapter, version) {
   const range = `${adapter.versions.minimum} or newer below ${adapter.versions.belowMajor}.0.0`;
   if (!version) return { version: "", compatible: false, reason: `${adapter.label} reported an unrecognized version; Outright supports ${range}` };
+  // Fixtures are recorded from stable releases; a prerelease may change the
+  // argv or stream the adapter relies on.
+  if (version.includes("-")) return { version, compatible: false, reason: `${adapter.label} ${version} is a prerelease; Outright supports stable releases ${range}` };
   const major = Number(version.split(".")[0]);
   if (compareVersions(version, adapter.versions.minimum) < 0 || major >= adapter.versions.belowMajor) {
     return { version, compatible: false, reason: `${adapter.label} ${version} is not supported; Outright supports ${range}` };
