@@ -13,9 +13,13 @@ const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 export const ENDPOINT_REQUIREMENT = "OUTRIGHT_ANTHROPIC_BASE_URL must be an https URL or a loopback http address, without a user name or password";
 
 // The manager may stop reading; wait for it instead of buffering the whole
-// stream in this process.
-function write(record) {
-  if (process.stdout.write(`${JSON.stringify(record)}\n`)) return undefined;
+// stream in this process. A provider or gateway can reflect the key in any
+// field it controls, so a record that carries provider text is written with
+// every JSON-escaped occurrence of the key replaced.
+function write(record, secret = "") {
+  let line = JSON.stringify(record);
+  if (secret) line = line.replaceAll(JSON.stringify(secret).slice(1, -1), "[redacted]");
+  if (process.stdout.write(`${line}\n`)) return undefined;
   return new Promise((resolve) => {
     const done = () => { process.stdout.off("drain", done); process.stdout.off("close", done); process.stdout.off("error", done); resolve(); };
     process.stdout.on("drain", done);
@@ -24,8 +28,8 @@ function write(record) {
   });
 }
 
-async function fail(type, message, code = 1) {
-  await write({ type: "error", error: { type, message } });
+async function fail(type, message, code = 1, secret = "") {
+  await write({ type: "error", error: { type, message } }, secret);
   process.exitCode = code;
 }
 
@@ -106,7 +110,7 @@ export async function run(argv = process.argv.slice(2), environment = process.en
       if (typeof parsed?.error?.message === "string") message = parsed.error.message;
       if (typeof parsed?.error?.type === "string") type = parsed.error.type;
     } catch { /* Keep the status summary. */ }
-    return fail(type, message);
+    return fail(type, message, 1, apiKey);
   }
   const decoder = new TextDecoder();
   let buffered = "";
@@ -116,6 +120,9 @@ export async function run(argv = process.argv.slice(2), environment = process.en
   let dataBytes = 0;
   let stopped = false;
   let errored = false;
+  // The adapter fails a message_delta without a valid stop reason; a stream
+  // with none at all must not complete either.
+  let delta = false;
   // Returns false when the stream can no longer be trusted. Text already
   // written stays in the transcript; the run still fails.
   const dispatch = async () => {
@@ -128,8 +135,9 @@ export async function run(argv = process.argv.slice(2), environment = process.en
     catch { return false; }
     if (!event || typeof event !== "object" || Array.isArray(event)) return false;
     if (event.type === "message_stop") stopped = true;
+    if (event.type === "message_delta") delta = true;
     if (event.type === "error") errored = true;
-    await write(event);
+    await write(event, apiKey);
     return true;
   };
   const malformedEvent = () => fail("api_error", "Anthropic API sent a malformed stream event");
@@ -166,6 +174,7 @@ export async function run(argv = process.argv.slice(2), environment = process.en
   } catch (error) { return fail("network_error", `Anthropic API stream failed: ${networkCode(error)}`); }
   if (errored) process.exitCode = 1;
   else if (!stopped) await fail("api_error", "Anthropic API stream ended before message_stop");
+  else if (!delta) await fail("api_error", "Anthropic API stream ended without a stop reason; the answer may be incomplete");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await run();

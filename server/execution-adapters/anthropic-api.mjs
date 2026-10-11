@@ -65,9 +65,11 @@ export const anthropicApiAdapter = defineAdapter({
     if (raw.type === "message_start") return [{ type: "usage", payload: { inputTokens: raw.message?.usage?.input_tokens, native: raw.message?.usage ?? null } }];
     if (raw.type === "message_delta") {
       const usage = { type: "usage", payload: { outputTokens: raw.usage?.output_tokens, native: { ...raw.usage, stop_reason: raw.delta?.stop_reason } } };
-      // A cut-off answer must not look complete. The text so far is kept.
+      // A cut-off answer must not look complete, and neither may one whose
+      // final delta has no stop reason. The text and usage so far are kept.
       const stopReason = raw.delta?.stop_reason;
-      if (typeof stopReason !== "string" || !Object.hasOwn(TRUNCATING_STOP_REASONS, stopReason)) return [usage];
+      if (typeof stopReason !== "string") return [usage, { type: "provider.failure", payload: { message: "Anthropic API ended the message without a stop reason; the answer may be incomplete", terminal: true, native: { type: "malformed_stop_reason" } } }];
+      if (!Object.hasOwn(TRUNCATING_STOP_REASONS, stopReason)) return [usage];
       return [usage, { type: "provider.failure", payload: { message: `Anthropic API stopped at ${TRUNCATING_STOP_REASONS[stopReason]}; the answer is truncated`, terminal: true, native: { stop_reason: stopReason } } }];
     }
     if (raw.type === "error") return [{ type: "provider.failure", payload: { message: String(raw.error?.message ?? "Anthropic API request failed"), terminal: true, native: raw.error ?? null } }];

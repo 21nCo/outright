@@ -69,9 +69,15 @@ test("provider controls explain readiness and only offer supported choices", asy
   const anthropic = { ...direct, modelProvider: "anthropic", models: ["claude-opus-5-5"] };
   const providers = [codex, claude, anthropic];
   assert.match(modelMismatch(providers, { provider: "claude", model: "gpt-5.4" }, { provider: "codex", model: "gpt-5.4" }), /“gpt-5\.4” was chosen for Codex; choose a Claude Code model or clear it/);
-  // An explicit edit, a cleared field, a listed model or the same model provider is a deliberate choice.
-  for (const [next, opened] of [[{ provider: "claude", model: "opus" }, { provider: "codex", model: "gpt-5.4" }], [{ provider: "claude", model: "" }, { provider: "codex", model: "gpt-5.4" }],
-    [{ provider: "claude", model: "claude-opus-5-5" }, { provider: "anthropic-api", model: "claude-opus-5-5" }], [{ provider: "codex", model: "gpt-5.4" }, { provider: "codex", model: "gpt-5.4" }]]) {
+  // A shared vendor does not make Claude Code's aliases or another adapter's names valid for the target.
+  for (const model of ["sonnet", "opus", "haiku"]) {
+    assert.match(modelMismatch(providers, { provider: "anthropic-api", model }, { provider: "claude", model }), new RegExp(`“${model}” was chosen for Claude Code; choose a Anthropic API model`));
+  }
+  assert.notEqual(modelMismatch(providers, { provider: "claude", model: "claude-opus-5-5" }, { provider: "anthropic-api", model: "claude-opus-5-5" }), "");
+  // An explicit edit, a cleared field, a model the target lists or no switch is a deliberate choice.
+  for (const [next, opened] of [[{ provider: "claude", model: "haiku" }, { provider: "codex", model: "gpt-5.4" }], [{ provider: "claude", model: "" }, { provider: "codex", model: "gpt-5.4" }],
+    [{ provider: "claude", model: "opus" }, { provider: "codex", model: "opus" }], [{ provider: "anthropic-api", model: "claude-opus-5-5" }, { provider: "claude", model: "claude-opus-5-5" }],
+    [{ provider: "codex", model: "gpt-5.4" }, { provider: "codex", model: "gpt-5.4" }]]) {
     assert.equal(modelMismatch(providers, next, opened), "", JSON.stringify(next));
   }
   const [app, settings] = await Promise.all([readFile(new URL("src/App.jsx", root), "utf8"), readFile(new URL("src/components/SettingsDialog.jsx", root), "utf8")]);

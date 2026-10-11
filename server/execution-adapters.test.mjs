@@ -16,6 +16,8 @@ const normalized = (adapter, records) => records.flatMap((record) => adapter.nor
   return event;
 });
 const normalizeFixture = (adapter, name) => normalized(adapter, fixture(adapter.id, name).split("\n").filter(Boolean).map((line) => JSON.parse(line)));
+// Long enough that redacting a reflected key cannot match ordinary stream text.
+const fixtureKey = "fixture-direct-api-key";
 const baseRun = { model: "", reasoningEffort: "medium", approvalPolicy: "read-only", prompt: "review" };
 const codex = findExecutionAdapter("codex");
 const claude = findExecutionAdapter("claude");
@@ -238,12 +240,12 @@ test("Anthropic API failures are normalized and fail the run", async () => {
     assert.deepEqual(result.events.map((event) => [event.type, event.payload.message, event.payload.native?.type]), [["provider.failure", "invalid x-api-key", "authentication_error"]]);
   });
   await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", "overloaded.sse")); }, async (base) => {
-    const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
+    const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
     assert.equal(result.code, 1);
     assert.equal(result.events.at(-1).payload.message, "Overloaded");
   });
   // A key is never sent over plaintext to a non-local host, and no CLI login is consulted.
-  const insecure = await runRunner(["--model", "m", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: "http://example.com" });
+  const insecure = await runRunner(["--model", "m", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: "http://example.com" });
   assert.equal(insecure.code, 2);
   assert.match(insecure.events[0].payload.message, /must be an https URL/);
   // A harness's own Anthropic credential is never borrowed by the direct provider.
@@ -256,7 +258,7 @@ test("an Anthropic answer cut off at the output cap or context window fails visi
   for (const [file, stopReason, message] of [["max-tokens.sse", "max_tokens", /8192-token output limit; the answer is truncated/],
     ["context-window.sse", "model_context_window_exceeded", /the model's context window; the answer is truncated/]]) {
     await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", file)); }, async (base, requests) => {
-      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
       assert.equal(requests[0].body.max_tokens, 8192, "the declared cap is the one requested");
       assert.equal(result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join(""), "READY now");
       // Before, a truncating stop normalized to usage only and the run completed.
@@ -270,7 +272,7 @@ test("an Anthropic answer cut off at the output cap or context window fails visi
 
 test("a recognized Anthropic text delta without text fails the run instead of dropping it", async () => {
   await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", "malformed-delta.sse")); }, async (base) => {
-    const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
+    const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
     assert.equal(result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join(""), "READY");
     // Before, the numeric text normalized to nothing and message_stop completed the run.
     const failures = result.events.filter((event) => event.type === "provider.failure");
@@ -280,6 +282,47 @@ test("a recognized Anthropic text delta without text fails the run instead of dr
   // A delta type Outright does not consume stays ignored for forward compatibility.
   assert.deepEqual(anthropic.normalize({ type: "content_block_delta", index: 0, delta: { type: "future_delta", value: 1 } }), []);
   assert.equal(anthropic.normalize({ type: "content_block_delta", index: 0 })[0].type, "provider.failure");
+});
+
+test("a reflected API key never leaves the runner in provider error text", async () => {
+  const secret = "sk-ant-reflected/fixture+key";
+  const reflected = `invalid x-api-key ${secret}`;
+  const sseError = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "overloaded_error", message: reflected, echoed: secret } })}\n\n`;
+  for (const respond of [
+    (response) => { response.writeHead(401, { "content-type": "application/json" }); response.end(JSON.stringify({ type: "error", error: { type: `authentication_error ${secret}`, message: reflected } })); },
+    (response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(sseError); },
+  ]) {
+    await withApiFixture(respond, async (base) => {
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: secret, OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      // Before, the gateway's message reached stdout, run events and the run error verbatim.
+      assert.equal(result.code, 1);
+      assert.equal(result.stdout.includes(secret) || result.stdout.includes(JSON.stringify(secret).slice(1, -1)), false, "the key is never echoed");
+      const failure = result.events.at(-1);
+      assert.deepEqual([failure.type, failure.payload.terminal, failure.payload.message], ["provider.failure", true, "invalid x-api-key [redacted]"]);
+    });
+  }
+});
+
+test("a message that ends without a valid stop reason fails and keeps its text and usage", async () => {
+  const text = (result) => result.events.filter((event) => event.type === "assistant.delta").map((event) => event.payload.text).join("");
+  const withoutReason = fixture("anthropic-api", "missing-stop-reason.sse");
+  for (const [name, body] of [["missing", withoutReason], ["numeric", withoutReason.replace('"delta":{"stop_sequence":null}', '"delta":{"stop_reason":7}')]]) {
+    await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(body); }, async (base) => {
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      assert.equal(text(result), "READY now", name);
+      assert.equal(result.events.find((event) => event.type === "usage" && event.payload.outputTokens !== undefined)?.payload.outputTokens, 3, name);
+      // Before, the delta normalized to usage only and message_stop completed the run.
+      const failures = result.events.filter((event) => event.type === "provider.failure");
+      assert.deepEqual(failures.map((event) => [event.payload.terminal, event.payload.message, event.payload.native]),
+        [[true, "Anthropic API ended the message without a stop reason; the answer may be incomplete", { type: "malformed_stop_reason" }]], name);
+    });
+  }
+  // A stream with no message_delta at all reaches message_stop without any stop reason.
+  const noDelta = withoutReason.replace(/event: message_delta\n.*\n\n/, "");
+  await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(noDelta); }, async (base) => {
+    const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
+    assert.deepEqual([result.code, text(result), result.events.at(-1).payload.message], [1, "READY now", "Anthropic API stream ended without a stop reason; the answer may be incomplete"]);
+  });
 });
 
 test("the direct provider never forwards its key across a redirect", async () => {
@@ -303,7 +346,7 @@ test("CR, LF and CRLF line endings stream the same answer, even split across chu
     const parts = pieces ? body.split(/(?<=\r)/) : [body];
     const next = () => { const part = parts.shift(); if (parts.length) response.write(part, () => setTimeout(next, 5)); else response.end(part); };
     next();
-  }, (base) => runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base }));
+  }, (base) => runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base }));
   const source = fixture("anthropic-api", "stream.sse");
   const expected = await runWith(source, false);
   assert.equal(expected.code, 0);
@@ -323,7 +366,7 @@ test("one stream event is bounded across chunks and data lines", async () => {
       for (let index = 0; index < lines; index += 1) response.write(line);
       response.end("\n");
     }, async (base) => {
-      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
       assert.equal(result.code, 1, `a ${lines}-line event must fail`);
       assert.equal(result.events.at(-1).payload.message, "Anthropic API stream event exceeded 1 MiB");
       assert.ok(result.stdout.length < 1024, "the oversized event is not echoed");
@@ -338,7 +381,7 @@ test("a malformed stream event fails the run and keeps the text already streamed
       response.writeHead(200, { "content-type": "text/event-stream" });
       response.end(`${delta("partial")}${broken}${delta(" lost")}data: {"type":"message_stop"}\n\n`);
     }, async (base) => {
-      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
       // Before, the event was dropped and message_stop completed the run.
       assert.equal(result.code, 1, broken);
       assert.deepEqual(result.events.map((event) => [event.type, event.payload.text ?? event.payload.message]),
@@ -358,12 +401,12 @@ test("the direct runner stops reading the API while its consumer is stalled", { 
     let index = 0;
     const pump = () => {
       while (index < events) { index += 1; if (!response.write(event)) { response.once("drain", pump); return; } }
-      response.end('data: {"type":"message_stop"}\n\n', () => { flushed = true; });
+      response.end('data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\ndata: {"type":"message_stop"}\n\n', () => { flushed = true; });
     };
     pump();
   }, async (base) => {
     const child = spawn(process.execPath, [fileURLToPath(new URL("./execution-adapters/anthropic-api-runner.mjs", import.meta.url)), "--model", "m", "--", "hi"],
-      { env: { PATH: process.env.PATH, OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base }, stdio: ["ignore", "pipe", "ignore"] });
+      { env: { PATH: process.env.PATH, OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base }, stdio: ["ignore", "pipe", "ignore"] });
     const closed = new Promise((resolve) => child.on("close", resolve));
     let bytes = 0;
     child.stdout.pause();
@@ -386,7 +429,7 @@ test("the direct runner stops reading the API while its consumer is stalled", { 
 
 test("an unusable direct-provider endpoint is reported as unavailable", async () => {
   for (const base of ["invalid-url", "http://example.com", "ftp://api.anthropic.com"]) {
-    const discovery = createProviderDiscovery({ environment: { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base }, probe: async () => { throw new Error("missing"); } });
+    const discovery = createProviderDiscovery({ environment: { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base }, probe: async () => { throw new Error("missing"); } });
     try {
       // Before, only the key was checked, so the run was queued and failed at launch.
       assert.equal(await discovery.available("anthropic-api"), false, base);
@@ -394,7 +437,7 @@ test("an unusable direct-provider endpoint is reported as unavailable", async ()
     } finally { await discovery.close(); }
   }
   for (const base of ["https://gateway.example/anthropic", "http://127.0.0.1:8080"]) {
-    assert.equal(anthropic.detect({ OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base }).available, true, base);
+    assert.equal(anthropic.detect({ OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base }).available, true, base);
   }
 });
 
@@ -404,11 +447,11 @@ test("an endpoint carrying a user name or password is refused before queueing an
     for (const base of [`http://user:fixture-password@127.0.0.1:${port}/anthropic`, `https://fixture-password@api.anthropic.com`]) {
       // Before, detect() accepted it and fetch rejected it after the run was
       // queued, with an error that quoted the URL and its password.
-      const status = anthropic.detect({ OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      const status = anthropic.detect({ OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
       assert.equal(status.available, false, base);
       assert.match(status.reason, /without a user name or password/);
       assert.equal(status.reason.includes("fixture-password"), false);
-      const result = await runRunner(["--model", "m", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: base });
+      const result = await runRunner(["--model", "m", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: base });
       assert.equal(result.code, 2);
       assert.equal(result.stdout.includes("fixture-password"), false, "the failure persisted as a run event is free of the secret");
     }
@@ -419,12 +462,12 @@ test("an endpoint carrying a user name or password is refused before queueing an
 test("a path-prefixed gateway base receives the request under its own path", async () => {
   await withApiFixture((response) => { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(fixture("anthropic-api", "stream.sse")); }, async (origin, requests) => {
     for (const suffix of ["/anthropic", "/anthropic/", "/team/anthropic"]) {
-      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: `${origin}${suffix}` });
+      const result = await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: `${origin}${suffix}` });
       assert.equal(result.code, 0, suffix);
       // Before, the leading-slash resolution sent the key to /v1/messages at the origin root.
       assert.equal(requests.at(-1).url, `${suffix.replace(/\/$/, "")}/v1/messages`, suffix);
     }
-    await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: "k", OUTRIGHT_ANTHROPIC_BASE_URL: origin });
+    await runRunner(["--model", "claude-opus-5-5", "--", "hi"], { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey, OUTRIGHT_ANTHROPIC_BASE_URL: origin });
     assert.equal(requests.at(-1).url, "/v1/messages", "a bare origin keeps the documented path");
   });
 });
@@ -444,7 +487,7 @@ test("discovery reports incompatible and unconfigured providers before authoriza
     assert.match(byId["anthropic-api"].reason, /OUTRIGHT_ANTHROPIC_API_KEY/);
     assert.equal(probed.includes("anthropic-api"), false, "a direct provider is never probed as a CLI");
   } finally { await discovery.close(); }
-  const configured = createProviderDiscovery({ environment: { OUTRIGHT_ANTHROPIC_API_KEY: "k" }, probe: async () => { throw new Error("missing"); } });
+  const configured = createProviderDiscovery({ environment: { OUTRIGHT_ANTHROPIC_API_KEY: fixtureKey }, probe: async () => { throw new Error("missing"); } });
   try {
     assert.equal(await configured.available("anthropic-api"), true);
     assert.equal(configured.list().find((entry) => entry.id === "anthropic-api").version, "1.0.0");

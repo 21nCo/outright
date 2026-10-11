@@ -41,12 +41,13 @@ export function unsupportedChoices(provider, draft) {
   return choices.length ? `${provider.label} does not support ${choices.join(" or ")}; choose a supported value before saving.` : "";
 }
 
-// A model belongs to its model provider. One chosen for another provider's
-// models must be replaced or cleared explicitly after a provider switch.
+// A model belongs to the adapter it was chosen for: a shared vendor does not
+// make one adapter's names, such as Claude Code's aliases, valid for another.
+// After a provider switch it is kept only when the new adapter lists it.
 export function modelMismatch(providers, draft, opened) {
   if (!draft.model || draft.model !== opened.model || draft.provider === opened.provider) return "";
   const source = providers.find((item) => item.id === opened.provider);
   const target = providers.find((item) => item.id === draft.provider);
-  if (!target || target.models?.includes(draft.model) || (source?.modelProvider && source.modelProvider === target.modelProvider)) return "";
+  if (!target || target.models?.includes(draft.model)) return "";
   return `The model “${draft.model}” was chosen for ${source?.label ?? opened.provider}; choose a ${target.label} model or clear it to use the provider default before saving.`;
 }

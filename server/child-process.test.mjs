@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import * as nodeChildProcess from "node:child_process";
+import * as scopedChildProcess from "./child-process.mjs";
 import { execFile, execFileSync, spawn, spawnExecution, spawnSync } from "./child-process.mjs";
 import { LAUNCH_WRAPPER_SOURCE } from "./agent-manager.mjs";
 import { DIRECT_PROVIDER_VARIABLES } from "./execution-adapters/index.mjs";
@@ -137,4 +139,30 @@ test("nullish args keep the options and callback in place for every scoped primi
   } finally { rmSync(cwd, { recursive: true, force: true }); }
   const version = await new Promise((resolve) => execFile(process.execPath, ["--version"], (error, stdout) => resolve(error ? null : stdout)));
   assert.equal(version.trim(), process.version);
+});
+
+test("each scoped primitive accepts and rejects exactly the arguments node:child_process does", async () => {
+  const callback = () => {};
+  const script = ["-e", "0"];
+  // Only execFile has a callback overload; a function, array or (for spawn)
+  // null options value is an error that must still throw instead of starting.
+  const shapes = { array: [script], null: [null], undefined: [undefined], optionsInArgs: [{ timeout: 5000 }], functionArgs: [callback],
+    optionsThenFunction: [{ timeout: 5000 }, callback], arrayThenFunction: [script, callback], nullThenFunction: [null, callback],
+    arrayOptions: [script, []], nullOptions: [script, null], stringArgs: ["-e"] };
+  const outcome = (start) => {
+    try { const child = start(); child?.stdin?.end?.(); child?.kill?.(); return "started"; } catch (error) { return error.code ?? error.message; }
+  };
+  for (const primitive of ["spawn", "spawnSync", "execFile", "execFileSync"]) {
+    for (const [shape, args] of Object.entries(shapes)) {
+      assert.equal(outcome(() => scopedChildProcess[primitive](process.execPath, ...args)),
+        outcome(() => nodeChildProcess[primitive](process.execPath, ...args)), `${primitive} with ${shape}`);
+    }
+  }
+  const settled = async (start) => {
+    try { const pending = start(); pending.child?.stdin?.end(); await pending; return "resolved"; } catch (error) { return error.code ?? error.message; }
+  };
+  for (const shape of ["array", "null", "optionsInArgs", "arrayOptions", "nullOptions", "stringArgs"]) {
+    assert.equal(await settled(() => promisify(execFile)(process.execPath, ...shapes[shape])),
+      await settled(() => promisify(nodeChildProcess.execFile)(process.execPath, ...shapes[shape])), `promisify(execFile) with ${shape}`);
+  }
 });

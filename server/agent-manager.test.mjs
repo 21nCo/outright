@@ -1653,6 +1653,11 @@ test("a terminal provider failure fails the run even when the process exits 0", 
     // A text delta without text is an incomplete answer, not a completed one.
     { provider: "anthropic-api", lines: [{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial" } }, { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: 7 } }, { type: "message_stop" }],
       status: "failed", error: "Anthropic API sent a malformed text delta; the answer is incomplete" },
+    // A final delta without a stop reason is not a completed answer either.
+    { provider: "anthropic-api", lines: [{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial" } }, { type: "message_delta", delta: {}, usage: { output_tokens: 1 } }, { type: "message_stop" }],
+      status: "failed", error: "Anthropic API ended the message without a stop reason; the answer may be incomplete" },
+    { provider: "anthropic-api", lines: [{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial" } }, { type: "message_delta", delta: { stop_reason: 7 }, usage: { output_tokens: 1 } }, { type: "message_stop" }],
+      status: "failed", error: "Anthropic API ended the message without a stop reason; the answer may be incomplete" },
     // A retried Codex stream notice is not the end of the turn.
     { provider: "codex", lines: [{ type: "error", message: "Reconnecting... 1/5" }, { type: "item.completed", item: { type: "agent_message", text: "done" } }], status: "completed", error: null },
   ];

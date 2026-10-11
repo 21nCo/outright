@@ -357,12 +357,15 @@ async function providerSwitchChoicesRegression() {
   const saveButton = () => [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent.includes("Save settings"));
   const status = () => document.querySelector("#default-provider-status").textContent;
   const values = () => ["Approval policy", "Reasoning effort", "Default model"].map((label) => control(label).value).join(",");
+  const blamed = () => ["Approval policy", "Reasoning effort", "Default model"].filter((label) => control(label).getAttribute("aria-invalid") === "true"
+    && control(label).getAttribute("aria-describedby") === "default-provider-status").join(",");
   await until(() => control("Default provider")?.value === "codex", "provider settings opened");
   // Before, the switch rewrote the global policy and effort to read-only/medium.
   chooseOption(control("Default provider"), "anthropic-api");
   await until(() => status().includes("does not support"), "unsupported choices announced");
   assert(values() === "workspace-write,high,gpt-5.4", `A provider switch changed another choice: ${values()}`);
   assert(saveButton().disabled && status().includes("was chosen for Codex"), "Save allowed choices the provider cannot honour");
+  assert(blamed() === "Approval policy,Reasoning effort,Default model", `Invalid controls were not tied to the status: ${blamed()}`);
   chooseOption(control("Default provider"), "codex");
   await until(() => !saveButton().disabled, "switching back restores a saveable draft");
   assert(values() === "workspace-write,high,gpt-5.4", "switching back did not keep the original choices");
@@ -371,19 +374,24 @@ async function providerSwitchChoicesRegression() {
   chooseOption(control("Reasoning effort"), "medium");
   setControlValue(control("Default model"), "");
   await until(() => !saveButton().disabled, "explicit supported choices enable Save");
+  assert(blamed() === "" && !control("Default model").hasAttribute("aria-invalid"), "Corrected controls are still marked invalid");
   saveButton().click();
   await until(() => patches.length === 1, "provider settings saved");
-  assert(JSON.stringify(Object.entries(patches[0]).sort()) === JSON.stringify(Object.entries({ provider: "anthropic-api", model: "", approvalPolicy: "read-only", reasoningEffort: "medium" }).sort()), `Unexpected settings patch: ${JSON.stringify(patches[0])}`);
+  const expectedPatch = { provider: "anthropic-api", model: "", approvalPolicy: "read-only", reasoningEffort: "medium" };
+  assert(Object.keys(patches[0]).length === Object.keys(expectedPatch).length && Object.entries(expectedPatch).every(([key, value]) => patches[0][key] === value),
+    `Unexpected settings patch: ${JSON.stringify(patches[0])}`);
 
   // The conversation dialog applies the same rule to its model.
   root.render(null);
   await settle();
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
-  const chat = { ...chats.A, model: "gpt-5.4" };
+  let chat = { ...chats.A, model: "gpt-5.4" };
+  const runs = [];
   route = async (url, options) => {
     if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: initial, providers, templates: [], trustedProjects: [] });
     if (url.pathname === "/api/conversations") return response({ conversations: [chat] });
-    if (url.pathname === "/api/conversations/chat-A" && options.method === "PATCH") { patches.push(JSON.parse(options.body)); return response({ ...chat, ...patches.at(-1) }); }
+    if (url.pathname === "/api/conversations/chat-A" && options.method === "PATCH") { patches.push(JSON.parse(options.body)); chat = { ...chat, ...patches.at(-1) }; return response(chat); }
+    if (url.pathname === "/api/conversations/chat-A/runs") { runs.push(JSON.parse(options.body)); return response({ id: "run", status: "queued" }, 202); }
     if (url.pathname === "/api/conversations/chat-A") return response(chat);
     return response({});
   };
@@ -394,12 +402,32 @@ async function providerSwitchChoicesRegression() {
   const chatSave = () => [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Save");
   chooseOption(document.querySelector('#chat-settings-provider'), "claude");
   await until(() => document.querySelector('#chat-settings-provider-status').textContent.includes("was chosen for Codex"), "chat model mismatch announced");
-  assert(chatSave().disabled && document.querySelector('#chat-settings-model').value === "gpt-5.4", "the chat kept a Codex model for Claude Code silently");
+  const chatModel = () => document.querySelector('#chat-settings-model');
+  assert(chatSave().disabled && chatModel().value === "gpt-5.4", "the chat kept a Codex model for Claude Code silently");
+  assert(chatModel().getAttribute("aria-invalid") === "true" && chatModel().getAttribute("aria-describedby") === "chat-settings-provider-status", "the chat model was not tied to its error");
   setControlValue(document.querySelector('#chat-settings-model'), "sonnet");
   await until(() => !chatSave().disabled, "an explicit model enables Save");
   chatSave().click();
   await until(() => patches.length === 2, "chat provider saved");
   assert(patches[1].provider === "claude" && patches[1].model === "sonnet", `Unexpected chat patch: ${JSON.stringify(patches[1])}`);
+  // Before, a shared vendor let a Claude Code alias reach the Messages API.
+  await until(() => !chatModel() && host.querySelector('textarea[placeholder*="Ask claude"]'), "chat saved on Claude Code");
+  host.querySelector('.conversation-meta button').click();
+  await until(() => chatModel()?.value === "sonnet", "chat settings reopened");
+  chooseOption(document.querySelector('#chat-settings-provider'), "anthropic-api");
+  await until(() => document.querySelector('#chat-settings-provider-status').textContent.includes("was chosen for Claude Code"), "alias mismatch announced");
+  assert(chatSave().disabled && chatModel().getAttribute("aria-invalid") === "true", "a Claude Code alias was kept for the Anthropic API");
+  setControlValue(chatModel(), "");
+  await until(() => !chatSave().disabled && !chatModel().hasAttribute("aria-invalid"), "clearing the alias enables Save");
+  chatSave().click();
+  await until(() => patches.length === 3, "chat moved to the direct provider");
+  assert(patches[2].provider === "anthropic-api" && patches[2].model === "", `Unexpected chat patch: ${JSON.stringify(patches[2])}`);
+  // The default model was chosen for Codex; this chat runs its own provider's default.
+  await until(() => !chatModel() && host.querySelector('textarea[placeholder*="Ask anthropic-api"]'), "chat saved on the direct provider");
+  setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "Answer with the provider default");
+  host.querySelector('[aria-label="Send message"]').click();
+  await until(() => runs.length === 1, "direct-provider chat sent");
+  assert(runs[0].provider === "anthropic-api" && runs[0].model === "", `The run inherited another provider's default model: ${JSON.stringify(runs[0])}`);
 }
 
 async function recoveryModelCorrectionRegression() {
@@ -5037,7 +5065,16 @@ async function responsiveSidebarBreakpointCycles(setWidth) {
     await remainsTrue(() => document.activeElement === document.body, 600,
       "sidebar reclaimed intentional BODY focus on a later breakpoint change");
   } catch (error) {
-    throw new Error(`${error.message}; focusTrace=${JSON.stringify(trace.slice(-35))}`);
+    // Bounded diagnosis for an intermittent macOS CI failure that has not
+    // reproduced locally: whether the visible sidebar control could take focus
+    // (the app's transfer gave up) or the browser refused it.
+    const candidate = host.querySelector("#project-sidebar")?.querySelector("button:not(:disabled)");
+    const rect = candidate?.getBoundingClientRect();
+    const layout = { candidate: describe(candidate), rect: rect && [rect.left, rect.width, rect.height].map(Math.round), visibility: candidate && getComputedStyle(candidate).visibility,
+      inert: Boolean(candidate?.closest("[inert]")), documentFocused: document.hasFocus(), visibilityState: document.visibilityState };
+    candidate?.focus({ preventScroll: true });
+    layout.probeFocused = document.activeElement === candidate;
+    throw new Error(`${error.message}; layout=${JSON.stringify(layout)}; focusTrace=${JSON.stringify(trace.slice(-35))}`);
   } finally {
     document.removeEventListener("focusin", record, true);
     document.removeEventListener("focusout", record, true);
