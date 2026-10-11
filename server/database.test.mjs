@@ -2124,7 +2124,6 @@ test("moving a thread reassigns it to a destination task and archives the task i
   try {
     const conversation = database.createConversation({ projectId: "p", worktreeId: "a", worktreePath: "/tmp/a", title: "Traveller", provider: "codex" });
     const original = conversation.taskId;
-    assert.equal(database.moveConversation(conversation.id, { projectId: "p", worktreeId: "a", worktreePath: "/tmp/a" }).taskId, original);
     const moved = database.moveConversation(conversation.id, { projectId: "p", worktreeId: "b", worktreePath: "/tmp/b" });
     assert.notEqual(moved.taskId, original);
     assert.deepEqual([database.getTask(moved.taskId).worktreeId, database.getTask(moved.taskId).title], ["b", "Traveller"]);
@@ -2140,6 +2139,51 @@ test("moving a thread reassigns it to a destination task and archives the task i
     const project = database.createTask({ scopeKind: "project", projectId: "p", title: "Project" });
     assert.throws(() => database.createConversation({ projectId: "p", worktreeId: "c", worktreePath: "/tmp/c", title: "No", provider: "codex", taskId: project.id }),
       (error) => error.statusCode === 409 && error.details.code === "TASK_SCOPE_UNSUPPORTED");
+  } finally { database.close(); }
+});
+
+test("a move without taskId starts a new task even in place, taking only the moved thread's status", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const at = { projectId: "p", worktreeId: "a", worktreePath: "/tmp/a" };
+    const stays = database.createConversation({ ...at, title: "Stays", provider: "codex" });
+    const leaves = database.createConversation({ ...at, title: "Leaves", provider: "codex", taskId: stays.taskId });
+    const run = database.createRun({ conversationId: leaves.id, provider: "codex", approvalPolicy: "read-only", prompt: "busy" });
+    assert.equal(database.getTask(stays.taskId).status, "running");
+    const moved = database.moveConversation(leaves.id, at);
+    assert.notEqual(moved.taskId, stays.taskId);
+    assert.equal(database.getConversation(stays.id).taskId, stays.taskId, "the sibling keeps its task");
+    assert.deepEqual([database.getTask(moved.taskId).title, database.getTask(moved.taskId).worktreeId, database.getTask(moved.taskId).status], ["Leaves", "a", "running"]);
+    assert.deepEqual([database.getTask(stays.taskId).threadCount, database.getTask(stays.taskId).status, database.getTask(stays.taskId).archived], [1, "idle", false]);
+    assert.equal(database.getRun(run.id).conversationId, leaves.id, "history stays with the thread");
+    const alone = database.moveConversation(stays.id, at);
+    assert.notEqual(alone.taskId, stays.taskId);
+    assert.equal(database.getTask(stays.taskId).archived, true, "the task it leaves empty is hidden");
+  } finally { database.close(); }
+});
+
+test("moving a thread its task hides into a named open task keeps it hidden and its new siblings visible", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const source = { projectId: "p", worktreeId: "a", worktreePath: "/tmp/a" };
+    const destination = { projectId: "p", worktreeId: "b", worktreePath: "/tmp/b" };
+    const hidden = database.createConversation({ ...source, title: "Hidden", provider: "codex" });
+    database.updateTask(hidden.taskId, { archived: true });
+    assert.deepEqual([database.getConversation(hidden.id).archived, database.listConversations().length], [1, 0]);
+    const named = database.createTask({ scopeKind: "worktree", ...destination, title: "Open" });
+    const sibling = database.createConversation({ ...destination, title: "Sibling", provider: "codex", taskId: named.id });
+    const moved = database.moveConversation(hidden.id, { ...destination, taskId: named.id });
+    assert.deepEqual([moved.taskId, moved.archived], [named.id, 1]);
+    assert.deepEqual(database.listConversations({ worktreeId: "b" }).map((conversation) => conversation.id), [sibling.id]);
+    assert.deepEqual(database.listConversations({ archived: true }).map((conversation) => conversation.id), [hidden.id]);
+    assert.deepEqual([database.getTask(named.id).archived, database.getConversation(sibling.id).archived], [false, 0]);
+    const unnamed = database.createConversation({ ...source, title: "Unnamed", provider: "codex" });
+    database.updateTask(unnamed.taskId, { archived: true });
+    const relocated = database.moveConversation(unnamed.id, destination);
+    assert.deepEqual([relocated.archived, database.getTask(relocated.taskId).archived], [1, true], "a new task hides it the same way");
+    database.updateConversation(hidden.id, { archived: false });
+    assert.deepEqual(database.listConversations({ worktreeId: "b" }).map((conversation) => conversation.id).sort(), [hidden.id, sibling.id].sort(),
+      "only an explicit restore shows it again");
   } finally { database.close(); }
 });
 

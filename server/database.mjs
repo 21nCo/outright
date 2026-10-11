@@ -993,16 +993,16 @@ export function createOutrightDatabase(options = {}) {
           c.worktree_path AS worktreePath, c.title, c.archived, t.archived AS taskArchived
           FROM conversations AS c JOIN tasks AS t ON t.id = c.task_id WHERE c.id = ? AND c.deleting = 0`).get(id);
         if (!current) throw databaseError(409, "Conversation is unavailable for moving");
-        // The thread joins a task at its destination: the named one, its own
-        // task when it stays in place, or a new task that keeps it as visible
-        // or hidden as it was.
-        let taskId = current.taskId;
-        if (destination.taskId !== undefined && destination.taskId !== null) taskId = requireThreadTask(db, destination.taskId, destination);
-        else if (["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== destination[key])) {
-          taskId = insertThreadTask(db, destination, current.title, Boolean(current.archived || current.taskArchived));
-        }
-        const changed = db.prepare("UPDATE conversations SET project_id = ?, worktree_id = ?, worktree_path = ?, tab_position = ?, updated_at = ?, task_id = ? WHERE id = ? AND deleting = 0")
-          .run(destination.projectId, destination.worktreeId, destination.worktreePath, position, timestamp, taskId, id).changes;
+        // The thread joins a task at its destination: the named one, or else
+        // a new task, even in place. A thread hidden by its task stays
+        // hidden: a new task is archived with it, and a named open task keeps
+        // its siblings visible while the thread archives itself.
+        const hidden = Boolean(current.archived || current.taskArchived);
+        const named = destination.taskId !== undefined && destination.taskId !== null;
+        const taskId = named ? requireThreadTask(db, destination.taskId, destination) : insertThreadTask(db, destination, current.title, hidden);
+        const archived = named && hidden ? 1 : current.archived;
+        const changed = db.prepare("UPDATE conversations SET project_id = ?, worktree_id = ?, worktree_path = ?, tab_position = ?, updated_at = ?, task_id = ?, archived = ? WHERE id = ? AND deleting = 0")
+          .run(destination.projectId, destination.worktreeId, destination.worktreePath, position, timestamp, taskId, archived, id).changes;
         if (!changed) throw databaseError(409, "Conversation is unavailable for moving");
         if (taskId !== current.taskId) {
           db.prepare("UPDATE tasks SET updated_at = ? WHERE id IN (?, ?)").run(timestamp, taskId, current.taskId);
@@ -1020,8 +1020,8 @@ export function createOutrightDatabase(options = {}) {
     // row, threads or derived status changed. A task's lifecycle follows its
     // last visible thread whatever its origin: archiving or moving away that
     // thread hides the task, and retention deletes an archived task with its
-    // last thread. A move without taskId keeps the thread's task when the
-    // destination is its current location, and otherwise starts a new task.
+    // last thread. A move without taskId always starts a new task at the
+    // destination, even in place, and never restores a hidden thread.
     listTasks(filters = {}) {
       assertTasksReady(db);
       const limit = filters.limit ?? 50;

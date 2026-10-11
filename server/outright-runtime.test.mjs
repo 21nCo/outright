@@ -3047,6 +3047,30 @@ test("conversation create and move keep every thread in exactly one task", { ski
   const returned = await callRuntime(runtime, "POST", `/api/conversations/${attached.body.id}/move`, { ...target, taskId: named.id });
   assert.equal(returned.statusCode, 200, returned.raw);
   assert.equal(returned.body.taskId, named.id);
+
+  // Without a taskId, even a move in place starts a new task.
+  const inPlace = await callRuntime(runtime, "POST", `/api/conversations/${attached.body.id}/move`, target);
+  assert.equal(inPlace.statusCode, 200, inPlace.raw);
+  assert.ok(![named.id, created.body.taskId].includes(inPlace.body.taskId));
+  assert.equal(runtime.database.getTask(inPlace.body.taskId).worktreeId, worktree.id);
+  assert.equal(runtime.database.getTask(named.id).archived, true, "the named task it left empty is hidden");
+
+  // A thread its task hides stays hidden when moved into a named open task.
+  const archivedTask = await callRuntime(runtime, "PATCH", `/api/tasks/${inPlace.body.taskId}`, { archived: true });
+  assert.equal(archivedTask.statusCode, 200, archivedTask.raw);
+  const home = runtime.database.createTask({ scopeKind: "worktree", ...destination, title: "Open home" });
+  const resident = runtime.database.createConversation({ ...destination, title: "Resident", provider: "codex", taskId: home.id });
+  const hiddenMove = await callRuntime(runtime, "POST", `/api/conversations/${attached.body.id}/move`, { ...destination, taskId: home.id });
+  assert.equal(hiddenMove.statusCode, 200, hiddenMove.raw);
+  assert.deepEqual([hiddenMove.body.taskId, hiddenMove.body.archived], [home.id, 1]);
+  const visible = await callRuntime(runtime, "GET", `/api/conversations?projectId=${project.id}&worktreeId=${linked.id}`);
+  assert.deepEqual(visible.body.conversations.map((conversation) => conversation.id), [resident.id]);
+  const launch = await callRuntime(runtime, "POST", `/api/conversations/${attached.body.id}/runs`, { prompt: "hello", approvalPolicy: "read-only" });
+  assert.deepEqual([launch.statusCode, launch.body.code], [409, "CONVERSATION_ARCHIVED"]);
+  const restored = await callRuntime(runtime, "PATCH", `/api/conversations/${attached.body.id}`, { archived: false });
+  assert.equal(restored.body.archived, 0, restored.raw);
+  assert.equal((await callRuntime(runtime, "GET", `/api/tasks/${home.id}`)).body.threadCount, 2);
+  assert.equal(runtime.database.getConversation(resident.id).archived, 0);
 }));
 
 test("run rows that change a task's derived status announce it, whatever events are published", withRuntime(async (runtime) => {
