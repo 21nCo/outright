@@ -4895,6 +4895,95 @@ async function responsiveSidebarBreakpointCycles(setWidth) {
   }
 }
 
+async function spaceSidebarRegression() {
+  const sidebarCopy = () => {
+    const sidebar = host.querySelector("#project-sidebar");
+    return [sidebar.textContent, ...[...sidebar.querySelectorAll("[aria-label]")].map((element) => element.getAttribute("aria-label"))].join("\n");
+  };
+  const assertNoGroupCopy = (copy, surface) => assert(!/group/i.test(copy.replaceAll("Ungrouped", "")), `${surface} still shows group copy: ${copy}`);
+  const headings = () => [...host.querySelectorAll(".space-heading")].map((heading) => `${heading.querySelector("span").textContent}:${heading.querySelector("small").textContent}`);
+  const base = { projects, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] };
+  const fixtureRoute = (bootstrap, extra = async () => null) => async (url, options = {}) => {
+    const handled = await extra(url, options);
+    if (handled) return handled;
+    if (url.pathname === "/api/bootstrap") return response({ ...base, ...bootstrap });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats[url.searchParams.get("projectId")]] });
+    const match = url.pathname.match(/^\/api\/conversations\/chat-([AB])$/);
+    if (match) return response(chats[match[1]]);
+    return response({});
+  };
+
+  // A bootstrap from an older runtime carries only the projectGroups alias.
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  route = fixtureRoute({ projectGroups: { groups: [{ id: "legacy", name: "Legacy space" }], memberships: { A: "legacy" } } });
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => headings().length === 2, "legacy alias sidebar");
+  assert(headings().join() === "Legacy space:1,Ungrouped:1", `Legacy alias sidebar: ${headings()}`);
+
+  root.render(null);
+  await until(() => !host.querySelector(".space-heading"), "legacy alias sidebar unmounted");
+  let state = { spaces: [{ id: "space-1", name: "Fixture space", position: 0 }], memberships: { A: "space-1" } };
+  const requests = [];
+  route = fixtureRoute({ spaces: state, projectGroups: { groups: [{ id: "stale", name: "Stale alias" }], memberships: {} } }, async (url, options) => {
+    if (/^\/api\/(?:groups|project-memberships)/.test(url.pathname)) throw new Error(`UI used a compatibility alias: ${url.pathname}`);
+    if (url.pathname === "/api/spaces" && options.method === "POST") {
+      const body = JSON.parse(options.body);
+      requests.push(["create", body]);
+      const created = { id: "space-2", name: body.name.trim(), position: 1 };
+      state = { ...state, spaces: [...state.spaces, created] };
+      return response(created, 201);
+    }
+    if (url.pathname === "/api/spaces") return response(state);
+    if (url.pathname === "/api/space-memberships" && options.method === "PUT") {
+      const body = JSON.parse(options.body);
+      requests.push(["move", body]);
+      state = { ...state, memberships: { ...state.memberships, [body.projectId]: body.spaceId } };
+      return response(state);
+    }
+    return null;
+  });
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => headings().length === 2, "space sidebar");
+  assert(headings().join() === "Fixture space:1,Ungrouped:1", `Sidebar did not prefer spaces over the alias: ${headings()}`);
+  const tree = host.querySelector('[aria-label="Spaces, projects, and worktrees"]');
+  assert(tree, "Sidebar tree lost its spaces label");
+  assertNoGroupCopy(sidebarCopy(), "Sidebar");
+
+  // OUT-31 keyboard traversal still walks space, project, worktree and action buttons.
+  const buttons = [...tree.querySelectorAll("button:not(:disabled)")];
+  buttons[0].focus();
+  for (const [key, expected] of [["ArrowDown", buttons[1]], ["End", buttons.at(-1)], ["Home", buttons[0]], ["ArrowUp", buttons.at(-1)]]) {
+    document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+    assert(document.activeElement === expected, `${key} did not move sidebar focus`);
+  }
+
+  host.querySelector('[aria-label="New space"]').click();
+  await until(() => document.querySelector("#space-name"), "new space dialog");
+  const dialog = document.querySelector('[role="dialog"]');
+  assert(dialog.querySelector("h2")?.textContent === "Create space", "Dialog title is not Create space");
+  assert(dialog.querySelector('label[for="space-name"]').textContent === "Space name", "Dialog label is not Space name");
+  assertNoGroupCopy(dialog.textContent, "Dialog");
+  setControlValue(document.querySelector("#space-name"), "  Launches  ");
+  await settle();
+  [...dialog.querySelectorAll("button")].find((button) => button.textContent === "Create space").click();
+  await until(() => headings().length === 3, "created space heading");
+  assert(JSON.stringify(requests[0]) === JSON.stringify(["create", { name: "  Launches  " }]), `Create request: ${JSON.stringify(requests)}`);
+  assert(host.querySelector(".toast")?.textContent === "Space created", "Create toast is not Space created");
+
+  host.querySelector('[aria-label="Project options for Review B"]').click();
+  await until(() => [...document.querySelectorAll('[role="menuitem"]')].some((item) => item.textContent === "Launches"), "move to space menu");
+  const menu = document.querySelector('[role="menu"]');
+  assert(menu.textContent.includes("Move to space"), "Project menu is not labeled Move to space");
+  assertNoGroupCopy(menu.textContent, "Project menu");
+  [...menu.querySelectorAll('[role="menuitem"]')].find((item) => item.textContent === "Launches").click();
+  await until(() => headings().join() === "Fixture space:1,Launches:1", "moved project into its space");
+  assert(JSON.stringify(requests[1]) === JSON.stringify(["move", { projectId: "B", spaceId: "space-2" }]), `Move request: ${JSON.stringify(requests)}`);
+  await until(() => host.querySelector(".toast")?.textContent === "Space updated", "move toast");
+  assertNoGroupCopy(sidebarCopy(), "Updated sidebar");
+}
+
 async function responsiveFocusRegression() {
   root.render(null);
   await settle();
@@ -5377,6 +5466,7 @@ try {
     ["delayed send", () => chatRace(false), "delayed send cannot attach A's run to B"],
     ["delayed trust response", () => chatRace(true), "delayed trust response cannot target another conversation"],
     ["same-worktree chat selection", sameWorktreeChatSelectionRegression, "click, keyboard and created-chat selection load only the selected detail and fence sends"],
+    ["space sidebar", spaceSidebarRegression, "sidebar shows spaces and Ungrouped, creates a space and moves a project with space copy and routes"],
     ["chat tab controls", chatTabControlRegression, "chat tab navigation ignores nested archive controls"],
     ["settings chat archive", chatSettingsArchiveRegression, "settings archive retains a selected, keyboard-reachable sibling chat"],
     ["settings retention draft", settingsRetentionDraftRegression, "missing archived data stays safe and cancel, cleanup and save use the persisted retention age"],

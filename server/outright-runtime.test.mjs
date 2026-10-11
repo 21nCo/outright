@@ -869,10 +869,12 @@ test("oversized archive writer returns retryable HTTP writes while capacity rema
       await runtime.handleRequest(requestStream("GET", "/api/capacity"), capacity);
       assert.equal(capacity.statusCode, 200);
       assert.equal(capacity.body.cleanupPending, true);
-      const denied = responseCapture();
-      await runtime.handleRequest(requestStream("POST", "/api/groups", { name: "Retry after cleanup" }), denied);
-      assert.equal(denied.statusCode, 503);
-      assert.match(denied.body.error, /retry shortly/);
+      for (const route of ["/api/spaces", "/api/groups"]) {
+        const denied = responseCapture();
+        await runtime.handleRequest(requestStream("POST", route, { name: "Retry after cleanup" }), denied);
+        assert.equal(denied.statusCode, 503, route);
+        assert.match(denied.body.error, /retry shortly/);
+      }
       await runtime.handleRequest(requestStream("POST", "/api/retention/cleanup", {}), cleanupResponse);
       assert.equal(cleanupResponse.statusCode, 503, "offline maintenance must reject another cleanup before auditing it");
     } finally {
@@ -891,9 +893,11 @@ test("oversized archive writer returns retryable HTTP writes while capacity rema
       assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'retention.cleaned'").get().count, 1,
         "cleanup response did not leave one durable completion audit");
     } finally { reopened.close(); }
-    const retry = responseCapture();
-    await runtime.handleRequest(requestStream("POST", "/api/groups", { name: "Retry after cleanup" }), retry);
-    assert.equal(retry.statusCode, 201);
+    for (const route of ["/api/spaces", "/api/groups"]) {
+      const retry = responseCapture();
+      await runtime.handleRequest(requestStream("POST", route, { name: "Retry after cleanup" }), retry);
+      assert.equal(retry.statusCode, 201, route);
+    }
     assert.equal(database.getConversation(archived.id), undefined);
   }, { deletionWorkerGate: lockGate.buffer });
 })());
@@ -973,7 +977,7 @@ test("concurrent HTTP submissions admit only the configured queue budget", { ski
 }));
 
 test("capacity-reclaim deletion routes recheck queued work against actual audited headroom", async () => {
-  for (const kind of ["group", "membership", "template", "trust"]) {
+  for (const kind of ["space", "group", "space-membership", "membership", "template", "trust"]) {
     await withRuntime(async (runtime) => {
       const database = runtime.database;
       database.updateSettings({ maxRetainedMiB: 64 });
@@ -982,13 +986,19 @@ test("capacity-reclaim deletion routes recheck queued work against actual audite
       let url;
       let body;
       let method = "DELETE";
-      if (kind === "group") url = `/api/groups/${database.createGroup("Spare group").id}`;
-      else if (kind === "membership") {
-        const group = database.createGroup("Membership group");
-        database.setProjectGroup("spare-project", group.id);
-        url = "/api/project-memberships";
+      if (kind === "space") url = `/api/spaces/${database.createSpace("Spare space").id}`;
+      else if (kind === "group") url = `/api/groups/${database.createSpace("Spare group").id}`;
+      else if (kind.endsWith("membership")) {
+        const space = database.createSpace("Membership space");
+        database.setProjectSpace("spare-project", space.id);
         method = "PUT";
-        body = { projectId: "spare-project", groupId: null };
+        if (kind === "space-membership") {
+          url = "/api/space-memberships";
+          body = { projectId: "spare-project", spaceId: null };
+        } else {
+          url = "/api/project-memberships";
+          body = { projectId: "spare-project", groupId: null };
+        }
       }
       else if (kind === "template") url = `/api/templates/${database.saveTemplate({ title: "Spare", prompt: "safe" }).id}`;
       else {
@@ -1022,7 +1032,8 @@ test("capacity-restoring edits wake deferred runs at the launch boundary", withR
   const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w",
     title: "Conversation ".repeat(150), provider: "codex" });
   const queued = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "waiting" });
-  const group = database.createGroup("Group ".repeat(350));
+  const space = database.createSpace("Space ".repeat(350));
+  const group = database.createSpace("Group ".repeat(350));
   const template = database.saveTemplate({ title: "Spare", prompt: "Template ".repeat(300) });
   const filler = database.addMessage({ conversationId: conversation.id, role: "assistant", body: "x".repeat(62 * 1024 * 1024) });
   let fillerBody = filler.body;
@@ -1030,6 +1041,7 @@ test("capacity-restoring edits wake deferred runs at the launch boundary", withR
   runtime.agents.resumeQueued = () => { wakeups += 1; };
   for (const [url, method, body] of [
     ["/api/templates", "POST", { id: template.id, title: template.title, prompt: "short" }],
+    [`/api/spaces/${space.id}`, "PATCH", { name: "Short space" }],
     [`/api/groups/${group.id}`, "PATCH", { name: "Short group" }],
     [`/api/conversations/${conversation.id}`, "PATCH", { title: "Short conversation" }],
   ]) {
@@ -1042,7 +1054,7 @@ test("capacity-restoring edits wake deferred runs at the launch boundary", withR
     await runtime.handleRequest(requestStream(method, url, body), response);
     assert.ok([200, 201].includes(response.statusCode), `${url} edit succeeded: ${response.raw}`);
     assert.equal(database.canLaunchRun(), true, `${url} edit restored launch room`);
-    assert.equal(wakeups, 1 + ["/api/templates", `/api/groups/${group.id}`, `/api/conversations/${conversation.id}`].indexOf(url));
+    assert.equal(wakeups, 1 + ["/api/templates", `/api/spaces/${space.id}`, `/api/groups/${group.id}`, `/api/conversations/${conversation.id}`].indexOf(url));
     assert.equal(database.getRun(queued.id).status, "queued");
   }
 }));
@@ -1069,7 +1081,7 @@ test("moving a conversation to a shorter worktree path wakes deferred work", { s
   assert.equal(database.getRun(queued.id).status, "queued");
 }));
 
-test("bootstrap and retention remain reachable when default groups cannot fit the retained budget", async () => {
+test("bootstrap and retention remain reachable when default spaces cannot fit the retained budget", async () => {
   const configDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-budget-config-"));
   const configFile = path.join(configDirectory, "outright.config.json");
   writeFileSync(configFile, JSON.stringify({ scanRoots: [], maxDepth: 1, maxProjects: 1 }));
@@ -1082,13 +1094,19 @@ test("bootstrap and retention remain reachable when default groups cannot fit th
   const remaining = 63 * 1024 * 1024 - database.capacity().retainedBytes;
   database.upsertMessage({ ...filler, body: `${filler.body}${"x".repeat(remaining - 300)}` });
   database.updateConversation(archived.id, { archived: true });
-  const firstGroup = database.createGroup("Core systems");
-  assert.throws(() => database.createGroup("Experiments"), (error) => error.statusCode === 507);
-  database.deleteGroup(firstGroup.id);
+  const firstSpace = database.createSpace("Core systems");
+  assert.throws(() => database.createSpace("Experiments"), (error) => error.statusCode === 507);
+  for (const route of ["/api/spaces", "/api/groups"]) {
+    const refused = responseCapture();
+    await runtime.handleRequest(requestStream("POST", route, { name: "Experiments" }), refused);
+    assert.equal(refused.statusCode, 507, `${route} create keeps the retained-budget refusal`);
+  }
+  database.deleteSpace(firstSpace.id);
   const bootstrap = responseCapture();
   await runtime.handleRequest(requestStream("GET", "/api/bootstrap"), bootstrap);
   assert.equal(bootstrap.statusCode, 200);
-  assert.deepEqual(bootstrap.body.projectGroups.groups, [], "failed setup leaves no partial default group");
+  assert.deepEqual(bootstrap.body.spaces.spaces, [], "failed setup leaves no partial default space");
+  assert.deepEqual(bootstrap.body.projectGroups.groups, []);
   assert.equal(bootstrap.body.capacity.availableForNewWorkBytes < 64 * 1024, true);
   const listing = responseCapture();
   await runtime.handleRequest(requestStream("GET", "/api/retention/archived"), listing);
@@ -1100,7 +1118,94 @@ test("bootstrap and retention remain reachable when default groups cannot fit th
   const rescan = responseCapture();
   await runtime.handleRequest(requestStream("POST", "/api/projects"), rescan);
   assert.equal(rescan.statusCode, 200);
-  assert.deepEqual(database.listGroups().groups.map((group) => group.name), ["Core systems", "Experiments"]);
+  assert.deepEqual(database.listSpaces().spaces.map((space) => space.name), ["Core systems", "Experiments"]);
+  for (const route of ["/api/spaces", "/api/groups"]) {
+    const retried = responseCapture();
+    await runtime.handleRequest(requestStream("POST", route, { name: `After cleanup ${route}` }), retried);
+    assert.equal(retried.statusCode, 201, `${route} create succeeds after cleanup`);
+  }
+    }, { configUrl: pathToFileURL(configFile) })();
+  } finally { rmSync(configDirectory, { recursive: true, force: true }); }
+});
+
+test("space routes and their group aliases share data, payload shapes, and side effects", async () => {
+  const configDirectory = mkdtempSync(path.join(os.tmpdir(), "outright-spaces-config-"));
+  const configFile = path.join(configDirectory, "outright.config.json");
+  writeFileSync(configFile, JSON.stringify({ scanRoots: [], maxDepth: 1, maxProjects: 1 }));
+  try {
+    await withRuntime(async (runtime) => {
+      const call = async (method, url, body) => {
+        const response = responseCapture();
+        await runtime.handleRequest(requestStream(method, url, body), response);
+        return response;
+      };
+      const assertEquivalent = async (step) => {
+        const spaces = await call("GET", "/api/spaces");
+        const groups = await call("GET", "/api/groups");
+        assert.equal(spaces.statusCode, 200);
+        assert.deepEqual(Object.keys(spaces.body).sort(), ["memberships", "spaces"], step);
+        assert.deepEqual(Object.keys(groups.body).sort(), ["groups", "memberships"], step);
+        assert.deepEqual(groups.body.groups, spaces.body.spaces, step);
+        assert.deepEqual(groups.body.memberships, spaces.body.memberships, step);
+        return spaces.body;
+      };
+      let wakeups = 0;
+      runtime.agents.resumeQueued = () => { wakeups += 1; };
+      const bootstrap = await call("GET", "/api/bootstrap");
+      assert.equal(bootstrap.statusCode, 200);
+      assert.deepEqual(bootstrap.body.projectGroups, { groups: bootstrap.body.spaces.spaces, memberships: bootstrap.body.spaces.memberships });
+      const seeded = (await assertEquivalent("bootstrap")).spaces.length;
+
+      const alpha = await call("POST", "/api/spaces", { name: "  Alpha  " });
+      const beta = await call("POST", "/api/groups", { name: "Beta" });
+      assert.equal(alpha.statusCode, 201);
+      assert.equal(beta.statusCode, 201);
+      assert.deepEqual(Object.keys(alpha.body).sort(), Object.keys(beta.body).sort());
+      assert.equal(alpha.body.name, "Alpha", "space names are trimmed");
+      assert.deepEqual([alpha.body.position, beta.body.position], [seeded, seeded + 1]);
+      for (const [route, label] of [["/api/spaces", /Space name is required/], ["/api/groups", /Group name is required/]]) {
+        for (const body of [{ name: "  " }, { name: 7 }, null]) {
+          const invalid = await call("POST", route, body);
+          assert.equal(invalid.statusCode, 400, `${route} ${JSON.stringify(body)}`);
+          assert.match(invalid.body.error, label);
+        }
+      }
+      await assertEquivalent("create");
+
+      assert.equal((await call("PATCH", `/api/groups/${alpha.body.id}`, { name: "Alpha renamed" })).body.name, "Alpha renamed");
+      assert.equal((await call("PATCH", `/api/spaces/${beta.body.id}`, { name: "Beta renamed" })).body.name, "Beta renamed");
+      await assertEquivalent("rename");
+
+      await call("PATCH", `/api/spaces/${alpha.body.id}`, { position: 50 });
+      await call("PATCH", `/api/groups/${beta.body.id}`, { position: 40 });
+      const reordered = await assertEquivalent("reorder");
+      assert.deepEqual(reordered.spaces.slice(-2).map((space) => space.id), [beta.body.id, alpha.body.id]);
+
+      const moved = await call("PUT", "/api/space-memberships", { projectId: "p1", spaceId: alpha.body.id });
+      assert.deepEqual(moved.body.memberships, { p1: alpha.body.id });
+      assert.ok(moved.body.spaces);
+      const legacyMoved = await call("PUT", "/api/project-memberships", { projectId: "p2", groupId: beta.body.id });
+      assert.deepEqual(legacyMoved.body.memberships, { p1: alpha.body.id, p2: beta.body.id });
+      assert.ok(legacyMoved.body.groups);
+      assert.equal(wakeups, 0, "assigning a project does not wake deferred work");
+      await assertEquivalent("move");
+      await call("PUT", "/api/space-memberships", { projectId: "p2", spaceId: null });
+      await call("PUT", "/api/project-memberships", { projectId: "p1", groupId: null });
+      assert.equal(wakeups, 2, "unassigning through either route wakes deferred work");
+      assert.deepEqual((await assertEquivalent("unassign")).memberships, {});
+      await call("PUT", "/api/project-memberships", { projectId: "p1", groupId: alpha.body.id });
+      await call("PUT", "/api/space-memberships", { projectId: "p2", spaceId: beta.body.id });
+
+      assert.equal((await call("DELETE", `/api/groups/${alpha.body.id}`)).statusCode, 204);
+      assert.deepEqual((await assertEquivalent("delete alias")).memberships, { p2: beta.body.id }, "memberships cascade");
+      assert.equal((await call("DELETE", `/api/spaces/${beta.body.id}`)).statusCode, 204);
+      assert.equal(wakeups, 4, "deleting through either route wakes deferred work");
+      const remaining = await assertEquivalent("delete");
+      assert.deepEqual(remaining.memberships, {});
+      assert.equal(remaining.spaces.length, seeded);
+      assert.equal((await call("DELETE", `/api/spaces/${beta.body.id}`)).statusCode, 404);
+      assert.equal((await call("DELETE", `/api/groups/${alpha.body.id}`)).statusCode, 404);
+      assert.equal(wakeups, 4);
     }, { configUrl: pathToFileURL(configFile) })();
   } finally { rmSync(configDirectory, { recursive: true, force: true }); }
 });

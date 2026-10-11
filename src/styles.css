@@ -167,14 +167,14 @@ button, input, textarea, select { font: inherit; }
 .project-section-heading { height: 40px; padding: 0 12px 0 18px; display: flex; align-items: center; justify-content: space-between; color: var(--muted-foreground); }
 .project-section-heading > span { font-size: 11px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
 .project-scroll { min-height: 0; flex: 1; }
-.group-list { padding: 2px 9px 72px; }
-.project-group + .project-group { margin-top: 9px; }
-.group-heading { width: 100%; height: 31px; border: 0; border-radius: 6px; padding: 0 8px; display: grid; grid-template-columns: 14px 17px minmax(0,1fr) auto; align-items: center; gap: 7px; color: var(--muted-foreground); background: transparent; cursor: pointer; text-align: left; }
-.group-heading:hover { color: var(--foreground); background: var(--hover); }
-.group-heading svg { width: 13px; height: 13px; }
-.group-heading svg:nth-child(2) { width: 15px; height: 15px; }
-.group-heading span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 650; letter-spacing: .02em; text-transform: uppercase; }
-.group-heading small { font-size: 10px; font-weight: 600; }
+.space-list { padding: 2px 9px 72px; }
+.project-space + .project-space { margin-top: 9px; }
+.space-heading { width: 100%; height: 31px; border: 0; border-radius: 6px; padding: 0 8px; display: grid; grid-template-columns: 14px 17px minmax(0,1fr) auto; align-items: center; gap: 7px; color: var(--muted-foreground); background: transparent; cursor: pointer; text-align: left; }
+.space-heading:hover { color: var(--foreground); background: var(--hover); }
+.space-heading svg { width: 13px; height: 13px; }
+.space-heading svg:nth-child(2) { width: 15px; height: 15px; }
+.space-heading span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 650; letter-spacing: .02em; text-transform: uppercase; }
+.space-heading small { font-size: 10px; font-weight: 600; }
 
 .project-tree { margin: 1px 0 4px; border-radius: 8px; }
 .project-tree.is-active { background: color-mix(in oklab, var(--sidebar-accent) 70%, transparent); }
