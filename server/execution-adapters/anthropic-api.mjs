@@ -64,7 +64,11 @@ export const anthropicApiAdapter = defineAdapter({
       }
       return raw.delta.type === "text_delta" && raw.delta.text ? [{ type: "assistant.delta", payload: { text: raw.delta.text } }] : [];
     }
-    if (raw.type === "message_start") return [{ type: "usage", payload: { inputTokens: raw.message?.usage?.input_tokens, native: raw.message?.usage ?? null } }];
+    if (raw.type === "message_start") {
+      const usage = { type: "usage", payload: { inputTokens: raw.message?.usage?.input_tokens, native: raw.message?.usage ?? null } };
+      const model = raw.message?.model;
+      return typeof model === "string" && model ? [usage, { type: "model", payload: { model } }] : [usage];
+    }
     if (raw.type === "message_delta") {
       const usage = { type: "usage", payload: { outputTokens: raw.usage?.output_tokens, native: { ...raw.usage, stop_reason: raw.delta?.stop_reason } } };
       // A cut-off answer must not look complete, and neither may one whose

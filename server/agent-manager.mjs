@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildExecutionEnvironment, buildExecutionLaunch, DIRECT_PROVIDER_VARIABLES, isProviderSessionId, requireExecutionAdapter, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
+import { buildExecutionEnvironment, buildExecutionLaunch, DIRECT_PROVIDER_VARIABLES, isProviderSessionId, modelMatches, requireExecutionAdapter, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
 import { RESOURCE_BUDGETS, retainedTranscriptMessageBytes } from "./resource-budgets.mjs";
 
@@ -15,6 +15,7 @@ const MAX_RUN_TRANSCRIPT_ITEMS = RESOURCE_BUDGETS.maxRunTranscriptItems;
 const MAX_RUN_TRANSCRIPT_BYTES = RESOURCE_BUDGETS.maxRunTranscriptBytes;
 const MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES = 16 * 1024;
 const MAX_PROVIDER_FAILURE_BYTES = 4 * 1024;
+const MAX_MODEL_SUBSTITUTION_NOTICES = 3;
 const ASSISTANT_TRUNCATION_MARKER = "\n\n[Output truncated by Outright at 1 MiB]";
 // Assistant checkpoints are coalesced: a new durable checkpoint is written
 // only after this many new stream bytes (or this much time) accumulate, so a
@@ -635,6 +636,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     state.adapter ??= requireExecutionAdapter(state.run.provider);
     for (const event of state.adapter.normalize(raw)) {
       let checkpointDelta = null;
+      if (event.type === "model") {
+        reportModelSubstitution(state, event.payload.model);
+        continue;
+      }
       if (event.type === "session") {
         // An id that could never be resumed is not stored.
         if (!isProviderSessionId(event.payload.sessionId)) continue;
@@ -1110,6 +1115,18 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     }
   }
 
+  // A run records the model it asked for. When the provider reports that
+  // another model answered, the transcript says so durably, never silently.
+  function reportModelSubstitution(state, reported) {
+    if (typeof reported !== "string" || !reported || modelMatches(state.adapter, state.run.model, reported)) return;
+    const model = truncateUtf8(reported, 200);
+    state.substitutedModels ??= new Set();
+    if (state.substitutedModels.has(model) || state.substitutedModels.size >= MAX_MODEL_SUBSTITUTION_NOTICES) return;
+    state.substitutedModels.add(model);
+    persistTranscriptItem(state, { kind: "text", body: `${state.adapter.label} reported that ${model} answered, not the requested model ${state.run.model}.`,
+      payload: { substitution: { requested: state.run.model, reported: model } } });
+  }
+
   // Persists one completed ordered transcript item immediately. Assistant
   // streams use a stable checkpoint id below so repeated delta writes update
   // one message rather than duplicating partial content.
@@ -1117,7 +1134,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     state.transcriptSeq = (state.transcriptSeq ?? 0) + 1;
     const toolItem = item.payload?.item ?? null;
     const payload = item.kind === "text"
-      ? { runId: state.run.id, provider: state.run.provider, truncated: Boolean(item.payload?.truncated) }
+      ? { runId: state.run.id, provider: state.run.provider, truncated: Boolean(item.payload?.truncated), ...(item.payload?.substitution ? { substitution: item.payload.substitution } : {}) }
       : boundedToolPayload(state.run.id, toolItem);
     const body = item.kind === "tool" ? truncateUtf8(item.body, MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES) : item.body;
     const input = budgetTranscript(state, { id: `${state.run.id}:${state.transcriptSeq}`, createdAt: new Date().toISOString(), conversationId: state.conversation.id, role: "assistant", kind: item.kind, body, payload });

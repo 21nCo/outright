@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { ADAPTER_CONTRACT_VERSION, defineAdapter, NORMALIZED_EVENT_TYPES, validateRunConfiguration } from "./execution-adapters/contract.mjs";
+import { ADAPTER_CONTRACT_VERSION, defineAdapter, modelMatches, NORMALIZED_EVENT_TYPES, validateRunConfiguration } from "./execution-adapters/contract.mjs";
 import { buildExecutionLaunch, describeAdapter, EXECUTION_ADAPTERS, findExecutionAdapter, validateExecutionConfiguration, versionCompatibility } from "./execution-adapters/index.mjs";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
 import { ENDPOINT_REQUIREMENT } from "./execution-adapters/anthropic-api-runner.mjs";
@@ -48,6 +48,42 @@ test("the adapter contract rejects specifications the scheduler could not trust"
   assert.throws(() => defineAdapter(harnessSpec({ ...direct, authority: { source: "env", variable: "OUTRIGHT_KEY" } })), /launch environment/);
   assert.deepEqual(defineAdapter(harnessSpec({ ...direct, authority: { source: "env", variable: "OUTRIGHT_KEY" }, environment: ["OUTRIGHT_KEY"] })).environment, ["OUTRIGHT_KEY"]);
   assert.throws(() => defineAdapter(harnessSpec({ versions: { minimum: "2.0.0", belowMajor: 2 } })), /version range/);
+  for (const unhonoredModels of [{ "read-only": ["unlisted"] }, { "workspace-write": ["m"] }, { "read-only": "m" }]) {
+    assert.throws(() => defineAdapter(harnessSpec({ capabilities: { ...harnessSpec().capabilities, unhonoredModels } })), /unhonored models/);
+  }
+});
+
+// Claude Code 2.1.296 answers with Sonnet for the haiku alias in plan mode
+// (live acceptance at b15b200). Every other advertised model and policy runs
+// exactly the model it names.
+test("every advertised Claude model and approval policy runs that model or is rejected before queueing", () => {
+  const conversation = { worktreePath: "/w" };
+  for (const model of claude.capabilities.models) {
+    for (const [approvalPolicy, mode] of Object.entries(claude.capabilities.permissionModes)) {
+      const run = { provider: "claude", ...baseRun, model, approvalPolicy };
+      if (model === "haiku" && approvalPolicy === "read-only") {
+        assert.throws(() => validateExecutionConfiguration(run), (error) => {
+          assert.deepEqual([error.code, error.statusCode], ["PROVIDER_CONFIGURATION_UNSUPPORTED", 409]);
+          assert.match(error.message, /haiku under the read-only approval policy/);
+          return true;
+        });
+        assert.throws(() => buildExecutionLaunch({ conversation, run }), { code: "PROVIDER_CONFIGURATION_UNSUPPORTED" }, "a stale queued run fails closed at launch");
+        continue;
+      }
+      const { args } = buildExecutionLaunch({ conversation, run });
+      assert.deepEqual(args.filter((arg, index) => ["--model", "--permission-mode"].includes(args[index - 1])), [mode, model], `${model} ${approvalPolicy}`);
+    }
+  }
+  assert.doesNotThrow(() => validateExecutionConfiguration({ provider: "claude", ...baseRun, model: "claude-haiku-5-5" }), "the full id is honored in plan mode");
+  assert.deepEqual(describeAdapter(claude).capabilities.unhonoredModels, { "read-only": ["haiku"] });
+});
+
+test("a reported model matches the requested id, its dated snapshot or the adapter's alias", () => {
+  for (const [adapter, requested, reported, expected] of [
+    [claude, "haiku", "claude-haiku-5-5", true], [claude, "haiku", "claude-sonnet-5-5", false], [claude, "sonnet", "claude-sonnet-5-5", true],
+    [claude, "claude-haiku-5-5", "claude-haiku-5-5", true], [claude, "claude-haiku-5-5", "claude-sonnet-5-5", false], [claude, "", "claude-sonnet-5-5", true],
+    [claude, "my-model", "claude-my-model-1", false], [anthropic, "claude-opus-5-5", "claude-opus-5-5-20261001", true], [anthropic, "claude-opus-5-5", "claude-sonnet-5-5", false],
+  ]) assert.equal(modelMatches(adapter, requested, reported), expected, `${adapter.id} ${requested} -> ${reported}`);
 });
 
 test("every registered adapter has fixtures and a serializable description without secrets", () => {
@@ -191,6 +227,17 @@ test("recorded Claude Code streams normalize without erasing provider details", 
   assert.match(failure.message, /issue with the selected model/);
   assert.deepEqual([failure.native.terminal_reason, failure.native.api_error_status], ["api_error", 404]);
   assert.equal(failure.terminal, true);
+  assert.ok(fresh.some((event) => event.type === "provider.event" && event.payload.type === "assistant"), "a text-only assistant record stays a native event");
+  assert.deepEqual(fresh.filter((event) => event.type === "model").map((event) => event.payload.model), ["claude-opus-5-5"]);
+});
+
+test("Claude Code reports the model its own messages ran, not its init event or subagents", () => {
+  const events = normalizeFixture(claude, "model-substitution.jsonl");
+  // Init says Haiku; the run's own messages say Sonnet; the Task subagent's Haiku is not the run's model.
+  assert.deepEqual(events.filter((event) => event.type === "model").map((event) => event.payload.model), ["claude-sonnet-5-5", "claude-sonnet-5-5", "claude-sonnet-5-5"]);
+  const usage = events.find((event) => event.type === "usage").payload;
+  assert.deepEqual(Object.keys(usage.modelUsage), ["claude-sonnet-5-5", "claude-haiku-5-5"], "per-model usage is kept");
+  assert.deepEqual(anthropic.normalize({ type: "message_start", message: { model: "claude-sonnet-5-5", usage: { input_tokens: 1 } } }).map((event) => event.type === "model" ? event.payload.model : event.type), ["usage", "claude-sonnet-5-5"]);
 });
 
 function runRunner(args, environment, nodeOptions = []) {

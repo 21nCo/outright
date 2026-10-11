@@ -1955,7 +1955,7 @@ function ProjectTree({ project, activeProjectId, activeWorktreeId, expanded, spa
 function ConversationHeader({ conversation, worktree, latestRun, pendingRuns, onManage }) {
   const latestPending = pendingRuns.some((run) => run.id === latestRun?.id);
   const earlierPending = pendingRuns.length - Number(latestPending);
-  return <section className="conversation-header"><div className="conversation-symbol"><ChatCircle weight="duotone" /></div><div><h1>{conversation?.title ?? "No conversation selected"}</h1><p><GitBranch />{worktree.branch}<span>·</span>{compactPath(worktree.path)}</p></div><div className="conversation-meta">{conversation && <button onClick={onManage}><span>{conversation.provider}</span><PencilSimple /></button>}{latestRun && <small>{runSummary(latestRun, latestPending)}</small>}{earlierPending > 0 && <small>{earlierPending} earlier outcome{earlierPending === 1 ? "" : "s"} pending</small>}</div></section>;
+  return <section className="conversation-header"><div className="conversation-symbol"><ChatCircle weight="duotone" /></div><div><h1>{conversation?.title ?? "No conversation selected"}</h1><p><GitBranch />{worktree.branch}<span>·</span>{compactPath(worktree.path)}</p></div><div className="conversation-meta">{conversation && <button type="button" onClick={onManage} aria-label={`Conversation settings · ${conversation.provider}`}><span>{conversation.provider}</span><PencilSimple /></button>}{latestRun && <small>{runSummary(latestRun, latestPending)}</small>}{earlierPending > 0 && <small>{earlierPending} earlier outcome{earlierPending === 1 ? "" : "s"} pending</small>}</div></section>;
 }
 function Message({ message, conversationId }) {
   const [bodyPage, setBodyPage] = useState(null);

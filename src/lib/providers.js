@@ -38,6 +38,10 @@ export function unsupportedChoices(provider, draft) {
   const choices = [];
   if (!supportsPolicy(provider, draft.approvalPolicy)) choices.push(`the ${POLICY_LABELS[draft.approvalPolicy] ?? draft.approvalPolicy} approval policy`);
   if (provider?.capabilities && !reasoningOptions(provider).includes(draft.reasoningEffort)) choices.push(`${draft.reasoningEffort} reasoning effort`);
+  // The CLI would run another model for this one under that policy.
+  if (draft.model && provider?.capabilities?.unhonoredModels?.[draft.approvalPolicy]?.includes(draft.model)) {
+    choices.push(`the ${draft.model} model with the ${POLICY_LABELS[draft.approvalPolicy]} approval policy`);
+  }
   return choices.length ? `${provider.label} does not support ${choices.join(" or ")}; choose a supported value before saving.` : "";
 }
 

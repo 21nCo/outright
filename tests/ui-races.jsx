@@ -451,6 +451,58 @@ async function providerSwitchChoicesRegression() {
   assert(runs[0].provider === "anthropic-api" && runs[0].model === "", `The run inherited another provider's default model: ${JSON.stringify(runs[0])}`);
 }
 
+// Before, widths of 920px or less hid the header's settings button, leaving
+// a conversation's provider and model reachable only by double-click.
+async function conversationSettingsKeyboardRegression() {
+  if (!window.__fixtureSetViewport || !window.__fixtureSendKey) return false;
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const provider = (id, label, ready) => ({ id, label, kind: "harness", version: "9.9.9", available: ready, compatible: ready, reason: ready ? "" : `${label} is not installed`,
+    capabilities: { permissionModes: ["read-only", "workspace-write", "danger-full-access"], reasoningEfforts: ["low", "medium", "high", "xhigh"], resume: true } });
+  const providers = [provider("codex", "Codex", true), provider("claude", "Claude Code", false)];
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers, templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/providers") return response({ providers });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    return response({});
+  };
+  try {
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('.conversation-header h1')?.textContent === chats.A.title, "conversation settings fixture");
+    for (const width of [360, 760, 900]) {
+      await window.__fixtureSetViewport(width);
+      await until(() => window.innerWidth === width, `real ${width}px layout`); // NOSONAR S9382: each width settles before its control is checked
+      window.dispatchEvent(new Event("resize"));
+      await settle(); // NOSONAR S9382: each width settles before its control is checked
+      const manage = host.querySelector('button[aria-label="Conversation settings · codex"]');
+      const bounds = manage?.getBoundingClientRect();
+      assert(bounds && bounds.width >= 24 && bounds.height >= 24 && bounds.right <= window.innerWidth, `No visible conversation settings control at ${width}px: ${JSON.stringify(bounds?.toJSON())}`);
+      host.querySelector('[aria-label="New chat tab"]').focus();
+      await window.__fixtureSendKey("Tab"); // NOSONAR S9382: keys are delivered in order
+      assert(document.activeElement === manage, `Tab did not reach conversation settings at ${width}px: ${document.activeElement?.outerHTML.slice(0, 160)}`);
+      await window.__fixtureSendKey("Enter"); // NOSONAR S9382: keys are delivered in order
+      await until(() => document.querySelector('#chat-settings-provider'), `Enter opened conversation settings at ${width}px`); // NOSONAR S9382: each width opens its own dialog
+      const select = document.querySelector('#chat-settings-provider');
+      await until(() => select.closest('[role="dialog"]').contains(document.activeElement), `focus entered conversation settings at ${width}px`); // NOSONAR S9382: each width opens its own dialog
+      const visited = [];
+      for (let step = 0; step < 6 && document.activeElement !== select; step += 1) {
+        visited.push(document.activeElement?.id || document.activeElement?.outerHTML.slice(0, 60));
+        await window.__fixtureSendKey("Tab"); // NOSONAR S9382: keys are delivered in order
+      }
+      assert(document.activeElement === select, `Tab did not reach the provider select at ${width}px: ${visited.join(" > ")}`);
+      const claude = select.querySelector('option[value="claude"]');
+      assert(claude.disabled && claude.textContent === "Claude Code (unavailable)", `An unready provider was offered at ${width}px: ${claude.outerHTML}`);
+      assert(select.getAttribute("aria-describedby") === "chat-settings-provider-status" && document.querySelector('#chat-settings-provider-status').textContent.startsWith("Codex 9.9.9"), `Provider status was not announced at ${width}px`);
+      await window.__fixtureSendKey("Escape"); // NOSONAR S9382: keys are delivered in order
+      await until(() => !document.querySelector('#chat-settings-provider') && document.activeElement === manage, `Escape restored focus to conversation settings at ${width}px`); // NOSONAR S9382: each width closes its own dialog
+    }
+  } finally {
+    await window.__fixtureSetViewport(1280);
+  }
+}
+
 async function providerReadinessSelectionRegression() {
   root.render(null);
   await settle();
@@ -5915,6 +5967,7 @@ try {
     ["bootstrap maintenance retry", bootstrapMaintenanceRetryRegression, "a transient archive cutover resumes initial loading"],
     ["bootstrap hard failures", bootstrapHardFailureRegression, "authorization, server, and network failures surface once"],
     ["provider checking rate", providerCheckingRateRegression, "repeated checking snapshots keep a bounded poll cadence"],
+    ["conversation settings keyboard", conversationSettingsKeyboardRegression, "conversation settings stay keyboard reachable at 360, 760 and 900px", "keyboard and width checks require the CDP bridges"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and inspector contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],
   ];

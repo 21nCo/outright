@@ -1679,6 +1679,45 @@ test("a terminal provider failure fails the run even when the process exits 0", 
   }
 });
 
+test("a model the provider reports in place of the requested one is recorded visibly, once", async () => {
+  const fixture = readFileSync(new URL("../tests/fixtures/execution-adapters/claude/model-substitution.jsonl", import.meta.url), "utf8").split("\n").filter(Boolean);
+  const assistant = (model, parent = null) => JSON.stringify({ type: "assistant", parent_tool_use_id: parent, message: { model, content: [{ type: "text", text: "ok" }] } });
+  const result = JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "ok" });
+  const start = (model) => JSON.stringify({ type: "message_start", message: { model, usage: { input_tokens: 1 } } });
+  const cases = [
+    // Init says Haiku while every message and the bill say Sonnet.
+    { provider: "claude", model: "haiku", lines: fixture, reported: "claude-sonnet-5-5" },
+    { provider: "claude", model: "haiku", lines: [assistant("claude-sonnet-5-5"), assistant("claude-opus-5-5"), assistant("claude-sonnet-5-5"), result], reported: "claude-sonnet-5-5,claude-opus-5-5" },
+    { provider: "claude", model: "haiku", lines: [assistant("claude-haiku-5-5"), result], reported: "" },
+    { provider: "claude", model: "sonnet", lines: fixture, reported: "" },
+    { provider: "claude", model: "", lines: fixture, reported: "" },
+    { provider: "anthropic-api", model: "claude-opus-5-5", lines: [start("claude-sonnet-5-5")], reported: "claude-sonnet-5-5" },
+    { provider: "anthropic-api", model: "claude-opus-5-5", lines: [start("claude-opus-5-5")], reported: "" },
+  ];
+  for (const { provider, model, lines, reported } of cases) {
+    const database = fakeDatabase({ id: "conv-1", worktreePath: "/tmp/project", provider });
+    const child = fakeChild();
+    const manager = createAgentManager({ database, publish: () => {}, spawnProcess: () => child,
+      launchCommand: async (command) => ({ executable: "fake-owner", args: [], display: command.display }) });
+    try {
+      // haiku under read-only is refused before launch, so the CLI path uses workspace-write.
+      const run = database.createRun({ ...codexRun(`model-${provider}-${model}-${reported}`), provider, model, approvalPolicy: provider === "claude" ? "workspace-write" : "read-only" });
+      await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+      for (const line of lines) child.stdout.write(`${line}\n`);
+      await new Promise((resolve) => setImmediate(resolve));
+      child.emit("close", 0, null);
+      const notices = database.messages.filter((message) => message.payload?.substitution);
+      const label = `${provider} ${model || "default"}`;
+      assert.equal(notices.map((message) => message.payload.substitution.reported).join(","), reported, label);
+      for (const notice of notices) {
+        assert.equal(notice.payload.substitution.requested, model, label);
+        assert.match(notice.body, new RegExp(`${notice.payload.substitution.reported} answered, not the requested model ${model}`), label);
+      }
+      if (lines === fixture) assert.equal(database.messages.filter((message) => message.body === "Only README.md.").length, 1, `${label} keeps one final answer`);
+    } finally { await manager.shutdown(); }
+  }
+});
+
 test("a direct-provider credential reaches only its own adapter's spawn", async () => {
   const environment = { PATH: "/usr/bin", ANTHROPIC_API_KEY: "harness-own-key", OUTRIGHT_ANTHROPIC_API_KEY: "direct-key",
     OUTRIGHT_ANTHROPIC_BASE_URL: "http://127.0.0.1:9", OUTRIGHT_OTHER: "runtime-only" };

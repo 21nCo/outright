@@ -64,6 +64,11 @@ test("provider controls explain readiness and only offer supported choices", asy
   const draft = { provider: "anthropic-api", approvalPolicy: "workspace-write", reasoningEffort: "high" };
   assert.equal(unsupportedChoices(direct, draft), "Anthropic API does not support the Workspace write approval policy or high reasoning effort; choose a supported value before saving.");
   assert.equal(unsupportedChoices(direct, { ...draft, approvalPolicy: "read-only", reasoningEffort: "medium" }), "");
+  // Claude Code runs Sonnet for the haiku alias in plan mode, so Settings refuses that pair.
+  const readyClaude = { id: "claude", label: "Claude Code", capabilities: { permissionModes: ["read-only", "workspace-write"], reasoningEfforts: ["medium"], unhonoredModels: { "read-only": ["haiku"] } } };
+  const haiku = { provider: "claude", model: "haiku", approvalPolicy: "read-only", reasoningEffort: "medium" };
+  assert.equal(unsupportedChoices(readyClaude, haiku), "Claude Code does not support the haiku model with the Read only approval policy; choose a supported value before saving.");
+  for (const allowed of [{ approvalPolicy: "workspace-write" }, { model: "claude-haiku-5-5" }, { model: "" }]) assert.equal(unsupportedChoices(readyClaude, { ...haiku, ...allowed }), "", JSON.stringify(allowed));
   const codex = { id: "codex", label: "Codex", modelProvider: "openai", models: ["gpt-5.4"] };
   const claude = { id: "claude", label: "Claude Code", modelProvider: "anthropic", models: ["sonnet", "opus", "haiku"] };
   const anthropic = { ...direct, modelProvider: "anthropic", models: ["claude-opus-5-5"] };

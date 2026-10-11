@@ -14,8 +14,9 @@ export const ADAPTER_CONTRACT_VERSION = 1;
 export const APPROVAL_POLICIES = Object.freeze(["read-only", "workspace-write", "danger-full-access"]);
 export const REASONING_EFFORTS = Object.freeze(["low", "medium", "high", "xhigh"]);
 // A provider.failure with `terminal: true` fails the run even if the process
-// exits 0; any other failure only explains a nonzero exit.
-export const NORMALIZED_EVENT_TYPES = Object.freeze(["session", "assistant.delta", "assistant.message", "tool.started", "tool.completed", "usage", "provider.failure", "provider.event"]);
+// exits 0; any other failure only explains a nonzero exit. A "model" event
+// names the model the provider reports actually answered.
+export const NORMALIZED_EVENT_TYPES = Object.freeze(["session", "assistant.delta", "assistant.message", "tool.started", "tool.completed", "usage", "model", "provider.failure", "provider.event"]);
 // Values that reach a provider's argv must never parse as an option.
 const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@+[\]-]{0,199}$/;
 const SESSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
@@ -75,6 +76,11 @@ export function defineAdapter(spec) {
   if (!Array.isArray(capabilities.reasoningEfforts) || capabilities.reasoningEfforts.some((effort) => !REASONING_EFFORTS.includes(effort))) throw contractError(`${spec.id} reasoning efforts are invalid`);
   if (!Array.isArray(capabilities.models) || capabilities.models.some((model) => !MODEL_PATTERN.test(model))) throw contractError(`${spec.id} models are invalid`);
   if (!capabilities.models.length && !capabilities.customModels) throw contractError(`${spec.id} must allow at least one model`);
+  // Advertised models the native CLI runs as another model under a policy.
+  const unhonored = capabilities.unhonoredModels ?? {};
+  if (Object.entries(unhonored).some(([mode, models]) => !modes.includes(mode) || !Array.isArray(models)
+    || models.some((model) => !capabilities.models.includes(model)))) throw contractError(`${spec.id} unhonored models must be advertised models under supported policies`);
+  if (spec.modelAliases !== undefined && typeof spec.modelAliases !== "function") throw contractError(`${spec.id} modelAliases must be a function`);
   if (capabilities.structuredOutput !== "jsonl") throw contractError(`${spec.id} must stream JSON lines`);
   if (capabilities.resume && !spec.sessionIdentity?.nativeField) throw contractError(`${spec.id} resumes sessions but names no native session field`);
   for (const method of ["buildLaunch", "normalize"]) if (typeof spec[method] !== "function") throw contractError(`${spec.id} must implement ${method}`);
@@ -86,6 +92,7 @@ export function defineAdapter(spec) {
       readOnly: modes.includes("read-only"),
       permissionModes: Object.freeze({ ...capabilities.permissionModes }),
       models: Object.freeze([...capabilities.models]),
+      unhonoredModels: Object.freeze(Object.fromEntries(Object.entries(unhonored).map(([mode, models]) => [mode, Object.freeze([...models])]))),
       reasoningEfforts: Object.freeze([...capabilities.reasoningEfforts]),
     }),
   });
@@ -108,6 +115,7 @@ export function describeAdapter(adapter) {
       nativePermissionModes: { ...capabilities.permissionModes },
       readOnly: capabilities.readOnly,
       models: [...capabilities.models],
+      unhonoredModels: Object.fromEntries(Object.entries(capabilities.unhonoredModels).map(([mode, models]) => [mode, [...models]])),
       customModels: Boolean(capabilities.customModels),
       reasoningEfforts: [...capabilities.reasoningEfforts],
       resume: Boolean(capabilities.resume),
@@ -160,6 +168,9 @@ export function validateRunConfiguration(adapter, { model = "", reasoningEffort,
   if (model && !capabilities.customModels && !capabilities.models.includes(model)) {
     throw configurationError(`${adapter.label} does not support model ${model}`);
   }
+  if (capabilities.unhonoredModels[approvalPolicy]?.includes(model)) {
+    throw configurationError(`${adapter.label} runs another model for ${model} under the ${approvalPolicy} approval policy; choose another model or approval policy`);
+  }
   if (!capabilities.reasoningEfforts.includes(reasoningEffort)) {
     throw configurationError(`${adapter.label} does not support ${reasoningEffort} reasoning effort`);
   }
@@ -167,4 +178,11 @@ export function validateRunConfiguration(adapter, { model = "", reasoningEffort,
     if (!capabilities.resume) throw configurationError(`${adapter.label} cannot resume a provider session`, "PROVIDER_RESUME_UNSUPPORTED");
     if (!isProviderSessionId(sessionId)) throw configurationError(`Provider session id is invalid for ${adapter.label}`, "PROVIDER_SESSION_INVALID", 400);
   }
+}
+
+// Whether a model the provider reports answering is the requested one: the
+// same id, a dated snapshot of it, or one of the adapter's own aliases for it.
+export function modelMatches(adapter, requested, reported) {
+  if (!requested || reported === requested || reported.startsWith(`${requested}-`)) return true;
+  return Boolean(adapter.modelAliases?.(requested)?.some((prefix) => reported.startsWith(prefix)));
 }

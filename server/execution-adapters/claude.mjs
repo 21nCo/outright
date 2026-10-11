@@ -14,6 +14,9 @@ export const claudeAdapter = defineAdapter({
   capabilities: {
     permissionModes: { "read-only": "plan", "workspace-write": "acceptEdits", "danger-full-access": "bypassPermissions" },
     models: ["sonnet", "opus", "haiku"],
+    // Claude Code 2.1.296 answers with Sonnet for the haiku alias in plan
+    // mode, while its init event still says Haiku. The full id is honored.
+    unhonoredModels: { "read-only": ["haiku"] },
     customModels: true,
     reasoningEfforts: ["low", "medium", "high", "xhigh"],
     resume: true,
@@ -22,6 +25,9 @@ export const claudeAdapter = defineAdapter({
   },
   sessionIdentity: { nativeField: "session_id" },
   parseVersion: parseSemanticVersion,
+  modelAliases(model) {
+    return this.capabilities.models.includes(model) ? [`claude-${model}-`] : [];
+  },
   buildLaunch({ run, sessionId }) {
     const mode = this.capabilities.permissionModes[run.approvalPolicy];
     const args = ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-prompts", "none", "--permission-mode", mode];
@@ -52,9 +58,14 @@ export const claudeAdapter = defineAdapter({
     if (raw.type === "result") {
       if (raw.result && !raw.is_error) events.push({ type: "assistant.message", payload: { text: raw.result } });
       if (raw.is_error) events.push({ type: "provider.failure", payload: { message: String(raw.result || raw.subtype || "Claude Code reported a failure"), terminal: true, native: { subtype: raw.subtype, is_error: true, terminal_reason: raw.terminal_reason, api_error_status: raw.api_error_status } } });
-      events.push({ type: "usage", payload: { costUsd: raw.total_cost_usd, inputTokens: raw.usage?.input_tokens, outputTokens: raw.usage?.output_tokens, native: raw.usage ?? null } });
+      events.push({ type: "usage", payload: { costUsd: raw.total_cost_usd, inputTokens: raw.usage?.input_tokens, outputTokens: raw.usage?.output_tokens, native: raw.usage ?? null, modelUsage: raw.modelUsage ?? null } });
     }
     if (!events.length && raw.type !== "stream_event") events.push({ type: "provider.event", payload: raw });
+    // The run's model is the one its own messages report, not system/init.
+    // Subagent messages and extra modelUsage entries may use other models.
+    if (raw.type === "assistant" && raw.parent_tool_use_id == null && typeof raw.message?.model === "string" && raw.message.model) {
+      events.push({ type: "model", payload: { model: raw.message.model } });
+    }
     return events;
   },
 });
