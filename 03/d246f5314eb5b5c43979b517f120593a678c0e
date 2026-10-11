@@ -1,0 +1,27 @@
+server/agent-supervisor-windows.c
+  s_1900bb15a7199a::t_6b22c4e4e3ff56 126-140,142
+server/execution-adapters.test.mjs
+  s_1900bb15a7199a::t_eabee58ac0de66 10,303-304,446-463
+server/execution-adapters/anthropic-api-runner.mjs
+  s_1900bb15a7199a::t_f9868468f2defd 56-79,126-133,138,168,204,211,213,215,244,248-249
+server/provider-discovery.mjs
+  s_1900bb15a7199a::t_d6c0a45a279b5e 68-74,306
+server/provider-discovery.test.mjs
+  s_1900bb15a7199a::t_f77fcfc3104ac4 246-262
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "03d246f5314eb5b5c43979b517f120593a678c0e",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
