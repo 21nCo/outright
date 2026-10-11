@@ -1,0 +1,45 @@
+server/agent-manager.mjs
+  s_1900bb15a7199a::t_69598c64356e65 6,18,639-642,1118-1129,1137
+server/agent-manager.test.mjs
+  s_1900bb15a7199a::t_62faac6e914755 1682-1720
+server/execution-adapters.test.mjs
+  s_1900bb15a7199a::t_dfda1a013cdcf0 7,51-86,230-240
+server/execution-adapters/anthropic-api.mjs
+  s_1900bb15a7199a::t_1a8ad0b72a81e0 67-71
+server/execution-adapters/claude.mjs
+  s_1900bb15a7199a::t_703b6be4b40c60 17-19,28-30,61,64-68
+server/execution-adapters/contract.mjs
+  s_1900bb15a7199a::t_85777577bda90c 17-19,79-83,95,118,171-173,182-188
+server/execution-adapters/index.mjs
+  s_1900bb15a7199a::t_83ed014f8cbf0a 6
+src/App.jsx
+  s_1900bb15a7199a::t_20588a5f2cb83f 1958
+src/lib/providers.js
+  s_1900bb15a7199a::t_9b26e0fa514b3b 41-44
+src/styles.css
+  s_1900bb15a7199a::t_2a61fa47e7dbbb 321-322,361,571-572
+tests/fixtures/execution-adapters/claude/model-substitution.jsonl
+  s_1900bb15a7199a::t_2b1c72f43888a0 1-9
+tests/ui-accessibility.test.mjs
+  s_1900bb15a7199a::t_9efb5971284301 67-71
+tests/ui-races.jsx
+  s_1900bb15a7199a::t_c4a3ed644e7096 454-505,5970
+tests/ui-races.test.mjs
+  s_1900bb15a7199a::t_12f04f2b650ad1 882,899
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "eca1735b93882fccd3be3364c0f49d04ce441ab3",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
