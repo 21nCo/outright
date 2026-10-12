@@ -36,6 +36,7 @@ function retainedReadback(db) {
     settings: "key value",
     spaces: "id name created_at",
     project_memberships: "project_id space_id",
+    tasks: "id space_id project_id worktree_id worktree_path title objective",
     conversations: "id project_id worktree_id worktree_path title provider model provider_session_id created_at updated_at",
     messages: "id conversation_id role kind body payload created_at",
     runs: "id conversation_id worktree_path provider model reasoning_effort approval_policy prompt status pid provider_session_id created_at started_at finished_at exit_code error cost_usd input_tokens output_tokens recovery_class recovery_decision transcript_omitted",
@@ -2614,4 +2615,42 @@ test("legacy run ownership and retained bytes advance without a whole-table star
     database = createOutrightDatabase({ filename });
     assert.equal(database.capacity().migrationStatus, "ready", "completed upgrade rescanned on restart");
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("a retained table added during an unfinished scan gets its own cursor and is counted", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-retained-added-table-"));
+  const filename = path.join(directory, "outright.db");
+  try {
+    let database = createOutrightDatabase({ filename });
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: `Chat ${index}`, provider: "codex" });
+      }
+      database.createTask({ scopeKind: "project", projectId: "p", title: "Counted", objective: "o".repeat(8 * 1024) });
+    } finally { database.close(); }
+    // The scan started before this store knew the tasks table.
+    const raw = new Database(filename);
+    try {
+      raw.transaction(() => {
+        raw.prepare("UPDATE retained_usage SET bytes = 0, measured = 0 WHERE id = 1").run();
+        raw.prepare("DELETE FROM retained_scans").run();
+        for (const { name } of raw.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'retained_%_insert'").all()) {
+          const table = name.slice("retained_".length, -"_insert".length);
+          if (table !== "tasks") raw.prepare("INSERT INTO retained_scans (table_name) VALUES (?)").run(table);
+        }
+      })();
+    } finally { raw.close(); }
+    database = createOutrightDatabase({ filename });
+    try {
+      const deadline = Date.now() + 5000;
+      while (database.capacity().migrationStatus !== "ready") {
+        assert.ok(Date.now() < deadline, "the retained scan did not finish");
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    } finally { database.close(); }
+    const probe = new Database(filename, { readonly: true });
+    try {
+      assert.equal(probe.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes, retainedReadback(probe));
+    } finally { probe.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });

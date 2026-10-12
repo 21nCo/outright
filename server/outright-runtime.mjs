@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { realpath } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { createOutrightDatabase } from "./database.mjs";
+import { createOutrightDatabase, normalizeTaskInput } from "./database.mjs";
 import { AGENT_SUPERVISOR, createAgentManager, defaultGroupMembers, hardenWindowsLaunchDirectory, terminateTree } from "./agent-manager.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { createGitService } from "./git-service.mjs";
@@ -66,7 +66,16 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     if (runRecovery.phase !== "complete") { runRecovery.resumeDeferred = true; return; }
     if (!shuttingDown) agents.resumeQueued();
   }
-  const database = databaseFactory({ runtimeLease: true, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, onMigrationComplete: () => {
+  const database = databaseFactory({ runtimeLease: true, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, onTaskArchiveChanged: (change) => {
+    // A task's threads share its worktree, and the conversation consumer
+    // reloads that worktree's tabs, so one event covers them all. It names no
+    // single conversation, so the open tab stays selected.
+    publish({ type: "conversation.updated", payload: change });
+  }, onTasksChanged: (change) => {
+    // Storage records every committed task, thread and run-status change,
+    // so routes, retention, recovery and migrations never announce their own.
+    publish?.({ type: "tasks.changed", payload: change });
+  }, onMigrationComplete: () => {
     resumeQueuedAfterRecovery();
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
   }, onDeletionWorkerStart: () => {
@@ -423,9 +432,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
             reason: "cleanup failed after admission", error: error.message });
           throw error;
         }
-        await database.auditRequired("retention.cleaned", { operationId, deleted: result.deleted, deferred: result.deferred, before: cutoff });
+        await database.auditRequired("retention.cleaned", { operationId, deleted: result.deleted, deferred: result.deferred,
+          tasksDeleted: result.tasksDeleted, before: cutoff });
         agents.resumeQueued();
-        return json(response, 200, { deleted: result.deleted, deferred: result.deferred, capacity: runtimeCapacity() });
+        return json(response, 200, { deleted: result.deleted, deferred: result.deferred, tasksDeleted: result.tasksDeleted, capacity: runtimeCapacity() });
       }
 
       // Spaces replaced project groups. The /api/groups and
@@ -448,6 +458,36 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const space = editRetainedData(() => database.updateSpace(spaceMatch[1], patch));
         return json(response, 200, space);
       }
+      if (url.pathname === "/api/tasks" && request.method === "GET") {
+        const params = url.searchParams;
+        const archived = params.get("archived");
+        if (archived !== null && !["true", "false"].includes(archived)) throw apiError(400, "Task archived filter must be true or false");
+        const limitText = params.get("limit");
+        if (limitText !== null && !/^[1-9][0-9]{0,2}$/.test(limitText)) throw apiError(400, "Task page size must be 1 to 100");
+        return json(response, 200, database.listTasks({ spaceId: params.get("spaceId"), projectId: params.get("projectId"),
+          worktreeId: params.get("worktreeId"), scopeKind: params.get("scopeKind"), status: params.get("status"),
+          archived: archived === "true", limit: limitText === null ? undefined : Number(limitText), cursor: params.get("cursor") }));
+      }
+      if (url.pathname === "/api/tasks" && request.method === "POST") {
+        const input = normalizeTaskInput(await readJson(request));
+        if (input.scopeKind === "worktree") input.worktreePath = (await resolveWorktreeTarget(input)).worktreePath;
+        if (input.scopeKind === "project" && !(await projects()).projects.some((project) => project.id === input.projectId)) {
+          throw apiError(400, "Project is not a discovered project");
+        }
+        return json(response, 201, database.createTask(input));
+      }
+      const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)$/);
+      if (taskMatch && request.method === "GET") {
+        const task = database.getTask(taskMatch[1], { threads: true });
+        if (!task) throw apiError(404, "Task not found");
+        return json(response, 200, task);
+      }
+      if (taskMatch && request.method === "PATCH") {
+        const patch = await readJson(request);
+        const task = editRetainedData(() => database.updateTask(taskMatch[1], patch));
+        if (!task) throw apiError(404, "Task not found");
+        return json(response, 200, task);
+      }
       if (spaceMatch && request.method === "DELETE") {
         const deleted = database.deleteSpace(spaceMatch[1]);
         if (deleted) agents.resumeQueued();
@@ -469,12 +509,20 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         return json(response, 200, spaceListing());
       }
 
-      if (url.pathname === "/api/conversations" && request.method === "GET") return json(response, 200, { conversations: database.listConversations({ projectId: url.searchParams.get("projectId"), worktreeId: url.searchParams.get("worktreeId"), archived: url.searchParams.get("archived") === "true" }) });
+      if (url.pathname === "/api/conversations" && request.method === "GET") return json(response, 200, { conversations: database.listConversations({ projectId: url.searchParams.get("projectId"), worktreeId: url.searchParams.get("worktreeId"), taskId: url.searchParams.get("taskId"), archived: url.searchParams.get("archived") === "true" }) });
       if (url.pathname === "/api/conversations" && request.method === "POST") {
         const body = await readJson(request);
+        if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Conversation request must be a JSON object");
+        const taskId = requestTaskId(body);
+        // Refuse a task that cannot take threads before resolving the target.
+        if (taskId) {
+          const task = database.getTask(taskId);
+          if (!task) throw apiError(404, "Task not found");
+          if (task.scopeKind !== "worktree") throw apiError(409, "Only worktree tasks can get new threads", { code: "TASK_SCOPE_UNSUPPORTED" });
+        }
         const { worktreePath } = await resolveWorktreeTarget(body);
-        const conversation = database.createConversation({ ...body, worktreePath });
-        database.audit("conversation.created", { target: conversation.id, projectId: body.projectId, worktreeId: body.worktreeId });
+        const conversation = database.createConversation({ ...body, taskId, worktreePath });
+        database.audit("conversation.created", { target: conversation.id, projectId: body.projectId, worktreeId: body.worktreeId, taskId: conversation.taskId });
         publish({ type: "conversation.created", conversationId: conversation.id, payload: conversation });
         return json(response, 201, conversation);
       }
@@ -585,14 +633,16 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (conversationMoveMatch && request.method === "POST") {
         if (!database.getConversation(conversationMoveMatch[1])) throw apiError(404, "Conversation not found");
         const body = await readJson(request);
+        if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Move request must be a JSON object");
+        const taskId = requestTaskId(body);
         const unresolved = database.listUnresolvedInterruptedRuns(conversationMoveMatch[1]);
         if (unresolved.some((run) => !run.worktreePath || run.worktreePath !== body.worktreePath)) {
           throw apiError(409, "Resolve the interrupted run before moving this conversation away from its recovery worktree", { code: "RUN_RECOVERY_REQUIRED" });
         }
         const { worktreePath: destinationPath } = await resolveWorktreeTarget(body);
         const conversation = editRetainedData(() => database.moveConversation(conversationMoveMatch[1],
-          { projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath }));
-        database.audit("conversation.moved", { target: conversation.id, projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath });
+          { projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath, taskId }));
+        database.audit("conversation.moved", { target: conversation.id, projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: destinationPath, taskId: conversation.taskId });
         publish({ type: "conversation.updated", conversationId: conversation.id, payload: conversation });
         return json(response, 200, conversation);
       }
@@ -974,7 +1024,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     return shutdownPromise;
   }
 
-  return { attach, handleRequest, projects, publish, database, agents, terminals, git, shutdown,
+  return { attach, handleRequest, projects, publish, eventHub, database, agents, terminals, git, shutdown,
     whenShutdownComplete: () => shutdownCompletion, whenRunRecoveryComplete: () => runRecovery.cycle };
   } catch (error) {
     runRecoveryController.abort();
@@ -1010,6 +1060,11 @@ function json(response, status, payload) {
   response.setHeader("Cache-Control", "no-store");
   if (status === 204) response.end(); else response.end(JSON.stringify(payload));
   return true;
+}
+function requestTaskId(body) {
+  if (body.taskId === undefined || body.taskId === null) return undefined;
+  if (typeof body.taskId !== "string" || !body.taskId || body.taskId.length > 512) throw apiError(400, "Task id is invalid");
+  return body.taskId;
 }
 function requiredQuery(url, name) { const value = url.searchParams.get(name); if (!value) throw apiError(400, `Missing ${name}`); return value; }
 function apiError(statusCode, message, details) { const error = new Error(message); error.statusCode = statusCode; error.details = details; return error; }

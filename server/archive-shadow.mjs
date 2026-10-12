@@ -575,7 +575,7 @@ export function prepareArchiveShadowCutover(filename) {
   writeArchiveMarker(state, { ...marker, candidate });
 }
 
-export function cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate } = {}) {
+export function cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate, cutoverPromoteGate } = {}) {
   const { next, old, state } = archiveShadowPaths(filename);
   if (!privateRegularFile(next)) throw new Error("Archive shadow is missing");
   if (fileInfo(old) || !privateRegularFile(state)) throw new Error("Archive cutover state is missing or conflicting");
@@ -598,7 +598,7 @@ export function cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate } =
       sourceDb = lockArchiveDatabase(filename);
       candidateDb = lockArchiveDatabase(next);
     }
-    cutoverArchiveShadowLocked(filename, { sourceInfo, cutoverStatGate, state, next, old, marker });
+    cutoverArchiveShadowLocked(filename, { sourceInfo, cutoverStatGate, cutoverPromoteGate, state, next, old, marker });
     promoted = true;
   } catch (error) {
     if (["SQLITE_BUSY", "SQLITE_LOCKED"].includes(error.code)) {
@@ -619,7 +619,7 @@ export function cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate } =
   }
 }
 
-function cutoverArchiveShadowLocked(filename, { sourceInfo, cutoverStatGate, state, next, old, marker }) {
+function cutoverArchiveShadowLocked(filename, { sourceInfo, cutoverStatGate, cutoverPromoteGate, state, next, old, marker }) {
   if (!matchesCandidate(next, marker.candidate)) {
     throw Object.assign(new Error("Archive candidate changed before exclusive cutover; retry when idle"), { code: "ARCHIVE_SOURCE_BUSY" });
   }
@@ -667,6 +667,14 @@ function cutoverArchiveShadowLocked(filename, { sourceInfo, cutoverStatGate, sta
   rmSync(next);
   durableDirectory(filename);
   if (!matchesCandidate(filename, marker.candidate, false, true)) throw new Error("Archive cutover candidate changed during promotion");
+  // An armed test gate here fails a cutover after it promoted its candidate.
+  if (cutoverPromoteGate instanceof SharedArrayBuffer) {
+    const signal = new Int32Array(cutoverPromoteGate);
+    if (Atomics.compareExchange(signal, 0, 0, 1) === 0) {
+      Atomics.notify(signal, 0);
+      if (Atomics.wait(signal, 0, 1, 5000) === "timed-out") throw new Error("Archive promotion probe timed out");
+    }
+  }
   // The worker validated and flushed this same inode before the fence. A
   // full integrity scan here would make the service outage size-dependent.
   rmSync(old);
