@@ -1,0 +1,39 @@
+server/archive-delete-worker.mjs
+  s_e1c5fc1a65c0cf::t_046ba2170ce570 7,131-132,136-143,225
+server/archive-shadow.mjs
+  s_e1c5fc1a65c0cf::t_4a2efae8531a72 578,601,622,670-677
+server/database.mjs
+  s_e1c5fc1a65c0cf::t_dfc4bae0b391fe 41-50,55,156-157,185-186,197-212,228,262,266,271-276,292,438-474,798,827,851-852,908-919,926-937,940,942-943,951,953-963,990-993,997,1011-1025,1027-1032,1036-1154,1570,1736,1848,2343,2365-2366,2401,2411,2420,2429-2435,2448-2449,2456-2458,2560-2561,2563-2568,2573,2578,2642-2655,2657,2660,2710,2752-2866,3053-3057,3097,3099,3284-3557
+server/database.test.mjs
+  s_2ad05f9e34dee0::t_d5bdbb7d465f8f 8,1889-2921
+server/outright-runtime.mjs
+  s_e1c5fc1a65c0cf::t_8bf9f15b179744 8,70-79,447-448,450,473-502,524,527-534,536-537,648-649,656-657,1057,1094-1098
+server/outright-runtime.test.mjs
+  s_e1c5fc1a65c0cf::t_36f5bb52ac7c4d 1266-1269,1297-1298,3209-3541
+server/resource-budgets.test.mjs
+  s_e1c5fc1a65c0cf::t_5e14ce51834a29 39,2619-2656
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7b75cea19f76faff9be75606f74908b9b9bf4886",
+  "prompts": {},
+  "sessions": {
+    "s_2ad05f9e34dee0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ad1f412b-3c1b-4353-8d1b-d106410efcc7",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_e1c5fc1a65c0cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13e18-4241-7662-a24f-782076addabe",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
