@@ -52,6 +52,95 @@ test("persists settings, spaces, conversations, messages, runs, and search", () 
   }
 });
 
+test("a conversation's native session is scoped to its provider", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Switch", provider: "claude" });
+    database.updateConversation(conversation.id, { providerSessionId: "claude-session" });
+    assert.equal(database.updateConversation(conversation.id, { provider: "claude", title: "Same" }).providerSessionId, "claude-session");
+    // Before adapters, switching kept the Claude token for the next Codex resume.
+    const switched = database.updateConversation(conversation.id, { provider: "codex" });
+    assert.deepEqual([switched.provider, switched.providerSessionId], ["codex", null]);
+    assert.equal(database.updateConversation(conversation.id, { provider: "claude", providerSessionId: "attached" }).providerSessionId, "attached",
+      "an explicit attach in the same edit is kept");
+    assert.throws(() => database.updateConversation(conversation.id, { provider: "hermes" }), { statusCode: 400 });
+    // A session the adapter cannot resume would make every later send fail.
+    assert.throws(() => database.updateConversation(conversation.id, { provider: "anthropic-api", providerSessionId: "msg-session" }),
+      { statusCode: 409, details: { code: "PROVIDER_RESUME_UNSUPPORTED" } });
+    const direct = database.updateConversation(conversation.id, { provider: "anthropic-api" });
+    assert.deepEqual([direct.provider, direct.providerSessionId], ["anthropic-api", null]);
+    assert.throws(() => database.updateConversation(conversation.id, { providerSessionId: "msg-session" }), { statusCode: 409 });
+    assert.equal(database.updateConversation(conversation.id, { providerSessionId: null }).providerSessionId, null, "clearing is always allowed");
+    database.updateConversation(conversation.id, { provider: "claude" });
+    // Launch requires this format; before, attach accepted any string and every send then failed.
+    for (const session of [" leading-space", "s".repeat(300), "--resume", 42]) {
+      assert.throws(() => database.updateConversation(conversation.id, { providerSessionId: session }),
+        { statusCode: 400, details: { code: "PROVIDER_SESSION_INVALID" } }, String(session));
+    }
+    assert.throws(() => database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", provider: "hermes" }), { statusCode: 400 });
+    assert.throws(() => database.updateSettings({ provider: "hermes" }));
+    assert.equal(database.updateSettings({ provider: "anthropic-api" }).provider, "anthropic-api");
+  } finally { database.close(); }
+});
+
+test("every save path applies the launch model rule", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const invalid = { statusCode: 400, details: { code: "PROVIDER_CONFIGURATION_INVALID" } };
+    const create = (model) => database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Model", provider: "claude", model });
+    const conversation = create("claude-opus-5-5");
+    // Before, any string up to 200 characters saved and every later send returned 400.
+    for (const model of ["claude sonnet", "-x", "--help", "m".repeat(201), 7]) {
+      assert.throws(() => database.updateSettings({ model }), invalid, `settings ${model}`);
+      assert.throws(() => create(model), invalid, `create ${model}`);
+      assert.throws(() => database.updateConversation(conversation.id, { model }), invalid, `patch ${model}`);
+    }
+    assert.equal(database.getSettings().model, "");
+    assert.equal(database.getConversation(conversation.id).model, "claude-opus-5-5");
+    // Names launch accepts still save, and empty selects the adapter default.
+    for (const model of ["us.anthropic/claude-opus-5-5@v1", ""]) {
+      assert.equal(database.updateSettings({ model }).model, model);
+      assert.equal(create(model).model, model);
+      assert.equal(database.updateConversation(conversation.id, { model }).model, model);
+    }
+  } finally { database.close(); }
+});
+
+test("a run that finishes late cannot restore a session the chat reset or replaced after launch", () => {
+  const database = createOutrightDatabase({ filename: ":memory:" });
+  try {
+    const launch = (title, session) => {
+      const conversation = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title, provider: "codex" });
+      if (session) database.updateConversation(conversation.id, { providerSessionId: session });
+      const run = database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: title });
+      database.updateRun(run.id, { status: "running", providerSessionId: session ?? null });
+      return { conversation: database.getConversation(conversation.id), run };
+    };
+    const finish = ({ conversation, run }, session) => database.finishRun(run.id,
+      { status: "completed", finishedAt: new Date().toISOString(), exitCode: 0, providerSessionId: session }, null, { sessionEpoch: conversation.sessionEpoch });
+    const cases = {
+      "switch away and back": (id) => { database.updateConversation(id, { provider: "claude" }); database.updateConversation(id, { provider: "codex" }); },
+      "explicit clear": (id) => database.updateConversation(id, { providerSessionId: null }),
+      "explicit attach": (id) => database.updateConversation(id, { providerSessionId: "session-b" }),
+    };
+    for (const [name, edit] of Object.entries(cases)) {
+      const launched = launch(name, "session-a");
+      const expected = name === "explicit attach" ? "session-b" : null;
+      edit(launched.conversation.id);
+      // Before the epoch fence, either stale write put session-a back.
+      assert.equal(database.adoptConversationSession(launched.conversation.id, { provider: "codex", sessionEpoch: launched.conversation.sessionEpoch, providerSessionId: "session-a" }), false, name);
+      finish(launched, "session-a");
+      assert.equal(database.getConversation(launched.conversation.id).providerSessionId, expected, name);
+      assert.equal(database.getRun(launched.run.id).providerSessionId, "session-a", `${name}: the run keeps its own session`);
+    }
+    // Edits that leave the session alone keep the run's continuity.
+    const untouched = launch("rename", null);
+    database.updateConversation(untouched.conversation.id, { title: "Renamed", pinned: true, provider: "codex", providerSessionId: "" });
+    finish(untouched, "session-new");
+    assert.equal(database.getConversation(untouched.conversation.id).providerSessionId, "session-new");
+  } finally { database.close(); }
+});
+
 test("global search bounds recent text and response bytes while keeping conversation Find available", async () => {
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
@@ -1976,6 +2065,55 @@ test("an interrupted task backfill resumes without duplicates, and a failed rebu
         assert.deepEqual(probe.pragma("foreign_key_check"), []);
       } finally { probe.close(); }
       assert.equal(database.listTasks({ limit: 100 }).tasks.length, 70);
+    } finally { database.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("the session epoch fence works after either upgrade order of tasks and session epochs", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-epoch-upgrade-"));
+  try {
+    // A finished run adopts its session only at the chat's current epoch.
+    const assertFence = (database, id, epoch, message) => {
+      assert.equal(database.getConversation(id).sessionEpoch, epoch, message);
+      assert.equal(database.adoptConversationSession(id, { provider: "codex", sessionEpoch: epoch + 1, providerSessionId: "stale" }), false, message);
+      assert.equal(database.adoptConversationSession(id, { provider: "codex", sessionEpoch: epoch, providerSessionId: "adopted" }), true, message);
+      assert.equal(database.getConversation(id).providerSessionId, "adopted", message);
+      database.updateConversation(id, { providerSessionId: null });
+      assert.equal(database.getConversation(id).sessionEpoch, epoch + 1, message);
+    };
+    const seed = (filename) => {
+      const database = createOutrightDatabase({ filename });
+      try { return database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: "/tmp/w", title: "Chat", provider: "codex" }).id; }
+      finally { database.close(); }
+    };
+
+    // A store from a release with tasks but no session epoch gains the column.
+    const tasksFirst = path.join(directory, "tasks-first.db");
+    const first = seed(tasksFirst);
+    const raw = new Database(tasksFirst);
+    try { raw.exec("ALTER TABLE conversations DROP COLUMN session_epoch"); }
+    finally { raw.close(); }
+    let database = createOutrightDatabase({ filename: tasksFirst });
+    try {
+      assert.equal(database.capacity().migrationStatus, "ready");
+      assert.ok(database.getConversation(first).taskId);
+      assertFence(database, first, 0, "tasks first");
+    } finally { database.close(); }
+
+    // A store with session epochs but no tasks keeps them through the rebuild.
+    const epochsFirst = path.join(directory, "epochs-first.db");
+    const second = seed(epochsFirst);
+    seedPreTaskStore(epochsFirst, { sessionEpoch: true });
+    const rowid = (() => {
+      const probe = new Database(epochsFirst, { readonly: true });
+      try { return probe.prepare("SELECT rowid FROM conversations WHERE id = ?").get(second).rowid; }
+      finally { probe.close(); }
+    })();
+    database = createOutrightDatabase({ filename: epochsFirst });
+    try {
+      assert.equal(database.capacity().migrationStatus, "ready");
+      assert.ok(database.getConversation(second).taskId);
+      assertFence(database, second, rowid * 3, "session epochs first");
     } finally { database.close(); }
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

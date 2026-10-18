@@ -5,7 +5,7 @@ import { PassThrough, Readable } from "node:stream";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -16,6 +16,7 @@ import { AGENT_SUPERVISOR, createAgentManager, LAUNCH_AUTHORIZED_CONTROL } from 
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { randomUUID } from "node:crypto";
+import { writeNodeCommand } from "../tests/fixtures/node-command.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -1262,9 +1263,10 @@ function seedLegacyRunningUnknownTargetDatabase(filename, { secondRun = false } 
 
 // A full harness with a real discovered, trusted git worktree and a fake
 // provider CLI on PATH, so successful submissions and replacement runs can be
-// exercised end-to-end through the HTTP surface. The fake CLI is a shell
-// script plus a cmd shim; tests that need POSIX process behaviour skip win32.
-// The native realpath expands Windows short names, as the runtime's does.
+// exercised end-to-end through the HTTP surface. The fake CLI is a Node
+// command (a shell script plus a cmd shim); tests that need POSIX process
+// behaviour skip win32. The native realpath expands Windows short names, as
+// the runtime's does.
 function withWorktreeRuntime(fn, options = {}) {
   return async () => {
     const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-e2e-")));
@@ -1284,9 +1286,8 @@ function withWorktreeRuntime(fn, options = {}) {
         if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
       }
       mkdirSync(bin, { recursive: true });
-      writeFileSync(path.join(bin, "codex"), "#!/bin/sh\nexit 0\n");
-      chmodSync(path.join(bin, "codex"), 0o755);
-      if (process.platform === "win32") writeFileSync(path.join(bin, "codex.cmd"), "@exit /b 0\r\n");
+      // A supported version keeps compatibility gating out of unrelated fixtures.
+      writeCodexVersion(bin, "0.162.1");
       const configFile = path.join(root, "outright.config.json");
       writeFileSync(configFile, JSON.stringify({ scanRoots: [root], maxDepth: 2, maxProjects: 8 }));
       process.env.OUTRIGHT_DATA_DIR = dataDirectory;
@@ -1309,6 +1310,10 @@ function withWorktreeRuntime(fn, options = {}) {
       rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     }
   };
+}
+
+function writeCodexVersion(bin, version) {
+  writeNodeCommand(bin, "codex", `if (process.argv[2] === "--version") console.log(${JSON.stringify(`codex-cli ${version}`)});\n`);
 }
 
 const worktreeRefreshBehavior = { blockScan: false };
@@ -1533,7 +1538,7 @@ test("archiving during asynchronous worktree validation rejects a run without du
 }));
 
 for (const operation of ["send", "recovery"]) {
-  test(`revoking trust during provider discovery rejects ${operation} before a durable commit`, { skip: process.platform === "win32", timeout: 20000 }, (() => {
+  test(`revoking trust during provider discovery rejects ${operation} before a durable commit`, { timeout: 20000 }, (() => {
     let releaseProbe;
     let enteredProbe;
     const waiting = new Promise((resolve) => { enteredProbe = resolve; });
@@ -1565,7 +1570,7 @@ for (const operation of ["send", "recovery"]) {
 }
 
 for (const operation of ["send", "recovery"]) {
-  test(`provider removal denies ${operation} before durable side effects`, { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  test(`provider removal denies ${operation} before durable side effects`, { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
     runtime.agents.providerAvailable = async () => false;
     const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Removed provider", provider: "codex" });
     let interrupted;
@@ -1583,15 +1588,261 @@ for (const operation of ["send", "recovery"]) {
   }));
 }
 
+test("unsupported provider configurations are rejected before probing or durable side effects", { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  runtime.agents.providerAvailable = async () => { throw new Error("static validation must precede discovery"); };
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Direct", provider: "anthropic-api" });
+  const send = async (body) => {
+    const result = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, body), result);
+    return result;
+  };
+  // The default policy is workspace-write; the direct provider cannot edit files.
+  const unsupported = await send({ prompt: "edit files" });
+  assert.equal(unsupported.statusCode, 409);
+  assert.equal(unsupported.body.code, "PROVIDER_CONFIGURATION_UNSUPPORTED");
+  assert.match(unsupported.body.error, /Anthropic API does not support the workspace-write approval policy/);
+  const injected = await send({ prompt: "hi", provider: "claude", model: "--dangerously-skip-permissions" });
+  assert.equal(injected.statusCode, 400);
+  assert.equal(injected.body.code, "PROVIDER_CONFIGURATION_INVALID");
+  const unknown = await send({ prompt: "hi", provider: "hermes" });
+  assert.equal(unknown.body.code, "PROVIDER_UNKNOWN");
+  assert.deepEqual(runtime.database.listMessages(conversation.id), []);
+  assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+}));
+
+test("explicitly supplied false, 0 or empty run settings are rejected instead of taking the defaults", { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  runtime.database.updateSettings({ provider: "codex", model: "gpt-5.4", approvalPolicy: "danger-full-access", reasoningEffort: "high" });
+  let probes = 0;
+  runtime.agents.providerAvailable = async () => { probes += 1; return true; };
+  runtime.agents.schedule = async ({ run }) => ({ id: run.id, status: run.status });
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Explicit", provider: "codex", model: "gpt-5.3-codex" });
+  const send = async (body) => {
+    const result = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "hi", ...body }), result);
+    return result;
+  };
+  const malformed = [
+    ...[false, 0, ""].map((value) => [{ provider: value }, "PROVIDER_UNKNOWN"]),
+    ...[false, 0, ""].map((value) => [{ approvalPolicy: value }, "PROVIDER_CONFIGURATION_INVALID"]),
+    ...[false, 0, ""].map((value) => [{ reasoningEffort: value }, "PROVIDER_CONFIGURATION_INVALID"]),
+    ...[false, 0].map((value) => [{ model: value }, "PROVIDER_CONFIGURATION_INVALID"]),
+  ];
+  for (const [body, code] of malformed) {
+    const result = await send(body);
+    assert.deepEqual([result.statusCode, result.body.code], [400, code], JSON.stringify(body));
+    assert.doesNotMatch(result.body.error, /false|\b0\b/, JSON.stringify(body));
+  }
+  assert.equal(probes, 0, "malformed settings reached discovery");
+  assert.deepEqual(runtime.database.listMessages(conversation.id), []);
+  assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+  // Omitted and null fields take the defaults; an explicit empty model
+  // still selects the adapter default rather than the conversation's model.
+  for (const [body, model] of [[{}, "gpt-5.3-codex"], [{ provider: null, model: null, approvalPolicy: null, reasoningEffort: null }, "gpt-5.3-codex"], [{ model: "" }, ""]]) {
+    const result = await send(body);
+    assert.equal(result.statusCode, 202, JSON.stringify(body));
+    const run = runtime.database.getRun(result.body.id);
+    assert.deepEqual([run.provider, run.model, run.approvalPolicy, run.reasoningEffort], ["codex", model, "danger-full-access", "high"], JSON.stringify(body));
+  }
+}));
+
+test("an installed but incompatible CLI is reported before enqueueing", { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
+  // Settle the startup probe so authorization cannot reuse its in-flight result.
+  assert.equal(await runtime.agents.providerAvailable("codex"), true);
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Old CLI", provider: "codex" });
+  for (const [version, reason] of [["0.20.0", /Codex 0\.20\.0 is not supported; Outright supports 0\.162\.1 or newer/],
+    ["0.162.1-rc.1", /Codex 0\.162\.1-rc\.1 is a prerelease; Outright supports stable releases 0\.162\.1 or newer/]]) {
+    writeCodexVersion(bin, version);
+    const result = responseCapture();
+    await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "must not persist" }), result);
+    assert.equal(result.statusCode, 409, version);
+    assert.equal(result.body.code, "PROVIDER_INCOMPATIBLE");
+    assert.match(result.body.error, reason);
+    const status = runtime.agents.providers().find((entry) => entry.id === "codex");
+    assert.deepEqual([status.available, status.compatible, status.version], [true, false, version]);
+  }
+  assert.deepEqual(runtime.database.listMessages(conversation.id), []);
+  assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+}));
+
+test("an unusable direct-provider endpoint is reported before enqueueing", { timeout: 20000 }, async () => {
+  const saved = { key: process.env.OUTRIGHT_ANTHROPIC_API_KEY, base: process.env.OUTRIGHT_ANTHROPIC_BASE_URL };
+  process.env.OUTRIGHT_ANTHROPIC_API_KEY = "sk-ant-endpoint";
+  try {
+    await withWorktreeRuntime(async (runtime, { project, worktree }) => {
+      const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Direct endpoint", provider: "anthropic-api" });
+      for (const base of ["invalid-url", "http://example.com", "https://user:fixture-password@127.0.0.1:9/anthropic"]) {
+        process.env.OUTRIGHT_ANTHROPIC_BASE_URL = base;
+        const result = responseCapture();
+        await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "must not persist", approvalPolicy: "read-only", reasoningEffort: "medium" }), result);
+        // Before, a set key was enough: the run was queued and failed at launch.
+        assert.equal(result.statusCode, 409, base);
+        assert.equal(result.body.code, "PROVIDER_UNAVAILABLE");
+        assert.match(result.body.error, /OUTRIGHT_ANTHROPIC_BASE_URL must be an https URL or a loopback http address/);
+        assert.equal(JSON.stringify(result.body).includes("fixture-password"), false);
+      }
+      assert.deepEqual(runtime.database.listMessages(conversation.id), []);
+      assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+    })();
+  } finally {
+    for (const [name, value] of [["OUTRIGHT_ANTHROPIC_API_KEY", saved.key], ["OUTRIGHT_ANTHROPIC_BASE_URL", saved.base]]) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  }
+});
+
+test("a conversation cannot store a session its adapter cannot resume", { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Direct session", provider: "anthropic-api" });
+  const result = responseCapture();
+  await runtime.handleRequest(requestStream("PATCH", `/api/conversations/${conversation.id}`, { providerSessionId: "msg-session" }), result);
+  assert.equal(result.statusCode, 409);
+  assert.equal(result.body.code, "PROVIDER_RESUME_UNSUPPORTED");
+  assert.equal(runtime.database.getConversation(conversation.id).providerSessionId, null);
+}));
+
+test("session recovery is refused for an adapter that cannot resume", { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  runtime.agents.providerAvailable = async () => true;
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Direct recovery", provider: "anthropic-api" });
+  const interrupted = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "anthropic-api", approvalPolicy: "read-only", reasoningEffort: "medium", prompt: "unfinished", providerSessionId: "msg-session" });
+  runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+  const result = responseCapture();
+  await runtime.handleRequest(requestStream("POST", `/api/runs/${interrupted.id}/resume`, { policy: "resume-session" }), result);
+  assert.equal(result.statusCode, 409);
+  assert.equal(result.body.code, "PROVIDER_RESUME_UNSUPPORTED");
+  assert.equal(runtime.database.getRun(interrupted.id).recoveryDecision, null);
+  assert.equal(runtime.database.listRuns(conversation.id).length, 1);
+}));
+
+test("a run saved before model and session validation can be continued with an explicit correction", { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  runtime.agents.providerAvailable = async () => true;
+  const scheduled = [];
+  runtime.agents.schedule = async (entry) => { scheduled.push(entry); return entry.run; };
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Legacy recovery", provider: "codex" });
+  // Both values were accepted before this release: a free-form model and a long session id.
+  const legacySession = `legacy ${"s".repeat(300)}`;
+  const interrupted = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "codex", model: "gpt 5 codex",
+    approvalPolicy: "workspace-write", reasoningEffort: "medium", prompt: "unfinished", providerSessionId: legacySession });
+  runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+  const recover = async (body) => { const result = responseCapture(); await runtime.handleRequest(requestStream("POST", `/api/runs/${interrupted.id}/resume`, body), result); return result; };
+  // Before, both policies failed validation forever and only discard remained.
+  for (const policy of ["resume-session", "retry"]) {
+    const refused = await recover({ policy });
+    assert.deepEqual([refused.statusCode, refused.body.code], [409, "RECOVERY_MODEL_UNLAUNCHABLE"], policy);
+    assert.equal(refused.body.error.includes("gpt 5 codex"), false, "the stored value is not echoed");
+  }
+  // The legacy session cannot reach argv, even with the model corrected.
+  const resumed = await recover({ policy: "resume-session", useProviderDefaultModel: true });
+  assert.deepEqual([resumed.statusCode, resumed.body.code], [400, "PROVIDER_SESSION_INVALID"]);
+  assert.equal(runtime.database.getRun(interrupted.id).recoveryDecision, null);
+  assert.equal(runtime.database.listRuns(conversation.id).length, 1);
+  const retried = await recover({ policy: "retry", useProviderDefaultModel: true });
+  assert.equal(retried.statusCode, 202);
+  assert.deepEqual([scheduled.length, scheduled[0].run.model, scheduled[0].run.providerSessionId, scheduled[0].forceFreshSession], [1, "", null, true]);
+  assert.deepEqual([scheduled[0].run.approvalPolicy, scheduled[0].run.reasoningEffort, scheduled[0].run.prompt], ["workspace-write", "medium", "unfinished"], "authority is unchanged");
+  const evidence = runtime.database.getRun(interrupted.id);
+  assert.deepEqual([evidence.recoveryDecision, evidence.model, evidence.providerSessionId], ["retry", "gpt 5 codex", legacySession], "the interrupted run keeps its record");
+  // The database applies the same session rule as launch, whatever the caller.
+  const other = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium", prompt: "second" });
+  runtime.database.updateRun(other.id, { status: "interrupted" });
+  assert.throws(() => runtime.database.beginInterruptedRunRecovery(other.id, "resume-session", { providerSessionId: legacySession }), (error) => error.details?.code === "PROVIDER_SESSION_INVALID");
+  assert.equal(runtime.database.getRun(other.id).recoveryDecision, null);
+}));
+
+test("a direct-provider run streams through the supervised runtime with its scoped credential", { timeout: 30000 }, async () => {
+  const stream = readFileSync(new URL("../tests/fixtures/execution-adapters/anthropic-api/stream.sse", import.meta.url), "utf8");
+  const unauthorized = readFileSync(new URL("../tests/fixtures/execution-adapters/anthropic-api/unauthorized.json", import.meta.url), "utf8");
+  const requests = [];
+  const reflectedKey = 'fixture-"runtime"\\reflected-key';
+  const server = (await import("node:http")).createServer((request, response) => {
+    request.resume();
+    request.on("end", () => {
+      requests.push(request.headers["x-api-key"]);
+      const key = request.headers["x-api-key"];
+      if (key === "sk-ant-runtime") { response.writeHead(200, { "content-type": "text/event-stream" }); response.end(stream); }
+      else if (key === reflectedKey) {
+        // A gateway that echoes the key split across text deltas, then nested in an error.
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        const event = (data) => `data: ${JSON.stringify(data)}\n\n`;
+        const delta = (text) => event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
+        const start = `${event({ type: "message_start", message: { model: "claude-opus-5-5", usage: { input_tokens: 1 } } })}${event({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}`;
+        const end = `${event({ type: "content_block_stop", index: 0 })}${event({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } })}${event({ type: "message_stop" })}`;
+        if (requests.length === 3) response.end(`${start}${delta(`key ${key.slice(0, 7)}`)}${delta(key.slice(7, 15))}${delta(`${key.slice(15)} kept`)}${event({ type: "error", error: { type: "api_error", message: JSON.stringify({ echoed: key }) } })}`);
+        // Then a key-bearing index on a delta that leaves a key prefix held.
+        else if (requests.length === 4) response.end(`${start}${delta("index ")}${event({ type: "content_block_delta", index: key, delta: { type: "text_delta", text: key.slice(0, 5) } })}${event({ type: "message_stop" })}`);
+        // Then text after the message's final event.
+        else if (requests.length === 5) response.end(`${start}${delta("whole")}${end}${delta(" late")}`);
+        // Then text for a block that has already stopped.
+        else response.end(`${start}${delta("closed")}${event({ type: "content_block_stop", index: 0 })}${delta(" late")}${end}`);
+      } else { response.writeHead(401, { "content-type": "application/json" }); response.end(unauthorized); }
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const saved = { key: process.env.OUTRIGHT_ANTHROPIC_API_KEY, base: process.env.OUTRIGHT_ANTHROPIC_BASE_URL };
+  process.env.OUTRIGHT_ANTHROPIC_API_KEY = "sk-ant-runtime";
+  process.env.OUTRIGHT_ANTHROPIC_BASE_URL = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await withWorktreeRuntime(async (runtime, { project, worktree }) => {
+      const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Direct", provider: "anthropic-api" });
+      const send = async () => {
+        const response = responseCapture();
+        await runtime.handleRequest(requestStream("POST", `/api/conversations/${conversation.id}/runs`, { prompt: "--help", approvalPolicy: "read-only", reasoningEffort: "medium" }), response);
+        assert.equal(response.statusCode, 202, JSON.stringify(response.body));
+        await waitFor(() => !["queued", "launching", "running"].includes(runtime.database.getRun(response.body.id).status), 20000, "the direct-provider run did not finish");
+        return runtime.database.getRun(response.body.id);
+      };
+      const completed = await send();
+      assert.equal(completed.status, "completed", completed.error);
+      assert.ok(runtime.database.listMessages(conversation.id).some((message) => message.role === "assistant" && JSON.stringify(message).includes("READY now")));
+      // A blank model launches the default, which is the model that answered.
+      assert.equal(runtime.database.listMessages(conversation.id).some((message) => message.payload?.substitution), false, "the defaulted model raises no notice");
+      process.env.OUTRIGHT_ANTHROPIC_API_KEY = "sk-ant-revoked";
+      const failed = await send();
+      assert.equal(failed.status, "failed");
+      assert.equal(failed.error, "invalid x-api-key", "the native failure explains the exit");
+      process.env.OUTRIGHT_ANTHROPIC_API_KEY = reflectedKey;
+      const reflected = await send();
+      assert.equal(reflected.status, "failed");
+      assert.equal(reflected.error, JSON.stringify({ echoed: "[redacted]" }));
+      const answer = runtime.database.listMessages(conversation.id).filter((message) => message.role === "assistant").map((message) => message.body).join("\n");
+      assert.match(answer, /key \[redacted\] kept/);
+      // Before, the stored answer held the key and the stored error its escape.
+      const stored = JSON.stringify([runtime.database.listMessages(conversation.id), runtime.database.listRunEvents(reflected.id), reflected]);
+      for (const form of [reflectedKey, JSON.stringify(reflectedKey).slice(1, -1)]) assert.equal(stored.includes(form) || stored.includes(JSON.stringify(form).slice(1, -1)), false);
+      const indexed = await send();
+      assert.deepEqual([indexed.status, indexed.error], ["failed", "Anthropic API sent a malformed stream event"]);
+      const indexedStored = JSON.stringify([runtime.database.listMessages(conversation.id), runtime.database.listRunEvents(indexed.id), indexed]);
+      assert.match(indexedStored, /index /, "the text before the malformed delta is kept");
+      for (const form of [reflectedKey, JSON.stringify(reflectedKey).slice(1, -1)]) assert.equal(indexedStored.includes(form) || indexedStored.includes(JSON.stringify(form).slice(1, -1)), false);
+      // Before, text after message_stop was stored and the run completed.
+      const late = await send();
+      assert.deepEqual([late.status, late.error], ["failed", "Anthropic API sent stream events out of order; the answer may be incomplete"]);
+      const lateStored = JSON.stringify(runtime.database.listMessages(conversation.id));
+      assert.match(lateStored, /whole/, "the answer before the break is kept");
+      assert.equal(lateStored.includes(" late"), false, "nothing after message_stop is stored");
+      // Before, a delta after its block stopped was stored and the run completed.
+      const reopened = await send();
+      assert.deepEqual([reopened.status, reopened.error], ["failed", "Anthropic API sent stream events out of order; the answer may be incomplete"]);
+      const reopenedStored = JSON.stringify(runtime.database.listMessages(conversation.id));
+      assert.match(reopenedStored, /closed/, "the answer before the break is kept");
+      assert.equal(reopenedStored.includes(" late"), false, "nothing after the break is stored");
+      assert.deepEqual(requests, ["sk-ant-runtime", "sk-ant-revoked", reflectedKey, reflectedKey, reflectedKey, reflectedKey]);
+    })();
+  } finally {
+    for (const [name, value] of [["OUTRIGHT_ANTHROPIC_API_KEY", saved.key], ["OUTRIGHT_ANTHROPIC_BASE_URL", saved.base]]) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 for (const operation of ["send", "recovery"]) {
-  test(`slow executable provider probe stays asynchronous and bounded for ${operation}`, { skip: process.platform === "win32", timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
+  test(`slow executable provider probe stays asynchronous and bounded for ${operation}`, { timeout: 20000 }, withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
     // Exercise the real execFile --version path through each HTTP endpoint.
     // Runtime construction starts an independent display probe. Finish it
     // before replacing the fixture, so authorization cannot reuse that old
     // in-flight result instead of testing the slow executable below.
     assert.equal(await runtime.agents.providerAvailable("codex"), true);
     const probeMarker = path.join(bin, "slow-probe-ran");
-    writeFileSync(path.join(bin, "codex"), `#!/bin/sh\nif [ "$1" = "--version" ]; then sleep 0.4; echo ran > '${probeMarker}'; echo 'codex test'; fi\n`);
+    writeNodeCommand(bin, "codex", `if (process.argv[2] === "--version") setTimeout(() => { require("node:fs").writeFileSync(${JSON.stringify(probeMarker)}, "ran\\n"); console.log("codex-cli 0.162.1"); }, 400);\n`);
     const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Probe latency", provider: "codex" });
     let interrupted;
     if (operation === "recovery") {
@@ -2532,7 +2783,7 @@ test("opens the recovery gate and schedules a replacement run after a verified d
 // no resumable session) then left the run with no process identity, so every
 // later attempt was rejected RECOVERY_PROCESS_UNKNOWN and the conversation was
 // permanently gated. The pid must survive until a decision actually commits.
-test("a failed validation after a verified-exited probe leaves recovery retryable", { skip: process.platform === "win32" }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("a failed validation after a verified-exited probe leaves recovery retryable", withWorktreeRuntime(async (runtime, { project, worktree }) => {
   const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Recovery", provider: "codex" });
   const interrupted = runtime.database.createRun({ conversationId: conversation.id, provider: "codex", approvalPolicy: "read-only", prompt: "half done" });
   const pid = await deadProcessId();
@@ -2723,6 +2974,39 @@ test("recovery identities are boot-scoped and Windows taskkill supplies a whole-
   const kills = [];
   assert.equal(defaultTerminateRecoveryProcess(456, "SIGKILL", { providerPid: 789, providerProcessIdentity: "linux:boot:1" }, "linux", null, (pid, signal) => kills.push([pid, signal])), false);
   assert.deepEqual(kills, [[789, "SIGKILL"]], "Linux escalation preserves the supervisor and targets only the revalidated provider");
+});
+
+test("recovery supervisor control never receives a direct provider credential", () => {
+  const ownershipToken = "00000000-0000-4000-8000-000000000002";
+  // A dead wrapper and supervisor with an absent label reach the settled re-probe.
+  const handshake = { ownershipToken, platformOwnershipId: `com.21n.outright.${ownershipToken}`, processIdentity: "darwin:wrapper",
+    providerPid: 456, providerProcessIdentity: "darwin-process:supervisor" };
+  const saved = { key: process.env.OUTRIGHT_ANTHROPIC_API_KEY, base: process.env.OUTRIGHT_ANTHROPIC_BASE_URL };
+  process.env.OUTRIGHT_ANTHROPIC_API_KEY = "sk-ant-recovery";
+  process.env.OUTRIGHT_ANTHROPIC_BASE_URL = "https://gateway.example";
+  // The launchd target needs a user id; simulate the macOS host's, since
+  // Windows has no process.getuid.
+  const getuid = Object.getOwnPropertyDescriptor(process, "getuid");
+  Object.defineProperty(process, "getuid", { value: () => 501, configurable: true, writable: true });
+  const calls = [];
+  try {
+    const run = (executable, args, options) => { calls.push([executable, args[0], options?.env]); return { status: 3, stdout: "absent\n" }; };
+    defaultRecoveryProcessAlive(123, "darwin", () => null, () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); }, handshake, run);
+    defaultTerminateRecoveryProcess(123, "SIGTERM", handshake, "darwin", (executable, args, options) => { calls.push([executable, args[0], options?.env]); return { status: 0 }; });
+  } finally {
+    if (getuid) Object.defineProperty(process, "getuid", getuid); else delete process.getuid;
+    for (const [name, value] of [["OUTRIGHT_ANTHROPIC_API_KEY", saved.key], ["OUTRIGHT_ANTHROPIC_BASE_URL", saved.base]]) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  }
+  const supervisor = calls.filter(([executable]) => executable === AGENT_SUPERVISOR);
+  assert.deepEqual(supervisor.map(([, command]) => command), ["--probe", "--probe", "--terminate"]);
+  for (const [, command, env] of supervisor) {
+    // Before, these calls inherited the runtime environment unfiltered.
+    assert.ok(env, `${command} gets an explicit environment`);
+    assert.equal(env.OUTRIGHT_ANTHROPIC_API_KEY, undefined, command);
+    assert.equal(env.OUTRIGHT_ANTHROPIC_BASE_URL, undefined, command);
+  }
 });
 
 test("macOS recovery termination stops a provider that ignores SIGTERM", {

@@ -123,7 +123,23 @@ static int archive_lock(int argc, wchar_t **argv) {
   return result;
 }
 
+// A token that the CRT and cmd.exe both read unchanged is passed bare, as
+// libuv does. cmd parses its own command line: a quoted "/c" leaves its
+// closing quote at the start of the command, so a probe's cmd /d /s /c ran
+// an unbalanced "<id> --version". Spaces, quotes and every cmd
+// metacharacter fall outside this set and are still quoted.
+static bool plain_argument(const wchar_t *value) {
+  if (!*value) return false;
+  for (const wchar_t *cursor = value; *cursor; cursor++) {
+    wchar_t character = *cursor;
+    if (!((character >= L'a' && character <= L'z') || (character >= L'A' && character <= L'Z')
+        || (character >= L'0' && character <= L'9') || wcschr(L"_+-./:\\@", character))) return false;
+  }
+  return true;
+}
+
 static wchar_t *quote_argument(const wchar_t *value) {
+  if (plain_argument(value)) return _wcsdup(value);
   size_t length = wcslen(value);
   wchar_t *quoted = calloc(length * 2 + 3, sizeof(wchar_t));
   if (!quoted) return NULL;

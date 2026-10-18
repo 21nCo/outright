@@ -318,8 +318,8 @@ button, input, textarea, select { font: inherit; }
 
 @media (max-width: 920px) {
   .app-shell { grid-template-columns: 292px minmax(0,1fr); min-width: 0; }
-  .conversation-meta { display: none; }
-  .conversation-header { grid-template-columns: 38px minmax(0,1fr); }
+  /* The settings button stays: it is the keyboard entry to the conversation's provider and model. */
+  .conversation-meta small { display: none; }
 }
 
 @media (max-width: 760px) {
@@ -358,7 +358,7 @@ button, input, textarea, select { font: inherit; }
 .run-state.failed, .run-state.stopped { color: var(--destructive); }
 .run-state.completed { color: var(--green); }
 .status-dot.error { background: var(--destructive); }
-.conversation-meta button { padding: 0; border: 0; display: flex; align-items: center; gap: 5px; background: transparent; cursor: pointer; }
+.conversation-meta button { min-height: 24px; padding: 0; border: 0; display: flex; align-items: center; gap: 5px; background: transparent; cursor: pointer; }
 .conversation-meta button > span { padding: 2px 7px; border-radius: 999px; color: var(--foreground); background: var(--muted); font-size: 9px; font-weight: 650; }
 .conversation-meta button svg { width: 12px; height: 12px; color: var(--muted-foreground); opacity: 0; }
 .conversation-meta button:hover svg, .conversation-meta button:focus-visible svg { opacity: 1; }
@@ -499,6 +499,7 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
 .setting-row > span:first-child { display: flex; align-items: center; gap: 5px; color: var(--muted-foreground); font-size: 10px; font-weight: 600; }
 .setting-row > span:first-child svg { width: 13px; height: 13px; }
 .setting-row > select, .setting-row > input:not([type="checkbox"]) { width: 100%; }
+.provider-status { grid-column: 1 / -1; margin: -4px 0 0; color: var(--muted-foreground); font-size: 11px; overflow-wrap: anywhere; }
 .switch-row { height: 34px; display: flex; align-items: center; gap: 7px; color: var(--foreground); font-size: 11px; }
 .template-settings { padding-top: 15px; border-top: 1px solid var(--line-soft); }
 .template-settings > header strong, .template-settings > header h3 { display: block; margin: 0; font-size: 11px; font-weight: 700; }
@@ -567,8 +568,8 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .workspace-context strong { max-width: 78px; }
   .workspace-tools [data-slot="button"] { width: 34px; }
   .conversation-pane { grid-template-rows: 68px minmax(0, 1fr) auto; }
-  .conversation-header { grid-template-columns: minmax(0,1fr); padding: 0 12px; }
-  .conversation-symbol, .conversation-meta { display: none; }
+  .conversation-header { grid-template-columns: minmax(0,1fr) auto; padding: 0 12px; }
+  .conversation-symbol { display: none; }
   .conversation-header h1 { font-size: 14px; }
   .chat-tab { min-width: 138px; }
   .message { grid-template-columns: 28px minmax(0,1fr); gap: 9px; margin-bottom: 20px; }

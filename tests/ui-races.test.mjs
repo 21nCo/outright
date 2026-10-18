@@ -879,7 +879,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
         }
         if (event.params.name !== "__requestFixtureViewport") return;
         const width = Number(event.params.payload);
-        if (![1280, 1200, 760, 640, 620, 390].includes(width)) throw new Error(`Unexpected fixture viewport: ${width}`);
+        if (![1280, 1200, 900, 760, 640, 620, 390, 360].includes(width)) throw new Error(`Unexpected fixture viewport: ${width}`);
         await send("Emulation.setDeviceMetricsOverride", { width, height: 844, deviceScaleFactor: 1, mobile: false });
         await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-viewport-ready", { detail: ${width} }))` });
       })().catch((error) => { viewportError = error; });
@@ -896,7 +896,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       devtoolsReady: devtools?.socket.readyState, viteOutput: output.slice(-500) }));
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
     const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
-    const expectedCount = selectedCount ?? 113;
+    const expectedCount = selectedCount ?? 118;
     const completedCount = Number(state.text.match(/(\d+) interaction regressions passed/)?.[1]);
     assert.equal(completedCount, expectedCount,
       `browser fixture completed ${completedCount || 0} of ${expectedCount} expected interactions; last step: ${state.progress?.step ?? "unknown"}`);
