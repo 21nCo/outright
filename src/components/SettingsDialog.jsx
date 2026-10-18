@@ -3,6 +3,7 @@ import { Bell, Brain, Code, ShieldCheck, Trash } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { ProviderAccounts } from "@/components/ProviderAccounts";
 import { APPROVAL_POLICY_OPTIONS, modelMismatch, providerOptionLabel, providerReady, providerStatusText, providerSwitchProblem, reasoningOptions, supportsPolicy, unsupportedChoices } from "@/lib/providers";
 import { api } from "@/lib/runtime-api";
 
@@ -227,6 +228,7 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
   <p id="budget-settings-error" role="status" aria-live="polite" className={validBudgetSettings(draft) ? "sr-only" : undefined}>
     {validBudgetSettings(draft) ? "" : "Enter whole numbers within the shown ranges before saving."}
   </p>
+  <ProviderAccounts open={open} runtimeEvent={runtimeEvent} onError={onError} />
   <section className="template-settings" aria-labelledby="capacity-retention-heading">
     <header><div><h3 id="capacity-retention-heading">Capacity and retention</h3><small>Cleanup removes unpinned archived chats older than the saved age. You can also select a recent archived chat to delete now. Active and recoverable runs stay protected.</small></div></header>
     {capacity?.limits && <p className="capacity-status">{capacity.queued} of {capacity.limits.maxQueuedRuns} queued · {capacity.activeProcesses ?? capacity.active} active · {pendingOutcomeCapacityText(capacity)}{capacity.recoverable} awaiting recovery · {capacity.utilityProcesses?.active ?? "unknown"} of {capacity.utilityProcesses?.limit ?? "unknown"} utility processes · {capacity.terminalProcesses?.active ?? "unknown"} of {capacity.terminalProcesses?.limit ?? "unknown"} terminals{terminalRecoveryText(capacity.terminalProcesses)} · {capacityUsageText(capacity)} ({(capacity.limits.reservedRetainedBytes / 1048576).toFixed(0)} MiB reserved for active runs). CPU and memory use are unknown. {allocatedDiskUsageText(capacity)}</p>}

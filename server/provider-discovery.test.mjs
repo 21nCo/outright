@@ -4,7 +4,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createProviderDiscovery, defaultProbe } from "./provider-discovery.mjs";
+import { createProviderDiscovery, defaultProbe, probeCommand } from "./provider-discovery.mjs";
 import { writeNodeCommand } from "../tests/fixtures/node-command.mjs";
 
 function probeProcessRunning(pid, inspect = spawnSync) {
@@ -239,6 +239,26 @@ test("a harness version probe never receives a direct provider's credential", as
     assert.equal((await defaultProbe("codex")).trim(), "version absent absent absent harness-own-key");
   } finally {
     for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("an account identity check runs with that account's home and accepts a signed-out exit", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-identity-"));
+  // A registered harness name on PATH, the only probe Windows accepts.
+  writeNodeCommand(directory, "claude", 'console.log(JSON.stringify({ args: process.argv.slice(2), home: process.env.CLAUDE_CONFIG_DIR ?? "absent", key: process.env.OUTRIGHT_ANTHROPIC_API_KEY ?? "absent" })); process.exit(1);\n');
+  const saved = process.env.PATH;
+  process.env.PATH = `${directory}${path.delimiter}${saved}`;
+  const environment = { ...process.env, CLAUDE_CONFIG_DIR: path.join(directory, "work"), OUTRIGHT_ANTHROPIC_API_KEY: "direct-key" };
+  const args = ["auth", "status", "--json"];
+  try {
+    const output = await defaultProbe("claude", { args, environment, exitCodes: [0, 1], timeoutMs: 5_000 });
+    assert.deepEqual(JSON.parse(output), { args, home: path.join(directory, "work"), key: "absent" });
+    // A version check still treats any nonzero exit as a failure.
+    await assert.rejects(defaultProbe("claude", { args, environment, timeoutMs: 5_000 }), /exited 1/);
+    assert.throws(() => probeCommand("claude", "/bin/claude", { args: ["status", "& calc"] }), /Invalid probe arguments/);
+  } finally {
+    process.env.PATH = saved;
     rmSync(directory, { recursive: true, force: true });
   }
 });

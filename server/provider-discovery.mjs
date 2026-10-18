@@ -35,8 +35,12 @@ async function providerExecutable(id, signal) {
   return id;
 }
 
-export function probeCommand(id, providerPath) {
+// `args` are adapter-declared constants: "--version", or an account's
+// identity check. `environment` adds an account's home directory; it never
+// carries a direct provider's credential.
+export function probeCommand(id, providerPath, { args = ["--version"], environment } = {}) {
   if (process.platform === "win32" && !EXECUTION_ADAPTERS.some((adapter) => adapter.executable === id)) throw new Error(`Unknown provider: ${id}`);
+  if (!args.every((arg) => /^-{0,2}[a-z][a-z-]*$/.test(arg))) throw new Error(`Invalid probe arguments: ${id}`);
   let supervisor = process.env.OUTRIGHT_AGENT_SUPERVISOR_PATH;
   if (!supervisor && process.platform === "win32") {
     const manifest = JSON.parse(readFileSync(new URL("./bin/agent-supervisor.json", import.meta.url), "utf8"));
@@ -48,21 +52,21 @@ export function probeCommand(id, providerPath) {
   supervisor ??= fileURLToPath(new URL("./bin/agent-supervisor", import.meta.url));
   // A harness CLI never sees a direct provider's credential, even to print
   // its version.
-  const env = withoutDirectProviderCredentials(process.env);
+  const env = withoutDirectProviderCredentials(environment ?? process.env);
   // The Windows supervisor tears its job down when its stdin control pipe
   // ends. An ignored stdin is NUL, which reads as ended at once and killed
   // every probe with 137; this pipe stays open until the supervisor exits.
-  if (process.platform === "win32") return { executable: supervisor, args: [process.env.ComSpec || "cmd.exe", "/d", "/s", "/c", `${id} --version`], stdio: ["pipe", "pipe", "pipe"], env };
+  if (process.platform === "win32") return { executable: supervisor, args: [process.env.ComSpec || "cmd.exe", "/d", "/s", "/c", [id, ...args].join(" ")], stdio: ["pipe", "pipe", "pipe"], env };
   // The platform supervisor owns descendants even after setsid/reparenting.
   // The Linux handshake and macOS launch gate are private to this one probe.
   const token = randomUUID();
   if (process.platform === "darwin") {
     const ownershipLabel = `com.21n.outright.probe.${token}`;
-    return { executable: supervisor, args: [ownershipLabel, providerPath, "--version"], ownershipLabel,
+    return { executable: supervisor, args: [ownershipLabel, providerPath, ...args], ownershipLabel,
       stdio: ["ignore", "pipe", "pipe", "pipe"], env: { ...env, OUTRIGHT_LAUNCH_GATE_FD: "3" } };
   }
   const handshakePath = join(tmpdir(), `outright-probe-${token}.json`);
-  return { executable: supervisor, args: [handshakePath, providerPath, "--version"], cleanupPath: handshakePath, stdio: ["pipe", "pipe", "pipe", "pipe"], env };
+  return { executable: supervisor, args: [handshakePath, providerPath, ...args], cleanupPath: handshakePath, stdio: ["pipe", "pipe", "pipe", "pipe"], env };
 }
 
 // A failed probe says why within a bound: the end of its stderr, or of its
@@ -229,10 +233,12 @@ export function createProviderDiscovery({ probe = defaultProbe, onChange = () =>
   };
 }
 
-export async function defaultProbe(id, { signal, resolveExecutable = providerExecutable, commandForProbe = probeCommand, cleanupMs = 8_000 } = {}) {
+// An account identity check passes its arguments and environment, a longer
+// timeout, and the exit codes its CLI uses to report a signed-out login.
+export async function defaultProbe(id, { signal, resolveExecutable = providerExecutable, commandForProbe = probeCommand, cleanupMs = 8_000, args, environment, timeoutMs = 2_500, exitCodes = [0] } = {}) {
   const started = Date.now();
   const lookupDeadline = new AbortController();
-  const lookupTimer = setTimeout(() => lookupDeadline.abort(), 2_500);
+  const lookupTimer = setTimeout(() => lookupDeadline.abort(), timeoutMs);
   const lookupSignal = signal ? AbortSignal.any([signal, lookupDeadline.signal]) : lookupDeadline.signal;
   let executable;
   try {
@@ -273,7 +279,7 @@ export async function defaultProbe(id, { signal, resolveExecutable = providerExe
     let stderr = Buffer.alloc(0);
     // Every platform supervisor owns descendants beyond the direct CLI's
     // process group. A version is valid only after that owner exits cleanly.
-    const command = commandForProbe(id, executable);
+    const command = commandForProbe(id, executable, { args, environment });
     const child = spawn(command.executable, command.args, {
       stdio: command.stdio, env: command.env, windowsHide: true, detached: process.platform !== "win32",
     });
@@ -303,7 +309,7 @@ export async function defaultProbe(id, { signal, resolveExecutable = providerExe
       let artifactError;
       try { if (command.cleanupPath && terminationError?.code !== "OUTRIGHT_PROBE_CLEANUP_UNCERTAIN") rmSync(command.cleanupPath, { force: true }); }
       catch (error) { artifactError = error; }
-      settle(terminationError ?? spawnError ?? artifactError ?? (code === 0 ? null : new Error(`Provider version check exited ${code ?? childSignal}: ${id}${probeOutputExcerpt(stdout, stderr)}`)), (stdout.length ? stdout : stderr).toString("utf8"));
+      settle(terminationError ?? spawnError ?? artifactError ?? (exitCodes.includes(code) ? null : new Error(`Provider version check exited ${code ?? childSignal}: ${id}${probeOutputExcerpt(stdout, stderr)}`)), (stdout.length ? stdout : stderr).toString("utf8"));
     });
     const terminateTree = (hard = false) => {
       // Let the native owner reap its tree. Killing the owner first can leave
@@ -316,7 +322,7 @@ export async function defaultProbe(id, { signal, resolveExecutable = providerExe
       terminateTree();
     };
     const abort = () => terminate(new Error(`Provider version check aborted: ${id}`));
-    const timeout = setTimeout(() => terminate(new Error(`Provider version check timed out: ${id}`)), Math.max(0, 2_500 - (Date.now() - started)));
+    const timeout = setTimeout(() => terminate(new Error(`Provider version check timed out: ${id}`)), Math.max(0, timeoutMs - (Date.now() - started)));
     // Keep the promise owned until the supervisor has actually exited. A
     // deadline may escalate its signal, but must never report cleanup while
     // an OS-visible owner can still be running.

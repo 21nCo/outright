@@ -61,8 +61,17 @@ const RETAINED_COLUMNS = [
   ["trusted_projects", "project_id, project_path, trusted_at"],
   ["audit_log", "action, target, details, created_at"],
   ["prompt_templates", "id, title, prompt, created_at"],
+  ["provider_accounts", "id, provider, label, home_path, created_at"],
+  ["provider_account_selection", "provider, account_id"],
+  ["provider_limit_windows", "account_id, provider, window_name, utilization, status, resets_at, observed_at, run_id"],
+  ["run_accounts", "run_id, account_id, account_label, account_identity, bound_at"],
 ];
 const RUN_RETAINED_FIELDS = RETAINED_COLUMNS.find(([name]) => name === "runs")[1];
+// The account a run launched with. A run that never launched has none.
+const RUN_ACCOUNT_FIELDS = "account.account_id AS accountId, account.account_label AS accountLabel, account.account_identity AS accountIdentity";
+const PROVIDER_ACCOUNT_FIELDS = "id, provider, label, home_path AS homePath, created_at AS createdAt";
+const MAX_ACCOUNTS_PER_PROVIDER = 16;
+const MAX_LIMIT_WINDOWS_PER_ACCOUNT = 8;
 
 const SETTING_RULES = {
   provider: (value) => EXECUTION_ADAPTER_IDS.includes(value),
@@ -1619,14 +1628,17 @@ export function createOutrightDatabase(options = {}) {
       return db.prepare(`SELECT id, conversation_id AS conversationId, worktree_path AS worktreePath, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
         prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
         finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
-        output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision, transcript_omitted AS transcriptOmitted FROM runs WHERE id = ?`).get(id);
+        output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision, transcript_omitted AS transcriptOmitted,
+        ${RUN_ACCOUNT_FIELDS} FROM runs LEFT JOIN run_accounts AS account ON account.run_id = runs.id WHERE id = ?`).get(id);
     },
     listRuns(conversationId, limit = 200) {
       const boundedLimit = Math.max(1, Math.min(500, Number(limit) || 200));
       return db.prepare(`SELECT id, conversation_id AS conversationId, worktree_path AS worktreePath, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
         prompt, status, pid, provider_session_id AS providerSessionId, created_at AS createdAt, started_at AS startedAt,
         finished_at AS finishedAt, exit_code AS exitCode, error, cost_usd AS costUsd, input_tokens AS inputTokens,
-        output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision, transcript_omitted AS transcriptOmitted FROM runs WHERE conversation_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(conversationId, boundedLimit);
+        output_tokens AS outputTokens, recovery_class AS recoveryClass, recovery_decision AS recoveryDecision, transcript_omitted AS transcriptOmitted,
+        ${RUN_ACCOUNT_FIELDS} FROM runs LEFT JOIN run_accounts AS account ON account.run_id = runs.id
+        WHERE conversation_id = ? ORDER BY runs.created_at DESC, runs.rowid DESC LIMIT ?`).all(conversationId, boundedLimit);
     },
     listUnresolvedInterruptedRuns(conversationId) {
       return db.prepare(`SELECT id, conversation_id AS conversationId, worktree_path AS worktreePath, provider, model, reasoning_effort AS reasoningEffort, approval_policy AS approvalPolicy,
@@ -2217,6 +2229,104 @@ export function createOutrightDatabase(options = {}) {
       return db.prepare("SELECT id, title, prompt, created_at AS createdAt FROM prompt_templates WHERE id = ?").get(id);
     },
     deleteTemplate(id) { return db.prepare("DELETE FROM prompt_templates WHERE id = ?").run(id).changes > 0; },
+    // Provider accounts store a CLI home directory reference, never a
+    // credential. Each provider's default account is implicit.
+    listProviderAccounts() { return db.prepare(`SELECT ${PROVIDER_ACCOUNT_FIELDS} FROM provider_accounts ORDER BY provider, created_at, id`).all(); },
+    getProviderAccount(id) { return db.prepare(`SELECT ${PROVIDER_ACCOUNT_FIELDS} FROM provider_accounts WHERE id = ?`).get(id) ?? null; },
+    createProviderAccount({ provider, label, homePath }) {
+      const id = randomUUID();
+      withinRetainedBudget(() => {
+        if (db.prepare("SELECT COUNT(*) AS count FROM provider_accounts WHERE provider = ?").get(provider).count >= MAX_ACCOUNTS_PER_PROVIDER) {
+          throw databaseError(409, `A provider can have at most ${MAX_ACCOUNTS_PER_PROVIDER} added accounts`, { code: "PROVIDER_ACCOUNT_LIMIT" });
+        }
+        if (db.prepare("SELECT 1 FROM provider_accounts WHERE provider = ? AND home_path = ?").get(provider, homePath)) {
+          throw databaseError(409, "That directory is already an account for this provider", { code: "PROVIDER_ACCOUNT_DUPLICATE" });
+        }
+        if (db.prepare("SELECT 1 FROM provider_accounts WHERE provider = ? AND label = ? COLLATE NOCASE").get(provider, label)) {
+          throw databaseError(409, "Another account for this provider has that name", { code: "PROVIDER_ACCOUNT_DUPLICATE" });
+        }
+        db.prepare("INSERT INTO provider_accounts (id, provider, label, home_path, created_at) VALUES (?, ?, ?, ?, ?)").run(id, provider, label, homePath, now());
+        writeAudit("provider-account.added", { target: id, provider });
+      });
+      return this.getProviderAccount(id);
+    },
+    deleteProviderAccount(id) {
+      return db.transaction(() => {
+        const account = this.getProviderAccount(id);
+        if (!account) return false;
+        if (db.prepare("SELECT 1 FROM provider_account_selection WHERE provider = ? AND account_id = ?").get(account.provider, id)) {
+          throw databaseError(409, "Switch to another account before removing the active one", { code: "PROVIDER_ACCOUNT_ACTIVE" });
+        }
+        db.prepare("DELETE FROM provider_limit_windows WHERE account_id = ?").run(id);
+        db.prepare("DELETE FROM provider_accounts WHERE id = ?").run(id);
+        writeCriticalAudit("provider-account.removed", { target: id, provider: account.provider });
+        return true;
+      }).immediate();
+    },
+    activeProviderAccountId(provider) {
+      return db.prepare("SELECT account_id AS accountId FROM provider_account_selection WHERE provider = ?").get(provider)?.accountId ?? defaultProviderAccountId(provider);
+    },
+    // The account must still exist when the selection commits; a removal
+    // that raced the eligibility check fails the switch.
+    selectProviderAccount(provider, accountId) {
+      return db.transaction(() => {
+        if (accountId !== defaultProviderAccountId(provider)
+          && !db.prepare("SELECT 1 FROM provider_accounts WHERE id = ? AND provider = ?").get(accountId, provider)) {
+          throw databaseError(409, "The account was removed before the switch completed", { code: "PROVIDER_ACCOUNT_SWITCH_FAILED" });
+        }
+        const previous = this.activeProviderAccountId(provider);
+        db.prepare(`INSERT INTO provider_account_selection (provider, account_id) VALUES (?, ?)
+          ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id`).run(provider, accountId);
+        if (previous !== accountId) writeCriticalAudit("provider-account.switched", { target: accountId, provider, previous });
+        return accountId;
+      }).immediate();
+    },
+    // Recorded immediately before the launch marker. A run whose admission
+    // was deferred is still queued and may be bound again; once it leaves
+    // the queue its account never changes.
+    bindRunAccount(runId, account) {
+      const bound = db.prepare(`INSERT INTO run_accounts (run_id, account_id, account_label, account_identity, bound_at)
+        SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'queued')
+        ON CONFLICT(run_id) DO UPDATE SET account_id = excluded.account_id, account_label = excluded.account_label,
+          account_identity = excluded.account_identity, bound_at = excluded.bound_at`)
+        .run(runId, account.id, account.label, account.identity ?? null, now(), runId);
+      if (!bound.changes) throw databaseError(409, "Only a queued run can be bound to an account", { code: "RUN_ACCOUNT_IMMUTABLE" });
+    },
+    // The account of the run that holds a session, so a resumed session
+    // keeps its account. Null for an attached or pre-account session.
+    sessionAccountId(conversationId, provider, sessionId) {
+      if (!sessionId) return null;
+      return db.prepare(`SELECT account.account_id AS accountId FROM runs JOIN run_accounts AS account ON account.run_id = runs.id
+        WHERE runs.conversation_id = ? AND runs.provider = ? AND runs.provider_session_id = ?
+        ORDER BY runs.created_at DESC, runs.rowid DESC LIMIT 1`).get(conversationId, provider, sessionId)?.accountId ?? null;
+    },
+    // The latest report of each window wins. A report is optional telemetry
+    // and obeys the retained budget.
+    recordProviderLimits(accountId, provider, runId, windows, observedAt = now()) {
+      withinRetainedBudget(() => {
+        const upsert = db.prepare(`INSERT INTO provider_limit_windows (account_id, provider, window_name, utilization, status, resets_at, observed_at, run_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account_id, window_name) DO UPDATE SET provider = excluded.provider,
+          utilization = excluded.utilization, status = excluded.status, resets_at = excluded.resets_at, observed_at = excluded.observed_at, run_id = excluded.run_id`);
+        const known = new Set(db.prepare("SELECT window_name AS name FROM provider_limit_windows WHERE account_id = ?").all(accountId).map((row) => row.name));
+        for (const window of windows) {
+          if (!known.has(window.window) && known.size >= MAX_LIMIT_WINDOWS_PER_ACCOUNT) continue;
+          known.add(window.window);
+          upsert.run(accountId, provider, window.window, window.utilization, window.status, window.resetsAt, observedAt, runId);
+        }
+      });
+    },
+    listProviderLimits(accountId) {
+      return db.prepare(`SELECT window_name AS window, utilization, status, resets_at AS resetsAt, observed_at AS observedAt, run_id AS runId
+        FROM provider_limit_windows WHERE account_id = ? ORDER BY window_name`).all(accountId);
+    },
+    // What Outright measured for runs launched with an account since a time.
+    // A run without reported cost is counted, so a sum is never mistaken for
+    // a complete total.
+    measuredAccountUsage(accountId, since) {
+      return db.prepare(`SELECT COUNT(*) AS runs, COALESCE(SUM(runs.input_tokens), 0) AS inputTokens, COALESCE(SUM(runs.output_tokens), 0) AS outputTokens,
+        SUM(runs.cost_usd) AS costUsd, COALESCE(SUM(runs.cost_usd IS NULL), 0) AS runsWithoutCost
+        FROM run_accounts AS account JOIN runs ON runs.id = account.run_id WHERE account.account_id = ? AND account.bound_at >= ?`).get(accountId, since);
+    },
     search(query, limit = 40) {
       if (typeof query !== "string" || !query.trim() || Buffer.byteLength(query) > SEARCH_QUERY_BYTES) {
         throw databaseError(400, `Search query must contain 1 to ${SEARCH_QUERY_BYTES} UTF-8 bytes`);
@@ -2684,6 +2794,21 @@ function migrate(db, onSpacesMigrationStep) {
     CREATE TABLE IF NOT EXISTS audit_retention_cursor (id INTEGER PRIMARY KEY CHECK (id = 1), cursor INTEGER NOT NULL DEFAULT 0,
       sweep_upper INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS prompt_templates (id TEXT PRIMARY KEY, title TEXT NOT NULL, prompt TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS provider_accounts (
+      id TEXT PRIMARY KEY, provider TEXT NOT NULL, label TEXT NOT NULL, home_path TEXT NOT NULL, created_at TEXT NOT NULL,
+      UNIQUE(provider, home_path)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS provider_accounts_label ON provider_accounts(provider, label COLLATE NOCASE);
+    CREATE TABLE IF NOT EXISTS provider_account_selection (provider TEXT PRIMARY KEY, account_id TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS provider_limit_windows (
+      account_id TEXT NOT NULL, provider TEXT NOT NULL, window_name TEXT NOT NULL, utilization REAL, status TEXT, resets_at TEXT,
+      observed_at TEXT NOT NULL, run_id TEXT, PRIMARY KEY (account_id, window_name)
+    );
+    CREATE TABLE IF NOT EXISTS run_accounts (
+      run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, account_id TEXT NOT NULL, account_label TEXT NOT NULL,
+      account_identity TEXT, bound_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS run_accounts_usage ON run_accounts(account_id, bound_at);
   `);
   db.prepare("INSERT OR IGNORE INTO audit_retention_cursor (id) VALUES (1)").run();
   prepareAuditEvidence(db, hadAudit);
@@ -3596,6 +3721,7 @@ function decodeMessageWindow(bytes) {
 function hydrateDetails(row) { return { ...row, details: parseJson(row.details, {}) }; }
 function parseJson(value, fallback) { try { return JSON.parse(value); } catch { return fallback; } }
 function now() { return new Date().toISOString(); }
+export function defaultProviderAccountId(provider) { return `${provider}:default`; }
 function retainedBytes(db) {
   return db.prepare("SELECT bytes FROM retained_usage WHERE id = 1").get().bytes;
 }

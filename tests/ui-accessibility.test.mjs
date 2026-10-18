@@ -101,3 +101,34 @@ test("provider controls explain readiness and only offer supported choices", asy
   assert.match(settings, /id="default-provider-status" className="provider-status" role="status" aria-live="polite"/);
   assert.match(app, /aria-describedby="chat-settings-provider-status"/);
 });
+
+test("account usage keeps measured, reported, stale and unknown values distinct", async () => {
+  const { limitText, limitWindowLabel, loginText, measuredText, runAccountText } = await import("../src/lib/provider-accounts.js");
+  const time = (value) => value.slice(11, 16);
+  const window = { window: "five_hour", utilization: 0.86, status: "allowed", resetsAt: "2026-10-19T15:00:00.000Z", observedAt: "2026-10-19T10:00:00.000Z" };
+  assert.equal(limitText({ ...window, state: "current" }, time), "86% used · resets 15:00");
+  assert.equal(limitText({ ...window, state: "stale" }, time), "86% used as of 10:00 (stale) · resets 15:00");
+  assert.equal(limitText({ ...window, utilization: null, status: null, state: "reset" }, time), "Reset 15:00; no report since");
+  assert.equal(limitText({ ...window, utilization: null, resetsAt: null, status: "rejected", state: "current" }, time), "limit reached · usage not reported · reset time not reported");
+  assert.equal(limitWindowLabel("seven_day_opus"), "7-day Opus limit");
+  assert.equal(limitWindowLabel("monthly_spend"), "monthly spend limit");
+  assert.equal(measuredText({ runs: 0, costUsd: null }), "No runs");
+  assert.equal(measuredText({ runs: 2, inputTokens: 1000, outputTokens: 234, costUsd: 0.5, runsWithoutCost: 1 }), "2 runs · 1,234 tokens · $0.500 reported (1 without reported cost)");
+  assert.equal(measuredText({ runs: 1, inputTokens: 1, outputTokens: 1, costUsd: null, runsWithoutCost: 1 }), "1 run · 2 tokens · cost not reported");
+  assert.equal(loginText({ status: "signed-in", identity: { email: "a@example.com", plan: "max" } }), "Signed in · a@example.com · max");
+  assert.equal(loginText({ status: "unknown", error: "Codex login status could not be checked" }), "Codex login status could not be checked");
+  assert.equal(loginText(undefined), "Checking login…");
+  assert.equal(runAccountText({ accountLabel: "Work", accountIdentity: "a@example.com" }), "Work (a@example.com)");
+  assert.equal(runAccountText({ accountLabel: null }), null);
+
+  const [accounts, settings] = await Promise.all([
+    readFile(new URL("src/components/ProviderAccounts.jsx", root), "utf8"),
+    readFile(new URL("src/components/SettingsDialog.jsx", root), "utf8"),
+  ]);
+  assert.match(settings, /<ProviderAccounts open=\{open\}/);
+  assert.match(accounts, /aria-labelledby="provider-accounts-heading"/);
+  assert.match(accounts, /role="alert">\{message\.alert\}/);
+  assert.match(accounts, /role="status" aria-live="polite">\{message\.status\}/);
+  assert.match(accounts, /aria-describedby="provider-account-help"/);
+  assert.match(accounts, /<legend className="sr-only">Confirm account removal<\/legend>/);
+});

@@ -11,11 +11,12 @@ The scheduler in `server/agent-manager.mjs` owns supervision, persistence, recov
 | `environment` | Direct providers only: the `OUTRIGHT_*` variables the adapter reads. They are removed from every spawn and handed only to that adapter's process. |
 | `detect` | Direct providers only: checks the credential and endpoint settings, so an unusable configuration is reported as unavailable before anything is queued. |
 | `versions` | The oldest verified version and the first unverified major. Anything outside the range, a prerelease such as `0.162.1-rc.1`, or an unparseable `--version` is reported as incompatible. |
-| `capabilities` | Approval policies mapped to native permission modes, suggested models and whether custom names are allowed, reasoning efforts, resume support, structured output (`jsonl`), read-only support and hosted suitability. |
+| `capabilities` | Approval policies mapped to native permission modes, suggested models and whether custom names are allowed, reasoning efforts, resume support, structured output (`jsonl`), read-only support, hosted suitability and whether the provider reports usage windows (`usageLimits`). |
+| `accounts` | Harness adapters only, optional: the CLI's home variable, the arguments of its login status command and a parser that keeps only display fields. See [OUT-28](out-28-provider-accounts.md). |
 | `sessionIdentity` | The native field carrying the provider's session id. Resume uses only a session created by the same adapter. |
 | `buildLaunch`, `normalize` | Argv construction and stream normalization. Positional values follow `--`, so a prompt or session id can never become an option or subcommand. |
 
-Normalized events are `session`, `assistant.delta`, `assistant.message`, `tool.started`, `tool.completed`, `usage`, `provider.failure` and `provider.event`. Usage and failure events keep provider detail under `native`, and unknown records remain `provider.event`. A `provider.failure` marked `terminal: true` (Codex `turn.failed`, a Claude Code `is_error` result, an Anthropic `error` event) fails the run even if the process exits 0. A non-terminal failure, such as a Codex top-level `error` notice that may precede a retry, only explains a nonzero exit.
+Normalized events are `session`, `assistant.delta`, `assistant.message`, `tool.started`, `tool.completed`, `usage`, `model`, `rate_limit`, `provider.failure` and `provider.event`. A `rate_limit` event carries the usage windows a provider reports for its login; see [OUT-28](out-28-provider-accounts.md). Usage and failure events keep provider detail under `native`, and unknown records remain `provider.event`. A `provider.failure` marked `terminal: true` (Codex `turn.failed`, a Claude Code `is_error` result, an Anthropic `error` event) fails the run even if the process exits 0. A non-terminal failure, such as a Codex top-level `error` notice that may precede a retry, only explains a nonzero exit.
 
 ## Validation order
 

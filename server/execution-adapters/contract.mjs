@@ -15,14 +15,21 @@ export const APPROVAL_POLICIES = Object.freeze(["read-only", "workspace-write", 
 export const REASONING_EFFORTS = Object.freeze(["low", "medium", "high", "xhigh"]);
 // A provider.failure with `terminal: true` fails the run even if the process
 // exits 0; any other failure only explains a nonzero exit. A "model" event
-// names the model the provider reports actually answered.
-export const NORMALIZED_EVENT_TYPES = Object.freeze(["session", "assistant.delta", "assistant.message", "tool.started", "tool.completed", "usage", "model", "provider.failure", "provider.event"]);
+// names the model the provider reports actually answered. A "rate_limit"
+// event carries the account's usage windows as the provider reports them.
+export const NORMALIZED_EVENT_TYPES = Object.freeze(["session", "assistant.delta", "assistant.message", "tool.started", "tool.completed", "usage", "model", "rate_limit", "provider.failure", "provider.event"]);
 // Values that reach a provider's argv must never parse as an option.
 const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@+[\]-]{0,199}$/;
 const SESSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const ID_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
 const DIRECT_VARIABLE_PATTERN = /^OUTRIGHT_[A-Z0-9_]+$/;
+const HOME_VARIABLE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+const IDENTITY_ARGUMENT_PATTERN = /^-{0,2}[a-z][a-z-]{0,31}$/;
+const LIMIT_WINDOW_PATTERN = /^[a-z0-9_]{1,40}$/;
+const LIMIT_STATUS_PATTERN = /^[a-z_]{1,32}$/;
+const MAX_LIMIT_WINDOWS = 8;
+const MAX_IDENTITY_TEXT = 200;
 
 function contractError(message) {
   return new TypeError(`Invalid execution adapter: ${message}`);
@@ -60,12 +67,19 @@ export function defineAdapter(spec) {
     if (authority.source !== "harness-login") throw contractError(`${spec.id} harness authority must be its own login`);
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(spec.executable ?? "")) throw contractError(`${spec.id} needs a bare executable name`);
     if (typeof spec.parseVersion !== "function") throw contractError(`${spec.id} must parse its CLI version`);
+    // A harness login lives in the CLI's own home directory. Selecting another
+    // directory selects another login; Outright never reads its credentials.
+    const accounts = spec.accounts;
+    if (accounts !== undefined && (!HOME_VARIABLE_PATTERN.test(accounts?.homeVariable ?? "") || accounts.homeVariable.startsWith("OUTRIGHT_")
+      || !Array.isArray(accounts.identityArgs) || !accounts.identityArgs.length || accounts.identityArgs.some((arg) => !IDENTITY_ARGUMENT_PATTERN.test(arg))
+      || typeof accounts.parseIdentity !== "function")) throw contractError(`${spec.id} accounts must name a home variable, identity arguments and a parser`);
   } else {
     // A harness login never grants direct API access.
     if (authority.source !== "env" || !DIRECT_VARIABLE_PATTERN.test(authority.variable ?? "")) throw contractError(`${spec.id} must reference its own API credential`);
     if (!Array.isArray(spec.environment) || !spec.environment.includes(authority.variable)
       || spec.environment.some((variable) => !DIRECT_VARIABLE_PATTERN.test(variable))) throw contractError(`${spec.id} must declare its OUTRIGHT_* launch environment`);
     if (typeof spec.detect !== "function") throw contractError(`${spec.id} must detect its credential`);
+    if (spec.accounts !== undefined) throw contractError(`${spec.id} direct credentials are configured by environment, not account homes`);
   }
   const versions = spec.versions ?? {};
   if (!VERSION_PATTERN.test(versions.minimum ?? "") || !Number.isInteger(versions.belowMajor)
@@ -91,6 +105,7 @@ export function defineAdapter(spec) {
   for (const method of ["buildLaunch", "normalize"]) if (typeof spec[method] !== "function") throw contractError(`${spec.id} must implement ${method}`);
   return Object.freeze({
     ...spec,
+    accounts: spec.accounts ? Object.freeze({ ...spec.accounts, identityArgs: Object.freeze([...spec.accounts.identityArgs]) }) : null,
     modelAliases: Object.freeze(Object.fromEntries(Object.entries(aliases).map(([alias, ids]) => [alias, Object.freeze([...ids])]))),
     environment: Object.freeze([...(spec.kind === "harness" ? [] : spec.environment)]),
     capabilities: Object.freeze({
@@ -115,6 +130,7 @@ export function describeAdapter(adapter) {
     contractVersion: adapter.contractVersion,
     modelProvider: adapter.modelProvider,
     authority: adapter.kind === "harness" ? { source: "harness-login" } : { source: "env", variable: adapter.authority.variable },
+    accounts: adapter.accounts ? { homeVariable: adapter.accounts.homeVariable } : null,
     supportedVersions: { minimum: adapter.versions.minimum, belowMajor: adapter.versions.belowMajor },
     capabilities: {
       permissionModes: Object.keys(capabilities.permissionModes),
@@ -127,6 +143,7 @@ export function describeAdapter(adapter) {
       resume: Boolean(capabilities.resume),
       structuredOutput: capabilities.structuredOutput,
       hosted: Boolean(capabilities.hosted),
+      usageLimits: Boolean(capabilities.usageLimits),
     },
     models: [...capabilities.models],
   };
@@ -200,4 +217,36 @@ export function modelMatches(adapter, requested, reported) {
   if (!requested) return false;
   const aliased = Object.hasOwn(adapter.modelAliases, requested) ? adapter.modelAliases[requested] : [];
   return [requested, ...aliased].some((id) => reported === id || (reported.startsWith(`${id}-`) && /^\d{8}$/.test(reported.slice(id.length + 1))));
+}
+
+// Identity text a CLI prints is display-only: control characters are
+// removed and the length is bounded. Anything else is dropped.
+export function identityText(value) {
+  if (typeof value !== "string") return null;
+  const text = value.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  return text ? text.slice(0, MAX_IDENTITY_TEXT) : null;
+}
+
+// Usage windows as a provider reports them. Malformed windows, values and
+// timestamps are dropped rather than guessed; a window keeps only what was
+// reported, so an absent utilization or reset stays unknown.
+export function limitWindow(window, { utilization, resetsAt, status } = {}) {
+  if (typeof window !== "string" || !LIMIT_WINDOW_PATTERN.test(window)) return null;
+  const seconds = Number.isFinite(resetsAt) && resetsAt > 0 && resetsAt < 32_503_680_000 ? resetsAt : null;
+  return {
+    window,
+    utilization: Number.isFinite(utilization) && utilization >= 0 && utilization <= 10 ? utilization : null,
+    resetsAt: seconds === null ? null : new Date(seconds * 1000).toISOString(),
+    status: typeof status === "string" && LIMIT_STATUS_PATTERN.test(status) ? status : null,
+  };
+}
+
+export function boundedLimitWindows(windows) {
+  const byName = new Map();
+  for (const window of windows) {
+    if (!window || byName.size >= MAX_LIMIT_WINDOWS && !byName.has(window.window)) continue;
+    const previous = byName.get(window.window);
+    byName.set(window.window, previous ? { ...previous, ...Object.fromEntries(Object.entries(window).filter(([, value]) => value !== null)) } : window);
+  }
+  return [...byName.values()];
 }

@@ -9,6 +9,7 @@ import { createOutrightDatabase, normalizeTaskInput } from "./database.mjs";
 import { isModelName, validateExecutionConfiguration, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
 import { AGENT_SUPERVISOR, createAgentManager, defaultGroupMembers, hardenWindowsLaunchDirectory, terminateTree } from "./agent-manager.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
+import { createProviderAccounts } from "./provider-accounts.mjs";
 import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { utilityProcesses } from "./subprocess-budget.mjs";
@@ -48,7 +49,7 @@ function abortableDelay(ms, signal) {
   });
 }
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, databaseFactory = createOutrightDatabase, agentManagerFactory = createAgentManager, hardenLaunchDirectory = process.platform === "win32" ? hardenWindowsLaunchDirectory : () => {}, terminalManagerFactory = createTerminalManager } = {}) {
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, databaseFactory = createOutrightDatabase, agentManagerFactory = createAgentManager, providerAccountsFactory = createProviderAccounts, hardenLaunchDirectory = process.platform === "win32" ? hardenWindowsLaunchDirectory : () => {}, terminalManagerFactory = createTerminalManager } = {}) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
   let agents;
@@ -148,7 +149,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   // Construct the agent manager after the remaining synchronous startup
   // checks. No provider discovery owner then needs asynchronous teardown on
   // a failed synchronous constructor path.
-  agents = agentManagerFactory({ database, publish,
+  const accounts = providerAccountsFactory({ database, publish: (event) => publish(event) });
+  agents = agentManagerFactory({ database, publish, accounts,
     onShutdownRecovery: () => {
       // The first shutdown may have failed while both SQLite and its outcome
       // journal refused writes. Once an exited result commits, resume the
@@ -416,6 +418,16 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         return json(response, 200, settings);
       }
       if (url.pathname === "/api/capacity" && request.method === "GET") return json(response, 200, runtimeCapacity());
+      if (url.pathname === "/api/provider-accounts" && request.method === "GET") return json(response, 200, accounts.list());
+      if (url.pathname === "/api/provider-accounts" && request.method === "POST") return json(response, 201, await accounts.add(await readJson(request)));
+      if (url.pathname === "/api/provider-accounts/active" && request.method === "PUT") return json(response, 200, await accounts.activate(await readJson(request)));
+      const accountMatch = url.pathname.match(/^\/api\/provider-accounts\/([^/]+)(\/refresh)?$/);
+      if (accountMatch && ((accountMatch[2] && request.method === "POST") || (!accountMatch[2] && request.method === "DELETE"))) {
+        let accountId;
+        try { accountId = decodeURIComponent(accountMatch[1]); }
+        catch { throw apiError(400, "Account id is malformed", { code: "PROVIDER_ACCOUNT_INVALID" }); }
+        return json(response, 200, accountMatch[2] ? await accounts.refresh(accountId) : accounts.remove(accountId));
+      }
       const utilityOwnerMatch = UTILITY_OWNER_RELEASE_ROUTE.exec(url.pathname);
       if (utilityOwnerMatch && request.method === "POST") return json(response, 200, await releaseUtilityOwner(utilityOwnerMatch[1]));
       if (url.pathname === "/api/retention/archived" && request.method === "GET") {
@@ -681,6 +693,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const provider = submitted("provider", conversation.provider || settings.provider);
         const runConfig = { provider, model: submitted("model", conversation.model ?? settings.model), reasoningEffort: submitted("reasoningEffort", settings.reasoningEffort), approvalPolicy: submitted("approvalPolicy", settings.approvalPolicy) };
         await preflightProvider({ ...runConfig, sessionId: provider === conversation.provider ? conversation.providerSessionId : null });
+        // The account is resolved again at launch; this refuses a removed or
+        // signed-out one before anything is written.
+        await accounts.assertLaunchable({ provider, conversationId: conversation.id, sessionId: provider === conversation.provider ? conversation.providerSessionId : null });
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         // Archive, move, or recovery can commit during either validation await.
         // Fence both message and run creation to the current durable target.
@@ -880,6 +895,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         }
         await preflightProvider({ provider: interrupted.provider, model, reasoningEffort: interrupted.reasoningEffort,
           approvalPolicy: interrupted.approvalPolicy, sessionId: policy === "resume-session" ? sessionId : null });
+        // A recovery continues on the account the interrupted run launched
+        // with. A run that never launched has none and uses the usual rule.
+        const recoveryAccountId = interrupted.accountId ?? undefined;
+        await accounts.assertLaunchable({ provider: interrupted.provider, conversationId: conversation.id,
+          sessionId: policy === "resume-session" ? sessionId : null, accountId: recoveryAccountId });
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         const currentRecoveryConversation = database.getConversation(conversation.id);
         if (!currentRecoveryConversation || currentRecoveryConversation.archived) {
@@ -899,6 +919,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           run: recovery.run,
           forceFreshSession: policy === "retry",
           providerSessionId: policy === "retry" ? null : sessionId,
+          accountId: recoveryAccountId,
         }));
       }
 
@@ -1017,7 +1038,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     let disposed = false;
     shutdownPromise = (async () => {
       const shutdownErrors = [];
-      const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown()]);
+      const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown(), accounts.close()]);
       for (const result of preliminaries) if (result.status === "rejected") shutdownErrors.push(result.reason);
       // A failed agent shutdown may be the sole owner of an exited provider's
       // result while both SQLite and its recovery sidecar are unavailable.

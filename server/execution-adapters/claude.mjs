@@ -1,4 +1,25 @@
-import { ADAPTER_CONTRACT_VERSION, defineAdapter, parseSemanticVersion } from "./contract.mjs";
+import { ADAPTER_CONTRACT_VERSION, boundedLimitWindows, defineAdapter, identityText, limitWindow, parseSemanticVersion } from "./contract.mjs";
+
+// `claude auth status --json` prints the login of CLAUDE_CONFIG_DIR. Only
+// these display fields are kept; it prints no token.
+function parseIdentity(output) {
+  let status;
+  try { status = JSON.parse(output); } catch { return null; }
+  if (!status || typeof status !== "object" || typeof status.loggedIn !== "boolean") return null;
+  return { signedIn: status.loggedIn, method: identityText(status.authMethod), email: identityText(status.email),
+    organization: identityText(status.orgName), plan: identityText(status.subscriptionType) };
+}
+
+// A rate_limit_event names the window that applies now and, in
+// unifiedWindows, every window it measured.
+function limitWindows(info) {
+  if (!info || typeof info !== "object") return [];
+  const unified = info.unifiedWindows && typeof info.unifiedWindows === "object" ? Object.entries(info.unifiedWindows) : [];
+  return boundedLimitWindows([
+    ...unified.map(([name, window]) => limitWindow(name, { utilization: window?.utilization, resetsAt: window?.resetsAt })),
+    limitWindow(info.rateLimitType, { resetsAt: info.resetsAt, status: info.status, utilization: info.utilization }),
+  ]);
+}
 
 export const claudeAdapter = defineAdapter({
   id: "claude",
@@ -22,9 +43,12 @@ export const claudeAdapter = defineAdapter({
     resume: true,
     structuredOutput: "jsonl",
     hosted: false,
+    // rate_limit_event reports the login's usage windows.
+    usageLimits: true,
   },
   sessionIdentity: { nativeField: "session_id" },
   parseVersion: parseSemanticVersion,
+  accounts: { homeVariable: "CLAUDE_CONFIG_DIR", identityArgs: ["auth", "status", "--json"], parseIdentity },
   // What Claude Code 2.1.296 resolves each alias to. Another release
   // answering for an alias is reported, not assumed equivalent.
   modelAliases: { haiku: ["claude-haiku-5-5"], sonnet: ["claude-sonnet-5-5"], opus: ["claude-opus-5-5"] },
@@ -54,6 +78,10 @@ export const claudeAdapter = defineAdapter({
       for (const block of raw.message?.content ?? []) {
         if (block.type === "tool_result") events.push({ type: "tool.completed", payload: { item: block } });
       }
+    }
+    if (raw.type === "rate_limit_event") {
+      const windows = limitWindows(raw.rate_limit_info);
+      if (windows.length) events.push({ type: "rate_limit", payload: { windows } });
     }
     if (raw.type === "result") {
       if (raw.result && !raw.is_error) events.push({ type: "assistant.message", payload: { text: raw.result } });

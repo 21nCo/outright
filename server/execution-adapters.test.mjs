@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { ADAPTER_CONTRACT_VERSION, defineAdapter, modelMatches, NORMALIZED_EVENT_TYPES, requestedModel, validateRunConfiguration } from "./execution-adapters/contract.mjs";
-import { buildExecutionLaunch, describeAdapter, EXECUTION_ADAPTERS, findExecutionAdapter, validateExecutionConfiguration, versionCompatibility } from "./execution-adapters/index.mjs";
+import { buildExecutionEnvironment, buildExecutionLaunch, describeAdapter, EXECUTION_ADAPTERS, findExecutionAdapter, validateExecutionConfiguration, versionCompatibility } from "./execution-adapters/index.mjs";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
 import { ENDPOINT_REQUIREMENT } from "./execution-adapters/anthropic-api-runner.mjs";
 
@@ -788,4 +788,51 @@ test("discovery reports incompatible and unconfigured providers before authoriza
     assert.equal(await configured.available("anthropic-api"), true);
     assert.equal(configured.list().find((entry) => entry.id === "anthropic-api").version, "1.0.0");
   } finally { await configured.close(); }
+});
+
+test("Claude Code usage windows normalize from the recorded stream and drop malformed values", () => {
+  const windows = normalizeFixture(claude, "print.jsonl").filter((event) => event.type === "rate_limit").map((event) => event.payload.windows);
+  // Before, the record stayed an opaque provider.event and no limit was kept.
+  assert.ok(windows.length > 0);
+  assert.deepEqual(windows[0], [{ window: "five_hour", utilization: 0.86, resetsAt: new Date(1791650400 * 1000).toISOString(), status: "allowed" }]);
+  const [malformed] = claude.normalize({ type: "rate_limit_event", rate_limit_info: { status: "Allowed!", rateLimitType: "five_hour", resetsAt: "soon",
+    unifiedWindows: { five_hour: { utilization: -1, resetsAt: 1791650400 }, "seven day": { utilization: 0.5 }, seven_day_opus: { utilization: 0.4, resetsAt: Infinity } } } });
+  assert.deepEqual(malformed.payload.windows, [
+    { window: "five_hour", utilization: null, resetsAt: new Date(1791650400 * 1000).toISOString(), status: null },
+    { window: "seven_day_opus", utilization: 0.4, resetsAt: null, status: null },
+  ]);
+  assert.deepEqual(claude.normalize({ type: "rate_limit_event", rate_limit_info: { rateLimitType: "../x" } }).map((event) => event.type), ["provider.event"]);
+  assert.equal(describeAdapter(claude).capabilities.usageLimits, true);
+  assert.equal(describeAdapter(codex).capabilities.usageLimits, false);
+});
+
+test("harness logins are read from each CLI's status without credentials", () => {
+  const parseClaude = claude.accounts.parseIdentity;
+  assert.deepEqual(parseClaude(JSON.stringify({ loggedIn: true, authMethod: "claude.ai", email: "a@example.com", orgName: "Org\u0007", subscriptionType: "max", configDirectory: "/x" })),
+    { signedIn: true, method: "claude.ai", email: "a@example.com", organization: "Org", plan: "max" });
+  assert.equal(parseClaude(JSON.stringify({ loggedIn: false, authMethod: "none" })).signedIn, false);
+  assert.equal(parseClaude("not json"), null);
+  assert.equal(parseClaude(JSON.stringify({ loggedIn: "yes" })), null);
+  const parseCodex = codex.accounts.parseIdentity;
+  assert.deepEqual(parseCodex("Logged in using ChatGPT\n"), { signedIn: true, method: "chatgpt", email: null, organization: null, plan: null });
+  assert.doesNotMatch(JSON.stringify(parseCodex("Logged in using an API key - sk-proj-***ABCD")), /sk-/);
+  assert.equal(parseCodex("Not logged in").signedIn, false);
+  assert.equal(parseCodex("Something else"), null);
+  assert.deepEqual([claude.accounts.homeVariable, codex.accounts.homeVariable, anthropic.accounts], ["CLAUDE_CONFIG_DIR", "CODEX_HOME", null]);
+  const accounts = { homeVariable: "FIXTURE_HOME", identityArgs: ["status"], parseIdentity: () => null };
+  assert.equal(defineAdapter(harnessSpec({ accounts })).accounts.homeVariable, "FIXTURE_HOME");
+  assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, homeVariable: "OUTRIGHT_HOME" } })), /accounts must name/);
+  assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, identityArgs: ["status; rm"] } })), /accounts must name/);
+});
+
+test("an account's home reaches only its own launch, and only under its own variable", () => {
+  const inherited = { PATH: "/bin", claude_config_dir: "/inherited", OUTRIGHT_ANTHROPIC_API_KEY: "direct" };
+  // The default account keeps whatever home the environment selects.
+  assert.equal(buildExecutionEnvironment("claude", inherited).claude_config_dir, "/inherited");
+  const scoped = buildExecutionEnvironment("claude", inherited, inherited, { homePath: "/accounts/work" });
+  assert.equal(scoped.CLAUDE_CONFIG_DIR, "/accounts/work");
+  assert.equal(Object.keys(scoped).filter((key) => key.toUpperCase() === "CLAUDE_CONFIG_DIR").length, 1, "no second spelling survives");
+  assert.equal(scoped.OUTRIGHT_ANTHROPIC_API_KEY, undefined);
+  assert.equal(buildExecutionEnvironment("codex", inherited, inherited, { homePath: "/accounts/codex" }).CODEX_HOME, "/accounts/codex");
+  assert.throws(() => buildExecutionEnvironment("anthropic-api", inherited, inherited, { homePath: "/accounts/x" }), /no selectable accounts/);
 });

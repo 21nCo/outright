@@ -1,5 +1,15 @@
 import { ADAPTER_CONTRACT_VERSION, defineAdapter, parseSemanticVersion } from "./contract.mjs";
 
+// `codex login status` prints one line for CODEX_HOME. An API-key login
+// prints a masked key after the method; only the method is kept.
+function parseIdentity(output) {
+  const line = String(output).trim().split(/\r?\n/)[0] ?? "";
+  if (/^Not logged in\b/.test(line)) return { signedIn: false, method: null, email: null, organization: null, plan: null };
+  if (/^Logged in using ChatGPT\b/.test(line)) return { signedIn: true, method: "chatgpt", email: null, organization: null, plan: null };
+  if (/^Logged in using an API key\b/.test(line)) return { signedIn: true, method: "api-key", email: null, organization: null, plan: null };
+  return null;
+}
+
 const SANDBOX_MODES = { "read-only": "read-only", "workspace-write": "workspace-write", "danger-full-access": "danger-full-access" };
 
 // Item types `codex exec --json` emits for tool calls.
@@ -27,6 +37,8 @@ export const codexAdapter = defineAdapter({
   },
   sessionIdentity: { nativeField: "thread_id" },
   parseVersion: parseSemanticVersion,
+  // `codex exec --json` reports token usage but no usage windows.
+  accounts: { homeVariable: "CODEX_HOME", identityArgs: ["login", "status"], parseIdentity },
   buildLaunch({ worktreePath, run, sessionId }) {
     const sandbox = SANDBOX_MODES[run.approvalPolicy];
     const options = [];

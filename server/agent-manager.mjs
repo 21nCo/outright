@@ -381,7 +381,7 @@ function unresolvedOutcomeUnavailable() {
   return unavailable;
 }
 
-export function createAgentManager({ database, publish, onProvidersChanged = () => {}, onShutdownRecovery = () => {}, onDiskRetry = () => {}, providerDiscoveryFactory = createProviderDiscovery, spawnProcess = spawnExecution, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory, environment = process.env }) {
+export function createAgentManager({ database, publish, onProvidersChanged = () => {}, onShutdownRecovery = () => {}, onDiskRetry = () => {}, providerDiscoveryFactory = createProviderDiscovery, accounts = null, spawnProcess = spawnExecution, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory, environment = process.env }) {
   const resolvedLaunchDirectory = launchDirectory
     ?? database.launchDirectory;
   assertPrivateLaunchDirectory(resolvedLaunchDirectory);
@@ -416,9 +416,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     return providerDiscovery.list();
   }
 
-  async function schedule({ conversation, run, forceFreshSession = false, providerSessionId }) {
+  // `accountId` pins a recovery run to the account of the run it continues.
+  async function schedule({ conversation, run, forceFreshSession = false, providerSessionId, accountId }) {
     if (shuttingDown) throw new Error("Agent manager is shutting down");
-    const entry = { conversation, run, forceFreshSession, providerSessionId };
+    const entry = { conversation, run, forceFreshSession, providerSessionId, accountId };
     queue.push(entry);
     emit(run.id, "run.queued", { position: queue.length });
     drain();
@@ -468,6 +469,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     const admission = preflightAgentAdmission(state, authorize);
     if (admission) return admission;
     const startedAt = new Date().toISOString();
+    // The account is recorded before the launch marker, so a launched run
+    // always names the account its provider ran with.
+    if (state.account) accounts.bindRun(run.id, state.account);
     // Crash-safe launch handshake, phase 1: this durable marker means "a spawn
     // may have been issued, but the provider was never authorized to run". A
     // crash from here on restarts as a run that provably never started side
@@ -476,13 +480,14 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // instead of being permanently gated on a missing pid.
     database.updateRun(run.id, { status: "launching", startedAt });
     database.auditCritical("agent.run.started", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath, approvalPolicy: run.approvalPolicy });
-    emit(run.id, "run.started", { provider: run.provider, model: run.model, startedAt, command: launch.display ?? command.display });
+    emit(run.id, "run.started", { provider: run.provider, model: run.model, startedAt, command: launch.display ?? command.display,
+      ...(state.account ? { account: { id: state.account.id, label: state.account.label } } : {}) });
 
     const child = spawnProcess(launch.executable, launch.args, {
       cwd: conversation.worktreePath,
       // Each adapter gets a scoped environment: direct-provider credentials
       // reach only the adapter that declares them.
-      env: buildExecutionEnvironment(run.provider, environment, sanitizedEnvironment(environment)),
+      env: buildExecutionEnvironment(run.provider, environment, sanitizedEnvironment(environment), state.account),
       // fd 3 is a manager-only launch-control channel. The provider inherits
       // stdout/stderr from its owner but never inherits this descriptor.
       stdio: ["pipe", "pipe", "pipe", "pipe"],
@@ -674,6 +679,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         try { if (Object.keys(usage).length) database.updateRun(state.run.id, usage); }
         catch (error) { if (error.statusCode !== 507) throw error; }
       }
+      // Usage windows belong to the account the run launched with.
+      if (event.type === "rate_limit" && state.account) accounts.recordLimits(state.account.id, state.run.provider, state.run.id, event.payload.windows);
       // A provider-reported failure explains a nonzero exit better than
       // stderr noise. Only a terminal one fails a run that exits 0.
       if (event.type === "provider.failure" && (event.payload.terminal === true || !state.providerFailed)) {
@@ -930,6 +937,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if (entry.providerSessionId !== undefined) state.conversation = { ...current, providerSessionId: entry.providerSessionId };
     else if (entry.forceFreshSession || current.provider !== entry.run.provider) state.conversation = { ...current, providerSessionId: null };
     else state.conversation = current;
+    // The launch boundary: a resumed session keeps its account, anything
+    // else uses the active one. A removed account fails the run.
+    if (accounts) state.account = accounts.resolve({ provider: entry.run.provider, conversationId: current.id, sessionId: state.conversation.providerSessionId, accountId: entry.accountId });
     return { authorize };
   }
 

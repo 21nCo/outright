@@ -47,9 +47,22 @@ export function withoutDirectProviderCredentials(environment = process.env) {
   return Object.fromEntries(Object.entries(environment).filter(([key]) => !directProviderVariables.has(key.toUpperCase())));
 }
 
-export function buildExecutionEnvironment(id, runtimeEnvironment, inherited = runtimeEnvironment) {
+// A configured account selects its CLI home directory; the default account
+// keeps whatever home the inherited environment selects.
+export function buildExecutionEnvironment(id, runtimeEnvironment, inherited = runtimeEnvironment, account = null) {
   const adapter = requireExecutionAdapter(id);
   const environment = withoutDirectProviderCredentials(inherited);
   for (const variable of adapter.environment) if (runtimeEnvironment[variable]) environment[variable] = runtimeEnvironment[variable];
+  if (account?.homePath) {
+    if (!adapter.accounts) throw configurationError(`${adapter.label} has no selectable accounts`, "PROVIDER_ACCOUNT_UNSUPPORTED");
+    return withAccountHome(environment, adapter.accounts.homeVariable, account.homePath);
+  }
   return environment;
+}
+
+export function withAccountHome(environment, variable, homePath) {
+  // Windows names are case-insensitive; never leave a second spelling behind.
+  const scoped = Object.fromEntries(Object.entries(environment).filter(([key]) => key.toUpperCase() !== variable));
+  scoped[variable] = homePath;
+  return scoped;
 }
