@@ -1,0 +1,59 @@
+docs/out-28-provider-accounts.md
+  s_3ecdb977784750::t_69f417e4fbba34 1-54
+docs/out-3-execution-adapters.md
+  s_3ecdb977784750::t_b6ae13bc4be7c2 14-15,19
+server/agent-manager.mjs
+  s_3ecdb977784750::t_5a85b07c6c9aa8 384,419-420,422,472-474,483-484,490,682-683,940-942
+server/database.mjs
+  s_3ecdb977784750::t_7d26a3932131c8 64-67,70-74,1631-1632,1639-1641,2232-2329,2797-2811,3724
+server/execution-adapters.test.mjs
+  s_3ecdb977784750::t_c1afe8e8709279 8,792-838
+server/execution-adapters/claude.mjs
+  s_3ecdb977784750::t_6a9d46e30c074e 1-22,46-47,51,82-85
+server/execution-adapters/codex.mjs
+  s_3ecdb977784750::t_df548a1a69e3d5 3-12,40-41
+server/execution-adapters/contract.mjs
+  s_3ecdb977784750::t_0fb10fe21de26c 18-20,27-32,70-75,82,108,133,146,221-252
+server/execution-adapters/index.mjs
+  s_3ecdb977784750::t_297c61eddc1187 50-52,56-59,62-68
+server/outright-runtime.mjs
+  s_3ecdb977784750::t_b392b2b21f3df3 12,52,152-153,421-430,696-698,898-902,922,1041
+server/outright-runtime.test.mjs
+  s_3ecdb977784750::t_a4caea209dfea7 3542-3601
+server/provider-accounts.mjs
+  s_3ecdb977784750::t_e23813635dae36 1-298
+server/provider-accounts.test.mjs
+  s_3ecdb977784750::t_9dcf9678b3e087 1-343
+server/provider-discovery.mjs
+  s_3ecdb977784750::t_20c4236987ac9b 38-41,43,55,59,65,69,236-238,241,282,312,325
+server/provider-discovery.test.mjs
+  s_3ecdb977784750::t_99331f8d89814f 7,246-265
+src/App.jsx
+  s_3ecdb977784750::t_c75720c619722e 32,647,1350-1351,1889,1963,1987,2147-2148
+src/components/ProviderAccounts.jsx
+  s_3ecdb977784750::t_51f951ca7348ba 1-144
+src/components/SettingsDialog.jsx
+  s_3ecdb977784750::t_77ffd5461c1555 6,231
+src/lib/provider-accounts.js
+  s_3ecdb977784750::t_abf80a9a74f003 1-51
+src/styles.css
+  s_3ecdb977784750::t_99cd6f23afac55 518-525,567,569-570
+tests/ui-accessibility.test.mjs
+  s_3ecdb977784750::t_421d1bfc0fe2fb 104-134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "041a5588a13f2930c9e6eb6123715fecd8e4043a",
+  "prompts": {},
+  "sessions": {
+    "s_3ecdb977784750": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_3ecdb977784750",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
