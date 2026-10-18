@@ -1,0 +1,47 @@
+docs/out-28-provider-accounts.md
+  s_89a09976e28189::t_a2791927bb21ac 13,15,23-26,28,36-37,39,43
+server/agent-manager.mjs
+  s_89a09976e28189::t_7604eb5ecc90c7 7,420,422,473-474,684,941-944,1151,1310,1588,1627-1632
+server/database.mjs
+  s_89a09976e28189::t_f229b60849eb7a 66-68,71-76,1637,1645,1940-1946,1949,2296-2299,2301-2317,2319,2321-2323,2327-2328,2330-2334,2339,2343-2345,2347,2350-2354,2356-2357,2834,2838,2841-2843,2845-2848
+server/execution-adapters.test.mjs
+  s_89a09976e28189::t_cef1e32fa8daaa 822,826-827,839-845
+server/execution-adapters/claude.mjs
+  s_89a09976e28189::t_415df99d993447 51-53
+server/execution-adapters/codex.mjs
+  s_89a09976e28189::t_8cd9f9dab65aa3 41-42
+server/execution-adapters/contract.mjs
+  s_89a09976e28189::t_c0abaa82c968ce 72-73,75-76,78-79,112-113
+server/execution-adapters/index.mjs
+  s_89a09976e28189::t_782546cd9f1fb8 51,58,63-65,67-69
+server/outright-runtime.mjs
+  s_89a09976e28189::t_5d293e2430ed1e 12,899,901
+server/provider-accounts.mjs
+  s_89a09976e28189::t_38e9545d225810 2,16-19,47-56,60-62,64-65,82-92,112,114,122-123,134,142-143,155,166,170,211-218,286-290,292-293,299-307,331-332,334,344
+server/provider-accounts.test.mjs
+  s_89a09976e28189::t_a12f71e08a5e15 10,45,53,61-64,75-81,83,103,105-107,219,274-275,294,307,309,313-330,334,340,342,344-347,349-350,362,372,375-556
+src/App.jsx
+  s_89a09976e28189::t_be7bc02a2fa357 32,1350,1889
+src/components/ProviderAccounts.jsx
+  s_89a09976e28189::t_b2289c5df75beb 4,26-28,43-52,124,153,156
+src/lib/provider-accounts.js
+  s_89a09976e28189::t_f2bd5101c459bb 38-61,65-70,73,81-88
+tests/ui-accessibility.test.mjs
+  s_89a09976e28189::t_f8d2a3bc38ee40 106,116-134,140-143,155-157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7c1f893989567e7828dbf17a6d12b44653807de5",
+  "prompts": {},
+  "sessions": {
+    "s_89a09976e28189": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_89a09976e28189",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
