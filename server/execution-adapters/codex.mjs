@@ -38,7 +38,8 @@ export const codexAdapter = defineAdapter({
   sessionIdentity: { nativeField: "thread_id" },
   parseVersion: parseSemanticVersion,
   // `codex exec --json` reports token usage but no usage windows.
-  accounts: { homeVariable: "CODEX_HOME", identityArgs: ["login", "status"], parseIdentity },
+  // An API key variable takes precedence over the login in CODEX_HOME.
+  accounts: { homeVariable: "CODEX_HOME", identityArgs: ["login", "status"], parseIdentity, credentialVariables: ["CODEX_API_KEY", "OPENAI_API_KEY"] },
   buildLaunch({ worktreePath, run, sessionId }) {
     const sandbox = SANDBOX_MODES[run.approvalPolicy];
     const options = [];

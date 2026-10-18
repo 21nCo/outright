@@ -69,10 +69,14 @@ export function defineAdapter(spec) {
     if (typeof spec.parseVersion !== "function") throw contractError(`${spec.id} must parse its CLI version`);
     // A harness login lives in the CLI's own home directory. Selecting another
     // directory selects another login; Outright never reads its credentials.
+    // Credential variables override the home's login, so an added account's
+    // launch and login check run without them.
     const accounts = spec.accounts;
-    if (accounts !== undefined && (!HOME_VARIABLE_PATTERN.test(accounts?.homeVariable ?? "") || accounts.homeVariable.startsWith("OUTRIGHT_")
+    const environmentVariable = (variable) => HOME_VARIABLE_PATTERN.test(variable ?? "") && !variable.startsWith("OUTRIGHT_");
+    if (accounts !== undefined && (!environmentVariable(accounts?.homeVariable)
       || !Array.isArray(accounts.identityArgs) || !accounts.identityArgs.length || accounts.identityArgs.some((arg) => !IDENTITY_ARGUMENT_PATTERN.test(arg))
-      || typeof accounts.parseIdentity !== "function")) throw contractError(`${spec.id} accounts must name a home variable, identity arguments and a parser`);
+      || !Array.isArray(accounts.credentialVariables) || !accounts.credentialVariables.every(environmentVariable)
+      || typeof accounts.parseIdentity !== "function")) throw contractError(`${spec.id} accounts must name a home variable, credential variables, identity arguments and a parser`);
   } else {
     // A harness login never grants direct API access.
     if (authority.source !== "env" || !DIRECT_VARIABLE_PATTERN.test(authority.variable ?? "")) throw contractError(`${spec.id} must reference its own API credential`);
@@ -105,7 +109,8 @@ export function defineAdapter(spec) {
   for (const method of ["buildLaunch", "normalize"]) if (typeof spec[method] !== "function") throw contractError(`${spec.id} must implement ${method}`);
   return Object.freeze({
     ...spec,
-    accounts: spec.accounts ? Object.freeze({ ...spec.accounts, identityArgs: Object.freeze([...spec.accounts.identityArgs]) }) : null,
+    accounts: spec.accounts ? Object.freeze({ ...spec.accounts, identityArgs: Object.freeze([...spec.accounts.identityArgs]),
+      credentialVariables: Object.freeze([...spec.accounts.credentialVariables]) }) : null,
     modelAliases: Object.freeze(Object.fromEntries(Object.entries(aliases).map(([alias, ids]) => [alias, Object.freeze([...ids])]))),
     environment: Object.freeze([...(spec.kind === "harness" ? [] : spec.environment)]),
     capabilities: Object.freeze({

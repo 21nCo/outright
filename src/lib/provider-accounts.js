@@ -35,17 +35,54 @@ export function limitText(limit, formatTime = defaultTime) {
   return `${reached}${used}${age} · ${resets}`;
 }
 
+// A limit as of `now`. The listing was aged when the runtime sent it; an
+// open Settings dialog ages it again as time passes, so a reset window's old
+// usage is withheld and an old report is marked stale.
+export function ageLimit(limit, now, staleAfterMs) {
+  const resetsAt = limit.resetsAt ? Date.parse(limit.resetsAt) : Number.NaN;
+  if (limit.state === "reset" || (Number.isFinite(resetsAt) && resetsAt <= now)) return { ...limit, utilization: null, status: null, state: "reset" };
+  return { ...limit, state: now - Date.parse(limit.observedAt) > staleAfterMs ? "stale" : "current" };
+}
+
+// When the next limit in a listing resets or becomes stale, or null.
+export function nextLimitChange(listing, now) {
+  let next = Number.POSITIVE_INFINITY;
+  for (const provider of listing?.providers ?? []) {
+    for (const account of provider.accounts ?? []) {
+      for (const limit of account.limits ?? []) {
+        const resetsAt = limit.resetsAt ? Date.parse(limit.resetsAt) : Number.NaN;
+        const staleAt = Date.parse(limit.observedAt) + listing.limitStaleAfterMs + 1;
+        for (const at of [resetsAt, staleAt]) if (Number.isFinite(at) && at > now) next = Math.min(next, at);
+      }
+    }
+  }
+  return Number.isFinite(next) ? next : null;
+}
+
 export function measuredText(period) {
   if (!period.runs) return "No runs";
-  const tokens = Number(period.inputTokens ?? 0) + Number(period.outputTokens ?? 0);
   const runs = `${period.runs} run${period.runs === 1 ? "" : "s"}`;
+  // A run that reported no tokens is not counted as zero tokens.
+  const missingTokens = Number(period.runsWithoutTokens ?? 0);
+  const reported = Number(period.inputTokens ?? 0) + Number(period.outputTokens ?? 0);
+  let tokens = `${reported.toLocaleString()} tokens`;
+  if (missingTokens >= period.runs) tokens = "tokens not reported";
+  else if (missingTokens) tokens = `at least ${reported.toLocaleString()} tokens (${missingTokens} without reported tokens)`;
   const without = period.runsWithoutCost ? ` (${period.runsWithoutCost} without reported cost)` : "";
   const cost = period.costUsd == null ? "cost not reported" : `$${Number(period.costUsd).toFixed(3)} reported${without}`;
-  return `${runs} · ${tokens.toLocaleString()} tokens · ${cost}`;
+  return `${runs} · ${tokens} · ${cost}`;
 }
 
 // The account a run launched with, as recorded when it launched.
 export function runAccountText(run) {
   if (!run?.accountLabel) return null;
   return run.accountIdentity ? `${run.accountLabel} (${run.accountIdentity})` : run.accountLabel;
+}
+
+// An answer carries its run's account, so every page of history names it.
+// A loaded run is the fallback for an answer written without one.
+export function answerAccountText(message, runAccounts) {
+  const account = message.payload?.account;
+  if (typeof account?.label === "string" && account.label) return runAccountText({ accountLabel: account.label, accountIdentity: account.identity });
+  return runAccounts.get(message.payload?.runId) ?? null;
 }

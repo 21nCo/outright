@@ -7,7 +7,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { createAgentManager, LAUNCH_AUTHORIZED_CONTROL } from "./agent-manager.mjs";
 import { createOutrightDatabase } from "./database.mjs";
-import { createProviderAccounts, LIMIT_STALE_AFTER_MS } from "./provider-accounts.mjs";
+import { accountPin, createProviderAccounts, LIMIT_STALE_AFTER_MS } from "./provider-accounts.mjs";
 
 const signedIn = (email) => JSON.stringify({ loggedIn: true, authMethod: "claude.ai", email, orgName: "Org", subscriptionType: "max" });
 const signedOut = JSON.stringify({ loggedIn: false, authMethod: "none" });
@@ -42,7 +42,7 @@ function fakeChild() {
   return child;
 }
 
-async function fixture(t, { clock } = {}) {
+async function fixture(t, { clock, launchCommand, extraEnvironment = {} } = {}) {
   const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "outright-accounts-")));
   const inheritedHome = path.join(root, "inherited");
   const workHome = path.join(root, "work");
@@ -50,7 +50,7 @@ async function fixture(t, { clock } = {}) {
   mkdirSync(workHome);
   const logins = new Map([[inheritedHome, signedIn("me@example.com")], [workHome, signedIn("work@example.com")]]);
   const probe = fakeProbe(logins);
-  const environment = { PATH: process.env.PATH, CLAUDE_CONFIG_DIR: inheritedHome, OUTRIGHT_ANTHROPIC_API_KEY: "direct-secret" };
+  const environment = { PATH: process.env.PATH, CLAUDE_CONFIG_DIR: inheritedHome, OUTRIGHT_ANTHROPIC_API_KEY: "direct-secret", ...extraEnvironment };
   const database = createOutrightDatabase({ filename: path.join(root, "outright.db") });
   const published = [];
   const accounts = createProviderAccounts({ database, probe, environment, publish: (event) => published.push(event), ...(clock ? { clock } : {}) });
@@ -58,7 +58,10 @@ async function fixture(t, { clock } = {}) {
   const manager = createAgentManager({
     database, publish: () => {}, accounts, environment,
     providerDiscoveryFactory: () => ({ list: () => [], refresh: async () => [], available: async () => true, close: async () => {} }),
-    launchCommand: (command) => ({ executable: process.execPath, args: command.args, display: "fixture" }),
+    launchCommand: async (command) => {
+      await launchCommand?.();
+      return { executable: process.execPath, args: command.args, display: "fixture" };
+    },
     spawnProcess: (executable, args, options) => { const child = fakeChild(); spawned.push({ args, env: options.env, child }); return child; },
   });
   t.after(async () => {
@@ -69,8 +72,15 @@ async function fixture(t, { clock } = {}) {
   });
   const conversation = (worktreePath = root) => database.createConversation({ projectId: "p", worktreeId: worktreePath, worktreePath, title: "Accounts", provider: "claude" });
   const claudeRun = (conversationId) => database.createRun({ conversationId, provider: "claude", approvalPolicy: "read-only", prompt: "hello" });
+  // A completed run whose provider created `sessionId`.
+  const finish = async (index, sessionId) => {
+    if (sessionId) spawned[index].child.stdout.write(`${JSON.stringify({ type: "system", subtype: "init", session_id: sessionId })}\n`);
+    await tick();
+    spawned[index].child.emit("close", 0, null);
+    await tick();
+  };
   const claude = () => accounts.list().providers.find((provider) => provider.provider === "claude");
-  return { root, inheritedHome, workHome, logins, probe, environment, database, accounts, manager, spawned, published, conversation, claudeRun, claude };
+  return { root, inheritedHome, workHome, logins, probe, environment, database, accounts, manager, spawned, published, conversation, claudeRun, claude, finish };
 }
 
 async function addWork(context) {
@@ -90,7 +100,11 @@ test("switching applies to new sessions while a resumed session and a running ru
   assert.equal(spawned[0].env.CLAUDE_CONFIG_DIR, context.workHome, "the active account's home reaches the provider");
   assert.equal(database.getRun(first.id).accountId, work.id);
   spawned[0].child.stdout.write(`${JSON.stringify({ type: "system", subtype: "init", session_id: "session-1" })}\n`);
+  spawned[0].child.stdout.write(`${JSON.stringify({ type: "result", result: "done" })}\n`);
   await tick();
+  // The answer itself names the account, so any page of history shows it.
+  const answer = database.listMessages(chat.id).find((message) => message.role === "assistant");
+  assert.deepEqual(answer.payload.account, { label: "Work", identity: "work@example.com" });
   // Switching while the run is live changes neither its record nor its process.
   await accounts.activate({ provider: "claude", accountId: "claude:default" });
   assert.equal(database.getRun(first.id).accountId, work.id);
@@ -202,7 +216,7 @@ test("a removed session account fails the launch instead of falling back", async
   // History keeps the removed account's recorded label.
   assert.equal(database.getRun(first.id).accountLabel, "Work");
   // A recovery is pinned to the interrupted run's account the same way.
-  await assert.rejects(accounts.assertLaunchable({ provider: "claude", conversationId: chat.id, accountId: work.id }), (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE");
+  await assert.rejects(accounts.assertLaunchable({ provider: "claude", conversationId: chat.id, pin: accountPin(database.getRun(first.id)) }), (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE");
 });
 
 test("a cached sign-out is checked again before a send is refused", async (t) => {
@@ -257,7 +271,8 @@ test("provider limits separate current, stale, reset and unreported windows", as
   const context = await fixture(t, { clock: () => now });
   const { accounts } = context;
   const seconds = (iso) => Date.parse(iso) / 1000;
-  accounts.recordLimits("claude:default", "claude", "run-1", [
+  const defaultLogin = { id: "claude:default", provider: "claude", home: context.inheritedHome };
+  accounts.recordLimits(defaultLogin, "run-1", [
     { window: "five_hour", utilization: 0.5, status: "allowed", resetsAt: new Date(seconds("2026-10-19T12:00:00Z") * 1000).toISOString() },
     { window: "seven_day", utilization: 0.2, status: null, resetsAt: "2026-10-22T00:00:00.000Z" },
   ]);
@@ -276,7 +291,7 @@ test("provider limits separate current, stale, reset and unreported windows", as
   now = Date.parse("2026-10-19T10:00:00.000Z") + LIMIT_STALE_AFTER_MS - 1;
   assert.equal(windows().seven_day.state, "current");
   // A later report replaces the window, from whichever run made it.
-  accounts.recordLimits("claude:default", "claude", "run-2", [{ window: "five_hour", utilization: 0.7, status: "allowed_warning", resetsAt: "2026-10-19T15:00:00.000Z" }]);
+  accounts.recordLimits(defaultLogin, "run-2", [{ window: "five_hour", utilization: 0.7, status: "allowed_warning", resetsAt: "2026-10-19T15:00:00.000Z" }]);
   assert.equal(windows().five_hour.utilization, 0.7);
   assert.equal(windows().five_hour.runId, "run-2");
   assert.equal(windows().seven_day.runId, "run-1");
@@ -289,34 +304,50 @@ test("measured usage counts only runs launched with the account and flags missin
   const { database } = context;
   const work = await addWork(context);
   const chat = context.conversation();
-  const launch = (account, usage) => {
+  const launch = (account, home, usage) => {
     const run = context.claudeRun(chat.id);
-    database.bindRunAccount(run.id, { id: account, label: account });
+    database.bindRunAccount(run.id, { id: account, provider: "claude", label: account, home });
     database.updateRun(run.id, { status: "completed", ...usage });
     return run;
   };
-  launch(work.id, { inputTokens: 100, outputTokens: 20, costUsd: 0.5 });
-  launch(work.id, { inputTokens: 10, outputTokens: 5 });
-  launch("claude:default", { inputTokens: 1000, outputTokens: 1000, costUsd: 9 });
-  const measured = () => Object.fromEntries(context.claude().accounts.find((account) => account.id === work.id).measured.map((period) => [period.period, period]));
-  assert.deepEqual({ ...measured()["5h"], since: undefined, label: undefined }, { period: "5h", since: undefined, label: undefined, runs: 2, inputTokens: 110, outputTokens: 25, costUsd: 0.5, runsWithoutCost: 1 });
+  launch(work.id, context.workHome, { inputTokens: 100, outputTokens: 20, costUsd: 0.5 });
+  launch(work.id, context.workHome, { inputTokens: 10, outputTokens: 5 });
+  launch("claude:default", context.inheritedHome, { inputTokens: 1000, outputTokens: 1000, costUsd: 9 });
+  const measured = (id = work.id) => Object.fromEntries(context.claude().accounts.find((account) => account.id === id).measured.map((period) => [period.period, period]));
+  assert.deepEqual({ ...measured()["5h"], since: undefined, label: undefined }, { period: "5h", since: undefined, label: undefined, runs: 2, inputTokens: 110, outputTokens: 25, runsWithoutTokens: 0, costUsd: 0.5, runsWithoutCost: 1 });
+  // A run that reported no tokens is counted as unreported, never as zero:
+  // a partial sum stays partial and nothing reported stays null.
+  launch(work.id, context.workHome, {});
+  assert.deepEqual([measured()["5h"].runs, measured()["5h"].inputTokens, measured()["5h"].runsWithoutTokens], [3, 110, 1]);
+  const codexHome = path.join(context.root, "codex");
+  mkdirSync(codexHome);
+  context.logins.set(codexHome, "Logged in using ChatGPT\n");
+  await context.accounts.add({ provider: "codex", label: "Silent", homePath: codexHome });
+  const silent = context.accounts.list().providers.find((provider) => provider.provider === "codex").accounts.find((account) => account.label === "Silent");
+  const silentRun = database.createRun({ conversationId: chat.id, provider: "codex", approvalPolicy: "read-only", prompt: "hello" });
+  database.bindRunAccount(silentRun.id, { id: silent.id, provider: "codex", label: "Silent", home: codexHome });
+  const silentUsage = context.accounts.list().providers.find((provider) => provider.provider === "codex").accounts.find((account) => account.id === silent.id).measured[0];
+  assert.deepEqual([silentUsage.runs, silentUsage.inputTokens, silentUsage.outputTokens, silentUsage.runsWithoutTokens], [1, null, null, 1]);
   now += 6 * 3_600_000;
   assert.equal(measured()["5h"].runs, 0);
   assert.equal(measured()["5h"].costUsd, null, "no runs means no measured cost, not zero");
-  assert.equal(measured()["7d"].runs, 2);
+  assert.equal(measured()["7d"].runs, 3);
 });
 
 test("a launched run's account cannot be rebound", async (t) => {
   const context = await fixture(t);
   const { database } = context;
+  const work = await addWork(context);
   const run = context.claudeRun(context.conversation().id);
-  database.bindRunAccount(run.id, { id: "claude:default", label: "Default login" });
+  database.bindRunAccount(run.id, { id: "claude:default", provider: "claude", label: "Default login" });
   // A deferred admission is still queued and binds again at its next launch.
-  database.bindRunAccount(run.id, { id: "other", label: "Other" });
-  assert.equal(database.getRun(run.id).accountId, "other");
+  database.bindRunAccount(run.id, { id: work.id, provider: "claude", label: "Work", home: context.workHome });
+  assert.equal(database.getRun(run.id).accountId, work.id);
+  assert.equal(database.getRun(run.id).accountHome, context.workHome);
+  assert.throws(() => database.bindRunAccount(run.id, { id: "removed", provider: "claude", label: "Removed" }), (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE");
   database.updateRun(run.id, { status: "launching" });
-  assert.throws(() => database.bindRunAccount(run.id, { id: "claude:default", label: "Default login" }), (error) => error.details.code === "RUN_ACCOUNT_IMMUTABLE");
-  assert.equal(database.getRun(run.id).accountId, "other");
+  assert.throws(() => database.bindRunAccount(run.id, { id: "claude:default", provider: "claude", label: "Default login" }), (error) => error.details.code === "RUN_ACCOUNT_IMMUTABLE");
+  assert.equal(database.getRun(run.id).accountId, work.id);
 });
 
 test("a database from before accounts upgrades in place and keeps its runs readable", async (t) => {
@@ -328,7 +359,7 @@ test("a database from before accounts upgrades in place and keeps its runs reada
   const legacyRun = database.createRun({ conversationId: chat.id, provider: "claude", approvalPolicy: "read-only", prompt: "old" });
   await database.close();
   const raw = new Database(filename);
-  raw.exec("DROP TABLE run_accounts; DROP TABLE provider_accounts; DROP TABLE provider_account_selection; DROP TABLE provider_limit_windows;");
+  raw.exec("DROP TABLE run_accounts; DROP TABLE run_account_pins; DROP TABLE provider_accounts; DROP TABLE provider_account_selection; DROP TABLE provider_limit_windows;");
   raw.close();
 
   database = createOutrightDatabase({ filename });
@@ -338,6 +369,188 @@ test("a database from before accounts upgrades in place and keeps its runs reada
   assert.equal(database.activeProviderAccountId("claude"), "claude:default");
   assert.equal(database.capacity().retainedUsageStatus, "measured", "new empty tables need no retained rescan");
   const before = database.capacity().retainedBytes;
-  database.bindRunAccount(legacyRun.id, { id: "claude:default", label: "Default login" });
+  database.bindRunAccount(legacyRun.id, { id: "claude:default", provider: "claude", label: "Default login" });
   assert.ok(database.capacity().retainedBytes > before, "a recorded account counts toward retained history");
+});
+
+test("a check that fails after its probe does not block later checks or switches", async (t) => {
+  const context = await fixture(t);
+  const { accounts, database, logins } = context;
+  const work = await addWork(context);
+  // The check's bookkeeping meets a storage fault (archive maintenance).
+  const getProviderAccount = database.getProviderAccount;
+  logins.set(context.workHome, () => {
+    database.getProviderAccount = () => { throw Object.assign(new Error("maintenance"), { statusCode: 503 }); };
+    return signedIn("work@example.com");
+  });
+  await assert.rejects(accounts.refresh(work.id), /maintenance/);
+  database.getProviderAccount = getProviderAccount;
+  logins.set(context.workHome, signedIn("work@example.com"));
+  const probes = context.probe.calls.length;
+  await accounts.refresh("claude:default");
+  assert.equal(context.probe.calls.length, probes + 1, "the next check probes instead of repeating the old failure");
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  assert.equal(context.claude().activeAccountId, work.id);
+});
+
+test("a session from before accounts resumes with the default login, and an attached one with the active account", async (t) => {
+  const context = await fixture(t);
+  const { accounts, database, manager, spawned } = context;
+  const chat = context.conversation();
+  // A pre-upgrade run created the session and has no recorded account.
+  const legacy = context.claudeRun(chat.id);
+  database.updateRun(legacy.id, { status: "completed", providerSessionId: "legacy-session" });
+  database.updateConversation(chat.id, { providerSessionId: "legacy-session" });
+  const work = await addWork(context);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+
+  const resumed = context.claudeRun(chat.id);
+  await manager.schedule({ conversation: database.getConversation(chat.id), run: resumed });
+  assert.ok(spawned[0].args.includes("legacy-session"));
+  assert.equal(spawned[0].env.CLAUDE_CONFIG_DIR, context.inheritedHome);
+  assert.equal(database.getRun(resumed.id).accountId, "claude:default");
+  await context.finish(0);
+
+  // No run created this session, so it starts on the active account.
+  database.updateConversation(chat.id, { providerSessionId: "attached-session" });
+  const attached = context.claudeRun(chat.id);
+  await manager.schedule({ conversation: database.getConversation(chat.id), run: attached });
+  assert.equal(spawned[1].env.CLAUDE_CONFIG_DIR, context.workHome);
+  assert.equal(database.getRun(attached.id).accountId, work.id);
+  await context.finish(1);
+});
+
+test("the default login's home is recorded, so a changed environment neither resumes nor shares its usage", async (t) => {
+  const context = await fixture(t);
+  const { database, manager, spawned } = context;
+  const chat = context.conversation();
+  const first = context.claudeRun(chat.id);
+  await manager.schedule({ conversation: chat, run: first });
+  spawned[0].child.stdout.write(`${JSON.stringify({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.4, resetsAt: Math.floor(Date.now() / 1000) + 3600 } })}\n`);
+  await context.finish(0, "session-1");
+  assert.equal(database.getRun(first.id).accountHome, context.inheritedHome);
+
+  // After a restart the environment selects another home for the default.
+  const otherHome = path.join(context.root, "other");
+  mkdirSync(otherHome);
+  context.logins.set(otherHome, signedIn("other@example.com"));
+  const restarted = createProviderAccounts({ database, probe: context.probe, environment: { ...context.environment, CLAUDE_CONFIG_DIR: otherHome } });
+  t.after(() => restarted.close());
+  assert.throws(() => restarted.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }),
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(context.inheritedHome));
+  const defaultLogin = (accounts) => accounts.list().providers.find((provider) => provider.provider === "claude").accounts[0];
+  assert.equal(defaultLogin(restarted).measured[1].runs, 0, "another login's runs are not this login's usage");
+  assert.deepEqual(defaultLogin(restarted).limits, []);
+  assert.equal(defaultLogin(context.accounts).measured[1].runs, 1);
+  assert.equal(defaultLogin(context.accounts).limits[0].utilization, 0.4);
+  // A new session uses the current default login.
+  assert.equal(restarted.resolve({ provider: "claude", conversationId: chat.id }).home, otherHome);
+});
+
+test("a recovery's account pin is durable across a restart before it launches", async (t) => {
+  const context = await fixture(t);
+  const { accounts, database, manager, spawned } = context;
+  const work = await addWork(context);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  const chat = context.conversation();
+  const first = context.claudeRun(chat.id);
+  await manager.schedule({ conversation: chat, run: first });
+  await context.finish(0, "session-1");
+  database.updateRun(first.id, { status: "interrupted" });
+  await accounts.activate({ provider: "claude", accountId: "claude:default" });
+
+  const recovery = database.beginInterruptedRunRecovery(first.id, "retry");
+  assert.deepEqual(accountPin(recovery.run), { accountId: work.id, home: context.workHome });
+  // The runtime restarts before the recovery launches; its retry keeps the pin.
+  database.updateRun(recovery.run.id, { status: "interrupted" });
+  const again = database.beginInterruptedRunRecovery(recovery.run.id, "retry");
+  assert.equal(again.run.accountPinId, work.id);
+  await manager.schedule({ conversation: database.getConversation(chat.id), run: again.run, forceFreshSession: true });
+  assert.equal(spawned[1].env.CLAUDE_CONFIG_DIR, context.workHome);
+  assert.equal(database.getRun(again.run.id).accountId, work.id);
+  await context.finish(1);
+});
+
+test("an account removed while its launch is being prepared fails the run without spawning", async (t) => {
+  let duringLaunch = null;
+  const context = await fixture(t, { launchCommand: () => duringLaunch?.() });
+  const { accounts, database, manager, spawned } = context;
+  const work = await addWork(context);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  const chat = context.conversation();
+  duringLaunch = async () => {
+    duringLaunch = null;
+    await accounts.activate({ provider: "claude", accountId: "claude:default" });
+    accounts.remove(work.id);
+  };
+  const run = context.claudeRun(chat.id);
+  await manager.schedule({ conversation: chat, run });
+  assert.equal(spawned.length, 0);
+  assert.equal(database.getRun(run.id).status, "failed");
+  assert.match(database.getRun(run.id).error, /removed before this run launched/);
+  assert.equal(database.getRun(run.id).accountId, null);
+});
+
+test("inherited credential variables never reach an added account's check or launch", async (t) => {
+  const context = await fixture(t, { extraEnvironment: { ANTHROPIC_API_KEY: "env-key", CLAUDE_CODE_OAUTH_TOKEN: "env-token" } });
+  const { accounts, manager, spawned } = context;
+  const work = await addWork(context);
+  const check = context.probe.calls.find((call) => call.environment.CLAUDE_CONFIG_DIR === context.workHome);
+  assert.equal(check.environment.ANTHROPIC_API_KEY, undefined);
+  assert.equal(check.environment.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  const chat = context.conversation();
+  await manager.schedule({ conversation: chat, run: context.claudeRun(chat.id) });
+  assert.equal(spawned[0].env.CLAUDE_CONFIG_DIR, context.workHome);
+  assert.equal(spawned[0].env.ANTHROPIC_API_KEY, undefined);
+  assert.equal(spawned[0].env.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+  await context.finish(0);
+  // The default login is whatever the environment selects, credentials included.
+  await accounts.activate({ provider: "claude", accountId: "claude:default" });
+  const other = context.conversation(path.join(context.root, "other"));
+  await manager.schedule({ conversation: other, run: context.claudeRun(other.id) });
+  assert.equal(spawned[1].env.ANTHROPIC_API_KEY, "env-key");
+  await context.finish(1);
+});
+
+test("a removed account's live run records no orphan limit windows", async (t) => {
+  const context = await fixture(t);
+  const { accounts, database, manager, spawned } = context;
+  const work = await addWork(context);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  const chat = context.conversation();
+  await manager.schedule({ conversation: chat, run: context.claudeRun(chat.id) });
+  await accounts.activate({ provider: "claude", accountId: "claude:default" });
+  accounts.remove(work.id);
+  spawned[0].child.stdout.write(`${JSON.stringify({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.4 } })}\n`);
+  await tick();
+  assert.deepEqual(database.listProviderLimits(work.id, context.workHome), []);
+  await context.finish(0);
+});
+
+test("an identity probe whose cleanup is uncertain stops further probes and is reported at close", async (t) => {
+  const context = await fixture(t);
+  const uncertain = Object.assign(new Error("Provider probe forced cleanup failed"), { code: "OUTRIGHT_PROBE_CLEANUP_UNCERTAIN" });
+  let probes = 0;
+  const accounts = createProviderAccounts({ database: context.database, environment: context.environment, probe: async (executable) => { if (executable === "claude") probes += 1; throw uncertain; } });
+  await accounts.refresh("claude:default");
+  const login = () => accounts.list().providers.find((provider) => provider.provider === "claude").accounts[0].login;
+  assert.equal(login().status, "unknown");
+  await accounts.refresh("claude:default");
+  assert.equal(probes, 1);
+  assert.match(login().error, /checks stopped/);
+  await assert.rejects(accounts.close(), (error) => error instanceof AggregateError && error.errors[0] === uncertain);
+});
+
+test("on Windows an account home must be inside the user's profile", async (t) => {
+  const context = await fixture(t);
+  const profile = path.join(context.root, "profile");
+  const inside = path.join(profile, ".claude-work");
+  mkdirSync(inside, { recursive: true });
+  context.logins.set(inside, signedIn("work@example.com"));
+  const accounts = createProviderAccounts({ database: context.database, probe: context.probe, environment: context.environment, platform: "win32", homeDirectory: profile });
+  t.after(() => accounts.close());
+  await assert.rejects(accounts.add({ provider: "claude", label: "Outside", homePath: context.workHome }), (error) => error.details.code === "PROVIDER_ACCOUNT_INVALID" && /user profile/.test(error.message));
+  await accounts.add({ provider: "claude", label: "Inside", homePath: inside });
+  assert.ok(accounts.list().providers.find((provider) => provider.provider === "claude").accounts.some((account) => account.label === "Inside"));
 });

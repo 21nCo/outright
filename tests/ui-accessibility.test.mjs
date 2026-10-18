@@ -103,7 +103,7 @@ test("provider controls explain readiness and only offer supported choices", asy
 });
 
 test("account usage keeps measured, reported, stale and unknown values distinct", async () => {
-  const { limitText, limitWindowLabel, loginText, measuredText, runAccountText } = await import("../src/lib/provider-accounts.js");
+  const { ageLimit, answerAccountText, limitText, limitWindowLabel, loginText, measuredText, nextLimitChange, runAccountText } = await import("../src/lib/provider-accounts.js");
   const time = (value) => value.slice(11, 16);
   const window = { window: "five_hour", utilization: 0.86, status: "allowed", resetsAt: "2026-10-19T15:00:00.000Z", observedAt: "2026-10-19T10:00:00.000Z" };
   assert.equal(limitText({ ...window, state: "current" }, time), "86% used · resets 15:00");
@@ -113,13 +113,34 @@ test("account usage keeps measured, reported, stale and unknown values distinct"
   assert.equal(limitWindowLabel("seven_day_opus"), "7-day Opus limit");
   assert.equal(limitWindowLabel("monthly_spend"), "monthly spend limit");
   assert.equal(measuredText({ runs: 0, costUsd: null }), "No runs");
-  assert.equal(measuredText({ runs: 2, inputTokens: 1000, outputTokens: 234, costUsd: 0.5, runsWithoutCost: 1 }), "2 runs · 1,234 tokens · $0.500 reported (1 without reported cost)");
-  assert.equal(measuredText({ runs: 1, inputTokens: 1, outputTokens: 1, costUsd: null, runsWithoutCost: 1 }), "1 run · 2 tokens · cost not reported");
+  assert.equal(measuredText({ runs: 2, inputTokens: 1000, outputTokens: 234, runsWithoutTokens: 0, costUsd: 0.5, runsWithoutCost: 1 }), "2 runs · 1,234 tokens · $0.500 reported (1 without reported cost)");
+  assert.equal(measuredText({ runs: 1, inputTokens: 1, outputTokens: 1, runsWithoutTokens: 0, costUsd: null, runsWithoutCost: 1 }), "1 run · 2 tokens · cost not reported");
+  // Unreported tokens are never shown as zero, and a partial sum says so.
+  assert.equal(measuredText({ runs: 1, inputTokens: null, outputTokens: null, runsWithoutTokens: 1, costUsd: null, runsWithoutCost: 1 }), "1 run · tokens not reported · cost not reported");
+  assert.equal(measuredText({ runs: 3, inputTokens: 100, outputTokens: 20, runsWithoutTokens: 1, costUsd: null, runsWithoutCost: 3 }), "3 runs · at least 120 tokens (1 without reported tokens) · cost not reported");
+
+  // An open dialog ages a listing as time passes: past its reset a window's
+  // usage is withheld, and an old report turns stale.
+  const staleAfterMs = 30 * 60_000;
+  const observed = Date.parse(window.observedAt);
+  const current = { ...window, state: "current" };
+  assert.equal(ageLimit(current, observed + 60_000, staleAfterMs).state, "current");
+  assert.deepEqual([ageLimit(current, observed + staleAfterMs + 1, staleAfterMs).state, ageLimit(current, observed + staleAfterMs + 1, staleAfterMs).utilization], ["stale", 0.86]);
+  const reset = ageLimit(current, Date.parse(window.resetsAt), staleAfterMs);
+  assert.deepEqual([reset.state, reset.utilization, reset.status], ["reset", null, null]);
+  const listing = { limitStaleAfterMs: staleAfterMs, providers: [{ accounts: [{ limits: [current] }, { limits: null }] }] };
+  assert.equal(nextLimitChange(listing, observed), observed + staleAfterMs + 1);
+  assert.equal(nextLimitChange(listing, observed + staleAfterMs + 1), Date.parse(window.resetsAt));
+  assert.equal(nextLimitChange(listing, Date.parse(window.resetsAt)), null);
   assert.equal(loginText({ status: "signed-in", identity: { email: "a@example.com", plan: "max" } }), "Signed in · a@example.com · max");
   assert.equal(loginText({ status: "unknown", error: "Codex login status could not be checked" }), "Codex login status could not be checked");
   assert.equal(loginText(undefined), "Checking login…");
   assert.equal(runAccountText({ accountLabel: "Work", accountIdentity: "a@example.com" }), "Work (a@example.com)");
   assert.equal(runAccountText({ accountLabel: null }), null);
+  // An answer names its own account even when its run is not loaded.
+  assert.equal(answerAccountText({ payload: { runId: "old", account: { label: "Work", identity: "a@example.com" } } }, new Map()), "Work (a@example.com)");
+  assert.equal(answerAccountText({ payload: { runId: "loaded" } }, new Map([["loaded", "Default login"]])), "Default login");
+  assert.equal(answerAccountText({ payload: { runId: "legacy" } }, new Map()), null);
 
   const [accounts, settings] = await Promise.all([
     readFile(new URL("src/components/ProviderAccounts.jsx", root), "utf8"),
@@ -131,4 +152,7 @@ test("account usage keeps measured, reported, stale and unknown values distinct"
   assert.match(accounts, /role="status" aria-live="polite">\{message\.status\}/);
   assert.match(accounts, /aria-describedby="provider-account-help"/);
   assert.match(accounts, /<legend className="sr-only">Confirm account removal<\/legend>/);
+  assert.match(accounts, /nextLimitChange\(listing, now\)/);
+  assert.match(accounts, /addEventListener\("visibilitychange"/);
+  assert.match(accounts, /ageLimit\(limit, now, staleAfterMs\)/);
 });

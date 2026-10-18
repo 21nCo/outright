@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { limitText, limitWindowLabel, loginText, measuredText } from "@/lib/provider-accounts";
+import { ageLimit, limitText, limitWindowLabel, loginText, measuredText, nextLimitChange } from "@/lib/provider-accounts";
 import { api } from "@/lib/runtime-api";
 
 const REFRESH_EVENTS = ["provider-accounts.changed", "runtime.connected", "run.event"];
@@ -23,6 +23,9 @@ export function ProviderAccounts({ open, runtimeEvent, onError }) {
   // A switched account's Use button disappears; focus continues on its Check.
   const focusCheckRef = useRef(null);
   const restoreRemoveFocusRef = useRef(false);
+  // Limits age while Settings stays open: re-render when the next window
+  // resets or turns stale, and on returning to a hidden tab.
+  const [now, setNow] = useState(() => Date.now());
 
   function load() {
     const request = ++requestRef.current;
@@ -37,6 +40,16 @@ export function ProviderAccounts({ open, runtimeEvent, onError }) {
   useEffect(() => {
     if (open && runtimeEvent && REFRESH_EVENTS.includes(runtimeEvent.type)) load().catch(onError);
   }, [open, runtimeEvent, onError]);
+  useEffect(() => { if (open) setNow(Date.now()); }, [open, listing]);
+  useEffect(() => {
+    if (!open) return undefined;
+    const tick = () => setNow(Date.now());
+    const next = nextLimitChange(listing, now);
+    const timer = next === null ? null : setTimeout(tick, Math.min(Math.max(next - Date.now(), 0), 2_147_483_647));
+    const visible = () => { if (document.visibilityState === "visible") tick(); };
+    document.addEventListener("visibilitychange", visible);
+    return () => { clearTimeout(timer); document.removeEventListener("visibilitychange", visible); };
+  }, [open, listing, now]);
   useLayoutEffect(() => {
     if (pendingRemove) cancelRemoveRef.current?.focus();
     else if (restoreRemoveFocusRef.current) {
@@ -108,7 +121,7 @@ export function ProviderAccounts({ open, runtimeEvent, onError }) {
         <strong>{provider.label} · {account.label}{account.active ? " (active)" : ""}</strong>
         <small title={account.homePath ?? undefined}>{loginText(account.login)}{account.homePath ? ` · ${account.homePath}` : ""}</small>
         {account.measured.map((period) => <small key={period.period}>Measured by Outright, {period.label.toLowerCase()}: {measuredText(period)}</small>)}
-        <small>{accountLimitsText(provider, account)}</small>
+        <small>{accountLimitsText(provider, account, now, listing.limitStaleAfterMs)}</small>
       </span><span className="account-actions">
         {provider.switchable && !account.active && <Button variant="outline" size="sm" aria-disabled={blocked} onClick={() => activate(provider, account)}
           aria-label={`Use ${account.label} for new ${provider.label} sessions`}>Use</Button>}
@@ -137,8 +150,8 @@ function validListing(value) {
   return Array.isArray(value?.providers) ? value : { providers: [] };
 }
 
-function accountLimitsText(provider, account) {
+function accountLimitsText(provider, account, now, staleAfterMs) {
   if (!provider.usageLimits) return `Provider limits: unavailable, ${provider.label} does not report them`;
   if (!account.limits.length) return "Provider limits: not reported yet";
-  return `Reported by ${provider.label}: ${account.limits.map((limit) => `${limitWindowLabel(limit.window)} ${limitText(limit)}`).join("; ")}`;
+  return `Reported by ${provider.label}: ${account.limits.map((limit) => `${limitWindowLabel(limit.window)} ${limitText(ageLimit(limit, now, staleAfterMs))}`).join("; ")}`;
 }

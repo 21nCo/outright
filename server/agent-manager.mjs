@@ -4,6 +4,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync,
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildExecutionEnvironment, buildExecutionLaunch, DIRECT_PROVIDER_VARIABLES, isProviderSessionId, modelMatches, requestedModel, requireExecutionAdapter, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
+import { accountPin } from "./provider-accounts.mjs";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
 import { RESOURCE_BUDGETS, retainedTranscriptMessageBytes } from "./resource-budgets.mjs";
 
@@ -416,10 +417,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     return providerDiscovery.list();
   }
 
-  // `accountId` pins a recovery run to the account of the run it continues.
-  async function schedule({ conversation, run, forceFreshSession = false, providerSessionId, accountId }) {
+  async function schedule({ conversation, run, forceFreshSession = false, providerSessionId }) {
     if (shuttingDown) throw new Error("Agent manager is shutting down");
-    const entry = { conversation, run, forceFreshSession, providerSessionId, accountId };
+    const entry = { conversation, run, forceFreshSession, providerSessionId };
     queue.push(entry);
     emit(run.id, "run.queued", { position: queue.length });
     drain();
@@ -470,7 +470,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if (admission) return admission;
     const startedAt = new Date().toISOString();
     // The account is recorded before the launch marker, so a launched run
-    // always names the account its provider ran with.
+    // always names the account its provider ran with. An account removed
+    // since it was resolved fails the run here, before anything spawns.
     if (state.account) accounts.bindRun(run.id, state.account);
     // Crash-safe launch handshake, phase 1: this durable marker means "a spawn
     // may have been issued, but the provider was never authorized to run". A
@@ -680,7 +681,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         catch (error) { if (error.statusCode !== 507) throw error; }
       }
       // Usage windows belong to the account the run launched with.
-      if (event.type === "rate_limit" && state.account) accounts.recordLimits(state.account.id, state.run.provider, state.run.id, event.payload.windows);
+      if (event.type === "rate_limit" && state.account) accounts.recordLimits(state.account, state.run.id, event.payload.windows);
       // A provider-reported failure explains a nonzero exit better than
       // stderr noise. Only a terminal one fails a run that exits 0.
       if (event.type === "provider.failure" && (event.payload.terminal === true || !state.providerFailed)) {
@@ -937,9 +938,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     if (entry.providerSessionId !== undefined) state.conversation = { ...current, providerSessionId: entry.providerSessionId };
     else if (entry.forceFreshSession || current.provider !== entry.run.provider) state.conversation = { ...current, providerSessionId: null };
     else state.conversation = current;
-    // The launch boundary: a resumed session keeps its account, anything
-    // else uses the active one. A removed account fails the run.
-    if (accounts) state.account = accounts.resolve({ provider: entry.run.provider, conversationId: current.id, sessionId: state.conversation.providerSessionId, accountId: entry.accountId });
+    // The launch boundary: a recovery keeps its durable pin, a resumed
+    // session keeps its account, anything else uses the active one. A removed
+    // account fails the run.
+    if (accounts) state.account = accounts.resolve({ provider: entry.run.provider, conversationId: current.id, sessionId: state.conversation.providerSessionId, pin: accountPin(entry.run) });
     return { authorize };
   }
 
@@ -1146,7 +1148,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     state.transcriptSeq = (state.transcriptSeq ?? 0) + 1;
     const toolItem = item.payload?.item ?? null;
     const payload = item.kind === "text"
-      ? { runId: state.run.id, provider: state.run.provider, truncated: Boolean(item.payload?.truncated), ...(item.payload?.substitution ? { substitution: item.payload.substitution } : {}) }
+      ? { runId: state.run.id, provider: state.run.provider, ...answerAccount(state), truncated: Boolean(item.payload?.truncated), ...(item.payload?.substitution ? { substitution: item.payload.substitution } : {}) }
       : boundedToolPayload(state.run.id, toolItem);
     const body = item.kind === "tool" ? truncateUtf8(item.body, MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES) : item.body;
     const input = budgetTranscript(state, { id: `${state.run.id}:${state.transcriptSeq}`, createdAt: new Date().toISOString(), conversationId: state.conversation.id, role: "assistant", kind: item.kind, body, payload });
@@ -1305,7 +1307,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     try {
       const message = database.addMessage({ id: `${state.run.id}:budget`, conversationId: state.conversation.id,
         role: "assistant", kind: "text", body: "Further run transcript items omitted because the retention budget was reached.",
-        payload: { runId: state.run.id, provider: state.run.provider, truncated: true } });
+        payload: { runId: state.run.id, provider: state.run.provider, ...answerAccount(state), truncated: true } });
       publish({ type: "message.created", conversationId: state.conversation.id, payload: message });
     } catch (error) { if (error.statusCode !== 507) throw error; }
   }
@@ -1583,6 +1585,7 @@ function pendingAssistantMessage(state) {
     payload: {
       runId: state.run.id,
       provider: state.run.provider,
+      ...answerAccount(state),
       truncated: state.assistantTruncated,
       ...(Number.isSafeInteger(state.lastAssistantDeltaSeq) ? { checkpointEventSeq: state.lastAssistantDeltaSeq } : {}),
     },
@@ -1620,6 +1623,12 @@ function boundUtf8(value, maxBytes) {
 }
 
 function truncateUtf8(value, maxBytes) { return boundUtf8(value, maxBytes).text; }
+
+// An answer names the account its run launched with, so any page of
+// history shows it without loading that run.
+function answerAccount(state) {
+  return state.account ? { account: { label: state.account.label, identity: state.account.identity ?? null } } : {};
+}
 
 function boundedToolPayload(runId, item) {
   const payload = { runId, item };

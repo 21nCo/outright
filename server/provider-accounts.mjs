@@ -1,4 +1,5 @@
 import { realpath, stat } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { defaultProviderAccountId } from "./database.mjs";
 import { EXECUTION_ADAPTERS, withAccountHome, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
@@ -12,9 +13,10 @@ import { defaultProbe } from "./provider-discovery.mjs";
 // has an implicit default account: whatever home the runtime's environment
 // selects, or a direct provider's own credential variable.
 //
-// A run resolves its account once, at launch, and records it. Resuming a
-// session keeps the account that created it; any other launch uses the
-// provider's active account. Nothing falls back to another account.
+// A run resolves its account once, at launch, and records it with the CLI
+// home it used. Resuming a session keeps the account that created it, and a
+// recovery keeps the account of the run it continues; any other launch uses
+// the provider's active account. Nothing falls back to another account.
 const LABEL_CHARACTERS = 80;
 const HOME_PATH_BYTES = 4096;
 const IDENTITY_TIMEOUT_MS = 5_000;
@@ -42,12 +44,25 @@ export function presentLimitWindow(window, now) {
   return { ...window, state: now - observedAt > LIMIT_STALE_AFTER_MS ? "stale" : "current" };
 }
 
-export function createProviderAccounts({ database, publish = () => {}, probe = defaultProbe, environment = process.env, adapters = EXECUTION_ADAPTERS, clock = Date.now }) {
+// The account a run continues with: the one it launched with, or the one a
+// recovery run was pinned to before it launched.
+export function accountPin(run) {
+  if (run?.accountId) return { accountId: run.accountId, home: run.accountHome ?? null };
+  if (run?.accountPinId) return { accountId: run.accountPinId, home: run.accountPinHome ?? null };
+  return null;
+}
+
+export function createProviderAccounts({ database, publish = () => {}, probe = defaultProbe, environment = process.env, adapters = EXECUTION_ADAPTERS, clock = Date.now,
+  platform = process.platform, homeDirectory = os.homedir() }) {
   const identities = new Map();
   const pendingChecks = new Map();
   const switches = new Map();
+  // A provider whose identity probe could not be proven stopped gets no
+  // further probes; close() reports it, as provider discovery does.
+  const cleanupErrors = new Map();
   // Identity checks run one at a time, so opening Settings with many
-  // accounts never starts a burst of CLI processes.
+  // accounts never starts a burst of CLI processes. The chain never
+  // rejects: one failed check affects only its own callers.
   let checkQueue = Promise.resolve();
   let notifyTimer = null;
   const closing = new AbortController();
@@ -62,6 +77,17 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     const adapter = adapters.find((candidate) => candidate.id === provider);
     if (!adapter) throw accountError(400, `Provider must be one of ${adapters.map((candidate) => candidate.id).join(", ")}`, "PROVIDER_UNKNOWN");
     return adapter;
+  }
+
+  // The home the default login uses: whatever the runtime's environment
+  // selects, or null for the CLI's standard home.
+  function defaultHome(adapter) {
+    if (!adapter.accounts) return null;
+    return Object.entries(environment).find(([key]) => key.toUpperCase() === adapter.accounts.homeVariable)?.[1] || null;
+  }
+
+  function accountHome(account, adapter) {
+    return account.homePath ?? defaultHome(adapter);
   }
 
   function defaultAccount(adapter) {
@@ -83,8 +109,9 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       return detected.available ? { status: "configured", identity: null, error: null } : { status: "unavailable", identity: null, error: detected.reason };
     }
     if (!adapter.accounts) return { status: "unknown", identity: null, error: `${adapter.label} does not report its login` };
+    if (cleanupErrors.has(adapter.id)) return { status: "unknown", identity: null, error: `${adapter.label} login checks stopped: an earlier check could not be confirmed stopped` };
     const base = withoutDirectProviderCredentials(environment);
-    const scoped = account.homePath ? withAccountHome(base, adapter.accounts.homeVariable, account.homePath) : base;
+    const scoped = account.homePath ? withAccountHome(base, adapter.accounts, account.homePath) : base;
     try {
       // Both CLIs exit 1 for a signed-out login and still print its status.
       if (closing.signal.aborted) throw closing.signal.reason;
@@ -92,7 +119,8 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       const identity = adapter.accounts.parseIdentity(output);
       if (!identity) return { status: "unknown", identity: null, error: `${adapter.label} printed a login status Outright does not recognize` };
       return { status: identity.signedIn ? "signed-in" : "signed-out", identity, error: null };
-    } catch {
+    } catch (error) {
+      if (error?.code === "OUTRIGHT_PROBE_CLEANUP_UNCERTAIN") cleanupErrors.set(adapter.id, error);
       // The probe's own message can quote CLI output; it is not repeated.
       return { status: "unknown", identity: null, error: `${adapter.label} login status could not be checked` };
     }
@@ -103,7 +131,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     const pending = pendingChecks.get(account.id);
     if (pending) return pending;
     const adapter = adapterFor(account.provider);
-    const task = (checkQueue = checkQueue.then(async () => {
+    const task = checkQueue.then(async () => {
       const result = { ...await probeIdentity(account, adapter), checkedAt: new Date(clock()).toISOString() };
       // A removed account's late result is dropped.
       if (findAccount(account.id)) {
@@ -111,7 +139,8 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
         identities.set(account.id, result);
       }
       return result;
-    })).finally(() => { if (pendingChecks.get(account.id) === task) pendingChecks.delete(account.id); });
+    }).finally(() => { if (pendingChecks.get(account.id) === task) pendingChecks.delete(account.id); });
+    checkQueue = task.catch(() => {});
     pendingChecks.set(account.id, task);
     return task;
   }
@@ -123,6 +152,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
 
   function presentAccount(account, adapter, activeId, now) {
     const checked = identities.get(account.id);
+    const home = accountHome(account, adapter);
     if (!checked && !pendingChecks.has(account.id)) void checkIdentity(account).catch(() => {});
     return {
       id: account.id,
@@ -133,11 +163,11 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       login: checked ?? { status: "checking", identity: null, error: null, checkedAt: null },
       measured: MEASURED_PERIODS.map((period) => {
         const since = new Date(now - period.durationMs).toISOString();
-        return { period: period.id, label: period.label, since, ...database.measuredAccountUsage(account.id, since) };
+        return { period: period.id, label: period.label, since, ...database.measuredAccountUsage(account.id, since, home) };
       }),
       // Only providers that report usage windows have any; for the others
       // the limits are unavailable, never zero.
-      limits: adapter.capabilities.usageLimits ? database.listProviderLimits(account.id).map((window) => presentLimitWindow(window, now)) : null,
+      limits: adapter.capabilities.usageLimits ? database.listProviderLimits(account.id, home).map((window) => presentLimitWindow(window, now)) : null,
     };
   }
 
@@ -178,7 +208,14 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     }
     if (!details.isDirectory()) throw accountError(400, "The account home must be a directory", "PROVIDER_ACCOUNT_INVALID");
     // A login in another user's directory is not this user's to select.
-    if (typeof process.getuid === "function" && details.uid !== process.getuid()) {
+    // Windows reports no owner here; a home must be inside the user's profile.
+    if (platform === "win32") {
+      const profile = await realpath(homeDirectory).catch(() => null);
+      const relative = profile ? path.relative(profile, resolved) : "..";
+      if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        throw accountError(400, "The account home must be a directory inside your user profile", "PROVIDER_ACCOUNT_INVALID");
+      }
+    } else if (typeof process.getuid === "function" && details.uid !== process.getuid()) {
       throw accountError(400, "The account home must be a directory you own", "PROVIDER_ACCOUNT_INVALID");
     }
     const inherited = Object.entries(environment).find(([key]) => key.toUpperCase() === adapter.accounts.homeVariable)?.[1];
@@ -246,18 +283,28 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     return list();
   }
 
-  // The account a launch uses. `accountId` pins a recovery to the account
-  // of the run it continues.
-  function resolve({ provider, conversationId, sessionId = null, accountId }) {
+  // The account a launch uses. `pin` (see accountPin) holds a recovery to
+  // the account of the run it continues; otherwise a resumed session keeps
+  // the account of the run that last launched in it. `home` is the CLI home
+  // the launch uses, recorded with the run.
+  function resolve({ provider, conversationId, sessionId = null, pin = null }) {
     const adapter = adapterFor(provider);
-    const owner = accountId ?? database.sessionAccountId(conversationId, provider, sessionId);
-    const account = findAccount(owner ?? database.activeProviderAccountId(provider));
+    const owner = pin ?? database.sessionAccount(conversationId, provider, sessionId);
+    const account = findAccount(owner?.accountId ?? database.activeProviderAccountId(provider));
     if (!account || account.provider !== adapter.id) {
       throw accountError(409, owner
         ? `The ${adapter.label} account this chat's session belongs to was removed. Clear the session in chat settings to continue with the active account.`
         : `The active ${adapter.label} account was removed. Choose another account in Settings.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
     }
-    return { id: account.id, provider: account.provider, label: account.label, homePath: account.homePath, identity: identitySummary(account) };
+    const home = accountHome(account, adapter);
+    // The default login follows the environment. A session it created under
+    // another home is not resumed under this one. A run from before accounts
+    // recorded no home and is taken to have used the current default.
+    if (owner && account.isDefault && owner.home !== undefined && (owner.home ?? null) !== home) {
+      const where = (value) => value ?? "the CLI's standard directory";
+      throw accountError(409, `This chat's ${adapter.label} session started with the default login in ${where(owner.home)}, but the default login now uses ${where(home)}. Restore ${adapter.accounts?.homeVariable ?? "it"} or clear the session in chat settings.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
+    }
+    return { id: account.id, provider: account.provider, label: account.label, homePath: account.homePath, home, identity: identitySummary(account) };
   }
 
   // Before a message or run is written: the account must exist and must not
@@ -281,9 +328,10 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     resolve,
     assertLaunchable,
     bindRun(runId, account) { database.bindRunAccount(runId, account); },
-    recordLimits(accountId, provider, runId, windows) {
+    // Windows are filed under the account and home the run launched with.
+    recordLimits(account, runId, windows) {
       if (!windows?.length) return;
-      try { database.recordProviderLimits(accountId, provider, runId, windows, new Date(clock()).toISOString()); }
+      try { database.recordProviderLimits({ accountId: account.id, provider: account.provider, home: account.home ?? null }, runId, windows, new Date(clock()).toISOString()); }
       catch (error) { if (error.statusCode !== 507) throw error; return; }
       notify();
     },
@@ -293,6 +341,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       if (notifyTimer) clearTimeout(notifyTimer);
       notifyTimer = null;
       await Promise.allSettled([...pendingChecks.values()]);
+      if (cleanupErrors.size) throw new AggregateError([...cleanupErrors.values()], "Account login check cleanup could not be verified");
     },
   };
 }

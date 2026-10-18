@@ -29,7 +29,7 @@ import { api, connectRuntime, query } from "@/lib/runtime-api";
 import { scheduleLayoutTick } from "@/lib/windowing";
 import { foldFindText } from "@/lib/find-text";
 import { modelMismatch, providerOptionLabel, providerReady, providerStatusText, providerSwitchProblem } from "@/lib/providers";
-import { runAccountText } from "@/lib/provider-accounts";
+import { answerAccountText, runAccountText } from "@/lib/provider-accounts";
 import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, messagePrecedesPage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "@/recovery-policy";
 import { createTerminalCommandFence } from "@/lib/terminal-command-fence";
 
@@ -1347,7 +1347,7 @@ export function App() {
   const unsentProject = bootstrap?.projects.find((item) => item.id === unsentCreatedChat?.projectId);
   const unsentWorktree = unsentProject?.worktrees.find((item) => item.id === unsentCreatedChat?.worktreeId);
   const latestRun = conversation?.runs?.[0];
-  // The loaded runs (the newest 200) name the account each one launched with.
+  // Answers name their own account; loaded runs cover older answers.
   const runAccounts = useMemo(() => new Map((conversation?.runs ?? []).map((run) => [run.id, runAccountText(run)])), [conversation?.runs]);
   const chatModelMismatch = manageChatOpen ? modelMismatch(providers, chatDraft, chatDraft.modelChosenFor) : "";
   const chatProviderProblem = manageChatOpen ? providerSwitchProblem(providers, chatDraft, conversation?.provider) : "";
@@ -1886,7 +1886,7 @@ export function App() {
   if (waitingForConversation) conversationContent = <output className="conversation-loading-status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</output>;
   if (conversation?.messages.length) conversationContent = <WindowedMessages key={conversation.id} messages={conversation.messages}
     messagePage={conversation.messagePage} viewportRef={messageViewportRef} restoreAnchorId={restoreMessageAnchorId}
-    renderMessage={(message) => <Message message={message} conversationId={conversation.id} runAccount={runAccounts.get(message.payload?.runId)} />}
+    renderMessage={(message) => <Message message={message} conversationId={conversation.id} runAccount={answerAccountText(message, runAccounts)} />}
     onFind={findConversationMessage} onCancelFind={() => {
       pendingFindRef.current?.abort(); pendingFindRef.current = null; activeFindMatchRef.current = null; findProgressRef.current = null;
     }} resetFindGeneration={findResetGeneration} />;

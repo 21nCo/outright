@@ -48,7 +48,9 @@ export const claudeAdapter = defineAdapter({
   },
   sessionIdentity: { nativeField: "session_id" },
   parseVersion: parseSemanticVersion,
-  accounts: { homeVariable: "CLAUDE_CONFIG_DIR", identityArgs: ["auth", "status", "--json"], parseIdentity },
+  // Each of these makes Claude Code ignore the login in CLAUDE_CONFIG_DIR.
+  accounts: { homeVariable: "CLAUDE_CONFIG_DIR", identityArgs: ["auth", "status", "--json"], parseIdentity,
+    credentialVariables: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"] },
   // What Claude Code 2.1.296 resolves each alias to. Another release
   // answering for an alias is reported, not assumed equivalent.
   modelAliases: { haiku: ["claude-haiku-5-5"], sonnet: ["claude-sonnet-5-5"], opus: ["claude-opus-5-5"] },

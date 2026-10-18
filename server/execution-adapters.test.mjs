@@ -819,10 +819,12 @@ test("harness logins are read from each CLI's status without credentials", () =>
   assert.equal(parseCodex("Not logged in").signedIn, false);
   assert.equal(parseCodex("Something else"), null);
   assert.deepEqual([claude.accounts.homeVariable, codex.accounts.homeVariable, anthropic.accounts], ["CLAUDE_CONFIG_DIR", "CODEX_HOME", null]);
-  const accounts = { homeVariable: "FIXTURE_HOME", identityArgs: ["status"], parseIdentity: () => null };
+  const accounts = { homeVariable: "FIXTURE_HOME", identityArgs: ["status"], parseIdentity: () => null, credentialVariables: ["FIXTURE_TOKEN"] };
   assert.equal(defineAdapter(harnessSpec({ accounts })).accounts.homeVariable, "FIXTURE_HOME");
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, homeVariable: "OUTRIGHT_HOME" } })), /accounts must name/);
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, identityArgs: ["status; rm"] } })), /accounts must name/);
+  assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialVariables: undefined } })), /accounts must name/);
+  assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialVariables: ["OUTRIGHT_ANTHROPIC_API_KEY"] } })), /accounts must name/);
 });
 
 test("an account's home reaches only its own launch, and only under its own variable", () => {
@@ -834,5 +836,12 @@ test("an account's home reaches only its own launch, and only under its own vari
   assert.equal(Object.keys(scoped).filter((key) => key.toUpperCase() === "CLAUDE_CONFIG_DIR").length, 1, "no second spelling survives");
   assert.equal(scoped.OUTRIGHT_ANTHROPIC_API_KEY, undefined);
   assert.equal(buildExecutionEnvironment("codex", inherited, inherited, { homePath: "/accounts/codex" }).CODEX_HOME, "/accounts/codex");
+  // A credential variable would make the CLI ignore the account's login. It
+  // stays with the default login and never reaches an added account.
+  const credentials = { PATH: "/bin", ANTHROPIC_API_KEY: "env-key", claude_code_oauth_token: "env-token", CLAUDE_CODE_USE_BEDROCK: "1", CODEX_API_KEY: "codex-key", OPENAI_API_KEY: "openai-key" };
+  assert.equal(buildExecutionEnvironment("claude", credentials).ANTHROPIC_API_KEY, "env-key");
+  assert.deepEqual(Object.keys(buildExecutionEnvironment("claude", credentials, credentials, { homePath: "/accounts/work" })).sort(), ["CLAUDE_CONFIG_DIR", "CODEX_API_KEY", "OPENAI_API_KEY", "PATH"]);
+  assert.deepEqual(Object.keys(buildExecutionEnvironment("codex", credentials, credentials, { homePath: "/accounts/codex" })).sort(),
+    ["ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK", "CODEX_HOME", "PATH", "claude_code_oauth_token"]);
   assert.throws(() => buildExecutionEnvironment("anthropic-api", inherited, inherited, { homePath: "/accounts/x" }), /no selectable accounts/);
 });

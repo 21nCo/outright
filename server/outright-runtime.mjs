@@ -9,7 +9,7 @@ import { createOutrightDatabase, normalizeTaskInput } from "./database.mjs";
 import { isModelName, validateExecutionConfiguration, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
 import { AGENT_SUPERVISOR, createAgentManager, defaultGroupMembers, hardenWindowsLaunchDirectory, terminateTree } from "./agent-manager.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
-import { createProviderAccounts } from "./provider-accounts.mjs";
+import { accountPin, createProviderAccounts } from "./provider-accounts.mjs";
 import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { utilityProcesses } from "./subprocess-budget.mjs";
@@ -896,10 +896,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         await preflightProvider({ provider: interrupted.provider, model, reasoningEffort: interrupted.reasoningEffort,
           approvalPolicy: interrupted.approvalPolicy, sessionId: policy === "resume-session" ? sessionId : null });
         // A recovery continues on the account the interrupted run launched
-        // with. A run that never launched has none and uses the usual rule.
-        const recoveryAccountId = interrupted.accountId ?? undefined;
+        // with (or was pinned to). The recovery run stores that pin durably.
         await accounts.assertLaunchable({ provider: interrupted.provider, conversationId: conversation.id,
-          sessionId: policy === "resume-session" ? sessionId : null, accountId: recoveryAccountId });
+          sessionId: policy === "resume-session" ? sessionId : null, pin: accountPin(database.getRun(interrupted.id)) });
         if (!database.isProjectTrusted(target.project.id, target.project.path)) throw apiError(403, "Project trust is required", { code: "PROJECT_TRUST_REQUIRED", project: { id: target.project.id, name: target.project.name, path: target.project.path } });
         const currentRecoveryConversation = database.getConversation(conversation.id);
         if (!currentRecoveryConversation || currentRecoveryConversation.archived) {
@@ -919,7 +918,6 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           run: recovery.run,
           forceFreshSession: policy === "retry",
           providerSessionId: policy === "retry" ? null : sessionId,
-          accountId: recoveryAccountId,
         }));
       }
 
