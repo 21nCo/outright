@@ -4,7 +4,7 @@ import { parentPort, workerData } from "node:worker_threads";
 import { archiveShadowPaths, cutoverArchiveShadow, fenceArchiveSource, prepareArchiveShadowCutover } from "./archive-shadow.mjs";
 import { trimAuditPage } from "./audit-retention.mjs";
 
-const { filename, conversationId, table, rowId, lockGate, cutoverStatGate, cutoverCloseGate, copyGate, copyStepGate, copyPhase } = workerData;
+const { filename, conversationId, table, rowId, lockGate, cutoverStatGate, cutoverCloseGate, cutoverPromoteGate, copyGate, copyStepGate, copyPhase } = workerData;
 const ownership = {
   run_events: `SELECT 1 FROM run_events AS item JOIN runs ON runs.id = item.run_id
     WHERE item.id = ? AND runs.conversation_id = ?`,
@@ -128,9 +128,19 @@ try {
     }
   }
   shadow.transaction(() => {
+    const ready = shadow.pragma("table_info(conversations)").some((column) => column.name === "task_id");
+    const taskId = ready ? shadow.prepare("SELECT task_id FROM conversations WHERE id = ?").get(conversationId)?.task_id : null;
     if (!shadow.prepare("DELETE FROM conversations WHERE id = ? AND deleting = 1").run(conversationId).changes) {
       throw new Error("Archive marker disappeared during shadow cleanup");
     }
+    // Match live retention: an archived task leaves with its last thread, an
+    // open one left without visible threads is hidden, and before the task
+    // rebuild a backfilled task reuses its conversation's id.
+    if (taskId) {
+      shadow.prepare("DELETE FROM tasks WHERE id = ? AND archived = 1 AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = ?)").run(taskId, taskId);
+      shadow.prepare(`UPDATE tasks SET archived = 1, updated_at = ? WHERE id = ? AND archived = 0
+        AND NOT EXISTS (SELECT 1 FROM conversations WHERE task_id = tasks.id AND archived = 0 AND deleting = 0)`).run(new Date().toISOString(), taskId);
+    } else if (!ready) shadow.prepare("DELETE FROM tasks WHERE id = ?").run(conversationId);
     shadow.prepare("UPDATE retained_usage SET legacy_ceiling = MAX(legacy_ceiling, bytes + 1048576) WHERE id = 1").run();
     shadow.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES (?, ?, ?, ?)")
       .run("retention.archived.deleted", conversationId, "{}", new Date().toISOString());
@@ -212,7 +222,7 @@ try {
     Atomics.notify(signal, 0);
     if (Atomics.wait(signal, 0, 1, 5000) === "timed-out") throw new Error("Archive close-gap probe timed out");
   }
-  cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate });
+  cutoverArchiveShadow(filename, { sourceInfo, cutoverStatGate, cutoverPromoteGate });
   parentPort.postMessage({ ok: true });
 } catch (error) {
   parentPort.postMessage({ ok: false, error: error.message, code: error.code });
