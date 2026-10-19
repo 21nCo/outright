@@ -1,17 +1,21 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { ageLimit, limitText, limitWindowLabel, listingTime, loginText, measuredText, nextListingChange } from "@/lib/provider-accounts";
+import { ageLimit, limitText, limitWindowLabel, listingOutOfDate, listingTime, loginText, measuredPeriodText, nextListingChange } from "@/lib/provider-accounts";
 import { api } from "@/lib/runtime-api";
 
-const REFRESH_EVENTS = ["provider-accounts.changed", "runtime.connected", "run.event"];
+// Account changes arrive as `accountsVersion`, not through the shared
+// runtime event, so they never displace another pane's event.
+const REFRESH_EVENTS = ["runtime.connected", "run.event"];
 // A time-driven reload waits at least this long, so it can never spin.
 const MIN_RELOAD_MS = 1_000;
+// An out-of-date listing whose reload failed is tried again this often.
+const RETRY_RELOAD_MS = 15_000;
 const MAX_TIMEOUT_MS = 2_147_483_647;
 
 // Account inventory in Settings. Each action applies immediately, like
 // template and history actions; the settings draft is not involved.
-export function ProviderAccounts({ open, runtimeEvent, onError }) {
+export function ProviderAccounts({ open, runtimeEvent, accountsVersion = 0, onError }) {
   const [listing, setListing] = useState(null);
   const [busy, setBusy] = useState(null);
   const busyRef = useRef(false);
@@ -44,18 +48,23 @@ export function ProviderAccounts({ open, runtimeEvent, onError }) {
   useEffect(() => {
     if (open && runtimeEvent && REFRESH_EVENTS.includes(runtimeEvent.type)) load().catch(onError);
   }, [open, runtimeEvent, onError]);
+  useEffect(() => {
+    if (open && accountsVersion) load().catch(onError);
+  }, [open, accountsVersion, onError]);
   useEffect(() => { if (open) setNow(Date.now()); }, [open, listing]);
   useEffect(() => {
     if (!open || !listing) return undefined;
     // Limits age in place if the reload fails, and the next change is still
-    // scheduled; measured totals need the runtime. A hidden tab reloads when
-    // it is shown again.
+    // scheduled. Measured totals need the runtime: past a window's change
+    // they are marked out of date and the reload is retried until it
+    // succeeds. A hidden tab reloads when it is shown again.
     const reload = () => {
       setNow(Date.now());
       if (document.visibilityState !== "hidden") load().catch(onError);
     };
     const runtimeNow = listingTime(listing, listing.receivedAt, Date.now());
-    const next = nextListingChange(listing, runtimeNow);
+    const changes = [nextListingChange(listing, runtimeNow), listingOutOfDate(listing, runtimeNow) ? runtimeNow + RETRY_RELOAD_MS : null].filter((at) => at !== null);
+    const next = changes.length ? Math.min(...changes) : null;
     const timer = next === null ? null : setTimeout(reload, Math.min(Math.max(next - runtimeNow, MIN_RELOAD_MS), MAX_TIMEOUT_MS));
     const visible = () => { if (document.visibilityState === "visible") reload(); };
     document.addEventListener("visibilitychange", visible);
@@ -132,10 +141,11 @@ export function ProviderAccounts({ open, runtimeEvent, onError }) {
       {provider.accounts.map((account) => <div key={account.id}><span>
         <strong>{provider.label} · {account.label}{account.active ? " (active)" : ""}</strong>
         <small title={account.homePath ?? undefined}>{loginText(account.login)}{account.homePath ? ` · ${account.homePath}` : ""}</small>
-        {account.measured.map((period) => <small key={period.period}>Measured by Outright, {period.label.toLowerCase()}: {measuredText(period)}</small>)}
+        {account.sameAsDefault && <small>This directory is now the default login's. Use Default login for new sessions; chats with a session on {account.label} keep it.</small>}
+        {account.measured.map((period) => <small key={period.period}>Measured by Outright, {period.label.toLowerCase()}: {measuredPeriodText(period, runtimeNow, listing.generatedAt)}</small>)}
         <small>{accountLimitsText(provider, account, runtimeNow, listing.limitStaleAfterMs)}</small>
       </span><span className="account-actions">
-        {provider.switchable && !account.active && <Button variant="outline" size="sm" aria-disabled={blocked} onClick={() => activate(provider, account)}
+        {provider.switchable && !account.active && !account.sameAsDefault && <Button variant="outline" size="sm" aria-disabled={blocked} onClick={() => activate(provider, account)}
           aria-label={`Use ${account.label} for new ${provider.label} sessions`}>Use</Button>}
         <Button variant="ghost" size="sm" aria-disabled={blocked} data-account-check={account.id} aria-label={`Check ${provider.label} account ${account.label}`}
           onClick={() => act(`refresh:${account.id}`, () => api(`/api/provider-accounts/${encodeURIComponent(account.id)}/refresh`, { method: "POST" }), `Checked ${account.label}.`)}>Check</Button>

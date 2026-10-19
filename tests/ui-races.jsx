@@ -1182,6 +1182,43 @@ async function providerAccountsWindowAgingRegression() {
   await remainsTrue(() => reads === 2, 1500, "an unchanging listing is not polled");
 }
 
+// A reload that fails when a run leaves a rolling window must not leave the
+// old total looking current; account changes reload through their own signal.
+async function providerAccountsFailedReloadRegression() {
+  root.render(null); await settle();
+  const changesAt = Date.now() + 1200;
+  let reads = 0;
+  let failing = false;
+  const errors = [];
+  const period = (runs) => ({ period: "5h", label: "Last 5 hours", since: "", changesAt: runs ? new Date(changesAt).toISOString() : null,
+    runs, inputTokens: runs ? 10 : null, outputTokens: runs ? 5 : null, runsWithoutTokens: 0, costUsd: null, runsWithoutCost: runs });
+  route = async (url) => {
+    if (url.pathname !== "/api/provider-accounts") return response({});
+    reads += 1;
+    if (Date.now() >= changesAt && failing) return response({ error: "Runtime unavailable" }, 503);
+    const runs = Date.now() < changesAt ? 1 : 0;
+    return response({ generatedAt: new Date().toISOString(), limitStaleAfterMs: 1_800_000, providers: [{ provider: "codex", label: "Codex", kind: "harness",
+      homeVariable: "CODEX_HOME", switchable: true, usageLimits: false, activeAccountId: "codex:default",
+      accounts: [{ id: "codex:default", label: "Default login", isDefault: true, homePath: null, active: true, sameAsDefault: false,
+        login: { status: "signed-in", identity: null, error: null, checkedAt: null }, measured: [period(runs)], limits: null }] }] });
+  };
+  const onError = (error) => { errors.push(error); };
+  const render = (accountsVersion) => root.render(<TooltipProvider><ProviderAccounts open runtimeEvent={null} accountsVersion={accountsVersion} onError={onError} /></TooltipProvider>);
+  failing = true;
+  render(0);
+  const measured = () => [...host.querySelectorAll(".provider-accounts small")].find((line) => line.textContent.startsWith("Measured by Outright"))?.textContent ?? "";
+  await until(() => measured().includes("1 run"), "the run in the 5-hour window is shown");
+  await until(() => errors.length > 0, "the reload at the window change fails");
+  await until(() => measured().includes("(out of date"), "the failed reload marks the expired total out of date");
+  assert(measured().includes("as of "), "an out-of-date total names its snapshot time");
+  // An account change is delivered without the shared runtime event.
+  failing = false;
+  const before = reads;
+  render(1);
+  await until(() => reads > before && measured().endsWith("No runs"), "an account change reloads the listing, which drops the expired run");
+  assert(!measured().includes("out of date"), "a successful reload clears the out-of-date mark");
+}
+
 async function settingsCapacityAndDeletionOrderRegression() {
   root.render(null);
   await settle();
@@ -5896,6 +5933,7 @@ try {
     ["settings migration completion", settingsMigrationCompletionRegression, "an open Settings dialog refreshes capacity when migration finishes"],
     ["settings live capacity", settingsCapacityWithoutEventRegression, "an open Settings dialog reads another client's quota changes without a capacity event"],
     ["provider accounts window aging", providerAccountsWindowAgingRegression, "an open account list drops a run that leaves the 5-hour window without any event"],
+    ["provider accounts failed reload", providerAccountsFailedReloadRegression, "a failed reload marks an expired measured total out of date, and account changes reload without the runtime event"],
     ["settings capacity and deletion order", settingsCapacityAndDeletionOrderRegression, "new capacity wins reordered responses and deletion owns its confirmation"],
     ["settings template completion", settingsTemplateCompletionRegression, "a successful template POST clears its submitted draft after reopening"],
     ["notification permission rejection", rejectedNotificationPermissionRegression, "a rejected permission request does not disrupt Settings save or escape as an unhandled rejection"],

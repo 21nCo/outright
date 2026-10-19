@@ -83,48 +83,76 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     return adapter;
   }
 
-  // The home variable as the CLI reads it: environment names are exact
-  // except on Windows.
-  function inheritedHome(adapter) {
-    const name = adapter.accounts.homeVariable;
+  // A variable as the CLI reads it: environment names are exact except on
+  // Windows.
+  function environmentValue(name) {
     if (platform !== "win32") return environment[name] || null;
     return Object.entries(environment).find(([key]) => key.toUpperCase() === name)?.[1] || null;
+  }
+
+  function inheritedHome(adapter) {
+    return environmentValue(adapter.accounts.homeVariable);
   }
 
   function standardHome(adapter) {
     return path.join(homeDirectory, adapter.accounts.standardHome);
   }
 
-  // Where a home leads, through links, or the path itself if it does not
-  // exist. Windows paths compare without case.
+  // Where a home leads, through links. A part that does not exist yet keeps
+  // its name under its nearest existing directory, so the key does not
+  // change when it is created. Windows paths compare without case.
   function canonicalHome(home) {
-    let resolved;
-    try { resolved = realpathSync(home); } catch { resolved = path.resolve(home); }
+    const missing = [];
+    let existing = path.resolve(home);
+    let resolved = null;
+    while (resolved === null) {
+      try { resolved = path.join(realpathSync(existing), ...missing); }
+      catch {
+        const parent = path.dirname(existing);
+        if (parent === existing) resolved = path.resolve(home);
+        else { missing.unshift(path.basename(existing)); existing = parent; }
+      }
+    }
     return platform === "win32" ? resolved.toLowerCase() : resolved;
   }
 
-  // The directory the default login reads: the home variable's, or the
-  // CLI's standard home when the variable is unset.
-  function effectiveDefaultHome(adapter) {
-    return canonicalHome(inheritedHome(adapter) ?? standardHome(adapter));
+  // The one key a CLI home is recorded, compared and partitioned by: its
+  // canonical directory, or null for the CLI's standard home. Runs, recovery
+  // pins, measured usage, limit windows and duplicate checks all use it.
+  function homeKey(adapter, home) {
+    if (!adapter.accounts) return null;
+    const standard = canonicalHome(standardHome(adapter));
+    const canonical = home ? canonicalHome(home) : standard;
+    return canonical === standard ? null : canonical;
   }
 
-  // The home recorded for the default login: the variable's value, or null
-  // for the CLI's standard home however the environment names it.
+  // The default login's key: its home variable's directory, or null when
+  // the variable is unset or names the standard home.
   function defaultHome(adapter) {
-    const inherited = adapter.accounts ? inheritedHome(adapter) : null;
-    return inherited && canonicalHome(inherited) !== canonicalHome(standardHome(adapter)) ? inherited : null;
+    return adapter.accounts ? homeKey(adapter, inheritedHome(adapter)) : null;
   }
 
-  // Whether two recorded homes are one directory; null is the standard home.
+  // Whether two recorded homes are one directory. Homes recorded before
+  // keys were canonical are compared by their key too.
   function sameHome(adapter, recorded, home) {
-    if ((recorded ?? null) === (home ?? null)) return true;
-    if (!adapter.accounts) return false;
-    return canonicalHome(recorded ?? standardHome(adapter)) === canonicalHome(home ?? standardHome(adapter));
+    return (recorded ?? null) === (home ?? null) || homeKey(adapter, recorded) === homeKey(adapter, home);
+  }
+
+  // An added account whose directory the environment now selects for the
+  // default login: one login under two ids. It is not activated and starts
+  // no new session; sessions it already has keep it.
+  function sameAsDefault(account, adapter) {
+    return Boolean(account.homePath) && homeKey(adapter, account.homePath) === defaultHome(adapter);
+  }
+
+  // A credential variable the default login launches with overrides the
+  // login in its home (adapter accounts.credentialVariables).
+  function environmentCredential(adapter) {
+    return adapter.accounts?.credentialVariables.find((name) => environmentValue(name)) ?? null;
   }
 
   function accountHome(account, adapter) {
-    return account.homePath ?? defaultHome(adapter);
+    return account.homePath ? homeKey(adapter, account.homePath) : defaultHome(adapter);
   }
 
   function defaultAccount(adapter) {
@@ -146,6 +174,10 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       return detected.available ? { status: "configured", identity: null, error: null } : { status: "unavailable", identity: null, error: detected.reason };
     }
     if (!adapter.accounts) return { status: "unknown", identity: null, error: `${adapter.label} does not report its login` };
+    // The CLI's status command reports only the home's login, which such a
+    // variable replaces; the variable is named, never its value.
+    const variable = account.homePath ? null : environmentCredential(adapter);
+    if (variable) return { status: "configured", identity: { signedIn: true, method: "environment", variable, email: null, organization: null, plan: null }, error: null };
     if (cleanupErrors.has(adapter.id)) return { status: "unknown", identity: null, error: `${adapter.label} login checks stopped: an earlier check could not be confirmed stopped` };
     const base = withoutDirectProviderCredentials(environment);
     const scoped = account.homePath ? withAccountHome(base, adapter.accounts, account.homePath) : base;
@@ -184,7 +216,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
 
   function identitySummary(account) {
     const identity = identities.get(account.id)?.identity;
-    return identity?.email ?? identity?.method ?? null;
+    return identity?.email ?? identity?.variable ?? identity?.method ?? null;
   }
 
   function presentAccount(account, adapter, activeId, now) {
@@ -197,6 +229,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       isDefault: account.isDefault,
       homePath: account.homePath,
       active: account.id === activeId,
+      sameAsDefault: sameAsDefault(account, adapter),
       login: checked ?? { status: "checking", identity: null, error: null, checkedAt: null },
       // A rolling window changes when its oldest run leaves it (`changesAt`),
       // with no event to announce it; the client lists again then.
@@ -260,10 +293,9 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       throw accountError(400, "The account home must be a directory you own", "PROVIDER_ACCOUNT_INVALID");
     }
     // With the variable unset, the CLI's standard home is the default login.
-    if (canonicalHome(resolved) === effectiveDefaultHome(adapter)) {
-      throw accountError(409, "That directory is already the default login", "PROVIDER_ACCOUNT_DUPLICATE");
-    }
-    return resolved;
+    const key = homeKey(adapter, resolved);
+    if (key === defaultHome(adapter)) throw accountError(409, "That directory is already the default login", "PROVIDER_ACCOUNT_DUPLICATE");
+    return { resolved, key };
   }
 
   async function add(input) {
@@ -274,7 +306,12 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       throw accountError(400, `Account name must be 1 to ${LABEL_CHARACTERS} characters`, "PROVIDER_ACCOUNT_INVALID");
     }
     if (label.toLowerCase() === defaultAccount(adapter).label.toLowerCase()) throw accountError(409, "Another account for this provider has that name", "PROVIDER_ACCOUNT_DUPLICATE");
-    const homePath = await validatedHome(adapter, input.homePath);
+    const { resolved: homePath, key } = await validatedHome(adapter, input.homePath);
+    // Checked with no await before the write, so two spellings of one
+    // directory (Windows case) cannot both be added.
+    if (database.listProviderAccounts().some((account) => account.provider === adapter.id && homeKey(adapter, account.homePath) === key)) {
+      throw accountError(409, "That directory is already an account for this provider", "PROVIDER_ACCOUNT_DUPLICATE");
+    }
     const account = database.createProviderAccount({ provider: adapter.id, label, homePath });
     notify();
     await checkIdentity({ ...account, isDefault: false });
@@ -309,12 +346,14 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     // Switches for one provider apply in request order.
     const previous = switches.get(adapter.id) ?? Promise.resolve();
     const task = previous.catch(() => {}).then(async () => {
+      if (sameAsDefault(account, adapter)) throw duplicateOfDefault(account, adapter);
       const result = await checkIdentity(account);
       if (result.status === "signed-out") {
         const signIn = account.homePath ? ` Sign in with ${adapter.accounts.homeVariable} set to its directory, then switch again.` : " Sign in with the CLI, then switch again.";
         throw accountError(409, `${account.label} is signed out of ${adapter.label}.${signIn}`, "PROVIDER_ACCOUNT_SWITCH_FAILED");
       }
-      if (result.status !== "signed-in") throw accountError(409, `Could not confirm that ${account.label} is signed in: ${result.error}`, "PROVIDER_ACCOUNT_SWITCH_FAILED");
+      // A default login that uses a credential variable launches with it.
+      if (result.status !== "signed-in" && result.status !== "configured") throw accountError(409, `Could not confirm that ${account.label} is signed in: ${result.error}`, "PROVIDER_ACCOUNT_SWITCH_FAILED");
       database.selectProviderAccount(adapter.id, account.id);
       notify();
     });
@@ -324,10 +363,14 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     return list();
   }
 
+  function duplicateOfDefault(account, adapter) {
+    return accountError(409, `${account.label} uses the directory the ${adapter.label} default login now uses. Use Default login for new sessions, or remove ${account.label}.`, "PROVIDER_ACCOUNT_DUPLICATE");
+  }
+
   // The account a launch uses. `pin` (see accountPin) holds a recovery to
   // the account of the run it continues; otherwise a resumed session keeps
-  // the account of the run that last launched in it. `home` is the CLI home
-  // the launch uses, recorded with the run.
+  // the account of the run that last launched in it. `home` is the key (homeKey)
+  // of the CLI home the launch uses, recorded with the run.
   function resolve({ provider, conversationId, sessionId = null, pin = null }) {
     const adapter = adapterFor(provider);
     const owner = pin ?? database.sessionAccount(conversationId, provider, sessionId);
@@ -342,6 +385,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
           ? `The ${adapter.label} account this interrupted run launched with was removed, so this run cannot continue. Discard the interrupted run.`
           : `The ${adapter.label} account this chat's session belongs to was removed. Clear the session in chat settings to continue with the active account.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
     }
+    if (!owner && sameAsDefault(account, adapter)) throw duplicateOfDefault(account, adapter);
     const home = accountHome(account, adapter);
     // The default login follows the environment. A session it created under
     // another home is not resumed under this one. A run from before accounts

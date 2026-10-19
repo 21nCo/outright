@@ -649,7 +649,7 @@ test("off Windows the default login reads only the exact home variable name", as
   t.after(() => Promise.all([posix.close(), windows.close()]));
   // The CLI ignores a lowercase twin on POSIX, so the default home is standard.
   assert.equal(posix.resolve({ provider: "claude", conversationId: "c" }).home, null);
-  assert.equal(windows.resolve({ provider: "claude", conversationId: "c" }).home, twin);
+  assert.equal(windows.resolve({ provider: "claude", conversationId: "c" }).home, twin.toLowerCase(), "Windows keys a home without case");
   // The twin is a separate login there, not the default one.
   await posix.add({ provider: "claude", label: "Twin", homePath: twin });
   await assert.rejects(windows.add({ provider: "claude", label: "Twin again", homePath: twin }),
@@ -691,4 +691,127 @@ test("with its variable unset, the CLI's standard home is the default login unde
   t.after(() => other.close());
   await other.add({ provider: "claude", label: "Standard", homePath: standard.claude });
   assert.equal(database.listProviderAccounts()[0].homePath, standard.claude);
+});
+
+test("one CLI home keeps one usage and limit history under any spelling, link or case", async (t) => {
+  const context = await fixture(t);
+  const { database, inheritedHome, probe, root } = context;
+  const chat = context.conversation();
+  const run = context.claudeRun(chat.id);
+  await context.manager.schedule({ conversation: chat, run });
+  context.spawned[0].child.stdout.write(`${JSON.stringify({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.4, resetsAt: Math.floor(Date.now() / 1000) + 3600 } })}\n`);
+  await context.finish(0, "session-1");
+  const link = path.join(root, "inherited-link");
+  symlinkSync(inheritedHome, link);
+  const defaultLogin = (accounts) => accounts.list().providers.find((provider) => provider.provider === "claude").accounts[0];
+  // A restart that names the same directory another way is the same login.
+  for (const spelling of [`${inheritedHome}/.`, `${inheritedHome}/`, link]) {
+    const restarted = createProviderAccounts({ database, probe, environment: { ...context.environment, CLAUDE_CONFIG_DIR: spelling } });
+    t.after(() => restarted.close());
+    assert.equal(restarted.resolve({ provider: "claude", conversationId: chat.id }).home, inheritedHome, spelling);
+    assert.equal(defaultLogin(restarted).measured[1].runs, 1, spelling);
+    assert.equal(defaultLogin(restarted).limits[0]?.utilization, 0.4, spelling);
+    assert.equal(restarted.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }).id, "claude:default");
+  }
+
+  // Reports under two default-login homes are kept apart, each with its own cap.
+  const otherHome = path.join(root, "other");
+  mkdirSync(otherHome);
+  const other = createProviderAccounts({ database, probe, environment: { ...context.environment, CLAUDE_CONFIG_DIR: otherHome } });
+  t.after(() => other.close());
+  const otherLogin = other.resolve({ provider: "claude", conversationId: chat.id });
+  other.recordLimits(otherLogin, "run-other", Array.from({ length: 8 }, (_, index) => ({ window: `window_${index}`, utilization: 0.9, status: "allowed", resetsAt: null })));
+  assert.equal(defaultLogin(other).limits.length, 8);
+  assert.deepEqual(defaultLogin(context.accounts).limits.map((limit) => [limit.window, limit.utilization]), [["five_hour", 0.4]], "restoring the first home shows its own window");
+  context.accounts.recordLimits(context.accounts.resolve({ provider: "claude", conversationId: chat.id }), "run-2", [{ window: "seven_day", utilization: 0.1, status: "allowed", resetsAt: null }]);
+  assert.equal(defaultLogin(context.accounts).limits.length, 2, "another home's windows do not use up this home's cap");
+  assert.equal(defaultLogin(other).limits.length, 8);
+
+  // On Windows, case variants of one directory are one key.
+  const upper = createProviderAccounts({ database, probe, platform: "win32", homeDirectory: root, environment: { PATH: process.env.PATH, CLAUDE_CONFIG_DIR: inheritedHome.toUpperCase() } });
+  const lower = createProviderAccounts({ database, probe, platform: "win32", homeDirectory: root, environment: { PATH: process.env.PATH, claude_config_dir: inheritedHome.toLowerCase() } });
+  t.after(() => Promise.all([upper.close(), lower.close()]));
+  const key = upper.resolve({ provider: "claude", conversationId: chat.id }).home;
+  assert.equal(key, lower.resolve({ provider: "claude", conversationId: chat.id }).home);
+  upper.recordLimits({ id: "claude:default", provider: "claude", home: key }, "run-win", [{ window: "five_hour", utilization: 0.3, status: "allowed", resetsAt: null }]);
+  assert.equal(defaultLogin(lower).limits[0].utilization, 0.3);
+});
+
+test("an added account whose directory becomes the default login's is flagged, not activated and keeps its sessions", async (t) => {
+  const context = await fixture(t);
+  const { accounts, database, manager, probe, spawned } = context;
+  const work = await addWork(context);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  const chat = context.conversation();
+  await manager.schedule({ conversation: chat, run: context.claudeRun(chat.id) });
+  await context.finish(0, "session-work");
+  await accounts.activate({ provider: "claude", accountId: "claude:default" });
+  assert.equal(context.claude().accounts.find((account) => account.id === work.id).sameAsDefault, false);
+
+  // After a restart the environment selects Work's directory for the default.
+  const restarted = createProviderAccounts({ database, probe, environment: { ...context.environment, CLAUDE_CONFIG_DIR: context.workHome } });
+  t.after(() => restarted.close());
+  const listed = restarted.list().providers.find((provider) => provider.provider === "claude").accounts.find((account) => account.id === work.id);
+  assert.equal(listed.sameAsDefault, true);
+  await assert.rejects(restarted.activate({ provider: "claude", accountId: work.id }),
+    (error) => error.details.code === "PROVIDER_ACCOUNT_DUPLICATE" && /Default login/.test(error.message));
+  assert.equal(database.activeProviderAccountId("claude"), "claude:default");
+  // The chat's existing session still resumes on Work.
+  assert.equal(restarted.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-work" }).id, work.id);
+  // Were it already active, it starts no new session under a second id.
+  database.selectProviderAccount("claude", work.id);
+  assert.throws(() => restarted.resolve({ provider: "claude", conversationId: chat.id }), (error) => error.details.code === "PROVIDER_ACCOUNT_DUPLICATE");
+  assert.equal(spawned.length, 1);
+});
+
+test("a default login that uses a credential variable is not refused as signed out", async (t) => {
+  const context = await fixture(t, { extraEnvironment: { CODEX_API_KEY: "env-secret" } });
+  const { accounts, database, probe, root } = context;
+  const codex = () => accounts.list().providers.find((provider) => provider.provider === "codex");
+  // The default CODEX_HOME has no login; `codex login status` would say so.
+  const before = probe.calls.length;
+  codex();
+  await tick(); await tick();
+  const login = codex().accounts[0].login;
+  assert.equal(login.status, "configured");
+  assert.equal(login.identity.variable, "CODEX_API_KEY");
+  assert.ok(!JSON.stringify(codex()).includes("env-secret"), "the variable is named, never its value");
+  assert.ok(!probe.calls.slice(before).some((call) => call.executable === "codex" && call.environment.CODEX_HOME === undefined), "the home login is not what the default launches with");
+  const chat = database.createConversation({ projectId: "p", worktreeId: root, worktreePath: root, title: "Codex", provider: "codex" });
+  assert.equal((await accounts.assertLaunchable({ provider: "codex", conversationId: chat.id })).identity, "CODEX_API_KEY");
+
+  // Switching back to the default works; an added signed-out account is still refused.
+  const personal = path.join(root, "codex-personal");
+  const signedOutHome = path.join(root, "codex-signed-out");
+  mkdirSync(personal);
+  mkdirSync(signedOutHome);
+  context.logins.set(personal, "Logged in using ChatGPT");
+  await accounts.add({ provider: "codex", label: "Personal", homePath: personal });
+  await accounts.add({ provider: "codex", label: "Old", homePath: signedOutHome });
+  const id = (label) => codex().accounts.find((account) => account.label === label).id;
+  await accounts.activate({ provider: "codex", accountId: id("Personal") });
+  await accounts.activate({ provider: "codex", accountId: "codex:default" });
+  assert.equal(database.activeProviderAccountId("codex"), "codex:default");
+  await assert.rejects(accounts.activate({ provider: "codex", accountId: id("Old") }), (error) => error.details.code === "PROVIDER_ACCOUNT_SWITCH_FAILED");
+  const check = probe.calls.find((call) => call.environment.CODEX_HOME === signedOutHome);
+  assert.equal(check.environment.CODEX_API_KEY, undefined, "an added account is checked by its own login");
+});
+
+test("limit windows stored before homes were keyed are kept by home", async (t) => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "outright-limit-keys-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const filename = path.join(root, "outright.db");
+  createOutrightDatabase({ filename }).close();
+  const raw = new Database(filename);
+  raw.exec(`DROP TABLE provider_limit_windows;
+    CREATE TABLE provider_limit_windows (account_id TEXT NOT NULL, provider TEXT NOT NULL, window_name TEXT NOT NULL, utilization REAL, status TEXT, resets_at TEXT,
+      observed_at TEXT NOT NULL, run_id TEXT, home_path TEXT, PRIMARY KEY (account_id, window_name));
+    INSERT INTO provider_limit_windows VALUES ('claude:default', 'claude', 'five_hour', 0.5, 'allowed', NULL, '2026-10-19T10:00:00.000Z', 'run-1', NULL);`);
+  raw.close();
+  const database = createOutrightDatabase({ filename });
+  t.after(() => database.close());
+  assert.equal(database.listProviderLimits("claude:default", null)[0].utilization, 0.5);
+  database.recordProviderLimits({ accountId: "claude:default", provider: "claude", home: "/other" }, "run-2", [{ window: "five_hour", utilization: 0.2, status: "allowed", resetsAt: null }]);
+  assert.equal(database.listProviderLimits("claude:default", null)[0].utilization, 0.5);
+  assert.equal(database.listProviderLimits("claude:default", "/other")[0].utilization, 0.2);
 });

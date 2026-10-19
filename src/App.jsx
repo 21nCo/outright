@@ -85,6 +85,9 @@ export function App() {
   const [pendingOutcomeRunIds, setPendingOutcomeRunIds] = useState(() => new Set());
   const [findResetGeneration, setFindResetGeneration] = useState(0);
   const [runtimeEvent, setRuntimeEvent] = useState(null);
+  // Account changes have their own counter: in the shared runtimeEvent slot
+  // a frequent one could replace a terminal chunk before it is written.
+  const [accountsVersion, setAccountsVersion] = useState(0);
   const [unverifiedTerminalIds, setUnverifiedTerminalIds] = useState(() => new Set());
   const [connection, setConnection] = useState("connecting");
   const [isScanning, setIsScanning] = useState(true);
@@ -644,7 +647,8 @@ export function App() {
     // A terminal event starts the durable detail refresh below. Keep the
     // pending reservation until that snapshot shows the terminal run; clearing
     // it here briefly announces the stale running state again.
-    if (["projects.changed", "terminal.output", "terminal.exit", "terminal.audit-failed", "runtime.connected", "capacity.changed", "provider-accounts.changed"].includes(event.type)
+    if (event.type === "provider-accounts.changed") setAccountsVersion((version) => version + 1);
+    if (["projects.changed", "terminal.output", "terminal.exit", "terminal.audit-failed", "runtime.connected", "capacity.changed"].includes(event.type)
       || (event.type === "run.event" && ["run.completed", "run.failed", "run.stopped"].includes(event.payload?.type))) setRuntimeEvent(event);
     const pendingLoad = pendingConversationLoadRef.current;
     if (["message.created", "run.event"].includes(event.type)
@@ -1936,7 +1940,7 @@ export function App() {
     </main>
 
     <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} projects={bootstrap.projects} onSelectProject={chooseProject} onSelectConversation={(item) => { const nextProject = bootstrap.projects.find((entry) => entry.id === item.projectId); const nextWorktree = nextProject?.worktrees.find((entry) => entry.id === item.worktreeId); if (nextProject && nextWorktree) { pendingConversationRef.current = item.id; chooseProject(nextProject, nextWorktree); } }} />
-    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} runtimeEvent={runtimeEvent} onSaved={(nextSettings, refresh) => { if (refresh !== "history" && refresh !== "settings" && refresh !== "templates") { ++settingsVersionRef.current; setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") requestNotificationPermission(); } if (refresh) void refreshAll(refresh === "templates"); }} onError={handleError} />
+    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} runtimeEvent={runtimeEvent} accountsVersion={accountsVersion} onSaved={(nextSettings, refresh) => { if (refresh !== "history" && refresh !== "settings" && refresh !== "templates") { ++settingsVersionRef.current; setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") requestNotificationPermission(); } if (refresh) void refreshAll(refresh === "templates"); }} onError={handleError} />
 
     <SimpleDialog open={newChatOpen} onOpenChange={setNewChatOpen} title="New agent chat" description={`${project.name} / ${worktree.name}`} onSubmit={(event) => { event.preventDefault(); createConversation(); }} submit="Create chat"><label htmlFor="chat-title">What should the agent work on?</label><Input id="chat-title" autoFocus value={newChatTitle} onChange={(event) => setNewChatTitle(event.target.value)} placeholder="Review the worktree scanner" /></SimpleDialog>
     <SimpleDialog open={newSpaceOpen} onOpenChange={setNewSpaceOpen} title="Create space" description="Organize related projects together in the sidebar." onSubmit={createSpace} submit="Create space" disabled={!newSpaceName.trim()}><label htmlFor="space-name">Space name</label><Input id="space-name" autoFocus value={newSpaceName} onChange={(event) => setNewSpaceName(event.target.value)} placeholder="Client work" /></SimpleDialog>

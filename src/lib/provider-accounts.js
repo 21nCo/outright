@@ -17,7 +17,7 @@ export function loginText(login) {
   const details = [identity.email, identity.organization, identity.plan, identity.method].filter(Boolean);
   if (login.status === "signed-in") return details.length ? `Signed in · ${details.join(" · ")}` : "Signed in";
   if (login.status === "signed-out") return "Signed out";
-  if (login.status === "configured") return "Credential configured";
+  if (login.status === "configured") return identity.variable ? `Uses ${identity.variable} from the environment` : "Credential configured";
   if (login.status === "unavailable") return login.error || "Credential not configured";
   return login.error || "Login could not be checked";
 }
@@ -66,6 +66,22 @@ export function nextListingChange(listing, now) {
 export function listingTime(listing, receivedAt, now) {
   const generatedAt = Date.parse(listing?.generatedAt);
   return Number.isFinite(generatedAt) && Number.isFinite(receivedAt) ? generatedAt + (now - receivedAt) : now;
+}
+
+// A measured window changes when its oldest run leaves it. Past that time,
+// until a listing is loaded again, its totals are out of date and say when
+// they were measured.
+export function measuredPeriodText(period, now, generatedAt, formatTime = defaultTime) {
+  const changesAt = period.changesAt ? Date.parse(period.changesAt) : Number.NaN;
+  if (!(changesAt <= now)) return measuredText(period);
+  return `${measuredText(period)} as of ${formatTime(generatedAt)} (out of date: a run has left this window since; reloading)`;
+}
+
+// Whether any measured window in a listing has passed its change time, so
+// the dialog keeps retrying until a reload succeeds.
+export function listingOutOfDate(listing, now) {
+  return (listing?.providers ?? []).some((provider) => (provider.accounts ?? []).some((account) => (account.measured ?? [])
+    .some((period) => period.changesAt && Date.parse(period.changesAt) <= now)));
 }
 
 export function measuredText(period) {

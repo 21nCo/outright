@@ -167,3 +167,35 @@ test("account usage keeps measured, reported, stale and unknown values distinct"
   assert.match(accounts, /addEventListener\("visibilitychange"/);
   assert.match(accounts, /ageLimit\(limit, now, staleAfterMs\)/);
 });
+
+test("expired measured totals are marked out of date and account changes keep their own signal", async () => {
+  const { listingOutOfDate, loginText, measuredPeriodText } = await import("../src/lib/provider-accounts.js");
+  const time = (value) => value.slice(11, 16);
+  const changesAt = "2026-10-19T15:00:00.001Z";
+  const period = { runs: 1, inputTokens: 100, outputTokens: 20, runsWithoutTokens: 0, costUsd: 0.5, runsWithoutCost: 0, changesAt };
+  const generatedAt = "2026-10-19T10:00:00.000Z";
+  assert.equal(measuredPeriodText(period, Date.parse(changesAt) - 1, generatedAt, time), "1 run · 120 tokens · $0.500 reported");
+  // A failed reload at the change keeps the old totals only as a dated snapshot.
+  assert.equal(measuredPeriodText(period, Date.parse(changesAt), generatedAt, time),
+    "1 run · 120 tokens · $0.500 reported as of 10:00 (out of date: a run has left this window since; reloading)");
+  assert.equal(measuredPeriodText({ runs: 0, changesAt: null }, Date.parse(changesAt), generatedAt, time), "No runs");
+  const listing = { providers: [{ accounts: [{ measured: [period] }] }] };
+  assert.equal(listingOutOfDate(listing, Date.parse(changesAt) - 1), false);
+  assert.equal(listingOutOfDate(listing, Date.parse(changesAt)), true);
+  // A default login that launches with a credential variable names it.
+  assert.equal(loginText({ status: "configured", identity: { variable: "CODEX_API_KEY" } }), "Uses CODEX_API_KEY from the environment");
+
+  const [app, accounts] = await Promise.all([
+    readFile(new URL("src/App.jsx", root), "utf8"),
+    readFile(new URL("src/components/ProviderAccounts.jsx", root), "utf8"),
+  ]);
+  // The shared runtime event slot carries terminal output; account changes
+  // must not replace it.
+  const slot = app.match(/if \((\[[^\]]*\])\.includes\(event\.type\)[^)]*\)[^;]*setRuntimeEvent\(event\)/s)?.[1] ?? "";
+  assert.match(slot, /"terminal\.output"/);
+  assert.doesNotMatch(slot, /provider-accounts\.changed/);
+  assert.match(app, /event\.type === "provider-accounts\.changed"\) setAccountsVersion\(/);
+  assert.match(app, /accountsVersion=\{accountsVersion\}/);
+  assert.match(accounts, /if \(open && accountsVersion\) load\(\)/);
+  assert.doesNotMatch(accounts, /REFRESH_EVENTS = \[[^\]]*provider-accounts\.changed/);
+});

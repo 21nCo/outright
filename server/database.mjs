@@ -77,7 +77,7 @@ const RUN_ACCOUNT_FIELDS = `account.account_id AS accountId, account.account_lab
 const RUN_ACCOUNT_JOINS = "LEFT JOIN run_accounts AS account ON account.run_id = runs.id LEFT JOIN run_account_pins AS pin ON pin.run_id = runs.id";
 const PROVIDER_ACCOUNT_FIELDS = "id, provider, label, home_path AS homePath, created_at AS createdAt";
 const MAX_ACCOUNTS_PER_PROVIDER = 16;
-const MAX_LIMIT_WINDOWS_PER_ACCOUNT = 8;
+const MAX_LIMIT_WINDOWS_PER_HOME = 8;
 
 const SETTING_RULES = {
   provider: (value) => EXECUTION_ADAPTER_IDS.includes(value),
@@ -2324,29 +2324,31 @@ export function createOutrightDatabase(options = {}) {
       if (!row) return null;
       return row.accountId ? { accountId: row.accountId, home: row.home } : { accountId: defaultProviderAccountId(provider), home: undefined };
     },
-    // The latest report of each window wins. A report is optional telemetry
-    // and obeys the retained budget.
+    // The latest report of each window wins, per account and CLI home key
+    // (null, the standard home, is stored as ''). A report is optional
+    // telemetry and obeys the retained budget.
     // A removed account keeps no windows, even from a run still using it.
     recordProviderLimits({ accountId, provider, home = null }, runId, windows, observedAt = now()) {
       withinRetainedBudget(() => {
         if (accountId !== defaultProviderAccountId(provider) && !db.prepare("SELECT 1 FROM provider_accounts WHERE id = ?").get(accountId)) return;
         const upsert = db.prepare(`INSERT INTO provider_limit_windows (account_id, provider, window_name, utilization, status, resets_at, observed_at, run_id, home_path)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account_id, window_name) DO UPDATE SET provider = excluded.provider,
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account_id, home_path, window_name) DO UPDATE SET provider = excluded.provider,
           utilization = excluded.utilization, status = excluded.status, resets_at = excluded.resets_at, observed_at = excluded.observed_at,
-          run_id = excluded.run_id, home_path = excluded.home_path`);
-        const known = new Set(db.prepare("SELECT window_name AS name FROM provider_limit_windows WHERE account_id = ?").all(accountId).map((row) => row.name));
+          run_id = excluded.run_id`);
+        const known = new Set(db.prepare("SELECT window_name AS name FROM provider_limit_windows WHERE account_id = ? AND home_path = ?").all(accountId, home ?? "").map((row) => row.name));
         for (const window of windows) {
-          if (!known.has(window.window) && known.size >= MAX_LIMIT_WINDOWS_PER_ACCOUNT) continue;
+          if (!known.has(window.window) && known.size >= MAX_LIMIT_WINDOWS_PER_HOME) continue;
           known.add(window.window);
-          upsert.run(accountId, provider, window.window, window.utilization, window.status, window.resetsAt, observedAt, runId, home);
+          upsert.run(accountId, provider, window.window, window.utilization, window.status, window.resetsAt, observedAt, runId, home ?? "");
         }
       });
     },
     // Windows and usage belong to the login in one CLI home. A default
-    // account whose home changed with the environment starts afresh.
+    // account whose home changed with the environment starts afresh, and
+    // returning to the earlier home shows that home's windows again.
     listProviderLimits(accountId, home = null) {
       return db.prepare(`SELECT window_name AS window, utilization, status, resets_at AS resetsAt, observed_at AS observedAt, run_id AS runId
-        FROM provider_limit_windows WHERE account_id = ? AND home_path IS ? ORDER BY window_name`).all(accountId, home);
+        FROM provider_limit_windows WHERE account_id = ? AND home_path = ? ORDER BY window_name`).all(accountId, home ?? "");
     },
     // What Outright measured for runs launched with an account since a time.
     // Runs without reported cost or tokens are counted, so a sum is never
@@ -2835,7 +2837,7 @@ function migrate(db, onSpacesMigrationStep) {
     CREATE TABLE IF NOT EXISTS provider_account_selection (provider TEXT PRIMARY KEY, account_id TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS provider_limit_windows (
       account_id TEXT NOT NULL, provider TEXT NOT NULL, window_name TEXT NOT NULL, utilization REAL, status TEXT, resets_at TEXT,
-      observed_at TEXT NOT NULL, run_id TEXT, home_path TEXT, PRIMARY KEY (account_id, window_name)
+      observed_at TEXT NOT NULL, run_id TEXT, home_path TEXT NOT NULL DEFAULT '', PRIMARY KEY (account_id, home_path, window_name)
     );
     CREATE TABLE IF NOT EXISTS run_accounts (
       run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, account_id TEXT NOT NULL, account_label TEXT NOT NULL,
@@ -2847,9 +2849,22 @@ function migrate(db, onSpacesMigrationStep) {
       home_known INTEGER NOT NULL DEFAULT 1
     );
   `);
-  // Account tables written before launch homes were recorded.
-  for (const table of ["provider_limit_windows", "run_accounts"]) {
-    if (!db.pragma(`table_info(${table})`).some((column) => column.name === "home_path")) db.exec(`ALTER TABLE ${table} ADD COLUMN home_path TEXT`);
+  // Account tables written before launch homes were recorded. Limit windows
+  // were once keyed by account alone; they are rebuilt keyed by home too.
+  if (!db.pragma("table_info(run_accounts)").some((column) => column.name === "home_path")) db.exec("ALTER TABLE run_accounts ADD COLUMN home_path TEXT");
+  const limitColumns = db.pragma("table_info(provider_limit_windows)");
+  if (!limitColumns.some((column) => column.name === "home_path" && column.pk)) {
+    const home = limitColumns.some((column) => column.name === "home_path") ? "COALESCE(home_path, '')" : "''";
+    db.transaction(() => {
+      db.exec(`CREATE TABLE provider_limit_windows_keyed (
+          account_id TEXT NOT NULL, provider TEXT NOT NULL, window_name TEXT NOT NULL, utilization REAL, status TEXT, resets_at TEXT,
+          observed_at TEXT NOT NULL, run_id TEXT, home_path TEXT NOT NULL DEFAULT '', PRIMARY KEY (account_id, home_path, window_name)
+        );
+        INSERT OR IGNORE INTO provider_limit_windows_keyed SELECT account_id, provider, window_name, utilization, status, resets_at, observed_at, run_id, ${home}
+          FROM provider_limit_windows;
+        DROP TABLE provider_limit_windows;
+        ALTER TABLE provider_limit_windows_keyed RENAME TO provider_limit_windows;`);
+    })();
   }
   if (!db.pragma("table_info(run_account_pins)").some((column) => column.name === "home_known")) {
     db.exec("ALTER TABLE run_account_pins ADD COLUMN home_known INTEGER NOT NULL DEFAULT 1");
