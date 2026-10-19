@@ -65,7 +65,9 @@ export function accountPin(run) {
 export function createProviderAccounts({ database, publish = () => {}, probe = defaultProbe, environment = process.env, adapters = EXECUTION_ADAPTERS, clock = Date.now,
   platform = process.platform, homeDirectory = os.homedir(), realpath = realpathSync.native }) {
   const identities = new Map();
+  // The newest check of each account; `checks` holds every unsettled one.
   const pendingChecks = new Map();
+  const checks = new Set();
   const switches = new Map();
   // A provider whose identity probe could not be proven stopped gets no
   // further probes; close() reports it, as provider discovery does.
@@ -268,10 +270,20 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     }
   }
 
-  // Concurrent requests for one account share a single check; a waiting
-  // request moves a queued background check of that account ahead.
-  function checkIdentity(account, { background = false } = {}) {
+  // A pending check this caller can share: one not started yet, or one
+  // checking the login key the account has now.
+  function joinableCheck(account, key) {
     const pending = pendingChecks.get(account.id);
+    return pending && (!pending.started || pending.key === key) ? pending : null;
+  }
+
+  // Concurrent requests for one account's current login share a single
+  // check; a waiting request moves a queued background check of that account
+  // ahead. A check started under another login key is not shared. The check
+  // settles with the key its result is evidence for (see runChecks).
+  function checkIdentity(account, { background = false } = {}) {
+    const adapter = adapterFor(account.provider);
+    const pending = joinableCheck(account, loginKey(account, adapter));
     if (pending) {
       if (!background && pending.background && !pending.started) {
         checkQueue.splice(checkQueue.indexOf(pending), 1);
@@ -280,9 +292,10 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       }
       return pending.task;
     }
-    const check = { account, adapter: adapterFor(account.provider), background, started: false };
+    const check = { account, adapter, background, started: false, key: null };
     check.task = new Promise((resolve, reject) => { check.settle = { resolve, reject }; });
     pendingChecks.set(account.id, check);
+    checks.add(check);
     enqueueCheck(check);
     queueMicrotask(runChecks);
     return check.task;
@@ -300,18 +313,28 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       const check = checkQueue.shift();
       check.started = true;
       try {
-        const key = loginKey(check.account, check.adapter);
+        check.key = loginKey(check.account, check.adapter);
         const result = { ...await probeIdentity(check.account, check.adapter), checkedAt: new Date(clock()).toISOString() };
+        // A result is evidence only for a login key that was current both
+        // when its probe started and when it ended. One whose directory or
+        // source changed meanwhile is kept for neither key, and its account
+        // is listed as checking again.
+        const { key } = check;
+        const unchanged = loginKey(check.account, check.adapter) === key;
         // A removed account's late result is dropped.
         if (findAccount(check.account.id)) {
-          if (JSON.stringify(identities.get(check.account.id)) !== JSON.stringify({ key, result })) notify();
-          identities.set(check.account.id, { key, result });
+          if (!unchanged) notify();
+          else {
+            if (JSON.stringify(identities.get(check.account.id)) !== JSON.stringify({ key, result })) notify();
+            identities.set(check.account.id, { key, result });
+          }
         }
-        check.settle.resolve(result);
+        check.settle.resolve({ key, result, unchanged });
       } catch (error) {
         check.settle.reject(error);
       } finally {
         if (pendingChecks.get(check.account.id) === check) pendingChecks.delete(check.account.id);
+        checks.delete(check);
       }
     }
     checking = false;
@@ -323,7 +346,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
   function recheckIfOld(account, key) {
     if (closing.signal.aborted) return;
     const checkedAt = Date.parse(checkedLogin(account, key)?.checkedAt);
-    if (pendingChecks.has(account.id) || clock() - checkedAt <= IDENTITY_RECHECK_MS) return;
+    if (joinableCheck(account, key) || clock() - checkedAt <= IDENTITY_RECHECK_MS) return;
     void checkIdentity(account, { background: true }).catch(() => {});
   }
 
@@ -472,7 +495,12 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     const previous = switches.get(adapter.id) ?? Promise.resolve();
     const task = previous.catch(() => {}).then(async () => {
       if (sameAsDefault(account, adapter)) throw duplicateOfDefault(account, adapter);
-      const result = await checkIdentity(account);
+      const checked = await currentLogin(account, adapter);
+      if (!checked || checked.key !== loginKey(account, adapter)) {
+        throw accountError(409, `${account.label}'s directory changed while it was being checked. Check it again, then switch.`, "PROVIDER_ACCOUNT_SWITCH_FAILED");
+      }
+      if (sameAsDefault(account, adapter)) throw duplicateOfDefault(account, adapter);
+      const { result } = checked;
       if (result.status === "signed-out") {
         const signIn = account.homePath ? ` Sign in with ${adapter.accounts.homeVariable} set to its directory, then switch again.` : " Sign in with the CLI, then switch again.";
         throw accountError(409, `${account.label} is signed out of ${adapter.label}.${signIn}`, "PROVIDER_ACCOUNT_SWITCH_FAILED");
@@ -486,6 +514,18 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     try { await task; }
     finally { if (switches.get(adapter.id) === task) switches.delete(adapter.id); }
     return list();
+  }
+
+  // A check of the account's login as it is now ({ key, result }): only
+  // when its key is still the account's key, after one more check if the
+  // first was made under another key; otherwise null. The caller compares
+  // the key again where it acts, with no wait in between.
+  async function currentLogin(account, adapter) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const checked = await checkIdentity(account);
+      if (checked.unchanged && checked.key === loginKey(account, adapter)) return checked;
+    }
+    return null;
   }
 
   function duplicateOfDefault(account, adapter) {
@@ -537,16 +577,21 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
 
   // Before a message or run is written: the account must exist and must not
   // be known to be signed out. A cached sign-out, or a result checked under
-  // another login key, is checked again first.
+  // another login key, is checked again first, and the send goes ahead only
+  // with the login key that check was made under.
   async function assertLaunchable(target) {
     const account = resolve(target);
-    const checked = identities.get(account.id);
-    if (!checked || (checked.key === account.home && checked.result.status !== "signed-out")) return account;
-    const result = await checkIdentity(account);
-    if (result.status === "signed-out") {
+    const cached = identities.get(account.id);
+    if (!cached || (cached.key === account.home && cached.result.status !== "signed-out")) return account;
+    const checked = await currentLogin(account, adapterFor(account.provider));
+    if (checked?.result.status === "signed-out") {
       throw accountError(409, `${account.label} is signed out. Sign in, refresh it in Settings, then send again.`, "PROVIDER_ACCOUNT_SIGNED_OUT");
     }
-    return resolve(target);
+    const launch = resolve(target);
+    if (!checked || launch.home !== checked.key) {
+      throw accountError(409, `${account.label}'s directory changed while its login was being checked. Check it in Settings, then send again.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
+    }
+    return launch;
   }
 
   return {
@@ -585,7 +630,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       closing.abort();
       if (notifyTimer) clearTimeout(notifyTimer);
       notifyTimer = null;
-      await Promise.allSettled([...pendingChecks.values()].map((check) => check.task));
+      await Promise.allSettled([...checks].map((check) => check.task));
       if (cleanupErrors.size) throw new AggregateError([...cleanupErrors.values()], "Account login check cleanup could not be verified");
     },
   };

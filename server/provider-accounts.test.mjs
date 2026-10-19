@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
-import { mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -1344,6 +1344,90 @@ test("a login checked before its account's directory led elsewhere is never show
   assert.deepEqual([database.getRun(run.id).accountIdentity, database.getRun(run.id).accountHome], ["other@example.com", elsewhere]);
   assert.equal(listed().login.identity.email, "other@example.com");
   await context.finish(spawned.length - 1);
+});
+
+test("a check started before an account's directory led elsewhere is not shared by a switch or send", async (t) => {
+  const context = await fixture(t);
+  const { accounts, database, logins, manager, probe, root, spawned, workHome } = context;
+  const work = await addWork(context);
+  const listed = (listing = accounts.list()) => listing.providers.find((provider) => provider.provider === "claude").accounts.find((account) => account.id === work.id);
+  const [signedOutHome, otherHome] = ["signed-out", "other"].map((name) => { const home = path.join(root, name); mkdirSync(home); return home; });
+  // Work's directory is replaced by a link to `target`, or restored (null).
+  const pointTo = (target) => {
+    if (lstatSync(workHome).isSymbolicLink()) unlinkSync(workHome);
+    else renameSync(workHome, path.join(root, "work-original"));
+    if (target) symlinkSync(target, workHome);
+    else renameSync(path.join(root, "work-original"), workHome);
+  };
+  // A Check of Work starts under its original directory, signed in, and is
+  // held while the directory is repointed.
+  const heldRefresh = async () => {
+    let release;
+    logins.set(workHome, () => new Promise((resolve) => { release = () => resolve(signedIn("work@example.com")); }));
+    const refreshing = accounts.refresh(work.id);
+    await tick();
+    assert.equal(probe.calls.at(-1).environment.CLAUDE_CONFIG_DIR, workHome);
+    return { refreshing, release: () => release() };
+  };
+
+  // (i) Repointed to a signed-out home, the switch checks that home.
+  let held = await heldRefresh();
+  pointTo(signedOutHome);
+  logins.set(workHome, signedOut);
+  const switching = accounts.activate({ provider: "claude", accountId: work.id });
+  await tick();
+  held.release();
+  await assert.rejects(switching, (error) => error.details.code === "PROVIDER_ACCOUNT_SWITCH_FAILED" && /signed out/.test(error.message));
+  assert.equal(context.claude().activeAccountId, "claude:default");
+  assert.notEqual(listed(await held.refreshing).login.identity?.email, "work@example.com", "the Check's listing never shows the old directory's login");
+
+  // (ii) The same with Work active: the send is refused.
+  pointTo(null);
+  logins.set(workHome, signedIn("work@example.com"));
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  const chat = context.conversation();
+  held = await heldRefresh();
+  pointTo(signedOutHome);
+  logins.set(workHome, signedOut);
+  const sending = accounts.assertLaunchable({ provider: "claude", conversationId: chat.id });
+  await tick();
+  held.release();
+  await assert.rejects(sending, (error) => error.details.code === "PROVIDER_ACCOUNT_SIGNED_OUT");
+  await held.refreshing;
+
+  // (iii) Repointed to a home signed in as someone else, the switch and send
+  // go ahead and the run records that login.
+  pointTo(null);
+  logins.set(workHome, signedIn("work@example.com"));
+  await accounts.activate({ provider: "claude", accountId: "claude:default" });
+  await accounts.refresh(work.id);
+  held = await heldRefresh();
+  pointTo(otherHome);
+  logins.set(workHome, signedIn("other@example.com"));
+  const switched = accounts.activate({ provider: "claude", accountId: work.id });
+  await tick();
+  held.release();
+  assert.equal(listed(await switched).login.identity.email, "other@example.com");
+  await held.refreshing;
+  assert.equal((await accounts.assertLaunchable({ provider: "claude", conversationId: chat.id })).identity, "other@example.com");
+  const run = context.claudeRun(chat.id);
+  await manager.schedule({ conversation: chat, run });
+  assert.deepEqual([database.getRun(run.id).accountIdentity, database.getRun(run.id).accountHome], ["other@example.com", otherHome]);
+  await context.finish(spawned.length - 1);
+
+  // (iv) A probe during which the directory is swapped is kept for neither
+  // directory: back on the original, the original's own check is shown.
+  pointTo(null);
+  logins.set(workHome, signedIn("work@example.com"));
+  await accounts.refresh(work.id);
+  logins.set(workHome, () => {
+    pointTo(otherHome);
+    logins.set(workHome, signedIn("other@example.com"));
+    return signedIn("other@example.com");
+  });
+  await accounts.refresh(work.id);
+  pointTo(null);
+  assert.notEqual(listed().login.identity?.email, "other@example.com", "the swapped probe's login is not the original directory's");
 });
 
 test("a session or recovery never continues under another credential source, and each source keeps its own usage", async (t) => {
