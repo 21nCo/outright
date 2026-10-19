@@ -1,29 +1,29 @@
 docs/out-28-provider-accounts.md
-  s_7d0a48f0aaecda::t_c0f696a44ce063 15,17,27
+  s_7d0a48f0aaecda::t_3e56b9b0d06681 15,17,27
 docs/out-3-execution-adapters.md
-  s_7d0a48f0aaecda::t_5b6cfb2ce5f513 15
+  s_7d0a48f0aaecda::t_a5a2f5c272d22e 15
 server/execution-adapters/claude.mjs
-  s_7d0a48f0aaecda::t_1ba2a6338d41e9 51-52,55
+  s_7d0a48f0aaecda::t_b9faa22aa856d7 51-52,55
 server/execution-adapters/codex.mjs
-  s_7d0a48f0aaecda::t_56e1f8ab9f88aa 41-46
+  s_7d0a48f0aaecda::t_e090b9fa1d827d 41-46
 server/execution-adapters/contract.mjs
-  s_7d0a48f0aaecda::t_79b9030bc7e5fa 75-77,83-85,119-120
+  s_7d0a48f0aaecda::t_24b5f0aabcaf12 75-77,83-85,119-120
 server/provider-accounts.mjs
-  s_7d0a48f0aaecda::t_adc1bb82f347bc 2,24-26,65,108-111,120,155-157,161,230-238,247,303-304,308,317-318,421-427,429-431,433
+  s_7d0a48f0aaecda::t_ba526fec314663 2,24-26,65,108-111,120,155-157,161,230-238,247,303-304,308,317-318,421-427,429-431,433
 server/provider-accounts.test.mjs
-  s_7d0a48f0aaecda::t_26b2e6da03085a 4,10,29-45,63,392,910-1037
+  s_7d0a48f0aaecda::t_6c8154cf98fb0c 4,10,29-45,63,392,910-1037
 src/components/ProviderAccounts.jsx
-  s_7d0a48f0aaecda::t_08f802c3c0e574 122-127
+  s_7d0a48f0aaecda::t_f74273a8acee7b 122-127
 src/lib/provider-accounts.js
-  s_7d0a48f0aaecda::t_a1607605941c09 14-15,17-21
+  s_7d0a48f0aaecda::t_c76b250e3857e0 14-15,17-21
 tests/ui-accessibility.test.mjs
-  s_7d0a48f0aaecda::t_e7eef5108d762b 149-151
+  s_7d0a48f0aaecda::t_f1345ab33d7e64 149-151
 tests/ui-races.jsx
-  s_7d0a48f0aaecda::t_98a30c16203e22 1222-1264,5980
+  s_7d0a48f0aaecda::t_c84005c3d59dfb 1222-1264,5980
 tests/ui-races.test.mjs
-  s_7d0a48f0aaecda::t_95a8be9802daba 899
+  s_7d0a48f0aaecda::t_c99ab13fc82c81 899
 server/execution-adapters.test.mjs
-  s_7d0a48f0aaecda::t_a89e8e53e0a5fe 823-824,836,839-846
+  s_7d0a48f0aaecda::t_cea003950a0154 823-824,836,839-846
 ---
 {
   "schema_version": "authorship/3.0.0",
