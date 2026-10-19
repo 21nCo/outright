@@ -1,0 +1,39 @@
+docs/out-28-provider-accounts.md
+  s_a25202d86907e1::t_21e8c7bb874e5f 15-17,25,39,41,47,59
+server/database.mjs
+  s_a25202d86907e1::t_3496042d5c65b6 80,2327-2329,2335,2337-2338,2340,2342,2347-2348,2351,2840,2852-2867
+server/provider-accounts.mjs
+  s_a25202d86907e1::t_52e3c393c0b2e3 86-88,93-96,101-103,105-115,119-126,129-130,132,135-136,138-151,155,177-180,219,232,296-298,309-314,349,355-356,366-369,372-373,388
+server/provider-accounts.test.mjs
+  s_a25202d86907e1::t_6cbadc5872c541 652,695-817
+src/App.jsx
+  s_a25202d86907e1::t_a3ec5032510973 88-90,650-651,1943
+src/components/ProviderAccounts.jsx
+  s_a25202d86907e1::t_41dad9565a3e0c 4,7-9,12-13,18,51-53,58-60,66-67,144-145,148
+src/components/SettingsDialog.jsx
+  s_a25202d86907e1::t_0526156eaf808d 10,231
+src/lib/provider-accounts.js
+  s_a25202d86907e1::t_00b9d19a231380 20,71-86
+tests/ui-accessibility.test.mjs
+  s_a25202d86907e1::t_0057aa638c309b 170-201
+tests/ui-races.jsx
+  s_a25202d86907e1::t_f266586bb55456 1185-1221,5936
+tests/ui-races.test.mjs
+  s_a25202d86907e1::t_8566ce4d886b95 899
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f5f2b26a7c0f875a7c6bfb83326cfcbf1a3d8007",
+  "prompts": {},
+  "sessions": {
+    "s_a25202d86907e1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_a25202d86907e1",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
