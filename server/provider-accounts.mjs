@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import os from "node:os";
@@ -76,6 +77,9 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
   let notifyTimer = null;
   // One listing resolves each home once, however many accounts share it.
   let listingKeys = null;
+  // Orders this runtime's listings as they were computed, so a client never
+  // shows one over a listing computed after it, whichever arrives last.
+  const listingRevision = { runtime: randomUUID(), sequence: 0 };
   const closing = new AbortController();
 
   function notify() {
@@ -289,6 +293,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     const now = clock();
     const stored = database.listProviderAccounts();
     return {
+      revision: { runtime: listingRevision.runtime, sequence: ++listingRevision.sequence },
       generatedAt: new Date(now).toISOString(),
       limitStaleAfterMs: LIMIT_STALE_AFTER_MS,
       providers: adapters.map((adapter) => {

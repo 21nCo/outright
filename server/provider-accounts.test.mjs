@@ -437,7 +437,7 @@ test("a session from before accounts resumes with the default login, and an atta
   const chat = context.conversation();
   // A pre-upgrade run created the session and has no recorded account.
   const legacy = context.claudeRun(chat.id);
-  database.updateRun(legacy.id, { status: "completed", providerSessionId: "legacy-session" });
+  database.updateRun(legacy.id, { status: "completed", providerSessionId: "legacy-session", startedAt: new Date().toISOString() });
   database.updateConversation(chat.id, { providerSessionId: "legacy-session" });
   const work = await addWork(context);
   await accounts.activate({ provider: "claude", accountId: work.id });
@@ -456,6 +456,52 @@ test("a session from before accounts resumes with the default login, and an atta
   assert.equal(spawned[1].env.CLAUDE_CONFIG_DIR, context.workHome);
   assert.equal(database.getRun(attached.id).accountId, work.id);
   await context.finish(1);
+});
+
+test("listings are ordered by the runtime that computed them, actions included", async (t) => {
+  const context = await fixture(t);
+  const first = context.accounts.list().revision;
+  const work = await addWork(context);
+  const switched = (await context.accounts.activate({ provider: "claude", accountId: work.id })).revision;
+  const after = context.accounts.list().revision;
+  assert.equal(switched.runtime, first.runtime);
+  assert.equal(after.runtime, first.runtime);
+  assert.ok(first.sequence < switched.sequence && switched.sequence < after.sequence);
+  // A restarted runtime is another sequence.
+  const restarted = createProviderAccounts({ database: context.database, probe: context.probe, environment: context.environment });
+  t.after(() => restarted.close());
+  assert.notEqual(restarted.list().revision.runtime, first.runtime);
+});
+
+test("a run that never launched does not own the session it carries", async (t) => {
+  const context = await fixture(t);
+  const { accounts, database, manager, spawned } = context;
+  const work = await addWork(context);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  const chat = context.conversation();
+  // A session attached by hand; its first run is interrupted before it launches.
+  database.updateConversation(chat.id, { providerSessionId: "attached-session" });
+  const queued = database.createRun({ conversationId: chat.id, provider: "claude", approvalPolicy: "read-only", prompt: "hello", providerSessionId: "attached-session" });
+  database.updateRun(queued.id, { status: "interrupted" });
+  const target = { provider: "claude", conversationId: chat.id, sessionId: "attached-session" };
+  assert.equal((await accounts.assertLaunchable(target)).id, work.id);
+
+  const recovery = database.beginInterruptedRunRecovery(queued.id, "resume-session", { providerSessionId: "attached-session" });
+  assert.equal(recovery.run.accountPinId, null);
+  // The recovery's own unlaunched row does not make the session a pre-accounts one.
+  assert.equal(accounts.resolve(target).id, work.id);
+  await manager.schedule({ conversation: database.getConversation(chat.id), run: recovery.run });
+  assert.ok(spawned[0].args.includes("attached-session"));
+  assert.equal(spawned[0].env.CLAUDE_CONFIG_DIR, context.workHome);
+  assert.deepEqual([database.getRun(recovery.run.id).accountId, database.getRun(recovery.run.id).accountHome], [work.id, context.workHome]);
+  await context.finish(0);
+
+  // Once launched, the run owns the session, and its home is checked on resume.
+  await accounts.activate({ provider: "claude", accountId: "claude:default" });
+  assert.equal(accounts.resolve(target).id, work.id);
+  rmSync(context.workHome, { recursive: true });
+  symlinkSync(context.inheritedHome, context.workHome);
+  assert.throws(() => accounts.resolve(target), (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(context.inheritedHome));
 });
 
 test("the default login's home is recorded, so a changed environment neither resumes nor shares its usage", async (t) => {

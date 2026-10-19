@@ -1262,6 +1262,66 @@ async function providerAccountsAddKeepsNewerDraftRegression() {
   await until(() => field("Account name").value === "" && field("CODEX_HOME directory").value === "", "an unchanged submitted draft is cleared");
 }
 
+// A switch's response computed before another client's switch must not
+// replace the listing that switch produced, and must not drop a load that
+// started after the switch.
+async function providerAccountsResponseOrderRegression() {
+  root.render(null); await settle();
+  let sequence = 0;
+  let active = "codex:default";
+  const listing = () => ({ revision: { runtime: "runtime-1", sequence: ++sequence }, generatedAt: new Date().toISOString(), limitStaleAfterMs: 1_800_000,
+    providers: [{ provider: "codex", label: "Codex", kind: "harness", homeVariable: "CODEX_HOME", switchable: true, usageLimits: false, activeAccountId: active,
+      accounts: ["Default login", "Work", "Personal"].map((label) => {
+        const id = label === "Default login" ? "codex:default" : `codex:${label}`;
+        return { id, label, isDefault: id === "codex:default", homePath: id === "codex:default" ? null : `/homes/${label}`, active: id === active, sameAsDefault: false,
+          login: { status: "signed-in", identity: null, error: null, checkedAt: null }, measured: [], limits: null };
+      }) }] });
+  let put = null;
+  let held = null;
+  route = async (url, init) => {
+    if (url.pathname === "/api/provider-accounts/active" && init?.method === "PUT") {
+      active = JSON.parse(init.body).accountId;
+      const value = listing();
+      put = deferred();
+      return put.promise.then(() => response(value));
+    }
+    if (url.pathname !== "/api/provider-accounts") return response({});
+    const value = listing();
+    if (held) return held.promise.then(() => response(value));
+    return response(value);
+  };
+  const onError = (error) => { throw error; };
+  const render = (accountsVersion) => root.render(<TooltipProvider><ProviderAccounts open runtimeEvent={null} accountsVersion={accountsVersion} onError={onError} /></TooltipProvider>);
+  render(0);
+  const activeLabel = () => [...host.querySelectorAll(".provider-accounts strong")].find((line) => line.textContent.endsWith("(active)"))?.textContent ?? "";
+  const use = (label) => [...host.querySelectorAll("button")].find((button) => button.getAttribute("aria-label") === `Use ${label} for new Codex sessions`);
+  await until(() => activeLabel() === "Codex · Default login (active)" && use("Work"), "the default login is active");
+  use("Work").click();
+  await until(() => put, "the switch to Work was sent");
+  // Another client switches to Personal; its change reloads this listing.
+  active = "codex:Personal";
+  render(1);
+  await until(() => activeLabel() === "Codex · Personal (active)", "the other client's switch is shown");
+  put.resolve();
+  await until(() => host.querySelector('[role="status"]')?.textContent === "Codex now starts new sessions with Work.", "the delayed switch response arrived");
+  await settle();
+  assert(activeLabel() === "Codex · Personal (active)", `a response computed before the newer listing replaced it: ${activeLabel()}`);
+
+  // A load that starts while a switch is pending and answers after it is kept.
+  put = null;
+  use("Work").click();
+  await until(() => put, "the second switch was sent");
+  held = deferred();
+  active = "codex:default";
+  render(2);
+  await settle();
+  put.resolve();
+  await until(() => host.querySelector('[role="status"]')?.textContent === "Codex now starts new sessions with Work.", "the second switch response arrived");
+  held.resolve();
+  held = null;
+  await until(() => activeLabel() === "Codex · Default login (active)", "the load computed after the switch is shown");
+}
+
 async function settingsCapacityAndDeletionOrderRegression() {
   root.render(null);
   await settle();
@@ -4656,12 +4716,27 @@ async function queuedRunAccountRegression() {
   root.render(<TooltipProvider><App /></TooltipProvider>);
   const header = () => host.querySelector(".conversation-header .conversation-meta small")?.textContent ?? "";
   await until(() => header().startsWith("queued"), "the queued run is shown");
-  assert(!header().includes("Work"), "a queued run has no account yet");
+  assert(!header().includes("Work") && !host.querySelector(".message.is-streaming .message-run"), "a queued run has no account yet");
   const reads = detailReads;
   fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-queued",
     payload: { type: "run.started", payload: { provider: "codex", account: { id: "account-work", label: "Work", identity: "work@example.com" } } } }) }));
   await until(() => header().includes("Work (work@example.com)"), "the started run names its account before it ends");
   assert(detailReads === reads, "the account is applied without reloading the conversation");
+  // The header summary is hidden at 920px and below; the running run still
+  // names its account, visibly and to assistive technology, before any answer.
+  const running = () => host.querySelector(".message.is-streaming .message-run");
+  if (window.__fixtureSetViewport) {
+    try {
+      await window.__fixtureSetViewport(900);
+      await until(() => window.innerWidth === 900, "real 900px layout");
+      window.dispatchEvent(new Event("resize"));
+      await settle();
+      assert(!host.querySelector(".conversation-header .conversation-meta small")?.checkVisibility(), "the header run summary is hidden at 900px");
+      const bounds = running()?.getBoundingClientRect();
+      assert(running()?.checkVisibility() && bounds.width > 0 && bounds.height > 0, "the running run's account is not visible at 900px");
+      assert(running().textContent === "codex · Work (work@example.com)", `the running run names another account: ${running()?.textContent}`);
+    } finally { await window.__fixtureSetViewport(1280); }
+  } else assert(running()?.textContent === "codex · Work (work@example.com)", "the running run names its account");
   root.render(null); await settle();
 }
 
@@ -6001,7 +6076,8 @@ try {
     ["provider accounts window aging", providerAccountsWindowAgingRegression, "an open account list drops a run that leaves the 5-hour window without any event"],
     ["provider accounts failed reload", providerAccountsFailedReloadRegression, "a failed reload marks an expired measured total out of date, and account changes reload without the runtime event"],
     ["provider accounts add keeps newer draft", providerAccountsAddKeepsNewerDraftRegression, "a successful add clears only the draft it submitted"],
-    ["queued run account", queuedRunAccountRegression, "a run queued without an account names the account its launch reports before it ends"],
+    ["provider accounts response order", providerAccountsResponseOrderRegression, "a delayed account action response never replaces a listing computed after it"],
+    ["queued run account", queuedRunAccountRegression, "a run queued without an account names the account its launch reports before it ends, also on narrow screens"],
     ["settings capacity and deletion order", settingsCapacityAndDeletionOrderRegression, "new capacity wins reordered responses and deletion owns its confirmation"],
     ["settings template completion", settingsTemplateCompletionRegression, "a successful template POST clears its submitted draft after reopening"],
     ["notification permission rejection", rejectedNotificationPermissionRegression, "a rejected permission request does not disrupt Settings save or escape as an unhandled rejection"],

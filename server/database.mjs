@@ -2323,11 +2323,15 @@ export function createOutrightDatabase(options = {}) {
     // The account a session belongs to, so resuming it keeps that account:
     // the latest run that launched in it. A session created only by runs from
     // before accounts used the default login, whose home was not recorded
-    // (`home` undefined). Null for a session no run created (attached by hand).
+    // (`home` undefined). A run that never launched (a queued run or a
+    // recovery that carries the session) does not own it. Null for a session
+    // no run in this chat launched in (attached by hand); ownership is looked
+    // up per chat.
     sessionAccount(conversationId, provider, sessionId) {
       if (!sessionId) return null;
       const row = db.prepare(`SELECT account.account_id AS accountId, account.home_path AS home FROM runs LEFT JOIN run_accounts AS account ON account.run_id = runs.id
         WHERE runs.conversation_id = ? AND runs.provider = ? AND runs.provider_session_id = ?
+          AND (account.account_id IS NOT NULL OR runs.started_at IS NOT NULL)
         ORDER BY account.account_id IS NULL, runs.created_at DESC, runs.rowid DESC LIMIT 1`).get(conversationId, provider, sessionId);
       if (!row) return null;
       return row.accountId ? { accountId: row.accountId, home: row.home } : { accountId: defaultProviderAccountId(provider), home: undefined };

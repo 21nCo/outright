@@ -22,7 +22,10 @@ export function ProviderAccounts({ open, runtimeEvent, accountsVersion = 0, onEr
   const [message, setMessage] = useState({ status: "", alert: "" });
   const [draft, setDraft] = useState({ provider: "", label: "", homePath: "" });
   const [pendingRemove, setPendingRemove] = useState(null);
-  const requestRef = useRef(0);
+  // Closing Settings drops loads in flight; the shown listing's revision
+  // keeps any response from replacing a listing computed after it.
+  const generationRef = useRef(0);
+  const shownRef = useRef(null);
   const cancelRemoveRef = useRef(null);
   const removeTriggerRef = useRef(null);
   const nameInputRef = useRef(null);
@@ -35,12 +38,19 @@ export function ProviderAccounts({ open, runtimeEvent, accountsVersion = 0, onEr
   // returning to a hidden tab, the listing is loaded again.
   const [now, setNow] = useState(() => Date.now());
 
+  function show(value, beforeShow) {
+    const next = receivedListing(value);
+    if (isOlderListing(next, shownRef.current)) return;
+    beforeShow?.();
+    shownRef.current = next;
+    setListing(next);
+  }
   function load() {
-    const request = ++requestRef.current;
-    return api("/api/provider-accounts").then((value) => { if (request === requestRef.current) setListing(receivedListing(value)); });
+    const generation = generationRef.current;
+    return api("/api/provider-accounts").then((value) => { if (generation === generationRef.current) show(value); });
   }
   useEffect(() => {
-    if (!open) { requestRef.current += 1; return; }
+    if (!open) { generationRef.current += 1; return; }
     setMessage({ status: "", alert: "" });
     setPendingRemove(null);
     load().catch(onError);
@@ -98,9 +108,8 @@ export function ProviderAccounts({ open, runtimeEvent, accountsVersion = 0, onEr
     setMessage({ status: "", alert: "" });
     try {
       const value = await request();
-      beforeUpdate?.();
-      requestRef.current += 1;
-      setListing(receivedListing(value));
+      // Loads still in flight are kept: one computed after this action is newer.
+      show(value, beforeUpdate);
       setMessage({ status: success, alert: "" });
       return true;
     } catch (error) {
@@ -174,6 +183,13 @@ export function ProviderAccounts({ open, runtimeEvent, accountsVersion = 0, onEr
 // The receipt time maps the client's clock onto the runtime's.
 function receivedListing(value) {
   return { ...(Array.isArray(value?.providers) ? value : { providers: [] }), receivedAt: Date.now() };
+}
+
+// Listings from one runtime are ordered by their revision; one without a
+// revision, or from another runtime (a restart), is taken as it arrives.
+function isOlderListing(next, shown) {
+  const [a, b] = [next?.revision, shown?.revision];
+  return Boolean(a && b && a.runtime === b.runtime && Number.isFinite(a.sequence) && Number.isFinite(b.sequence) && a.sequence < b.sequence);
 }
 
 function accountLimitsText(provider, account, now, staleAfterMs) {
