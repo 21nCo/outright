@@ -65,14 +65,15 @@ const RETAINED_COLUMNS = [
   ["provider_account_selection", "provider, account_id"],
   ["provider_limit_windows", "account_id, provider, window_name, utilization, status, resets_at, observed_at, run_id, home_path"],
   ["run_accounts", "run_id, account_id, account_label, account_identity, bound_at, home_path"],
-  ["run_account_pins", "run_id, account_id, home_path"],
+  ["run_account_pins", "run_id, account_id, home_path, home_known"],
 ];
 const RUN_RETAINED_FIELDS = RETAINED_COLUMNS.find(([name]) => name === "runs")[1];
 // The account a run launched with, and the CLI home it used (null: the
 // CLI's standard home). A run that never launched has none. A recovery run
-// is pinned to the account of the run it continues until it launches.
+// is pinned to the account of the run it continues until it launches; a
+// pin to a run from before accounts does not know that run's home.
 const RUN_ACCOUNT_FIELDS = `account.account_id AS accountId, account.account_label AS accountLabel, account.account_identity AS accountIdentity,
-  account.home_path AS accountHome, pin.account_id AS accountPinId, pin.home_path AS accountPinHome`;
+  account.home_path AS accountHome, pin.account_id AS accountPinId, pin.home_path AS accountPinHome, pin.home_known AS accountPinHomeKnown`;
 const RUN_ACCOUNT_JOINS = "LEFT JOIN run_accounts AS account ON account.run_id = runs.id LEFT JOIN run_account_pins AS pin ON pin.run_id = runs.id";
 const PROVIDER_ACCOUNT_FIELDS = "id, provider, label, home_path AS homePath, created_at AS createdAt";
 const MAX_ACCOUNTS_PER_PROVIDER = 16;
@@ -1938,12 +1939,13 @@ export function createOutrightDatabase(options = {}) {
           providerSessionId: decision === "resume-session" ? providerSessionId : null,
         });
         // The recovery continues on the interrupted run's account. The pin is
-        // durable, so a restart before it launches cannot lose it.
-        const accountId = interrupted.accountId ?? interrupted.accountPinId;
-        if (accountId) {
-          db.prepare("INSERT INTO run_account_pins (run_id, account_id, home_path) VALUES (?, ?, ?)")
-            .run(run.id, accountId, interrupted.accountId ? interrupted.accountHome : interrupted.accountPinHome);
-        }
+        // durable, so a restart before it launches cannot lose it. A run that
+        // launched before accounts used the default login in an unrecorded
+        // home; a run that never launched has no account to keep.
+        const pin = interrupted.accountId ? [interrupted.accountId, interrupted.accountHome, 1]
+          : interrupted.accountPinId ? [interrupted.accountPinId, interrupted.accountPinHome, interrupted.accountPinHomeKnown]
+            : interrupted.startedAt ? [defaultProviderAccountId(interrupted.provider), null, 0] : null;
+        if (pin) db.prepare("INSERT INTO run_account_pins (run_id, account_id, home_path, home_known) VALUES (?, ?, ?, ?)").run(run.id, ...pin);
         writeCriticalAudit(`agent.run.recovery.${decision}`, { target: run.id, recoveredFrom: id, conversationId: interrupted.conversationId, recoveryClass: interrupted.recoveryClass,
           ...(model !== undefined && model !== interrupted.model ? { modelCorrected: true } : {}) });
         return { interrupted: this.getRun(id), run: this.getRun(run.id), conversation: this.getConversation(interrupted.conversationId) };
@@ -2349,10 +2351,11 @@ export function createOutrightDatabase(options = {}) {
     // What Outright measured for runs launched with an account since a time.
     // Runs without reported cost or tokens are counted, so a sum is never
     // mistaken for a complete total; a sum nothing reported is null.
+    // The oldest counted launch says when the window next loses a run.
     measuredAccountUsage(accountId, since, home = null) {
       return db.prepare(`SELECT COUNT(*) AS runs, SUM(runs.input_tokens) AS inputTokens, SUM(runs.output_tokens) AS outputTokens,
         COALESCE(SUM(runs.input_tokens IS NULL OR runs.output_tokens IS NULL), 0) AS runsWithoutTokens,
-        SUM(runs.cost_usd) AS costUsd, COALESCE(SUM(runs.cost_usd IS NULL), 0) AS runsWithoutCost
+        SUM(runs.cost_usd) AS costUsd, COALESCE(SUM(runs.cost_usd IS NULL), 0) AS runsWithoutCost, MIN(account.bound_at) AS oldestBoundAt
         FROM run_accounts AS account JOIN runs ON runs.id = account.run_id
         WHERE account.account_id = ? AND account.home_path IS ? AND account.bound_at >= ?`).get(accountId, home, since);
     },
@@ -2839,12 +2842,16 @@ function migrate(db, onSpacesMigrationStep) {
     );
     CREATE INDEX IF NOT EXISTS run_accounts_usage ON run_accounts(account_id, bound_at);
     CREATE TABLE IF NOT EXISTS run_account_pins (
-      run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, account_id TEXT NOT NULL, home_path TEXT
+      run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, account_id TEXT NOT NULL, home_path TEXT,
+      home_known INTEGER NOT NULL DEFAULT 1
     );
   `);
   // Account tables written before launch homes were recorded.
   for (const table of ["provider_limit_windows", "run_accounts"]) {
     if (!db.pragma(`table_info(${table})`).some((column) => column.name === "home_path")) db.exec(`ALTER TABLE ${table} ADD COLUMN home_path TEXT`);
+  }
+  if (!db.pragma("table_info(run_account_pins)").some((column) => column.name === "home_known")) {
+    db.exec("ALTER TABLE run_account_pins ADD COLUMN home_known INTEGER NOT NULL DEFAULT 1");
   }
   db.prepare("INSERT OR IGNORE INTO audit_retention_cursor (id) VALUES (1)").run();
   prepareAuditEvidence(db, hadAudit);

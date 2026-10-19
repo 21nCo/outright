@@ -8,6 +8,7 @@ import { WindowedMessages } from "../src/components/WindowedMessages.jsx";
 import { WindowedDiff } from "../src/components/WindowedDiff.jsx";
 import { CommandPalette } from "../src/components/CommandPalette.jsx";
 import { SettingsDialog } from "../src/components/SettingsDialog.jsx";
+import { ProviderAccounts } from "../src/components/ProviderAccounts.jsx";
 import { TerminalPane } from "../src/components/TerminalPane.jsx";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
 import { scheduleLayoutTick } from "../src/lib/windowing.js";
@@ -1154,6 +1155,31 @@ async function settingsCapacityWithoutEventRegression() {
   await new Promise((resolve) => setTimeout(resolve, 2200));
   assert(reads === readsAtClose, "closed Settings kept polling capacity");
   } finally { liveObserver.disconnect(); }
+}
+
+// No run or account event arrives when a run ages out of a rolling window.
+async function providerAccountsWindowAgingRegression() {
+  root.render(null); await settle();
+  const changesAt = Date.now() + 1200;
+  let reads = 0;
+  const period = (runs) => ({ period: "5h", label: "Last 5 hours", since: "", changesAt: runs ? new Date(changesAt).toISOString() : null,
+    runs, inputTokens: runs ? 10 : null, outputTokens: runs ? 5 : null, runsWithoutTokens: 0, costUsd: null, runsWithoutCost: runs });
+  route = async (url) => {
+    if (url.pathname !== "/api/provider-accounts") return response({});
+    reads += 1;
+    const runs = Date.now() < changesAt ? 1 : 0;
+    return response({ generatedAt: new Date().toISOString(), limitStaleAfterMs: 1_800_000, providers: [{ provider: "codex", label: "Codex", kind: "harness",
+      homeVariable: "CODEX_HOME", switchable: true, usageLimits: false, activeAccountId: "codex:default",
+      accounts: [{ id: "codex:default", label: "Default login", isDefault: true, homePath: null, active: true,
+        login: { status: "signed-in", identity: null, error: null, checkedAt: null }, measured: [period(runs)], limits: null }] }] });
+  };
+  const onError = (error) => { throw error; };
+  root.render(<TooltipProvider><ProviderAccounts open runtimeEvent={null} onError={onError} /></TooltipProvider>);
+  const measured = () => [...host.querySelectorAll(".provider-accounts small")].find((line) => line.textContent.startsWith("Measured by Outright"))?.textContent ?? "";
+  await until(() => measured().includes("1 run"), "the run in the 5-hour window is shown");
+  await until(() => measured().endsWith("No runs"), "the run leaves the shown 5-hour total when it ages out");
+  assert(reads === 2, `the listing is read once more at the window change, not ${reads} times`);
+  await remainsTrue(() => reads === 2, 1500, "an unchanging listing is not polled");
 }
 
 async function settingsCapacityAndDeletionOrderRegression() {
@@ -5869,6 +5895,7 @@ try {
     ["bootstrap error ownership", bootstrapRefreshErrorOwnershipRegression, "a background bootstrap cannot dismiss an unrelated operation error"],
     ["settings migration completion", settingsMigrationCompletionRegression, "an open Settings dialog refreshes capacity when migration finishes"],
     ["settings live capacity", settingsCapacityWithoutEventRegression, "an open Settings dialog reads another client's quota changes without a capacity event"],
+    ["provider accounts window aging", providerAccountsWindowAgingRegression, "an open account list drops a run that leaves the 5-hour window without any event"],
     ["settings capacity and deletion order", settingsCapacityAndDeletionOrderRegression, "new capacity wins reordered responses and deletion owns its confirmation"],
     ["settings template completion", settingsTemplateCompletionRegression, "a successful template POST clears its submitted draft after reopening"],
     ["notification permission rejection", rejectedNotificationPermissionRegression, "a rejected permission request does not disrupt Settings save or escape as an unhandled rejection"],

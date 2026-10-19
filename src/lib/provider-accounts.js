@@ -44,19 +44,28 @@ export function ageLimit(limit, now, staleAfterMs) {
   return { ...limit, state: now - Date.parse(limit.observedAt) > staleAfterMs ? "stale" : "current" };
 }
 
-// When the next limit in a listing resets or becomes stale, or null.
-export function nextLimitChange(listing, now) {
+// When a listing next changes with time alone, or null: a limit resets or
+// turns stale, or a run leaves a measured window.
+export function nextListingChange(listing, now) {
   let next = Number.POSITIVE_INFINITY;
+  const consider = (at) => { if (Number.isFinite(at) && at > now) next = Math.min(next, at); };
   for (const provider of listing?.providers ?? []) {
     for (const account of provider.accounts ?? []) {
       for (const limit of account.limits ?? []) {
-        const resetsAt = limit.resetsAt ? Date.parse(limit.resetsAt) : Number.NaN;
-        const staleAt = Date.parse(limit.observedAt) + listing.limitStaleAfterMs + 1;
-        for (const at of [resetsAt, staleAt]) if (Number.isFinite(at) && at > now) next = Math.min(next, at);
+        consider(limit.resetsAt ? Date.parse(limit.resetsAt) : Number.NaN);
+        consider(Date.parse(limit.observedAt) + listing.limitStaleAfterMs + 1);
       }
+      for (const period of account.measured ?? []) consider(period.changesAt ? Date.parse(period.changesAt) : Number.NaN);
     }
   }
   return Number.isFinite(next) ? next : null;
+}
+
+// The runtime's time for a listing received at `receivedAt`, so a client
+// clock that differs from the runtime's ages nothing early or late.
+export function listingTime(listing, receivedAt, now) {
+  const generatedAt = Date.parse(listing?.generatedAt);
+  return Number.isFinite(generatedAt) && Number.isFinite(receivedAt) ? generatedAt + (now - receivedAt) : now;
 }
 
 export function measuredText(period) {

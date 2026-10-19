@@ -103,7 +103,7 @@ test("provider controls explain readiness and only offer supported choices", asy
 });
 
 test("account usage keeps measured, reported, stale and unknown values distinct", async () => {
-  const { ageLimit, answerAccountText, limitText, limitWindowLabel, loginText, measuredText, nextLimitChange, runAccountText } = await import("../src/lib/provider-accounts.js");
+  const { ageLimit, answerAccountText, limitText, limitWindowLabel, listingTime, loginText, measuredText, nextListingChange, runAccountText } = await import("../src/lib/provider-accounts.js");
   const time = (value) => value.slice(11, 16);
   const window = { window: "five_hour", utilization: 0.86, status: "allowed", resetsAt: "2026-10-19T15:00:00.000Z", observedAt: "2026-10-19T10:00:00.000Z" };
   assert.equal(limitText({ ...window, state: "current" }, time), "86% used · resets 15:00");
@@ -128,10 +128,18 @@ test("account usage keeps measured, reported, stale and unknown values distinct"
   assert.deepEqual([ageLimit(current, observed + staleAfterMs + 1, staleAfterMs).state, ageLimit(current, observed + staleAfterMs + 1, staleAfterMs).utilization], ["stale", 0.86]);
   const reset = ageLimit(current, Date.parse(window.resetsAt), staleAfterMs);
   assert.deepEqual([reset.state, reset.utilization, reset.status], ["reset", null, null]);
-  const listing = { limitStaleAfterMs: staleAfterMs, providers: [{ accounts: [{ limits: [current] }, { limits: null }] }] };
-  assert.equal(nextLimitChange(listing, observed), observed + staleAfterMs + 1);
-  assert.equal(nextLimitChange(listing, observed + staleAfterMs + 1), Date.parse(window.resetsAt));
-  assert.equal(nextLimitChange(listing, Date.parse(window.resetsAt)), null);
+  const listing = { limitStaleAfterMs: staleAfterMs, providers: [{ accounts: [{ limits: [current], measured: [] }, { limits: null, measured: [{ changesAt: null }] }] }] };
+  assert.equal(nextListingChange(listing, observed), observed + staleAfterMs + 1);
+  assert.equal(nextListingChange(listing, observed + staleAfterMs + 1), Date.parse(window.resetsAt));
+  assert.equal(nextListingChange(listing, Date.parse(window.resetsAt)), null);
+  // A run leaving a measured window is a change too, and can come first.
+  const leaves = observed + 60_000;
+  listing.providers[0].accounts[1].measured.push({ changesAt: new Date(leaves).toISOString() });
+  assert.equal(nextListingChange(listing, observed), leaves);
+  assert.equal(nextListingChange(listing, leaves), observed + staleAfterMs + 1);
+  // Aging follows the runtime's clock, not a skewed client clock.
+  assert.equal(listingTime({ generatedAt: window.observedAt }, 5_000, 6_000), observed + 1_000);
+  assert.equal(listingTime({ providers: [] }, 5_000, 6_000), 6_000);
   assert.equal(loginText({ status: "signed-in", identity: { email: "a@example.com", plan: "max" } }), "Signed in · a@example.com · max");
   assert.equal(loginText({ status: "unknown", error: "Codex login status could not be checked" }), "Codex login status could not be checked");
   assert.equal(loginText(undefined), "Checking login…");
@@ -152,7 +160,7 @@ test("account usage keeps measured, reported, stale and unknown values distinct"
   assert.match(accounts, /role="status" aria-live="polite">\{message\.status\}/);
   assert.match(accounts, /aria-describedby="provider-account-help"/);
   assert.match(accounts, /<legend className="sr-only">Confirm account removal<\/legend>/);
-  assert.match(accounts, /nextLimitChange\(listing, now\)/);
+  assert.match(accounts, /nextListingChange\(listing, runtimeNow\)/);
   assert.match(accounts, /addEventListener\("visibilitychange"/);
   assert.match(accounts, /ageLimit\(limit, now, staleAfterMs\)/);
 });

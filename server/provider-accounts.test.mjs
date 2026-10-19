@@ -215,8 +215,10 @@ test("a removed session account fails the launch instead of falling back", async
   assert.equal(database.getRun(orphan.id).accountId, null);
   // History keeps the removed account's recorded label.
   assert.equal(database.getRun(first.id).accountLabel, "Work");
-  // A recovery is pinned to the interrupted run's account the same way.
-  await assert.rejects(accounts.assertLaunchable({ provider: "claude", conversationId: chat.id, pin: accountPin(database.getRun(first.id)) }), (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE");
+  // A recovery is pinned to the interrupted run's account the same way. Its
+  // session cannot be cleared to change that, so the error says what can.
+  await assert.rejects(accounts.assertLaunchable({ provider: "claude", conversationId: chat.id, pin: accountPin(database.getRun(first.id)) }),
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && /discard the interrupted run/.test(error.message) && !/session/i.test(error.message));
 });
 
 test("a cached sign-out is checked again before a send is refused", async (t) => {
@@ -314,7 +316,7 @@ test("measured usage counts only runs launched with the account and flags missin
   launch(work.id, context.workHome, { inputTokens: 10, outputTokens: 5 });
   launch("claude:default", context.inheritedHome, { inputTokens: 1000, outputTokens: 1000, costUsd: 9 });
   const measured = (id = work.id) => Object.fromEntries(context.claude().accounts.find((account) => account.id === id).measured.map((period) => [period.period, period]));
-  assert.deepEqual({ ...measured()["5h"], since: undefined, label: undefined }, { period: "5h", since: undefined, label: undefined, runs: 2, inputTokens: 110, outputTokens: 25, runsWithoutTokens: 0, costUsd: 0.5, runsWithoutCost: 1 });
+  assert.deepEqual({ ...measured()["5h"], since: undefined, label: undefined, changesAt: undefined }, { period: "5h", since: undefined, label: undefined, changesAt: undefined, runs: 2, inputTokens: 110, outputTokens: 25, runsWithoutTokens: 0, costUsd: 0.5, runsWithoutCost: 1 });
   // A run that reported no tokens is counted as unreported, never as zero:
   // a partial sum stays partial and nothing reported stays null.
   launch(work.id, context.workHome, {});
@@ -328,8 +330,19 @@ test("measured usage counts only runs launched with the account and flags missin
   database.bindRunAccount(silentRun.id, { id: silent.id, provider: "codex", label: "Silent", home: codexHome });
   const silentUsage = context.accounts.list().providers.find((provider) => provider.provider === "codex").accounts.find((account) => account.id === silent.id).measured[0];
   assert.deepEqual([silentUsage.runs, silentUsage.inputTokens, silentUsage.outputTokens, silentUsage.runsWithoutTokens], [1, null, null, 1]);
+  // The listing says when its oldest run leaves each window; at that moment
+  // the total drops without any run or account event.
+  const oldest = database.listRuns(chat.id).filter((run) => run.accountId === work.id).map((run) => run.createdAt).sort()[0];
+  const leavesAt = Date.parse(measured()["5h"].changesAt);
+  assert.ok(leavesAt > Date.parse(oldest) + 5 * 3_600_000 - 1_000 && leavesAt <= Date.now() + 5 * 3_600_000 + 1);
+  now = leavesAt - 1;
+  assert.equal(measured()["5h"].runs, 3);
+  now = leavesAt;
+  assert.ok(measured()["5h"].runs < 3, "the oldest run left the 5-hour total");
+  assert.equal(Date.parse(measured()["7d"].changesAt) - 7 * 86_400_000, leavesAt - 5 * 3_600_000);
   now += 6 * 3_600_000;
   assert.equal(measured()["5h"].runs, 0);
+  assert.equal(measured()["5h"].changesAt, null, "an empty window has nothing to age out");
   assert.equal(measured()["5h"].costUsd, null, "no runs means no measured cost, not zero");
   assert.equal(measured()["7d"].runs, 3);
 });
@@ -460,7 +473,7 @@ test("a recovery's account pin is durable across a restart before it launches", 
   await accounts.activate({ provider: "claude", accountId: "claude:default" });
 
   const recovery = database.beginInterruptedRunRecovery(first.id, "retry");
-  assert.deepEqual(accountPin(recovery.run), { accountId: work.id, home: context.workHome });
+  assert.deepEqual(accountPin(recovery.run), { accountId: work.id, home: context.workHome, recovery: true });
   // The runtime restarts before the recovery launches; its retry keeps the pin.
   database.updateRun(recovery.run.id, { status: "interrupted" });
   const again = database.beginInterruptedRunRecovery(recovery.run.id, "retry");
@@ -553,4 +566,84 @@ test("on Windows an account home must be inside the user's profile", async (t) =
   await assert.rejects(accounts.add({ provider: "claude", label: "Outside", homePath: context.workHome }), (error) => error.details.code === "PROVIDER_ACCOUNT_INVALID" && /user profile/.test(error.message));
   await accounts.add({ provider: "claude", label: "Inside", homePath: inside });
   assert.ok(accounts.list().providers.find((provider) => provider.provider === "claude").accounts.some((account) => account.label === "Inside"));
+});
+
+test("a recovery of a run launched before accounts stays on the default login, repeatedly", async (t) => {
+  const context = await fixture(t);
+  const { accounts, database, manager, spawned } = context;
+  const chat = context.conversation();
+  // Pre-upgrade: one run launched (no recorded account), one never launched.
+  const launched = context.claudeRun(chat.id);
+  database.updateRun(launched.id, { status: "interrupted", startedAt: new Date().toISOString() });
+  const work = await addWork(context);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+
+  // The runtime's check and the durable pin agree on the default login.
+  assert.deepEqual(accountPin(database.getRun(launched.id)), { accountId: "claude:default", home: undefined, recovery: true });
+  await accounts.assertLaunchable({ provider: "claude", conversationId: chat.id, pin: accountPin(database.getRun(launched.id)) });
+  const first = database.beginInterruptedRunRecovery(launched.id, "retry");
+  assert.deepEqual([first.run.accountPinId, first.run.accountPinHomeKnown], ["claude:default", 0]);
+  // A restart before it launches keeps the pin, home still unknown.
+  database.updateRun(first.run.id, { status: "interrupted" });
+  const second = database.beginInterruptedRunRecovery(first.run.id, "retry");
+  assert.deepEqual(accountPin(second.run), { accountId: "claude:default", home: undefined, recovery: true });
+  await manager.schedule({ conversation: database.getConversation(chat.id), run: second.run, forceFreshSession: true });
+  assert.equal(spawned[0].env.CLAUDE_CONFIG_DIR, context.inheritedHome);
+  assert.deepEqual([database.getRun(second.run.id).accountId, database.getRun(second.run.id).accountHome], ["claude:default", context.inheritedHome]);
+  await context.finish(0);
+  // Interrupted again after launching, it is retried on the same login.
+  database.updateRun(second.run.id, { status: "interrupted" });
+  const third = database.beginInterruptedRunRecovery(second.run.id, "retry");
+  await manager.schedule({ conversation: database.getConversation(chat.id), run: third.run, forceFreshSession: true });
+  assert.equal(spawned[1].env.CLAUDE_CONFIG_DIR, context.inheritedHome);
+  assert.equal(database.getRun(third.run.id).accountId, "claude:default");
+  await context.finish(1);
+
+  // A run that never launched has no account to keep: it uses the active one.
+  const queued = context.claudeRun(chat.id);
+  database.updateRun(queued.id, { status: "interrupted" });
+  assert.equal(accountPin(database.getRun(queued.id)), null);
+  const fresh = database.beginInterruptedRunRecovery(queued.id, "retry");
+  assert.equal(fresh.run.accountPinId, null);
+  await manager.schedule({ conversation: database.getConversation(chat.id), run: fresh.run, forceFreshSession: true });
+  assert.equal(spawned[2].env.CLAUDE_CONFIG_DIR, context.workHome);
+  assert.equal(database.getRun(fresh.run.id).accountId, work.id);
+  await context.finish(2);
+});
+
+test("a recovery whose default-login home changed names actions that work", async (t) => {
+  const context = await fixture(t);
+  const { database, manager } = context;
+  const chat = context.conversation();
+  const first = context.claudeRun(chat.id);
+  await manager.schedule({ conversation: chat, run: first });
+  await context.finish(0, "session-1");
+  database.updateRun(first.id, { status: "interrupted" });
+  const otherHome = path.join(context.root, "other");
+  mkdirSync(otherHome);
+  const restarted = createProviderAccounts({ database, probe: context.probe, environment: { ...context.environment, CLAUDE_CONFIG_DIR: otherHome } });
+  t.after(() => restarted.close());
+  assert.throws(() => restarted.resolve({ provider: "claude", conversationId: chat.id, pin: accountPin(database.getRun(first.id)) }),
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(context.inheritedHome)
+      && /Restore CLAUDE_CONFIG_DIR or discard the interrupted run/.test(error.message) && !/session/i.test(error.message));
+  // A chat session in the same state can still be cleared.
+  assert.throws(() => restarted.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }), /clear the session in chat settings/);
+});
+
+test("off Windows the default login reads only the exact home variable name", async (t) => {
+  const context = await fixture(t);
+  const twin = path.join(context.root, "twin");
+  mkdirSync(twin);
+  context.logins.set(twin, signedIn("twin@example.com"));
+  const environment = { PATH: process.env.PATH, claude_config_dir: twin };
+  const posix = createProviderAccounts({ database: context.database, probe: context.probe, environment, platform: "linux" });
+  const windows = createProviderAccounts({ database: context.database, probe: context.probe, environment, platform: "win32", homeDirectory: context.root });
+  t.after(() => Promise.all([posix.close(), windows.close()]));
+  // The CLI ignores a lowercase twin on POSIX, so the default home is standard.
+  assert.equal(posix.resolve({ provider: "claude", conversationId: "c" }).home, null);
+  assert.equal(windows.resolve({ provider: "claude", conversationId: "c" }).home, twin);
+  // The twin is a separate login there, not the default one.
+  await posix.add({ provider: "claude", label: "Twin", homePath: twin });
+  await assert.rejects(windows.add({ provider: "claude", label: "Twin again", homePath: twin }),
+    (error) => error.details.code === "PROVIDER_ACCOUNT_DUPLICATE");
 });

@@ -45,10 +45,13 @@ export function presentLimitWindow(window, now) {
 }
 
 // The account a run continues with: the one it launched with, or the one a
-// recovery run was pinned to before it launched.
+// recovery run was pinned to before it launched. A run that launched before
+// accounts used the default login in a home nobody recorded (`home`
+// undefined). A run that never launched has none.
 export function accountPin(run) {
-  if (run?.accountId) return { accountId: run.accountId, home: run.accountHome ?? null };
-  if (run?.accountPinId) return { accountId: run.accountPinId, home: run.accountPinHome ?? null };
+  if (run?.accountId) return { accountId: run.accountId, home: run.accountHome ?? null, recovery: true };
+  if (run?.accountPinId) return { accountId: run.accountPinId, home: run.accountPinHomeKnown === 0 ? undefined : run.accountPinHome ?? null, recovery: true };
+  if (run?.startedAt) return { accountId: defaultProviderAccountId(run.provider), home: undefined, recovery: true };
   return null;
 }
 
@@ -79,11 +82,18 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     return adapter;
   }
 
+  // The home variable as the CLI reads it: environment names are exact
+  // except on Windows.
+  function inheritedHome(adapter) {
+    const name = adapter.accounts.homeVariable;
+    if (platform !== "win32") return environment[name] || null;
+    return Object.entries(environment).find(([key]) => key.toUpperCase() === name)?.[1] || null;
+  }
+
   // The home the default login uses: whatever the runtime's environment
   // selects, or null for the CLI's standard home.
   function defaultHome(adapter) {
-    if (!adapter.accounts) return null;
-    return Object.entries(environment).find(([key]) => key.toUpperCase() === adapter.accounts.homeVariable)?.[1] || null;
+    return adapter.accounts ? inheritedHome(adapter) : null;
   }
 
   function accountHome(account, adapter) {
@@ -161,9 +171,13 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       homePath: account.homePath,
       active: account.id === activeId,
       login: checked ?? { status: "checking", identity: null, error: null, checkedAt: null },
+      // A rolling window changes when its oldest run leaves it (`changesAt`),
+      // with no event to announce it; the client lists again then.
       measured: MEASURED_PERIODS.map((period) => {
         const since = new Date(now - period.durationMs).toISOString();
-        return { period: period.id, label: period.label, since, ...database.measuredAccountUsage(account.id, since, home) };
+        const { oldestBoundAt, ...usage } = database.measuredAccountUsage(account.id, since, home);
+        const changesAt = oldestBoundAt ? new Date(Date.parse(oldestBoundAt) + period.durationMs + 1).toISOString() : null;
+        return { period: period.id, label: period.label, since, changesAt, ...usage };
       }),
       // Only providers that report usage windows have any; for the others
       // the limits are unavailable, never zero.
@@ -218,7 +232,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     } else if (typeof process.getuid === "function" && details.uid !== process.getuid()) {
       throw accountError(400, "The account home must be a directory you own", "PROVIDER_ACCOUNT_INVALID");
     }
-    const inherited = Object.entries(environment).find(([key]) => key.toUpperCase() === adapter.accounts.homeVariable)?.[1];
+    const inherited = inheritedHome(adapter);
     if (inherited && await realpath(inherited).catch(() => null) === resolved) {
       throw accountError(409, "That directory is already the default login", "PROVIDER_ACCOUNT_DUPLICATE");
     }
@@ -291,10 +305,15 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     const adapter = adapterFor(provider);
     const owner = pin ?? database.sessionAccount(conversationId, provider, sessionId);
     const account = findAccount(owner?.accountId ?? database.activeProviderAccountId(provider));
+    // A recovery's account cannot be changed from the chat, so its errors
+    // name what does work.
+    const remedy = owner?.recovery ? "or discard the interrupted run" : "or clear the session in chat settings";
     if (!account || account.provider !== adapter.id) {
-      throw accountError(409, owner
-        ? `The ${adapter.label} account this chat's session belongs to was removed. Clear the session in chat settings to continue with the active account.`
-        : `The active ${adapter.label} account was removed. Choose another account in Settings.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
+      throw accountError(409, !owner
+        ? `The active ${adapter.label} account was removed. Choose another account in Settings.`
+        : owner.recovery
+          ? `The ${adapter.label} account this interrupted run launched with was removed. Add that account's directory again in Settings, ${remedy}.`
+          : `The ${adapter.label} account this chat's session belongs to was removed. Clear the session in chat settings to continue with the active account.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
     }
     const home = accountHome(account, adapter);
     // The default login follows the environment. A session it created under
@@ -302,7 +321,8 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     // recorded no home and is taken to have used the current default.
     if (owner && account.isDefault && owner.home !== undefined && (owner.home ?? null) !== home) {
       const where = (value) => value ?? "the CLI's standard directory";
-      throw accountError(409, `This chat's ${adapter.label} session started with the default login in ${where(owner.home)}, but the default login now uses ${where(home)}. Restore ${adapter.accounts?.homeVariable ?? "it"} or clear the session in chat settings.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
+      const subject = owner.recovery ? "This interrupted run" : "This chat's session";
+      throw accountError(409, `${subject} used the ${adapter.label} default login in ${where(owner.home)}, but the default login now uses ${where(home)}. Restore ${adapter.accounts?.homeVariable ?? "it"} ${remedy}.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
     }
     return { id: account.id, provider: account.provider, label: account.label, homePath: account.homePath, home, identity: identitySummary(account) };
   }
