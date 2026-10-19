@@ -820,8 +820,8 @@ test("harness logins are read from each CLI's status without credentials", () =>
   assert.equal(parseCodex("Something else"), null);
   assert.deepEqual([claude.accounts.homeVariable, codex.accounts.homeVariable, anthropic.accounts], ["CLAUDE_CONFIG_DIR", "CODEX_HOME", null]);
   assert.deepEqual([claude.accounts.standardHome, codex.accounts.standardHome], [".claude", ".codex"]);
-  const accounts = { homeVariable: "FIXTURE_HOME", standardHome: ".fixture", identityArgs: ["status"], parseIdentity: () => null, credentialVariables: ["FIXTURE_TOKEN", "FIXTURE_USE_CLOUD"],
-    credentialSwitches: ["FIXTURE_USE_CLOUD"] };
+  const accounts = { homeVariable: "FIXTURE_HOME", standardHome: ".fixture", identityArgs: ["status"], parseIdentity: () => null, credentialVariables: ["FIXTURE_TOKEN", "FIXTURE_USE_CLOUD", "FIXTURE_UNUSED"],
+    loginOverrides: ["FIXTURE_TOKEN", "FIXTURE_USE_CLOUD"], credentialSwitches: ["FIXTURE_USE_CLOUD"] };
   assert.equal(defineAdapter(harnessSpec({ accounts })).accounts.homeVariable, "FIXTURE_HOME");
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, homeVariable: "OUTRIGHT_HOME" } })), /accounts must name/);
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, identityArgs: ["status; rm"] } })), /accounts must name/);
@@ -833,8 +833,16 @@ test("harness logins are read from each CLI's status without credentials", () =>
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialVariables: ["OUTRIGHT_ANTHROPIC_API_KEY"] } })), /accounts must name/);
   // A switch is a declared credential variable that counts only when enabled.
   assert.deepEqual([claude.accounts.credentialSwitches, codex.accounts.credentialSwitches], [["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"], []]);
-  for (const credentialSwitches of [undefined, ["FIXTURE_OTHER"]]) {
+  for (const credentialSwitches of [undefined, ["FIXTURE_OTHER"], ["FIXTURE_UNUSED"]]) {
     assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialSwitches } })), /accounts must name/, String(credentialSwitches));
+  }
+  // Only variables the CLI authenticates with stand in for its login: Codex
+  // ignores OPENAI_API_KEY, which is still kept from an added account.
+  assert.deepEqual(codex.accounts.loginOverrides, ["CODEX_API_KEY"]);
+  assert.deepEqual(codex.accounts.credentialVariables, ["CODEX_API_KEY", "OPENAI_API_KEY"]);
+  assert.deepEqual(claude.accounts.loginOverrides, claude.accounts.credentialVariables);
+  for (const loginOverrides of [undefined, ["FIXTURE_OTHER"]]) {
+    assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, loginOverrides } })), /accounts must name/, String(loginOverrides));
   }
 });
 

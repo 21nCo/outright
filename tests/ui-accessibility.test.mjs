@@ -146,6 +146,9 @@ test("account usage keeps measured, reported, stale and unknown values distinct"
   assert.equal(loginText({ status: "signed-in", identity: { email: "a@example.com", plan: "max" } }), "Signed in · a@example.com · max");
   assert.equal(loginText({ status: "unknown", error: "Codex login status could not be checked" }), "Codex login status could not be checked");
   assert.equal(loginText(undefined), "Checking login…");
+  // A login says when it was checked; a re-login since then is not yet known.
+  assert.equal(loginText({ status: "signed-in", identity: { email: "a@example.com" }, checkedAt: "2026-10-19T10:42:00.000Z" }, time), "Signed in · a@example.com · checked 10:42");
+  assert.equal(loginText({ status: "signed-out", identity: null, checkedAt: "2026-10-19T10:42:00.000Z" }, time), "Signed out · checked 10:42");
   assert.equal(runAccountText({ accountLabel: "Work", accountIdentity: "a@example.com" }), "Work (a@example.com)");
   assert.equal(runAccountText({ accountLabel: null }), null);
   // An answer names its own account even when its run is not loaded.

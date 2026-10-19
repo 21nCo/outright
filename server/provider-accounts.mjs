@@ -1,5 +1,5 @@
 import { realpathSync } from "node:fs";
-import { realpath, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { defaultProviderAccountId } from "./database.mjs";
@@ -21,6 +21,9 @@ import { defaultProbe } from "./provider-discovery.mjs";
 const LABEL_CHARACTERS = 80;
 const HOME_PATH_BYTES = 4096;
 const IDENTITY_TIMEOUT_MS = 5_000;
+// A login checked longer ago than this is checked again when listed or
+// launched, so a re-login in a home is not shown or recorded indefinitely.
+export const IDENTITY_RECHECK_MS = 10 * 60_000;
 const NOTIFY_DELAY_MS = 250;
 // A reported window older than this is shown as stale rather than current.
 export const LIMIT_STALE_AFTER_MS = 30 * 60_000;
@@ -59,7 +62,7 @@ export function accountPin(run) {
 }
 
 export function createProviderAccounts({ database, publish = () => {}, probe = defaultProbe, environment = process.env, adapters = EXECUTION_ADAPTERS, clock = Date.now,
-  platform = process.platform, homeDirectory = os.homedir() }) {
+  platform = process.platform, homeDirectory = os.homedir(), realpath = realpathSync.native }) {
   const identities = new Map();
   const pendingChecks = new Map();
   const switches = new Map();
@@ -102,8 +105,10 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     return path.join(homeDirectory, adapter.accounts.standardHome);
   }
 
-  // Where a home leads, through links. A part that does not exist yet keeps
-  // its name under its nearest existing directory, so the key does not
+  // Where a home leads, through links, as the operating system names it
+  // (`realpath`, native: the stored case on a case-insensitive volume, and
+  // 8.3 and subst names expanded on Windows). A part that does not exist yet
+  // keeps its name under its nearest existing directory, so the key does not
   // change when it is created. Windows paths compare without case.
   function canonicalHome(home) {
     const cached = listingKeys?.get(home);
@@ -112,7 +117,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     let existing = path.resolve(home);
     let resolved = null;
     while (resolved === null) {
-      try { resolved = path.join(realpathSync(existing), ...missing); }
+      try { resolved = path.join(realpath(existing), ...missing); }
       catch {
         const parent = path.dirname(existing);
         if (parent === existing) resolved = path.resolve(home);
@@ -147,13 +152,13 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     return Boolean(account.homePath) && homeKey(adapter, account.homePath) === defaultHome(adapter);
   }
 
-  // A credential variable the default login launches with overrides the
-  // login in its home (adapter accounts.credentialVariables).
-  // A switch (accounts.credentialSwitches) counts only when the CLI reads it
+  // A variable the CLI authenticates with in place of the login in its home
+  // (adapter accounts.loginOverrides) stands in for the default login. A
+  // switch (accounts.credentialSwitches) counts only when the CLI reads it
   // as enabled.
   function environmentCredential(adapter) {
     const accounts = adapter.accounts;
-    return accounts?.credentialVariables.find((name) => {
+    return accounts?.loginOverrides.find((name) => {
       const value = environmentValue(name);
       return accounts.credentialSwitches.includes(name) ? CREDENTIAL_SWITCH_ON.has(value?.trim().toLowerCase()) : Boolean(value);
     }) ?? null;
@@ -222,6 +227,15 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     return task;
   }
 
+  // An unchecked login, or one checked too long ago, is checked in the
+  // background; the listing shows when the result it has was checked.
+  function recheckIfOld(account) {
+    if (closing.signal.aborted) return;
+    const checkedAt = Date.parse(identities.get(account.id)?.checkedAt);
+    if (pendingChecks.has(account.id) || clock() - checkedAt <= IDENTITY_RECHECK_MS) return;
+    void checkIdentity(account).catch(() => {});
+  }
+
   function identitySummary(account) {
     const identity = identities.get(account.id)?.identity;
     return identity?.email ?? identity?.variable ?? identity?.method ?? null;
@@ -230,7 +244,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
   function presentAccount(account, adapter, activeId, now) {
     const checked = identities.get(account.id);
     const home = accountHome(account, adapter);
-    if (!checked && !pendingChecks.has(account.id)) void checkIdentity(account).catch(() => {});
+    recheckIfOld(account);
     return {
       id: account.id,
       label: account.label,
@@ -286,10 +300,12 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     if (typeof homePath !== "string" || !homePath || homePath.includes("\0") || Buffer.byteLength(homePath) > HOME_PATH_BYTES || !path.isAbsolute(homePath)) {
       throw accountError(400, `Enter the absolute path of a ${adapter.accounts.homeVariable} directory`, "PROVIDER_ACCOUNT_INVALID");
     }
+    // The same resolution as every home key, so the stored path and its key
+    // name the directory one way.
     let resolved;
     let details;
     try {
-      resolved = await realpath(homePath);
+      resolved = realpath(homePath);
       details = await stat(resolved);
     } catch {
       throw accountError(400, "That directory does not exist or cannot be read", "PROVIDER_ACCOUNT_INVALID");
@@ -298,7 +314,8 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     // A login in another user's directory is not this user's to select.
     // Windows reports no owner here; a home must be inside the user's profile.
     if (platform === "win32") {
-      const profile = await realpath(homeDirectory).catch(() => null);
+      let profile = null;
+      try { profile = realpath(homeDirectory); } catch { /* no profile: refused below */ }
       const relative = profile ? path.relative(profile, resolved) : "..";
       if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
         throw accountError(400, "The account home must be a directory inside your user profile", "PROVIDER_ACCOUNT_INVALID");
@@ -401,16 +418,19 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     }
     if (!owner && sameAsDefault(account, adapter)) throw duplicateOfDefault(account, adapter);
     const home = accountHome(account, adapter);
-    // The default login follows the environment. A session it created under
-    // another home is not resumed under this one. A run from before accounts
-    // recorded no home and is taken to have used the current default. Keys
-    // compare as recorded: a directory whose contents were swapped in place
-    // keeps its key.
-    if (owner && account.isDefault && owner.home !== undefined && owner.home !== home) {
-      const where = (value) => value ?? "the CLI's standard directory";
+    // A session or recovery continues only in the home key it launched with,
+    // for every account: the default login follows the environment, and an
+    // added account's directory can be replaced by a link elsewhere. A run
+    // from before accounts recorded no home and is taken to have used the
+    // current default. Keys compare as recorded: a directory whose contents
+    // were swapped in place keeps its key.
+    if (owner && owner.home !== undefined && owner.home !== home) {
       const subject = owner.recovery ? "This interrupted run" : "This chat's session";
-      throw accountError(409, `${subject} used the ${adapter.label} default login in ${where(owner.home)}, but the default login now uses ${where(home)}. Point ${adapter.accounts?.homeVariable ?? "it"} or the CLI's standard directory there again, or ${remedy}.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
+      throw accountError(409, account.isDefault
+        ? `${subject} used the ${adapter.label} default login in ${owner.home}, but the default login now uses ${home}. Point ${adapter.accounts?.homeVariable ?? "it"} or the CLI's standard directory there again, or ${remedy}.`
+        : `${subject} used ${account.label} in ${owner.home}, but its directory ${account.homePath} now leads to ${home}. Restore its directory, or ${remedy}.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
     }
+    recheckIfOld(account);
     return { id: account.id, provider: account.provider, label: account.label, homePath: account.homePath, home, identity: identitySummary(account) };
   }
 

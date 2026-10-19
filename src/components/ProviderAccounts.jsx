@@ -119,9 +119,12 @@ export function ProviderAccounts({ open, runtimeEvent, accountsVersion = 0, onEr
   }
   async function add(event) {
     event.preventDefault();
-    const added = await act("add", () => api("/api/provider-accounts", { method: "POST", body: { provider: addProvider.provider, label: draft.label, homePath: draft.homePath } }),
-      `Added ${draft.label.trim()} to ${addProvider.label}.`);
-    if (added) setDraft({ provider: addProvider.provider, label: "", homePath: "" });
+    const submitted = { provider: addProvider.provider, label: draft.label, homePath: draft.homePath };
+    const added = await act("add", () => api("/api/provider-accounts", { method: "POST", body: submitted }),
+      `Added ${submitted.label.trim()} to ${addProvider.label}.`);
+    // Only the submitted draft is cleared; one edited while it was added stays.
+    if (added) setDraft((current) => current.label === submitted.label && current.homePath === submitted.homePath && (current.provider || submitted.provider) === submitted.provider
+      ? { provider: submitted.provider, label: "", homePath: "" } : current);
   }
   async function remove() {
     if (busy) return;

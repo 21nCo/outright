@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { createAgentManager, LAUNCH_AUTHORIZED_CONTROL } from "./agent-manager.mjs";
 import { createOutrightDatabase } from "./database.mjs";
-import { accountPin, createProviderAccounts, LIMIT_STALE_AFTER_MS } from "./provider-accounts.mjs";
+import { accountPin, createProviderAccounts, IDENTITY_RECHECK_MS, LIMIT_STALE_AFTER_MS } from "./provider-accounts.mjs";
 
 const signedIn = (email) => JSON.stringify({ loggedIn: true, authMethod: "claude.ai", email, orgName: "Org", subscriptionType: "max" });
 const signedOut = JSON.stringify({ loggedIn: false, authMethod: "none" });
@@ -24,6 +24,23 @@ function fakeProbe(logins) {
   };
   probe.calls = calls;
   return probe;
+}
+
+// A case-insensitive volume under `root`, as APFS and NTFS are by default:
+// any spelling finds a directory, and the native realpath names it as stored.
+function caseInsensitiveRealpath(root) {
+  return (target) => {
+    const relative = path.relative(root, path.resolve(target));
+    if (relative.startsWith("..") || path.isAbsolute(relative)) return realpathSync.native(target);
+    let resolved = root;
+    for (const part of relative.split(path.sep).filter(Boolean)) {
+      const entries = readdirSync(resolved);
+      const stored = entries.includes(part) ? part : entries.find((entry) => entry.toLowerCase() === part.toLowerCase());
+      if (stored === undefined) throw Object.assign(new Error(`ENOENT: no such file or directory, realpath '${target}'`), { code: "ENOENT" });
+      resolved = realpathSync.native(path.join(resolved, stored));
+    }
+    return resolved;
+  };
 }
 
 function fakeChild() {
@@ -43,7 +60,7 @@ function fakeChild() {
 }
 
 async function fixture(t, { clock, launchCommand, extraEnvironment = {} } = {}) {
-  const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "outright-accounts-")));
+  const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-accounts-")));
   const inheritedHome = path.join(root, "inherited");
   const workHome = path.join(root, "work");
   mkdirSync(inheritedHome);
@@ -372,7 +389,7 @@ test("a launched run's account cannot be rebound", async (t) => {
 });
 
 test("a database from before accounts upgrades in place and keeps its runs readable", async (t) => {
-  const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "outright-accounts-legacy-")));
+  const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-accounts-legacy-")));
   const filename = path.join(root, "outright.db");
   t.after(() => rmSync(root, { recursive: true, force: true }));
   let database = createOutrightDatabase({ filename });
@@ -889,4 +906,132 @@ test("limit windows stored before homes were keyed are kept by home", async (t) 
   database.recordProviderLimits({ accountId: "claude:default", provider: "claude", home: "/other" }, "run-2", [{ window: "five_hour", utilization: 0.2, status: "allowed", resetsAt: null }]);
   assert.equal(database.listProviderLimits("claude:default", null)[0].utilization, 0.5);
   assert.equal(database.listProviderLimits("claude:default", "/other")[0].utilization, 0.2);
+});
+
+test("on a case-insensitive volume another spelling of the default home is the same login", async (t) => {
+  const context = await fixture(t);
+  const { database, probe, root, workHome } = context;
+  const realpath = caseInsensitiveRealpath(root);
+  const upper = path.join(root, "WORK");
+  const restart = (home) => {
+    const accounts = createProviderAccounts({ database, probe, realpath, environment: { ...context.environment, CLAUDE_CONFIG_DIR: home } });
+    t.after(() => accounts.close());
+    return accounts;
+  };
+  const named = restart(upper);
+  // The key is the directory's stored name, however the variable spells it.
+  assert.equal(named.resolve({ provider: "claude", conversationId: "c" }).home, workHome);
+  for (const homePath of [workHome, upper]) {
+    await assert.rejects(named.add({ provider: "claude", label: "Work", homePath }),
+      (error) => error.details.code === "PROVIDER_ACCOUNT_DUPLICATE" && /default login/.test(error.message), homePath);
+  }
+  assert.equal(database.listProviderAccounts().length, 0);
+
+  const chat = context.conversation();
+  const run = context.claudeRun(chat.id);
+  const launched = named.resolve({ provider: "claude", conversationId: chat.id });
+  database.bindRunAccount(run.id, launched);
+  database.updateRun(run.id, { status: "completed", providerSessionId: "session-1" });
+  named.recordLimits(launched, run.id, [{ window: "five_hour", utilization: 0.4, status: "allowed", resetsAt: null }]);
+  // Either spelling shows one usage and limit history and resumes the session.
+  for (const accounts of [named, restart(workHome)]) {
+    const defaultLogin = accounts.list().providers.find((provider) => provider.provider === "claude").accounts[0];
+    assert.deepEqual([defaultLogin.measured[1].runs, defaultLogin.limits[0]?.utilization], [1, 0.4]);
+    assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }).home, workHome);
+  }
+});
+
+test("an added account whose directory is replaced by a link elsewhere keeps its sessions and history apart", async (t) => {
+  const context = await fixture(t);
+  const { accounts, database, root, workHome } = context;
+  const work = await addWork(context);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  const elsewhere = path.join(root, "elsewhere");
+  const moved = path.join(root, "work-moved");
+  mkdirSync(elsewhere);
+  const chat = context.conversation();
+  const launch = (sessionId, utilization) => {
+    const account = accounts.resolve({ provider: "claude", conversationId: chat.id });
+    const run = context.claudeRun(chat.id);
+    database.bindRunAccount(run.id, account);
+    database.updateRun(run.id, { status: "interrupted", startedAt: new Date().toISOString(), providerSessionId: sessionId });
+    accounts.recordLimits(account, run.id, [{ window: "five_hour", utilization, status: "allowed", resetsAt: null }]);
+    return database.getRun(run.id);
+  };
+  const listed = () => context.claude().accounts.find((account) => account.id === work.id);
+  const first = launch("session-work", 0.4);
+  assert.equal(first.accountHome, workHome);
+
+  // Work's directory now leads to another login.
+  renameSync(workHome, moved);
+  symlinkSync(elsewhere, workHome);
+  assert.throws(() => accounts.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-work" }),
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(workHome) && error.message.includes(elsewhere)
+      && /Restore its directory, or clear the session in chat settings/.test(error.message));
+  const recovery = database.beginInterruptedRunRecovery(first.id, "retry");
+  assert.throws(() => accounts.resolve({ provider: "claude", conversationId: chat.id, pin: accountPin(recovery.run) }),
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && /Restore its directory, or discard the interrupted run/.test(error.message));
+  assert.deepEqual([listed().measured[1].runs, listed().limits], [0, []], "the earlier directory's history is not this login's");
+  launch("session-elsewhere", 0.7);
+  assert.deepEqual([listed().measured[1].runs, listed().limits[0].utilization], [1, 0.7]);
+
+  // Restoring the directory restores its session, recovery and history.
+  rmSync(workHome);
+  renameSync(moved, workHome);
+  assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-work" }).id, work.id);
+  assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, pin: accountPin(recovery.run) }).home, workHome);
+  assert.deepEqual([listed().measured[1].runs, listed().limits[0].utilization], [1, 0.4]);
+});
+
+test("OPENAI_API_KEY does not stand in for the default Codex login", async (t) => {
+  const context = await fixture(t, { extraEnvironment: { OPENAI_API_KEY: "openai-secret" } });
+  const { accounts, database, logins, probe, root } = context;
+  const codex = () => accounts.list().providers.find((provider) => provider.provider === "codex").accounts[0];
+  codex();
+  await tick(); await tick();
+  // Codex ignores the variable, so the home's own login is what it uses.
+  assert.equal(codex().login.status, "signed-out");
+  assert.ok(probe.calls.some((call) => call.executable === "codex" && call.environment.CODEX_HOME === undefined), "the home's real check runs");
+  const chat = database.createConversation({ projectId: "p", worktreeId: root, worktreePath: root, title: "Codex", provider: "codex" });
+  await assert.rejects(accounts.assertLaunchable({ provider: "codex", conversationId: chat.id }), (error) => error.details.code === "PROVIDER_ACCOUNT_SIGNED_OUT");
+  await assert.rejects(accounts.activate({ provider: "codex", accountId: "codex:default" }), (error) => error.details.code === "PROVIDER_ACCOUNT_SWITCH_FAILED");
+
+  // A signed-in home reports its own login with the variable still set.
+  logins.set("unset", "Logged in using ChatGPT");
+  await accounts.refresh("codex:default");
+  assert.deepEqual([codex().login.status, codex().login.identity.method, codex().login.identity.variable], ["signed-in", "chatgpt", undefined]);
+  assert.equal((await accounts.assertLaunchable({ provider: "codex", conversationId: chat.id })).identity, "chatgpt");
+  assert.ok(!JSON.stringify(accounts.list()).includes("openai-secret"));
+});
+
+test("a login checked long ago is checked again when listed or launched, and shows when it was checked", async (t) => {
+  let now = Date.parse("2026-10-19T10:00:00.000Z");
+  const context = await fixture(t, { clock: () => now });
+  const { accounts, logins, probe, workHome } = context;
+  const work = await addWork(context);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  const listed = () => context.claude().accounts.find((account) => account.id === work.id);
+  const checks = () => probe.calls.filter((call) => call.environment.CLAUDE_CONFIG_DIR === workHome).length;
+  assert.deepEqual([listed().login.identity.email, listed().login.checkedAt], ["work@example.com", "2026-10-19T10:00:00.000Z"]);
+
+  // A re-login in its home is seen once the check is older than the interval.
+  logins.set(workHome, signedIn("new@example.com"));
+  const before = checks();
+  now += IDENTITY_RECHECK_MS;
+  listed();
+  await tick(); await tick();
+  assert.equal(checks(), before, "a recent check is reused");
+  now += 1;
+  listed();
+  await tick(); await tick();
+  assert.equal(checks(), before + 1);
+  assert.deepEqual([listed().login.identity.email, listed().login.checkedAt], ["new@example.com", new Date(now).toISOString()]);
+
+  // A launch does the same, so later runs record the current login.
+  logins.set(workHome, signedIn("third@example.com"));
+  now += IDENTITY_RECHECK_MS + 1;
+  const chat = context.conversation();
+  assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id }).identity, "new@example.com");
+  await tick(); await tick();
+  assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id }).identity, "third@example.com");
 });

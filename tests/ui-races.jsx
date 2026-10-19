@@ -1219,6 +1219,49 @@ async function providerAccountsFailedReloadRegression() {
   assert(!measured().includes("out of date"), "a successful reload clears the out-of-date mark");
 }
 
+// An account added while its fields are edited again clears only what it sent.
+async function providerAccountsAddKeepsNewerDraftRegression() {
+  root.render(null); await settle();
+  const post = deferred();
+  let posted = null;
+  const listing = (accounts) => ({ generatedAt: new Date().toISOString(), limitStaleAfterMs: 1_800_000, providers: [{ provider: "codex", label: "Codex", kind: "harness",
+    homeVariable: "CODEX_HOME", switchable: true, usageLimits: false, activeAccountId: "codex:default",
+    accounts: accounts.map((label) => ({ id: label === "Default login" ? "codex:default" : `codex:${label}`, label, isDefault: label === "Default login", homePath: label === "Default login" ? null : `/homes/${label}`,
+      active: label === "Default login", sameAsDefault: false, login: { status: "signed-in", identity: null, error: null, checkedAt: null }, measured: [], limits: null })) }] });
+  route = async (url, init) => {
+    if (url.pathname !== "/api/provider-accounts") return response({});
+    if (init?.method === "POST") { posted = JSON.parse(init.body); return post.promise; }
+    return response(listing(["Default login"]));
+  };
+  const onError = (error) => { throw error; };
+  root.render(<TooltipProvider><ProviderAccounts open runtimeEvent={null} onError={onError} /></TooltipProvider>);
+  const field = (label) => host.querySelector(`[aria-label="${label}"]`);
+  await until(() => field("Account name") && field("CODEX_HOME directory"), "the add form is shown");
+  setControlValue(field("Account name"), "Work");
+  setControlValue(field("CODEX_HOME directory"), "/homes/Work");
+  [...host.querySelectorAll("button")].find((button) => button.textContent === "Add account").click();
+  await until(() => posted, "the add request started");
+  assert(posted.label === "Work" && posted.homePath === "/homes/Work", "the submitted draft is sent");
+  // The next account is typed while the first is being added.
+  setControlValue(field("Account name"), "Personal");
+  setControlValue(field("CODEX_HOME directory"), "/homes/Personal");
+  post.resolve(response(listing(["Default login", "Work"]), 201));
+  await until(() => host.textContent.includes("Codex · Work"), "the added account is listed");
+  await settle();
+  assert(field("Account name").value === "Personal" && field("CODEX_HOME directory").value === "/homes/Personal", "the newer draft is kept");
+  posted = null;
+  const second = deferred();
+  route = async (url, init) => {
+    if (url.pathname !== "/api/provider-accounts") return response({});
+    if (init?.method === "POST") { posted = JSON.parse(init.body); return second.promise; }
+    return response(listing(["Default login", "Work"]));
+  };
+  [...host.querySelectorAll("button")].find((button) => button.textContent === "Add account").click();
+  await until(() => posted?.label === "Personal", "the newer draft is added");
+  second.resolve(response(listing(["Default login", "Work", "Personal"]), 201));
+  await until(() => field("Account name").value === "" && field("CODEX_HOME directory").value === "", "an unchanged submitted draft is cleared");
+}
+
 async function settingsCapacityAndDeletionOrderRegression() {
   root.render(null);
   await settle();
@@ -5934,6 +5977,7 @@ try {
     ["settings live capacity", settingsCapacityWithoutEventRegression, "an open Settings dialog reads another client's quota changes without a capacity event"],
     ["provider accounts window aging", providerAccountsWindowAgingRegression, "an open account list drops a run that leaves the 5-hour window without any event"],
     ["provider accounts failed reload", providerAccountsFailedReloadRegression, "a failed reload marks an expired measured total out of date, and account changes reload without the runtime event"],
+    ["provider accounts add keeps newer draft", providerAccountsAddKeepsNewerDraftRegression, "a successful add clears only the draft it submitted"],
     ["settings capacity and deletion order", settingsCapacityAndDeletionOrderRegression, "new capacity wins reordered responses and deletion owns its confirmation"],
     ["settings template completion", settingsTemplateCompletionRegression, "a successful template POST clears its submitted draft after reopening"],
     ["notification permission rejection", rejectedNotificationPermissionRegression, "a rejected permission request does not disrupt Settings save or escape as an unhandled rejection"],

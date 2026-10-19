@@ -38,9 +38,12 @@ export const codexAdapter = defineAdapter({
   sessionIdentity: { nativeField: "thread_id" },
   parseVersion: parseSemanticVersion,
   // `codex exec --json` reports token usage but no usage windows.
-  // An API key variable takes precedence over the login in CODEX_HOME,
-  // which is ~/.codex when unset.
-  accounts: { homeVariable: "CODEX_HOME", standardHome: ".codex", identityArgs: ["login", "status"], parseIdentity, credentialVariables: ["CODEX_API_KEY", "OPENAI_API_KEY"], credentialSwitches: [] },
+  // CODEX_API_KEY takes precedence over the login in CODEX_HOME, which is
+  // ~/.codex when unset. Codex 0.162 does not authenticate with
+  // OPENAI_API_KEY, so it never stands in for the login; it is still kept
+  // from an added account's launch and check.
+  accounts: { homeVariable: "CODEX_HOME", standardHome: ".codex", identityArgs: ["login", "status"], parseIdentity, credentialVariables: ["CODEX_API_KEY", "OPENAI_API_KEY"],
+    loginOverrides: ["CODEX_API_KEY"], credentialSwitches: [] },
   buildLaunch({ worktreePath, run, sessionId }) {
     const sandbox = SANDBOX_MODES[run.approvalPolicy];
     const options = [];

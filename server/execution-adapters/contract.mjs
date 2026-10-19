@@ -72,15 +72,17 @@ export function defineAdapter(spec) {
     // Credential variables override the home's login, so an added account's
     // launch and login check run without them. The standard home is the
     // directory in the user's home the CLI uses when the variable is unset.
-    // Credential switches are credential variables that count only when
-    // the CLI reads them as enabled.
+    // Login overrides are the credential variables the CLI authenticates with
+    // in place of the home's login; credential switches are overrides that
+    // count only when the CLI reads them as enabled.
     const accounts = spec.accounts;
     const environmentVariable = (variable) => HOME_VARIABLE_PATTERN.test(variable ?? "") && !variable.startsWith("OUTRIGHT_");
     if (accounts !== undefined && (!environmentVariable(accounts?.homeVariable) || !/^\.?[A-Za-z0-9][A-Za-z0-9._-]*$/.test(accounts.standardHome ?? "")
       || !Array.isArray(accounts.identityArgs) || !accounts.identityArgs.length || accounts.identityArgs.some((arg) => !IDENTITY_ARGUMENT_PATTERN.test(arg))
       || !Array.isArray(accounts.credentialVariables) || !accounts.credentialVariables.every(environmentVariable)
-      || !Array.isArray(accounts.credentialSwitches) || !accounts.credentialSwitches.every((variable) => accounts.credentialVariables.includes(variable))
-      || typeof accounts.parseIdentity !== "function")) throw contractError(`${spec.id} accounts must name a home variable, its standard directory, credential variables and switches, identity arguments and a parser`);
+      || !Array.isArray(accounts.loginOverrides) || !accounts.loginOverrides.every((variable) => accounts.credentialVariables.includes(variable))
+      || !Array.isArray(accounts.credentialSwitches) || !accounts.credentialSwitches.every((variable) => accounts.loginOverrides.includes(variable))
+      || typeof accounts.parseIdentity !== "function")) throw contractError(`${spec.id} accounts must name a home variable, its standard directory, credential variables, login overrides and switches, identity arguments and a parser`);
   } else {
     // A harness login never grants direct API access.
     if (authority.source !== "env" || !DIRECT_VARIABLE_PATTERN.test(authority.variable ?? "")) throw contractError(`${spec.id} must reference its own API credential`);
@@ -114,7 +116,8 @@ export function defineAdapter(spec) {
   return Object.freeze({
     ...spec,
     accounts: spec.accounts ? Object.freeze({ ...spec.accounts, identityArgs: Object.freeze([...spec.accounts.identityArgs]),
-      credentialVariables: Object.freeze([...spec.accounts.credentialVariables]), credentialSwitches: Object.freeze([...spec.accounts.credentialSwitches]) }) : null,
+      credentialVariables: Object.freeze([...spec.accounts.credentialVariables]), loginOverrides: Object.freeze([...spec.accounts.loginOverrides]),
+      credentialSwitches: Object.freeze([...spec.accounts.credentialSwitches]) }) : null,
     modelAliases: Object.freeze(Object.fromEntries(Object.entries(aliases).map(([alias, ids]) => [alias, Object.freeze([...ids])]))),
     environment: Object.freeze([...(spec.kind === "harness" ? [] : spec.environment)]),
     capabilities: Object.freeze({

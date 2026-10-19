@@ -11,8 +11,14 @@ const WINDOW_LABELS = {
 
 const defaultTime = (value) => new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(new Date(value));
 
-export function loginText(login) {
+// A login is as of its check, which says when it was made.
+export function loginText(login, formatTime = defaultTime) {
   if (!login || login.status === "checking") return "Checking login…";
+  const checked = login.checkedAt ? ` · checked ${formatTime(login.checkedAt)}` : "";
+  return `${loginStatusText(login)}${checked}`;
+}
+
+function loginStatusText(login) {
   const identity = login.identity ?? {};
   const details = [identity.email, identity.organization, identity.plan, identity.method].filter(Boolean);
   if (login.status === "signed-in") return details.length ? `Signed in · ${details.join(" · ")}` : "Signed in";
