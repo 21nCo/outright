@@ -1,0 +1,37 @@
+docs/out-28-provider-accounts.md
+  s_e4277cfa3d2c51::t_b200acef539a9a 9-10,13,23,26,36
+server/database.mjs
+  s_e4277cfa3d2c51::t_9f1ee2abe0593c 2357-2358
+server/execution-adapters.test.mjs
+  s_e4277cfa3d2c51::t_cc34e6ea6688bf 822-823,828-831
+server/execution-adapters/claude.mjs
+  s_e4277cfa3d2c51::t_0507d72b1889ff 52-53
+server/execution-adapters/codex.mjs
+  s_e4277cfa3d2c51::t_f3f36ed19178b9 41-43
+server/execution-adapters/contract.mjs
+  s_e4277cfa3d2c51::t_74b1f547836793 73-74,77,80
+server/provider-accounts.mjs
+  s_e4277cfa3d2c51::t_775fbdf2a00240 1,94-113,115-123,262-263,342,349
+server/provider-accounts.test.mjs
+  s_e4277cfa3d2c51::t_fd55062eecb27f 4,219-222,224-226,324,329-331,340,347,349,355,658-694
+src/lib/provider-accounts.js
+  s_e4277cfa3d2c51::t_897a039702bd28 74-75,77,79,82
+tests/ui-accessibility.test.mjs
+  s_e4277cfa3d2c51::t_0a2be5ecff508b 121-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c02ce1de56f58de0570081f1d6bc1c7b0b442036",
+  "prompts": {},
+  "sessions": {
+    "s_e4277cfa3d2c51": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_e4277cfa3d2c51",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
