@@ -1,0 +1,33 @@
+docs/out-28-provider-accounts.md
+  s_7d0a48f0aaecda::t_36700a9aa891d3 15,17
+server/database.mjs
+  s_7d0a48f0aaecda::t_eafa020c6c3ff0 71-72,2328
+server/execution-adapters.test.mjs
+  s_7d0a48f0aaecda::t_d900b979521e2f 823-824,834-838
+server/execution-adapters/claude.mjs
+  s_7d0a48f0aaecda::t_7d5ae44274ee9e 54-55
+server/execution-adapters/codex.mjs
+  s_7d0a48f0aaecda::t_7733dab2970947 43
+server/execution-adapters/contract.mjs
+  s_7d0a48f0aaecda::t_842a25a683bc69 75-76,82-83,117
+server/provider-accounts.mjs
+  s_7d0a48f0aaecda::t_cf24e138458f6a 27-28,74-75,109-110,122-124,127-131,134,137-138,152-153,155-159,257-262,394,406-409,412
+server/provider-accounts.test.mjs
+  s_7d0a48f0aaecda::t_cafd976d7c8cf9 636,647,651,681-683,687-690,700-752,857-874
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fc677f829654b8923af83a716b54e2547bc03dae",
+  "prompts": {},
+  "sessions": {
+    "s_7d0a48f0aaecda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec9cf707-0884-40ca-b283-dbc4d0f2a4b5",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
