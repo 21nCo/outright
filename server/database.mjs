@@ -68,8 +68,8 @@ const RETAINED_COLUMNS = [
   ["run_account_pins", "run_id, account_id, home_path, home_known"],
 ];
 const RUN_RETAINED_FIELDS = RETAINED_COLUMNS.find(([name]) => name === "runs")[1];
-// The account a run launched with, and the CLI home it used (null: the
-// CLI's standard home). A run that never launched has none. A recovery run
+// The account a run launched with, and the key of the CLI home it used
+// (null for a direct provider). A run that never launched has none. A recovery run
 // is pinned to the account of the run it continues until it launches; a
 // pin to a run from before accounts does not know that run's home.
 const RUN_ACCOUNT_FIELDS = `account.account_id AS accountId, account.account_label AS accountLabel, account.account_identity AS accountIdentity,
@@ -2325,7 +2325,7 @@ export function createOutrightDatabase(options = {}) {
       return row.accountId ? { accountId: row.accountId, home: row.home } : { accountId: defaultProviderAccountId(provider), home: undefined };
     },
     // The latest report of each window wins, per account and CLI home key
-    // (null, the standard home, is stored as ''). A report is optional
+    // (a direct provider's null is stored as ''). A report is optional
     // telemetry and obeys the retained budget.
     // A removed account keeps no windows, even from a run still using it.
     recordProviderLimits({ accountId, provider, home = null }, runId, windows, observedAt = now()) {

@@ -24,6 +24,8 @@ const IDENTITY_TIMEOUT_MS = 5_000;
 const NOTIFY_DELAY_MS = 250;
 // A reported window older than this is shown as stale rather than current.
 export const LIMIT_STALE_AFTER_MS = 30 * 60_000;
+// The values a CLI reads as an enabled switch (Claude Code's isEnvTruthy).
+const CREDENTIAL_SWITCH_ON = new Set(["1", "true", "yes", "on"]);
 export const MEASURED_PERIODS = Object.freeze([
   Object.freeze({ id: "5h", label: "Last 5 hours", durationMs: 5 * 3_600_000 }),
   Object.freeze({ id: "7d", label: "Last 7 days", durationMs: 7 * 86_400_000 }),
@@ -69,6 +71,8 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
   // rejects: one failed check affects only its own callers.
   let checkQueue = Promise.resolve();
   let notifyTimer = null;
+  // One listing resolves each home once, however many accounts share it.
+  let listingKeys = null;
   const closing = new AbortController();
 
   function notify() {
@@ -102,6 +106,8 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
   // its name under its nearest existing directory, so the key does not
   // change when it is created. Windows paths compare without case.
   function canonicalHome(home) {
+    const cached = listingKeys?.get(home);
+    if (cached !== undefined) return cached;
     const missing = [];
     let existing = path.resolve(home);
     let resolved = null;
@@ -113,29 +119,25 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
         else { missing.unshift(path.basename(existing)); existing = parent; }
       }
     }
-    return platform === "win32" ? resolved.toLowerCase() : resolved;
+    const key = platform === "win32" ? resolved.toLowerCase() : resolved;
+    listingKeys?.set(home, key);
+    return key;
   }
 
-  // The one key a CLI home is recorded, compared and partitioned by: its
-  // canonical directory, or null for the CLI's standard home. Runs, recovery
-  // pins, measured usage, limit windows and duplicate checks all use it.
+  // The one key a CLI home is recorded, compared and partitioned by: the
+  // canonical directory it leads to. With no home, that is the directory
+  // the CLI's standard home leads to now, so repointing a linked standard
+  // home is another login. Runs, recovery pins, measured usage, limit
+  // windows and duplicate checks all use it. A direct provider has no home.
   function homeKey(adapter, home) {
     if (!adapter.accounts) return null;
-    const standard = canonicalHome(standardHome(adapter));
-    const canonical = home ? canonicalHome(home) : standard;
-    return canonical === standard ? null : canonical;
+    return canonicalHome(home || standardHome(adapter));
   }
 
-  // The default login's key: its home variable's directory, or null when
-  // the variable is unset or names the standard home.
+  // The default login's key: its home variable's directory, or the standard
+  // home's when the variable is unset.
   function defaultHome(adapter) {
     return adapter.accounts ? homeKey(adapter, inheritedHome(adapter)) : null;
-  }
-
-  // Whether two recorded homes are one directory. Homes recorded before
-  // keys were canonical are compared by their key too.
-  function sameHome(adapter, recorded, home) {
-    return (recorded ?? null) === (home ?? null) || homeKey(adapter, recorded) === homeKey(adapter, home);
   }
 
   // An added account whose directory the environment now selects for the
@@ -147,8 +149,14 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
 
   // A credential variable the default login launches with overrides the
   // login in its home (adapter accounts.credentialVariables).
+  // A switch (accounts.credentialSwitches) counts only when the CLI reads it
+  // as enabled.
   function environmentCredential(adapter) {
-    return adapter.accounts?.credentialVariables.find((name) => environmentValue(name)) ?? null;
+    const accounts = adapter.accounts;
+    return accounts?.credentialVariables.find((name) => {
+      const value = environmentValue(name);
+      return accounts.credentialSwitches.includes(name) ? CREDENTIAL_SWITCH_ON.has(value?.trim().toLowerCase()) : Boolean(value);
+    }) ?? null;
   }
 
   function accountHome(account, adapter) {
@@ -246,6 +254,12 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
   }
 
   function list() {
+    listingKeys = new Map();
+    try { return listing(); }
+    finally { listingKeys = null; }
+  }
+
+  function listing() {
     const now = clock();
     const stored = database.listProviderAccounts();
     return {
@@ -377,7 +391,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     const account = findAccount(owner?.accountId ?? database.activeProviderAccountId(provider));
     // A recovery's account cannot be changed from the chat, so its errors
     // name what does work.
-    const remedy = owner?.recovery ? "or discard the interrupted run" : "or clear the session in chat settings";
+    const remedy = owner?.recovery ? "discard the interrupted run" : "clear the session in chat settings";
     if (!account || account.provider !== adapter.id) {
       throw accountError(409, !owner
         ? `The active ${adapter.label} account was removed. Choose another account in Settings.`
@@ -389,11 +403,13 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     const home = accountHome(account, adapter);
     // The default login follows the environment. A session it created under
     // another home is not resumed under this one. A run from before accounts
-    // recorded no home and is taken to have used the current default.
-    if (owner && account.isDefault && owner.home !== undefined && !sameHome(adapter, owner.home, home)) {
+    // recorded no home and is taken to have used the current default. Keys
+    // compare as recorded: a directory whose contents were swapped in place
+    // keeps its key.
+    if (owner && account.isDefault && owner.home !== undefined && owner.home !== home) {
       const where = (value) => value ?? "the CLI's standard directory";
       const subject = owner.recovery ? "This interrupted run" : "This chat's session";
-      throw accountError(409, `${subject} used the ${adapter.label} default login in ${where(owner.home)}, but the default login now uses ${where(home)}. Restore ${adapter.accounts?.homeVariable ?? "it"} ${remedy}.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
+      throw accountError(409, `${subject} used the ${adapter.label} default login in ${where(owner.home)}, but the default login now uses ${where(home)}. Point ${adapter.accounts?.homeVariable ?? "it"} or the CLI's standard directory there again, or ${remedy}.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
     }
     return { id: account.id, provider: account.provider, label: account.label, homePath: account.homePath, home, identity: identitySummary(account) };
   }

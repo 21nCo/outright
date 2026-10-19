@@ -633,7 +633,7 @@ test("a recovery whose default-login home changed names actions that work", asyn
   t.after(() => restarted.close());
   assert.throws(() => restarted.resolve({ provider: "claude", conversationId: chat.id, pin: accountPin(database.getRun(first.id)) }),
     (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(context.inheritedHome)
-      && /Restore CLAUDE_CONFIG_DIR or discard the interrupted run/.test(error.message) && !/session/i.test(error.message));
+      && /Point CLAUDE_CONFIG_DIR or the CLI's standard directory there again, or discard the interrupted run/.test(error.message) && !/session/i.test(error.message));
   // A chat session in the same state can still be cleared.
   assert.throws(() => restarted.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }), /clear the session in chat settings/);
 });
@@ -644,11 +644,11 @@ test("off Windows the default login reads only the exact home variable name", as
   mkdirSync(twin);
   context.logins.set(twin, signedIn("twin@example.com"));
   const environment = { PATH: process.env.PATH, claude_config_dir: twin };
-  const posix = createProviderAccounts({ database: context.database, probe: context.probe, environment, platform: "linux" });
+  const posix = createProviderAccounts({ database: context.database, probe: context.probe, environment, platform: "linux", homeDirectory: context.root });
   const windows = createProviderAccounts({ database: context.database, probe: context.probe, environment, platform: "win32", homeDirectory: context.root });
   t.after(() => Promise.all([posix.close(), windows.close()]));
   // The CLI ignores a lowercase twin on POSIX, so the default home is standard.
-  assert.equal(posix.resolve({ provider: "claude", conversationId: "c" }).home, null);
+  assert.equal(posix.resolve({ provider: "claude", conversationId: "c" }).home, path.join(context.root, ".claude"));
   assert.equal(windows.resolve({ provider: "claude", conversationId: "c" }).home, twin.toLowerCase(), "Windows keys a home without case");
   // The twin is a separate login there, not the default one.
   await posix.add({ provider: "claude", label: "Twin", homePath: twin });
@@ -678,12 +678,16 @@ test("with its variable unset, the CLI's standard home is the default login unde
   // a session recorded under it resumes and its usage stays in one bucket.
   const chat = context.conversation();
   const run = context.claudeRun(chat.id);
-  database.bindRunAccount(run.id, { id: "claude:default", provider: "claude", label: "Default login", home: null });
+  const launched = unset.resolve({ provider: "claude", conversationId: chat.id });
+  assert.equal(launched.home, standard.claude);
+  database.bindRunAccount(run.id, launched);
   database.updateRun(run.id, { status: "completed", providerSessionId: "session-1" });
   const named = createProviderAccounts({ database, probe, environment: { PATH: process.env.PATH, CLAUDE_CONFIG_DIR: path.join(root, "claude-link") }, homeDirectory: user });
   t.after(() => named.close());
-  assert.equal(named.resolve({ provider: "claude", conversationId: chat.id }).home, null);
-  assert.equal(named.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }).home, null);
+  assert.equal(named.resolve({ provider: "claude", conversationId: chat.id }).home, standard.claude);
+  assert.equal(named.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }).home, standard.claude);
+  const defaultLogin = (accounts) => accounts.list().providers.find((provider) => provider.provider === "claude").accounts[0];
+  assert.equal(defaultLogin(named).measured[1].runs, 1, "one bucket for both ways of naming it");
   await assert.rejects(named.add({ provider: "claude", label: "Standard", homePath: standard.claude }), (error) => error.details.code === "PROVIDER_ACCOUNT_DUPLICATE");
 
   // When the variable selects another home, the standard home is another login.
@@ -691,6 +695,59 @@ test("with its variable unset, the CLI's standard home is the default login unde
   t.after(() => other.close());
   await other.add({ provider: "claude", label: "Standard", homePath: standard.claude });
   assert.equal(database.listProviderAccounts()[0].homePath, standard.claude);
+});
+
+test("with its variable unset, repointing a linked standard home is another login", async (t) => {
+  const context = await fixture(t);
+  const { database, probe, root } = context;
+  const user = path.join(root, "user");
+  const [first, second] = [path.join(root, "standard-a"), path.join(root, "standard-b")];
+  mkdirSync(user);
+  mkdirSync(first);
+  mkdirSync(second);
+  const standard = path.join(user, ".claude");
+  symlinkSync(first, standard);
+  const unset = () => {
+    const accounts = createProviderAccounts({ database, probe, environment: { PATH: process.env.PATH }, homeDirectory: user });
+    t.after(() => accounts.close());
+    return accounts;
+  };
+  const defaultLogin = (accounts) => accounts.list().providers.find((provider) => provider.provider === "claude").accounts[0];
+  const chat = context.conversation();
+  const launch = (accounts, sessionId) => {
+    const account = accounts.resolve({ provider: "claude", conversationId: chat.id });
+    const run = context.claudeRun(chat.id);
+    database.bindRunAccount(run.id, account);
+    database.updateRun(run.id, { status: "interrupted", startedAt: new Date().toISOString(), providerSessionId: sessionId });
+    accounts.recordLimits(account, run.id, [{ window: "five_hour", utilization: sessionId === "session-a" ? 0.4 : 0.7, status: "allowed", resetsAt: null }]);
+    return { account, run: database.getRun(run.id) };
+  };
+  const before = unset();
+  const a = launch(before, "session-a");
+  assert.equal(a.account.home, first, "the standard home is keyed by where it leads");
+
+  // ~/.claude now leads to another directory: another login.
+  rmSync(standard);
+  symlinkSync(second, standard);
+  const after = unset();
+  assert.equal(after.resolve({ provider: "claude", conversationId: chat.id }).home, second);
+  assert.throws(() => after.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-a" }),
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(first) && error.message.includes(second));
+  const recovery = database.beginInterruptedRunRecovery(a.run.id, "retry");
+  assert.throws(() => after.resolve({ provider: "claude", conversationId: chat.id, pin: accountPin(recovery.run) }),
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && /discard the interrupted run/.test(error.message));
+  assert.equal(defaultLogin(after).measured[1].runs, 0, "the earlier directory's runs are not this login's usage");
+  assert.deepEqual(defaultLogin(after).limits, []);
+  launch(after, "session-b");
+  assert.deepEqual([defaultLogin(after).measured[1].runs, defaultLogin(after).limits[0].utilization], [1, 0.7]);
+
+  // Pointing it back restores the first login's session, pin and history.
+  rmSync(standard);
+  symlinkSync(first, standard);
+  const restored = unset();
+  assert.equal(restored.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-a" }).home, first);
+  assert.equal(restored.resolve({ provider: "claude", conversationId: chat.id, pin: accountPin(recovery.run) }).home, first);
+  assert.deepEqual([defaultLogin(restored).measured[1].runs, defaultLogin(restored).limits[0].utilization], [1, 0.4]);
 });
 
 test("one CLI home keeps one usage and limit history under any spelling, link or case", async (t) => {
@@ -795,6 +852,24 @@ test("a default login that uses a credential variable is not refused as signed o
   await assert.rejects(accounts.activate({ provider: "codex", accountId: id("Old") }), (error) => error.details.code === "PROVIDER_ACCOUNT_SWITCH_FAILED");
   const check = probe.calls.find((call) => call.environment.CODEX_HOME === signedOutHome);
   assert.equal(check.environment.CODEX_API_KEY, undefined, "an added account is checked by its own login");
+});
+
+test("a disabled credential switch does not stand in for the default login", async (t) => {
+  for (const [value, configured] of [["0", false], ["false", false], ["", false], ["1", true], [" TRUE ", true], ["on", true]]) {
+    const context = await fixture(t, { extraEnvironment: { CLAUDE_CODE_USE_BEDROCK: value } });
+    context.logins.set(context.inheritedHome, signedOut);
+    context.claude();
+    await tick(); await tick();
+    const login = context.claude().accounts[0].login;
+    assert.equal(login.status, configured ? "configured" : "signed-out", JSON.stringify(value));
+    assert.equal(context.probe.calls.some((call) => call.executable === "claude"), !configured, "a disabled switch runs the real check");
+    if (!configured) {
+      const chat = context.conversation();
+      // A signed-out home is still refused for a send and a switch.
+      await assert.rejects(context.accounts.assertLaunchable({ provider: "claude", conversationId: chat.id }), (error) => error.details.code === "PROVIDER_ACCOUNT_SIGNED_OUT");
+      await assert.rejects(context.accounts.activate({ provider: "claude", accountId: "claude:default" }), (error) => error.details.code === "PROVIDER_ACCOUNT_SWITCH_FAILED");
+    }
+  }
 });
 
 test("limit windows stored before homes were keyed are kept by home", async (t) => {

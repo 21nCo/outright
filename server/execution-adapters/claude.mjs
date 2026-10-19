@@ -51,7 +51,8 @@ export const claudeAdapter = defineAdapter({
   // Each of these makes Claude Code ignore the login in CLAUDE_CONFIG_DIR.
   // Without the variable it uses ~/.claude.
   accounts: { homeVariable: "CLAUDE_CONFIG_DIR", standardHome: ".claude", identityArgs: ["auth", "status", "--json"], parseIdentity,
-    credentialVariables: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"] },
+    credentialVariables: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"],
+    credentialSwitches: ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"] },
   // What Claude Code 2.1.296 resolves each alias to. Another release
   // answering for an alias is reported, not assumed equivalent.
   modelAliases: { haiku: ["claude-haiku-5-5"], sonnet: ["claude-sonnet-5-5"], opus: ["claude-opus-5-5"] },

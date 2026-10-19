@@ -820,7 +820,8 @@ test("harness logins are read from each CLI's status without credentials", () =>
   assert.equal(parseCodex("Something else"), null);
   assert.deepEqual([claude.accounts.homeVariable, codex.accounts.homeVariable, anthropic.accounts], ["CLAUDE_CONFIG_DIR", "CODEX_HOME", null]);
   assert.deepEqual([claude.accounts.standardHome, codex.accounts.standardHome], [".claude", ".codex"]);
-  const accounts = { homeVariable: "FIXTURE_HOME", standardHome: ".fixture", identityArgs: ["status"], parseIdentity: () => null, credentialVariables: ["FIXTURE_TOKEN"] };
+  const accounts = { homeVariable: "FIXTURE_HOME", standardHome: ".fixture", identityArgs: ["status"], parseIdentity: () => null, credentialVariables: ["FIXTURE_TOKEN", "FIXTURE_USE_CLOUD"],
+    credentialSwitches: ["FIXTURE_USE_CLOUD"] };
   assert.equal(defineAdapter(harnessSpec({ accounts })).accounts.homeVariable, "FIXTURE_HOME");
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, homeVariable: "OUTRIGHT_HOME" } })), /accounts must name/);
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, identityArgs: ["status; rm"] } })), /accounts must name/);
@@ -830,6 +831,11 @@ test("harness logins are read from each CLI's status without credentials", () =>
     assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, standardHome } })), /accounts must name/, standardHome);
   }
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialVariables: ["OUTRIGHT_ANTHROPIC_API_KEY"] } })), /accounts must name/);
+  // A switch is a declared credential variable that counts only when enabled.
+  assert.deepEqual([claude.accounts.credentialSwitches, codex.accounts.credentialSwitches], [["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"], []]);
+  for (const credentialSwitches of [undefined, ["FIXTURE_OTHER"]]) {
+    assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialSwitches } })), /accounts must name/, String(credentialSwitches));
+  }
 });
 
 test("an account's home reaches only its own launch, and only under its own variable", () => {

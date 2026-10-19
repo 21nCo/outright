@@ -40,7 +40,7 @@ export const codexAdapter = defineAdapter({
   // `codex exec --json` reports token usage but no usage windows.
   // An API key variable takes precedence over the login in CODEX_HOME,
   // which is ~/.codex when unset.
-  accounts: { homeVariable: "CODEX_HOME", standardHome: ".codex", identityArgs: ["login", "status"], parseIdentity, credentialVariables: ["CODEX_API_KEY", "OPENAI_API_KEY"] },
+  accounts: { homeVariable: "CODEX_HOME", standardHome: ".codex", identityArgs: ["login", "status"], parseIdentity, credentialVariables: ["CODEX_API_KEY", "OPENAI_API_KEY"], credentialSwitches: [] },
   buildLaunch({ worktreePath, run, sessionId }) {
     const sandbox = SANDBOX_MODES[run.approvalPolicy];
     const options = [];
