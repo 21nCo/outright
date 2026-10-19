@@ -1,0 +1,47 @@
+docs/out-28-provider-accounts.md
+  s_e1c5fc1a65c0cf::t_db0f89abb73ee5 19,21
+docs/out-3-execution-adapters.md
+  s_e1c5fc1a65c0cf::t_4639c2182c6b15 15
+server/execution-adapters.test.mjs
+  s_e1c5fc1a65c0cf::t_245c56869d13d6 812,814-820,824,830-833,840-841,843-844,846-865,884-891
+server/execution-adapters/codex.mjs
+  s_e1c5fc1a65c0cf::t_27e6c9188e4abc 4-7,10-12,44-53
+server/outright-runtime.test.mjs
+  s_e1c5fc1a65c0cf::t_739d51a01d099a 3615-3617
+server/provider-accounts.test.mjs
+  s_e1c5fc1a65c0cf::t_409efbcda3a541 15-17,287,301,340-342,347,350,358,415,417-421,425,570,578,589,598,605,621,674-699,763,798,802-804,848,853-854,893,899,901,914-915,934,1077,1086,1103,1120,1143,1149,1162,1238,1297,1310-1319,1340,1394-1399,1402,1442,1513,1534-1546,1561,1566,1570,1575,1583-1584,1586,1617,1619,1627,1629
+server/provider-discovery.test.mjs
+  s_e1c5fc1a65c0cf::t_db34247b954aca 23-37,281-318
+server/execution-adapters/claude.mjs
+  s_1900bb15a7199a::t_648ddaf6e35daf 3-9,14-15,57-62,64-69
+server/execution-adapters/contract.mjs
+  s_1900bb15a7199a::t_cfef430f3cb4e1 29-30,60-79,97-101,105,108-110,143
+server/execution-adapters/index.mjs
+  s_1900bb15a7199a::t_5f0b9008aa349b 63-65,67
+server/provider-accounts.mjs
+  s_1900bb15a7199a::t_af19071fb20d10 189-194,197-204,217-218,239,272-279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5ac0fe7d18b53ff072db65d940c375c345d63ce9",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_e1c5fc1a65c0cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13e18-4241-7662-a24f-782076addabe",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
