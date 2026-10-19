@@ -1,0 +1,43 @@
+docs/out-28-provider-accounts.md
+  s_7d0a48f0aaecda::t_c0f696a44ce063 15,17,27
+docs/out-3-execution-adapters.md
+  s_7d0a48f0aaecda::t_5b6cfb2ce5f513 15
+server/execution-adapters/claude.mjs
+  s_7d0a48f0aaecda::t_1ba2a6338d41e9 51-52,55
+server/execution-adapters/codex.mjs
+  s_7d0a48f0aaecda::t_56e1f8ab9f88aa 41-46
+server/execution-adapters/contract.mjs
+  s_7d0a48f0aaecda::t_79b9030bc7e5fa 75-77,83-85,119-120
+server/provider-accounts.mjs
+  s_7d0a48f0aaecda::t_adc1bb82f347bc 2,24-26,65,108-111,120,155-157,161,230-238,247,303-304,308,317-318,421-427,429-431,433
+server/provider-accounts.test.mjs
+  s_7d0a48f0aaecda::t_26b2e6da03085a 4,10,29-45,63,392,910-1037
+src/components/ProviderAccounts.jsx
+  s_7d0a48f0aaecda::t_08f802c3c0e574 122-127
+src/lib/provider-accounts.js
+  s_7d0a48f0aaecda::t_a1607605941c09 14-15,17-21
+tests/ui-accessibility.test.mjs
+  s_7d0a48f0aaecda::t_e7eef5108d762b 149-151
+tests/ui-races.jsx
+  s_7d0a48f0aaecda::t_98a30c16203e22 1222-1264,5980
+tests/ui-races.test.mjs
+  s_7d0a48f0aaecda::t_95a8be9802daba 899
+server/execution-adapters.test.mjs
+  s_7d0a48f0aaecda::t_a89e8e53e0a5fe 823-824,836,839-846
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7240896e659b9feb3fb7bb76a9c62e9f12cf1f11",
+  "prompts": {},
+  "sessions": {
+    "s_7d0a48f0aaecda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec9cf707-0884-40ca-b283-dbc4d0f2a4b5",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
