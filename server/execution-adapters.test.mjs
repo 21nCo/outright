@@ -809,43 +809,60 @@ test("Claude Code usage windows normalize from the recorded stream and drop malf
 test("harness logins are read from each CLI's status without credentials", () => {
   const parseClaude = claude.accounts.parseIdentity;
   assert.deepEqual(parseClaude(JSON.stringify({ loggedIn: true, authMethod: "claude.ai", email: "a@example.com", orgName: "Org\u0007", subscriptionType: "max", configDirectory: "/x" })),
-    { signedIn: true, method: "claude.ai", email: "a@example.com", organization: "Org", plan: "max" });
+    { signedIn: true, ownLogin: true, method: "claude.ai", email: "a@example.com", organization: "Org", plan: "max" });
   assert.equal(parseClaude(JSON.stringify({ loggedIn: false, authMethod: "none" })).signedIn, false);
+  // Claude Code 2.1.303 with an empty CLAUDE_CONFIG_DIR and only dummy
+  // federation selectors, an inherited key or a helper: signed in, but not
+  // by a login stored in that directory.
+  for (const status of [{ authMethod: "oauth_token" }, { authMethod: "api_key", apiKeySource: "ANTHROPIC_API_KEY" }, { authMethod: "api_key_helper" }, { authMethod: "third_party" }]) {
+    assert.deepEqual([parseClaude(JSON.stringify({ loggedIn: true, apiProvider: "firstParty", ...status })).signedIn, parseClaude(JSON.stringify({ loggedIn: true, ...status })).ownLogin], [true, false], JSON.stringify(status));
+  }
+  assert.equal(parseClaude(JSON.stringify({ loggedIn: true, authMethod: "api_key", apiKeySource: "/login managed key" })).ownLogin, true);
   assert.equal(parseClaude("not json"), null);
   assert.equal(parseClaude(JSON.stringify({ loggedIn: "yes" })), null);
   const parseCodex = codex.accounts.parseIdentity;
-  assert.deepEqual(parseCodex("Logged in using ChatGPT\n"), { signedIn: true, method: "chatgpt", email: null, organization: null, plan: null });
+  assert.deepEqual(parseCodex("Logged in using ChatGPT\n"), { signedIn: true, ownLogin: true, method: "chatgpt", email: null, organization: null, plan: null });
   assert.doesNotMatch(JSON.stringify(parseCodex("Logged in using an API key - sk-proj-***ABCD")), /sk-/);
   assert.equal(parseCodex("Not logged in").signedIn, false);
   assert.equal(parseCodex("Something else"), null);
   assert.deepEqual([claude.accounts.homeVariable, codex.accounts.homeVariable, anthropic.accounts], ["CLAUDE_CONFIG_DIR", "CODEX_HOME", null]);
   assert.deepEqual([claude.accounts.standardHome, codex.accounts.standardHome], [".claude", ".codex"]);
-  const accounts = { homeVariable: "FIXTURE_HOME", standardHome: ".fixture", identityArgs: ["status"], parseIdentity: () => null, credentialVariables: ["FIXTURE_TOKEN", "FIXTURE_USE_CLOUD", "FIXTURE_UNUSED"],
-    loginOverrides: ["FIXTURE_TOKEN", "FIXTURE_USE_CLOUD"], credentialSwitches: ["FIXTURE_USE_CLOUD"] };
-  assert.equal(defineAdapter(harnessSpec({ accounts })).accounts.homeVariable, "FIXTURE_HOME");
+  const accounts = { homeVariable: "FIXTURE_HOME", standardHome: ".fixture", identityArgs: ["status"], parseIdentity: () => null, credentialVariables: ["FIXTURE_*", "OTHER_TOKEN"],
+    nonCredentialVariables: ["FIXTURE_MODEL", "FIXTURE_USE_TOOL"], credentialSwitches: ["FIXTURE_USE_*"], inertCredentials: ["FIXTURE_IGNORED"] };
+  const fixture = defineAdapter(harnessSpec({ accounts })).accounts;
+  assert.equal(fixture.homeVariable, "FIXTURE_HOME");
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, homeVariable: "OUTRIGHT_HOME" } })), /accounts must name/);
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, identityArgs: ["status; rm"] } })), /accounts must name/);
-  assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialVariables: undefined } })), /accounts must name/);
   // The standard home is one directory inside the user's home, never a path out of it.
   for (const standardHome of [undefined, "../.fixture", "/etc", "a/b"]) {
     assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, standardHome } })), /accounts must name/, standardHome);
   }
-  assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialVariables: ["OUTRIGHT_ANTHROPIC_API_KEY"] } })), /accounts must name/);
-  // A switch is a declared credential variable that counts only when enabled.
-  // Claude Code 2.1.303 selects a provider by each of these switches.
-  assert.deepEqual([claude.accounts.credentialSwitches, codex.accounts.credentialSwitches], [["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD", "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_GATEWAY"], []]);
-  for (const credentialSwitches of [undefined, ["FIXTURE_OTHER"], ["FIXTURE_UNUSED"]]) {
-    assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialSwitches } })), /accounts must name/, String(credentialSwitches));
+  for (const credentialVariables of [undefined, [], ["OUTRIGHT_*"], ["fixture_*"], ["FIXTURE_(.*)"]]) {
+    assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialVariables } })), /accounts must name/, String(credentialVariables));
   }
-  // Only variables the CLI authenticates with stand in for its login: Codex
-  // ignores OPENAI_API_KEY, which is still kept from an added account.
-  assert.deepEqual(codex.accounts.loginOverrides, ["CODEX_API_KEY"]);
-  assert.deepEqual(codex.accounts.credentialVariables, ["CODEX_API_KEY", "OPENAI_API_KEY"]);
-  assert.deepEqual(claude.accounts.loginOverrides, claude.accounts.credentialVariables);
-  for (const loginOverrides of [undefined, ["FIXTURE_OTHER"]]) {
-    assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, loginOverrides } })), /accounts must name/, String(loginOverrides));
+  for (const field of ["nonCredentialVariables", "credentialSwitches", "inertCredentials"]) {
+    assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, [field]: undefined } })), /accounts must name/, field);
   }
+  // A source is any name its rules match, except the home variable and the
+  // non-credential exceptions; an inert one never stands in for the login.
+  assert.deepEqual(["FIXTURE_TOKEN", "FIXTURE_NEW_SOURCE", "OTHER_TOKEN", "FIXTURE_HOME", "FIXTURE_MODEL", "OTHER_TOKENS", "FIXTURE_IGNORED"].map(fixture.isCredential),
+    [true, true, true, false, false, false, true]);
+  assert.deepEqual([fixture.overridesLogin("FIXTURE_IGNORED"), fixture.overridesLogin("FIXTURE_TOKEN")], [false, true]);
+  assert.deepEqual(["FIXTURE_USE_CLOUD", "FIXTURE_USE_TOOL", "FIXTURE_TOKEN"].map(fixture.isCredentialSwitch), [true, false, false]);
+  // Claude Code 2.1.303's own sources, including those it reads for
+  // profiles, federation and gateways; model and tool choices are not.
+  const claudeSources = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_IDENTITY_TOKEN", "ANTHROPIC_IDENTITY_TOKEN_FILE", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_GATEWAY_TOKEN", "CLAUDE_CODE_SESSION_ACCESS_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_GATEWAY"];
+  assert.deepEqual(claudeSources.filter((name) => !claude.accounts.overridesLogin(name)), []);
+  assert.deepEqual(["ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CODE_USE_POWERSHELL_TOOL", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CONFIG_DIR"]
+    .filter(claude.accounts.isCredential), []);
+  assert.deepEqual(["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_NATIVE_FILE_SEARCH", "ANTHROPIC_API_KEY"].map(claude.accounts.isCredentialSwitch), [true, true, false, false]);
+  // Codex: OPENAI_API_KEY is a source an added account runs without, but
+  // Codex never signs in with it in place of its login.
+  assert.deepEqual(["CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE", "OPENAI_API_KEY", "CODEX_HOME", "CODEX_SANDBOX"]
+    .map(codex.accounts.isCredential), [true, true, true, true, true, false, false]);
+  assert.deepEqual([codex.accounts.overridesLogin("OPENAI_API_KEY"), codex.accounts.overridesLogin("CODEX_ACCESS_TOKEN")], [false, true]);
 });
 
 test("an account's home reaches only its own launch, and only under its own variable", () => {
@@ -864,5 +881,13 @@ test("an account's home reaches only its own launch, and only under its own vari
   assert.deepEqual(Object.keys(buildExecutionEnvironment("claude", credentials, credentials, { homePath: "/accounts/work" })).sort(), ["CLAUDE_CONFIG_DIR", "CODEX_API_KEY", "OPENAI_API_KEY", "PATH"]);
   assert.deepEqual(Object.keys(buildExecutionEnvironment("codex", credentials, credentials, { homePath: "/accounts/codex" })).sort(),
     ["ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK", "CODEX_HOME", "PATH", "claude_code_oauth_token"]);
+  // Profiles, federation and identity tokens are sources too; a model or
+  // tool choice is not.
+  const sources = { PATH: "/bin", ANTHROPIC_PROFILE: "work", ANTHROPIC_FEDERATION_RULE_ID: "rule", ANTHROPIC_ORGANIZATION_ID: "org", ANTHROPIC_IDENTITY_TOKEN: "jwt",
+    ANTHROPIC_IDENTITY_TOKEN_FILE: "/t", ANTHROPIC_MODEL: "opus", CLAUDE_CODE_USE_POWERSHELL_TOOL: "1", CODEX_ACCESS_TOKEN: "token", OPENAI_FEDERATION_RULE_ID: "rule",
+    OPENAI_IDENTITY_TOKEN_FILE: "/t" };
+  assert.deepEqual(Object.keys(buildExecutionEnvironment("claude", sources, sources, { homePath: "/accounts/work" })).sort(),
+    ["ANTHROPIC_MODEL", "CLAUDE_CODE_USE_POWERSHELL_TOOL", "CLAUDE_CONFIG_DIR", "CODEX_ACCESS_TOKEN", "OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE", "PATH"]);
+  assert.deepEqual(Object.keys(buildExecutionEnvironment("codex", sources, sources, { homePath: "/accounts/codex" })).filter((name) => /^(CODEX|OPENAI)_/.test(name)), ["CODEX_HOME"]);
   assert.throws(() => buildExecutionEnvironment("anthropic-api", inherited, inherited, { homePath: "/accounts/x" }), /no selectable accounts/);
 });

@@ -12,6 +12,9 @@ import { accountPin, createProviderAccounts, IDENTITY_RECHECK_MS, LIMIT_STALE_AF
 const signedIn = (email) => JSON.stringify({ loggedIn: true, authMethod: "claude.ai", email, orgName: "Org", subscriptionType: "max" });
 const signedOut = JSON.stringify({ loggedIn: false, authMethod: "none" });
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+// The key a home is recorded and compared by: Windows folds its case.
+const keyOf = (home) => (process.platform === "win32" ? home.toLowerCase() : home);
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // Answers an identity check by the account home the probe would run with.
 function fakeProbe(logins) {
@@ -281,7 +284,7 @@ test("account homes are validated and only display identity is kept", async (t) 
   logins.set(codexHome, "Logged in using an API key - sk-proj-***ABCD\n");
   await accounts.add({ provider: "codex", label: "API", homePath: codexHome });
   const codex = accounts.list().providers.find((provider) => provider.provider === "codex");
-  assert.deepEqual(codex.accounts.find((account) => account.label === "API").login.identity, { signedIn: true, method: "api-key", email: null, organization: null, plan: null });
+  assert.deepEqual(codex.accounts.find((account) => account.label === "API").login.identity, { signedIn: true, ownLogin: true, method: "api-key", email: null, organization: null, plan: null });
   assert.equal(codex.usageLimits, false);
   assert.equal(codex.accounts[0].limits, null, "an unreported limit is unavailable, not empty");
   assert.doesNotMatch(JSON.stringify(accounts.list()), /sk-proj|direct-secret/);
@@ -295,7 +298,7 @@ test("provider limits separate current, stale, reset and unreported windows", as
   const context = await fixture(t, { clock: () => now });
   const { accounts } = context;
   const seconds = (iso) => Date.parse(iso) / 1000;
-  const defaultLogin = { id: "claude:default", provider: "claude", home: context.inheritedHome };
+  const defaultLogin = { id: "claude:default", provider: "claude", home: keyOf(context.inheritedHome) };
   accounts.recordLimits(defaultLogin, "run-1", [
     { window: "five_hour", utilization: 0.5, status: "allowed", resetsAt: new Date(seconds("2026-10-19T12:00:00Z") * 1000).toISOString() },
     { window: "seven_day", utilization: 0.2, status: null, resetsAt: "2026-10-22T00:00:00.000Z" },
@@ -334,17 +337,17 @@ test("measured usage counts only runs launched with the account and flags missin
     database.updateRun(run.id, { status: "completed", ...usage });
     return run;
   };
-  launch(work.id, context.workHome, { inputTokens: 100, outputTokens: 20, costUsd: 0.5 });
-  launch(work.id, context.workHome, { inputTokens: 10, outputTokens: 5 });
-  launch("claude:default", context.inheritedHome, { inputTokens: 1000, outputTokens: 1000, costUsd: 9 });
+  launch(work.id, keyOf(context.workHome), { inputTokens: 100, outputTokens: 20, costUsd: 0.5 });
+  launch(work.id, keyOf(context.workHome), { inputTokens: 10, outputTokens: 5 });
+  launch("claude:default", keyOf(context.inheritedHome), { inputTokens: 1000, outputTokens: 1000, costUsd: 9 });
   const measured = (id = work.id) => Object.fromEntries(context.claude().accounts.find((account) => account.id === id).measured.map((period) => [period.period, period]));
   assert.deepEqual({ ...measured()["5h"], since: undefined, label: undefined, changesAt: undefined }, { period: "5h", since: undefined, label: undefined, changesAt: undefined, runs: 2, inputTokens: 110, outputTokens: 25, runsWithoutTokens: 0, runsWithPartialTokens: 0, costUsd: 0.5, runsWithoutCost: 1 });
   // A run that reported no tokens is counted as unreported, never as zero:
   // a partial sum stays partial and nothing reported stays null.
-  launch(work.id, context.workHome, {});
+  launch(work.id, keyOf(context.workHome), {});
   assert.deepEqual([measured()["5h"].runs, measured()["5h"].inputTokens, measured()["5h"].runsWithoutTokens], [3, 110, 1]);
   // A run that reported one counter keeps it and is counted as partial.
-  launch(work.id, context.workHome, { inputTokens: 7 });
+  launch(work.id, keyOf(context.workHome), { inputTokens: 7 });
   assert.deepEqual([measured()["5h"].runs, measured()["5h"].inputTokens, measured()["5h"].outputTokens, measured()["5h"].runsWithoutTokens, measured()["5h"].runsWithPartialTokens], [4, 117, 25, 1, 1]);
   const codexHome = path.join(context.root, "codex");
   mkdirSync(codexHome);
@@ -352,7 +355,7 @@ test("measured usage counts only runs launched with the account and flags missin
   await context.accounts.add({ provider: "codex", label: "Silent", homePath: codexHome });
   const silent = context.accounts.list().providers.find((provider) => provider.provider === "codex").accounts.find((account) => account.label === "Silent");
   const silentRun = database.createRun({ conversationId: chat.id, provider: "codex", approvalPolicy: "read-only", prompt: "hello" });
-  database.bindRunAccount(silentRun.id, { id: silent.id, provider: "codex", label: "Silent", home: codexHome });
+  database.bindRunAccount(silentRun.id, { id: silent.id, provider: "codex", label: "Silent", home: keyOf(codexHome) });
   const silentUsage = context.accounts.list().providers.find((provider) => provider.provider === "codex").accounts.find((account) => account.id === silent.id).measured[0];
   assert.deepEqual([silentUsage.runs, silentUsage.inputTokens, silentUsage.outputTokens, silentUsage.runsWithoutTokens, silentUsage.runsWithPartialTokens], [1, null, null, 1, 0]);
   // The listing says when its oldest run leaves each window; at that moment
@@ -409,17 +412,21 @@ test("a launched run's account cannot be rebound", async (t) => {
 test("a database from before accounts upgrades in place and keeps its runs readable", async (t) => {
   const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-accounts-legacy-")));
   const filename = path.join(root, "outright.db");
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  // Windows cannot remove a database file while any connection holds it.
   let database = createOutrightDatabase({ filename });
+  let raw = null;
+  t.after(async () => {
+    try { raw?.close(); await database.close(); }
+    finally { rmSync(root, { recursive: true, force: true }); }
+  });
   const chat = database.createConversation({ projectId: "p", worktreeId: "w", worktreePath: root, title: "Legacy", provider: "claude" });
   const legacyRun = database.createRun({ conversationId: chat.id, provider: "claude", approvalPolicy: "read-only", prompt: "old" });
   await database.close();
-  const raw = new Database(filename);
+  raw = new Database(filename);
   raw.exec("DROP TABLE run_accounts; DROP TABLE run_account_pins; DROP TABLE provider_accounts; DROP TABLE provider_account_selection; DROP TABLE provider_limit_windows;");
   raw.close();
 
   database = createOutrightDatabase({ filename });
-  t.after(() => database.close());
   assert.equal(database.getRun(legacyRun.id).accountId, null, "a run from before accounts names none");
   assert.equal(database.listRuns(chat.id).length, 1);
   assert.equal(database.activeProviderAccountId("claude"), "claude:default");
@@ -560,7 +567,7 @@ test("a run that never launched does not own the session it carries", async (t) 
   await manager.schedule({ conversation: database.getConversation(chat.id), run: recovery.run });
   assert.ok(spawned[0].args.includes("attached-session"));
   assert.equal(spawned[0].env.CLAUDE_CONFIG_DIR, context.workHome);
-  assert.deepEqual([database.getRun(recovery.run.id).accountId, database.getRun(recovery.run.id).accountHome], [work.id, context.workHome]);
+  assert.deepEqual([database.getRun(recovery.run.id).accountId, database.getRun(recovery.run.id).accountHome], [work.id, keyOf(context.workHome)]);
   await context.finish(0);
 
   // Once launched, the run owns the session, and its home is checked on resume.
@@ -568,7 +575,7 @@ test("a run that never launched does not own the session it carries", async (t) 
   assert.equal(accounts.resolve(target).id, work.id);
   rmSync(context.workHome, { recursive: true });
   symlinkSync(context.inheritedHome, context.workHome);
-  assert.throws(() => accounts.resolve(target), (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(context.inheritedHome));
+  assert.throws(() => accounts.resolve(target), (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(keyOf(context.inheritedHome)));
 });
 
 test("the default login's home is recorded, so a changed environment neither resumes nor shares its usage", async (t) => {
@@ -579,7 +586,7 @@ test("the default login's home is recorded, so a changed environment neither res
   await manager.schedule({ conversation: chat, run: first });
   spawned[0].child.stdout.write(`${JSON.stringify({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.4, resetsAt: Math.floor(Date.now() / 1000) + 3600 } })}\n`);
   await context.finish(0, "session-1");
-  assert.equal(database.getRun(first.id).accountHome, context.inheritedHome);
+  assert.equal(database.getRun(first.id).accountHome, keyOf(context.inheritedHome));
 
   // After a restart the environment selects another home for the default.
   const otherHome = path.join(context.root, "other");
@@ -588,14 +595,14 @@ test("the default login's home is recorded, so a changed environment neither res
   const restarted = createProviderAccounts({ database, probe: context.probe, environment: { ...context.environment, CLAUDE_CONFIG_DIR: otherHome } });
   t.after(() => restarted.close());
   assert.throws(() => restarted.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }),
-    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(context.inheritedHome));
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(keyOf(context.inheritedHome)));
   const defaultLogin = (accounts) => accounts.list().providers.find((provider) => provider.provider === "claude").accounts[0];
   assert.equal(defaultLogin(restarted).measured[1].runs, 0, "another login's runs are not this login's usage");
   assert.deepEqual(defaultLogin(restarted).limits, []);
   assert.equal(defaultLogin(context.accounts).measured[1].runs, 1);
   assert.equal(defaultLogin(context.accounts).limits[0].utilization, 0.4);
   // A new session uses the current default login.
-  assert.equal(restarted.resolve({ provider: "claude", conversationId: chat.id }).home, otherHome);
+  assert.equal(restarted.resolve({ provider: "claude", conversationId: chat.id }).home, keyOf(otherHome));
 });
 
 test("a recovery's account pin is durable across a restart before it launches", async (t) => {
@@ -611,7 +618,7 @@ test("a recovery's account pin is durable across a restart before it launches", 
   await accounts.activate({ provider: "claude", accountId: "claude:default" });
 
   const recovery = database.beginInterruptedRunRecovery(first.id, "retry");
-  assert.deepEqual(accountPin(recovery.run), { accountId: work.id, home: context.workHome, recovery: true });
+  assert.deepEqual(accountPin(recovery.run), { accountId: work.id, home: keyOf(context.workHome), recovery: true });
   // The runtime restarts before the recovery launches; its retry keeps the pin.
   database.updateRun(recovery.run.id, { status: "interrupted" });
   const again = database.beginInterruptedRunRecovery(recovery.run.id, "retry");
@@ -662,6 +669,32 @@ test("inherited credential variables never reach an added account's check or lau
   await manager.schedule({ conversation: other, run: context.claudeRun(other.id) });
   assert.equal(spawned[1].env.ANTHROPIC_API_KEY, "env-key");
   await context.finish(1);
+});
+
+test("an added account is signed in only by a login stored in its directory", async (t) => {
+  const sources = { ANTHROPIC_FEDERATION_RULE_ID: "rule", ANTHROPIC_ORGANIZATION_ID: "org", ANTHROPIC_PROFILE: "work" };
+  const context = await fixture(t, { extraEnvironment: sources });
+  const { accounts, database, logins } = context;
+  // What Claude Code 2.1.303 prints for an empty directory when a
+  // federation it found elsewhere signs it in.
+  logins.set(context.workHome, JSON.stringify({ loggedIn: true, authMethod: "oauth_token", apiProvider: "firstParty" }));
+  const work = await addWork(context);
+  const check = context.probe.calls.find((call) => call.environment.CLAUDE_CONFIG_DIR === context.workHome);
+  assert.deepEqual(Object.keys(sources).filter((name) => name in check.environment), [], "the check runs without the inherited sources");
+  assert.deepEqual([work.login.status, work.login.identity.email], ["signed-out", null]);
+  await assert.rejects(accounts.activate({ provider: "claude", accountId: work.id }), (error) => error.details.code === "PROVIDER_ACCOUNT_SWITCH_FAILED");
+  assert.equal(database.activeProviderAccountId("claude"), "claude:default");
+  // Selected while it still had a login: a send is refused before anything is written.
+  database.selectProviderAccount("claude", work.id);
+  const chat = context.conversation();
+  await assert.rejects(accounts.assertLaunchable({ provider: "claude", conversationId: chat.id }), (error) => error.details.code === "PROVIDER_ACCOUNT_SIGNED_OUT");
+  // The default login launches with them, named and never their values.
+  const defaultLogin = context.claude().accounts[0].login;
+  assert.deepEqual([defaultLogin.status, defaultLogin.identity.variable], ["configured", "ANTHROPIC_FEDERATION_RULE_ID+ANTHROPIC_ORGANIZATION_ID+ANTHROPIC_PROFILE"]);
+  // A login stored in the directory signs the account in.
+  logins.set(context.workHome, signedIn("work@example.com"));
+  await accounts.refresh(work.id);
+  assert.equal((await accounts.assertLaunchable({ provider: "claude", conversationId: chat.id })).identity, "work@example.com");
 });
 
 test("a removed account's live run records no orphan limit windows", async (t) => {
@@ -727,7 +760,7 @@ test("a recovery of a run launched before accounts stays on the default login, r
   assert.deepEqual(accountPin(second.run), { accountId: "claude:default", home: undefined, recovery: true });
   await manager.schedule({ conversation: database.getConversation(chat.id), run: second.run, forceFreshSession: true });
   assert.equal(spawned[0].env.CLAUDE_CONFIG_DIR, context.inheritedHome);
-  assert.deepEqual([database.getRun(second.run.id).accountId, database.getRun(second.run.id).accountHome], ["claude:default", context.inheritedHome]);
+  assert.deepEqual([database.getRun(second.run.id).accountId, database.getRun(second.run.id).accountHome], ["claude:default", keyOf(context.inheritedHome)]);
   await context.finish(0);
   // Interrupted again after launching, it is retried on the same login.
   database.updateRun(second.run.id, { status: "interrupted" });
@@ -762,10 +795,13 @@ test("a recovery whose default-login home changed names actions that work", asyn
   const restarted = createProviderAccounts({ database, probe: context.probe, environment: { ...context.environment, CLAUDE_CONFIG_DIR: otherHome } });
   t.after(() => restarted.close());
   assert.throws(() => restarted.resolve({ provider: "claude", conversationId: chat.id, pin: accountPin(database.getRun(first.id)) }),
-    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(context.inheritedHome)
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(keyOf(context.inheritedHome))
       && /Point CLAUDE_CONFIG_DIR or the CLI's standard directory there again, or discard the interrupted run/.test(error.message) && !/session/i.test(error.message));
   // A chat session in the same state can still be cleared.
   assert.throws(() => restarted.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }), /clear the session in chat settings/);
+  // A Windows drive letter is part of the directory, never a credential source.
+  assert.throws(() => restarted.resolve({ provider: "claude", conversationId: chat.id, pin: { accountId: "claude:default", home: "C:\\Users\\me\\.claude", recovery: true } }),
+    (error) => error.message.includes("default login in C:\\Users\\me\\.claude, but"));
 });
 
 test("off Windows the default login reads only the exact home variable name", async (t) => {
@@ -809,13 +845,13 @@ test("with its variable unset, the CLI's standard home is the default login unde
   const chat = context.conversation();
   const run = context.claudeRun(chat.id);
   const launched = unset.resolve({ provider: "claude", conversationId: chat.id });
-  assert.equal(launched.home, standard.claude);
+  assert.equal(launched.home, keyOf(standard.claude));
   database.bindRunAccount(run.id, launched);
   database.updateRun(run.id, { status: "completed", providerSessionId: "session-1" });
   const named = createProviderAccounts({ database, probe, environment: { PATH: process.env.PATH, CLAUDE_CONFIG_DIR: path.join(root, "claude-link") }, homeDirectory: user });
   t.after(() => named.close());
-  assert.equal(named.resolve({ provider: "claude", conversationId: chat.id }).home, standard.claude);
-  assert.equal(named.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }).home, standard.claude);
+  assert.equal(named.resolve({ provider: "claude", conversationId: chat.id }).home, keyOf(standard.claude));
+  assert.equal(named.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }).home, keyOf(standard.claude));
   const defaultLogin = (accounts) => accounts.list().providers.find((provider) => provider.provider === "claude").accounts[0];
   assert.equal(defaultLogin(named).measured[1].runs, 1, "one bucket for both ways of naming it");
   await assert.rejects(named.add({ provider: "claude", label: "Standard", homePath: standard.claude }), (error) => error.details.code === "PROVIDER_ACCOUNT_DUPLICATE");
@@ -854,15 +890,15 @@ test("with its variable unset, repointing a linked standard home is another logi
   };
   const before = unset();
   const a = launch(before, "session-a");
-  assert.equal(a.account.home, first, "the standard home is keyed by where it leads");
+  assert.equal(a.account.home, keyOf(first), "the standard home is keyed by where it leads");
 
   // ~/.claude now leads to another directory: another login.
   rmSync(standard);
   symlinkSync(second, standard);
   const after = unset();
-  assert.equal(after.resolve({ provider: "claude", conversationId: chat.id }).home, second);
+  assert.equal(after.resolve({ provider: "claude", conversationId: chat.id }).home, keyOf(second));
   assert.throws(() => after.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-a" }),
-    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(first) && error.message.includes(second));
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(keyOf(first)) && error.message.includes(keyOf(second)));
   const recovery = database.beginInterruptedRunRecovery(a.run.id, "retry");
   assert.throws(() => after.resolve({ provider: "claude", conversationId: chat.id, pin: accountPin(recovery.run) }),
     (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && /discard the interrupted run/.test(error.message));
@@ -875,8 +911,8 @@ test("with its variable unset, repointing a linked standard home is another logi
   rmSync(standard);
   symlinkSync(first, standard);
   const restored = unset();
-  assert.equal(restored.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-a" }).home, first);
-  assert.equal(restored.resolve({ provider: "claude", conversationId: chat.id, pin: accountPin(recovery.run) }).home, first);
+  assert.equal(restored.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-a" }).home, keyOf(first));
+  assert.equal(restored.resolve({ provider: "claude", conversationId: chat.id, pin: accountPin(recovery.run) }).home, keyOf(first));
   assert.deepEqual([defaultLogin(restored).measured[1].runs, defaultLogin(restored).limits[0].utilization], [1, 0.4]);
 });
 
@@ -895,7 +931,7 @@ test("one CLI home keeps one usage and limit history under any spelling, link or
   for (const spelling of [`${inheritedHome}/.`, `${inheritedHome}/`, link]) {
     const restarted = createProviderAccounts({ database, probe, environment: { ...context.environment, CLAUDE_CONFIG_DIR: spelling } });
     t.after(() => restarted.close());
-    assert.equal(restarted.resolve({ provider: "claude", conversationId: chat.id }).home, inheritedHome, spelling);
+    assert.equal(restarted.resolve({ provider: "claude", conversationId: chat.id }).home, keyOf(inheritedHome), spelling);
     assert.equal(defaultLogin(restarted).measured[1].runs, 1, spelling);
     assert.equal(defaultLogin(restarted).limits[0]?.utilization, 0.4, spelling);
     assert.equal(restarted.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }).id, "claude:default");
@@ -1038,7 +1074,7 @@ test("every Claude Code provider switch is a credential source, and a login key 
   const chat = context.conversation(path.join(root, "keyed"));
   const withKey = runtime({ ANTHROPIC_API_KEY: "secret" });
   const account = withKey.resolve({ provider: "claude", conversationId: chat.id });
-  assert.equal(account.home, `ANTHROPIC_API_KEY:${context.inheritedHome}`);
+  assert.equal(account.home, `ANTHROPIC_API_KEY:${keyOf(context.inheritedHome)}`);
   const run = context.claudeRun(chat.id);
   database.updateRun(run.id, { status: "running", startedAt: new Date().toISOString() }, { account });
   database.updateRun(run.id, { status: "completed", providerSessionId: "keyed" });
@@ -1047,7 +1083,7 @@ test("every Claude Code provider switch is a credential source, and a login key 
   assert.throws(() => withBedrock.resolve({ provider: "claude", conversationId: chat.id, sessionId: "keyed" }),
     (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && !error.message.includes("secret")
       && error.message.includes("with ANTHROPIC_API_KEY, but it now launches with ANTHROPIC_API_KEY and CLAUDE_CODE_USE_BEDROCK"));
-  assert.equal(withBedrock.resolve({ provider: "claude", conversationId: chat.id }).home, `ANTHROPIC_API_KEY+CLAUDE_CODE_USE_BEDROCK:${context.inheritedHome}`);
+  assert.equal(withBedrock.resolve({ provider: "claude", conversationId: chat.id }).home, `ANTHROPIC_API_KEY+CLAUDE_CODE_USE_BEDROCK:${keyOf(context.inheritedHome)}`);
   assert.equal(runs(withBedrock), 0, "the two sources' usage stays apart");
   assert.equal(runs(withKey), 1);
 });
@@ -1064,7 +1100,7 @@ test("on a case-insensitive volume another spelling of the default home is the s
   };
   const named = restart(upper);
   // The key is the directory's stored name, however the variable spells it.
-  assert.equal(named.resolve({ provider: "claude", conversationId: "c" }).home, workHome);
+  assert.equal(named.resolve({ provider: "claude", conversationId: "c" }).home, keyOf(workHome));
   for (const homePath of [workHome, upper]) {
     await assert.rejects(named.add({ provider: "claude", label: "Work", homePath }),
       (error) => error.details.code === "PROVIDER_ACCOUNT_DUPLICATE" && /default login/.test(error.message), homePath);
@@ -1081,7 +1117,7 @@ test("on a case-insensitive volume another spelling of the default home is the s
   for (const accounts of [named, restart(workHome)]) {
     const defaultLogin = accounts.list().providers.find((provider) => provider.provider === "claude").accounts[0];
     assert.deepEqual([defaultLogin.measured[1].runs, defaultLogin.limits[0]?.utilization], [1, 0.4]);
-    assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }).home, workHome);
+    assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }).home, keyOf(workHome));
   }
 });
 
@@ -1104,13 +1140,13 @@ test("an added account whose directory is replaced by a link elsewhere keeps its
   };
   const listed = () => context.claude().accounts.find((account) => account.id === work.id);
   const first = launch("session-work", 0.4);
-  assert.equal(first.accountHome, workHome);
+  assert.equal(first.accountHome, keyOf(workHome));
 
   // Work's directory now leads to another login.
   renameSync(workHome, moved);
   symlinkSync(elsewhere, workHome);
   assert.throws(() => accounts.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-work" }),
-    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(workHome) && error.message.includes(elsewhere)
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(workHome) && error.message.includes(keyOf(elsewhere))
       && /Restore its directory, or clear the session in chat settings/.test(error.message));
   const recovery = database.beginInterruptedRunRecovery(first.id, "retry");
   assert.throws(() => accounts.resolve({ provider: "claude", conversationId: chat.id, pin: accountPin(recovery.run) }),
@@ -1123,7 +1159,7 @@ test("an added account whose directory is replaced by a link elsewhere keeps its
   rmSync(workHome);
   renameSync(moved, workHome);
   assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-work" }).id, work.id);
-  assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, pin: accountPin(recovery.run) }).home, workHome);
+  assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, pin: accountPin(recovery.run) }).home, keyOf(workHome));
   assert.deepEqual([listed().measured[1].runs, listed().limits[0].utilization], [1, 0.4]);
 });
 
@@ -1199,7 +1235,7 @@ test("an account's directory redirected while its launch is prepared starts noth
   const refused = (run) => {
     assert.equal(spawned.length, 1, "nothing launched under the other login");
     assert.equal(database.getRun(run.id).status, "failed");
-    assert.match(database.getRun(run.id).error, new RegExp(`changed while this run was launching.*${elsewhere}`));
+    assert.match(database.getRun(run.id).error, new RegExp(`changed while this run was launching.*${escapeRegExp(keyOf(elsewhere))}`));
     assert.equal(database.getRun(run.id).accountId, null);
   };
 
@@ -1258,7 +1294,7 @@ test("a relative home variable leaves the default login unusable instead of keyi
   await relative.add({ provider: "claude", label: "Work", homePath: workHome });
   const work = claude().accounts.find((account) => account.label === "Work");
   await relative.activate({ provider: "claude", accountId: work.id });
-  assert.equal((await relative.assertLaunchable({ provider: "claude", conversationId: chat.id })).home, workHome);
+  assert.equal((await relative.assertLaunchable({ provider: "claude", conversationId: chat.id })).home, keyOf(workHome));
 });
 
 test("a home variable whose .. follows a link leaves the default login unusable, and one that crosses no link is its directory", async (t) => {
@@ -1271,8 +1307,16 @@ test("a home variable whose .. follows a link leaves the default login unusable,
   mkdirSync(path.join(root, "a", "b"), { recursive: true });
   symlinkSync(path.join(root, "a", "b"), path.join(root, "link"));
   mkdirSync(path.join(root, "plain"));
-  // `<root>/link/..` is `<root>` by name but `<root>/a` on disk.
-  for (const value of [path.join(root, "link") + "/../x", path.join(root, "missing") + "/../x"]) {
+  // `<root>/link/..` is `<root>` by name but `<root>/a` on disk. Windows
+  // removes a .. by name before the file system reads a path, so there every
+  // reader finds `<root>/x`.
+  const values = [path.join(root, "link") + "/../x", path.join(root, "missing") + "/../x"];
+  for (const value of process.platform === "win32" ? values : []) {
+    const lexical = createProviderAccounts({ database, probe, environment: { PATH: process.env.PATH, CLAUDE_CONFIG_DIR: value } });
+    t.after(() => lexical.close());
+    assert.equal(lexical.resolve({ provider: "claude", conversationId: chat.id }).home, keyOf(path.join(root, "x")), value);
+  }
+  for (const value of process.platform === "win32" ? [] : values) {
     const ambiguous = createProviderAccounts({ database, probe, environment: { PATH: process.env.PATH, CLAUDE_CONFIG_DIR: value, CODEX_HOME: value } });
     t.after(() => ambiguous.close());
     for (const [provider, variable] of [["claude", "CLAUDE_CONFIG_DIR"], ["codex", "CODEX_HOME"]]) {
@@ -1293,7 +1337,7 @@ test("a home variable whose .. follows a link leaves the default login unusable,
   const plainValue = path.join(root, "plain") + "/../x";
   const plain = createProviderAccounts({ database, probe, environment: { PATH: process.env.PATH, CLAUDE_CONFIG_DIR: plainValue } });
   t.after(() => plain.close());
-  assert.equal((await plain.assertLaunchable({ provider: "claude", conversationId: chat.id })).home, path.join(root, "x"));
+  assert.equal((await plain.assertLaunchable({ provider: "claude", conversationId: chat.id })).home, keyOf(path.join(root, "x")));
   await plain.refresh("claude:default");
   assert.ok(probe.calls.some((call) => call.environment.CLAUDE_CONFIG_DIR === plainValue), "its login is checked");
 });
@@ -1347,11 +1391,15 @@ test("each run deletion prunes expired deleted-run usage by an index, not a scan
   const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-accounts-prune-")));
   const filename = path.join(root, "outright.db");
   const database = createOutrightDatabase({ filename });
-  t.after(async () => { await database.close(); rmSync(root, { recursive: true, force: true }); });
+  let raw = null;
+  // Every connection closes before the file is removed, which Windows requires.
+  t.after(async () => {
+    try { raw?.close(); await database.close(); }
+    finally { rmSync(root, { recursive: true, force: true }); }
+  });
   const chat = database.createConversation({ projectId: "p", worktreeId: root, worktreePath: root, title: "Chat", provider: "claude" });
   const run = database.createRun({ conversationId: chat.id, provider: "claude", approvalPolicy: "read-only", prompt: "hello" });
-  const raw = new Database(filename);
-  t.after(() => raw.close());
+  raw = new Database(filename);
   // Archive cleanup deletes runs in batches on the runtime connection, and
   // the trigger prunes once per deleted run.
   const trigger = raw.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'deleted_run_usage_keep'").get().sql;
@@ -1391,7 +1439,7 @@ test("a login checked before its account's directory led elsewhere is never show
   assert.equal((await accounts.assertLaunchable({ provider: "claude", conversationId: chat.id })).identity, "other@example.com");
   const run = context.claudeRun(chat.id);
   await manager.schedule({ conversation: chat, run });
-  assert.deepEqual([database.getRun(run.id).accountIdentity, database.getRun(run.id).accountHome], ["other@example.com", elsewhere]);
+  assert.deepEqual([database.getRun(run.id).accountIdentity, database.getRun(run.id).accountHome], ["other@example.com", keyOf(elsewhere)]);
   assert.equal(listed().login.identity.email, "other@example.com");
   await context.finish(spawned.length - 1);
 });
@@ -1462,7 +1510,7 @@ test("a check started before an account's directory led elsewhere is not shared 
   assert.equal((await accounts.assertLaunchable({ provider: "claude", conversationId: chat.id })).identity, "other@example.com");
   const run = context.claudeRun(chat.id);
   await manager.schedule({ conversation: chat, run });
-  assert.deepEqual([database.getRun(run.id).accountIdentity, database.getRun(run.id).accountHome], ["other@example.com", otherHome]);
+  assert.deepEqual([database.getRun(run.id).accountIdentity, database.getRun(run.id).accountHome], ["other@example.com", keyOf(otherHome)]);
   await context.finish(spawned.length - 1);
 
   // (iv) A probe during which the directory is swapped is kept for neither
@@ -1483,15 +1531,19 @@ test("a check started before an account's directory led elsewhere is not shared 
 test("a session or recovery never continues under another credential source, and each source keeps its own usage", async (t) => {
   const context = await fixture(t);
   const { database, logins, probe, root } = context;
-  const codexHome = path.join(root, "codex-home");
-  mkdirSync(codexHome);
-  logins.set(codexHome, "Logged in using ChatGPT");
-  const runtime = (variables = {}) => {
-    const accounts = createProviderAccounts({ database, probe, environment: { ...context.environment, CODEX_HOME: codexHome, ...variables } });
-    t.after(() => accounts.close());
-    return accounts;
-  };
-  for (const [provider, variable, home] of [["claude", "ANTHROPIC_API_KEY", context.inheritedHome], ["codex", "CODEX_API_KEY", codexHome]]) {
+  // Federation selectors and an access token are sources as a key is. Each
+  // case has its own home, so its usage starts empty.
+  const cases = [["claude", ["ANTHROPIC_API_KEY"]], ["codex", ["CODEX_API_KEY"]], ["claude", ["ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID"]], ["codex", ["CODEX_ACCESS_TOKEN"]]];
+  for (const [index, [provider, names]] of cases.entries()) {
+    const home = path.join(root, `${provider}-home-${index}`);
+    mkdirSync(home);
+    logins.set(home, provider === "claude" ? signedIn("me@example.com") : "Logged in using ChatGPT");
+    const runtime = (variables = {}) => {
+      const accounts = createProviderAccounts({ database, probe, environment: { ...context.environment, [provider === "claude" ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME"]: home, ...variables } });
+      t.after(() => accounts.close());
+      return accounts;
+    };
+    const [variable, variables, key] = [names.join("+"), Object.fromEntries(names.map((name) => [name, "secret"])), keyOf(home)];
     const chat = database.createConversation({ projectId: "p", worktreeId: root, worktreePath: root, title: provider, provider });
     const launch = (accounts, sessionId, utilization) => {
       const account = accounts.resolve({ provider, conversationId: chat.id });
@@ -1506,21 +1558,21 @@ test("a session or recovery never continues under another credential source, and
     const usage = (accounts) => [defaultLogin(accounts).measured[1].runs, defaultLogin(accounts).limits?.[0]?.utilization ?? null];
     const reported = (utilization) => (provider === "claude" ? utilization : null);
     const refused = (accounts, target, was, now) => assert.throws(() => accounts.resolve({ provider, conversationId: chat.id, ...target }),
-      (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(`with ${was}, but it now launches with ${now}`)
+      (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(`with ${was.split("+").join(" and ")}, but it now launches with ${now.split("+").join(" and ")}`)
         && !error.message.includes("secret"));
 
     const fromHome = runtime();
     const homeRun = launch(fromHome, `${provider}-home`, 0.4);
-    assert.equal(homeRun.accountHome, home, "a login from its home keeps the bare home key");
+    assert.equal(homeRun.accountHome, key, "a login from its home keeps the bare home key");
     const homePin = accountPin(database.beginInterruptedRunRecovery(homeRun.id, "retry").run);
 
     // Restarted with a variable that replaces the home's login.
-    const fromVariable = runtime({ [variable]: "secret" });
+    const fromVariable = runtime(variables);
     refused(fromVariable, { sessionId: `${provider}-home` }, "the login in its directory", variable);
     refused(fromVariable, { pin: homePin }, "the login in its directory", variable);
     assert.deepEqual(usage(fromVariable), [0, null], "another source's runs and windows are not this login's");
     const variableRun = launch(fromVariable, `${provider}-variable`, 0.7);
-    assert.equal(variableRun.accountHome, `${variable}:${home}`);
+    assert.equal(variableRun.accountHome, `${variable}:${key}`);
     const variablePin = accountPin(database.beginInterruptedRunRecovery(variableRun.id, "retry").run);
     assert.deepEqual(usage(fromVariable), [1, reported(0.7)]);
 
@@ -1528,10 +1580,10 @@ test("a session or recovery never continues under another credential source, and
     const restored = runtime();
     refused(restored, { sessionId: `${provider}-variable` }, variable, "the login in its directory");
     refused(restored, { pin: variablePin }, variable, "the login in its directory");
-    assert.equal(restored.resolve({ provider, conversationId: chat.id, sessionId: `${provider}-home` }).home, home);
-    assert.equal(restored.resolve({ provider, conversationId: chat.id, pin: homePin }).home, home);
+    assert.equal(restored.resolve({ provider, conversationId: chat.id, sessionId: `${provider}-home` }).home, key);
+    assert.equal(restored.resolve({ provider, conversationId: chat.id, pin: homePin }).home, key);
     assert.deepEqual(usage(restored), [1, reported(0.4)]);
-    assert.equal(runtime({ [variable]: "another-secret" }).resolve({ provider, conversationId: chat.id, sessionId: `${provider}-variable` }).home, `${variable}:${home}`,
+    assert.equal(runtime(Object.fromEntries(names.map((name) => [name, "another-secret"]))).resolve({ provider, conversationId: chat.id, sessionId: `${provider}-variable` }).home, `${variable}:${key}`,
       "another value of the same variable cannot be told apart");
   }
 });
@@ -1562,9 +1614,9 @@ test("a recovery resumes a session attached by hand only if that session used it
   await assert.rejects(accounts.assertLaunchable({ provider: "claude", conversationId: chat.id, sessionId: "session-b", pin }),
     (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE");
   // (iii) A fresh session, the run's own session and one no run launched in continue under the pin.
-  assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, pin }).home, inheritedHome);
+  assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, pin }).home, keyOf(inheritedHome));
   const own = launch(accounts, { sessionId: "session-a", status: "interrupted" });
-  assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-a", pin: accountPin(own) }).home, inheritedHome);
+  assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-a", pin: accountPin(own) }).home, keyOf(inheritedHome));
   assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, sessionId: "attached-by-hand", pin }).id, "claude:default");
 
   // (ii) One default home with two credential sources: a session launched
@@ -1572,7 +1624,7 @@ test("a recovery resumes a session attached by hand only if that session used it
   const fromVariable = createProviderAccounts({ database, probe, environment: { ...context.environment, ANTHROPIC_API_KEY: "secret" } });
   t.after(() => fromVariable.close());
   launch(fromVariable, { sessionId: "session-variable" });
-  refused(accounts, { sessionId: "session-variable", pin }, `with the login in ${inheritedHome}`, "launched with ANTHROPIC_API_KEY");
+  refused(accounts, { sessionId: "session-variable", pin }, `with the login in ${keyOf(inheritedHome)}`, "launched with ANTHROPIC_API_KEY");
   const variablePin = accountPin(launch(fromVariable, { status: "interrupted" }));
-  refused(fromVariable, { sessionId: "session-a", pin: variablePin }, "with ANTHROPIC_API_KEY", `launched with the login in ${inheritedHome}`);
+  refused(fromVariable, { sessionId: "session-a", pin: variablePin }, "with ANTHROPIC_API_KEY", `launched with the login in ${keyOf(inheritedHome)}`);
 });

@@ -186,19 +186,22 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     return Boolean(account.homePath) && homeKey(adapter, account.homePath) === defaultHome(adapter);
   }
 
-  // A variable the CLI authenticates with in place of the login in its home
-  // (adapter accounts.loginOverrides) stands in for the default login. A
-  // switch (accounts.credentialSwitches) counts only when the CLI reads it
-  // as enabled. Every one set is named, sorted and joined by +, so the
-  // source changes whenever one is added or removed, whichever the CLI
-  // gives precedence.
+  // Every credential source the CLI authenticates with in place of the
+  // login in its home (adapter accounts.overridesLogin, a rule rather than
+  // a list) stands in for the default login. A switch counts only when the
+  // CLI reads it as enabled. Every one set is named, sorted and joined by
+  // +, so the source changes whenever one is added or removed, whichever
+  // the CLI gives precedence.
   function environmentCredential(adapter) {
     const accounts = adapter.accounts;
-    const names = accounts?.loginOverrides.filter((name) => {
-      const value = environmentValue(name);
-      return accounts.credentialSwitches.includes(name) ? CREDENTIAL_SWITCH_ON.has(value?.trim().toLowerCase()) : Boolean(value);
-    }) ?? [];
-    return names.length ? names.sort().join("+") : null;
+    if (!accounts) return null;
+    const names = new Set();
+    for (const [key, value] of Object.entries(environment)) {
+      const name = platform === "win32" ? key.toUpperCase() : key;
+      if (!value || !accounts.overridesLogin(name)) continue;
+      if (!accounts.isCredentialSwitch(name) || CREDENTIAL_SWITCH_ON.has(value.trim().toLowerCase())) names.add(name);
+    }
+    return names.size ? [...names].sort().join("+") : null;
   }
 
   function accountHome(account, adapter) {
@@ -211,7 +214,8 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
   // measured usage and limit window are all keyed by it, so a session never
   // continues under another credential source. A login from its home keeps
   // the bare home key, as runs recorded before sources were. A home key is
-  // absolute, so it never starts with a variable name and a colon.
+  // absolute, so it starts with a separator or a one-letter Windows drive,
+  // never a name of two or more characters and a colon.
   function loginKey(account, adapter) {
     const home = accountHome(account, adapter);
     const variable = home !== null && !account.homePath ? environmentCredential(adapter) : null;
@@ -232,7 +236,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
   }
 
   function parseLogin(key) {
-    const match = /^([A-Z][A-Z0-9_]*(?:\+[A-Z][A-Z0-9_]*)*):(.*)$/s.exec(key ?? "");
+    const match = /^([A-Z][A-Z0-9_]+(?:\+[A-Z][A-Z0-9_]+)*):(.*)$/s.exec(key ?? "");
     return match ? { source: match[1], home: match[2] } : { source: null, home: key };
   }
 
@@ -265,6 +269,14 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       const output = await probe(adapter.executable, { signal: closing.signal, args: [...adapter.accounts.identityArgs], environment: scoped, timeoutMs: IDENTITY_TIMEOUT_MS, exitCodes: [0, 1] });
       const identity = adapter.accounts.parseIdentity(output);
       if (!identity) return { status: "unknown", identity: null, error: `${adapter.label} printed a login status Outright does not recognize` };
+      // An added account is signed in only by the login stored in its
+      // directory. A credential the CLI found elsewhere is not that login,
+      // even with every declared source removed, so its directory counts as
+      // signed out and none of that credential's details are kept.
+      if (account.homePath && identity.signedIn && !identity.ownLogin) {
+        return { status: "signed-out", identity: { signedIn: false, ownLogin: false, method: identity.method, email: null, organization: null, plan: null },
+          error: `${adapter.label} signs in with a ${identity.method ?? "credential"} login from outside ${account.label}'s directory, not one stored in it` };
+      }
       return { status: identity.signedIn ? "signed-in" : "signed-out", identity, error: null };
     } catch (error) {
       if (error?.code === "OUTRIGHT_PROBE_CLEANUP_UNCERTAIN") cleanupErrors.set(adapter.id, error);

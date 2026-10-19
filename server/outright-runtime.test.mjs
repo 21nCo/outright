@@ -3612,7 +3612,9 @@ console.log("Logged in using ChatGPT");\n`);
     mkdirSync(homePath);
     const listing = (await callRuntime(runtime, "POST", "/api/provider-accounts", { provider: "codex", label, homePath })).body;
     const account = listing.providers.find((provider) => provider.provider === "codex").accounts.find((item) => item.label === label);
-    return { id: account.id, provider: "codex", label, homePath, home: homePath, identity: null };
+    // The login key the runtime records: the directory as the system names it, case-folded on Windows.
+    const home = realpathSync.native(homePath);
+    return { id: account.id, provider: "codex", label, homePath, home: process.platform === "win32" ? home.toLowerCase() : home, identity: null };
   };
   const [work, other] = [await add("Work"), await add("Other")];
   const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Attached", provider: "codex" });

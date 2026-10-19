@@ -1,12 +1,18 @@
 import { ADAPTER_CONTRACT_VERSION, boundedLimitWindows, defineAdapter, identityText, limitWindow, parseSemanticVersion } from "./contract.mjs";
 
-// `claude auth status --json` prints the login of CLAUDE_CONFIG_DIR. Only
-// these display fields are kept; it prints no token.
+// `claude auth status --json` prints the login it would use. Only these
+// display fields are kept; it prints no token. The login is the one stored
+// in CLAUDE_CONFIG_DIR (`ownLogin`) only for a claude.ai sign-in or a
+// Console key from /login. Claude Code 2.1.303 reports every other source
+// as another method: a token, profile or federation as oauth_token, a key
+// from the environment as api_key with that source, a helper as
+// api_key_helper and a cloud provider as third_party.
 function parseIdentity(output) {
   let status;
   try { status = JSON.parse(output); } catch { return null; }
   if (!status || typeof status !== "object" || typeof status.loggedIn !== "boolean") return null;
-  return { signedIn: status.loggedIn, method: identityText(status.authMethod), email: identityText(status.email),
+  const ownLogin = status.loggedIn && (status.authMethod === "claude.ai" || (status.authMethod === "api_key" && status.apiKeySource === "/login managed key"));
+  return { signedIn: status.loggedIn, ownLogin, method: identityText(status.authMethod), email: identityText(status.email),
     organization: identityText(status.orgName), plan: identityText(status.subscriptionType) };
 }
 
@@ -20,9 +26,6 @@ function limitWindows(info) {
     limitWindow(info.rateLimitType, { resetsAt: info.resetsAt, status: info.status, utilization: info.utilization }),
   ]);
 }
-
-const CLAUDE_PROVIDER_SWITCHES = ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-  "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD", "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_GATEWAY"];
 
 export const claudeAdapter = defineAdapter({
   id: "claude",
@@ -51,13 +54,19 @@ export const claudeAdapter = defineAdapter({
   },
   sessionIdentity: { nativeField: "session_id" },
   parseVersion: parseSemanticVersion,
-  // Claude Code authenticates with each of these instead of the login in
-  // CLAUDE_CONFIG_DIR. Without the variable it uses ~/.claude. The provider
-  // switches are every one Claude Code 2.1.303 selects a provider by.
+  // Without CLAUDE_CONFIG_DIR Claude Code uses ~/.claude. Checked against
+  // Claude Code 2.1.303: it can authenticate, or pick a provider or
+  // endpoint, from every ANTHROPIC_* variable (keys, tokens, profiles,
+  // federation, organization, base URLs) and the CLAUDE_CODE_* families
+  // below, so each is a source. The exceptions choose models, betas or
+  // logging, or a tool rather than a provider.
   accounts: { homeVariable: "CLAUDE_CONFIG_DIR", standardHome: ".claude", identityArgs: ["auth", "status", "--json"], parseIdentity,
-    credentialVariables: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", ...CLAUDE_PROVIDER_SWITCHES],
-    loginOverrides: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", ...CLAUDE_PROVIDER_SWITCHES],
-    credentialSwitches: CLAUDE_PROVIDER_SWITCHES },
+    credentialVariables: ["ANTHROPIC_*", "CLAUDE_CODE_USE_*", "CLAUDE_CODE_OAUTH_*", "CLAUDE_CODE_API_KEY_*", "CLAUDE_CODE_GATEWAY_*", "CLAUDE_CODE_HOST_*",
+      "CLAUDE_CODE_FEDERATION_*", "CLAUDE_CODE_SDK_HAS_*", "CLAUDE_CODE_CLIENT_KEY*", "CLAUDE_CODE_ACCOUNT_*", "CLAUDE_CODE_ORGANIZATION_*",
+      "CLAUDE_CODE_SESSION_ACCESS_TOKEN", "CLAUDE_CODE_WEBSOCKET_AUTH_*", "CLAUDE_CODE_CUSTOM_OAUTH_URL"],
+    nonCredentialVariables: ["ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_*", "ANTHROPIC_CUSTOM_MODEL_OPTION*", "ANTHROPIC_BETAS", "ANTHROPIC_LOG",
+      "CLAUDE_CODE_USE_NATIVE_FILE_SEARCH", "CLAUDE_CODE_USE_POWERSHELL_TOOL", "CLAUDE_CODE_USE_COWORK_PLUGINS", "CLAUDE_CODE_USE_CCR_V2"],
+    credentialSwitches: ["CLAUDE_CODE_USE_*"], inertCredentials: [] },
   // What Claude Code 2.1.296 resolves each alias to. Another release
   // answering for an alias is reported, not assumed equivalent.
   modelAliases: { haiku: ["claude-haiku-5-5"], sonnet: ["claude-sonnet-5-5"], opus: ["claude-opus-5-5"] },

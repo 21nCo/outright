@@ -26,6 +26,8 @@ const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
 const DIRECT_VARIABLE_PATTERN = /^OUTRIGHT_[A-Z0-9_]+$/;
 const HOME_VARIABLE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
 const IDENTITY_ARGUMENT_PATTERN = /^-{0,2}[a-z][a-z-]{0,31}$/;
+// A variable name, or a rule where each * stands for any run of name characters.
+const VARIABLE_RULE_PATTERN = /^[A-Z][A-Z0-9_]*(\*[A-Z0-9_]*)*$/;
 const LIMIT_WINDOW_PATTERN = /^[a-z0-9_]{1,40}$/;
 const LIMIT_STATUS_PATTERN = /^[a-z_]{1,32}$/;
 const MAX_LIMIT_WINDOWS = 8;
@@ -55,6 +57,26 @@ function compareVersions(left, right) {
   return 0;
 }
 
+// An upper-case variable name's role for an account (Windows callers
+// upper-case it first): a credential source an added account runs without,
+// one that stands in for the default login, and a switch counted only when
+// enabled. The home variable and Outright's own direct-provider variables
+// are never sources.
+function credentialRules(accounts) {
+  const frozen = (list) => Object.freeze([...list]);
+  const matcher = (list) => {
+    const rule = new RegExp(`^(?:${list.map((item) => item.replaceAll("*", "[A-Z0-9_]*")).join("|") || "(?!)"})$`);
+    return (name) => rule.test(name);
+  };
+  const [credential, nonCredential, credentialSwitch] = [matcher(accounts.credentialVariables), matcher(accounts.nonCredentialVariables), matcher(accounts.credentialSwitches)];
+  const inert = frozen(accounts.inertCredentials);
+  const isCredential = (name) => name !== accounts.homeVariable && !name.startsWith("OUTRIGHT_") && credential(name) && !nonCredential(name);
+  return Object.freeze({ ...accounts, identityArgs: frozen(accounts.identityArgs), credentialVariables: frozen(accounts.credentialVariables),
+    nonCredentialVariables: frozen(accounts.nonCredentialVariables), credentialSwitches: frozen(accounts.credentialSwitches), inertCredentials: inert, isCredential,
+    overridesLogin: (name) => isCredential(name) && !inert.includes(name),
+    isCredentialSwitch: (name) => isCredential(name) && credentialSwitch(name) });
+}
+
 export function defineAdapter(spec) {
   if (!spec || typeof spec !== "object") throw contractError("specification is required");
   if (spec.contractVersion !== ADAPTER_CONTRACT_VERSION) throw contractError(`${spec.id} targets contract ${spec.contractVersion}; this runtime supports ${ADAPTER_CONTRACT_VERSION}`);
@@ -72,17 +94,20 @@ export function defineAdapter(spec) {
     // Credential variables override the home's login, so an added account's
     // launch and login check run without them. The standard home is the
     // directory in the user's home the CLI uses when the variable is unset.
-    // Login overrides are the credential variables the CLI authenticates with
-    // in place of the home's login; credential switches are overrides that
+    // Credential variables are rules, so a source the CLI adds under a
+    // declared prefix is covered without a new name: every match not in
+    // nonCredentialVariables is a source. The CLI authenticates with a
+    // source in place of the home's login, except the inertCredentials it
+    // reads but never signs in with. Credential switches are sources that
     // count only when the CLI reads them as enabled.
     const accounts = spec.accounts;
     const environmentVariable = (variable) => HOME_VARIABLE_PATTERN.test(variable ?? "") && !variable.startsWith("OUTRIGHT_");
+    const rules = (list) => Array.isArray(list) && list.every((rule) => VARIABLE_RULE_PATTERN.test(rule ?? "") && rule.length <= 64 && !rule.startsWith("OUTRIGHT_"));
     if (accounts !== undefined && (!environmentVariable(accounts?.homeVariable) || !/^\.?[A-Za-z0-9][A-Za-z0-9._-]*$/.test(accounts.standardHome ?? "")
       || !Array.isArray(accounts.identityArgs) || !accounts.identityArgs.length || accounts.identityArgs.some((arg) => !IDENTITY_ARGUMENT_PATTERN.test(arg))
-      || !Array.isArray(accounts.credentialVariables) || !accounts.credentialVariables.every(environmentVariable)
-      || !Array.isArray(accounts.loginOverrides) || !accounts.loginOverrides.every((variable) => accounts.credentialVariables.includes(variable))
-      || !Array.isArray(accounts.credentialSwitches) || !accounts.credentialSwitches.every((variable) => accounts.loginOverrides.includes(variable))
-      || typeof accounts.parseIdentity !== "function")) throw contractError(`${spec.id} accounts must name a home variable, its standard directory, credential variables, login overrides and switches, identity arguments and a parser`);
+      || !rules(accounts.credentialVariables) || !accounts.credentialVariables.length || !rules(accounts.nonCredentialVariables) || !rules(accounts.credentialSwitches)
+      || !Array.isArray(accounts.inertCredentials) || !accounts.inertCredentials.every(environmentVariable)
+      || typeof accounts.parseIdentity !== "function")) throw contractError(`${spec.id} accounts must name a home variable, its standard directory, credential variable rules, identity arguments and a parser`);
   } else {
     // A harness login never grants direct API access.
     if (authority.source !== "env" || !DIRECT_VARIABLE_PATTERN.test(authority.variable ?? "")) throw contractError(`${spec.id} must reference its own API credential`);
@@ -115,9 +140,7 @@ export function defineAdapter(spec) {
   for (const method of ["buildLaunch", "normalize"]) if (typeof spec[method] !== "function") throw contractError(`${spec.id} must implement ${method}`);
   return Object.freeze({
     ...spec,
-    accounts: spec.accounts ? Object.freeze({ ...spec.accounts, identityArgs: Object.freeze([...spec.accounts.identityArgs]),
-      credentialVariables: Object.freeze([...spec.accounts.credentialVariables]), loginOverrides: Object.freeze([...spec.accounts.loginOverrides]),
-      credentialSwitches: Object.freeze([...spec.accounts.credentialSwitches]) }) : null,
+    accounts: spec.accounts ? credentialRules(spec.accounts) : null,
     modelAliases: Object.freeze(Object.fromEntries(Object.entries(aliases).map(([alias, ids]) => [alias, Object.freeze([...ids])]))),
     environment: Object.freeze([...(spec.kind === "harness" ? [] : spec.environment)]),
     capabilities: Object.freeze({

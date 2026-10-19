@@ -1,12 +1,15 @@
 import { ADAPTER_CONTRACT_VERSION, defineAdapter, parseSemanticVersion } from "./contract.mjs";
 
 // `codex login status` prints one line for CODEX_HOME. An API-key login
-// prints a masked key after the method; only the method is kept.
+// prints a masked key after the method; only the method is kept. It does
+// not say whether a key came from the environment, so an added account's
+// check runs without every credential source, and any other line is
+// unrecognized.
 function parseIdentity(output) {
   const line = String(output).trim().split(/\r?\n/)[0] ?? "";
-  if (/^Not logged in\b/.test(line)) return { signedIn: false, method: null, email: null, organization: null, plan: null };
-  if (/^Logged in using ChatGPT\b/.test(line)) return { signedIn: true, method: "chatgpt", email: null, organization: null, plan: null };
-  if (/^Logged in using an API key\b/.test(line)) return { signedIn: true, method: "api-key", email: null, organization: null, plan: null };
+  if (/^Not logged in\b/.test(line)) return { signedIn: false, ownLogin: false, method: null, email: null, organization: null, plan: null };
+  if (/^Logged in using ChatGPT\b/.test(line)) return { signedIn: true, ownLogin: true, method: "chatgpt", email: null, organization: null, plan: null };
+  if (/^Logged in using an API key\b/.test(line)) return { signedIn: true, ownLogin: true, method: "api-key", email: null, organization: null, plan: null };
   return null;
 }
 
@@ -38,12 +41,16 @@ export const codexAdapter = defineAdapter({
   sessionIdentity: { nativeField: "thread_id" },
   parseVersion: parseSemanticVersion,
   // `codex exec --json` reports token usage but no usage windows.
-  // CODEX_API_KEY takes precedence over the login in CODEX_HOME, which is
-  // ~/.codex when unset. Codex 0.162 does not authenticate with
-  // OPENAI_API_KEY, so it never stands in for the login; it is still kept
-  // from an added account's launch and check.
-  accounts: { homeVariable: "CODEX_HOME", standardHome: ".codex", identityArgs: ["login", "status"], parseIdentity, credentialVariables: ["CODEX_API_KEY", "OPENAI_API_KEY"],
-    loginOverrides: ["CODEX_API_KEY"], credentialSwitches: [] },
+  // CODEX_HOME is ~/.codex when unset. Codex documents CODEX_API_KEY,
+  // CODEX_ACCESS_TOKEN and the OPENAI_FEDERATION_RULE_ID and
+  // OPENAI_IDENTITY_TOKEN_FILE workload identity as sources used in place
+  // of that login, and OPENAI_* also picks its endpoint and organization.
+  // Codex 0.162 does not authenticate with OPENAI_API_KEY, so that one
+  // never stands in for the login; it is still kept from an added
+  // account's launch and check.
+  accounts: { homeVariable: "CODEX_HOME", standardHome: ".codex", identityArgs: ["login", "status"], parseIdentity,
+    credentialVariables: ["OPENAI_*", "CODEX_*KEY*", "CODEX_*TOKEN*", "CODEX_*AUTH*", "CODEX_*FEDERATION*", "CODEX_*IDENTITY*"],
+    nonCredentialVariables: [], credentialSwitches: [], inertCredentials: ["OPENAI_API_KEY"] },
   buildLaunch({ worktreePath, run, sessionId }) {
     const sandbox = SANDBOX_MODES[run.approvalPolicy];
     const options = [];

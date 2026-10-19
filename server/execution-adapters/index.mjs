@@ -60,12 +60,11 @@ export function buildExecutionEnvironment(id, runtimeEnvironment, inherited = ru
   return environment;
 }
 
-// An added account's login is the one in its home: inherited credential
-// variables that would override it are removed.
-export function withAccountHome(environment, { homeVariable, credentialVariables }, homePath) {
+// An added account's login is the one in its home: every inherited
+// credential source (accounts.isCredential) is removed.
+export function withAccountHome(environment, { homeVariable, isCredential }, homePath) {
   // Windows names are case-insensitive; never leave a second spelling behind.
-  const removed = new Set([homeVariable, ...credentialVariables]);
-  const scoped = Object.fromEntries(Object.entries(environment).filter(([key]) => !removed.has(key.toUpperCase())));
+  const scoped = Object.fromEntries(Object.entries(environment).filter(([key]) => key.toUpperCase() !== homeVariable && !isCredential(key.toUpperCase())));
   scoped[homeVariable] = homePath;
   return scoped;
 }
