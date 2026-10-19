@@ -1,0 +1,21 @@
+server/database.mjs
+  s_1900bb15a7199a::t_bf400016a94597 2877
+server/provider-accounts.test.mjs
+  s_1900bb15a7199a::t_0fb42d7c02664c 1296-1319
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4432bf825638b13a70bd6fef69787bf0a46bb886",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
