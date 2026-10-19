@@ -21,6 +21,9 @@ function limitWindows(info) {
   ]);
 }
 
+const CLAUDE_PROVIDER_SWITCHES = ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+  "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD", "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_GATEWAY"];
+
 export const claudeAdapter = defineAdapter({
   id: "claude",
   label: "Claude Code",
@@ -49,11 +52,12 @@ export const claudeAdapter = defineAdapter({
   sessionIdentity: { nativeField: "session_id" },
   parseVersion: parseSemanticVersion,
   // Claude Code authenticates with each of these instead of the login in
-  // CLAUDE_CONFIG_DIR. Without the variable it uses ~/.claude.
+  // CLAUDE_CONFIG_DIR. Without the variable it uses ~/.claude. The provider
+  // switches are every one Claude Code 2.1.303 selects a provider by.
   accounts: { homeVariable: "CLAUDE_CONFIG_DIR", standardHome: ".claude", identityArgs: ["auth", "status", "--json"], parseIdentity,
-    credentialVariables: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"],
-    loginOverrides: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"],
-    credentialSwitches: ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"] },
+    credentialVariables: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", ...CLAUDE_PROVIDER_SWITCHES],
+    loginOverrides: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", ...CLAUDE_PROVIDER_SWITCHES],
+    credentialSwitches: CLAUDE_PROVIDER_SWITCHES },
   // What Claude Code 2.1.296 resolves each alias to. Another release
   // answering for an alias is reported, not assumed equivalent.
   modelAliases: { haiku: ["claude-haiku-5-5"], sonnet: ["claude-sonnet-5-5"], opus: ["claude-opus-5-5"] },

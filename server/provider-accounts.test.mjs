@@ -1002,6 +1002,56 @@ test("a disabled credential switch does not stand in for the default login", asy
   }
 });
 
+test("every Claude Code provider switch is a credential source, and a login key names each one set", async (t) => {
+  for (const variable of ["CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_MANTLE"]) {
+    const context = await fixture(t, { extraEnvironment: { [variable]: "1" } });
+    const { accounts, database, manager, spawned } = context;
+    // An added account checks and launches with its own login only.
+    const work = await addWork(context);
+    assert.equal(context.probe.calls.find((call) => call.environment.CLAUDE_CONFIG_DIR === context.workHome).environment[variable], undefined, variable);
+    await accounts.activate({ provider: "claude", accountId: work.id });
+    const chat = context.conversation();
+    const run = context.claudeRun(chat.id);
+    await manager.schedule({ conversation: chat, run });
+    assert.equal(spawned[0].env[variable], undefined, variable);
+    assert.equal(database.getRun(run.id).accountIdentity, "work@example.com");
+    await context.finish(0);
+  }
+
+  // The default login launches through the provider, not its signed-out home.
+  const context = await fixture(t, { extraEnvironment: { CLAUDE_CODE_USE_FOUNDRY: "1" } });
+  context.logins.set(context.inheritedHome, signedOut);
+  context.claude();
+  await tick(); await tick();
+  const login = context.claude().accounts[0].login;
+  assert.deepEqual([login.status, login.identity.variable], ["configured", "CLAUDE_CODE_USE_FOUNDRY"]);
+  assert.ok(!context.probe.calls.some((call) => call.executable === "claude"), "the home's status command does not run");
+  assert.equal((await context.accounts.assertLaunchable({ provider: "claude", conversationId: context.conversation().id })).identity, "CLAUDE_CODE_USE_FOUNDRY");
+
+  // Enabling a switch the CLI prefers over a key already set changes the source.
+  const { database, root } = context;
+  const runtime = (variables) => {
+    const accounts = createProviderAccounts({ database, probe: context.probe, environment: { ...context.environment, CLAUDE_CODE_USE_FOUNDRY: "", ...variables } });
+    t.after(() => accounts.close());
+    return accounts;
+  };
+  const chat = context.conversation(path.join(root, "keyed"));
+  const withKey = runtime({ ANTHROPIC_API_KEY: "secret" });
+  const account = withKey.resolve({ provider: "claude", conversationId: chat.id });
+  assert.equal(account.home, `ANTHROPIC_API_KEY:${context.inheritedHome}`);
+  const run = context.claudeRun(chat.id);
+  database.updateRun(run.id, { status: "running", startedAt: new Date().toISOString() }, { account });
+  database.updateRun(run.id, { status: "completed", providerSessionId: "keyed" });
+  const runs = (accounts) => accounts.list().providers.find((item) => item.provider === "claude").accounts[0].measured[1].runs;
+  const withBedrock = runtime({ ANTHROPIC_API_KEY: "secret", CLAUDE_CODE_USE_BEDROCK: "1" });
+  assert.throws(() => withBedrock.resolve({ provider: "claude", conversationId: chat.id, sessionId: "keyed" }),
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && !error.message.includes("secret")
+      && error.message.includes("with ANTHROPIC_API_KEY, but it now launches with ANTHROPIC_API_KEY and CLAUDE_CODE_USE_BEDROCK"));
+  assert.equal(withBedrock.resolve({ provider: "claude", conversationId: chat.id }).home, `ANTHROPIC_API_KEY+CLAUDE_CODE_USE_BEDROCK:${context.inheritedHome}`);
+  assert.equal(runs(withBedrock), 0, "the two sources' usage stays apart");
+  assert.equal(runs(withKey), 1);
+});
+
 test("on a case-insensitive volume another spelling of the default home is the same login", async (t) => {
   const context = await fixture(t);
   const { database, probe, root, workHome } = context;

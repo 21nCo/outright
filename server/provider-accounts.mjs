@@ -189,13 +189,16 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
   // A variable the CLI authenticates with in place of the login in its home
   // (adapter accounts.loginOverrides) stands in for the default login. A
   // switch (accounts.credentialSwitches) counts only when the CLI reads it
-  // as enabled.
+  // as enabled. Every one set is named, sorted and joined by +, so the
+  // source changes whenever one is added or removed, whichever the CLI
+  // gives precedence.
   function environmentCredential(adapter) {
     const accounts = adapter.accounts;
-    return accounts?.loginOverrides.find((name) => {
+    const names = accounts?.loginOverrides.filter((name) => {
       const value = environmentValue(name);
       return accounts.credentialSwitches.includes(name) ? CREDENTIAL_SWITCH_ON.has(value?.trim().toLowerCase()) : Boolean(value);
-    }) ?? null;
+    }) ?? [];
+    return names.length ? names.sort().join("+") : null;
   }
 
   function accountHome(account, adapter) {
@@ -203,8 +206,8 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
   }
 
   // The login a launch uses: its home key and, when a variable stands in for
-  // the home's login (environmentCredential), that variable's name, never its
-  // value, as `NAME:<home key>`. A run, recovery pin, identity check,
+  // the home's login (environmentCredential), the names of every such
+  // variable, never their values, as `NAME+NAME:<home key>`. A run, recovery pin, identity check,
   // measured usage and limit window are all keyed by it, so a session never
   // continues under another credential source. A login from its home keeps
   // the bare home key, as runs recorded before sources were. A home key is
@@ -229,7 +232,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
   }
 
   function parseLogin(key) {
-    const match = /^([A-Z][A-Z0-9_]*):(.*)$/s.exec(key ?? "");
+    const match = /^([A-Z][A-Z0-9_]*(?:\+[A-Z][A-Z0-9_]*)*):(.*)$/s.exec(key ?? "");
     return match ? { source: match[1], home: match[2] } : { source: null, home: key };
   }
 
@@ -564,7 +567,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     if (owner && owner.home !== undefined && owner.home !== home) {
       const subject = owner.recovery ? "This interrupted run" : "This chat's session";
       const [was, now] = [parseLogin(owner.home), parseLogin(home)];
-      const source = (login) => login.source ?? "the login in its directory";
+      const source = (login) => login.source?.split("+").join(" and ") ?? "the login in its directory";
       throw accountError(409, was.home !== now.home
         ? account.isDefault
           ? `${subject} used the ${adapter.label} default login in ${was.home}, but the default login now uses ${now.home}. Point ${adapter.accounts?.homeVariable ?? "it"} or the CLI's standard directory there again, or ${remedy}.`

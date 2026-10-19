@@ -832,7 +832,9 @@ test("harness logins are read from each CLI's status without credentials", () =>
   }
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialVariables: ["OUTRIGHT_ANTHROPIC_API_KEY"] } })), /accounts must name/);
   // A switch is a declared credential variable that counts only when enabled.
-  assert.deepEqual([claude.accounts.credentialSwitches, codex.accounts.credentialSwitches], [["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"], []]);
+  // Claude Code 2.1.303 selects a provider by each of these switches.
+  assert.deepEqual([claude.accounts.credentialSwitches, codex.accounts.credentialSwitches], [["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD", "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_GATEWAY"], []]);
   for (const credentialSwitches of [undefined, ["FIXTURE_OTHER"], ["FIXTURE_UNUSED"]]) {
     assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialSwitches } })), /accounts must name/, String(credentialSwitches));
   }
