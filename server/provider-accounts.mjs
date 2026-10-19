@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -90,10 +91,36 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     return Object.entries(environment).find(([key]) => key.toUpperCase() === name)?.[1] || null;
   }
 
-  // The home the default login uses: whatever the runtime's environment
-  // selects, or null for the CLI's standard home.
+  function standardHome(adapter) {
+    return path.join(homeDirectory, adapter.accounts.standardHome);
+  }
+
+  // Where a home leads, through links, or the path itself if it does not
+  // exist. Windows paths compare without case.
+  function canonicalHome(home) {
+    let resolved;
+    try { resolved = realpathSync(home); } catch { resolved = path.resolve(home); }
+    return platform === "win32" ? resolved.toLowerCase() : resolved;
+  }
+
+  // The directory the default login reads: the home variable's, or the
+  // CLI's standard home when the variable is unset.
+  function effectiveDefaultHome(adapter) {
+    return canonicalHome(inheritedHome(adapter) ?? standardHome(adapter));
+  }
+
+  // The home recorded for the default login: the variable's value, or null
+  // for the CLI's standard home however the environment names it.
   function defaultHome(adapter) {
-    return adapter.accounts ? inheritedHome(adapter) : null;
+    const inherited = adapter.accounts ? inheritedHome(adapter) : null;
+    return inherited && canonicalHome(inherited) !== canonicalHome(standardHome(adapter)) ? inherited : null;
+  }
+
+  // Whether two recorded homes are one directory; null is the standard home.
+  function sameHome(adapter, recorded, home) {
+    if ((recorded ?? null) === (home ?? null)) return true;
+    if (!adapter.accounts) return false;
+    return canonicalHome(recorded ?? standardHome(adapter)) === canonicalHome(home ?? standardHome(adapter));
   }
 
   function accountHome(account, adapter) {
@@ -232,8 +259,8 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     } else if (typeof process.getuid === "function" && details.uid !== process.getuid()) {
       throw accountError(400, "The account home must be a directory you own", "PROVIDER_ACCOUNT_INVALID");
     }
-    const inherited = inheritedHome(adapter);
-    if (inherited && await realpath(inherited).catch(() => null) === resolved) {
+    // With the variable unset, the CLI's standard home is the default login.
+    if (canonicalHome(resolved) === effectiveDefaultHome(adapter)) {
       throw accountError(409, "That directory is already the default login", "PROVIDER_ACCOUNT_DUPLICATE");
     }
     return resolved;
@@ -312,14 +339,14 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       throw accountError(409, !owner
         ? `The active ${adapter.label} account was removed. Choose another account in Settings.`
         : owner.recovery
-          ? `The ${adapter.label} account this interrupted run launched with was removed. Add that account's directory again in Settings, ${remedy}.`
+          ? `The ${adapter.label} account this interrupted run launched with was removed, so this run cannot continue. Discard the interrupted run.`
           : `The ${adapter.label} account this chat's session belongs to was removed. Clear the session in chat settings to continue with the active account.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
     }
     const home = accountHome(account, adapter);
     // The default login follows the environment. A session it created under
     // another home is not resumed under this one. A run from before accounts
     // recorded no home and is taken to have used the current default.
-    if (owner && account.isDefault && owner.home !== undefined && (owner.home ?? null) !== home) {
+    if (owner && account.isDefault && owner.home !== undefined && !sameHome(adapter, owner.home, home)) {
       const where = (value) => value ?? "the CLI's standard directory";
       const subject = owner.recovery ? "This interrupted run" : "This chat's session";
       throw accountError(409, `${subject} used the ${adapter.label} default login in ${where(owner.home)}, but the default login now uses ${where(home)}. Restore ${adapter.accounts?.homeVariable ?? "it"} ${remedy}.`, "PROVIDER_ACCOUNT_UNAVAILABLE");

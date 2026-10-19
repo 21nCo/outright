@@ -71,12 +71,15 @@ export function listingTime(listing, receivedAt, now) {
 export function measuredText(period) {
   if (!period.runs) return "No runs";
   const runs = `${period.runs} run${period.runs === 1 ? "" : "s"}`;
-  // A run that reported no tokens is not counted as zero tokens.
+  // A run that reported no tokens is not counted as zero tokens, and one
+  // that reported only input or output makes the sum a lower bound.
   const missingTokens = Number(period.runsWithoutTokens ?? 0);
+  const partialTokens = Number(period.runsWithPartialTokens ?? 0);
   const reported = Number(period.inputTokens ?? 0) + Number(period.outputTokens ?? 0);
+  const incomplete = [missingTokens && `${missingTokens} without reported tokens`, partialTokens && `${partialTokens} with partial token counts`].filter(Boolean);
   let tokens = `${reported.toLocaleString()} tokens`;
   if (missingTokens >= period.runs) tokens = "tokens not reported";
-  else if (missingTokens) tokens = `at least ${reported.toLocaleString()} tokens (${missingTokens} without reported tokens)`;
+  else if (incomplete.length) tokens = `at least ${reported.toLocaleString()} tokens (${incomplete.join(", ")})`;
   const without = period.runsWithoutCost ? ` (${period.runsWithoutCost} without reported cost)` : "";
   const cost = period.costUsd == null ? "cost not reported" : `$${Number(period.costUsd).toFixed(3)} reported${without}`;
   return `${runs} · ${tokens} · ${cost}`;

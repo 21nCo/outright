@@ -2354,7 +2354,8 @@ export function createOutrightDatabase(options = {}) {
     // The oldest counted launch says when the window next loses a run.
     measuredAccountUsage(accountId, since, home = null) {
       return db.prepare(`SELECT COUNT(*) AS runs, SUM(runs.input_tokens) AS inputTokens, SUM(runs.output_tokens) AS outputTokens,
-        COALESCE(SUM(runs.input_tokens IS NULL OR runs.output_tokens IS NULL), 0) AS runsWithoutTokens,
+        COALESCE(SUM(runs.input_tokens IS NULL AND runs.output_tokens IS NULL), 0) AS runsWithoutTokens,
+        COALESCE(SUM((runs.input_tokens IS NULL) <> (runs.output_tokens IS NULL)), 0) AS runsWithPartialTokens,
         SUM(runs.cost_usd) AS costUsd, COALESCE(SUM(runs.cost_usd IS NULL), 0) AS runsWithoutCost, MIN(account.bound_at) AS oldestBoundAt
         FROM run_accounts AS account JOIN runs ON runs.id = account.run_id
         WHERE account.account_id = ? AND account.home_path IS ? AND account.bound_at >= ?`).get(accountId, home, since);

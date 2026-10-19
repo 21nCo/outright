@@ -70,13 +70,14 @@ export function defineAdapter(spec) {
     // A harness login lives in the CLI's own home directory. Selecting another
     // directory selects another login; Outright never reads its credentials.
     // Credential variables override the home's login, so an added account's
-    // launch and login check run without them.
+    // launch and login check run without them. The standard home is the
+    // directory in the user's home the CLI uses when the variable is unset.
     const accounts = spec.accounts;
     const environmentVariable = (variable) => HOME_VARIABLE_PATTERN.test(variable ?? "") && !variable.startsWith("OUTRIGHT_");
-    if (accounts !== undefined && (!environmentVariable(accounts?.homeVariable)
+    if (accounts !== undefined && (!environmentVariable(accounts?.homeVariable) || !/^\.?[A-Za-z0-9][A-Za-z0-9._-]*$/.test(accounts.standardHome ?? "")
       || !Array.isArray(accounts.identityArgs) || !accounts.identityArgs.length || accounts.identityArgs.some((arg) => !IDENTITY_ARGUMENT_PATTERN.test(arg))
       || !Array.isArray(accounts.credentialVariables) || !accounts.credentialVariables.every(environmentVariable)
-      || typeof accounts.parseIdentity !== "function")) throw contractError(`${spec.id} accounts must name a home variable, credential variables, identity arguments and a parser`);
+      || typeof accounts.parseIdentity !== "function")) throw contractError(`${spec.id} accounts must name a home variable, its standard directory, credential variables, identity arguments and a parser`);
   } else {
     // A harness login never grants direct API access.
     if (authority.source !== "env" || !DIRECT_VARIABLE_PATTERN.test(authority.variable ?? "")) throw contractError(`${spec.id} must reference its own API credential`);

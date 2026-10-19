@@ -118,6 +118,9 @@ test("account usage keeps measured, reported, stale and unknown values distinct"
   // Unreported tokens are never shown as zero, and a partial sum says so.
   assert.equal(measuredText({ runs: 1, inputTokens: null, outputTokens: null, runsWithoutTokens: 1, costUsd: null, runsWithoutCost: 1 }), "1 run · tokens not reported · cost not reported");
   assert.equal(measuredText({ runs: 3, inputTokens: 100, outputTokens: 20, runsWithoutTokens: 1, costUsd: null, runsWithoutCost: 3 }), "3 runs · at least 120 tokens (1 without reported tokens) · cost not reported");
+  // Runs that reported only input tokens keep them, as a lower bound.
+  assert.equal(measuredText({ runs: 2, inputTokens: 500, outputTokens: null, runsWithoutTokens: 0, runsWithPartialTokens: 2, costUsd: null, runsWithoutCost: 2 }), "2 runs · at least 500 tokens (2 with partial token counts) · cost not reported");
+  assert.equal(measuredText({ runs: 3, inputTokens: 500, outputTokens: 9, runsWithoutTokens: 1, runsWithPartialTokens: 1, costUsd: null, runsWithoutCost: 3 }), "3 runs · at least 509 tokens (1 without reported tokens, 1 with partial token counts) · cost not reported");
 
   // An open dialog ages a listing as time passes: past its reset a window's
   // usage is withheld, and an old report turns stale.

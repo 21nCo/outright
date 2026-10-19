@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -216,9 +216,14 @@ test("a removed session account fails the launch instead of falling back", async
   // History keeps the removed account's recorded label.
   assert.equal(database.getRun(first.id).accountLabel, "Work");
   // A recovery is pinned to the interrupted run's account the same way. Its
-  // session cannot be cleared to change that, so the error says what can.
+  // session cannot be cleared to change that, and adding the same directory
+  // again makes a new account, so the error offers only what works.
+  database.updateRun(first.id, { status: "interrupted" });
+  await accounts.add({ provider: "claude", label: "Work", homePath: context.workHome });
   await assert.rejects(accounts.assertLaunchable({ provider: "claude", conversationId: chat.id, pin: accountPin(database.getRun(first.id)) }),
-    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && /discard the interrupted run/.test(error.message) && !/session/i.test(error.message));
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && /Discard the interrupted run/.test(error.message)
+      && !/session|add|again/i.test(error.message));
+  assert.equal(database.resolveInterruptedRun(first.id, "discard").status, "failed");
 });
 
 test("a cached sign-out is checked again before a send is refused", async (t) => {
@@ -316,11 +321,14 @@ test("measured usage counts only runs launched with the account and flags missin
   launch(work.id, context.workHome, { inputTokens: 10, outputTokens: 5 });
   launch("claude:default", context.inheritedHome, { inputTokens: 1000, outputTokens: 1000, costUsd: 9 });
   const measured = (id = work.id) => Object.fromEntries(context.claude().accounts.find((account) => account.id === id).measured.map((period) => [period.period, period]));
-  assert.deepEqual({ ...measured()["5h"], since: undefined, label: undefined, changesAt: undefined }, { period: "5h", since: undefined, label: undefined, changesAt: undefined, runs: 2, inputTokens: 110, outputTokens: 25, runsWithoutTokens: 0, costUsd: 0.5, runsWithoutCost: 1 });
+  assert.deepEqual({ ...measured()["5h"], since: undefined, label: undefined, changesAt: undefined }, { period: "5h", since: undefined, label: undefined, changesAt: undefined, runs: 2, inputTokens: 110, outputTokens: 25, runsWithoutTokens: 0, runsWithPartialTokens: 0, costUsd: 0.5, runsWithoutCost: 1 });
   // A run that reported no tokens is counted as unreported, never as zero:
   // a partial sum stays partial and nothing reported stays null.
   launch(work.id, context.workHome, {});
   assert.deepEqual([measured()["5h"].runs, measured()["5h"].inputTokens, measured()["5h"].runsWithoutTokens], [3, 110, 1]);
+  // A run that reported one counter keeps it and is counted as partial.
+  launch(work.id, context.workHome, { inputTokens: 7 });
+  assert.deepEqual([measured()["5h"].runs, measured()["5h"].inputTokens, measured()["5h"].outputTokens, measured()["5h"].runsWithoutTokens, measured()["5h"].runsWithPartialTokens], [4, 117, 25, 1, 1]);
   const codexHome = path.join(context.root, "codex");
   mkdirSync(codexHome);
   context.logins.set(codexHome, "Logged in using ChatGPT\n");
@@ -329,22 +337,22 @@ test("measured usage counts only runs launched with the account and flags missin
   const silentRun = database.createRun({ conversationId: chat.id, provider: "codex", approvalPolicy: "read-only", prompt: "hello" });
   database.bindRunAccount(silentRun.id, { id: silent.id, provider: "codex", label: "Silent", home: codexHome });
   const silentUsage = context.accounts.list().providers.find((provider) => provider.provider === "codex").accounts.find((account) => account.id === silent.id).measured[0];
-  assert.deepEqual([silentUsage.runs, silentUsage.inputTokens, silentUsage.outputTokens, silentUsage.runsWithoutTokens], [1, null, null, 1]);
+  assert.deepEqual([silentUsage.runs, silentUsage.inputTokens, silentUsage.outputTokens, silentUsage.runsWithoutTokens, silentUsage.runsWithPartialTokens], [1, null, null, 1, 0]);
   // The listing says when its oldest run leaves each window; at that moment
   // the total drops without any run or account event.
   const oldest = database.listRuns(chat.id).filter((run) => run.accountId === work.id).map((run) => run.createdAt).sort()[0];
   const leavesAt = Date.parse(measured()["5h"].changesAt);
   assert.ok(leavesAt > Date.parse(oldest) + 5 * 3_600_000 - 1_000 && leavesAt <= Date.now() + 5 * 3_600_000 + 1);
   now = leavesAt - 1;
-  assert.equal(measured()["5h"].runs, 3);
+  assert.equal(measured()["5h"].runs, 4);
   now = leavesAt;
-  assert.ok(measured()["5h"].runs < 3, "the oldest run left the 5-hour total");
+  assert.ok(measured()["5h"].runs < 4, "the oldest run left the 5-hour total");
   assert.equal(Date.parse(measured()["7d"].changesAt) - 7 * 86_400_000, leavesAt - 5 * 3_600_000);
   now += 6 * 3_600_000;
   assert.equal(measured()["5h"].runs, 0);
   assert.equal(measured()["5h"].changesAt, null, "an empty window has nothing to age out");
   assert.equal(measured()["5h"].costUsd, null, "no runs means no measured cost, not zero");
-  assert.equal(measured()["7d"].runs, 3);
+  assert.equal(measured()["7d"].runs, 4);
 });
 
 test("a launched run's account cannot be rebound", async (t) => {
@@ -646,4 +654,41 @@ test("off Windows the default login reads only the exact home variable name", as
   await posix.add({ provider: "claude", label: "Twin", homePath: twin });
   await assert.rejects(windows.add({ provider: "claude", label: "Twin again", homePath: twin }),
     (error) => error.details.code === "PROVIDER_ACCOUNT_DUPLICATE");
+});
+
+test("with its variable unset, the CLI's standard home is the default login under any path", async (t) => {
+  const context = await fixture(t);
+  const { database, probe, root } = context;
+  const user = path.join(root, "user");
+  const standard = { claude: path.join(user, ".claude"), codex: path.join(user, ".codex") };
+  for (const home of Object.values(standard)) mkdirSync(home, { recursive: true });
+  const unset = createProviderAccounts({ database, probe, environment: { PATH: process.env.PATH }, homeDirectory: user });
+  t.after(() => unset.close());
+  for (const [provider, home] of Object.entries(standard)) {
+    const link = path.join(root, `${provider}-link`);
+    symlinkSync(home, link);
+    for (const homePath of [home, link, `${home}/.`]) {
+      await assert.rejects(unset.add({ provider, label: "Alias", homePath }),
+        (error) => error.details.code === "PROVIDER_ACCOUNT_DUPLICATE" && /default login/.test(error.message), homePath);
+    }
+  }
+  assert.equal(database.listProviderAccounts().length, 0);
+
+  // Naming the standard home in the variable is still the standard home, so
+  // a session recorded under it resumes and its usage stays in one bucket.
+  const chat = context.conversation();
+  const run = context.claudeRun(chat.id);
+  database.bindRunAccount(run.id, { id: "claude:default", provider: "claude", label: "Default login", home: null });
+  database.updateRun(run.id, { status: "completed", providerSessionId: "session-1" });
+  const named = createProviderAccounts({ database, probe, environment: { PATH: process.env.PATH, CLAUDE_CONFIG_DIR: path.join(root, "claude-link") }, homeDirectory: user });
+  t.after(() => named.close());
+  assert.equal(named.resolve({ provider: "claude", conversationId: chat.id }).home, null);
+  assert.equal(named.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }).home, null);
+  await assert.rejects(named.add({ provider: "claude", label: "Standard", homePath: standard.claude }), (error) => error.details.code === "PROVIDER_ACCOUNT_DUPLICATE");
+
+  // When the variable selects another home, the standard home is another login.
+  const other = createProviderAccounts({ database, probe, environment: context.environment, homeDirectory: user });
+  t.after(() => other.close());
+  await other.add({ provider: "claude", label: "Standard", homePath: standard.claude });
+  assert.equal(database.listProviderAccounts()[0].homePath, standard.claude);
 });

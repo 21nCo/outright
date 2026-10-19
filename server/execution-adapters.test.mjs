@@ -819,11 +819,16 @@ test("harness logins are read from each CLI's status without credentials", () =>
   assert.equal(parseCodex("Not logged in").signedIn, false);
   assert.equal(parseCodex("Something else"), null);
   assert.deepEqual([claude.accounts.homeVariable, codex.accounts.homeVariable, anthropic.accounts], ["CLAUDE_CONFIG_DIR", "CODEX_HOME", null]);
-  const accounts = { homeVariable: "FIXTURE_HOME", identityArgs: ["status"], parseIdentity: () => null, credentialVariables: ["FIXTURE_TOKEN"] };
+  assert.deepEqual([claude.accounts.standardHome, codex.accounts.standardHome], [".claude", ".codex"]);
+  const accounts = { homeVariable: "FIXTURE_HOME", standardHome: ".fixture", identityArgs: ["status"], parseIdentity: () => null, credentialVariables: ["FIXTURE_TOKEN"] };
   assert.equal(defineAdapter(harnessSpec({ accounts })).accounts.homeVariable, "FIXTURE_HOME");
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, homeVariable: "OUTRIGHT_HOME" } })), /accounts must name/);
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, identityArgs: ["status; rm"] } })), /accounts must name/);
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialVariables: undefined } })), /accounts must name/);
+  // The standard home is one directory inside the user's home, never a path out of it.
+  for (const standardHome of [undefined, "../.fixture", "/etc", "a/b"]) {
+    assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, standardHome } })), /accounts must name/, standardHome);
+  }
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialVariables: ["OUTRIGHT_ANTHROPIC_API_KEY"] } })), /accounts must name/);
 });
 
