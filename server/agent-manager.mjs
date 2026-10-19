@@ -483,6 +483,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // none. An account removed since it was resolved fails the run here,
     // before anything spawns.
     database.updateRun(run.id, { status: "launching", startedAt }, state.account ? { account: state.account } : undefined);
+    if (state.account) accounts.launched();
     database.auditCritical("agent.run.started", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath, approvalPolicy: run.approvalPolicy });
     emit(run.id, "run.started", { provider: run.provider, model: run.model, startedAt, command: launch.display ?? command.display,
       ...(state.account ? { account: { id: state.account.id, label: state.account.label, identity: state.account.identity ?? null } } : {}) });

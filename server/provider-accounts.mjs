@@ -119,20 +119,29 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
   function canonicalHome(home) {
     const cached = listingKeys?.get(home);
     if (cached !== undefined) return cached;
-    const missing = [];
-    let existing = path.resolve(home);
-    let resolved = null;
-    while (resolved === null) {
-      try { resolved = path.join(realpath(existing), ...missing); }
-      catch {
-        const parent = path.dirname(existing);
-        if (parent === existing) resolved = path.resolve(home);
-        else { missing.unshift(path.basename(existing)); existing = parent; }
-      }
-    }
+    const resolved = physicalPath(path.resolve(home)) ?? path.resolve(home);
     const key = platform === "win32" ? resolved.toLowerCase() : resolved;
     listingKeys?.set(home, key);
     return key;
+  }
+
+  // The directory an absolute path leads to, its parts followed as written
+  // (a `..` after a link leaves the link's target). Parts that do not exist
+  // keep their names under the nearest existing directory. Null when that
+  // cannot be known: a `..` under a missing part, or nothing exists.
+  function physicalPath(absolute) {
+    const missing = [];
+    let existing = absolute;
+    for (;;) {
+      try { return path.join(realpath(existing), ...missing); }
+      catch {
+        const parent = path.dirname(existing);
+        const name = path.basename(existing);
+        if (parent === existing || name === "..") return null;
+        missing.unshift(name);
+        existing = parent;
+      }
+    }
   }
 
   // The one key a CLI home is recorded, compared and partitioned by: the
@@ -145,19 +154,26 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     return canonicalHome(home || standardHome(adapter));
   }
 
-  // A relative home variable names a different directory in each worktree
-  // a run starts in, so the default login it selects cannot be checked or
-  // keyed. The variable is named, never its value.
-  function relativeHomeError(adapter) {
+  // A home variable whose directory depends on who reads it makes the
+  // default login it selects impossible to check or key: a relative path
+  // resolves in each run's worktree, and a `..` after a link leads one way
+  // when removed by name (Node's path.join) and another when followed (the
+  // operating system). The variable is named, never its value.
+  function homeVariableError(adapter) {
     const value = adapter.accounts ? inheritedHome(adapter) : null;
-    if (!value || path.isAbsolute(value)) return null;
-    return `${adapter.accounts.homeVariable} is a relative path, which each run would resolve in its own worktree. Set it to an absolute directory and restart Outright.`;
+    if (!value) return null;
+    const name = adapter.accounts.homeVariable;
+    if (!path.isAbsolute(value)) return `${name} is a relative path, which each run would resolve in its own worktree. Set it to an absolute directory and restart Outright.`;
+    if (!value.split(/[\\/]/).includes("..")) return null;
+    const physical = physicalPath(value);
+    if (physical !== null && (platform === "win32" ? physical.toLowerCase() : physical) === canonicalHome(value)) return null;
+    return `${name} contains a .. that leads to a different directory depending on how the path is read. Set it to the full path without .. and restart Outright.`;
   }
 
   // The default login's key: its home variable's directory, or the standard
-  // home's when the variable is unset. None while the variable is relative.
+  // home's when the variable is unset. None while the variable is unusable.
   function defaultHome(adapter) {
-    if (!adapter.accounts || relativeHomeError(adapter)) return null;
+    if (!adapter.accounts || homeVariableError(adapter)) return null;
     return homeKey(adapter, inheritedHome(adapter));
   }
 
@@ -203,8 +219,8 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       return detected.available ? { status: "configured", identity: null, error: null } : { status: "unavailable", identity: null, error: detected.reason };
     }
     if (!adapter.accounts) return { status: "unknown", identity: null, error: `${adapter.label} does not report its login` };
-    const relative = account.homePath ? null : relativeHomeError(adapter);
-    if (relative) return { status: "unknown", identity: null, error: relative };
+    const unusable = account.homePath ? null : homeVariableError(adapter);
+    if (unusable) return { status: "unknown", identity: null, error: unusable };
     // The CLI's status command reports only the home's login, which such a
     // variable replaces; the variable is named, never its value.
     const variable = account.homePath ? null : environmentCredential(adapter);
@@ -467,8 +483,8 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
           : `The ${adapter.label} account this chat's session belongs to was removed. Clear the session in chat settings to continue with the active account.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
     }
     if (!owner && sameAsDefault(account, adapter)) throw duplicateOfDefault(account, adapter);
-    const relative = account.isDefault ? relativeHomeError(adapter) : null;
-    if (relative) throw accountError(409, relative, "PROVIDER_ACCOUNT_UNAVAILABLE");
+    const unusable = account.isDefault ? homeVariableError(adapter) : null;
+    if (unusable) throw accountError(409, unusable, "PROVIDER_ACCOUNT_UNAVAILABLE");
     const home = accountHome(account, adapter);
     // A session or recovery continues only in the home key it launched with,
     // for every account: the default login follows the environment, and an
@@ -516,6 +532,11 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       if (home !== account.home) {
         throw accountError(409, `${account.label}'s directory changed while this run was launching: it led to ${account.home} and now leads to ${home}, so the run did not start.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
       }
+    },
+    // A run's account was recorded with its launch, so that account's
+    // measured usage counts it from now, not from when it ends.
+    launched() {
+      notify();
     },
     // Windows are filed under the account and home the run launched with.
     recordLimits(account, runId, windows) {

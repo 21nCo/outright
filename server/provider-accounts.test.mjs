@@ -372,6 +372,24 @@ test("measured usage counts only runs launched with the account and flags missin
   assert.equal(measured()["7d"].runs, 4);
 });
 
+test("a launched run is announced as its account's measured usage before it ends", async (t) => {
+  const context = await fixture(t);
+  const { accounts, manager, published, spawned } = context;
+  const work = await addWork(context);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  const runs = () => context.claude().accounts.find((account) => account.id === work.id).measured[0].runs;
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.equal(runs(), 0);
+  published.length = 0;
+  const chat = context.conversation();
+  await manager.schedule({ conversation: chat, run: context.claudeRun(chat.id) });
+  assert.equal(spawned.length, 1);
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.ok(published.some((event) => event.type === "provider-accounts.changed"), "the launch is announced while the run is still running");
+  assert.equal(runs(), 1, "the next listing counts the running run");
+  await context.finish(0);
+});
+
 test("a launched run's account cannot be rebound", async (t) => {
   const context = await fixture(t);
   const { database } = context;
@@ -1210,6 +1228,43 @@ test("a relative home variable leaves the default login unusable instead of keyi
   const work = claude().accounts.find((account) => account.label === "Work");
   await relative.activate({ provider: "claude", accountId: work.id });
   assert.equal((await relative.assertLaunchable({ provider: "claude", conversationId: chat.id })).home, workHome);
+});
+
+test("a home variable whose .. follows a link leaves the default login unusable, and one that crosses no link is its directory", async (t) => {
+  const context = await fixture(t);
+  const { database, probe, root } = context;
+  const chat = context.conversation();
+  const run = context.claudeRun(chat.id);
+  await context.manager.schedule({ conversation: chat, run });
+  await context.finish(0, "session-1");
+  mkdirSync(path.join(root, "a", "b"), { recursive: true });
+  symlinkSync(path.join(root, "a", "b"), path.join(root, "link"));
+  mkdirSync(path.join(root, "plain"));
+  // `<root>/link/..` is `<root>` by name but `<root>/a` on disk.
+  for (const value of [path.join(root, "link") + "/../x", path.join(root, "missing") + "/../x"]) {
+    const ambiguous = createProviderAccounts({ database, probe, environment: { PATH: process.env.PATH, CLAUDE_CONFIG_DIR: value, CODEX_HOME: value } });
+    t.after(() => ambiguous.close());
+    for (const [provider, variable] of [["claude", "CLAUDE_CONFIG_DIR"], ["codex", "CODEX_HOME"]]) {
+      const unusable = (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.startsWith(`${variable} contains a ..`);
+      ambiguous.list();
+      await ambiguous.refresh(`${provider}:default`);
+      const login = ambiguous.list().providers.find((entry) => entry.provider === provider).accounts[0].login;
+      assert.equal(login.status, "unknown", value);
+      assert.match(login.error, new RegExp(`${variable} contains a \\.\\.`));
+      assert.ok(!login.error.includes(root), "the variable's value is never shown");
+      assert.ok(!probe.calls.some((call) => call.environment[variable] === value), "no check of a directory a launch may not use");
+      await assert.rejects(ambiguous.assertLaunchable({ provider, conversationId: chat.id }), unusable);
+      await assert.rejects(ambiguous.activate({ provider, accountId: `${provider}:default` }), (error) => error.details.code === "PROVIDER_ACCOUNT_SWITCH_FAILED");
+    }
+    assert.throws(() => ambiguous.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-1" }), (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE");
+  }
+  // A .. that crosses no link names one directory however it is read.
+  const plainValue = path.join(root, "plain") + "/../x";
+  const plain = createProviderAccounts({ database, probe, environment: { PATH: process.env.PATH, CLAUDE_CONFIG_DIR: plainValue } });
+  t.after(() => plain.close());
+  assert.equal((await plain.assertLaunchable({ provider: "claude", conversationId: chat.id })).home, path.join(root, "x"));
+  await plain.refresh("claude:default");
+  assert.ok(probe.calls.some((call) => call.environment.CLAUDE_CONFIG_DIR === plainValue), "its login is checked");
 });
 
 test("deleting an archived chat removes its runs' account records and their retained bytes", async (t) => {
