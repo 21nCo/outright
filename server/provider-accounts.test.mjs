@@ -431,6 +431,55 @@ test("a check that fails after its probe does not block later checks or switches
   assert.equal(context.claude().activeAccountId, work.id);
 });
 
+test("an account whose check fails after it is added is still added", async (t) => {
+  const context = await fixture(t);
+  const { accounts, database, logins, workHome } = context;
+  // The check's bookkeeping meets one storage fault after the row is written.
+  const getProviderAccount = database.getProviderAccount;
+  logins.set(workHome, () => {
+    logins.set(workHome, signedIn("work@example.com"));
+    database.getProviderAccount = () => { database.getProviderAccount = getProviderAccount; throw Object.assign(new Error("maintenance"), { statusCode: 503 }); };
+    return signedIn("work@example.com");
+  });
+  const listing = await accounts.add({ provider: "claude", label: "Work", homePath: workHome });
+  const added = listing.providers.find((provider) => provider.provider === "claude").accounts.find((account) => account.label === "Work");
+  assert.equal(added.login.status, "checking", "its login is shown unchecked, not failed");
+  await assert.rejects(accounts.add({ provider: "claude", label: "Work again", homePath: workHome }), (error) => error.details.code === "PROVIDER_ACCOUNT_DUPLICATE");
+  await tick(); await tick();
+  assert.equal(context.claude().accounts.find((account) => account.id === added.id).login.identity.email, "work@example.com", "the next listing checks it again");
+});
+
+test("a check someone waits for runs before queued background rechecks", async (t) => {
+  let now = Date.parse("2026-10-19T10:00:00.000Z");
+  const context = await fixture(t, { clock: () => now });
+  const { accounts, logins, probe, root } = context;
+  const homes = ["two", "three"].map((name) => { const home = path.join(root, name); mkdirSync(home); logins.set(home, signedIn(`${name}@example.com`)); return home; });
+  await addWork(context);
+  for (const [index, home] of homes.entries()) await accounts.add({ provider: "claude", label: `Account ${index + 2}`, homePath: home });
+  const three = context.claude().accounts.find((account) => account.label === "Account 3");
+  await tick();
+
+  // Every login is old: listing queues a background recheck of each, and
+  // the first one (the default login's) is held.
+  let release;
+  logins.set(context.inheritedHome, () => new Promise((resolve) => { release = () => resolve(signedIn("me@example.com")); }));
+  now += IDENTITY_RECHECK_MS + 1;
+  const before = probe.calls.length;
+  context.claude();
+  await tick();
+  assert.equal(probe.calls.at(-1).environment.CLAUDE_CONFIG_DIR, context.inheritedHome);
+  const switching = accounts.activate({ provider: "claude", accountId: three.id });
+  await tick();
+  release();
+  await switching;
+  const homesChecked = probe.calls.slice(before).filter((call) => call.executable === "claude").map((call) => call.environment.CLAUDE_CONFIG_DIR);
+  assert.deepEqual(homesChecked.slice(0, 2), [context.inheritedHome, homes[1]], "the switch's check runs next, after only the probe in flight");
+  await tick(); await tick();
+  const after = probe.calls.slice(before).filter((call) => call.executable === "claude").map((call) => call.environment.CLAUDE_CONFIG_DIR);
+  assert.deepEqual([...after].sort(), [context.inheritedHome, context.workHome, ...homes].sort(), "the background rechecks still run, and the promoted one only once");
+  assert.ok(context.claude().accounts.every((account) => account.login.checkedAt === new Date(now).toISOString()));
+});
+
 test("a session from before accounts resumes with the default login, and an attached one with the active account", async (t) => {
   const context = await fixture(t);
   const { accounts, database, manager, spawned } = context;
@@ -1161,4 +1210,40 @@ test("a relative home variable leaves the default login unusable instead of keyi
   const work = claude().accounts.find((account) => account.label === "Work");
   await relative.activate({ provider: "claude", accountId: work.id });
   assert.equal((await relative.assertLaunchable({ provider: "claude", conversationId: chat.id })).home, workHome);
+});
+
+test("deleting an archived chat removes its runs' account records and their retained bytes", async (t) => {
+  const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-accounts-archive-")));
+  const filename = path.join(root, "outright.db");
+  const database = createOutrightDatabase({ filename });
+  t.after(async () => { await database.close(); rmSync(root, { recursive: true, force: true }); });
+  const read = (query, ...values) => { const raw = new Database(filename, { readonly: true }); try { return raw.prepare(query).get(...values); } finally { raw.close(); } };
+  const retained = () => read("SELECT bytes FROM retained_usage WHERE id = 1").bytes;
+  const records = () => read("SELECT (SELECT COUNT(*) FROM run_accounts) + (SELECT COUNT(*) FROM run_account_pins) AS count").count;
+  // The same chat with and without account records: archiving and deleting
+  // either returns the retained budget to the same place.
+  async function cycle(withAccounts) {
+    const before = retained();
+    const chat = database.createConversation({ projectId: "p", worktreeId: root, worktreePath: root, title: "Archived", provider: "claude" });
+    const launched = database.createRun({ conversationId: chat.id, provider: "claude", approvalPolicy: "read-only", prompt: "hello" });
+    const account = withAccounts ? { account: { id: "claude:default", provider: "claude", label: "Default login", identity: "me@example.com", home: root } } : undefined;
+    database.updateRun(launched.id, { status: "running", startedAt: new Date().toISOString() }, account);
+    database.updateRun(launched.id, { status: "completed" });
+    const pinned = database.createRun({ conversationId: chat.id, provider: "claude", approvalPolicy: "read-only", prompt: "again" });
+    database.updateRun(pinned.id, { status: "failed" });
+    if (withAccounts) {
+      const writer = new Database(filename);
+      writer.prepare("INSERT INTO run_account_pins (run_id, account_id, home_path, home_known) VALUES (?, ?, ?, 1)").run(pinned.id, "claude:default", root);
+      writer.close();
+      assert.equal(records(), 2);
+    }
+    database.updateConversation(chat.id, { archived: true });
+    await database.deleteArchivedConversation(chat.id, chat.id);
+    return retained() - before;
+  }
+  const withoutAccounts = await cycle(false);
+  const withAccounts = await cycle(true);
+  assert.equal(records(), 0, "the records go with their runs");
+  assert.equal(database.measuredAccountUsage("claude:default", "1970-01-01T00:00:00.000Z", root).runs, 0);
+  assert.equal(withAccounts, withoutAccounts, "their retained bytes are released with them");
 });

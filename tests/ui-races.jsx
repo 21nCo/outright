@@ -1303,7 +1303,9 @@ async function providerAccountsResponseOrderRegression() {
   render(1);
   await until(() => activeLabel() === "Codex · Personal (active)", "the other client's switch is shown");
   put.resolve();
-  await until(() => host.querySelector('[role="status"]')?.textContent === "Codex now starts new sessions with Work.", "the delayed switch response arrived");
+  // Its announcement does not claim an account the shown listing contradicts.
+  await until(() => host.querySelector('[role="status"]')?.textContent === "Switched to Work, but a later change made Personal active for new Codex sessions.",
+    `the delayed switch response is announced against the shown listing: ${host.querySelector('[role="status"]')?.textContent}`);
   await settle();
   assert(activeLabel() === "Codex · Personal (active)", `a response computed before the newer listing replaced it: ${activeLabel()}`);
 
@@ -1320,6 +1322,56 @@ async function providerAccountsResponseOrderRegression() {
   held.resolve();
   held = null;
   await until(() => activeLabel() === "Codex · Default login (active)", "the load computed after the switch is shown");
+}
+
+// A switch hands focus to the account's Check only if focus is still on its
+// Use button; focus moved elsewhere while it was pending stays there.
+async function providerAccountsSwitchFocusRegression() {
+  root.render(null); await settle();
+  let active = "codex:default";
+  const listing = () => ({ generatedAt: new Date().toISOString(), limitStaleAfterMs: 1_800_000,
+    providers: [{ provider: "codex", label: "Codex", kind: "harness", homeVariable: "CODEX_HOME", switchable: true, usageLimits: false, activeAccountId: active,
+      accounts: ["Default login", "Work"].map((label) => {
+        const id = label === "Default login" ? "codex:default" : `codex:${label}`;
+        return { id, label, isDefault: id === "codex:default", homePath: id === "codex:default" ? null : `/homes/${label}`, active: id === active, sameAsDefault: false,
+          login: { status: "signed-in", identity: null, error: null, checkedAt: null }, measured: [], limits: null };
+      }) }] });
+  let put = null;
+  route = async (url, init) => {
+    if (url.pathname === "/api/provider-accounts/active" && init?.method === "PUT") {
+      active = JSON.parse(init.body).accountId;
+      const value = listing();
+      put = deferred();
+      return put.promise.then(() => response(value));
+    }
+    if (url.pathname !== "/api/provider-accounts") return response({});
+    return response(listing());
+  };
+  const onError = (error) => { throw error; };
+  root.render(<TooltipProvider><ProviderAccounts open runtimeEvent={null} onError={onError} /></TooltipProvider>);
+  const button = (label) => [...host.querySelectorAll("button")].find((entry) => entry.getAttribute("aria-label") === label);
+  const status = () => host.querySelector('[role="status"]')?.textContent;
+  await until(() => button("Use Work for new Codex sessions"), "the default login is active");
+  button("Use Work for new Codex sessions").focus();
+  button("Use Work for new Codex sessions").click();
+  await until(() => put, "the switch to Work was sent");
+  // The next account's name is typed while the switch is pending.
+  const name = host.querySelector('[aria-label="Account name"]');
+  name.focus();
+  put.resolve();
+  await until(() => status() === "Codex now starts new sessions with Work.", "the switch response arrived");
+  await settle();
+  assert(document.activeElement === name, `focus was taken from the account name to ${document.activeElement?.getAttribute("aria-label") ?? document.activeElement?.tagName}`);
+
+  // Focus left on Use follows the switched account to its Check.
+  put = null;
+  button("Use Default login for new Codex sessions").focus();
+  button("Use Default login for new Codex sessions").click();
+  await until(() => put, "the switch back was sent");
+  put.resolve();
+  await until(() => status() === "Codex now starts new sessions with Default login.", "the switch back arrived");
+  await settle();
+  assert(document.activeElement === button("Check Codex account Default login"), "focus on Use continues on the switched account's Check");
 }
 
 async function settingsCapacityAndDeletionOrderRegression() {
@@ -6077,6 +6129,7 @@ try {
     ["provider accounts failed reload", providerAccountsFailedReloadRegression, "a failed reload marks an expired measured total out of date, and account changes reload without the runtime event"],
     ["provider accounts add keeps newer draft", providerAccountsAddKeepsNewerDraftRegression, "a successful add clears only the draft it submitted"],
     ["provider accounts response order", providerAccountsResponseOrderRegression, "a delayed account action response never replaces a listing computed after it"],
+    ["provider accounts switch focus", providerAccountsSwitchFocusRegression, "a switch moves focus only from its own Use button"],
     ["queued run account", queuedRunAccountRegression, "a run queued without an account names the account its launch reports before it ends, also on narrow screens"],
     ["settings capacity and deletion order", settingsCapacityAndDeletionOrderRegression, "new capacity wins reordered responses and deletion owns its confirmation"],
     ["settings template completion", settingsTemplateCompletionRegression, "a successful template POST clears its submitted draft after reopening"],

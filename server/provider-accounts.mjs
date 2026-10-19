@@ -71,9 +71,11 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
   // further probes; close() reports it, as provider discovery does.
   const cleanupErrors = new Map();
   // Identity checks run one at a time, so opening Settings with many
-  // accounts never starts a burst of CLI processes. The chain never
-  // rejects: one failed check affects only its own callers.
-  let checkQueue = Promise.resolve();
+  // accounts never starts a burst of CLI processes. A check someone waits
+  // for (a switch, Check, add or send) runs before every background recheck
+  // that has not started. One failed check affects only its own callers.
+  const checkQueue = [];
+  let checking = false;
   let notifyTimer = null;
   // One listing resolves each home once, however many accounts share it.
   let listingKeys = null;
@@ -224,23 +226,52 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     }
   }
 
-  // Concurrent requests for one account share a single check.
-  function checkIdentity(account) {
+  // Concurrent requests for one account share a single check; a waiting
+  // request moves a queued background check of that account ahead.
+  function checkIdentity(account, { background = false } = {}) {
     const pending = pendingChecks.get(account.id);
-    if (pending) return pending;
-    const adapter = adapterFor(account.provider);
-    const task = checkQueue.then(async () => {
-      const result = { ...await probeIdentity(account, adapter), checkedAt: new Date(clock()).toISOString() };
-      // A removed account's late result is dropped.
-      if (findAccount(account.id)) {
-        if (JSON.stringify(identities.get(account.id)) !== JSON.stringify(result)) notify();
-        identities.set(account.id, result);
+    if (pending) {
+      if (!background && pending.background && !pending.started) {
+        checkQueue.splice(checkQueue.indexOf(pending), 1);
+        pending.background = false;
+        enqueueCheck(pending);
       }
-      return result;
-    }).finally(() => { if (pendingChecks.get(account.id) === task) pendingChecks.delete(account.id); });
-    checkQueue = task.catch(() => {});
-    pendingChecks.set(account.id, task);
-    return task;
+      return pending.task;
+    }
+    const check = { account, adapter: adapterFor(account.provider), background, started: false };
+    check.task = new Promise((resolve, reject) => { check.settle = { resolve, reject }; });
+    pendingChecks.set(account.id, check);
+    enqueueCheck(check);
+    queueMicrotask(runChecks);
+    return check.task;
+  }
+
+  function enqueueCheck(check) {
+    const at = check.background ? -1 : checkQueue.findIndex((queued) => queued.background);
+    checkQueue.splice(at === -1 ? checkQueue.length : at, 0, check);
+  }
+
+  async function runChecks() {
+    if (checking) return;
+    checking = true;
+    while (checkQueue.length) {
+      const check = checkQueue.shift();
+      check.started = true;
+      try {
+        const result = { ...await probeIdentity(check.account, check.adapter), checkedAt: new Date(clock()).toISOString() };
+        // A removed account's late result is dropped.
+        if (findAccount(check.account.id)) {
+          if (JSON.stringify(identities.get(check.account.id)) !== JSON.stringify(result)) notify();
+          identities.set(check.account.id, result);
+        }
+        check.settle.resolve(result);
+      } catch (error) {
+        check.settle.reject(error);
+      } finally {
+        if (pendingChecks.get(check.account.id) === check) pendingChecks.delete(check.account.id);
+      }
+    }
+    checking = false;
   }
 
   // An unchecked login, or one checked too long ago, is checked in the
@@ -249,7 +280,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     if (closing.signal.aborted) return;
     const checkedAt = Date.parse(identities.get(account.id)?.checkedAt);
     if (pendingChecks.has(account.id) || clock() - checkedAt <= IDENTITY_RECHECK_MS) return;
-    void checkIdentity(account).catch(() => {});
+    void checkIdentity(account, { background: true }).catch(() => {});
   }
 
   function identitySummary(account) {
@@ -362,7 +393,9 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     }
     const account = database.createProviderAccount({ provider: adapter.id, label, homePath });
     notify();
-    await checkIdentity({ ...account, isDefault: false });
+    // The account exists from here: a failed check leaves its login
+    // unchecked in the listing rather than failing the add.
+    await checkIdentity({ ...account, isDefault: false }).catch(() => {});
     return list();
   }
 
@@ -496,7 +529,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       closing.abort();
       if (notifyTimer) clearTimeout(notifyTimer);
       notifyTimer = null;
-      await Promise.allSettled([...pendingChecks.values()]);
+      await Promise.allSettled([...pendingChecks.values()].map((check) => check.task));
       if (cleanupErrors.size) throw new AggregateError([...cleanupErrors.values()], "Account login check cleanup could not be verified");
     },
   };

@@ -101,6 +101,8 @@ export function ProviderAccounts({ open, runtimeEvent, accountsVersion = 0, onEr
 
   // Controls stay focusable while busy (aria-disabled) so keyboard focus is
   // never dropped; a second action is ignored until the first settles.
+  // `beforeUpdate` runs only if the action's listing is shown, and a
+  // `success` function words its message from the listing that is shown.
   async function act(key, request, success, beforeUpdate) {
     if (busyRef.current) return false;
     busyRef.current = true;
@@ -110,7 +112,7 @@ export function ProviderAccounts({ open, runtimeEvent, accountsVersion = 0, onEr
       const value = await request();
       // Loads still in flight are kept: one computed after this action is newer.
       show(value, beforeUpdate);
-      setMessage({ status: success, alert: "" });
+      setMessage({ status: typeof success === "function" ? success(shownRef.current) : success, alert: "" });
       return true;
     } catch (error) {
       // The runtime's message names the account and the next step; the
@@ -120,11 +122,19 @@ export function ProviderAccounts({ open, runtimeEvent, accountsVersion = 0, onEr
     } finally { busyRef.current = false; setBusy(null); }
   }
 
-  async function activate(provider, account) {
-    const focused = document.activeElement;
+  async function activate(provider, account, trigger) {
     await act(`activate:${account.id}`, () => api("/api/provider-accounts/active", { method: "PUT", body: { provider: provider.provider, accountId: account.id } }),
-      `${provider.label} now starts new sessions with ${account.label}.`,
-      () => { if (sectionRef.current?.contains(focused)) focusCheckRef.current = account.id; });
+      (shown) => {
+        // A change made after this switch may have made another account active.
+        const active = shown?.providers.find((entry) => entry.provider === provider.provider)?.accounts.find((entry) => entry.active);
+        return !active || active.id === account.id ? `${provider.label} now starts new sessions with ${account.label}.`
+          : `Switched to ${account.label}, but a later change made ${active.label} active for new ${provider.label} sessions.`;
+      },
+      // Focus follows only if it is still on Use, or was lost when Use left.
+      () => {
+        const focused = document.activeElement;
+        if (focused === trigger || (!trigger.isConnected && (!focused || focused === document.body))) focusCheckRef.current = account.id;
+      });
   }
   async function add(event) {
     event.preventDefault();
@@ -157,7 +167,7 @@ export function ProviderAccounts({ open, runtimeEvent, accountsVersion = 0, onEr
         {account.measured.map((period) => <small key={period.period}>Measured by Outright, {period.label.toLowerCase()}: {measuredPeriodText(period, runtimeNow, listing.generatedAt)}</small>)}
         <small>{accountLimitsText(provider, account, runtimeNow, listing.limitStaleAfterMs)}</small>
       </span><span className="account-actions">
-        {provider.switchable && !account.active && !account.sameAsDefault && <Button variant="outline" size="sm" aria-disabled={blocked} onClick={() => activate(provider, account)}
+        {provider.switchable && !account.active && !account.sameAsDefault && <Button variant="outline" size="sm" aria-disabled={blocked} onClick={(event) => activate(provider, account, event.currentTarget)}
           aria-label={`Use ${account.label} for new ${provider.label} sessions`}>Use</Button>}
         <Button variant="ghost" size="sm" aria-disabled={blocked} data-account-check={account.id} aria-label={`Check ${provider.label} account ${account.label}`}
           onClick={() => act(`refresh:${account.id}`, () => api(`/api/provider-accounts/${encodeURIComponent(account.id)}/refresh`, { method: "POST" }), `Checked ${account.label}.`)}>Check</Button>
