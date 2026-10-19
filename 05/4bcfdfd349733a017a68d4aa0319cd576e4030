@@ -1,0 +1,27 @@
+docs/out-28-provider-accounts.md
+  s_1900bb15a7199a::t_9cfd056db74a15 19,21,47
+server/execution-adapters.test.mjs
+  s_1900bb15a7199a::t_1e3d8579602923 835-837
+server/execution-adapters/claude.mjs
+  s_1900bb15a7199a::t_47087c6233b695 24-26,55-56,58-60
+server/provider-accounts.mjs
+  s_1900bb15a7199a::t_0da39d7b395b54 192-194,197,200-201,209-210,235,570
+server/provider-accounts.test.mjs
+  s_1900bb15a7199a::t_4600a65f3e741b 1005-1054
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "054bcfdfd349733a017a68d4aa0319cd576e4030",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
