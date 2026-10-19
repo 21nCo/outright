@@ -1535,3 +1535,44 @@ test("a session or recovery never continues under another credential source, and
       "another value of the same variable cannot be told apart");
   }
 });
+
+test("a recovery resumes a session attached by hand only if that session used its account and login", async (t) => {
+  const context = await fixture(t);
+  const { accounts, database, inheritedHome, probe } = context;
+  const work = await addWork(context);
+  const chat = context.conversation();
+  const launch = (runtime, { sessionId = null, status = "completed" } = {}) => {
+    const account = runtime.resolve({ provider: "claude", conversationId: chat.id });
+    const run = context.claudeRun(chat.id);
+    database.updateRun(run.id, { status: "running", startedAt: new Date().toISOString() }, { account });
+    database.updateRun(run.id, { status, providerSessionId: sessionId });
+    return database.getRun(run.id);
+  };
+  const refused = (runtime, target, ...named) => assert.throws(() => runtime.resolve({ provider: "claude", conversationId: chat.id, ...target }),
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && named.every((name) => error.message.includes(name)) && !error.message.includes("secret"));
+
+  // (i) Session B belongs to Work; run A on the default login is interrupted
+  // before it records a session, and B is attached to the chat by hand.
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  launch(accounts, { sessionId: "session-b" });
+  await accounts.activate({ provider: "claude", accountId: "claude:default" });
+  const interrupted = launch(accounts, { status: "interrupted" });
+  const pin = accountPin(interrupted);
+  refused(accounts, { sessionId: "session-b", pin }, "Default login", "belongs to Work");
+  await assert.rejects(accounts.assertLaunchable({ provider: "claude", conversationId: chat.id, sessionId: "session-b", pin }),
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE");
+  // (iii) A fresh session, the run's own session and one no run launched in continue under the pin.
+  assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, pin }).home, inheritedHome);
+  const own = launch(accounts, { sessionId: "session-a", status: "interrupted" });
+  assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, sessionId: "session-a", pin: accountPin(own) }).home, inheritedHome);
+  assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id, sessionId: "attached-by-hand", pin }).id, "claude:default");
+
+  // (ii) One default home with two credential sources: a session launched
+  // with ANTHROPIC_API_KEY is not resumed by a run that used the directory's login.
+  const fromVariable = createProviderAccounts({ database, probe, environment: { ...context.environment, ANTHROPIC_API_KEY: "secret" } });
+  t.after(() => fromVariable.close());
+  launch(fromVariable, { sessionId: "session-variable" });
+  refused(accounts, { sessionId: "session-variable", pin }, `with the login in ${inheritedHome}`, "launched with ANTHROPIC_API_KEY");
+  const variablePin = accountPin(launch(fromVariable, { status: "interrupted" }));
+  refused(fromVariable, { sessionId: "session-a", pin: variablePin }, "with ANTHROPIC_API_KEY", `launched with the login in ${inheritedHome}`);
+});

@@ -3599,3 +3599,42 @@ console.log("Logged in using ChatGPT");\n`);
   assert.equal(runtime.database.listRuns(conversation.id).length, 0);
   assert.equal(runtime.database.listMessagePage(conversation.id, { limit: 10 }).messages.length, 0);
 }));
+
+test("resuming a session attached by hand that another account launched spends no recovery decision", withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
+  writeNodeCommand(bin, "codex", `if (process.argv[2] === "--version") { console.log("codex-cli 0.162.1"); process.exit(0); }
+console.log("Logged in using ChatGPT");\n`);
+  runtime.agents.providerAvailable = async () => true;
+  const scheduled = [];
+  runtime.agents.schedule = async (entry) => { scheduled.push(entry); return entry.run; };
+  const root = path.dirname(bin);
+  const add = async (label) => {
+    const homePath = path.join(root, `codex-${label}`);
+    mkdirSync(homePath);
+    const listing = (await callRuntime(runtime, "POST", "/api/provider-accounts", { provider: "codex", label, homePath })).body;
+    const account = listing.providers.find((provider) => provider.provider === "codex").accounts.find((item) => item.label === label);
+    return { id: account.id, provider: "codex", label, homePath, home: homePath, identity: null };
+  };
+  const [work, other] = [await add("Work"), await add("Other")];
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Attached", provider: "codex" });
+  const launched = (account, status, providerSessionId = null) => {
+    const run = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium", prompt: account.label });
+    runtime.database.updateRun(run.id, { status: "running", startedAt: new Date().toISOString(), pid: 2 ** 22 + 7 }, { account });
+    if (status) runtime.database.updateRun(run.id, { status, providerSessionId });
+    return run;
+  };
+  // Other's session; Work's run is interrupted before it records a session.
+  launched(other, "completed", "019a-other-session");
+  const interrupted = launched(work, null);
+  runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+  assert.equal((await callRuntime(runtime, "PATCH", `/api/conversations/${conversation.id}`, { providerSessionId: "019a-other-session" })).statusCode, 200);
+
+  const resumed = await callRuntime(runtime, "POST", `/api/runs/${interrupted.id}/resume`, { policy: "resume-session" });
+  assert.deepEqual([resumed.statusCode, resumed.body.code], [409, "PROVIDER_ACCOUNT_UNAVAILABLE"], JSON.stringify(resumed.body));
+  assert.match(resumed.body.error, /used Work, but the session it would resume belongs to Other/);
+  assert.equal(runtime.database.getRun(interrupted.id).recoveryDecision, null, "the run still awaits a decision");
+  assert.deepEqual([scheduled.length, runtime.database.listRuns(conversation.id).length], [0, 2]);
+  // Retry starts a fresh session on Work.
+  const retried = await callRuntime(runtime, "POST", `/api/runs/${interrupted.id}/resume`, { policy: "retry" });
+  assert.equal(retried.statusCode, 202, JSON.stringify(retried.body));
+  assert.deepEqual([scheduled.length, scheduled[0].forceFreshSession, scheduled[0].run.accountPinId], [1, true, work.id]);
+}));

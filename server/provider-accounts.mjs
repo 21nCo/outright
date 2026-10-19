@@ -557,6 +557,17 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     const unusable = account.isDefault ? homeVariableError(adapter) : null;
     if (unusable) throw accountError(409, unusable, "PROVIDER_ACCOUNT_UNAVAILABLE");
     const home = loginKey(account, adapter);
+    const sessionSource = (login) => login.source?.split("+").join(" and ") ?? `the login in ${login.home}`;
+    // A recovery that resumes a session some run in this chat launched in
+    // (one attached by hand) goes ahead only if that run used the pin's
+    // account and login key. A key from before accounts is the current one.
+    const session = pin && sessionId ? database.sessionAccount(conversationId, provider, sessionId) : null;
+    const keyOf = (login) => (login.home === undefined ? home : login.home);
+    if (session && (session.accountId !== pin.accountId || keyOf(session) !== keyOf(pin))) {
+      throw accountError(409, session.accountId !== pin.accountId
+        ? `This interrupted run used ${account.label}, but the session it would resume belongs to ${findAccount(session.accountId)?.label ?? "a removed account"}. Retry it in a new session, or discard the interrupted run.`
+        : `This interrupted run used ${account.label} with ${sessionSource(parseLogin(keyOf(pin)))}, but the session it would resume was launched with ${sessionSource(parseLogin(keyOf(session)))}. Retry it in a new session, or discard the interrupted run.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
+    }
     // A session or recovery continues only with the login key it launched
     // with, for every account: the default login follows the environment,
     // and an added account's directory can be replaced by a link elsewhere.
