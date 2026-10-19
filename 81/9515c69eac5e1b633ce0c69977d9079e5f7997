@@ -1,0 +1,31 @@
+docs/out-28-provider-accounts.md
+  s_7d0a48f0aaecda::t_a521c175a0285f 19-21,47,51
+server/database.mjs
+  s_7d0a48f0aaecda::t_a679dad09619dc 71-74,2294,2368-2369,2374-2381,2869-2881
+server/provider-accounts.mjs
+  s_7d0a48f0aaecda::t_66d04e220beb64 18-19,203-215,229-241,303,307-308,320-323,325,330-331,336-338,497-498,516-523,526-532,534-535,539-540,543-544,561,566,568,576
+server/provider-accounts.test.mjs
+  s_7d0a48f0aaecda::t_cae9c5dbfef7a4 1251,1267-1271,1276,1279,1289-1378
+src/App.jsx
+  s_7d0a48f0aaecda::t_540febce213eba 1942,1976-1979,2007,2012,2165
+src/styles.css
+  s_7d0a48f0aaecda::t_c282b067c462df 258,323
+tests/ui-races.jsx
+  s_7d0a48f0aaecda::t_c694bafa43d211 4761-4762,4767,4771-4774,4776-4779,4781-4788,4795-4808,4810,6152
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "819515c69eac5e1b633ce0c69977d9079e5f7997",
+  "prompts": {},
+  "sessions": {
+    "s_7d0a48f0aaecda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec9cf707-0884-40ca-b283-dbc4d0f2a4b5",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
