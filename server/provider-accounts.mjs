@@ -186,22 +186,24 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     return Boolean(account.homePath) && homeKey(adapter, account.homePath) === defaultHome(adapter);
   }
 
-  // Every credential source the CLI authenticates with in place of the
-  // login in its home (adapter accounts.overridesLogin, a rule rather than
-  // a list) stands in for the default login. A switch counts only when the
-  // CLI reads it as enabled. Every one set is named, sorted and joined by
-  // +, so the source changes whenever one is added or removed, whichever
-  // the CLI gives precedence.
-  function environmentCredential(adapter) {
+  // Every credential source the CLI can authenticate with, or pick a
+  // provider or endpoint with, in place of the login in its home (adapter
+  // accounts.overridesLogin, a rule rather than a list) partitions the
+  // default login. A switch counts only when the CLI reads it as enabled.
+  // Every one set (or, with `matches`, every such one) is named, sorted by
+  // code unit and joined by +, so the source changes whenever one is added
+  // or removed, whichever the CLI gives precedence. A source is not proof
+  // of a login; see probeIdentity.
+  function environmentCredential(adapter, matches = adapter.accounts?.overridesLogin) {
     const accounts = adapter.accounts;
     if (!accounts) return null;
     const names = new Set();
     for (const [key, value] of Object.entries(environment)) {
       const name = platform === "win32" ? key.toUpperCase() : key;
-      if (!value || !accounts.overridesLogin(name)) continue;
+      if (!value || !accounts.overridesLogin(name) || !matches(name)) continue;
       if (!accounts.isCredentialSwitch(name) || CREDENTIAL_SWITCH_ON.has(value.trim().toLowerCase())) names.add(name);
     }
-    return names.size ? [...names].sort().join("+") : null;
+    return names.size ? [...names].sort((a, b) => (a < b ? -1 : Number(a > b))).join("+") : null;
   }
 
   function accountHome(account, adapter) {
@@ -256,10 +258,15 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     if (!adapter.accounts) return { status: "unknown", identity: null, error: `${adapter.label} does not report its login` };
     const unusable = account.homePath ? null : homeVariableError(adapter);
     if (unusable) return { status: "unknown", identity: null, error: unusable };
-    // The CLI's status command reports only the home's login, which such a
-    // variable replaces; the variable is named, never its value.
+    // The default login is checked by the CLI's status command with its
+    // credential sources set, so an endpoint or selector alone never makes
+    // a signed-out home a login. Only a source that command cannot report
+    // (accounts.isUnreported) counts as configured unchecked. Sources are
+    // named, never their values.
     const variable = account.homePath ? null : environmentCredential(adapter);
-    if (variable) return { status: "configured", identity: { signedIn: true, method: "environment", variable, email: null, organization: null, plan: null }, error: null };
+    if (variable && environmentCredential(adapter, adapter.accounts.isUnreported)) {
+      return { status: "configured", identity: { signedIn: true, method: "environment", variable, email: null, organization: null, plan: null }, error: null };
+    }
     if (cleanupErrors.has(adapter.id)) return { status: "unknown", identity: null, error: `${adapter.label} login checks stopped: an earlier check could not be confirmed stopped` };
     const base = withoutDirectProviderCredentials(environment);
     const scoped = account.homePath ? withAccountHome(base, adapter.accounts, account.homePath) : base;
@@ -277,7 +284,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
         return { status: "signed-out", identity: { signedIn: false, ownLogin: false, method: identity.method, email: null, organization: null, plan: null },
           error: `${adapter.label} signs in with a ${identity.method ?? "credential"} login from outside ${account.label}'s directory, not one stored in it` };
       }
-      return { status: identity.signedIn ? "signed-in" : "signed-out", identity, error: null };
+      return { status: identity.signedIn ? "signed-in" : "signed-out", identity: variable ? { ...identity, variable } : identity, error: null };
     } catch (error) {
       if (error?.code === "OUTRIGHT_PROBE_CLEANUP_UNCERTAIN") cleanupErrors.set(adapter.id, error);
       // The probe's own message can quote CLI output; it is not repeated.
@@ -520,7 +527,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
         const signIn = account.homePath ? ` Sign in with ${adapter.accounts.homeVariable} set to its directory, then switch again.` : " Sign in with the CLI, then switch again.";
         throw accountError(409, `${account.label} is signed out of ${adapter.label}.${signIn}`, "PROVIDER_ACCOUNT_SWITCH_FAILED");
       }
-      // A default login that uses a credential variable launches with it.
+      // A default login whose source its status command cannot report launches with it.
       if (result.status !== "signed-in" && result.status !== "configured") throw accountError(409, `Could not confirm that ${account.label} is signed in: ${result.error}`, "PROVIDER_ACCOUNT_SWITCH_FAILED");
       database.selectProviderAccount(adapter.id, account.id);
       notify();

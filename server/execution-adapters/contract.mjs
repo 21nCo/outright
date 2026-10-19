@@ -60,21 +60,24 @@ function compareVersions(left, right) {
 // An upper-case variable name's role for an account (Windows callers
 // upper-case it first): a credential source an added account runs without,
 // one that stands in for the default login, and a switch counted only when
-// enabled. The home variable and Outright's own direct-provider variables
-// are never sources.
+// enabled, and one the login status command does not report. The home
+// variable and Outright's own direct-provider variables are never sources.
 function credentialRules(accounts) {
   const frozen = (list) => Object.freeze([...list]);
   const matcher = (list) => {
     const rule = new RegExp(`^(?:${list.map((item) => item.replaceAll("*", "[A-Z0-9_]*")).join("|") || "(?!)"})$`);
     return (name) => rule.test(name);
   };
-  const [credential, nonCredential, credentialSwitch] = [matcher(accounts.credentialVariables), matcher(accounts.nonCredentialVariables), matcher(accounts.credentialSwitches)];
+  const [credential, nonCredential, credentialSwitch, unreported] = [matcher(accounts.credentialVariables), matcher(accounts.nonCredentialVariables),
+    matcher(accounts.credentialSwitches), matcher(accounts.unreportedCredentials)];
   const inert = frozen(accounts.inertCredentials);
   const isCredential = (name) => name !== accounts.homeVariable && !name.startsWith("OUTRIGHT_") && credential(name) && !nonCredential(name);
+  const overridesLogin = (name) => isCredential(name) && !inert.includes(name);
   return Object.freeze({ ...accounts, identityArgs: frozen(accounts.identityArgs), credentialVariables: frozen(accounts.credentialVariables),
-    nonCredentialVariables: frozen(accounts.nonCredentialVariables), credentialSwitches: frozen(accounts.credentialSwitches), inertCredentials: inert, isCredential,
-    overridesLogin: (name) => isCredential(name) && !inert.includes(name),
-    isCredentialSwitch: (name) => isCredential(name) && credentialSwitch(name) });
+    nonCredentialVariables: frozen(accounts.nonCredentialVariables), credentialSwitches: frozen(accounts.credentialSwitches), inertCredentials: inert,
+    unreportedCredentials: frozen(accounts.unreportedCredentials), isCredential, overridesLogin,
+    isCredentialSwitch: (name) => isCredential(name) && credentialSwitch(name),
+    isUnreported: (name) => overridesLogin(name) && unreported(name) });
 }
 
 export function defineAdapter(spec) {
@@ -99,13 +102,17 @@ export function defineAdapter(spec) {
     // nonCredentialVariables is a source. The CLI authenticates with a
     // source in place of the home's login, except the inertCredentials it
     // reads but never signs in with. Credential switches are sources that
-    // count only when the CLI reads them as enabled.
+    // count only when the CLI reads them as enabled. A source is not proof
+    // of a login: the default login is checked by the CLI's status command
+    // with its sources set, except for the unreportedCredentials that
+    // command cannot report, which count as configured unchecked.
     const accounts = spec.accounts;
     const environmentVariable = (variable) => HOME_VARIABLE_PATTERN.test(variable ?? "") && !variable.startsWith("OUTRIGHT_");
     const rules = (list) => Array.isArray(list) && list.every((rule) => VARIABLE_RULE_PATTERN.test(rule ?? "") && rule.length <= 64 && !rule.startsWith("OUTRIGHT_"));
     if (accounts !== undefined && (!environmentVariable(accounts?.homeVariable) || !/^\.?[A-Za-z0-9][A-Za-z0-9._-]*$/.test(accounts.standardHome ?? "")
       || !Array.isArray(accounts.identityArgs) || !accounts.identityArgs.length || accounts.identityArgs.some((arg) => !IDENTITY_ARGUMENT_PATTERN.test(arg))
       || !rules(accounts.credentialVariables) || !accounts.credentialVariables.length || !rules(accounts.nonCredentialVariables) || !rules(accounts.credentialSwitches)
+      || !rules(accounts.unreportedCredentials)
       || !Array.isArray(accounts.inertCredentials) || !accounts.inertCredentials.every(environmentVariable)
       || typeof accounts.parseIdentity !== "function")) throw contractError(`${spec.id} accounts must name a home variable, its standard directory, credential variable rules, identity arguments and a parser`);
   } else {

@@ -47,10 +47,13 @@ export const codexAdapter = defineAdapter({
   // of that login, and OPENAI_* also picks its endpoint and organization.
   // Codex 0.162 does not authenticate with OPENAI_API_KEY, so that one
   // never stands in for the login; it is still kept from an added
-  // account's launch and check.
+  // account's launch and check. `codex login status` reads only
+  // CODEX_HOME, so the default login with CODEX_API_KEY or
+  // CODEX_ACCESS_TOKEN set counts as configured unchecked; with only an
+  // endpoint, organization or workload-identity setting it is checked.
   accounts: { homeVariable: "CODEX_HOME", standardHome: ".codex", identityArgs: ["login", "status"], parseIdentity,
     credentialVariables: ["OPENAI_*", "CODEX_*KEY*", "CODEX_*TOKEN*", "CODEX_*AUTH*", "CODEX_*FEDERATION*", "CODEX_*IDENTITY*"],
-    nonCredentialVariables: [], credentialSwitches: [], inertCredentials: ["OPENAI_API_KEY"] },
+    nonCredentialVariables: [], credentialSwitches: [], inertCredentials: ["OPENAI_API_KEY"], unreportedCredentials: ["CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] },
   buildLaunch({ worktreePath, run, sessionId }) {
     const sandbox = SANDBOX_MODES[run.approvalPolicy];
     const options = [];

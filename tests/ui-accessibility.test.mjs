@@ -187,6 +187,7 @@ test("expired measured totals are marked out of date and account changes keep th
   assert.equal(listingOutOfDate(listing, Date.parse(changesAt)), true);
   // A default login that launches with a credential variable names it.
   assert.equal(loginText({ status: "configured", identity: { variable: "CODEX_API_KEY" } }), "Uses CODEX_API_KEY from the environment");
+  assert.equal(loginText({ status: "signed-in", identity: { method: "third_party", variable: "CLAUDE_CODE_USE_BEDROCK" } }), "Signed in · third_party · uses CLAUDE_CODE_USE_BEDROCK");
 
   const [app, accounts] = await Promise.all([
     readFile(new URL("src/App.jsx", root), "utf8"),

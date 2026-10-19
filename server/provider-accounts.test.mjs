@@ -16,11 +16,26 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 const keyOf = (home) => (process.platform === "win32" ? home.toLowerCase() : home);
 const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-// Answers an identity check by the account home the probe would run with.
+// What Claude Code 2.1.304's `auth status --json` reports for a source in
+// its environment that signs it in, whatever its home holds. An endpoint,
+// profile or federation selector alone signs nothing in.
+function claudeEnvironmentLogin(environment) {
+  const provider = Object.keys(environment).find((name) => /^CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY|ANTHROPIC_AWS|ANTHROPIC_GOOGLE_CLOUD|MANTLE)$/.test(name)
+    && ["1", "true", "yes", "on"].includes(environment[name].trim().toLowerCase()));
+  if (provider) return { loggedIn: true, authMethod: "third_party" };
+  if (environment.ANTHROPIC_API_KEY) return { loggedIn: true, authMethod: "api_key", apiKeySource: "ANTHROPIC_API_KEY" };
+  if (environment.ANTHROPIC_AUTH_TOKEN || environment.CLAUDE_CODE_OAUTH_TOKEN) return { loggedIn: true, authMethod: "oauth_token" };
+  return null;
+}
+
+// Answers an identity check by the account home the probe would run with,
+// or for Claude by a source in its environment that signs it in.
 function fakeProbe(logins) {
   const calls = [];
   const probe = async (executable, options) => {
     calls.push({ executable, ...options });
+    const fromEnvironment = executable === "claude" ? claudeEnvironmentLogin(options.environment) : null;
+    if (fromEnvironment) return JSON.stringify(fromEnvironment);
     const login = logins.get(options.environment[executable === "claude" ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME"] ?? "unset");
     if (login instanceof Error) throw login;
     return typeof login === "function" ? login() : (login ?? "Not logged in");
@@ -690,7 +705,8 @@ test("an added account is signed in only by a login stored in its directory", as
   await assert.rejects(accounts.assertLaunchable({ provider: "claude", conversationId: chat.id }), (error) => error.details.code === "PROVIDER_ACCOUNT_SIGNED_OUT");
   // The default login launches with them, named and never their values.
   const defaultLogin = context.claude().accounts[0].login;
-  assert.deepEqual([defaultLogin.status, defaultLogin.identity.variable], ["configured", "ANTHROPIC_FEDERATION_RULE_ID+ANTHROPIC_ORGANIZATION_ID+ANTHROPIC_PROFILE"]);
+  assert.deepEqual([defaultLogin.status, defaultLogin.identity.email, defaultLogin.identity.variable],
+    ["signed-in", "me@example.com", "ANTHROPIC_FEDERATION_RULE_ID+ANTHROPIC_ORGANIZATION_ID+ANTHROPIC_PROFILE"]);
   // A login stored in the directory signs the account in.
   logins.set(context.workHome, signedIn("work@example.com"));
   await accounts.refresh(work.id);
@@ -1021,21 +1037,61 @@ test("a default login that uses a credential variable is not refused as signed o
 });
 
 test("a disabled credential switch does not stand in for the default login", async (t) => {
-  for (const [value, configured] of [["0", false], ["false", false], ["", false], ["1", true], [" TRUE ", true], ["on", true]]) {
+  for (const [value, enabled] of [["0", false], ["false", false], ["", false], ["1", true], [" TRUE ", true], ["on", true]]) {
     const context = await fixture(t, { extraEnvironment: { CLAUDE_CODE_USE_BEDROCK: value } });
     context.logins.set(context.inheritedHome, signedOut);
     context.claude();
     await tick(); await tick();
     const login = context.claude().accounts[0].login;
-    assert.equal(login.status, configured ? "configured" : "signed-out", JSON.stringify(value));
-    assert.equal(context.probe.calls.some((call) => call.executable === "claude"), !configured, "a disabled switch runs the real check");
-    if (!configured) {
+    // The CLI's own check signs an enabled provider in, and only that one.
+    assert.deepEqual([login.status, login.identity.method, login.identity.variable], enabled ? ["signed-in", "third_party", "CLAUDE_CODE_USE_BEDROCK"] : ["signed-out", "none", undefined], JSON.stringify(value));
+    assert.ok(context.probe.calls.some((call) => call.executable === "claude"), "the real check runs");
+    if (!enabled) {
       const chat = context.conversation();
       // A signed-out home is still refused for a send and a switch.
       await assert.rejects(context.accounts.assertLaunchable({ provider: "claude", conversationId: chat.id }), (error) => error.details.code === "PROVIDER_ACCOUNT_SIGNED_OUT");
       await assert.rejects(context.accounts.activate({ provider: "claude", accountId: "claude:default" }), (error) => error.details.code === "PROVIDER_ACCOUNT_SWITCH_FAILED");
     }
   }
+});
+
+test("an endpoint or selector alone keys the default login but never signs a signed-out one in", async (t) => {
+  const cases = [["claude", "ANTHROPIC_BASE_URL", "https://gateway.example"], ["claude", "ANTHROPIC_PROFILE", "profile-name"], ["codex", "OPENAI_BASE_URL", "https://gateway.example"]];
+  for (const [provider, variable, value] of cases) {
+    const context = await fixture(t, { extraEnvironment: { [variable]: value } });
+    const { accounts, database, logins, probe, root } = context;
+    const listed = () => accounts.list().providers.find((item) => item.provider === provider).accounts;
+    if (provider === "claude") logins.set(context.inheritedHome, signedOut);
+    const workHome = path.join(root, `${provider}-work`);
+    mkdirSync(workHome);
+    logins.set(workHome, provider === "claude" ? signedIn("work@example.com") : "Logged in using ChatGPT");
+    await accounts.add({ provider, label: "Work", homePath: workHome });
+    const work = listed().find((account) => account.label === "Work");
+    await accounts.activate({ provider, accountId: work.id });
+    // The default login's check runs with the variable and finds no login.
+    await assert.rejects(accounts.activate({ provider, accountId: `${provider}:default` }), (error) => error.details.code === "PROVIDER_ACCOUNT_SWITCH_FAILED", variable);
+    assert.equal(database.activeProviderAccountId(provider), work.id, "the selection is kept");
+    const check = probe.calls.find((call) => call.executable === provider && call.environment[provider === "claude" ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME"] !== keyOf(workHome) && call.environment[variable]);
+    assert.equal(check?.environment[variable], value, `${variable}: the CLI checks the login it launches with`);
+    assert.equal(listed()[0].login.status, "signed-out", variable);
+    // The variable still partitions the default login's sessions and usage.
+    const chat = database.createConversation({ projectId: "p", worktreeId: root, worktreePath: root, title: provider, provider });
+    database.selectProviderAccount(provider, `${provider}:default`);
+    const home = provider === "claude" ? keyOf(context.inheritedHome) : accounts.resolve({ provider, conversationId: chat.id }).home.split(":").slice(1).join(":");
+    assert.equal(accounts.resolve({ provider, conversationId: chat.id }).home, `${variable}:${home}`, variable);
+    await assert.rejects(accounts.assertLaunchable({ provider, conversationId: chat.id }), (error) => error.details.code === "PROVIDER_ACCOUNT_SIGNED_OUT", variable);
+    assert.ok(!JSON.stringify(accounts.list()).includes(value), "the variable is named, never its value");
+  }
+
+  // A signed-in home with an endpoint set is that home's login under the endpoint's key.
+  const context = await fixture(t, { extraEnvironment: { ANTHROPIC_BASE_URL: "https://gateway.example" } });
+  context.claude();
+  await tick(); await tick();
+  const login = context.claude().accounts[0].login;
+  assert.deepEqual([login.status, login.identity.email, login.identity.variable], ["signed-in", "me@example.com", "ANTHROPIC_BASE_URL"]);
+  const chat = context.conversation();
+  assert.equal(context.accounts.resolve({ provider: "claude", conversationId: chat.id }).home, `ANTHROPIC_BASE_URL:${keyOf(context.inheritedHome)}`);
+  assert.equal((await context.accounts.assertLaunchable({ provider: "claude", conversationId: chat.id })).identity, "me@example.com");
 });
 
 test("every Claude Code provider switch is a credential source, and a login key names each one set", async (t) => {
@@ -1060,8 +1116,8 @@ test("every Claude Code provider switch is a credential source, and a login key 
   context.claude();
   await tick(); await tick();
   const login = context.claude().accounts[0].login;
-  assert.deepEqual([login.status, login.identity.variable], ["configured", "CLAUDE_CODE_USE_FOUNDRY"]);
-  assert.ok(!context.probe.calls.some((call) => call.executable === "claude"), "the home's status command does not run");
+  assert.deepEqual([login.status, login.identity.method, login.identity.variable], ["signed-in", "third_party", "CLAUDE_CODE_USE_FOUNDRY"]);
+  assert.equal(context.probe.calls.find((call) => call.executable === "claude").environment.CLAUDE_CODE_USE_FOUNDRY, "1", "the CLI checks the login it launches with");
   assert.equal((await context.accounts.assertLaunchable({ provider: "claude", conversationId: context.conversation().id })).identity, "CLAUDE_CODE_USE_FOUNDRY");
 
   // Enabling a switch the CLI prefers over a key already set changes the source.

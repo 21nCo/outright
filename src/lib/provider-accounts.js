@@ -20,7 +20,7 @@ export function loginText(login, formatTime = defaultTime) {
 
 function loginStatusText(login) {
   const identity = login.identity ?? {};
-  const details = [identity.email, identity.organization, identity.plan, identity.method].filter(Boolean);
+  const details = [identity.email, identity.organization, identity.plan, identity.method, identity.variable && `uses ${identity.variable}`].filter(Boolean);
   if (login.status === "signed-in") return details.length ? `Signed in · ${details.join(" · ")}` : "Signed in";
   if (login.status === "signed-out") return "Signed out";
   if (login.status === "configured") return identity.variable ? `Uses ${identity.variable} from the environment` : "Credential configured";

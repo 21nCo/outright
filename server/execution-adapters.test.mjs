@@ -828,7 +828,8 @@ test("harness logins are read from each CLI's status without credentials", () =>
   assert.deepEqual([claude.accounts.homeVariable, codex.accounts.homeVariable, anthropic.accounts], ["CLAUDE_CONFIG_DIR", "CODEX_HOME", null]);
   assert.deepEqual([claude.accounts.standardHome, codex.accounts.standardHome], [".claude", ".codex"]);
   const accounts = { homeVariable: "FIXTURE_HOME", standardHome: ".fixture", identityArgs: ["status"], parseIdentity: () => null, credentialVariables: ["FIXTURE_*", "OTHER_TOKEN"],
-    nonCredentialVariables: ["FIXTURE_MODEL", "FIXTURE_USE_TOOL"], credentialSwitches: ["FIXTURE_USE_*"], inertCredentials: ["FIXTURE_IGNORED"] };
+    nonCredentialVariables: ["FIXTURE_MODEL", "FIXTURE_USE_TOOL"], credentialSwitches: ["FIXTURE_USE_*"], inertCredentials: ["FIXTURE_IGNORED"],
+    unreportedCredentials: ["FIXTURE_TOKEN", "FIXTURE_IGNORED", "FIXTURE_MODEL"] };
   const fixture = defineAdapter(harnessSpec({ accounts })).accounts;
   assert.equal(fixture.homeVariable, "FIXTURE_HOME");
   assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, homeVariable: "OUTRIGHT_HOME" } })), /accounts must name/);
@@ -840,7 +841,7 @@ test("harness logins are read from each CLI's status without credentials", () =>
   for (const credentialVariables of [undefined, [], ["OUTRIGHT_*"], ["fixture_*"], ["FIXTURE_(.*)"]]) {
     assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialVariables } })), /accounts must name/, String(credentialVariables));
   }
-  for (const field of ["nonCredentialVariables", "credentialSwitches", "inertCredentials"]) {
+  for (const field of ["nonCredentialVariables", "credentialSwitches", "inertCredentials", "unreportedCredentials"]) {
     assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, [field]: undefined } })), /accounts must name/, field);
   }
   // A source is any name its rules match, except the home variable and the
@@ -849,6 +850,8 @@ test("harness logins are read from each CLI's status without credentials", () =>
     [true, true, true, false, false, false, true]);
   assert.deepEqual([fixture.overridesLogin("FIXTURE_IGNORED"), fixture.overridesLogin("FIXTURE_TOKEN")], [false, true]);
   assert.deepEqual(["FIXTURE_USE_CLOUD", "FIXTURE_USE_TOOL", "FIXTURE_TOKEN"].map(fixture.isCredentialSwitch), [true, false, false]);
+  // Only a source that stands in for the login can count as one unchecked.
+  assert.deepEqual(["FIXTURE_TOKEN", "FIXTURE_NEW_SOURCE", "FIXTURE_IGNORED", "FIXTURE_MODEL"].map(fixture.isUnreported), [true, false, false, false]);
   // Claude Code 2.1.303's own sources, including those it reads for
   // profiles, federation and gateways; model and tool choices are not.
   const claudeSources = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID",
@@ -863,6 +866,10 @@ test("harness logins are read from each CLI's status without credentials", () =>
   assert.deepEqual(["CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE", "OPENAI_API_KEY", "CODEX_HOME", "CODEX_SANDBOX"]
     .map(codex.accounts.isCredential), [true, true, true, true, true, false, false]);
   assert.deepEqual([codex.accounts.overridesLogin("OPENAI_API_KEY"), codex.accounts.overridesLogin("CODEX_ACCESS_TOKEN")], [false, true]);
+  // Claude Code's status command reports every source that signs it in;
+  // `codex login status` reports neither of Codex's keys from the environment.
+  assert.deepEqual(claudeSources.filter(claude.accounts.isUnreported), []);
+  assert.deepEqual(["CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BASE_URL", "OPENAI_FEDERATION_RULE_ID"].map(codex.accounts.isUnreported), [true, true, false, false]);
 });
 
 test("an account's home reaches only its own launch, and only under its own variable", () => {

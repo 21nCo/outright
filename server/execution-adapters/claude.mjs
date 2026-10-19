@@ -59,14 +59,18 @@ export const claudeAdapter = defineAdapter({
   // endpoint, from every ANTHROPIC_* variable (keys, tokens, profiles,
   // federation, organization, base URLs) and the CLAUDE_CODE_* families
   // below, so each is a source. The exceptions choose models, betas or
-  // logging, or a tool rather than a provider.
+  // logging, or a tool rather than a provider. Claude Code 2.1.304's
+  // `auth status` reports each source that signs it in (a key as api_key,
+  // a token as oauth_token, an enabled provider switch as third_party) and
+  // an endpoint, profile or federation selector alone as signed out, so no
+  // source counts as a login without that check.
   accounts: { homeVariable: "CLAUDE_CONFIG_DIR", standardHome: ".claude", identityArgs: ["auth", "status", "--json"], parseIdentity,
     credentialVariables: ["ANTHROPIC_*", "CLAUDE_CODE_USE_*", "CLAUDE_CODE_OAUTH_*", "CLAUDE_CODE_API_KEY_*", "CLAUDE_CODE_GATEWAY_*", "CLAUDE_CODE_HOST_*",
       "CLAUDE_CODE_FEDERATION_*", "CLAUDE_CODE_SDK_HAS_*", "CLAUDE_CODE_CLIENT_KEY*", "CLAUDE_CODE_ACCOUNT_*", "CLAUDE_CODE_ORGANIZATION_*",
       "CLAUDE_CODE_SESSION_ACCESS_TOKEN", "CLAUDE_CODE_WEBSOCKET_AUTH_*", "CLAUDE_CODE_CUSTOM_OAUTH_URL"],
     nonCredentialVariables: ["ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_*", "ANTHROPIC_CUSTOM_MODEL_OPTION*", "ANTHROPIC_BETAS", "ANTHROPIC_LOG",
       "CLAUDE_CODE_USE_NATIVE_FILE_SEARCH", "CLAUDE_CODE_USE_POWERSHELL_TOOL", "CLAUDE_CODE_USE_COWORK_PLUGINS", "CLAUDE_CODE_USE_CCR_V2"],
-    credentialSwitches: ["CLAUDE_CODE_USE_*"], inertCredentials: [] },
+    credentialSwitches: ["CLAUDE_CODE_USE_*"], inertCredentials: [], unreportedCredentials: [] },
   // What Claude Code 2.1.296 resolves each alias to. Another release
   // answering for an alias is reported, not assumed equivalent.
   modelAliases: { haiku: ["claude-haiku-5-5"], sonnet: ["claude-sonnet-5-5"], opus: ["claude-opus-5-5"] },

@@ -288,15 +288,18 @@ test("an identity check's abort and timeout leave no descendant of its CLI runni
   const saved = process.env.PATH;
   process.env.PATH = `${directory}${path.delimiter}${saved}`;
   const environment = { ...process.env, CLAUDE_CONFIG_DIR: path.join(directory, "work") };
+  // The helper must be seen running well before the probe's own deadline,
+  // or a slow start would let the timeout reap it unobserved.
+  const readinessMs = 4_000;
   try {
     for (const mode of ["abort", "timeout"]) {
       rmSync(pidFile, { force: true });
       const controller = new AbortController();
       let pid = 0;
       try {
-        const pending = defaultProbe("claude", { signal: controller.signal, args: ["auth", "status", "--json"], environment, exitCodes: [0, 1], timeoutMs: mode === "timeout" ? 4_000 : 15_000 });
+        const pending = defaultProbe("claude", { signal: controller.signal, args: ["auth", "status", "--json"], environment, exitCodes: [0, 1], timeoutMs: mode === "timeout" ? readinessMs * 2 : readinessMs * 4 });
         pending.catch(() => {});
-        const readyUntil = Date.now() + 4_000;
+        const readyUntil = Date.now() + readinessMs;
         while (!pid && Date.now() < readyUntil) {
           await new Promise((resolve) => setTimeout(resolve, 20));
           pid = existsSync(pidFile) ? Number(readFileSync(pidFile, "utf8")) : 0;
