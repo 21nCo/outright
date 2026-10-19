@@ -1,0 +1,25 @@
+docs/out-28-provider-accounts.md
+  s_18023774558565::t_298a8d4de03c46 15,61
+server/agent-manager.mjs
+  s_18023774558565::t_db68061a8d2974 486
+server/provider-accounts.mjs
+  s_18023774558565::t_3e667c1f8a8b7e 122-132,134-136,139-142,157-162,164-170,174,176,222-223,486-487,536-540
+server/provider-accounts.test.mjs
+  s_18023774558565::t_dddf65f67338b7 375-392,1233-1269
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "879045eb7f4e0f278976f4ecf3664adf412da833",
+  "prompts": {},
+  "sessions": {
+    "s_18023774558565": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_18023774558565",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
