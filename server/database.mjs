@@ -521,6 +521,19 @@ export function createOutrightDatabase(options = {}) {
     }).immediate();
   }
 
+  // Within a caller's transaction: only a queued run takes an account.
+  function bindRunAccount(runId, account) {
+    if (account.id !== defaultProviderAccountId(account.provider) && !db.prepare("SELECT 1 FROM provider_accounts WHERE id = ?").get(account.id)) {
+      throw databaseError(409, `The ${account.label} account was removed before this run launched`, { code: "PROVIDER_ACCOUNT_UNAVAILABLE" });
+    }
+    const bound = db.prepare(`INSERT INTO run_accounts (run_id, account_id, account_label, account_identity, bound_at, home_path)
+      SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'queued')
+      ON CONFLICT(run_id) DO UPDATE SET account_id = excluded.account_id, account_label = excluded.account_label,
+        account_identity = excluded.account_identity, bound_at = excluded.bound_at, home_path = excluded.home_path`)
+      .run(runId, account.id, account.label, account.identity ?? null, now(), account.home ?? null, runId);
+    if (!bound.changes) throw databaseError(409, "Only a queued run can be bound to an account", { code: "RUN_ACCOUNT_IMMUTABLE" });
+  }
+
   function beginTerminalAuditScan() {
     // All SQLite work belongs to the tick. A retry timer must never throw
     // synchronously out of a process-level callback on a storage fault.
@@ -1956,14 +1969,18 @@ export function createOutrightDatabase(options = {}) {
       }
       return result;
     },
-    updateRun(id, patch) {
+    // `account` binds the run's account (bindRunAccount) in the same
+    // transaction as the patch, so the launch marker and the account record
+    // commit together or not at all.
+    updateRun(id, patch, { account = null } = {}) {
       const { criticalFields, criticalValues, optionalFields, optionalValues } = runPatchAssignments(patch);
       const criticalUpdate = () => { if (criticalFields.length) db.prepare(`UPDATE runs SET ${criticalFields.join(", ")} WHERE id = ?`).run(...criticalValues, id); };
       const optionalUpdate = () => { if (optionalFields.length) withinRetainedBudget(() => db.prepare(`UPDATE runs SET ${optionalFields.join(", ")} WHERE id = ?`).run(...optionalValues, id)); };
       // A mixed update commits its state even if optional usage telemetry is
       // refused. Usage alone reports the quota error to its caller.
-      if (criticalFields.length && optionalFields.length) {
+      if (account || (criticalFields.length && optionalFields.length)) {
         db.transaction(() => {
+          if (account) bindRunAccount(id, account);
           criticalUpdate();
           try { optionalUpdate(); }
           catch (error) { if (error.statusCode !== 507) throw error; }
@@ -2295,22 +2312,13 @@ export function createOutrightDatabase(options = {}) {
         return accountId;
       }).immediate();
     },
-    // Recorded immediately before the launch marker, with the CLI home the
-    // launch uses. A run whose admission was deferred is still queued and may
-    // be bound again; once it leaves the queue its account never changes. An
-    // added account removed since it was resolved fails the launch here.
+    // Recorded with the launch marker (updateRun's `account`), with the CLI
+    // home the launch uses. A run whose admission was deferred is still
+    // queued and may be bound again; once it leaves the queue its account
+    // never changes. An added account removed since it was resolved fails
+    // the launch here.
     bindRunAccount(runId, account) {
-      return db.transaction(() => {
-        if (account.id !== defaultProviderAccountId(account.provider) && !db.prepare("SELECT 1 FROM provider_accounts WHERE id = ?").get(account.id)) {
-          throw databaseError(409, `The ${account.label} account was removed before this run launched`, { code: "PROVIDER_ACCOUNT_UNAVAILABLE" });
-        }
-        const bound = db.prepare(`INSERT INTO run_accounts (run_id, account_id, account_label, account_identity, bound_at, home_path)
-          SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'queued')
-          ON CONFLICT(run_id) DO UPDATE SET account_id = excluded.account_id, account_label = excluded.account_label,
-            account_identity = excluded.account_identity, bound_at = excluded.bound_at, home_path = excluded.home_path`)
-          .run(runId, account.id, account.label, account.identity ?? null, now(), account.home ?? null, runId);
-        if (!bound.changes) throw databaseError(409, "Only a queued run can be bound to an account", { code: "RUN_ACCOUNT_IMMUTABLE" });
-      }).immediate();
+      return db.transaction(() => bindRunAccount(runId, account)).immediate();
     },
     // The account a session belongs to, so resuming it keeps that account:
     // the latest run that launched in it. A session created only by runs from

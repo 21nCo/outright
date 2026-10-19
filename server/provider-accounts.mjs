@@ -139,10 +139,20 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     return canonicalHome(home || standardHome(adapter));
   }
 
+  // A relative home variable names a different directory in each worktree
+  // a run starts in, so the default login it selects cannot be checked or
+  // keyed. The variable is named, never its value.
+  function relativeHomeError(adapter) {
+    const value = adapter.accounts ? inheritedHome(adapter) : null;
+    if (!value || path.isAbsolute(value)) return null;
+    return `${adapter.accounts.homeVariable} is a relative path, which each run would resolve in its own worktree. Set it to an absolute directory and restart Outright.`;
+  }
+
   // The default login's key: its home variable's directory, or the standard
-  // home's when the variable is unset.
+  // home's when the variable is unset. None while the variable is relative.
   function defaultHome(adapter) {
-    return adapter.accounts ? homeKey(adapter, inheritedHome(adapter)) : null;
+    if (!adapter.accounts || relativeHomeError(adapter)) return null;
+    return homeKey(adapter, inheritedHome(adapter));
   }
 
   // An added account whose directory the environment now selects for the
@@ -187,6 +197,8 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       return detected.available ? { status: "configured", identity: null, error: null } : { status: "unavailable", identity: null, error: detected.reason };
     }
     if (!adapter.accounts) return { status: "unknown", identity: null, error: `${adapter.label} does not report its login` };
+    const relative = account.homePath ? null : relativeHomeError(adapter);
+    if (relative) return { status: "unknown", identity: null, error: relative };
     // The CLI's status command reports only the home's login, which such a
     // variable replaces; the variable is named, never its value.
     const variable = account.homePath ? null : environmentCredential(adapter);
@@ -417,6 +429,8 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
           : `The ${adapter.label} account this chat's session belongs to was removed. Clear the session in chat settings to continue with the active account.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
     }
     if (!owner && sameAsDefault(account, adapter)) throw duplicateOfDefault(account, adapter);
+    const relative = account.isDefault ? relativeHomeError(adapter) : null;
+    if (relative) throw accountError(409, relative, "PROVIDER_ACCOUNT_UNAVAILABLE");
     const home = accountHome(account, adapter);
     // A session or recovery continues only in the home key it launched with,
     // for every account: the default login follows the environment, and an
@@ -454,7 +468,17 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     activate,
     resolve,
     assertLaunchable,
-    bindRun(runId, account) { database.bindRunAccount(runId, account); },
+    // The last check before a launch spawns: the account resolved for it
+    // (resolve) still leads to the home key it was resolved with. A removed
+    // account is refused when the launch is recorded.
+    confirmLaunch(account) {
+      const current = findAccount(account.id);
+      if (!current) return;
+      const home = accountHome(current, adapterFor(account.provider));
+      if (home !== account.home) {
+        throw accountError(409, `${account.label}'s directory changed while this run was launching: it led to ${account.home} and now leads to ${home}, so the run did not start.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
+      }
+    },
     // Windows are filed under the account and home the run launched with.
     recordLimits(account, runId, windows) {
       if (!windows?.length) return;

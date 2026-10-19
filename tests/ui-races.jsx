@@ -4642,6 +4642,29 @@ async function backgroundCompletionKeepsExplicitPageRegression() {
   await until(() => !host.querySelector('.history-return') && host.querySelector('[data-message-id="pending-999"]'), "explicit latest page committed");
 }
 
+async function queuedRunAccountRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const queued = { id: "run-queued", conversationId: "chat-A", provider: "codex", status: "queued", createdAt: new Date(0).toISOString(), accountId: null, accountLabel: null, accountIdentity: null };
+  let detailReads = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") { detailReads += 1; return response({ ...chats.A, runs: [queued] }); }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  const header = () => host.querySelector(".conversation-header .conversation-meta small")?.textContent ?? "";
+  await until(() => header().startsWith("queued"), "the queued run is shown");
+  assert(!header().includes("Work"), "a queued run has no account yet");
+  const reads = detailReads;
+  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-queued",
+    payload: { type: "run.started", payload: { provider: "codex", account: { id: "account-work", label: "Work", identity: "work@example.com" } } } }) }));
+  await until(() => header().includes("Work (work@example.com)"), "the started run names its account before it ends");
+  assert(detailReads === reads, "the account is applied without reloading the conversation");
+  root.render(null); await settle();
+}
+
 async function checkpointReadingPageRegression() {
   root.render(null); await settle();
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
@@ -5978,6 +6001,7 @@ try {
     ["provider accounts window aging", providerAccountsWindowAgingRegression, "an open account list drops a run that leaves the 5-hour window without any event"],
     ["provider accounts failed reload", providerAccountsFailedReloadRegression, "a failed reload marks an expired measured total out of date, and account changes reload without the runtime event"],
     ["provider accounts add keeps newer draft", providerAccountsAddKeepsNewerDraftRegression, "a successful add clears only the draft it submitted"],
+    ["queued run account", queuedRunAccountRegression, "a run queued without an account names the account its launch reports before it ends"],
     ["settings capacity and deletion order", settingsCapacityAndDeletionOrderRegression, "new capacity wins reordered responses and deletion owns its confirmation"],
     ["settings template completion", settingsTemplateCompletionRegression, "a successful template POST clears its submitted draft after reopening"],
     ["notification permission rejection", rejectedNotificationPermissionRegression, "a rejected permission request does not disrupt Settings save or escape as an unhandled rejection"],

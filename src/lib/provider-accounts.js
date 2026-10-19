@@ -113,6 +113,17 @@ export function runAccountText(run) {
   return run.accountIdentity ? `${run.accountLabel} (${run.accountIdentity})` : run.accountLabel;
 }
 
+// A run queued before it had an account gets the one its launch reports
+// (run.started), so it is named before the run ends.
+export function withStartedRunAccount(runs, runId, account) {
+  if (!Array.isArray(runs) || typeof account?.label !== "string" || !account.label) return runs;
+  const index = runs.findIndex((run) => run.id === runId);
+  if (index === -1 || runs[index].accountId === account.id) return runs;
+  const next = [...runs];
+  next[index] = { ...runs[index], accountId: account.id ?? null, accountLabel: account.label, accountIdentity: account.identity ?? null };
+  return next;
+}
+
 // An answer carries its run's account, so every page of history names it.
 // A loaded run is the fallback for an answer written without one.
 export function answerAccountText(message, runAccounts) {

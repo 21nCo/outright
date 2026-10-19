@@ -29,7 +29,7 @@ import { api, connectRuntime, query } from "@/lib/runtime-api";
 import { scheduleLayoutTick } from "@/lib/windowing";
 import { foldFindText } from "@/lib/find-text";
 import { modelMismatch, providerOptionLabel, providerReady, providerStatusText, providerSwitchProblem } from "@/lib/providers";
-import { answerAccountText, runAccountText } from "@/lib/provider-accounts";
+import { answerAccountText, runAccountText, withStartedRunAccount } from "@/lib/provider-accounts";
 import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, messagePrecedesPage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "@/recovery-policy";
 import { createTerminalCommandFence } from "@/lib/terminal-command-fence";
 
@@ -502,6 +502,10 @@ export function App() {
         return;
       }
       pendingConversationLoadRef.current = null;
+      // A launch reported while this snapshot was read names its account.
+      for (const event of pendingLoad.events) {
+        if (event.type === "run.event" && event.payload?.type === "run.started") nextConversation.runs = withStartedRunAccount(nextConversation.runs, event.runId, event.payload.payload?.account);
+      }
       setPendingOutcomeRunIds((current) => {
         const settled = (nextConversation.runs ?? []).filter((run) => !ACTIVE_RUN_STATUSES.has(run.status) && current.has(run.id));
         if (!settled.length) return current;
@@ -802,6 +806,13 @@ export function App() {
         applyStreamingText((current) => streamingTextAfterRuntimeEvent(current, event), true);
       }
       if (runEvent.type.startsWith("tool.") && ownsLiveOutput) setRunEvents((current) => [...current, runEvent].slice(-20));
+      if (runEvent.type === "run.started" && runEvent.payload?.account) {
+        setConversation((current) => {
+          if (current?.id !== event.conversationId) return current;
+          const runs = withStartedRunAccount(current.runs, event.runId, runEvent.payload.account);
+          return runs === current.runs ? current : { ...current, runs };
+        });
+      }
       if (["run.completed", "run.failed", "run.stopped"].includes(runEvent.type)) {
         if (acceptedPreviewRunRef.current === event.runId) acceptedPreviewRunRef.current = null;
         if (liveDeltaEventsRef.current.runId === event.runId) liveDeltaEventsRef.current = emptyLiveDeltaEvents();

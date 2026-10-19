@@ -1035,3 +1035,84 @@ test("a login checked long ago is checked again when listed or launched, and sho
   await tick(); await tick();
   assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id }).identity, "third@example.com");
 });
+
+test("an account's directory redirected while its launch is prepared starts nothing under the other login", async (t) => {
+  let duringLaunch = null;
+  const context = await fixture(t, { launchCommand: () => duringLaunch?.() });
+  const { accounts, database, manager, root, spawned, workHome } = context;
+  const work = await addWork(context);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  const elsewhere = path.join(root, "elsewhere");
+  const moved = path.join(root, "work-moved");
+  mkdirSync(elsewhere);
+  const chat = context.conversation();
+  const first = context.claudeRun(chat.id);
+  await manager.schedule({ conversation: chat, run: first });
+  await context.finish(0, "session-1");
+  // Work's directory leads elsewhere only while the launch command is built.
+  const redirect = () => { duringLaunch = null; renameSync(workHome, moved); symlinkSync(elsewhere, workHome); };
+  const restore = () => { rmSync(workHome); renameSync(moved, workHome); };
+  const refused = (run) => {
+    assert.equal(spawned.length, 1, "nothing launched under the other login");
+    assert.equal(database.getRun(run.id).status, "failed");
+    assert.match(database.getRun(run.id).error, new RegExp(`changed while this run was launching.*${elsewhere}`));
+    assert.equal(database.getRun(run.id).accountId, null);
+  };
+
+  duringLaunch = redirect;
+  const resumed = context.claudeRun(chat.id);
+  await manager.schedule({ conversation: database.getConversation(chat.id), run: resumed });
+  refused(resumed);
+  restore();
+
+  database.updateRun(first.id, { status: "interrupted" });
+  const recovery = database.beginInterruptedRunRecovery(first.id, "retry");
+  duringLaunch = redirect;
+  await manager.schedule({ conversation: database.getConversation(chat.id), run: recovery.run, forceFreshSession: true });
+  refused(recovery.run);
+  restore();
+  assert.equal(context.claude().accounts.find((account) => account.id === work.id).measured[1].runs, 1, "only the launched run is counted");
+});
+
+test("a run whose launch marker is refused records no account", async (t) => {
+  const context = await fixture(t);
+  const { accounts, database, manager, root, spawned } = context;
+  const work = await addWork(context);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  const writer = new Database(path.join(root, "outright.db"));
+  writer.exec("CREATE TRIGGER refuse_launch BEFORE UPDATE OF status ON runs WHEN NEW.status = 'launching' BEGIN SELECT RAISE(ABORT, 'simulated storage fault'); END");
+  writer.close();
+  const chat = context.conversation();
+  const run = context.claudeRun(chat.id);
+  await manager.schedule({ conversation: chat, run });
+  assert.equal(spawned.length, 0);
+  assert.equal(database.getRun(run.id).status, "failed");
+  assert.equal(database.getRun(run.id).accountId, null, "a run that never launched has no account record");
+  assert.equal(context.claude().accounts.find((account) => account.id === work.id).measured[1].runs, 0);
+  database.updateRun(run.id, { status: "interrupted" });
+  assert.equal(accountPin(database.getRun(run.id)), null, "and no account to pin a recovery to");
+});
+
+test("a relative home variable leaves the default login unusable instead of keying it by the runtime's directory", async (t) => {
+  const context = await fixture(t);
+  const { database, probe, workHome } = context;
+  const relative = createProviderAccounts({ database, probe, environment: { PATH: process.env.PATH, CLAUDE_CONFIG_DIR: "relative-claude-home" } });
+  t.after(() => relative.close());
+  const claude = () => relative.list().providers.find((provider) => provider.provider === "claude");
+  claude();
+  await relative.refresh("claude:default");
+  const login = claude().accounts[0].login;
+  assert.equal(login.status, "unknown");
+  assert.match(login.error, /CLAUDE_CONFIG_DIR is a relative path/);
+  assert.ok(!login.error.includes("relative-claude-home"), "the variable's value is never shown");
+  assert.ok(!probe.calls.some((call) => call.executable === "claude" && call.environment.CLAUDE_CONFIG_DIR === "relative-claude-home"), "no check of a directory no launch uses");
+  const chat = context.conversation();
+  await assert.rejects(relative.assertLaunchable({ provider: "claude", conversationId: chat.id }),
+    (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && /CLAUDE_CONFIG_DIR is a relative path/.test(error.message));
+  await assert.rejects(relative.activate({ provider: "claude", accountId: "claude:default" }), (error) => error.details.code === "PROVIDER_ACCOUNT_SWITCH_FAILED");
+  // An added account names its own absolute directory and still launches.
+  await relative.add({ provider: "claude", label: "Work", homePath: workHome });
+  const work = claude().accounts.find((account) => account.label === "Work");
+  await relative.activate({ provider: "claude", accountId: work.id });
+  assert.equal((await relative.assertLaunchable({ provider: "claude", conversationId: chat.id })).home, workHome);
+});

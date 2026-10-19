@@ -466,23 +466,26 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     const command = buildProviderCommand(conversation, run);
     const launch = await launchCommand(command, run, resolvedLaunchDirectory);
     if (state.stopped || shuttingDown) return;
+    // No await follows: the account's directory must still lead to the home
+    // it was resolved with, which the spawn below uses.
+    if (state.account) accounts.confirmLaunch(state.account);
     const admission = preflightAgentAdmission(state, authorize);
     if (admission) return admission;
     const startedAt = new Date().toISOString();
-    // The account is recorded before the launch marker, so a launched run
-    // always names the account its provider ran with. An account removed
-    // since it was resolved fails the run here, before anything spawns.
-    if (state.account) accounts.bindRun(run.id, state.account);
     // Crash-safe launch handshake, phase 1: this durable marker means "a spawn
     // may have been issued, but the provider was never authorized to run". A
     // crash from here on restarts as a run that provably never started side
     // effects (the wrapper records its identity durably but waits for
     // authorization), so recovery always has an explicit safe continuation
     // instead of being permanently gated on a missing pid.
-    database.updateRun(run.id, { status: "launching", startedAt });
+    // The account commits with the marker, so a launched run always names
+    // the account its provider ran with and a run that never launched has
+    // none. An account removed since it was resolved fails the run here,
+    // before anything spawns.
+    database.updateRun(run.id, { status: "launching", startedAt }, state.account ? { account: state.account } : undefined);
     database.auditCritical("agent.run.started", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath, approvalPolicy: run.approvalPolicy });
     emit(run.id, "run.started", { provider: run.provider, model: run.model, startedAt, command: launch.display ?? command.display,
-      ...(state.account ? { account: { id: state.account.id, label: state.account.label } } : {}) });
+      ...(state.account ? { account: { id: state.account.id, label: state.account.label, identity: state.account.identity ?? null } } : {}) });
 
     const child = spawnProcess(launch.executable, launch.args, {
       cwd: conversation.worktreePath,
