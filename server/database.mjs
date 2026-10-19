@@ -2874,6 +2874,7 @@ function migrate(db, onSpacesMigrationStep) {
       account_id TEXT NOT NULL, home_path TEXT, bound_at TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL
     );
     CREATE INDEX IF NOT EXISTS deleted_run_usage_window ON deleted_run_usage(account_id, bound_at);
+    CREATE INDEX IF NOT EXISTS deleted_run_usage_expiry ON deleted_run_usage(bound_at);
     CREATE TRIGGER IF NOT EXISTS deleted_run_usage_keep BEFORE DELETE ON runs BEGIN
       DELETE FROM deleted_run_usage WHERE bound_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days');
       INSERT INTO deleted_run_usage SELECT account.account_id, account.home_path, account.bound_at, OLD.input_tokens, OLD.output_tokens, OLD.cost_usd

@@ -1293,6 +1293,30 @@ test("deleting an archived chat removes its runs' account records and their reta
   assert.equal(database.measuredAccountUsage("claude:default", "1970-01-01T00:00:00.000Z", `ANTHROPIC_API_KEY:${root}`).runs, 0);
 });
 
+test("each run deletion prunes expired deleted-run usage by an index, not a scan", async (t) => {
+  const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-accounts-prune-")));
+  const filename = path.join(root, "outright.db");
+  const database = createOutrightDatabase({ filename });
+  t.after(async () => { await database.close(); rmSync(root, { recursive: true, force: true }); });
+  const chat = database.createConversation({ projectId: "p", worktreeId: root, worktreePath: root, title: "Chat", provider: "claude" });
+  const run = database.createRun({ conversationId: chat.id, provider: "claude", approvalPolicy: "read-only", prompt: "hello" });
+  const raw = new Database(filename);
+  t.after(() => raw.close());
+  // Archive cleanup deletes runs in batches on the runtime connection, and
+  // the trigger prunes once per deleted run.
+  const trigger = raw.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'deleted_run_usage_keep'").get().sql;
+  const prune = trigger.match(/DELETE FROM deleted_run_usage[^;]*/)[0];
+  const plan = raw.prepare(`EXPLAIN QUERY PLAN ${prune}`).all().map((step) => step.detail);
+  assert.ok(plan.some((detail) => /deleted_run_usage USING (COVERING )?INDEX/.test(detail)), plan.join("; "));
+  assert.ok(!plan.some((detail) => /^SCAN deleted_run_usage/.test(detail)), plan.join("; "));
+
+  const insert = raw.prepare("INSERT INTO deleted_run_usage (account_id, home_path, bound_at, input_tokens, output_tokens, cost_usd) VALUES (?, ?, ?, 1, 1, NULL)");
+  insert.run("claude:default", root, new Date(Date.now() - 8 * 86_400_000).toISOString());
+  insert.run("claude:default", root, new Date(Date.now() - 86_400_000).toISOString());
+  raw.prepare("DELETE FROM runs WHERE id = ?").run(run.id);
+  assert.equal(raw.prepare("SELECT COUNT(*) AS count FROM deleted_run_usage").get().count, 1, "only the expired row is pruned");
+});
+
 test("a login checked before its account's directory led elsewhere is never shown, recorded or trusted", async (t) => {
   const context = await fixture(t);
   const { accounts, database, logins, manager, root, spawned, workHome } = context;
