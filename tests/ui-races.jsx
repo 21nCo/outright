@@ -4758,37 +4758,56 @@ async function queuedRunAccountRegression() {
   root.render(null); await settle();
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
   const queued = { id: "run-queued", conversationId: "chat-A", provider: "codex", status: "queued", createdAt: new Date(0).toISOString(), accountId: null, accountLabel: null, accountIdentity: null };
+  const launched = { ...queued, accountId: "account-work", accountLabel: "Work", accountIdentity: "work@example.com" };
+  let detail = { ...chats.A, runs: [queued] };
   let detailReads = 0;
   route = async (url) => {
     if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
     if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
-    if (url.pathname === "/api/conversations/chat-A") { detailReads += 1; return response({ ...chats.A, runs: [queued] }); }
+    if (url.pathname === "/api/conversations/chat-A") { detailReads += 1; return response(detail); }
     return response({});
   };
   root.render(<TooltipProvider><App /></TooltipProvider>);
-  const header = () => host.querySelector(".conversation-header .conversation-meta small")?.textContent ?? "";
-  await until(() => header().startsWith("queued"), "the queued run is shown");
-  assert(!header().includes("Work") && !host.querySelector(".message.is-streaming .message-run"), "a queued run has no account yet");
+  const summary = () => host.querySelector(".conversation-header .conversation-meta small:not(.conversation-account)")?.textContent ?? "";
+  const account = () => host.querySelector(".conversation-header .conversation-account");
+  await until(() => summary().startsWith("queued"), "the queued run is shown");
+  assert(!account(), "a queued run has no account yet");
   const reads = detailReads;
-  fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId: "chat-A", runId: "run-queued",
-    payload: { type: "run.started", payload: { provider: "codex", account: { id: "account-work", label: "Work", identity: "work@example.com" } } } }) }));
-  await until(() => header().includes("Work (work@example.com)"), "the started run names its account before it ends");
+  const send = (data) => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(data) }));
+  send({ type: "run.event", conversationId: "chat-A", runId: "run-queued",
+    payload: { type: "run.started", payload: { provider: "codex", account: { id: "account-work", label: "Work", identity: "work@example.com" } } } });
+  await until(() => account()?.textContent === "codex · Work (work@example.com)", "the started run names its account before it ends");
   assert(detailReads === reads, "the account is applied without reloading the conversation");
-  // The header summary is hidden at 920px and below; the running run still
-  // names its account, visibly and to assistive technology, before any answer.
-  const running = () => host.querySelector(".message.is-streaming .message-run");
+  // The run summary is hidden at 920px and below; the latest run's account
+  // stays visible and exposed while history is read and after a run that
+  // gave no answer.
+  const visible = (state) => {
+    const bounds = account()?.getBoundingClientRect();
+    assert(account()?.checkVisibility() && bounds.width > 0 && bounds.height > 0, `the run's account is not visible at 900px ${state}`);
+    assert(account().textContent === "codex · Work (work@example.com)", `the header names another account ${state}: ${account()?.textContent}`);
+  };
   if (window.__fixtureSetViewport) {
     try {
       await window.__fixtureSetViewport(900);
       await until(() => window.innerWidth === 900, "real 900px layout");
       window.dispatchEvent(new Event("resize"));
       await settle();
-      assert(!host.querySelector(".conversation-header .conversation-meta small")?.checkVisibility(), "the header run summary is hidden at 900px");
-      const bounds = running()?.getBoundingClientRect();
-      assert(running()?.checkVisibility() && bounds.width > 0 && bounds.height > 0, "the running run's account is not visible at 900px");
-      assert(running().textContent === "codex · Work (work@example.com)", `the running run names another account: ${running()?.textContent}`);
+      assert(!host.querySelector(".conversation-header .conversation-meta small:not(.conversation-account)")?.checkVisibility(), "the header run summary is hidden at 900px");
+      visible("while it runs");
+      const earlier = { id: "earlier-1", role: "assistant", kind: "text", body: "Earlier answer", payload: {}, createdAt: new Date(0).toISOString() };
+      detail = { ...chats.A, runs: [{ ...launched, status: "running" }], messages: [earlier],
+        messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 2, total: 3, beforeId: earlier.id } };
+      send({ type: "runtime.connected", payload: { replay: { missed: true } } });
+      await until(() => host.querySelector(".history-forward") && !host.querySelector(".message.is-streaming"), "earlier history is read during the run");
+      visible("while earlier history is read");
+      detail = { ...chats.A, runs: [{ ...launched, status: "completed" }], messages: [] };
+      send({ type: "run.event", conversationId: "chat-A", runId: "run-queued", payload: { type: "run.completed", payload: {} } });
+      await until(() => host.querySelector(".history-return"), "the reader can return to the latest messages");
+      host.querySelector(".history-return").click();
+      await until(() => !host.querySelector(".history-forward") && !host.querySelector(".message.is-streaming") && host.querySelector(".conversation-header .conversation-meta small:not(.conversation-account)")?.textContent.startsWith("completed"), "the run ends with no answer");
+      visible("after a run with no answer");
     } finally { await window.__fixtureSetViewport(1280); }
-  } else assert(running()?.textContent === "codex · Work (work@example.com)", "the running run names its account");
+  } else assert(account()?.textContent === "codex · Work (work@example.com)", "the running run names its account");
   root.render(null); await settle();
 }
 
@@ -6130,7 +6149,7 @@ try {
     ["provider accounts add keeps newer draft", providerAccountsAddKeepsNewerDraftRegression, "a successful add clears only the draft it submitted"],
     ["provider accounts response order", providerAccountsResponseOrderRegression, "a delayed account action response never replaces a listing computed after it"],
     ["provider accounts switch focus", providerAccountsSwitchFocusRegression, "a switch moves focus only from its own Use button"],
-    ["queued run account", queuedRunAccountRegression, "a run queued without an account names the account its launch reports before it ends, also on narrow screens"],
+    ["queued run account", queuedRunAccountRegression, "a run queued without an account names the account its launch reports before it ends, at every width, while history is read and with no answer"],
     ["settings capacity and deletion order", settingsCapacityAndDeletionOrderRegression, "new capacity wins reordered responses and deletion owns its confirmation"],
     ["settings template completion", settingsTemplateCompletionRegression, "a successful template POST clears its submitted draft after reopening"],
     ["notification permission rejection", rejectedNotificationPermissionRegression, "a rejected permission request does not disrupt Settings save or escape as an unhandled rejection"],

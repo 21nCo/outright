@@ -15,8 +15,8 @@ import { defaultProbe } from "./provider-discovery.mjs";
 // has an implicit default account: whatever home the runtime's environment
 // selects, or a direct provider's own credential variable.
 //
-// A run resolves its account once, at launch, and records it with the CLI
-// home it used. Resuming a session keeps the account that created it, and a
+// A run resolves its account once, at launch, and records it with the login
+// it used (loginKey). Resuming a session keeps the account that created it, and a
 // recovery keeps the account of the run it continues; any other launch uses
 // the provider's active account. Nothing falls back to another account.
 const LABEL_CHARACTERS = 80;
@@ -200,6 +200,19 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     return account.homePath ? homeKey(adapter, account.homePath) : defaultHome(adapter);
   }
 
+  // The login a launch uses: its home key and, when a variable stands in for
+  // the home's login (environmentCredential), that variable's name, never its
+  // value, as `NAME:<home key>`. A run, recovery pin, identity check,
+  // measured usage and limit window are all keyed by it, so a session never
+  // continues under another credential source. A login from its home keeps
+  // the bare home key, as runs recorded before sources were. A home key is
+  // absolute, so it never starts with a variable name and a colon.
+  function loginKey(account, adapter) {
+    const home = accountHome(account, adapter);
+    const variable = home !== null && !account.homePath ? environmentCredential(adapter) : null;
+    return variable ? `${variable}:${home}` : home;
+  }
+
   function defaultAccount(adapter) {
     return { id: defaultProviderAccountId(adapter.id), provider: adapter.id, homePath: null, isDefault: true,
       label: adapter.kind === "harness" ? "Default login" : adapter.authority.variable };
@@ -211,6 +224,19 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     if (adapter) return defaultAccount(adapter);
     const stored = database.getProviderAccount(accountId);
     return stored && adapters.some((candidate) => candidate.id === stored.provider) ? { ...stored, isDefault: false } : null;
+  }
+
+  function parseLogin(key) {
+    const match = /^([A-Z][A-Z0-9_]*):(.*)$/s.exec(key ?? "");
+    return match ? { source: match[1], home: match[2] } : { source: null, home: key };
+  }
+
+  // A check's result describes the login it was made under; once the
+  // account's login key changes (its directory leads elsewhere, or the
+  // default's credential source changed) the result is not this login's.
+  function checkedLogin(account, key) {
+    const checked = identities.get(account.id);
+    return checked?.key === key ? checked.result : null;
   }
 
   async function probeIdentity(account, adapter) {
@@ -274,11 +300,12 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
       const check = checkQueue.shift();
       check.started = true;
       try {
+        const key = loginKey(check.account, check.adapter);
         const result = { ...await probeIdentity(check.account, check.adapter), checkedAt: new Date(clock()).toISOString() };
         // A removed account's late result is dropped.
         if (findAccount(check.account.id)) {
-          if (JSON.stringify(identities.get(check.account.id)) !== JSON.stringify(result)) notify();
-          identities.set(check.account.id, result);
+          if (JSON.stringify(identities.get(check.account.id)) !== JSON.stringify({ key, result })) notify();
+          identities.set(check.account.id, { key, result });
         }
         check.settle.resolve(result);
       } catch (error) {
@@ -290,24 +317,25 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     checking = false;
   }
 
-  // An unchecked login, or one checked too long ago, is checked in the
-  // background; the listing shows when the result it has was checked.
-  function recheckIfOld(account) {
+  // An unchecked login, one checked under another key, or one checked too
+  // long ago is checked in the background; the listing shows when the result
+  // it has was checked.
+  function recheckIfOld(account, key) {
     if (closing.signal.aborted) return;
-    const checkedAt = Date.parse(identities.get(account.id)?.checkedAt);
+    const checkedAt = Date.parse(checkedLogin(account, key)?.checkedAt);
     if (pendingChecks.has(account.id) || clock() - checkedAt <= IDENTITY_RECHECK_MS) return;
     void checkIdentity(account, { background: true }).catch(() => {});
   }
 
-  function identitySummary(account) {
-    const identity = identities.get(account.id)?.identity;
+  function identitySummary(account, key) {
+    const identity = checkedLogin(account, key)?.identity;
     return identity?.email ?? identity?.variable ?? identity?.method ?? null;
   }
 
   function presentAccount(account, adapter, activeId, now) {
-    const checked = identities.get(account.id);
-    const home = accountHome(account, adapter);
-    recheckIfOld(account);
+    const home = loginKey(account, adapter);
+    const checked = checkedLogin(account, home);
+    recheckIfOld(account, home);
     return {
       id: account.id,
       label: account.label,
@@ -466,8 +494,8 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
 
   // The account a launch uses. `pin` (see accountPin) holds a recovery to
   // the account of the run it continues; otherwise a resumed session keeps
-  // the account of the run that last launched in it. `home` is the key (homeKey)
-  // of the CLI home the launch uses, recorded with the run.
+  // the account of the run that last launched in it. `home` is the login key
+  // (loginKey) the launch uses, recorded with the run.
   function resolve({ provider, conversationId, sessionId = null, pin = null }) {
     const adapter = adapterFor(provider);
     const owner = pin ?? database.sessionAccount(conversationId, provider, sessionId);
@@ -485,28 +513,35 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     if (!owner && sameAsDefault(account, adapter)) throw duplicateOfDefault(account, adapter);
     const unusable = account.isDefault ? homeVariableError(adapter) : null;
     if (unusable) throw accountError(409, unusable, "PROVIDER_ACCOUNT_UNAVAILABLE");
-    const home = accountHome(account, adapter);
-    // A session or recovery continues only in the home key it launched with,
-    // for every account: the default login follows the environment, and an
-    // added account's directory can be replaced by a link elsewhere. A run
-    // from before accounts recorded no home and is taken to have used the
-    // current default. Keys compare as recorded: a directory whose contents
-    // were swapped in place keeps its key.
+    const home = loginKey(account, adapter);
+    // A session or recovery continues only with the login key it launched
+    // with, for every account: the default login follows the environment,
+    // and an added account's directory can be replaced by a link elsewhere.
+    // A run from before accounts recorded no home and is taken to have used
+    // the current default. Keys compare as recorded: a directory whose
+    // contents were swapped in place, or a credential variable given another
+    // value, keeps its key.
     if (owner && owner.home !== undefined && owner.home !== home) {
       const subject = owner.recovery ? "This interrupted run" : "This chat's session";
-      throw accountError(409, account.isDefault
-        ? `${subject} used the ${adapter.label} default login in ${owner.home}, but the default login now uses ${home}. Point ${adapter.accounts?.homeVariable ?? "it"} or the CLI's standard directory there again, or ${remedy}.`
-        : `${subject} used ${account.label} in ${owner.home}, but its directory ${account.homePath} now leads to ${home}. Restore its directory, or ${remedy}.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
+      const [was, now] = [parseLogin(owner.home), parseLogin(home)];
+      const source = (login) => login.source ?? "the login in its directory";
+      throw accountError(409, was.home !== now.home
+        ? account.isDefault
+          ? `${subject} used the ${adapter.label} default login in ${was.home}, but the default login now uses ${now.home}. Point ${adapter.accounts?.homeVariable ?? "it"} or the CLI's standard directory there again, or ${remedy}.`
+          : `${subject} used ${account.label} in ${was.home}, but its directory ${account.homePath} now leads to ${now.home}. Restore its directory, or ${remedy}.`
+        : `${subject} used the ${adapter.label} default login with ${source(was)}, but it now launches with ${source(now)}. Restore the environment it used and restart Outright, or ${remedy}.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
     }
-    recheckIfOld(account);
-    return { id: account.id, provider: account.provider, label: account.label, homePath: account.homePath, home, identity: identitySummary(account) };
+    recheckIfOld(account, home);
+    return { id: account.id, provider: account.provider, label: account.label, homePath: account.homePath, home, identity: identitySummary(account, home) };
   }
 
   // Before a message or run is written: the account must exist and must not
-  // be known to be signed out. A cached sign-out is checked again first.
+  // be known to be signed out. A cached sign-out, or a result checked under
+  // another login key, is checked again first.
   async function assertLaunchable(target) {
     const account = resolve(target);
-    if (identities.get(account.id)?.status !== "signed-out") return account;
+    const checked = identities.get(account.id);
+    if (!checked || (checked.key === account.home && checked.result.status !== "signed-out")) return account;
     const result = await checkIdentity(account);
     if (result.status === "signed-out") {
       throw accountError(409, `${account.label} is signed out. Sign in, refresh it in Settings, then send again.`, "PROVIDER_ACCOUNT_SIGNED_OUT");
@@ -523,14 +558,14 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     resolve,
     assertLaunchable,
     // The last check before a launch spawns: the account resolved for it
-    // (resolve) still leads to the home key it was resolved with. A removed
+    // (resolve) still has the login key it was resolved with. A removed
     // account is refused when the launch is recorded.
     confirmLaunch(account) {
       const current = findAccount(account.id);
       if (!current) return;
-      const home = accountHome(current, adapterFor(account.provider));
+      const home = loginKey(current, adapterFor(account.provider));
       if (home !== account.home) {
-        throw accountError(409, `${account.label}'s directory changed while this run was launching: it led to ${account.home} and now leads to ${home}, so the run did not start.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
+        throw accountError(409, `${account.label}'s directory changed while this run was launching: it led to ${parseLogin(account.home).home} and now leads to ${parseLogin(home).home}, so the run did not start.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
       }
     },
     // A run's account was recorded with its launch, so that account's
@@ -538,7 +573,7 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     launched() {
       notify();
     },
-    // Windows are filed under the account and home the run launched with.
+    // Windows are filed under the account and login key the run launched with.
     recordLimits(account, runId, windows) {
       if (!windows?.length) return;
       try { database.recordProviderLimits({ accountId: account.id, provider: account.provider, home: account.home ?? null }, runId, windows, new Date(clock()).toISOString()); }

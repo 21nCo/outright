@@ -68,8 +68,10 @@ const RETAINED_COLUMNS = [
   ["run_account_pins", "run_id, account_id, home_path, home_known"],
 ];
 const RUN_RETAINED_FIELDS = RETAINED_COLUMNS.find(([name]) => name === "runs")[1];
-// The account a run launched with, and the key of the CLI home it used
-// (null for a direct provider). A run that never launched has none. A recovery run
+// The account a run launched with, and the login key it used: the key of
+// its CLI home, prefixed by the name of a credential variable that stood in
+// for the home's login (null for a direct provider). A run that never
+// launched has none. A recovery run
 // is pinned to the account of the run it continues until it launches; a
 // pin to a run from before accounts does not know that run's home.
 const RUN_ACCOUNT_FIELDS = `account.account_id AS accountId, account.account_label AS accountLabel, account.account_identity AS accountIdentity,
@@ -2289,6 +2291,7 @@ export function createOutrightDatabase(options = {}) {
           throw databaseError(409, "Switch to another account before removing the active one", { code: "PROVIDER_ACCOUNT_ACTIVE" });
         }
         db.prepare("DELETE FROM provider_limit_windows WHERE account_id = ?").run(id);
+        db.prepare("DELETE FROM deleted_run_usage WHERE account_id = ?").run(id);
         db.prepare("DELETE FROM provider_accounts WHERE id = ?").run(id);
         writeCriticalAudit("provider-account.removed", { target: id, provider: account.provider });
         return true;
@@ -2362,17 +2365,20 @@ export function createOutrightDatabase(options = {}) {
       return db.prepare(`SELECT window_name AS window, utilization, status, resets_at AS resetsAt, observed_at AS observedAt, run_id AS runId
         FROM provider_limit_windows WHERE account_id = ? AND home_path = ? ORDER BY window_name`).all(accountId, home ?? "");
     },
-    // What Outright measured for runs launched with an account since a time.
+    // What Outright measured for runs launched with an account since a time,
+    // including runs whose chat was deleted since (deleted_run_usage).
     // Runs without reported cost or tokens are counted, so a sum is never
     // mistaken for a complete total; a sum nothing reported is null.
     // The oldest counted launch says when the window next loses a run.
     measuredAccountUsage(accountId, since, home = null) {
-      return db.prepare(`SELECT COUNT(*) AS runs, SUM(runs.input_tokens) AS inputTokens, SUM(runs.output_tokens) AS outputTokens,
-        COALESCE(SUM(runs.input_tokens IS NULL AND runs.output_tokens IS NULL), 0) AS runsWithoutTokens,
-        COALESCE(SUM((runs.input_tokens IS NULL) <> (runs.output_tokens IS NULL)), 0) AS runsWithPartialTokens,
-        SUM(runs.cost_usd) AS costUsd, COALESCE(SUM(runs.cost_usd IS NULL), 0) AS runsWithoutCost, MIN(account.bound_at) AS oldestBoundAt
-        FROM run_accounts AS account JOIN runs ON runs.id = account.run_id
-        WHERE account.account_id = ? AND account.home_path IS ? AND account.bound_at >= ?`).get(accountId, home, since);
+      return db.prepare(`SELECT COUNT(*) AS runs, SUM(input_tokens) AS inputTokens, SUM(output_tokens) AS outputTokens,
+        COALESCE(SUM(input_tokens IS NULL AND output_tokens IS NULL), 0) AS runsWithoutTokens,
+        COALESCE(SUM((input_tokens IS NULL) <> (output_tokens IS NULL)), 0) AS runsWithPartialTokens,
+        SUM(cost_usd) AS costUsd, COALESCE(SUM(cost_usd IS NULL), 0) AS runsWithoutCost, MIN(bound_at) AS oldestBoundAt
+        FROM (SELECT account.bound_at, runs.input_tokens, runs.output_tokens, runs.cost_usd FROM run_accounts AS account JOIN runs ON runs.id = account.run_id
+            WHERE account.account_id = @accountId AND account.home_path IS @home AND account.bound_at >= @since
+          UNION ALL SELECT bound_at, input_tokens, output_tokens, cost_usd FROM deleted_run_usage
+            WHERE account_id = @accountId AND home_path IS @home AND bound_at >= @since)`).get({ accountId, home, since });
     },
     search(query, limit = 40) {
       if (typeof query !== "string" || !query.trim() || Buffer.byteLength(query) > SEARCH_QUERY_BYTES) {
@@ -2860,27 +2866,20 @@ function migrate(db, onSpacesMigrationStep) {
       run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, account_id TEXT NOT NULL, home_path TEXT,
       home_known INTEGER NOT NULL DEFAULT 1
     );
+    -- A deleted run keeps counting in its account's measured usage until it
+    -- leaves the longest period (7 days). Rows hold no content and are not
+    -- charged to the retained budget, so deleting history is never refused
+    -- for lack of space; at most a week of deleted launches is kept.
+    CREATE TABLE IF NOT EXISTS deleted_run_usage (
+      account_id TEXT NOT NULL, home_path TEXT, bound_at TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL
+    );
+    CREATE INDEX IF NOT EXISTS deleted_run_usage_window ON deleted_run_usage(account_id, bound_at);
+    CREATE TRIGGER IF NOT EXISTS deleted_run_usage_keep BEFORE DELETE ON runs BEGIN
+      DELETE FROM deleted_run_usage WHERE bound_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days');
+      INSERT INTO deleted_run_usage SELECT account.account_id, account.home_path, account.bound_at, OLD.input_tokens, OLD.output_tokens, OLD.cost_usd
+        FROM run_accounts AS account WHERE account.run_id = OLD.id AND account.bound_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days');
+    END;
   `);
-  // Account tables written before launch homes were recorded. Limit windows
-  // were once keyed by account alone; they are rebuilt keyed by home too.
-  if (!db.pragma("table_info(run_accounts)").some((column) => column.name === "home_path")) db.exec("ALTER TABLE run_accounts ADD COLUMN home_path TEXT");
-  const limitColumns = db.pragma("table_info(provider_limit_windows)");
-  if (!limitColumns.some((column) => column.name === "home_path" && column.pk)) {
-    const home = limitColumns.some((column) => column.name === "home_path") ? "COALESCE(home_path, '')" : "''";
-    db.transaction(() => {
-      db.exec(`CREATE TABLE provider_limit_windows_keyed (
-          account_id TEXT NOT NULL, provider TEXT NOT NULL, window_name TEXT NOT NULL, utilization REAL, status TEXT, resets_at TEXT,
-          observed_at TEXT NOT NULL, run_id TEXT, home_path TEXT NOT NULL DEFAULT '', PRIMARY KEY (account_id, home_path, window_name)
-        );
-        INSERT OR IGNORE INTO provider_limit_windows_keyed SELECT account_id, provider, window_name, utilization, status, resets_at, observed_at, run_id, ${home}
-          FROM provider_limit_windows;
-        DROP TABLE provider_limit_windows;
-        ALTER TABLE provider_limit_windows_keyed RENAME TO provider_limit_windows;`);
-    })();
-  }
-  if (!db.pragma("table_info(run_account_pins)").some((column) => column.name === "home_known")) {
-    db.exec("ALTER TABLE run_account_pins ADD COLUMN home_known INTEGER NOT NULL DEFAULT 1");
-  }
   db.prepare("INSERT OR IGNORE INTO audit_retention_cursor (id) VALUES (1)").run();
   prepareAuditEvidence(db, hadAudit);
   if (!db.pragma("table_info(audit_retention_cursor)").some((column) => column.name === "sweep_upper")) {

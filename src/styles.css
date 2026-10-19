@@ -255,6 +255,7 @@ button, input, textarea, select { font: inherit; }
 .conversation-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
 .conversation-meta span { padding: 2px 7px; border-radius: 999px; color: var(--foreground); background: var(--muted); font-size: 9px; font-weight: 650; }
 .conversation-meta small { color: var(--muted-foreground); font-size: 9px; }
+.conversation-meta .conversation-account { max-width: min(260px, 38vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .message-scroll { min-height: 0; height: 100%; overflow: hidden; }
 .message-scroll [data-slot="scroll-area-viewport"] { height: 100%; overflow-y: auto; }
@@ -319,7 +320,7 @@ button, input, textarea, select { font: inherit; }
 @media (max-width: 920px) {
   .app-shell { grid-template-columns: 292px minmax(0,1fr); min-width: 0; }
   /* The settings button stays: it is the keyboard entry to the conversation's provider and model. */
-  .conversation-meta small { display: none; }
+  .conversation-meta small:not(.conversation-account) { display: none; }
 }
 
 @media (max-width: 760px) {

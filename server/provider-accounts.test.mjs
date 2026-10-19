@@ -1002,25 +1002,6 @@ test("a disabled credential switch does not stand in for the default login", asy
   }
 });
 
-test("limit windows stored before homes were keyed are kept by home", async (t) => {
-  const root = mkdtempSync(path.join(os.tmpdir(), "outright-limit-keys-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const filename = path.join(root, "outright.db");
-  createOutrightDatabase({ filename }).close();
-  const raw = new Database(filename);
-  raw.exec(`DROP TABLE provider_limit_windows;
-    CREATE TABLE provider_limit_windows (account_id TEXT NOT NULL, provider TEXT NOT NULL, window_name TEXT NOT NULL, utilization REAL, status TEXT, resets_at TEXT,
-      observed_at TEXT NOT NULL, run_id TEXT, home_path TEXT, PRIMARY KEY (account_id, window_name));
-    INSERT INTO provider_limit_windows VALUES ('claude:default', 'claude', 'five_hour', 0.5, 'allowed', NULL, '2026-10-19T10:00:00.000Z', 'run-1', NULL);`);
-  raw.close();
-  const database = createOutrightDatabase({ filename });
-  t.after(() => database.close());
-  assert.equal(database.listProviderLimits("claude:default", null)[0].utilization, 0.5);
-  database.recordProviderLimits({ accountId: "claude:default", provider: "claude", home: "/other" }, "run-2", [{ window: "five_hour", utilization: 0.2, status: "allowed", resetsAt: null }]);
-  assert.equal(database.listProviderLimits("claude:default", null)[0].utilization, 0.5);
-  assert.equal(database.listProviderLimits("claude:default", "/other")[0].utilization, 0.2);
-});
-
 test("on a case-insensitive volume another spelling of the default home is the same login", async (t) => {
   const context = await fixture(t);
   const { database, probe, root, workHome } = context;
@@ -1267,7 +1248,7 @@ test("a home variable whose .. follows a link leaves the default login unusable,
   assert.ok(probe.calls.some((call) => call.environment.CLAUDE_CONFIG_DIR === plainValue), "its login is checked");
 });
 
-test("deleting an archived chat removes its runs' account records and their retained bytes", async (t) => {
+test("deleting an archived chat removes its runs' account records and their retained bytes, and keeps a week of their usage", async (t) => {
   const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-accounts-archive-")));
   const filename = path.join(root, "outright.db");
   const database = createOutrightDatabase({ filename });
@@ -1283,14 +1264,19 @@ test("deleting an archived chat removes its runs' account records and their reta
     const launched = database.createRun({ conversationId: chat.id, provider: "claude", approvalPolicy: "read-only", prompt: "hello" });
     const account = withAccounts ? { account: { id: "claude:default", provider: "claude", label: "Default login", identity: "me@example.com", home: root } } : undefined;
     database.updateRun(launched.id, { status: "running", startedAt: new Date().toISOString() }, account);
-    database.updateRun(launched.id, { status: "completed" });
+    database.updateRun(launched.id, { status: "completed", inputTokens: 100, outputTokens: 20, costUsd: 0.5 });
+    // Launched before the longest measured period: not counted, not kept.
+    const old = database.createRun({ conversationId: chat.id, provider: "claude", approvalPolicy: "read-only", prompt: "old" });
+    database.updateRun(old.id, { status: "running", startedAt: new Date().toISOString() }, account);
+    database.updateRun(old.id, { status: "completed", inputTokens: 7, outputTokens: 7 });
     const pinned = database.createRun({ conversationId: chat.id, provider: "claude", approvalPolicy: "read-only", prompt: "again" });
     database.updateRun(pinned.id, { status: "failed" });
     if (withAccounts) {
       const writer = new Database(filename);
+      writer.prepare("UPDATE run_accounts SET bound_at = ? WHERE run_id = ?").run(new Date(Date.now() - 8 * 86_400_000).toISOString(), old.id);
       writer.prepare("INSERT INTO run_account_pins (run_id, account_id, home_path, home_known) VALUES (?, ?, ?, 1)").run(pinned.id, "claude:default", root);
       writer.close();
-      assert.equal(records(), 2);
+      assert.equal(records(), 3);
     }
     database.updateConversation(chat.id, { archived: true });
     await database.deleteArchivedConversation(chat.id, chat.id);
@@ -1299,6 +1285,95 @@ test("deleting an archived chat removes its runs' account records and their reta
   const withoutAccounts = await cycle(false);
   const withAccounts = await cycle(true);
   assert.equal(records(), 0, "the records go with their runs");
-  assert.equal(database.measuredAccountUsage("claude:default", "1970-01-01T00:00:00.000Z", root).runs, 0);
   assert.equal(withAccounts, withoutAccounts, "their retained bytes are released with them");
+  // The deleted run still counts in its rolling windows, under its login key.
+  const usage = database.measuredAccountUsage("claude:default", new Date(Date.now() - 7 * 86_400_000).toISOString(), root);
+  assert.deepEqual([usage.runs, usage.inputTokens, usage.outputTokens, usage.costUsd, usage.runsWithoutCost], [1, 100, 20, 0.5, 0]);
+  assert.equal(database.measuredAccountUsage("claude:default", "1970-01-01T00:00:00.000Z", root).runs, 1, "a launch older than a week is not kept");
+  assert.equal(database.measuredAccountUsage("claude:default", "1970-01-01T00:00:00.000Z", `ANTHROPIC_API_KEY:${root}`).runs, 0);
+});
+
+test("a login checked before its account's directory led elsewhere is never shown, recorded or trusted", async (t) => {
+  const context = await fixture(t);
+  const { accounts, database, logins, manager, root, spawned, workHome } = context;
+  const work = await addWork(context);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  const listed = () => context.claude().accounts.find((account) => account.id === work.id);
+  assert.equal(listed().login.identity.email, "work@example.com");
+
+  // In the same runtime, Work's directory now leads to a signed-out home.
+  const elsewhere = path.join(root, "elsewhere");
+  mkdirSync(elsewhere);
+  renameSync(workHome, path.join(root, "work-moved"));
+  symlinkSync(elsewhere, workHome);
+  logins.set(workHome, signedOut);
+  assert.deepEqual([listed().login.status, listed().login.identity], ["checking", null], "the earlier login is not shown against the new directory");
+  const chat = context.conversation();
+  assert.equal(accounts.resolve({ provider: "claude", conversationId: chat.id }).identity, null, "nor recorded with a launch");
+  await assert.rejects(accounts.assertLaunchable({ provider: "claude", conversationId: chat.id }), (error) => error.details.code === "PROVIDER_ACCOUNT_SIGNED_OUT");
+
+  // Signed in there as someone else, the run records that login.
+  logins.set(workHome, signedIn("other@example.com"));
+  assert.equal((await accounts.assertLaunchable({ provider: "claude", conversationId: chat.id })).identity, "other@example.com");
+  const run = context.claudeRun(chat.id);
+  await manager.schedule({ conversation: chat, run });
+  assert.deepEqual([database.getRun(run.id).accountIdentity, database.getRun(run.id).accountHome], ["other@example.com", elsewhere]);
+  assert.equal(listed().login.identity.email, "other@example.com");
+  await context.finish(spawned.length - 1);
+});
+
+test("a session or recovery never continues under another credential source, and each source keeps its own usage", async (t) => {
+  const context = await fixture(t);
+  const { database, logins, probe, root } = context;
+  const codexHome = path.join(root, "codex-home");
+  mkdirSync(codexHome);
+  logins.set(codexHome, "Logged in using ChatGPT");
+  const runtime = (variables = {}) => {
+    const accounts = createProviderAccounts({ database, probe, environment: { ...context.environment, CODEX_HOME: codexHome, ...variables } });
+    t.after(() => accounts.close());
+    return accounts;
+  };
+  for (const [provider, variable, home] of [["claude", "ANTHROPIC_API_KEY", context.inheritedHome], ["codex", "CODEX_API_KEY", codexHome]]) {
+    const chat = database.createConversation({ projectId: "p", worktreeId: root, worktreePath: root, title: provider, provider });
+    const launch = (accounts, sessionId, utilization) => {
+      const account = accounts.resolve({ provider, conversationId: chat.id });
+      const run = database.createRun({ conversationId: chat.id, provider, approvalPolicy: "read-only", prompt: "hello" });
+      database.updateRun(run.id, { status: "running", startedAt: new Date().toISOString() }, { account });
+      database.updateRun(run.id, { status: "interrupted", providerSessionId: sessionId });
+      accounts.recordLimits(account, run.id, [{ window: "five_hour", utilization, status: "allowed", resetsAt: null }]);
+      return database.getRun(run.id);
+    };
+    const defaultLogin = (accounts) => accounts.list().providers.find((item) => item.provider === provider).accounts[0];
+    // Codex reports no limit windows.
+    const usage = (accounts) => [defaultLogin(accounts).measured[1].runs, defaultLogin(accounts).limits?.[0]?.utilization ?? null];
+    const reported = (utilization) => (provider === "claude" ? utilization : null);
+    const refused = (accounts, target, was, now) => assert.throws(() => accounts.resolve({ provider, conversationId: chat.id, ...target }),
+      (error) => error.details.code === "PROVIDER_ACCOUNT_UNAVAILABLE" && error.message.includes(`with ${was}, but it now launches with ${now}`)
+        && !error.message.includes("secret"));
+
+    const fromHome = runtime();
+    const homeRun = launch(fromHome, `${provider}-home`, 0.4);
+    assert.equal(homeRun.accountHome, home, "a login from its home keeps the bare home key");
+    const homePin = accountPin(database.beginInterruptedRunRecovery(homeRun.id, "retry").run);
+
+    // Restarted with a variable that replaces the home's login.
+    const fromVariable = runtime({ [variable]: "secret" });
+    refused(fromVariable, { sessionId: `${provider}-home` }, "the login in its directory", variable);
+    refused(fromVariable, { pin: homePin }, "the login in its directory", variable);
+    assert.deepEqual(usage(fromVariable), [0, null], "another source's runs and windows are not this login's");
+    const variableRun = launch(fromVariable, `${provider}-variable`, 0.7);
+    assert.equal(variableRun.accountHome, `${variable}:${home}`);
+    const variablePin = accountPin(database.beginInterruptedRunRecovery(variableRun.id, "retry").run);
+    assert.deepEqual(usage(fromVariable), [1, reported(0.7)]);
+
+    // And the reverse; restoring the source restores its sessions and usage.
+    const restored = runtime();
+    refused(restored, { sessionId: `${provider}-variable` }, variable, "the login in its directory");
+    refused(restored, { pin: variablePin }, variable, "the login in its directory");
+    assert.equal(restored.resolve({ provider, conversationId: chat.id, sessionId: `${provider}-home` }).home, home);
+    assert.equal(restored.resolve({ provider, conversationId: chat.id, pin: homePin }).home, home);
+    assert.deepEqual(usage(restored), [1, reported(0.4)]);
+    assert.equal(runtime({ [variable]: "another-secret" }).resolve({ provider, conversationId: chat.id, sessionId: `${provider}-variable` }).home, `${variable}:${home}`,
+      "another value of the same variable cannot be told apart");
+  }
 });
