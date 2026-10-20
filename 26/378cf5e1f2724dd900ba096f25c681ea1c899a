@@ -1,0 +1,19 @@
+server/terminal-broker.test.mjs
+  s_1900bb15a7199a::t_58012c3957e07e 4,264-268,275,279-285,301,306-307,310,326
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "26378cf5e1f2724dd900ba096f25c681ea1c899a",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
