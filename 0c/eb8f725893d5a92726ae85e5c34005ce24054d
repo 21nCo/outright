@@ -1,0 +1,33 @@
+docs/out-28-provider-accounts.md
+  s_e1c5fc1a65c0cf::t_da6e1754372cf4 36
+server/agent-manager.mjs
+  s_e1c5fc1a65c0cf::t_3a3013ce96375e 925-928,946,949-951,955-963
+server/provider-accounts.mjs
+  s_e1c5fc1a65c0cf::t_0fc60b94539e9c 638-646,648-650,658-660
+server/provider-accounts.test.mjs
+  s_1900bb15a7199a::t_a6197cc4fe3a59 284-361
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0ceb8f725893d5a92726ae85e5c34005ce24054d",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_e1c5fc1a65c0cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13e18-4241-7662-a24f-782076addabe",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
