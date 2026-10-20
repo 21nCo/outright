@@ -182,7 +182,7 @@ test("Windows terminal supervisor stop empties the owned Job Object when a PTY c
   }
 });
 
-test("a slow broker reader backpressures sustained PTY output without losing its shell", async () => {
+test("a slow broker reader backpressures sustained PTY output without losing its shell", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "pty-broker-"));
   const address = process.platform === "win32"
     ? `\\\\.\\pipe\\outright-broker-test-${randomUUID()}` : path.join(directory, "broker.sock");
@@ -207,6 +207,9 @@ test("a slow broker reader backpressures sustained PTY output without losing its
   let brokerExited = false;
   let dataBytes = 0;
   let recentData = "";
+  // Only an omission notice that follows the colored burst's own output
+  // proves that burst was shed; an earlier burst's notice precedes it.
+  let coloredBurst = false;
   let omissionReset = false;
   const received = [];
   const waiters = new Set();
@@ -233,8 +236,9 @@ test("a slow broker reader backpressures sustained PTY output without losing its
         pending = pending.slice(end + 1);
         if (frame.type === "data") {
           dataBytes += Buffer.byteLength(frame.data);
-          if (frame.data.includes("[Outright:") && frame.data.startsWith("\u001b[0m\r\n")) omissionReset = true;
+          if (`${recentData}${frame.data}`.includes("OUTRIGHT_COLORED")) coloredBurst = true;
           recentData = `${recentData}${frame.data}`.slice(-128);
+          if (coloredBurst && frame.data.includes("[Outright:") && frame.data.startsWith("\u001b[0m\r\n")) omissionReset = true;
           if (recentData.includes("OUTRIGHT_BURST_DONE")) received.push("OUTRIGHT_BURST_DONE");
           if (recentData.includes("OUTRIGHT_LATER")) received.push("OUTRIGHT_LATER");
         } else received.push(frame.type);
@@ -257,8 +261,9 @@ test("a slow broker reader backpressures sustained PTY output without losing its
       cwd: directory, env: process.env, cols: 80, rows: 24 })}\n`);
     await until(() => received.includes("ready"), "PTY did not become ready");
 
-    // A full read window proves this reader has stopped pulling output, so
-    // the broker is held behind it. Resume before the burst can finish.
+    // A full read window shows this reader has stopped pulling output. The
+    // broker's own pause is asserted from its shell-exit diagnostics below.
+    // Resume before the burst can finish.
     socket.pause();
     socket.write(`${JSON.stringify({ type: "write",
       data: 'process.stdout.write("x".repeat(8*1024*1024)); console.log("OUTRIGHT_"+"BURST_DONE")\r' })}\n`);
@@ -268,13 +273,24 @@ test("a slow broker reader backpressures sustained PTY output without losing its
     await until(() => received.includes("OUTRIGHT_BURST_DONE"), "burst did not finish");
     assert.ok(dataBytes > 1024 * 1024, "the fixture did not sustain enough PTY output to backpressure the socket");
 
-    // Stay silent until the shell's whole burst has been written. It is far
-    // larger than every buffer, so the broker has shed output and is still
-    // waiting on this reader; later input cannot reach the shell mid-burst.
+    // Stay silent until the shell's whole burst has been written. 2 MiB is
+    // far larger than every socket, pipe and PTY buffer, so the broker has
+    // shed output and is still waiting on this reader; later input cannot
+    // reach the shell mid-burst. The broker tears down a reader that stays
+    // silent for its 8s stalled-reader window, so the silent span is bounded
+    // well inside it: the 2s Unix PTY hold plus a short drain on every OS.
+    const stalledReaderMs = 8000;
+    const silentBudgetMs = 6000;
     socket.pause();
+    coloredBurst = false;
+    omissionReset = false;
+    const silentSince = Date.now();
     socket.write(`${JSON.stringify({ type: "write",
-      data: 'process.stdout.write("\\u001b[31m"+"c".repeat(8*1024*1024)); require("fs").writeFileSync("burst-written", "")\r' })}\n`);
-    await until(() => existsSync(path.join(directory, "burst-written")), "shell did not finish its burst behind a silent reader");
+      data: 'process.stdout.write("\\u001b[31mOUTRIGHT_"+"COLORED"+"c".repeat(2*1024*1024)); require("fs").writeFileSync("burst-written", "")\r' })}\n`);
+    await until(() => existsSync(path.join(directory, "burst-written")),
+      `shell did not finish its burst within ${silentBudgetMs}ms of a silent reader (broker stalled-reader window ${stalledReaderMs}ms)`, silentBudgetMs);
+    const silentMs = Date.now() - silentSince;
+    t.diagnostic(`silent reader span ${silentMs}ms of the ${stalledReaderMs}ms stalled-reader window`);
     // This input arrives while the client is still silent. It must wait for
     // the same drain boundary as the output, then reach the live shell once.
     socket.write(`${JSON.stringify({ type: "write", data: 'console.log("OUTRIGHT_"+"LATER")\r' })}\n`);
@@ -296,6 +312,14 @@ test("a slow broker reader backpressures sustained PTY output without losing its
     const exitDeadline = Date.now() + 5000;
     while (!brokerExited && Date.now() < exitDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
     assert.equal(brokerExited, true, "broker process did not exit after its shell exited");
+    // The silent span pauses the broker exactly once, so a second pause shows
+    // the phase-1 burst also held it behind its socket. The later input
+    // queued behind the drain boundary instead of reaching the shell directly.
+    const counts = JSON.parse(/\{"broker":"shell-exit"[^\n]*/.exec(stderr)?.[0] ?? "null");
+    assert.ok(counts, `broker did not report its shell exit: ${stderr}`);
+    assert.ok(counts.pauses >= 2, `broker did not pause behind both slow readers: ${stderr}`);
+    assert.ok(counts.shedChars > 0, `broker did not shed output behind a silent reader: ${stderr}`);
+    assert.ok(counts.queuedInputs >= 1, `later input did not queue behind the drain boundary: ${stderr}`);
   } finally {
     socket?.destroy();
     if (broker.exitCode === null) {
