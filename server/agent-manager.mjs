@@ -4,6 +4,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync,
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildExecutionEnvironment, buildExecutionLaunch, DIRECT_PROVIDER_VARIABLES, isProviderSessionId, modelMatches, requestedModel, requireExecutionAdapter, withoutDirectProviderCredentials } from "./execution-adapters/index.mjs";
+import { accountPin } from "./provider-accounts.mjs";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
 import { RESOURCE_BUDGETS, retainedTranscriptMessageBytes } from "./resource-budgets.mjs";
 
@@ -381,7 +382,7 @@ function unresolvedOutcomeUnavailable() {
   return unavailable;
 }
 
-export function createAgentManager({ database, publish, onProvidersChanged = () => {}, onShutdownRecovery = () => {}, onDiskRetry = () => {}, providerDiscoveryFactory = createProviderDiscovery, spawnProcess = spawnExecution, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory, environment = process.env }) {
+export function createAgentManager({ database, publish, onProvidersChanged = () => {}, onShutdownRecovery = () => {}, onDiskRetry = () => {}, providerDiscoveryFactory = createProviderDiscovery, accounts = null, spawnProcess = spawnExecution, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory, environment = process.env }) {
   const resolvedLaunchDirectory = launchDirectory
     ?? database.launchDirectory;
   assertPrivateLaunchDirectory(resolvedLaunchDirectory);
@@ -465,6 +466,9 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     const command = buildProviderCommand(conversation, run);
     const launch = await launchCommand(command, run, resolvedLaunchDirectory);
     if (state.stopped || shuttingDown) return;
+    // No await follows: the account's directory must still lead to the home
+    // it was resolved with, which the spawn below uses.
+    if (state.account) accounts.confirmLaunch(state.account);
     const admission = preflightAgentAdmission(state, authorize);
     if (admission) return admission;
     const startedAt = new Date().toISOString();
@@ -474,15 +478,21 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // effects (the wrapper records its identity durably but waits for
     // authorization), so recovery always has an explicit safe continuation
     // instead of being permanently gated on a missing pid.
-    database.updateRun(run.id, { status: "launching", startedAt });
+    // The account commits with the marker, so a launched run always names
+    // the account its provider ran with and a run that never launched has
+    // none. An account removed since it was resolved fails the run here,
+    // before anything spawns.
+    database.updateRun(run.id, { status: "launching", startedAt }, state.account ? { account: state.account } : undefined);
+    if (state.account) accounts.launched();
     database.auditCritical("agent.run.started", { target: run.id, provider: run.provider, conversationId: conversation.id, worktreePath: conversation.worktreePath, approvalPolicy: run.approvalPolicy });
-    emit(run.id, "run.started", { provider: run.provider, model: run.model, startedAt, command: launch.display ?? command.display });
+    emit(run.id, "run.started", { provider: run.provider, model: run.model, startedAt, command: launch.display ?? command.display,
+      ...(state.account ? { account: { id: state.account.id, label: state.account.label, identity: state.account.identity ?? null } } : {}) });
 
     const child = spawnProcess(launch.executable, launch.args, {
       cwd: conversation.worktreePath,
       // Each adapter gets a scoped environment: direct-provider credentials
       // reach only the adapter that declares them.
-      env: buildExecutionEnvironment(run.provider, environment, sanitizedEnvironment(environment)),
+      env: buildExecutionEnvironment(run.provider, environment, sanitizedEnvironment(environment), state.account),
       // fd 3 is a manager-only launch-control channel. The provider inherits
       // stdout/stderr from its owner but never inherits this descriptor.
       stdio: ["pipe", "pipe", "pipe", "pipe"],
@@ -674,6 +684,8 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
         try { if (Object.keys(usage).length) database.updateRun(state.run.id, usage); }
         catch (error) { if (error.statusCode !== 507) throw error; }
       }
+      // Usage windows belong to the account the run launched with.
+      if (event.type === "rate_limit" && state.account) accounts.recordLimits(state.account, state.run.id, event.payload.windows);
       // A provider-reported failure explains a nonzero exit better than
       // stderr noise. Only a terminal one fails a run that exits 0.
       if (event.type === "provider.failure" && (event.payload.terminal === true || !state.providerFailed)) {
@@ -910,6 +922,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     }
     const authorize = await validateConversation(fresh);
     if (state.stopped || shuttingDown) return null;
+    // A login found signed out while the run waited is checked again, as a
+    // send is, and refuses the run before anything is written.
+    const checked = accounts ? await accounts.assertLaunchable(accountTarget(entry, fresh)) : null;
+    if (state.stopped || shuttingDown) return null;
     const current = database.getConversation(fresh.id);
     if (!current || ["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== fresh[key])
       || (entry.run.worktreePath && current.worktreePath !== entry.run.worktreePath)) {
@@ -927,10 +943,22 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // an edit made while it waited to launch outranks it.
     const recoverySession = entry.providerSessionId !== undefined || entry.forceFreshSession;
     state.sessionEpoch = recoverySession ? entry.conversation?.sessionEpoch : current.sessionEpoch;
-    if (entry.providerSessionId !== undefined) state.conversation = { ...current, providerSessionId: entry.providerSessionId };
-    else if (entry.forceFreshSession || current.provider !== entry.run.provider) state.conversation = { ...current, providerSessionId: null };
-    else state.conversation = current;
+    state.conversation = { ...current, providerSessionId: launchSessionId(entry, current) };
+    // The launch boundary: a recovery keeps its durable pin, a resumed
+    // session keeps its account, anything else uses the active one. A removed
+    // account fails the run, and so does one other than the account and
+    // login key checked above.
+    if (accounts) state.account = accounts.resolveChecked(accountTarget(entry, current), checked);
     return { authorize };
+  }
+
+  function launchSessionId(entry, conversation) {
+    if (entry.providerSessionId !== undefined) return entry.providerSessionId;
+    return entry.forceFreshSession || conversation.provider !== entry.run.provider ? null : conversation.providerSessionId;
+  }
+
+  function accountTarget(entry, conversation) {
+    return { provider: entry.run.provider, conversationId: conversation.id, sessionId: launchSessionId(entry, conversation), pin: accountPin(entry.run) };
   }
 
   async function handleQueuedLaunchError(state, error) {
@@ -1136,7 +1164,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     state.transcriptSeq = (state.transcriptSeq ?? 0) + 1;
     const toolItem = item.payload?.item ?? null;
     const payload = item.kind === "text"
-      ? { runId: state.run.id, provider: state.run.provider, truncated: Boolean(item.payload?.truncated), ...(item.payload?.substitution ? { substitution: item.payload.substitution } : {}) }
+      ? { runId: state.run.id, provider: state.run.provider, ...answerAccount(state), truncated: Boolean(item.payload?.truncated), ...(item.payload?.substitution ? { substitution: item.payload.substitution } : {}) }
       : boundedToolPayload(state.run.id, toolItem);
     const body = item.kind === "tool" ? truncateUtf8(item.body, MAX_TOOL_TRANSCRIPT_PAYLOAD_BYTES) : item.body;
     const input = budgetTranscript(state, { id: `${state.run.id}:${state.transcriptSeq}`, createdAt: new Date().toISOString(), conversationId: state.conversation.id, role: "assistant", kind: item.kind, body, payload });
@@ -1295,7 +1323,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     try {
       const message = database.addMessage({ id: `${state.run.id}:budget`, conversationId: state.conversation.id,
         role: "assistant", kind: "text", body: "Further run transcript items omitted because the retention budget was reached.",
-        payload: { runId: state.run.id, provider: state.run.provider, truncated: true } });
+        payload: { runId: state.run.id, provider: state.run.provider, ...answerAccount(state), truncated: true } });
       publish({ type: "message.created", conversationId: state.conversation.id, payload: message });
     } catch (error) { if (error.statusCode !== 507) throw error; }
   }
@@ -1573,6 +1601,7 @@ function pendingAssistantMessage(state) {
     payload: {
       runId: state.run.id,
       provider: state.run.provider,
+      ...answerAccount(state),
       truncated: state.assistantTruncated,
       ...(Number.isSafeInteger(state.lastAssistantDeltaSeq) ? { checkpointEventSeq: state.lastAssistantDeltaSeq } : {}),
     },
@@ -1610,6 +1639,12 @@ function boundUtf8(value, maxBytes) {
 }
 
 function truncateUtf8(value, maxBytes) { return boundUtf8(value, maxBytes).text; }
+
+// An answer names the account its run launched with, so any page of
+// history shows it without loading that run.
+function answerAccount(state) {
+  return state.account ? { account: { label: state.account.label, identity: state.account.identity ?? null } } : {};
+}
 
 function boundedToolPayload(runId, item) {
   const payload = { runId, item };

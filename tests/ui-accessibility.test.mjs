@@ -101,3 +101,105 @@ test("provider controls explain readiness and only offer supported choices", asy
   assert.match(settings, /id="default-provider-status" className="provider-status" role="status" aria-live="polite"/);
   assert.match(app, /aria-describedby="chat-settings-provider-status"/);
 });
+
+test("account usage keeps measured, reported, stale and unknown values distinct", async () => {
+  const { ageLimit, answerAccountText, limitText, limitWindowLabel, listingTime, loginText, measuredText, nextListingChange, runAccountText } = await import("../src/lib/provider-accounts.js");
+  const time = (value) => value.slice(11, 16);
+  const window = { window: "five_hour", utilization: 0.86, status: "allowed", resetsAt: "2026-10-19T15:00:00.000Z", observedAt: "2026-10-19T10:00:00.000Z" };
+  assert.equal(limitText({ ...window, state: "current" }, time), "86% used · resets 15:00");
+  assert.equal(limitText({ ...window, state: "stale" }, time), "86% used as of 10:00 (stale) · resets 15:00");
+  assert.equal(limitText({ ...window, utilization: null, status: null, state: "reset" }, time), "Reset 15:00; no report since");
+  assert.equal(limitText({ ...window, utilization: null, resetsAt: null, status: "rejected", state: "current" }, time), "limit reached · usage not reported · reset time not reported");
+  assert.equal(limitWindowLabel("seven_day_opus"), "7-day Opus limit");
+  assert.equal(limitWindowLabel("monthly_spend"), "monthly spend limit");
+  assert.equal(measuredText({ runs: 0, costUsd: null }), "No runs");
+  assert.equal(measuredText({ runs: 2, inputTokens: 1000, outputTokens: 234, runsWithoutTokens: 0, costUsd: 0.5, runsWithoutCost: 1 }), "2 runs · 1,234 tokens · $0.500 reported (1 without reported cost)");
+  assert.equal(measuredText({ runs: 1, inputTokens: 1, outputTokens: 1, runsWithoutTokens: 0, costUsd: null, runsWithoutCost: 1 }), "1 run · 2 tokens · cost not reported");
+  // Unreported tokens are never shown as zero, and a partial sum says so.
+  assert.equal(measuredText({ runs: 1, inputTokens: null, outputTokens: null, runsWithoutTokens: 1, costUsd: null, runsWithoutCost: 1 }), "1 run · tokens not reported · cost not reported");
+  assert.equal(measuredText({ runs: 3, inputTokens: 100, outputTokens: 20, runsWithoutTokens: 1, costUsd: null, runsWithoutCost: 3 }), "3 runs · at least 120 tokens (1 without reported tokens) · cost not reported");
+  // Runs that reported only input tokens keep them, as a lower bound.
+  assert.equal(measuredText({ runs: 2, inputTokens: 500, outputTokens: null, runsWithoutTokens: 0, runsWithPartialTokens: 2, costUsd: null, runsWithoutCost: 2 }), "2 runs · at least 500 tokens (2 with partial token counts) · cost not reported");
+  assert.equal(measuredText({ runs: 3, inputTokens: 500, outputTokens: 9, runsWithoutTokens: 1, runsWithPartialTokens: 1, costUsd: null, runsWithoutCost: 3 }), "3 runs · at least 509 tokens (1 without reported tokens, 1 with partial token counts) · cost not reported");
+
+  // An open dialog ages a listing as time passes: past its reset a window's
+  // usage is withheld, and an old report turns stale.
+  const staleAfterMs = 30 * 60_000;
+  const observed = Date.parse(window.observedAt);
+  const current = { ...window, state: "current" };
+  assert.equal(ageLimit(current, observed + 60_000, staleAfterMs).state, "current");
+  assert.deepEqual([ageLimit(current, observed + staleAfterMs + 1, staleAfterMs).state, ageLimit(current, observed + staleAfterMs + 1, staleAfterMs).utilization], ["stale", 0.86]);
+  const reset = ageLimit(current, Date.parse(window.resetsAt), staleAfterMs);
+  assert.deepEqual([reset.state, reset.utilization, reset.status], ["reset", null, null]);
+  const listing = { limitStaleAfterMs: staleAfterMs, providers: [{ accounts: [{ limits: [current], measured: [] }, { limits: null, measured: [{ changesAt: null }] }] }] };
+  assert.equal(nextListingChange(listing, observed), observed + staleAfterMs + 1);
+  assert.equal(nextListingChange(listing, observed + staleAfterMs + 1), Date.parse(window.resetsAt));
+  assert.equal(nextListingChange(listing, Date.parse(window.resetsAt)), null);
+  // A run leaving a measured window is a change too, and can come first.
+  const leaves = observed + 60_000;
+  listing.providers[0].accounts[1].measured.push({ changesAt: new Date(leaves).toISOString() });
+  assert.equal(nextListingChange(listing, observed), leaves);
+  assert.equal(nextListingChange(listing, leaves), observed + staleAfterMs + 1);
+  // Aging follows the runtime's clock, not a skewed client clock.
+  assert.equal(listingTime({ generatedAt: window.observedAt }, 5_000, 6_000), observed + 1_000);
+  assert.equal(listingTime({ providers: [] }, 5_000, 6_000), 6_000);
+  assert.equal(loginText({ status: "signed-in", identity: { email: "a@example.com", plan: "max" } }), "Signed in · a@example.com · max");
+  assert.equal(loginText({ status: "unknown", error: "Codex login status could not be checked" }), "Codex login status could not be checked");
+  assert.equal(loginText(undefined), "Checking login…");
+  // A login says when it was checked; a re-login since then is not yet known.
+  assert.equal(loginText({ status: "signed-in", identity: { email: "a@example.com" }, checkedAt: "2026-10-19T10:42:00.000Z" }, time), "Signed in · a@example.com · checked 10:42");
+  assert.equal(loginText({ status: "signed-out", identity: null, checkedAt: "2026-10-19T10:42:00.000Z" }, time), "Signed out · checked 10:42");
+  assert.equal(runAccountText({ accountLabel: "Work", accountIdentity: "a@example.com" }), "Work (a@example.com)");
+  assert.equal(runAccountText({ accountLabel: null }), null);
+  // An answer names its own account even when its run is not loaded.
+  assert.equal(answerAccountText({ payload: { runId: "old", account: { label: "Work", identity: "a@example.com" } } }, new Map()), "Work (a@example.com)");
+  assert.equal(answerAccountText({ payload: { runId: "loaded" } }, new Map([["loaded", "Default login"]])), "Default login");
+  assert.equal(answerAccountText({ payload: { runId: "legacy" } }, new Map()), null);
+
+  const [accounts, settings] = await Promise.all([
+    readFile(new URL("src/components/ProviderAccounts.jsx", root), "utf8"),
+    readFile(new URL("src/components/SettingsDialog.jsx", root), "utf8"),
+  ]);
+  assert.match(settings, /<ProviderAccounts open=\{open\}/);
+  assert.match(accounts, /aria-labelledby="provider-accounts-heading"/);
+  assert.match(accounts, /role="alert">\{message\.alert\}/);
+  assert.match(accounts, /role="status" aria-live="polite">\{message\.status\}/);
+  assert.match(accounts, /aria-describedby="provider-account-help"/);
+  assert.match(accounts, /<legend className="sr-only">Confirm account removal<\/legend>/);
+  assert.match(accounts, /nextListingChange\(listing, runtimeNow\)/);
+  assert.match(accounts, /addEventListener\("visibilitychange"/);
+  assert.match(accounts, /ageLimit\(limit, now, staleAfterMs\)/);
+});
+
+test("expired measured totals are marked out of date and account changes keep their own signal", async () => {
+  const { listingOutOfDate, loginText, measuredPeriodText } = await import("../src/lib/provider-accounts.js");
+  const time = (value) => value.slice(11, 16);
+  const changesAt = "2026-10-19T15:00:00.001Z";
+  const period = { runs: 1, inputTokens: 100, outputTokens: 20, runsWithoutTokens: 0, costUsd: 0.5, runsWithoutCost: 0, changesAt };
+  const generatedAt = "2026-10-19T10:00:00.000Z";
+  assert.equal(measuredPeriodText(period, Date.parse(changesAt) - 1, generatedAt, time), "1 run · 120 tokens · $0.500 reported");
+  // A failed reload at the change keeps the old totals only as a dated snapshot.
+  assert.equal(measuredPeriodText(period, Date.parse(changesAt), generatedAt, time),
+    "1 run · 120 tokens · $0.500 reported as of 10:00 (out of date: a run has left this window since; reloading)");
+  assert.equal(measuredPeriodText({ runs: 0, changesAt: null }, Date.parse(changesAt), generatedAt, time), "No runs");
+  const listing = { providers: [{ accounts: [{ measured: [period] }] }] };
+  assert.equal(listingOutOfDate(listing, Date.parse(changesAt) - 1), false);
+  assert.equal(listingOutOfDate(listing, Date.parse(changesAt)), true);
+  // A default login that launches with a credential variable names it.
+  assert.equal(loginText({ status: "configured", identity: { variable: "CODEX_API_KEY" } }), "Uses CODEX_API_KEY from the environment");
+  assert.equal(loginText({ status: "signed-in", identity: { method: "third_party", variable: "CLAUDE_CODE_USE_BEDROCK" } }), "Signed in · third_party · uses CLAUDE_CODE_USE_BEDROCK");
+
+  const [app, accounts] = await Promise.all([
+    readFile(new URL("src/App.jsx", root), "utf8"),
+    readFile(new URL("src/components/ProviderAccounts.jsx", root), "utf8"),
+  ]);
+  // The shared runtime event slot carries terminal output; account changes
+  // must not replace it.
+  const slot = app.match(/if \((\[[^\]]*\])\.includes\(event\.type\)[^)]*\)[^;]*setRuntimeEvent\(event\)/s)?.[1] ?? "";
+  assert.match(slot, /"terminal\.output"/);
+  assert.doesNotMatch(slot, /provider-accounts\.changed/);
+  assert.match(app, /event\.type === "provider-accounts\.changed"\) setAccountsVersion\(/);
+  assert.match(app, /accountsVersion=\{accountsVersion\}/);
+  assert.match(accounts, /if \(open && accountsVersion\) load\(\)/);
+  assert.doesNotMatch(accounts, /REFRESH_EVENTS = \[[^\]]*provider-accounts\.changed/);
+});

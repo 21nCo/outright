@@ -1,5 +1,31 @@
 import { ADAPTER_CONTRACT_VERSION, defineAdapter, parseSemanticVersion } from "./contract.mjs";
 
+// `codex login status` prints one line, read from the environment and
+// CODEX_HOME (codex-rs/cli/src/login.rs in 0.162.1). An API-key login
+// prints a masked key after the method; only the method is kept. Workload
+// identity comes only from the environment, so it is never a login stored
+// in a home. Every other method can come from CODEX_HOME, which is the only
+// place an added account's check can find it, because that check runs
+// without every credential source. Any other line, such as "Error checking
+// login status", is unrecognized.
+const CODEX_LOGINS = [
+  ["Logged in using workload identity", "workload-identity", false],
+  ["Logged in using ChatGPT", "chatgpt", true],
+  ["Logged in using an API key", "api-key", true],
+  ["Logged in using access token", "access-token", true],
+  ["Logged in using personal access token", "personal-access-token", true],
+  ["Logged in using Amazon Bedrock API key", "bedrock-api-key", true],
+  ["Logged in using Amazon Bedrock AWS access keys", "bedrock-access-keys", true],
+];
+
+function parseIdentity(output) {
+  const line = String(output).trim().split(/\r?\n/)[0] ?? "";
+  const identity = (signedIn, ownLogin, method) => ({ signedIn, ownLogin, method, email: null, organization: null, plan: null });
+  if (/^Not logged in\b/.test(line)) return identity(false, false, null);
+  const login = CODEX_LOGINS.find(([status]) => line === status || line.startsWith(`${status} `));
+  return login ? identity(true, login[2], login[1]) : null;
+}
+
 const SANDBOX_MODES = { "read-only": "read-only", "workspace-write": "workspace-write", "danger-full-access": "danger-full-access" };
 
 // Item types `codex exec --json` emits for tool calls.
@@ -27,6 +53,20 @@ export const codexAdapter = defineAdapter({
   },
   sessionIdentity: { nativeField: "thread_id" },
   parseVersion: parseSemanticVersion,
+  // `codex exec --json` reports token usage but no usage windows.
+  // CODEX_HOME is ~/.codex when unset. Codex documents CODEX_API_KEY,
+  // CODEX_ACCESS_TOKEN and the OPENAI_FEDERATION_RULE_ID and
+  // OPENAI_IDENTITY_TOKEN_FILE workload identity as sources used in place
+  // of that login, and OPENAI_* also picks its endpoint and organization.
+  // Codex 0.162 does not authenticate with OPENAI_API_KEY, so that one
+  // never stands in for the login; it is still kept from an added
+  // account's launch and check. `codex login status` reports
+  // CODEX_ACCESS_TOKEN and workload identity but ignores CODEX_API_KEY,
+  // so only the default login with CODEX_API_KEY set counts as configured
+  // unchecked; with any other source it is checked.
+  accounts: { homeVariable: "CODEX_HOME", standardHome: ".codex", identityArgs: ["login", "status"], parseIdentity,
+    credentialVariables: ["OPENAI_*", "CODEX_*KEY*", "CODEX_*TOKEN*", "CODEX_*AUTH*", "CODEX_*FEDERATION*", "CODEX_*IDENTITY*"],
+    nonCredentialVariables: [], credentialSwitches: [], inertCredentials: ["OPENAI_API_KEY"], unreportedCredentials: ["CODEX_API_KEY"] },
   buildLaunch({ worktreePath, run, sessionId }) {
     const sandbox = SANDBOX_MODES[run.approvalPolicy];
     const options = [];

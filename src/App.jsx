@@ -29,6 +29,7 @@ import { api, connectRuntime, query } from "@/lib/runtime-api";
 import { scheduleLayoutTick } from "@/lib/windowing";
 import { foldFindText } from "@/lib/find-text";
 import { modelMismatch, providerOptionLabel, providerReady, providerStatusText, providerSwitchProblem } from "@/lib/providers";
+import { answerAccountText, runAccountText, withStartedRunAccount } from "@/lib/provider-accounts";
 import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, messagePrecedesPage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "@/recovery-policy";
 import { createTerminalCommandFence } from "@/lib/terminal-command-fence";
 
@@ -84,6 +85,9 @@ export function App() {
   const [pendingOutcomeRunIds, setPendingOutcomeRunIds] = useState(() => new Set());
   const [findResetGeneration, setFindResetGeneration] = useState(0);
   const [runtimeEvent, setRuntimeEvent] = useState(null);
+  // Account changes have their own counter: in the shared runtimeEvent slot
+  // a frequent one could replace a terminal chunk before it is written.
+  const [accountsVersion, setAccountsVersion] = useState(0);
   const [unverifiedTerminalIds, setUnverifiedTerminalIds] = useState(() => new Set());
   const [connection, setConnection] = useState("connecting");
   const [isScanning, setIsScanning] = useState(true);
@@ -498,6 +502,10 @@ export function App() {
         return;
       }
       pendingConversationLoadRef.current = null;
+      // A launch reported while this snapshot was read names its account.
+      for (const event of pendingLoad.events) {
+        if (event.type === "run.event" && event.payload?.type === "run.started") nextConversation.runs = withStartedRunAccount(nextConversation.runs, event.runId, event.payload.payload?.account);
+      }
       setPendingOutcomeRunIds((current) => {
         const settled = (nextConversation.runs ?? []).filter((run) => !ACTIVE_RUN_STATUSES.has(run.status) && current.has(run.id));
         if (!settled.length) return current;
@@ -643,6 +651,7 @@ export function App() {
     // A terminal event starts the durable detail refresh below. Keep the
     // pending reservation until that snapshot shows the terminal run; clearing
     // it here briefly announces the stale running state again.
+    if (event.type === "provider-accounts.changed") setAccountsVersion((version) => version + 1);
     if (["projects.changed", "terminal.output", "terminal.exit", "terminal.audit-failed", "runtime.connected", "capacity.changed"].includes(event.type)
       || (event.type === "run.event" && ["run.completed", "run.failed", "run.stopped"].includes(event.payload?.type))) setRuntimeEvent(event);
     const pendingLoad = pendingConversationLoadRef.current;
@@ -797,6 +806,13 @@ export function App() {
         applyStreamingText((current) => streamingTextAfterRuntimeEvent(current, event), true);
       }
       if (runEvent.type.startsWith("tool.") && ownsLiveOutput) setRunEvents((current) => [...current, runEvent].slice(-20));
+      if (runEvent.type === "run.started" && runEvent.payload?.account) {
+        setConversation((current) => {
+          if (current?.id !== event.conversationId) return current;
+          const runs = withStartedRunAccount(current.runs, event.runId, runEvent.payload.account);
+          return runs === current.runs ? current : { ...current, runs };
+        });
+      }
       if (["run.completed", "run.failed", "run.stopped"].includes(runEvent.type)) {
         if (acceptedPreviewRunRef.current === event.runId) acceptedPreviewRunRef.current = null;
         if (liveDeltaEventsRef.current.runId === event.runId) liveDeltaEventsRef.current = emptyLiveDeltaEvents();
@@ -1346,6 +1362,8 @@ export function App() {
   const unsentProject = bootstrap?.projects.find((item) => item.id === unsentCreatedChat?.projectId);
   const unsentWorktree = unsentProject?.worktrees.find((item) => item.id === unsentCreatedChat?.worktreeId);
   const latestRun = conversation?.runs?.[0];
+  // Answers name their own account; loaded runs cover older answers.
+  const runAccounts = useMemo(() => new Map((conversation?.runs ?? []).map((run) => [run.id, runAccountText(run)])), [conversation?.runs]);
   const chatModelMismatch = manageChatOpen ? modelMismatch(providers, chatDraft, chatDraft.modelChosenFor) : "";
   const chatProviderProblem = manageChatOpen ? providerSwitchProblem(providers, chatDraft, conversation?.provider) : "";
   const chatSettingsProblem = [chatProviderProblem, chatModelMismatch].filter(Boolean).join(" ");
@@ -1883,7 +1901,7 @@ export function App() {
   if (waitingForConversation) conversationContent = <output className="conversation-loading-status">{conversationLoadFailed ? "Could not load selected chat" : "Loading selected chat…"}</output>;
   if (conversation?.messages.length) conversationContent = <WindowedMessages key={conversation.id} messages={conversation.messages}
     messagePage={conversation.messagePage} viewportRef={messageViewportRef} restoreAnchorId={restoreMessageAnchorId}
-    renderMessage={(message) => <Message message={message} conversationId={conversation.id} />}
+    renderMessage={(message) => <Message message={message} conversationId={conversation.id} runAccount={answerAccountText(message, runAccounts)} />}
     onFind={findConversationMessage} onCancelFind={() => {
       pendingFindRef.current?.abort(); pendingFindRef.current = null; activeFindMatchRef.current = null; findProgressRef.current = null;
     }} resetFindGeneration={findResetGeneration} />;
@@ -1933,7 +1951,7 @@ export function App() {
     </main>
 
     <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} projects={bootstrap.projects} onSelectProject={chooseProject} onSelectConversation={(item) => { const nextProject = bootstrap.projects.find((entry) => entry.id === item.projectId); const nextWorktree = nextProject?.worktrees.find((entry) => entry.id === item.worktreeId); if (nextProject && nextWorktree) { pendingConversationRef.current = item.id; chooseProject(nextProject, nextWorktree); } }} />
-    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} runtimeEvent={runtimeEvent} onSaved={(nextSettings, refresh) => { if (refresh !== "history" && refresh !== "settings" && refresh !== "templates") { ++settingsVersionRef.current; setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") requestNotificationPermission(); } if (refresh) void refreshAll(refresh === "templates"); }} onError={handleError} />
+    <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={settings} providers={providers} templates={templates} runtimeEvent={runtimeEvent} accountsVersion={accountsVersion} onSaved={(nextSettings, refresh) => { if (refresh !== "history" && refresh !== "settings" && refresh !== "templates") { ++settingsVersionRef.current; setBootstrap((current) => ({ ...current, settings: nextSettings })); if (nextSettings.notifications && window.Notification && Notification.permission === "default") requestNotificationPermission(); } if (refresh) void refreshAll(refresh === "templates"); }} onError={handleError} />
 
     <SimpleDialog open={newChatOpen} onOpenChange={setNewChatOpen} title="New agent chat" description={`${project.name} / ${worktree.name}`} onSubmit={(event) => { event.preventDefault(); createConversation(); }} submit="Create chat"><label htmlFor="chat-title">What should the agent work on?</label><Input id="chat-title" autoFocus value={newChatTitle} onChange={(event) => setNewChatTitle(event.target.value)} placeholder="Review the worktree scanner" /></SimpleDialog>
     <SimpleDialog open={newSpaceOpen} onOpenChange={setNewSpaceOpen} title="Create space" description="Organize related projects together in the sidebar." onSubmit={createSpace} submit="Create space" disabled={!newSpaceName.trim()}><label htmlFor="space-name">Space name</label><Input id="space-name" autoFocus value={newSpaceName} onChange={(event) => setNewSpaceName(event.target.value)} placeholder="Client work" /></SimpleDialog>
@@ -1955,9 +1973,12 @@ function ProjectTree({ project, activeProjectId, activeWorktreeId, expanded, spa
 function ConversationHeader({ conversation, worktree, latestRun, pendingRuns, onManage }) {
   const latestPending = pendingRuns.some((run) => run.id === latestRun?.id);
   const earlierPending = pendingRuns.length - Number(latestPending);
-  return <section className="conversation-header"><div className="conversation-symbol"><ChatCircle weight="duotone" /></div><div><h1>{conversation?.title ?? "No conversation selected"}</h1><p><GitBranch />{worktree.branch}<span>·</span>{compactPath(worktree.path)}</p></div><div className="conversation-meta">{conversation && <button type="button" onClick={onManage} aria-label={`Conversation settings · ${conversation.provider}`}><span>{conversation.provider}</span><PencilSimple /></button>}{latestRun && <small>{runSummary(latestRun, latestPending)}</small>}{earlierPending > 0 && <small>{earlierPending} earlier outcome{earlierPending === 1 ? "" : "s"} pending</small>}</div></section>;
+  // The latest run's account has its own line, shown at every width while the
+  // rest of the run summary is hidden on narrow screens.
+  const latestAccount = runAccountText(latestRun) && `${latestRun.provider} · ${runAccountText(latestRun)}`;
+  return <section className="conversation-header"><div className="conversation-symbol"><ChatCircle weight="duotone" /></div><div><h1>{conversation?.title ?? "No conversation selected"}</h1><p><GitBranch />{worktree.branch}<span>·</span>{compactPath(worktree.path)}</p></div><div className="conversation-meta">{conversation && <button type="button" onClick={onManage} aria-label={`Conversation settings · ${conversation.provider}`}><span>{conversation.provider}</span><PencilSimple /></button>}{latestAccount && <small className="conversation-account" title={latestAccount}>{latestAccount}</small>}{latestRun && <small>{runSummary(latestRun, latestPending)}</small>}{earlierPending > 0 && <small>{earlierPending} earlier outcome{earlierPending === 1 ? "" : "s"} pending</small>}</div></section>;
 }
-function Message({ message, conversationId }) {
+function Message({ message, conversationId, runAccount }) {
   const [bodyPage, setBodyPage] = useState(null);
   const [bodyError, setBodyError] = useState("");
   const [bodyLoading, setBodyLoading] = useState(false);
@@ -1981,7 +2002,7 @@ function Message({ message, conversationId }) {
   const user = message.role === "user";
   const bodyReader = message.findExcerpt && <div className="message-full-reader"><button type="button" onClick={() => readBody(bodyPage?.offset ?? 0)} disabled={bodyLoading}>{bodyPage ? "Reload this section" : "Read full message"}</button>{bodyPage && <><p>Bytes {bodyPage.offset + 1}–{bodyPage.nextOffset} of {bodyPage.totalBytes}</p><pre tabIndex={0} aria-label="Full message section">{bodyPage.body}</pre><div><button type="button" disabled={bodyLoading || bodyPage.offset === 0} onClick={() => readBody(Math.max(0, bodyPage.offset - 65536))}>Previous section</button><button type="button" disabled={bodyLoading || !bodyPage.hasMore} onClick={() => readBody(bodyPage.nextOffset)}>Next section</button></div></>}{bodyLoading && <span role="status">Loading message section…</span>}{bodyError && <span role="alert">{bodyError}</span>}</div>;
   if (message.kind === "tool") return <article className="message is-agent is-tool" data-message-id={message.id}><div className="avatar"><CheckCircle weight="fill" /></div><div className="message-body"><p className="message-text">{message.body}</p>{bodyReader}</div></article>;
-  return <article className={`message ${user ? "is-user" : "is-agent"}`} data-message-id={message.id}><div className="avatar">{user ? "Y" : <Sparkle weight="fill" />}</div><div className="message-body"><div className="message-meta"><strong>{user ? "You" : "Outright"}</strong><time>{formatTime(message.createdAt)}</time></div><p className="message-text">{message.body}</p>{bodyReader}{message.payload?.runId && <small className="message-run">{message.payload.provider} · {message.payload.runId.slice(0, 8)}</small>}</div></article>;
+  return <article className={`message ${user ? "is-user" : "is-agent"}`} data-message-id={message.id}><div className="avatar">{user ? "Y" : <Sparkle weight="fill" />}</div><div className="message-body"><div className="message-meta"><strong>{user ? "You" : "Outright"}</strong><time>{formatTime(message.createdAt)}</time></div><p className="message-text">{message.body}</p>{bodyReader}{message.payload?.runId && <small className="message-run">{message.payload.provider}{runAccount ? ` · ${runAccount}` : ""} · {message.payload.runId.slice(0, 8)}</small>}</div></article>;
 }
 function StreamingMessage({ text, events, busy }) { return <article className="message is-agent is-streaming" aria-busy={busy}><div className="avatar"><Sparkle weight="fill" /></div><div className="message-body"><div className="message-meta"><strong>Outright</strong><span className="typing-dot" aria-hidden="true" /></div><p className="message-text">{text}</p><ToolActivity events={events} /></div></article>; }
 function RunningMessage({ run, events, outcomePending = false, busy }) {

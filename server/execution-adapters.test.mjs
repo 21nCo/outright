@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { ADAPTER_CONTRACT_VERSION, defineAdapter, modelMatches, NORMALIZED_EVENT_TYPES, requestedModel, validateRunConfiguration } from "./execution-adapters/contract.mjs";
-import { buildExecutionLaunch, describeAdapter, EXECUTION_ADAPTERS, findExecutionAdapter, validateExecutionConfiguration, versionCompatibility } from "./execution-adapters/index.mjs";
+import { buildExecutionEnvironment, buildExecutionLaunch, describeAdapter, EXECUTION_ADAPTERS, findExecutionAdapter, validateExecutionConfiguration, versionCompatibility } from "./execution-adapters/index.mjs";
 import { createProviderDiscovery } from "./provider-discovery.mjs";
 import { ENDPOINT_REQUIREMENT } from "./execution-adapters/anthropic-api-runner.mjs";
 
@@ -788,4 +788,125 @@ test("discovery reports incompatible and unconfigured providers before authoriza
     assert.equal(await configured.available("anthropic-api"), true);
     assert.equal(configured.list().find((entry) => entry.id === "anthropic-api").version, "1.0.0");
   } finally { await configured.close(); }
+});
+
+test("Claude Code usage windows normalize from the recorded stream and drop malformed values", () => {
+  const windows = normalizeFixture(claude, "print.jsonl").filter((event) => event.type === "rate_limit").map((event) => event.payload.windows);
+  // Before, the record stayed an opaque provider.event and no limit was kept.
+  assert.ok(windows.length > 0);
+  assert.deepEqual(windows[0], [{ window: "five_hour", utilization: 0.86, resetsAt: new Date(1791650400 * 1000).toISOString(), status: "allowed" }]);
+  const [malformed] = claude.normalize({ type: "rate_limit_event", rate_limit_info: { status: "Allowed!", rateLimitType: "five_hour", resetsAt: "soon",
+    unifiedWindows: { five_hour: { utilization: -1, resetsAt: 1791650400 }, "seven day": { utilization: 0.5 }, seven_day_opus: { utilization: 0.4, resetsAt: Infinity } } } });
+  assert.deepEqual(malformed.payload.windows, [
+    { window: "five_hour", utilization: null, resetsAt: new Date(1791650400 * 1000).toISOString(), status: null },
+    { window: "seven_day_opus", utilization: 0.4, resetsAt: null, status: null },
+  ]);
+  assert.deepEqual(claude.normalize({ type: "rate_limit_event", rate_limit_info: { rateLimitType: "../x" } }).map((event) => event.type), ["provider.event"]);
+  assert.equal(describeAdapter(claude).capabilities.usageLimits, true);
+  assert.equal(describeAdapter(codex).capabilities.usageLimits, false);
+});
+
+test("harness logins are read from each CLI's status without credentials", () => {
+  const parseClaude = claude.accounts.parseIdentity;
+  assert.deepEqual(parseClaude(JSON.stringify({ loggedIn: true, authMethod: "claude.ai", email: "a@example.com", orgName: "Org\u0007", subscriptionType: "max", configDirectory: "/x" })),
+    { signedIn: true, ownLogin: true, method: "claude.ai", email: "a@example.com", organization: "Org", plan: "max" });
+  assert.equal(parseClaude(JSON.stringify({ loggedIn: false, authMethod: "none" })).signedIn, false);
+  // Claude Code 2.1.303 with an empty CLAUDE_CONFIG_DIR and only dummy
+  // federation selectors, an inherited key or a helper: signed in, but not
+  // by a login stored in that directory.
+  for (const status of [{ authMethod: "oauth_token" }, { authMethod: "api_key", apiKeySource: "ANTHROPIC_API_KEY" }, { authMethod: "api_key_helper" }, { authMethod: "third_party" }]) {
+    assert.deepEqual([parseClaude(JSON.stringify({ loggedIn: true, apiProvider: "firstParty", ...status })).signedIn, parseClaude(JSON.stringify({ loggedIn: true, ...status })).ownLogin], [true, false], JSON.stringify(status));
+  }
+  assert.equal(parseClaude(JSON.stringify({ loggedIn: true, authMethod: "api_key", apiKeySource: "/login managed key" })).ownLogin, true);
+  assert.equal(parseClaude("not json"), null);
+  assert.equal(parseClaude(JSON.stringify({ loggedIn: "yes" })), null);
+  const parseCodex = codex.accounts.parseIdentity;
+  assert.deepEqual(parseCodex("Logged in using ChatGPT\n"), { signedIn: true, ownLogin: true, method: "chatgpt", email: null, organization: null, plan: null });
+  assert.doesNotMatch(JSON.stringify(parseCodex("Logged in using an API key - sk-proj-***ABCD")), /sk-/);
+  assert.equal(parseCodex("Not logged in").signedIn, false);
+  assert.equal(parseCodex("Something else"), null);
+  // Every line `codex login status` prints in 0.162.1. Workload identity is
+  // read only from the environment, so it is never a home's own login.
+  const codexStatus = [["Logged in using workload identity", true, false, "workload-identity"], ["Logged in using ChatGPT", true, true, "chatgpt"],
+    ["Logged in using an API key - sk-proj-***ABCD", true, true, "api-key"], ["Logged in using access token", true, true, "access-token"],
+    ["Logged in using personal access token", true, true, "personal-access-token"], ["Logged in using Amazon Bedrock API key", true, true, "bedrock-api-key"],
+    ["Logged in using Amazon Bedrock AWS access keys", true, true, "bedrock-access-keys"], ["Not logged in", false, false, null]];
+  for (const [line, ...expected] of codexStatus) {
+    const identity = parseCodex(`${line}\r\n`);
+    assert.deepEqual([identity?.signedIn, identity?.ownLogin, identity?.method], expected, line);
+  }
+  for (const line of ["Error checking login status: token file missing", "Unexpected error retrieving API key: denied", "Logged in using a future method"]) assert.equal(parseCodex(line), null, line);
+  assert.deepEqual([claude.accounts.homeVariable, codex.accounts.homeVariable, anthropic.accounts], ["CLAUDE_CONFIG_DIR", "CODEX_HOME", null]);
+  assert.deepEqual([claude.accounts.standardHome, codex.accounts.standardHome], [".claude", ".codex"]);
+  const accounts = { homeVariable: "FIXTURE_HOME", standardHome: ".fixture", identityArgs: ["status"], parseIdentity: () => null, credentialVariables: ["FIXTURE_*", "OTHER_TOKEN"],
+    nonCredentialVariables: ["FIXTURE_MODEL", "FIXTURE_USE_TOOL"], credentialSwitches: ["FIXTURE_USE_*"], inertCredentials: ["FIXTURE_IGNORED"],
+    unreportedCredentials: ["FIXTURE_TOKEN", "FIXTURE_IGNORED", "FIXTURE_MODEL"] };
+  const fixture = defineAdapter(harnessSpec({ accounts })).accounts;
+  assert.equal(fixture.homeVariable, "FIXTURE_HOME");
+  assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, homeVariable: "OUTRIGHT_HOME" } })), /accounts must name/);
+  assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, identityArgs: ["status; rm"] } })), /accounts must name/);
+  // The standard home is one directory inside the user's home, never a path out of it.
+  for (const standardHome of [undefined, "../.fixture", "/etc", "a/b"]) {
+    assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, standardHome } })), /accounts must name/, standardHome);
+  }
+  for (const credentialVariables of [undefined, [], ["OUTRIGHT_*"], ["fixture_*"], ["FIXTURE_(.*)"]]) {
+    assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, credentialVariables } })), /accounts must name/, String(credentialVariables));
+  }
+  for (const field of ["nonCredentialVariables", "credentialSwitches", "inertCredentials", "unreportedCredentials"]) {
+    assert.throws(() => defineAdapter(harnessSpec({ accounts: { ...accounts, [field]: undefined } })), /accounts must name/, field);
+  }
+  // A source is any name its rules match, except the home variable and the
+  // non-credential exceptions; an inert one never stands in for the login.
+  assert.deepEqual(["FIXTURE_TOKEN", "FIXTURE_NEW_SOURCE", "OTHER_TOKEN", "FIXTURE_HOME", "FIXTURE_MODEL", "OTHER_TOKENS", "FIXTURE_IGNORED"].map(fixture.isCredential),
+    [true, true, true, false, false, false, true]);
+  assert.deepEqual([fixture.overridesLogin("FIXTURE_IGNORED"), fixture.overridesLogin("FIXTURE_TOKEN")], [false, true]);
+  assert.deepEqual(["FIXTURE_USE_CLOUD", "FIXTURE_USE_TOOL", "FIXTURE_TOKEN"].map(fixture.isCredentialSwitch), [true, false, false]);
+  // Only a source that stands in for the login can count as one unchecked.
+  assert.deepEqual(["FIXTURE_TOKEN", "FIXTURE_NEW_SOURCE", "FIXTURE_IGNORED", "FIXTURE_MODEL"].map(fixture.isUnreported), [true, false, false, false]);
+  // Claude Code 2.1.303's own sources, including those it reads for
+  // profiles, federation and gateways; model and tool choices are not.
+  const claudeSources = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_IDENTITY_TOKEN", "ANTHROPIC_IDENTITY_TOKEN_FILE", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_GATEWAY_TOKEN", "CLAUDE_CODE_SESSION_ACCESS_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_GATEWAY"];
+  assert.deepEqual(claudeSources.filter((name) => !claude.accounts.overridesLogin(name)), []);
+  assert.deepEqual(["ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CODE_USE_POWERSHELL_TOOL", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CONFIG_DIR"]
+    .filter(claude.accounts.isCredential), []);
+  assert.deepEqual(["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_NATIVE_FILE_SEARCH", "ANTHROPIC_API_KEY"].map(claude.accounts.isCredentialSwitch), [true, true, false, false]);
+  // Codex: OPENAI_API_KEY is a source an added account runs without, but
+  // Codex never signs in with it in place of its login.
+  assert.deepEqual(["CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE", "OPENAI_API_KEY", "CODEX_HOME", "CODEX_SANDBOX"]
+    .map(codex.accounts.isCredential), [true, true, true, true, true, false, false]);
+  assert.deepEqual([codex.accounts.overridesLogin("OPENAI_API_KEY"), codex.accounts.overridesLogin("CODEX_ACCESS_TOKEN")], [false, true]);
+  // Claude Code's status command reports every source that signs it in;
+  // `codex login status` reports CODEX_ACCESS_TOKEN and workload identity,
+  // but not CODEX_API_KEY.
+  assert.deepEqual(claudeSources.filter(claude.accounts.isUnreported), []);
+  assert.deepEqual(["CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BASE_URL", "OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE"].map(codex.accounts.isUnreported), [true, false, false, false, false]);
+});
+
+test("an account's home reaches only its own launch, and only under its own variable", () => {
+  const inherited = { PATH: "/bin", claude_config_dir: "/inherited", OUTRIGHT_ANTHROPIC_API_KEY: "direct" };
+  // The default account keeps whatever home the environment selects.
+  assert.equal(buildExecutionEnvironment("claude", inherited).claude_config_dir, "/inherited");
+  const scoped = buildExecutionEnvironment("claude", inherited, inherited, { homePath: "/accounts/work" });
+  assert.equal(scoped.CLAUDE_CONFIG_DIR, "/accounts/work");
+  assert.equal(Object.keys(scoped).filter((key) => key.toUpperCase() === "CLAUDE_CONFIG_DIR").length, 1, "no second spelling survives");
+  assert.equal(scoped.OUTRIGHT_ANTHROPIC_API_KEY, undefined);
+  assert.equal(buildExecutionEnvironment("codex", inherited, inherited, { homePath: "/accounts/codex" }).CODEX_HOME, "/accounts/codex");
+  // A credential variable would make the CLI ignore the account's login. It
+  // stays with the default login and never reaches an added account.
+  const credentials = { PATH: "/bin", ANTHROPIC_API_KEY: "env-key", claude_code_oauth_token: "env-token", CLAUDE_CODE_USE_BEDROCK: "1", CODEX_API_KEY: "codex-key", OPENAI_API_KEY: "openai-key" };
+  assert.equal(buildExecutionEnvironment("claude", credentials).ANTHROPIC_API_KEY, "env-key");
+  assert.deepEqual(Object.keys(buildExecutionEnvironment("claude", credentials, credentials, { homePath: "/accounts/work" })).sort(), ["CLAUDE_CONFIG_DIR", "CODEX_API_KEY", "OPENAI_API_KEY", "PATH"]);
+  assert.deepEqual(Object.keys(buildExecutionEnvironment("codex", credentials, credentials, { homePath: "/accounts/codex" })).sort(),
+    ["ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK", "CODEX_HOME", "PATH", "claude_code_oauth_token"]);
+  // Profiles, federation and identity tokens are sources too; a model or
+  // tool choice is not.
+  const sources = { PATH: "/bin", ANTHROPIC_PROFILE: "work", ANTHROPIC_FEDERATION_RULE_ID: "rule", ANTHROPIC_ORGANIZATION_ID: "org", ANTHROPIC_IDENTITY_TOKEN: "jwt",
+    ANTHROPIC_IDENTITY_TOKEN_FILE: "/t", ANTHROPIC_MODEL: "opus", CLAUDE_CODE_USE_POWERSHELL_TOOL: "1", CODEX_ACCESS_TOKEN: "token", OPENAI_FEDERATION_RULE_ID: "rule",
+    OPENAI_IDENTITY_TOKEN_FILE: "/t" };
+  assert.deepEqual(Object.keys(buildExecutionEnvironment("claude", sources, sources, { homePath: "/accounts/work" })).sort(),
+    ["ANTHROPIC_MODEL", "CLAUDE_CODE_USE_POWERSHELL_TOOL", "CLAUDE_CONFIG_DIR", "CODEX_ACCESS_TOKEN", "OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE", "PATH"]);
+  assert.deepEqual(Object.keys(buildExecutionEnvironment("codex", sources, sources, { homePath: "/accounts/codex" })).filter((name) => /^(CODEX|OPENAI)_/.test(name)), ["CODEX_HOME"]);
+  assert.throws(() => buildExecutionEnvironment("anthropic-api", inherited, inherited, { homePath: "/accounts/x" }), /no selectable accounts/);
 });

@@ -3539,3 +3539,104 @@ test("retention, automatic cleanup and startup recovery announce the tasks they 
     },
   });
 })());
+
+test("account routes switch only to a signed-in account and a signed-out send writes nothing", withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
+  // The fake CLI reports a login per CODEX_HOME through the real supervised probe.
+  writeNodeCommand(bin, "codex", `const fs = require("node:fs"); const path = require("node:path");
+if (process.argv[2] === "--version") { console.log("codex-cli 0.162.1"); process.exit(0); }
+const home = process.env.CODEX_HOME;
+if (!home || fs.existsSync(path.join(home, "signed-out"))) { console.log("Not logged in"); process.exit(1); }
+console.log("Logged in using ChatGPT");\n`);
+  const events = captureEvents(runtime);
+  const root = path.dirname(bin);
+  const codexAccounts = (body) => body.providers.find((provider) => provider.provider === "codex");
+  const listed = await callRuntime(runtime, "GET", "/api/provider-accounts");
+  assert.equal(listed.statusCode, 200);
+  assert.equal(codexAccounts(listed.body).activeAccountId, "codex:default");
+  assert.equal(codexAccounts(listed.body).homeVariable, "CODEX_HOME");
+
+  const invalid = await callRuntime(runtime, "POST", "/api/provider-accounts", { provider: "codex", label: "Work", homePath: "relative" });
+  assert.equal(invalid.statusCode, 400);
+  assert.equal(invalid.body.code, "PROVIDER_ACCOUNT_INVALID");
+
+  const outHome = path.join(root, "codex-out");
+  mkdirSync(outHome);
+  writeFileSync(path.join(outHome, "signed-out"), "");
+  const addedOut = await callRuntime(runtime, "POST", "/api/provider-accounts", { provider: "codex", label: "Signed out", homePath: outHome });
+  assert.equal(addedOut.statusCode, 201);
+  const out = codexAccounts(addedOut.body).accounts.find((account) => account.label === "Signed out");
+  assert.equal(out.login.status, "signed-out");
+  const refused = await callRuntime(runtime, "PUT", "/api/provider-accounts/active", { provider: "codex", accountId: out.id });
+  assert.equal(refused.statusCode, 409);
+  assert.equal(refused.body.code, "PROVIDER_ACCOUNT_SWITCH_FAILED");
+  assert.equal(codexAccounts((await callRuntime(runtime, "GET", "/api/provider-accounts")).body).activeAccountId, "codex:default");
+
+  const workHome = path.join(root, "codex-work");
+  mkdirSync(workHome);
+  const work = codexAccounts((await callRuntime(runtime, "POST", "/api/provider-accounts", { provider: "codex", label: "Work", homePath: workHome })).body)
+    .accounts.find((account) => account.label === "Work");
+  assert.deepEqual([work.login.status, work.login.identity.method], ["signed-in", "chatgpt"]);
+  const switched = await callRuntime(runtime, "PUT", "/api/provider-accounts/active", { provider: "codex", accountId: work.id });
+  assert.equal(switched.statusCode, 200);
+  assert.equal(codexAccounts(switched.body).activeAccountId, work.id);
+  assert.equal(runtime.database.listAudit(20).filter((row) => row.action === "provider-account.switched" && row.target === work.id).length, 1);
+  await waitFor(() => events.of("provider-accounts.changed").length > 0, 2_000, "account changes are announced");
+
+  const active = await callRuntime(runtime, "DELETE", `/api/provider-accounts/${encodeURIComponent(work.id)}`);
+  assert.equal(active.body.code, "PROVIDER_ACCOUNT_ACTIVE");
+  const fixed = await callRuntime(runtime, "DELETE", "/api/provider-accounts/codex%3Adefault");
+  assert.equal(fixed.body.code, "PROVIDER_ACCOUNT_DEFAULT");
+
+  // The account signs out after the switch. Once a check has seen that, the
+  // next send is checked again and refused before its message or run exists.
+  writeFileSync(path.join(workHome, "signed-out"), "");
+  const checked = await callRuntime(runtime, "POST", `/api/provider-accounts/${encodeURIComponent(work.id)}/refresh`);
+  assert.equal(codexAccounts(checked.body).accounts.find((account) => account.id === work.id).login.status, "signed-out");
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Accounts", provider: "codex" });
+  const send = await callRuntime(runtime, "POST", `/api/conversations/${conversation.id}/runs`, { prompt: "hello", approvalPolicy: "read-only" });
+  assert.equal(send.statusCode, 409, JSON.stringify(send.body));
+  assert.equal(send.body.code, "PROVIDER_ACCOUNT_SIGNED_OUT");
+  assert.equal(runtime.database.listRuns(conversation.id).length, 0);
+  assert.equal(runtime.database.listMessagePage(conversation.id, { limit: 10 }).messages.length, 0);
+}));
+
+test("resuming a session attached by hand that another account launched spends no recovery decision", withWorktreeRuntime(async (runtime, { project, worktree, bin }) => {
+  writeNodeCommand(bin, "codex", `if (process.argv[2] === "--version") { console.log("codex-cli 0.162.1"); process.exit(0); }
+console.log("Logged in using ChatGPT");\n`);
+  runtime.agents.providerAvailable = async () => true;
+  const scheduled = [];
+  runtime.agents.schedule = async (entry) => { scheduled.push(entry); return entry.run; };
+  const root = path.dirname(bin);
+  const add = async (label) => {
+    const homePath = path.join(root, `codex-${label}`);
+    mkdirSync(homePath);
+    const listing = (await callRuntime(runtime, "POST", "/api/provider-accounts", { provider: "codex", label, homePath })).body;
+    const account = listing.providers.find((provider) => provider.provider === "codex").accounts.find((item) => item.label === label);
+    // The login key the runtime records: the directory as the system names it, case-folded on Windows.
+    const home = realpathSync.native(homePath);
+    return { id: account.id, provider: "codex", label, homePath, home: process.platform === "win32" ? home.toLowerCase() : home, identity: null };
+  };
+  const [work, other] = [await add("Work"), await add("Other")];
+  const conversation = runtime.database.createConversation({ projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path, title: "Attached", provider: "codex" });
+  const launched = (account, status, providerSessionId = null) => {
+    const run = runtime.database.createRun({ conversationId: conversation.id, worktreePath: worktree.path, provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium", prompt: account.label });
+    runtime.database.updateRun(run.id, { status: "running", startedAt: new Date().toISOString(), pid: 2 ** 22 + 7 }, { account });
+    if (status) runtime.database.updateRun(run.id, { status, providerSessionId });
+    return run;
+  };
+  // Other's session; Work's run is interrupted before it records a session.
+  launched(other, "completed", "019a-other-session");
+  const interrupted = launched(work, null);
+  runtime.database.reconcileInterruptedRuns({ probeAlive: () => false });
+  assert.equal((await callRuntime(runtime, "PATCH", `/api/conversations/${conversation.id}`, { providerSessionId: "019a-other-session" })).statusCode, 200);
+
+  const resumed = await callRuntime(runtime, "POST", `/api/runs/${interrupted.id}/resume`, { policy: "resume-session" });
+  assert.deepEqual([resumed.statusCode, resumed.body.code], [409, "PROVIDER_ACCOUNT_UNAVAILABLE"], JSON.stringify(resumed.body));
+  assert.match(resumed.body.error, /used Work, but the session it would resume belongs to Other/);
+  assert.equal(runtime.database.getRun(interrupted.id).recoveryDecision, null, "the run still awaits a decision");
+  assert.deepEqual([scheduled.length, runtime.database.listRuns(conversation.id).length], [0, 2]);
+  // Retry starts a fresh session on Work.
+  const retried = await callRuntime(runtime, "POST", `/api/runs/${interrupted.id}/resume`, { policy: "retry" });
+  assert.equal(retried.statusCode, 202, JSON.stringify(retried.body));
+  assert.deepEqual([scheduled.length, scheduled[0].forceFreshSession, scheduled[0].run.accountPinId], [1, true, work.id]);
+}));

@@ -4,7 +4,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createProviderDiscovery, defaultProbe } from "./provider-discovery.mjs";
+import { createProviderDiscovery, defaultProbe, probeCommand } from "./provider-discovery.mjs";
 import { writeNodeCommand } from "../tests/fixtures/node-command.mjs";
 
 function probeProcessRunning(pid, inspect = spawnSync) {
@@ -18,6 +18,21 @@ function probeProcessRunning(pid, inspect = spawnSync) {
   const state = result.stdout.trim();
   assert.match(state, /^[A-Z]/, "ps returned no process state for an existing PID");
   return !state.startsWith("Z");
+}
+
+// Whether `pid` is running, as the operating system lists it: ps on POSIX,
+// tasklist on Windows, which prints a CSV row quoting the pid of a match.
+function processRunning(pid, inspect = spawnSync) {
+  if (process.platform !== "win32") return probeProcessRunning(pid, inspect);
+  const result = inspect("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], { encoding: "utf8", timeout: 5000 });
+  if (result.error || result.status !== 0) throw result.error ?? new Error(`tasklist inspection failed: ${result.status}: ${result.stderr}`);
+  return result.stdout.includes(`"${pid}"`);
+}
+
+async function waitForProcessExit(pid) {
+  const deadline = Date.now() + 5000;
+  while (processRunning(pid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(processRunning(pid), false, `probe descendant ${pid} is still running`);
 }
 
 test("a failed process inspection cannot prove probe cleanup", () => {
@@ -239,6 +254,67 @@ test("a harness version probe never receives a direct provider's credential", as
     assert.equal((await defaultProbe("codex")).trim(), "version absent absent absent harness-own-key");
   } finally {
     for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("an account identity check runs with that account's home and accepts a signed-out exit", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-probe-identity-"));
+  // A registered harness name on PATH, the only probe Windows accepts.
+  writeNodeCommand(directory, "claude", 'console.log(JSON.stringify({ args: process.argv.slice(2), home: process.env.CLAUDE_CONFIG_DIR ?? "absent", key: process.env.OUTRIGHT_ANTHROPIC_API_KEY ?? "absent" })); process.exit(1);\n');
+  const saved = process.env.PATH;
+  process.env.PATH = `${directory}${path.delimiter}${saved}`;
+  const environment = { ...process.env, CLAUDE_CONFIG_DIR: path.join(directory, "work"), OUTRIGHT_ANTHROPIC_API_KEY: "direct-key" };
+  const args = ["auth", "status", "--json"];
+  try {
+    const output = await defaultProbe("claude", { args, environment, exitCodes: [0, 1], timeoutMs: 5_000 });
+    assert.deepEqual(JSON.parse(output), { args, home: path.join(directory, "work"), key: "absent" });
+    // A version check still treats any nonzero exit as a failure.
+    await assert.rejects(defaultProbe("claude", { args, environment, timeoutMs: 5_000 }), /exited 1/);
+    assert.throws(() => probeCommand("claude", "/bin/claude", { args: ["status", "& calc"] }), /Invalid probe arguments/);
+  } finally {
+    process.env.PATH = saved;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("an identity check's abort and timeout leave no descendant of its CLI running, on every platform", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-identity-tree-"));
+  const pidFile = path.join(directory, "descendant-pid");
+  // A registered harness name on PATH, the only probe Windows accepts. Its
+  // detached helper outlives the CLI unless the probe's owner reaps the tree.
+  const helper = `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`;
+  writeNodeCommand(directory, "claude", `require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(helper)}], { detached: true, stdio: "ignore" }).unref(); setInterval(() => {}, 1000);\n`);
+  const saved = process.env.PATH;
+  process.env.PATH = `${directory}${path.delimiter}${saved}`;
+  const environment = { ...process.env, CLAUDE_CONFIG_DIR: path.join(directory, "work") };
+  // The helper must be seen running well before the probe's own deadline,
+  // or a slow start would let the timeout reap it unobserved.
+  const readinessMs = 4_000;
+  try {
+    for (const mode of ["abort", "timeout"]) {
+      rmSync(pidFile, { force: true });
+      const controller = new AbortController();
+      let pid = 0;
+      try {
+        const pending = defaultProbe("claude", { signal: controller.signal, args: ["auth", "status", "--json"], environment, exitCodes: [0, 1], timeoutMs: mode === "timeout" ? readinessMs * 2 : readinessMs * 4 });
+        pending.catch(() => {});
+        const readyUntil = Date.now() + readinessMs;
+        while (!pid && Date.now() < readyUntil) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          pid = existsSync(pidFile) ? Number(readFileSync(pidFile, "utf8")) : 0;
+        }
+        assert.ok(pid > 0 && processRunning(pid), `${mode}: the helper runs under the probe`);
+        if (mode === "abort") controller.abort();
+        await assert.rejects(pending, mode === "abort" ? /aborted/ : /timed out/);
+        await waitForProcessExit(pid);
+      } finally {
+        controller.abort();
+        if (pid) try { process.kill(pid, "SIGKILL"); } catch { /* Already gone. */ }
+      }
+    }
+  } finally {
+    process.env.PATH = saved;
     rmSync(directory, { recursive: true, force: true });
   }
 });

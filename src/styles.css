@@ -255,6 +255,7 @@ button, input, textarea, select { font: inherit; }
 .conversation-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
 .conversation-meta span { padding: 2px 7px; border-radius: 999px; color: var(--foreground); background: var(--muted); font-size: 9px; font-weight: 650; }
 .conversation-meta small { color: var(--muted-foreground); font-size: 9px; }
+.conversation-meta .conversation-account { max-width: min(260px, 38vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .message-scroll { min-height: 0; height: 100%; overflow: hidden; }
 .message-scroll [data-slot="scroll-area-viewport"] { height: 100%; overflow-y: auto; }
@@ -319,7 +320,7 @@ button, input, textarea, select { font: inherit; }
 @media (max-width: 920px) {
   .app-shell { grid-template-columns: 292px minmax(0,1fr); min-width: 0; }
   /* The settings button stays: it is the keyboard entry to the conversation's provider and model. */
-  .conversation-meta small { display: none; }
+  .conversation-meta small:not(.conversation-account) { display: none; }
 }
 
 @media (max-width: 760px) {
@@ -515,6 +516,14 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
 .template-list strong, .template-list small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .template-list strong { font-size: 10px; }
 .template-list small { color: var(--muted-foreground); font-size: 8px; }
+.account-list > div { align-items: flex-start; gap: 8px; padding-block: 6px; }
+.account-list strong, .account-list small { white-space: normal; overflow-wrap: anywhere; }
+.account-list small { font-size: 9px; }
+.account-list > div > .account-actions { flex: 0 0 auto; flex-direction: row; align-items: center; gap: 4px; }
+.new-template.new-account { grid-template-columns: auto 1fr 1.6fr auto; }
+.provider-accounts [aria-disabled="true"] { opacity: .5; cursor: progress; }
+.account-help { display: block; color: var(--muted-foreground); font-size: 9px; }
+.account-error { margin: 6px 0 0; color: var(--destructive); font-size: 10px; }
 .new-template { display: grid; grid-template-columns: 1fr 1.6fr auto; gap: 6px; }
 
 @media (max-width: 1180px) {
@@ -556,8 +565,10 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .command-dialog { inset: 8px; width: auto; max-width: none; max-height: calc(100dvh - 16px); padding: 0; display: block; overflow: hidden; translate: 0 0; }
   .command-results { max-height: calc(100dvh - 88px); }
   .settings-grid { grid-template-columns: minmax(0,1fr); }
-  .new-template { grid-template-columns: minmax(0,1fr); }
+  .new-template, .new-template.new-account { grid-template-columns: minmax(0,1fr); }
   .new-template button { width: 100%; }
+  .account-list > div { flex-wrap: wrap; }
+  .account-list > div > span:first-child { flex-basis: 100%; }
   .dialog-form { gap: 17px; }
 }
 

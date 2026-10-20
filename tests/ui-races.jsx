@@ -8,6 +8,7 @@ import { WindowedMessages } from "../src/components/WindowedMessages.jsx";
 import { WindowedDiff } from "../src/components/WindowedDiff.jsx";
 import { CommandPalette } from "../src/components/CommandPalette.jsx";
 import { SettingsDialog } from "../src/components/SettingsDialog.jsx";
+import { ProviderAccounts } from "../src/components/ProviderAccounts.jsx";
 import { TerminalPane } from "../src/components/TerminalPane.jsx";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
 import { scheduleLayoutTick } from "../src/lib/windowing.js";
@@ -1154,6 +1155,223 @@ async function settingsCapacityWithoutEventRegression() {
   await new Promise((resolve) => setTimeout(resolve, 2200));
   assert(reads === readsAtClose, "closed Settings kept polling capacity");
   } finally { liveObserver.disconnect(); }
+}
+
+// No run or account event arrives when a run ages out of a rolling window.
+async function providerAccountsWindowAgingRegression() {
+  root.render(null); await settle();
+  const changesAt = Date.now() + 1200;
+  let reads = 0;
+  const period = (runs) => ({ period: "5h", label: "Last 5 hours", since: "", changesAt: runs ? new Date(changesAt).toISOString() : null,
+    runs, inputTokens: runs ? 10 : null, outputTokens: runs ? 5 : null, runsWithoutTokens: 0, costUsd: null, runsWithoutCost: runs });
+  route = async (url) => {
+    if (url.pathname !== "/api/provider-accounts") return response({});
+    reads += 1;
+    const runs = Date.now() < changesAt ? 1 : 0;
+    return response({ generatedAt: new Date().toISOString(), limitStaleAfterMs: 1_800_000, providers: [{ provider: "codex", label: "Codex", kind: "harness",
+      homeVariable: "CODEX_HOME", switchable: true, usageLimits: false, activeAccountId: "codex:default",
+      accounts: [{ id: "codex:default", label: "Default login", isDefault: true, homePath: null, active: true,
+        login: { status: "signed-in", identity: null, error: null, checkedAt: null }, measured: [period(runs)], limits: null }] }] });
+  };
+  const onError = (error) => { throw error; };
+  root.render(<TooltipProvider><ProviderAccounts open runtimeEvent={null} onError={onError} /></TooltipProvider>);
+  const measured = () => [...host.querySelectorAll(".provider-accounts small")].find((line) => line.textContent.startsWith("Measured by Outright"))?.textContent ?? "";
+  await until(() => measured().includes("1 run"), "the run in the 5-hour window is shown");
+  await until(() => measured().endsWith("No runs"), "the run leaves the shown 5-hour total when it ages out");
+  assert(reads === 2, `the listing is read once more at the window change, not ${reads} times`);
+  await remainsTrue(() => reads === 2, 1500, "an unchanging listing is not polled");
+}
+
+// A reload that fails when a run leaves a rolling window must not leave the
+// old total looking current; account changes reload through their own signal.
+async function providerAccountsFailedReloadRegression() {
+  root.render(null); await settle();
+  const changesAt = Date.now() + 1200;
+  let reads = 0;
+  let failing = false;
+  const errors = [];
+  const period = (runs) => ({ period: "5h", label: "Last 5 hours", since: "", changesAt: runs ? new Date(changesAt).toISOString() : null,
+    runs, inputTokens: runs ? 10 : null, outputTokens: runs ? 5 : null, runsWithoutTokens: 0, costUsd: null, runsWithoutCost: runs });
+  route = async (url) => {
+    if (url.pathname !== "/api/provider-accounts") return response({});
+    reads += 1;
+    if (Date.now() >= changesAt && failing) return response({ error: "Runtime unavailable" }, 503);
+    const runs = Date.now() < changesAt ? 1 : 0;
+    return response({ generatedAt: new Date().toISOString(), limitStaleAfterMs: 1_800_000, providers: [{ provider: "codex", label: "Codex", kind: "harness",
+      homeVariable: "CODEX_HOME", switchable: true, usageLimits: false, activeAccountId: "codex:default",
+      accounts: [{ id: "codex:default", label: "Default login", isDefault: true, homePath: null, active: true, sameAsDefault: false,
+        login: { status: "signed-in", identity: null, error: null, checkedAt: null }, measured: [period(runs)], limits: null }] }] });
+  };
+  const onError = (error) => { errors.push(error); };
+  const render = (accountsVersion) => root.render(<TooltipProvider><ProviderAccounts open runtimeEvent={null} accountsVersion={accountsVersion} onError={onError} /></TooltipProvider>);
+  failing = true;
+  render(0);
+  const measured = () => [...host.querySelectorAll(".provider-accounts small")].find((line) => line.textContent.startsWith("Measured by Outright"))?.textContent ?? "";
+  await until(() => measured().includes("1 run"), "the run in the 5-hour window is shown");
+  await until(() => errors.length > 0, "the reload at the window change fails");
+  await until(() => measured().includes("(out of date"), "the failed reload marks the expired total out of date");
+  assert(measured().includes("as of "), "an out-of-date total names its snapshot time");
+  // An account change is delivered without the shared runtime event.
+  failing = false;
+  const before = reads;
+  render(1);
+  await until(() => reads > before && measured().endsWith("No runs"), "an account change reloads the listing, which drops the expired run");
+  assert(!measured().includes("out of date"), "a successful reload clears the out-of-date mark");
+}
+
+// An account added while its fields are edited again clears only what it sent.
+async function providerAccountsAddKeepsNewerDraftRegression() {
+  root.render(null); await settle();
+  const post = deferred();
+  let posted = null;
+  const listing = (accounts) => ({ generatedAt: new Date().toISOString(), limitStaleAfterMs: 1_800_000, providers: [{ provider: "codex", label: "Codex", kind: "harness",
+    homeVariable: "CODEX_HOME", switchable: true, usageLimits: false, activeAccountId: "codex:default",
+    accounts: accounts.map((label) => ({ id: label === "Default login" ? "codex:default" : `codex:${label}`, label, isDefault: label === "Default login", homePath: label === "Default login" ? null : `/homes/${label}`,
+      active: label === "Default login", sameAsDefault: false, login: { status: "signed-in", identity: null, error: null, checkedAt: null }, measured: [], limits: null })) }] });
+  route = async (url, init) => {
+    if (url.pathname !== "/api/provider-accounts") return response({});
+    if (init?.method === "POST") { posted = JSON.parse(init.body); return post.promise; }
+    return response(listing(["Default login"]));
+  };
+  const onError = (error) => { throw error; };
+  root.render(<TooltipProvider><ProviderAccounts open runtimeEvent={null} onError={onError} /></TooltipProvider>);
+  const field = (label) => host.querySelector(`[aria-label="${label}"]`);
+  await until(() => field("Account name") && field("CODEX_HOME directory"), "the add form is shown");
+  setControlValue(field("Account name"), "Work");
+  setControlValue(field("CODEX_HOME directory"), "/homes/Work");
+  [...host.querySelectorAll("button")].find((button) => button.textContent === "Add account").click();
+  await until(() => posted, "the add request started");
+  assert(posted.label === "Work" && posted.homePath === "/homes/Work", "the submitted draft is sent");
+  // The next account is typed while the first is being added.
+  setControlValue(field("Account name"), "Personal");
+  setControlValue(field("CODEX_HOME directory"), "/homes/Personal");
+  post.resolve(response(listing(["Default login", "Work"]), 201));
+  await until(() => host.textContent.includes("Codex · Work"), "the added account is listed");
+  await settle();
+  assert(field("Account name").value === "Personal" && field("CODEX_HOME directory").value === "/homes/Personal", "the newer draft is kept");
+  posted = null;
+  const second = deferred();
+  route = async (url, init) => {
+    if (url.pathname !== "/api/provider-accounts") return response({});
+    if (init?.method === "POST") { posted = JSON.parse(init.body); return second.promise; }
+    return response(listing(["Default login", "Work"]));
+  };
+  [...host.querySelectorAll("button")].find((button) => button.textContent === "Add account").click();
+  await until(() => posted?.label === "Personal", "the newer draft is added");
+  second.resolve(response(listing(["Default login", "Work", "Personal"]), 201));
+  await until(() => field("Account name").value === "" && field("CODEX_HOME directory").value === "", "an unchanged submitted draft is cleared");
+}
+
+// A switch's response computed before another client's switch must not
+// replace the listing that switch produced, and must not drop a load that
+// started after the switch.
+async function providerAccountsResponseOrderRegression() {
+  root.render(null); await settle();
+  let sequence = 0;
+  let active = "codex:default";
+  const listing = () => ({ revision: { runtime: "runtime-1", sequence: ++sequence }, generatedAt: new Date().toISOString(), limitStaleAfterMs: 1_800_000,
+    providers: [{ provider: "codex", label: "Codex", kind: "harness", homeVariable: "CODEX_HOME", switchable: true, usageLimits: false, activeAccountId: active,
+      accounts: ["Default login", "Work", "Personal"].map((label) => {
+        const id = label === "Default login" ? "codex:default" : `codex:${label}`;
+        return { id, label, isDefault: id === "codex:default", homePath: id === "codex:default" ? null : `/homes/${label}`, active: id === active, sameAsDefault: false,
+          login: { status: "signed-in", identity: null, error: null, checkedAt: null }, measured: [], limits: null };
+      }) }] });
+  let put = null;
+  let held = null;
+  route = async (url, init) => {
+    if (url.pathname === "/api/provider-accounts/active" && init?.method === "PUT") {
+      active = JSON.parse(init.body).accountId;
+      const value = listing();
+      put = deferred();
+      return put.promise.then(() => response(value));
+    }
+    if (url.pathname !== "/api/provider-accounts") return response({});
+    const value = listing();
+    if (held) return held.promise.then(() => response(value));
+    return response(value);
+  };
+  const onError = (error) => { throw error; };
+  const render = (accountsVersion) => root.render(<TooltipProvider><ProviderAccounts open runtimeEvent={null} accountsVersion={accountsVersion} onError={onError} /></TooltipProvider>);
+  render(0);
+  const activeLabel = () => [...host.querySelectorAll(".provider-accounts strong")].find((line) => line.textContent.endsWith("(active)"))?.textContent ?? "";
+  const use = (label) => [...host.querySelectorAll("button")].find((button) => button.getAttribute("aria-label") === `Use ${label} for new Codex sessions`);
+  await until(() => activeLabel() === "Codex · Default login (active)" && use("Work"), "the default login is active");
+  use("Work").click();
+  await until(() => put, "the switch to Work was sent");
+  // Another client switches to Personal; its change reloads this listing.
+  active = "codex:Personal";
+  render(1);
+  await until(() => activeLabel() === "Codex · Personal (active)", "the other client's switch is shown");
+  put.resolve();
+  // Its announcement does not claim an account the shown listing contradicts.
+  await until(() => host.querySelector('[role="status"]')?.textContent === "Switched to Work, but a later change made Personal active for new Codex sessions.",
+    `the delayed switch response is announced against the shown listing: ${host.querySelector('[role="status"]')?.textContent}`);
+  await settle();
+  assert(activeLabel() === "Codex · Personal (active)", `a response computed before the newer listing replaced it: ${activeLabel()}`);
+
+  // A load that starts while a switch is pending and answers after it is kept.
+  put = null;
+  use("Work").click();
+  await until(() => put, "the second switch was sent");
+  held = deferred();
+  active = "codex:default";
+  render(2);
+  await settle();
+  put.resolve();
+  await until(() => host.querySelector('[role="status"]')?.textContent === "Codex now starts new sessions with Work.", "the second switch response arrived");
+  held.resolve();
+  held = null;
+  await until(() => activeLabel() === "Codex · Default login (active)", "the load computed after the switch is shown");
+}
+
+// A switch hands focus to the account's Check only if focus is still on its
+// Use button; focus moved elsewhere while it was pending stays there.
+async function providerAccountsSwitchFocusRegression() {
+  root.render(null); await settle();
+  let active = "codex:default";
+  const listing = () => ({ generatedAt: new Date().toISOString(), limitStaleAfterMs: 1_800_000,
+    providers: [{ provider: "codex", label: "Codex", kind: "harness", homeVariable: "CODEX_HOME", switchable: true, usageLimits: false, activeAccountId: active,
+      accounts: ["Default login", "Work"].map((label) => {
+        const id = label === "Default login" ? "codex:default" : `codex:${label}`;
+        return { id, label, isDefault: id === "codex:default", homePath: id === "codex:default" ? null : `/homes/${label}`, active: id === active, sameAsDefault: false,
+          login: { status: "signed-in", identity: null, error: null, checkedAt: null }, measured: [], limits: null };
+      }) }] });
+  let put = null;
+  route = async (url, init) => {
+    if (url.pathname === "/api/provider-accounts/active" && init?.method === "PUT") {
+      active = JSON.parse(init.body).accountId;
+      const value = listing();
+      put = deferred();
+      return put.promise.then(() => response(value));
+    }
+    if (url.pathname !== "/api/provider-accounts") return response({});
+    return response(listing());
+  };
+  const onError = (error) => { throw error; };
+  root.render(<TooltipProvider><ProviderAccounts open runtimeEvent={null} onError={onError} /></TooltipProvider>);
+  const button = (label) => [...host.querySelectorAll("button")].find((entry) => entry.getAttribute("aria-label") === label);
+  const status = () => host.querySelector('[role="status"]')?.textContent;
+  await until(() => button("Use Work for new Codex sessions"), "the default login is active");
+  button("Use Work for new Codex sessions").focus();
+  button("Use Work for new Codex sessions").click();
+  await until(() => put, "the switch to Work was sent");
+  // The next account's name is typed while the switch is pending.
+  const name = host.querySelector('[aria-label="Account name"]');
+  name.focus();
+  put.resolve();
+  await until(() => status() === "Codex now starts new sessions with Work.", "the switch response arrived");
+  await settle();
+  assert(document.activeElement === name, `focus was taken from the account name to ${document.activeElement?.getAttribute("aria-label") ?? document.activeElement?.tagName}`);
+
+  // Focus left on Use follows the switched account to its Check.
+  put = null;
+  button("Use Default login for new Codex sessions").focus();
+  button("Use Default login for new Codex sessions").click();
+  await until(() => put, "the switch back was sent");
+  put.resolve();
+  await until(() => status() === "Codex now starts new sessions with Default login.", "the switch back arrived");
+  await settle();
+  assert(document.activeElement === button("Check Codex account Default login"), "focus on Use continues on the switched account's Check");
 }
 
 async function settingsCapacityAndDeletionOrderRegression() {
@@ -4536,6 +4754,63 @@ async function backgroundCompletionKeepsExplicitPageRegression() {
   await until(() => !host.querySelector('.history-return') && host.querySelector('[data-message-id="pending-999"]'), "explicit latest page committed");
 }
 
+async function queuedRunAccountRegression() {
+  root.render(null); await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const queued = { id: "run-queued", conversationId: "chat-A", provider: "codex", status: "queued", createdAt: new Date(0).toISOString(), accountId: null, accountLabel: null, accountIdentity: null };
+  const launched = { ...queued, accountId: "account-work", accountLabel: "Work", accountIdentity: "work@example.com" };
+  let detail = { ...chats.A, runs: [queued] };
+  let detailReads = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") { detailReads += 1; return response(detail); }
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  const summary = () => host.querySelector(".conversation-header .conversation-meta small:not(.conversation-account)")?.textContent ?? "";
+  const account = () => host.querySelector(".conversation-header .conversation-account");
+  await until(() => summary().startsWith("queued"), "the queued run is shown");
+  assert(!account(), "a queued run has no account yet");
+  const reads = detailReads;
+  const send = (data) => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(data) }));
+  send({ type: "run.event", conversationId: "chat-A", runId: "run-queued",
+    payload: { type: "run.started", payload: { provider: "codex", account: { id: "account-work", label: "Work", identity: "work@example.com" } } } });
+  await until(() => account()?.textContent === "codex · Work (work@example.com)", "the started run names its account before it ends");
+  assert(detailReads === reads, "the account is applied without reloading the conversation");
+  // The run summary is hidden at 920px and below; the latest run's account
+  // stays visible and exposed while history is read and after a run that
+  // gave no answer.
+  const visible = (state) => {
+    const bounds = account()?.getBoundingClientRect();
+    assert(account()?.checkVisibility() && bounds.width > 0 && bounds.height > 0, `the run's account is not visible at 900px ${state}`);
+    assert(account().textContent === "codex · Work (work@example.com)", `the header names another account ${state}: ${account()?.textContent}`);
+  };
+  if (window.__fixtureSetViewport) {
+    try {
+      await window.__fixtureSetViewport(900);
+      await until(() => window.innerWidth === 900, "real 900px layout");
+      window.dispatchEvent(new Event("resize"));
+      await settle();
+      assert(!host.querySelector(".conversation-header .conversation-meta small:not(.conversation-account)")?.checkVisibility(), "the header run summary is hidden at 900px");
+      visible("while it runs");
+      const earlier = { id: "earlier-1", role: "assistant", kind: "text", body: "Earlier answer", payload: {}, createdAt: new Date(0).toISOString() };
+      detail = { ...chats.A, runs: [{ ...launched, status: "running" }], messages: [earlier],
+        messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 2, total: 3, beforeId: earlier.id } };
+      send({ type: "runtime.connected", payload: { replay: { missed: true } } });
+      await until(() => host.querySelector(".history-forward") && !host.querySelector(".message.is-streaming"), "earlier history is read during the run");
+      visible("while earlier history is read");
+      detail = { ...chats.A, runs: [{ ...launched, status: "completed" }], messages: [] };
+      send({ type: "run.event", conversationId: "chat-A", runId: "run-queued", payload: { type: "run.completed", payload: {} } });
+      await until(() => host.querySelector(".history-return"), "the reader can return to the latest messages");
+      host.querySelector(".history-return").click();
+      await until(() => !host.querySelector(".history-forward") && !host.querySelector(".message.is-streaming") && host.querySelector(".conversation-header .conversation-meta small:not(.conversation-account)")?.textContent.startsWith("completed"), "the run ends with no answer");
+      visible("after a run with no answer");
+    } finally { await window.__fixtureSetViewport(1280); }
+  } else assert(account()?.textContent === "codex · Work (work@example.com)", "the running run names its account");
+  root.render(null); await settle();
+}
+
 async function checkpointReadingPageRegression() {
   root.render(null); await settle();
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
@@ -5869,6 +6144,12 @@ try {
     ["bootstrap error ownership", bootstrapRefreshErrorOwnershipRegression, "a background bootstrap cannot dismiss an unrelated operation error"],
     ["settings migration completion", settingsMigrationCompletionRegression, "an open Settings dialog refreshes capacity when migration finishes"],
     ["settings live capacity", settingsCapacityWithoutEventRegression, "an open Settings dialog reads another client's quota changes without a capacity event"],
+    ["provider accounts window aging", providerAccountsWindowAgingRegression, "an open account list drops a run that leaves the 5-hour window without any event"],
+    ["provider accounts failed reload", providerAccountsFailedReloadRegression, "a failed reload marks an expired measured total out of date, and account changes reload without the runtime event"],
+    ["provider accounts add keeps newer draft", providerAccountsAddKeepsNewerDraftRegression, "a successful add clears only the draft it submitted"],
+    ["provider accounts response order", providerAccountsResponseOrderRegression, "a delayed account action response never replaces a listing computed after it"],
+    ["provider accounts switch focus", providerAccountsSwitchFocusRegression, "a switch moves focus only from its own Use button"],
+    ["queued run account", queuedRunAccountRegression, "a run queued without an account names the account its launch reports before it ends, at every width, while history is read and with no answer"],
     ["settings capacity and deletion order", settingsCapacityAndDeletionOrderRegression, "new capacity wins reordered responses and deletion owns its confirmation"],
     ["settings template completion", settingsTemplateCompletionRegression, "a successful template POST clears its submitted draft after reopening"],
     ["notification permission rejection", rejectedNotificationPermissionRegression, "a rejected permission request does not disrupt Settings save or escape as an unhandled rejection"],
