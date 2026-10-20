@@ -729,6 +729,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
   let browser;
   let devtools;
   let failure;
+  const foreignPages = [];
 
   try {
     phase = "wait for Vite";
@@ -799,8 +800,16 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     await send("Runtime.addBinding", { name: "__requestFixtureViewport" });
     await send("Runtime.addBinding", { name: "__requestFixtureKey" });
     await send("Runtime.addBinding", { name: "__requestFixtureWheel" });
+    await send("Runtime.addBinding", { name: "__requestFixtureForeground" });
     await send("Page.addScriptToEvaluateOnNewDocument", { source: `
       window.__fixtureWheelCap = ${Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) || 0};
+      // Headless Chrome on macOS can route an unconsumed fixture key to a
+      // browser shortcut that opens chrome://settings/help over this tab.
+      // A hidden page paints no frames, so restore it. Fixtures that model a
+      // hidden page override document.hidden, not the real visibility state.
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") window.__requestFixtureForeground("");
+      });
       window.__fixtureSetViewport = (width) => new Promise((resolve) => {
         const ready = (event) => {
           if (event.detail !== width) return;
@@ -859,6 +868,15 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       }
       if (event.method !== "Runtime.bindingCalled") return;
       (async () => {
+        if (event.params.name === "__requestFixtureForeground") {
+          const pages = await (await fetch(`http://127.0.0.1:${debugPort}/json/list`, { signal: AbortSignal.timeout(Math.min(5000, remaining())) })).json();
+          for (const page of pages.filter((candidate) => candidate.type === "page" && candidate.url.startsWith("chrome://"))) {
+            foreignPages.push(page.url);
+            await fetch(`http://127.0.0.1:${debugPort}/json/close/${page.id}`, { signal: AbortSignal.timeout(Math.min(5000, remaining())) });
+          }
+          await send("Page.bringToFront");
+          return;
+        }
         if (event.params.name === "__requestFixtureWheel") {
           const wheel = JSON.parse(event.params.payload);
           const configuredCap = Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP);
@@ -904,9 +922,11 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     if (!process.env.OUTRIGHT_UI_STEP) assert.ok(performanceFixture, "large fixture measurements were not recorded");
     if (performanceFixture) console.log(`UI performance: ${performanceFixture[1]}`);
     if (!process.env.OUTRIGHT_UI_STEP) console.log(`UI fixture timings: ${fixtureProgress(state)}`);
+    if (foreignPages.length) console.log(`UI fixture restored its tab after the browser opened: ${foreignPages.join(", ")}`);
     if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
   } catch (error) {
-    failure = new Error(`UI fixture ${phase}: ${error.message}`, { cause: error });
+    const restored = foreignPages.length ? `; restored its tab after the browser opened ${foreignPages.join(", ")}` : "";
+    failure = new Error(`UI fixture ${phase}: ${error.message}${restored}`, { cause: error });
   } finally {
     try {
       await cleanupResources([
