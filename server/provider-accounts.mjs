@@ -635,15 +635,28 @@ export function createProviderAccounts({ database, publish = () => {}, probe = d
     activate,
     resolve,
     assertLaunchable,
+    // A queued launch's final, synchronous resolve: it must still be the
+    // account and login key assertLaunchable checked (`checked`).
+    resolveChecked(target, checked) {
+      const account = resolve(target);
+      if (account.id !== checked.id || account.home !== checked.home) {
+        throw accountError(409, `This run's account changed while ${checked.label}'s login was being checked, so the run did not start. Check it in Settings, then send again.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
+      }
+      return account;
+    },
     // The last check before a launch spawns: the account resolved for it
-    // (resolve) still has the login key it was resolved with. A removed
-    // account is refused when the launch is recorded.
+    // (resolve) still has the login key it was resolved with, and no check
+    // since has found that login signed out. A removed account is refused
+    // when the launch is recorded.
     confirmLaunch(account) {
       const current = findAccount(account.id);
       if (!current) return;
       const home = loginKey(current, adapterFor(account.provider));
       if (home !== account.home) {
         throw accountError(409, `${account.label}'s directory changed while this run was launching: it led to ${parseLogin(account.home).home} and now leads to ${parseLogin(home).home}, so the run did not start.`, "PROVIDER_ACCOUNT_UNAVAILABLE");
+      }
+      if (checkedLogin(current, home)?.status === "signed-out") {
+        throw accountError(409, `${account.label} was found signed out while this run was launching, so the run did not start. Sign in, refresh it in Settings, then send again.`, "PROVIDER_ACCOUNT_SIGNED_OUT");
       }
     },
     // A run's account was recorded with its launch, so that account's

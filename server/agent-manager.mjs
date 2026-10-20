@@ -922,6 +922,10 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     }
     const authorize = await validateConversation(fresh);
     if (state.stopped || shuttingDown) return null;
+    // A login found signed out while the run waited is checked again, as a
+    // send is, and refuses the run before anything is written.
+    const checked = accounts ? await accounts.assertLaunchable(accountTarget(entry, fresh)) : null;
+    if (state.stopped || shuttingDown) return null;
     const current = database.getConversation(fresh.id);
     if (!current || ["projectId", "worktreeId", "worktreePath"].some((key) => current[key] !== fresh[key])
       || (entry.run.worktreePath && current.worktreePath !== entry.run.worktreePath)) {
@@ -939,14 +943,22 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     // an edit made while it waited to launch outranks it.
     const recoverySession = entry.providerSessionId !== undefined || entry.forceFreshSession;
     state.sessionEpoch = recoverySession ? entry.conversation?.sessionEpoch : current.sessionEpoch;
-    if (entry.providerSessionId !== undefined) state.conversation = { ...current, providerSessionId: entry.providerSessionId };
-    else if (entry.forceFreshSession || current.provider !== entry.run.provider) state.conversation = { ...current, providerSessionId: null };
-    else state.conversation = current;
+    state.conversation = { ...current, providerSessionId: launchSessionId(entry, current) };
     // The launch boundary: a recovery keeps its durable pin, a resumed
     // session keeps its account, anything else uses the active one. A removed
-    // account fails the run.
-    if (accounts) state.account = accounts.resolve({ provider: entry.run.provider, conversationId: current.id, sessionId: state.conversation.providerSessionId, pin: accountPin(entry.run) });
+    // account fails the run, and so does one other than the account and
+    // login key checked above.
+    if (accounts) state.account = accounts.resolveChecked(accountTarget(entry, current), checked);
     return { authorize };
+  }
+
+  function launchSessionId(entry, conversation) {
+    if (entry.providerSessionId !== undefined) return entry.providerSessionId;
+    return entry.forceFreshSession || conversation.provider !== entry.run.provider ? null : conversation.providerSessionId;
+  }
+
+  function accountTarget(entry, conversation) {
+    return { provider: entry.run.provider, conversationId: conversation.id, sessionId: launchSessionId(entry, conversation), pin: accountPin(entry.run) };
   }
 
   async function handleQueuedLaunchError(state, error) {

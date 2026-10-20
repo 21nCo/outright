@@ -281,6 +281,84 @@ test("a cached sign-out is checked again before a send is refused", async (t) =>
   assert.equal((await accounts.assertLaunchable({ provider: "claude", conversationId: chat.id })).id, "claude:default");
 });
 
+test("a queued run whose login is found signed out while it waits never launches, and one found signed in again does", async (t) => {
+  let duringLaunch = null;
+  const context = await fixture(t, { launchCommand: () => duringLaunch?.() });
+  const { accounts, database, logins, manager, spawned, workHome } = context;
+  const work = await addWork(context);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  const measured = () => context.claude().accounts.find((account) => account.id === work.id).measured[1].runs;
+  const refused = (run, message, launched) => {
+    assert.equal(spawned.length, launched, "nothing spawned");
+    const row = database.getRun(run.id);
+    assert.equal(row.status, "failed");
+    assert.match(row.error, message);
+    assert.deepEqual([row.startedAt ?? null, row.accountId], [null, null], "no launching marker and no account record");
+    assert.equal(measured(), launched, "the refused run is not measured");
+  };
+  // Each run waits for capacity behind one running in the same worktree.
+  const blocker = context.claudeRun(context.conversation().id);
+  await manager.schedule({ conversation: database.getConversation(blocker.conversationId), run: blocker });
+  const chat = context.conversation();
+  const queued = context.claudeRun(chat.id);
+  await manager.schedule({ conversation: chat, run: queued });
+  assert.equal(database.getRun(queued.id).status, "queued");
+  logins.set(workHome, signedOut);
+  await accounts.refresh(work.id);
+  await context.finish(0);
+  refused(queued, /Work is signed out/, 1);
+
+  // A sign-in made with the CLI after a check found the run's login signed
+  // out is found by the check at dequeue.
+  logins.set(workHome, signedIn("work@example.com"));
+  await accounts.refresh(work.id);
+  const next = context.claudeRun(context.conversation().id);
+  await manager.schedule({ conversation: database.getConversation(next.conversationId), run: next });
+  assert.equal(spawned.length, 2);
+  const again = context.claudeRun(context.conversation().id);
+  await manager.schedule({ conversation: database.getConversation(again.conversationId), run: again });
+  logins.set(workHome, signedOut);
+  await accounts.refresh(work.id);
+  logins.set(workHome, signedIn("work@example.com"));
+  await context.finish(1);
+  assert.equal(spawned.length, 3);
+  assert.equal(spawned[2].env.CLAUDE_CONFIG_DIR, workHome);
+  assert.deepEqual([database.getRun(again.id).accountId, database.getRun(again.id).accountHome], [work.id, keyOf(workHome)]);
+  await context.finish(2);
+
+  // A sign-out found while the launch command is built refuses it too.
+  duringLaunch = async () => { duringLaunch = null; logins.set(workHome, signedOut); await accounts.refresh(work.id); };
+  const late = context.claudeRun(context.conversation().id);
+  await manager.schedule({ conversation: database.getConversation(late.conversationId), run: late });
+  refused(late, /Work was found signed out while this run was launching/, 3);
+});
+
+test("a queued recovery whose pinned login is found signed out is refused, not moved to the active account", async (t) => {
+  const context = await fixture(t);
+  const { accounts, database, logins, manager, spawned, workHome } = context;
+  const work = await addWork(context);
+  await accounts.activate({ provider: "claude", accountId: work.id });
+  const chat = context.conversation();
+  const first = context.claudeRun(chat.id);
+  await manager.schedule({ conversation: chat, run: first });
+  await context.finish(0, "session-1");
+  await accounts.activate({ provider: "claude", accountId: "claude:default" });
+  const blocker = context.claudeRun(context.conversation().id);
+  await manager.schedule({ conversation: database.getConversation(blocker.conversationId), run: blocker });
+  database.updateRun(first.id, { status: "interrupted" });
+  const recovery = database.beginInterruptedRunRecovery(first.id, "resume-session", { providerSessionId: "session-1" });
+  await manager.schedule({ conversation: database.getConversation(chat.id), run: recovery.run, providerSessionId: "session-1" });
+  assert.equal(database.getRun(recovery.run.id).status, "queued");
+  logins.set(workHome, signedOut);
+  await accounts.refresh(work.id);
+  await context.finish(1);
+  assert.equal(spawned.length, 2, "nothing launched with the active account instead");
+  const row = database.getRun(recovery.run.id);
+  assert.equal(row.status, "failed");
+  assert.match(row.error, /Work is signed out/);
+  assert.deepEqual([row.startedAt ?? null, row.accountId], [null, null]);
+});
+
 test("account homes are validated and only display identity is kept", async (t) => {
   const context = await fixture(t);
   const { accounts, root, logins } = context;
