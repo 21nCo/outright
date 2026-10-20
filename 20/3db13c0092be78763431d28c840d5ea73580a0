@@ -1,0 +1,35 @@
+server/execution-adapters/codex.mjs
+  s_e1c5fc1a65c0cf::t_919d065502966f 3-20,23-26,63-66,69
+docs/out-28-provider-accounts.md
+  s_1900bb15a7199a::t_526a5b1cd85039 21
+docs/out-3-execution-adapters.md
+  s_1900bb15a7199a::t_a6477cbe271f04 47
+server/execution-adapters.test.mjs
+  s_1900bb15a7199a::t_d15d011325a573 828-838,881-882,884
+server/provider-accounts.test.mjs
+  s_1900bb15a7199a::t_367bd74916827a 31-38,40,45,1106-1145
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "203db13c0092be78763431d28c840d5ea73580a0",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_e1c5fc1a65c0cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13e18-4241-7662-a24f-782076addabe",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
