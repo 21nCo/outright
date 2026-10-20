@@ -1,0 +1,23 @@
+server/terminal-broker.test.mjs
+  s_1900bb15a7199a::t_17e45879e39903 254,260-261,265,271-273,276-277,285-295
+tests/ui-races.jsx
+  s_1900bb15a7199a::t_3e9e0d172cac5f 35-36
+tests/ui-races.test.mjs
+  s_1900bb15a7199a::t_340ab22b50e922 732,803,806-812,871-879,925,928-929
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6a675a02394a0943927e6f31d2314e032a577747",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
