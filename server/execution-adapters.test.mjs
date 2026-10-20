@@ -825,6 +825,17 @@ test("harness logins are read from each CLI's status without credentials", () =>
   assert.doesNotMatch(JSON.stringify(parseCodex("Logged in using an API key - sk-proj-***ABCD")), /sk-/);
   assert.equal(parseCodex("Not logged in").signedIn, false);
   assert.equal(parseCodex("Something else"), null);
+  // Every line `codex login status` prints in 0.162.1. Workload identity is
+  // read only from the environment, so it is never a home's own login.
+  const codexStatus = [["Logged in using workload identity", true, false, "workload-identity"], ["Logged in using ChatGPT", true, true, "chatgpt"],
+    ["Logged in using an API key - sk-proj-***ABCD", true, true, "api-key"], ["Logged in using access token", true, true, "access-token"],
+    ["Logged in using personal access token", true, true, "personal-access-token"], ["Logged in using Amazon Bedrock API key", true, true, "bedrock-api-key"],
+    ["Logged in using Amazon Bedrock AWS access keys", true, true, "bedrock-access-keys"], ["Not logged in", false, false, null]];
+  for (const [line, ...expected] of codexStatus) {
+    const identity = parseCodex(`${line}\r\n`);
+    assert.deepEqual([identity?.signedIn, identity?.ownLogin, identity?.method], expected, line);
+  }
+  for (const line of ["Error checking login status: token file missing", "Unexpected error retrieving API key: denied", "Logged in using a future method"]) assert.equal(parseCodex(line), null, line);
   assert.deepEqual([claude.accounts.homeVariable, codex.accounts.homeVariable, anthropic.accounts], ["CLAUDE_CONFIG_DIR", "CODEX_HOME", null]);
   assert.deepEqual([claude.accounts.standardHome, codex.accounts.standardHome], [".claude", ".codex"]);
   const accounts = { homeVariable: "FIXTURE_HOME", standardHome: ".fixture", identityArgs: ["status"], parseIdentity: () => null, credentialVariables: ["FIXTURE_*", "OTHER_TOKEN"],
@@ -867,9 +878,10 @@ test("harness logins are read from each CLI's status without credentials", () =>
     .map(codex.accounts.isCredential), [true, true, true, true, true, false, false]);
   assert.deepEqual([codex.accounts.overridesLogin("OPENAI_API_KEY"), codex.accounts.overridesLogin("CODEX_ACCESS_TOKEN")], [false, true]);
   // Claude Code's status command reports every source that signs it in;
-  // `codex login status` reports neither of Codex's keys from the environment.
+  // `codex login status` reports CODEX_ACCESS_TOKEN and workload identity,
+  // but not CODEX_API_KEY.
   assert.deepEqual(claudeSources.filter(claude.accounts.isUnreported), []);
-  assert.deepEqual(["CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BASE_URL", "OPENAI_FEDERATION_RULE_ID"].map(codex.accounts.isUnreported), [true, true, false, false]);
+  assert.deepEqual(["CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BASE_URL", "OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE"].map(codex.accounts.isUnreported), [true, false, false, false, false]);
 });
 
 test("an account's home reaches only its own launch, and only under its own variable", () => {

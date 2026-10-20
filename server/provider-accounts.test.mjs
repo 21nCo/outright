@@ -28,12 +28,21 @@ function claudeEnvironmentLogin(environment) {
   return null;
 }
 
+// What `codex login status` 0.162.1 prints for a source in its environment
+// it reports: either workload identity marker, set even if empty, or an
+// access token. It ignores CODEX_API_KEY.
+function codexEnvironmentLogin(environment) {
+  if ("OPENAI_FEDERATION_RULE_ID" in environment || "OPENAI_IDENTITY_TOKEN_FILE" in environment) return "Logged in using workload identity";
+  return environment.CODEX_ACCESS_TOKEN ? "Logged in using access token" : null;
+}
+
 // Answers an identity check by the account home the probe would run with,
-// or for Claude by a source in its environment that signs it in.
+// or by a source in its environment that signs the CLI in.
 function fakeProbe(logins) {
   const calls = [];
   const probe = async (executable, options) => {
     calls.push({ executable, ...options });
+    if (executable === "codex" && codexEnvironmentLogin(options.environment)) return codexEnvironmentLogin(options.environment);
     const fromEnvironment = executable === "claude" ? claudeEnvironmentLogin(options.environment) : null;
     if (fromEnvironment) return JSON.stringify(fromEnvironment);
     const login = logins.get(options.environment[executable === "claude" ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME"] ?? "unset");
@@ -1092,6 +1101,46 @@ test("an endpoint or selector alone keys the default login but never signs a sig
   const chat = context.conversation();
   assert.equal(context.accounts.resolve({ provider: "claude", conversationId: chat.id }).home, `ANTHROPIC_BASE_URL:${keyOf(context.inheritedHome)}`);
   assert.equal((await context.accounts.assertLaunchable({ provider: "claude", conversationId: chat.id })).identity, "me@example.com");
+});
+
+test("a Codex workload identity signs in only the default login, and every other login Codex reports is a home's own", async (t) => {
+  const sources = { OPENAI_FEDERATION_RULE_ID: "rule-secret", OPENAI_IDENTITY_TOKEN_FILE: "/run/token-secret" };
+  const context = await fixture(t, { extraEnvironment: sources });
+  const { accounts, database, logins, probe, root } = context;
+  const listed = () => accounts.list().providers.find((item) => item.provider === "codex").accounts;
+  const add = async (label, login) => {
+    const home = path.join(root, `codex-${label}`);
+    mkdirSync(home);
+    logins.set(home, login);
+    await accounts.add({ provider: "codex", label, homePath: home });
+    return listed().find((account) => account.label === label);
+  };
+  // An added account's check runs without the workload identity sources,
+  // so Codex reports the login stored in its directory.
+  const work = await add("Work", "Logged in using personal access token");
+  await accounts.activate({ provider: "codex", accountId: work.id });
+  assert.equal(database.activeProviderAccountId("codex"), work.id);
+  const workCheck = probe.calls.findLast((call) => call.executable === "codex" && call.environment.CODEX_HOME);
+  assert.ok(!Object.keys(sources).some((name) => name in workCheck.environment), "the added account's check runs without the sources");
+  assert.deepEqual([listed().find((account) => account.id === work.id).login.status, listed().find((account) => account.id === work.id).login.identity.method], ["signed-in", "personal-access-token"]);
+
+  // Workload identity reported for an added account comes from outside its directory.
+  const foreign = await add("Foreign", "Logged in using workload identity");
+  await assert.rejects(accounts.activate({ provider: "codex", accountId: foreign.id }), (error) => error.details.code === "PROVIDER_ACCOUNT_SWITCH_FAILED");
+  assert.equal(listed().find((account) => account.id === foreign.id).login.status, "signed-out");
+  assert.equal(database.activeProviderAccountId("codex"), work.id, "the selection is kept");
+
+  // The default login is checked with the sources set, and Codex reports the workload identity.
+  await accounts.activate({ provider: "codex", accountId: "codex:default" });
+  assert.equal(database.activeProviderAccountId("codex"), "codex:default");
+  const login = listed()[0].login;
+  assert.deepEqual([login.status, login.identity.method, login.identity.variable], ["signed-in", "workload-identity", "OPENAI_FEDERATION_RULE_ID+OPENAI_IDENTITY_TOKEN_FILE"]);
+  const defaultCheck = probe.calls.findLast((call) => call.executable === "codex" && !call.environment.CODEX_HOME);
+  assert.deepEqual([defaultCheck.environment.OPENAI_FEDERATION_RULE_ID, defaultCheck.environment.OPENAI_IDENTITY_TOKEN_FILE], ["rule-secret", "/run/token-secret"]);
+  const chat = database.createConversation({ projectId: "p", worktreeId: root, worktreePath: root, title: "codex", provider: "codex" });
+  assert.match(accounts.resolve({ provider: "codex", conversationId: chat.id }).home, /^OPENAI_FEDERATION_RULE_ID\+OPENAI_IDENTITY_TOKEN_FILE:/);
+  await accounts.assertLaunchable({ provider: "codex", conversationId: chat.id });
+  assert.ok(!/secret/.test(JSON.stringify(accounts.list())), "the sources are named, never their values");
 });
 
 test("every Claude Code provider switch is a credential source, and a login key names each one set", async (t) => {

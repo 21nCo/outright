@@ -44,7 +44,7 @@ The Anthropic runner sends its key only to the configured endpoint. That endpoin
 
 | Adapter | Kind | Supported versions | Notes |
 | --- | --- | --- | --- |
-| `codex` | harness | 0.162.1 up to, but not including, 1.0.0 | Sandbox modes map one-to-one. Resume uses `exec resume` with a config override for the sandbox. Only `command_execution`, `file_change`, `mcp_tool_call` and `web_search` items become tool events; reasoning, plans and other items stay `provider.event`. |
+| `codex` | harness | 0.162.1 up to, but not including, 1.0.0 | Sandbox modes map one-to-one. Resume uses `exec resume` with a config override for the sandbox. Only `command_execution`, `file_change`, `mcp_tool_call` and `web_search` items become tool events; reasoning, plans and other items stay `provider.event`. Every success line of `codex login status` is recognized; workload identity is read only from the environment, so it signs in the default login and never an added account. |
 | `claude` | harness | 2.1.296 up to, but not including, 3.0.0 | Policies map to `plan`, `acceptEdits` and `bypassPermissions`. |
 | `anthropic-api` | direct-provider | runner 1.x | Requires `OUTRIGHT_ANTHROPIC_API_KEY`. `OUTRIGHT_ANTHROPIC_BASE_URL` optionally overrides the endpoint. It is read-only because it has no tools, does not resume, uses the model's default effort and accepts only https or loopback endpoints. |
 
