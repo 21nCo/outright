@@ -251,26 +251,30 @@ test("a slow broker reader backpressures sustained PTY output without losing its
           waiters.add(wake);
         });
       }
-      assert.ok(condition(), `${label}; broker closed=${closed}, output=${dataBytes}, ${shellState()}, stderr=${stderr}`);
+      assert.ok(condition(), `${label}; broker closed=${closed}, output=${dataBytes}, tail=${JSON.stringify(recentData)}, ${shellState()}, stderr=${stderr}`);
     };
     socket.write(`${JSON.stringify({ type: "start", token, shell: process.execPath,
       cwd: directory, env: process.env, cols: 80, rows: 24 })}\n`);
     await until(() => received.includes("ready"), "PTY did not become ready");
 
+    // A full read window proves this reader has stopped pulling output, so
+    // the broker is held behind it. Resume before the burst can finish.
     socket.pause();
     socket.write(`${JSON.stringify({ type: "write",
       data: 'process.stdout.write("x".repeat(8*1024*1024)); console.log("OUTRIGHT_"+"BURST_DONE")\r' })}\n`);
-    await until(() => socket.readableLength > 0, "paused broker reader did not buffer output");
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await until(() => socket.readableLength >= socket.readableHighWaterMark, "paused broker reader did not fill its read window");
     assert.equal(closed, false, `slow reader disconnected its broker: ${stderr}`);
     socket.resume();
     await until(() => received.includes("OUTRIGHT_BURST_DONE"), "burst did not finish");
     assert.ok(dataBytes > 1024 * 1024, "the fixture did not sustain enough PTY output to backpressure the socket");
 
+    // Stay silent until the shell's whole burst has been written. It is far
+    // larger than every buffer, so the broker has shed output and is still
+    // waiting on this reader; later input cannot reach the shell mid-burst.
     socket.pause();
     socket.write(`${JSON.stringify({ type: "write",
-      data: 'process.stdout.write("\\u001b[31m"+"c".repeat(8*1024*1024))\r' })}\n`);
-    await new Promise((resolve) => setTimeout(resolve, 4000));
+      data: 'process.stdout.write("\\u001b[31m"+"c".repeat(8*1024*1024)); require("fs").writeFileSync("burst-written", "")\r' })}\n`);
+    await until(() => existsSync(path.join(directory, "burst-written")), "shell did not finish its burst behind a silent reader");
     // This input arrives while the client is still silent. It must wait for
     // the same drain boundary as the output, then reach the live shell once.
     socket.write(`${JSON.stringify({ type: "write", data: 'console.log("OUTRIGHT_"+"LATER")\r' })}\n`);
@@ -278,7 +282,17 @@ test("a slow broker reader backpressures sustained PTY output without losing its
     await until(() => omissionReset, "shed colored output did not reset styling before its notice");
     await until(() => received.includes("OUTRIGHT_LATER"), "shell did not accept later input");
     socket.write(`${JSON.stringify({ type: "write", data: "process.exit(0)\r" })}\n`);
-    await until(() => received.includes("shell-exited"), "shell exit was not delivered");
+    try { await until(() => received.includes("shell-exited"), "shell exit was not delivered"); }
+    catch (error) {
+      // Stop the shell outside its PTY. The broker's shell-exit event then
+      // records whether the exit input reached the PTY or is still queued.
+      const pid = Number(/"shellPid":(\d+)/.exec(stderr)?.[1]);
+      if (pid > 0) try { process.kill(pid); } catch {}
+      const expires = Date.now() + 3000;
+      while (!stderr.includes('"broker":"shell-exit"') && Date.now() < expires) await new Promise((resolve) => setTimeout(resolve, 25));
+      error.message += `; after stopping the shell: ${stderr}`;
+      throw error;
+    }
     const exitDeadline = Date.now() + 5000;
     while (!brokerExited && Date.now() < exitDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
     assert.equal(brokerExited, true, "broker process did not exit after its shell exited");

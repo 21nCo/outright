@@ -32,7 +32,8 @@ function terminalReady(name) { return host.querySelector('.terminal-tabs[aria-bu
 async function until(check, label) {
   const deadline = performance.now() + 5000;
   while (!check()) {
-    if (performance.now() > deadline) throw new Error(`Timed out: ${label}`);
+    // A hidden page paints no frames, so frame-driven focus cannot settle.
+    if (performance.now() > deadline) throw new Error(`Timed out: ${label}; page ${document.visibilityState}`);
     await frame();
   }
 }
