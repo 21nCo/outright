@@ -315,8 +315,12 @@ test("a slow broker reader backpressures sustained PTY output without losing its
     const exitDeadline = Date.now() + 5000;
     while (!brokerExited && Date.now() < exitDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
     assert.equal(brokerExited, true, "broker process did not exit after its shell exited");
-    // The shell finished a 2 MiB burst behind a silent reader, so the broker
-    // must have paused and shed output during that span.
+    // These counts are lifetime totals, so the 8 MiB first burst can satisfy
+    // them; they are only a cumulative sanity floor. The burst-scoped notice
+    // check above (reset at the silent span's start, after 4096 of its own
+    // "c" characters) is what proves the silent burst was shed. A notice
+    // proves omitted output, not a pause: truncating a chunk over 64 KiB
+    // emits one too.
     const counts = JSON.parse(/\{"broker":"shell-exit"[^\n]*/.exec(stderr)?.[0] ?? "null");
     assert.ok(counts, `broker did not report its shell exit: ${stderr}`);
     assert.ok(counts.pauses >= 1, `broker did not pause behind a silent reader: ${stderr}`);
