@@ -935,7 +935,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         return json(response, 200, { trusted: false });
       }
 
-      if (url.pathname === "/api/terminals" && request.method === "GET") return json(response, 200, { terminals: terminals.list() });
+      if (url.pathname === "/api/terminals" && request.method === "GET") return json(response, 200, { terminals: terminals.list(), history: terminals.historyStatus?.() ?? null });
       if (url.pathname === "/api/terminals" && request.method === "POST") {
         const body = await readJson(request);
         if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.cwd !== "string" || !body.cwd

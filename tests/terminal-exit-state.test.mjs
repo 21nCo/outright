@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { pruneExitedIds } from "../src/lib/terminal-exit-state.js";
+import { preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabLabel } from "../src/lib/terminal-exit-state.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
 
 test("audit failure fences terminal commands before a later runtime event or React commit", () => {
@@ -32,4 +32,32 @@ test("exited identities are pruned across repeated closes without dropping a pen
   }
   pruneExitedIds(exited, [{ id: "active" }], null);
   assert.equal(exited.size, 0, "Closed or finished pending terminals retained their exit identities");
+});
+
+test("saved sessions are labelled by how they ended and never as running", () => {
+  const restarted = { id: "a", name: "Server", status: "ended", endReason: "restart", exitCode: null };
+  const exited = { id: "b", name: "Build", status: "ended", endReason: "exit", exitCode: 7 };
+  assert.equal(terminalEndLabel(restarted), "ended when Outright restarted");
+  assert.equal(terminalEndLabel(exited), "process exited 7");
+  assert.equal(terminalTabLabel(restarted), "Server, saved output, ended when Outright restarted");
+  assert.equal(terminalTabLabel(exited), "Build, saved output, process exited 7");
+  for (const label of [terminalTabLabel(restarted), terminalTabLabel(exited)]) assert.doesNotMatch(label, /running|resum/i);
+  const relaunched = { id: "c", name: "Server", status: "running", relaunchedFrom: "a" };
+  assert.equal(terminalTabLabel(relaunched), "Server, new shell");
+  assert.equal(terminalTabLabel({ ...relaunched, status: "exited", exitCode: 0 }), "Server, new shell, process exited 0");
+  assert.equal(terminalTabLabel({ id: "d", name: "Shell", status: "running" }), "Shell");
+});
+
+test("reopening a worktree shows live work first and otherwise the newest saved session without starting a shell", () => {
+  const older = { id: "old", status: "ended", endedAt: "2026-10-20T00:00:00.000Z" };
+  const newer = { id: "new", status: "ended", endedAt: "2026-10-21T00:00:00.000Z" };
+  const unknown = { id: "unknown", status: "unknown" };
+  const running = { id: "running", status: "running" };
+  assert.equal(preferredTerminal([older, newer]), newer);
+  assert.equal(preferredTerminal([newer, older]), newer);
+  assert.equal(preferredTerminal([older, unknown]), unknown, "a saved session hid an unverified prior-run owner");
+  assert.equal(preferredTerminal([older, unknown, running]), running);
+  assert.equal(preferredTerminal([older, running], "old"), older, "a selected saved session was replaced on refresh");
+  assert.equal(preferredTerminal([{ id: "gone", status: "exited" }]), null);
+  assert.equal(preferredTerminal([]), null);
 });
