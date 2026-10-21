@@ -14,6 +14,8 @@ import { TerminalPane } from "../src/components/TerminalPane.jsx";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
 import { scheduleLayoutTick } from "../src/lib/windowing.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
+import { savedPagesAt, savedPageText } from "../src/lib/terminal-exit-state.js";
+import { Terminal } from "@xterm/xterm";
 import "../src/styles.css";
 
 const host = document.getElementById("root");
@@ -2581,10 +2583,12 @@ async function terminalSavedPagingRegression(reservation = false) {
   lines[0] = "FIRST saved line\r\n";
   // A full-screen program ended by a full reset: the output before and after
   // it stays readable, the program's screen does not.
-  lines[1] = "BEFORE reset line\x1b[?1049hFULLSCREEN\x1bcAFTER reset line\r\n";
+  // The reset also ends a line-drawing character set.
+  lines[1] = "BEFORE reset line\x1b(0\x1b[?1049hFULLSCREEN\x1bcAFTER reset line\r\n";
   // A rendition set on the first page and never reset is in effect on every later page.
   lines[2] = "\x1b[31mRED saved line\r\n";
-  lines[lines.length - 1] = "LAST saved line\r\n";
+  // The saved label reads as plain text after output that left modes on.
+  lines[lines.length - 1] = "LAST saved line\r\n\x1b(0\x1b[4h";
   const saved = reservation
     ? { id: "term-L", name: "Terminal recovery required", cwd: "/fixture/A", pid: 4242, status: "unknown", createdAt: null, recoveryReservation: true }
     : savedTerminal("term-L", "Long", "exit", 0, "2026-10-21T01:00:00.000Z");
@@ -2604,6 +2608,7 @@ async function terminalSavedPagingRegression(reservation = false) {
   const control = (name) => [...host.querySelectorAll('.terminal-saved-bar button')].find((button) => button.textContent === name);
   const part = () => /Part (\d+) of (\d+)/.exec(host.querySelector('.terminal-saved-bar')?.textContent ?? "");
   await until(() => output().includes("LAST saved line"), "newest saved output shown");
+  assert(output().includes("[saved output; "), "The saved label was drawn in the modes saved output left on");
   assert(part() && part()[1] === part()[2] && Number(part()[2]) > 1, "Long saved output is not paged");
   assert(control("Later output").getAttribute("aria-disabled") === "true", "The newest page offers later output");
   if (reservation) {
@@ -2634,6 +2639,57 @@ async function terminalSavedPagingRegression(reservation = false) {
   assert(topRow().querySelector("span")?.classList.contains("xterm-fg-1"), "The rendition set on an earlier page was lost at the next page start");
   assert(details === 1, `Paging re-read the session ${details} times`);
   assert(!sent.length && !errors.length, "Paging saved output sent a command or failed");
+}
+
+// Saved output that sets terminal modes reads in the view as the terminal
+// showed it. The oracle is xterm itself: the view of a stream equals the raw
+// output before a full reset followed by the raw stream, whose real reset
+// clears everything earlier. Pages render together as one continuous view.
+async function terminalSavedModesRegression() {
+  const render = async (data) => {
+    // The saved view's options in the pane.
+    const xterm = new Terminal({ rows: 24, cols: 80, convertEol: true, scrollback: 10_000, scrollOnEraseInDisplay: true });
+    await new Promise((resolve) => xterm.write(data, resolve));
+    const rows = [];
+    for (let index = 0; index < xterm.buffer.active.length; index += 1) {
+      const text = xterm.buffer.active.getLine(index).translateToString(true);
+      if (text.trim()) rows.push(text);
+    }
+    xterm.dispose();
+    return rows;
+  };
+  // Each page replaces the view with a full reset, as the pane writes it.
+  const view = async (buffer, starts) => (await Promise.all(savedPagesAt(buffer, starts).map((page) => render(`\x1bc${savedPageText(buffer, page)}`)))).flat();
+  // Overwritten lines show insert mode; wrapped lines show line wrapping.
+  const row = (name, index) => `${name} ${String(index).padStart(3, "0")} line${index % 2 ? "" : ` ${"=".repeat(80)}`}`;
+  const lines = (name, count) => Array.from({ length: count }, (_, index) => `########\r${row(name, index)}\r\n`).join("");
+  const lineStarts = (buffer, from, to) => [...buffer.slice(from, to).matchAll(/\n/g)].map((match) => from + match.index + 1).filter((_, index) => index % 9 === 4);
+  const same = (actual, expected, label) => assert(JSON.stringify(actual) === JSON.stringify(expected), `${label}: ${JSON.stringify(actual.slice(0, 3))} ... differs from ${JSON.stringify(expected.slice(0, 3))} ...`);
+  const modes = { margins: "\x1b[5;20r", origin: "\x1b[?6h", insert: "\x1b[4h", nowrap: "\x1b[?7l", "line drawing": "\x1b(0", "shift out": "\x1b)0\x0e" };
+  // Absolute rows after the output show whether origin mode survived the reset.
+  const probe = "\x1b[2J\x1b[HROW1\r\nROW2\r\nROW3\x1b[3;22r\x1b[1;1HO\x1b[r";
+  for (const [name, mode] of Object.entries(modes)) {
+    // A mode on before a full reset in saved output.
+    const pre = lines("pre", 30) + mode;
+    const reset = `${pre}\x1bc${lines("post", 60)}`;
+    const buffer = reset + probe;
+    const shown = await view(buffer, [0]);
+    same(shown, [...await render(pre), ...await render(buffer)], `${name} before a reset`);
+    const post = shown.filter((text) => text.startsWith("post "));
+    assert(post.length === 60 && post.every((text, index) => text === row("post", index).slice(0, 80)),
+      `${name} before a reset hid or redrew later saved lines`);
+    for (const split of [pre.length - mode.length, pre.length, pre.length + 2, ...lineStarts(reset, 0, reset.length)]) {
+      same(await view(buffer, [0, split]), shown, `${name} before a reset, paged at ${split}`);
+    }
+    // A mode on where a page opens.
+    const opened = `${mode === modes.margins ? "\x1b[1;20r" : mode}${lines("mid", 40)}`;
+    const stream = `${opened}\x1bc${lines("post", 5)}`;
+    const continuous = await view(stream, [0]);
+    same(continuous, [...await render(opened), ...await render(stream)], `${name} on through the output`);
+    for (const split of [opened.length - lines("mid", 40).length, ...lineStarts(opened, 0, opened.length)]) {
+      same(await view(stream, [0, split]), continuous, `${name} on where a page opens at ${split}`);
+    }
+  }
 }
 
 async function terminalCloseHistoryFailureRegression() {
@@ -6570,6 +6626,7 @@ try {
     ["terminal listing adds sessions", terminalListingAddsSessionsRegression, "a re-list adds new live sessions and late reservations without a remount"],
     ["terminal saved paging", terminalSavedPagingRegression, "all saved output beyond one view is reachable a page at a time, earliest first line shown"],
     ["terminal reservation paging", () => terminalSavedPagingRegression(true), "a reservation's saved output is paged read-only to its first and last lines"],
+    ["terminal saved modes", terminalSavedModesRegression, "saved output that sets terminal modes renders as the terminal showed it, whole and paged"],
     ["terminal close history failure", terminalCloseHistoryFailureRegression, "a close whose saved output cannot be deleted shows it ended and read-only"],
     ["terminal fenced saved session", terminalFencedSavedSessionRegression, "a saved status from the server wins over the page audit fence"],
     ["terminal selection during reconnect", terminalSelectionReconnectRegression, "selected terminal and output survive a reconnect while its buffer is pending"],

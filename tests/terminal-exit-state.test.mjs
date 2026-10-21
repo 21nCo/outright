@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { escapeSpans, preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabLabel, savedOutputPages, savedPageProjection, savedPageText } from "../src/lib/terminal-exit-state.js";
+import { escapeSpans, PLAIN_TEXT, preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabLabel, savedOutputPages, savedPagesAt, savedPageProjection, savedPageText } from "../src/lib/terminal-exit-state.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
 
 test("audit failure fences terminal commands before a later runtime event or React commit", () => {
@@ -100,7 +100,7 @@ test("saved output pages never split an escape sequence and carry the rendition 
   assert.deepEqual([first[3], second[3], second[2]], [false, true, "\x1b[34m"], "a page opened inside the alternate screen lost its saved rendition");
   const text = pages(app).join("");
   assert.ok(text.includes("before") && text.includes("after") && !/FULLSCREEN|frame|\x1b\[\?1049|\x1b\[3J/.test(text), "alternate-screen output or a scrollback erase reached the saved view");
-  assert.equal(savedPageText("a\x1bcb", [0, 4]), "a\x1b[0m\x1b[H\x1b[2Jb", "a full reset inside saved output cleared the view's scrollback");
+  assert.equal(savedPageText("a\x1bcb", [0, 4]), `a\x1b[r\x1b[?6l${PLAIN_TEXT}\x1b[H\x1b[2Jb`, "a full reset inside saved output cleared the view's scrollback");
   function pages(buffer) { return savedOutputPages(buffer).map((page) => savedPageText(buffer, page)); }
 });
 
@@ -135,6 +135,28 @@ test("a full reset ends a full-screen program's hidden screen in the saved view"
   assert.match(savedPageText(app, pages[opened]), /normal after/, "a page opened inside the alternate screen hid output after a full reset");
 });
 
+test("a full reset in saved output ends every mode, and a page opens with the modes in effect", () => {
+  const reset = savedPageText("\x1bc", [0, 2]);
+  for (const sequence of ["\x1b[r", "\x1b[?6l", "\x1b[4l", "\x1b[?7h", "\x1b(B", "\x1b)B", "\x1b*B", "\x1b+B", "\x0f", "\x1b[0m", "\x1b[2J"]) {
+    assert.ok(reset.includes(sequence), `a saved full reset left ${JSON.stringify(sequence)} out`);
+  }
+  assert.ok(!reset.includes("\x1bc") && !reset.includes("\x1b[3J"), "a saved full reset cleared the view's scrollback");
+  const modes = "\x1b[5;20r\x1b[?6h\x1b[4h\x1b[?7l\x1b(0\x1b)0\x0e\x1b[31m";
+  const buffer = `a\r\n${modes}b\r\nc\r\n\x1b[3;2rd\r\n`;
+  const [, page] = savedPagesAt(buffer, [0, buffer.indexOf("c")]);
+  assert.equal(page[2], "\x1b(0\x1b)0\x0e\x1b[5;20r\x1b[?6h\x1b[4h\x1b[?7l\x1b[31m", "a page lost the modes set before it");
+  assert.equal(savedPagesAt(buffer, [0, buffer.indexOf("d")])[1][2], page[2], "refused margins replaced the margins in effect");
+  const ended = (sequence) => savedPagesAt(`${modes}${sequence}x`, [0, modes.length + sequence.length])[1][2];
+  assert.equal(ended("\x1bc"), "", "a full reset left a mode on");
+  assert.equal(ended("\x1b[!p\x0f"), "", "a soft reset left a mode on");
+  assert.equal(ended("\x1b[r\x1b[?6;7l\x1b[?7h\x1b[4l\x1b(B\x1b)B\x0f\x1b[m"), "", "turning each mode off left it on");
+  for (const screen of ["47", "1047", "1049"]) {
+    const app = `x\x1b[?${screen}h${modes}\x1b[?${screen}l`;
+    assert.equal(savedPagesAt(`${app}y`, [0, app.length])[1][2].replace("\x1b[31m", ""), "", `modes set on the alternate screen ${screen} reached the saved view`);
+  }
+  assert.equal(savedPagesAt("\x1b(0\x1bn\x1b*0zz", [0, 9])[1][2], "\x1b(0\x1b*0\x1bn", "a locking shift was lost");
+});
+
 test("saved pages project a generated stream exactly as one continuous view", () => {
   let seed = 7;
   const random = (count) => { seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648; return seed % count; };
@@ -145,11 +167,12 @@ test("saved pages project a generated stream exactly as one continuous view", ()
     let buffer = "";
     const visible = [];
     for (let step = 0; step < 60; step += 1) {
-      const choice = random(9);
+      const choice = random(10);
       if (choice === 0) { buffer += `\x1b[?${["47", "1047", "1049"][random(3)]}h`; alternate = true; }
       else if (choice === 1) { buffer += `\x1b[?${["47", "1047", "1049"][random(3)]}l`; alternate = false; }
       else if (choice === 2) { buffer += "\x1bc"; alternate = false; }
       else if (choice === 3) buffer += ["\x1b[31m", "\x1b[0m", "\x1b]0;t\x07", "\x1b[3J"][random(4)];
+      else if (choice === 4) buffer += ["\x1b[2;5r", "\x1b[r", "\x1b[?6h", "\x1b[4h", "\x1b[4l", "\x1b[?7l", "\x1b(0", "\x1b)0", "\x0e", "\x0f", "\x1b[!p"][random(11)];
       else {
         const token = `${alternate ? "H" : "V"}${step}.${round}${random(2) ? "\n" : " "}`;
         if (!alternate) visible.push(token.trim());
@@ -158,10 +181,13 @@ test("saved pages project a generated stream exactly as one continuous view", ()
     }
     const pages = savedOutputPages(buffer, 1 + random(40), 1 + random(4));
     const projections = pages.map((page) => savedPageProjection(buffer, page));
-    projections.slice(0, -1).forEach((projection, index) => assert.equal(projection.alternate, pages[index + 1][3], `round ${round}: page ${index} ends on another screen than the next starts`));
+    projections.slice(0, -1).forEach((projection, index) => {
+      assert.equal(projection.alternate, pages[index + 1][3], `round ${round}: page ${index} ends on another screen than the next starts`);
+      assert.deepEqual(projection.context.modes, pages[index + 1][4].modes, `round ${round}: page ${index} ends in other modes than the next starts`);
+    });
     const joined = projections.map((projection) => projection.text).join("");
     assert.equal(joined, savedPageProjection(buffer, [0, buffer.length]).text, `round ${round}: pages differ from one continuous projection`);
-    const plain = joined.replace(/\[[0-9;]*[mHJ]|\]0;t/g, " ");
+    const plain = joined.replace(/\[[0-9;?!]*[mHJrhlp]|\]0;t|[()*+][0B]/g, " ");
     assert.ok(!/H\d/.test(plain), `round ${round}: full-screen output reached the saved view`);
     let at = 0;
     for (const token of visible) {

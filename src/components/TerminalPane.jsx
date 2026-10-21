@@ -5,7 +5,7 @@ import { ArrowsClockwise, Plus, TerminalWindow, X } from "@phosphor-icons/react"
 import "@xterm/xterm/css/xterm.css";
 import { Button } from "@/components/ui/button";
 import { domId, nextTabIndex } from "@/lib/accessibility";
-import { preferredTerminal, pruneExitedIds, savedOutputPages, savedPageText, terminalEndLabel, terminalTabLabel } from "@/lib/terminal-exit-state";
+import { PLAIN_TEXT, preferredTerminal, pruneExitedIds, savedOutputPages, savedPageText, terminalEndLabel, terminalTabLabel } from "@/lib/terminal-exit-state";
 import { api } from "@/lib/runtime-api";
 
 const EMPTY_UNVERIFIED_IDS = new Set();
@@ -295,7 +295,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     // A screen erase in saved output scrolls it up instead of deleting it.
     if (xterm) Object.assign(xterm.options, { scrollback: SAVED_SCROLLBACK, scrollOnEraseInDisplay: true });
     const marker = view.marker && index <= 0 ? NEW_SHELL_MARKER : "";
-    const label = newest ? `\x1b[0m\r\n\x1b[90m[saved output; ${view.label}]\x1b[0m\r\n` : "";
+    // The label reads as plain text whatever modes the saved output left on.
+    const label = newest ? `${PLAIN_TEXT}\r\n\x1b[90m[saved output; ${view.label}]\x1b[0m\r\n` : "";
     const opened = () => { if (!newest && savedViewRef.current === view && view.generation === generation) xterm.scrollToTop(); };
     xterm?.write(CLEAR_VIEW + marker + savedPageText(view.buffer, view.pages[index] ?? [0, 0]) + label, opened);
     setSavedPage({ id: view.id, index, count: view.pages.length });

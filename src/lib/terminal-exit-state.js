@@ -41,9 +41,17 @@ const ESC = "\u001b";
 const STRING_INTRODUCERS = new Set(["]", "P", "X", "^", "_"]);
 const FULL_RESET = `${ESC}c`;
 const CLEAR_SCROLLBACK = `${ESC}[3J`;
-// A full reset in saved output clears the screen, which the read-only view
-// scrolls into its scrollback, so the output before it stays readable.
-const RESET_VIEW = `${ESC}[0m${ESC}[H${ESC}[2J`;
+const SHIFT_OUT = "\u000e";
+const SHIFT_IN = "\u000f";
+const DESIGNATORS = "()*+";
+const SHIFTS = ["", SHIFT_OUT, `${ESC}n`, `${ESC}o`];
+// Text written after saved output reads as plain text: no insert mode, line
+// wrapping on, ASCII in every character set and the default rendition.
+export const PLAIN_TEXT = `${ESC}[4l${ESC}[?7h${ESC}(B${ESC})B${ESC}*B${ESC}+B${SHIFT_IN}${ESC}[0m`;
+// A full reset in saved output resets every mode the view tracks, as the
+// reset did, and clears the screen, which the read-only view scrolls into its
+// scrollback, so the output before it stays readable.
+const RESET_VIEW = `${ESC}[r${ESC}[?6l${PLAIN_TEXT}${ESC}[H${ESC}[2J`;
 const ALT_SCREEN_MODES = new Set(["47", "1047", "1049"]);
 const SGR_OFF = { 22: ["1", "2"], 23: ["3"], 24: ["4"], 25: ["5"], 27: ["7"], 28: ["8"], 29: ["9"], 39: ["fg"], 49: ["bg"], 55: ["53"], 59: ["ul"] };
 const SGR_COLOR = { 38: "fg", 48: "bg", 58: "ul" };
@@ -107,30 +115,89 @@ function applySgr(state, params) {
   }
 }
 
-const freshContext = () => ({ state: new Map(), saved: null, alternate: false });
-const copyContext = ({ state, saved, alternate }) => ({ state: new Map(state), saved: saved && new Map(saved), alternate });
+const freshModes = () => ({ margins: "", origin: false, insert: false, nowrap: false, charsets: ["B", "B", "B", "B"], shift: 0 });
+const freshContext = () => ({ state: new Map(), saved: null, alternate: false, modes: freshModes() });
+const copyContext = ({ state, saved, alternate, modes }) => ({ state: new Map(state), saved: saved && new Map(saved), alternate, modes: { ...modes, charsets: [...modes.charsets] } });
 const sgr = (rendition) => rendition.size ? `${ESC}[${[...rendition.values()].join(";")}m` : "";
 
-// Follows the rendition and screen a sequence leaves in effect, and says
-// whether it reset the terminal or switched screens. The alternate screen
-// with mode 1049 restores the rendition it saved.
+// The sequences that restore the modes a page opens with after the view's
+// own full reset: character sets and shift, then scroll margins, origin,
+// insert and wrap modes.
+function modesText({ margins, origin, insert, nowrap, charsets, shift }) {
+  let text = charsets.map((set, slot) => set === "B" ? "" : `${ESC}${DESIGNATORS[slot]}${set}`).join("") + SHIFTS[shift];
+  if (margins) text += `${ESC}[${margins}r`;
+  if (origin) text += `${ESC}[?6h`;
+  if (insert) text += `${ESC}[4h`;
+  return nowrap ? `${text}${ESC}[?7l` : text;
+}
+
+// Scroll margins as set, or "" for the whole screen. Margins the terminal
+// refuses leave the previous ones in effect.
+function setMargins(modes, params) {
+  const [top = 0, bottom = 0] = params.split(";").map(Number);
+  if (bottom && Math.max(top, 1) >= bottom) return;
+  modes.margins = top > 1 || bottom ? params : "";
+}
+
+function setMode(modes, mode, on) {
+  if (mode === "?6") modes.origin = on;
+  else if (mode === "4") modes.insert = on;
+  else if (mode === "?7") modes.nowrap = !on;
+}
+
+// The alternate screen with mode 1049 restores the rendition it saved.
+function switchScreen(context, mode, enter) {
+  if (mode === "1049" && enter) context.saved = new Map(context.state);
+  else if (mode === "1049" && context.saved) Object.assign(context, { state: context.saved, saved: null });
+  context.alternate = enter;
+}
+
+function trackCsi(context, body) {
+  if (body === "!p") {
+    context.state.clear();
+    if (!context.alternate) context.modes = freshModes();
+    return "";
+  }
+  const csi = /^(\??)([0-9:;]*)([hlmr])$/.exec(body);
+  if (!csi) return "";
+  const [, prefix, params, final] = csi;
+  if (final === "m" || final === "r") {
+    if (!prefix && final === "m") applySgr(context.state, params);
+    else if (!prefix && !context.alternate) setMargins(context.modes, params);
+    return "";
+  }
+  let kind = "";
+  for (const mode of params.split(";")) {
+    if (prefix && ALT_SCREEN_MODES.has(mode)) {
+      switchScreen(context, mode, final === "h");
+      kind = "screen";
+    } else if (!context.alternate) setMode(context.modes, prefix + mode, final === "h");
+  }
+  return kind;
+}
+
+// Follows the rendition, screen and modes a sequence leaves in effect, and
+// says whether it reset the terminal or switched screens. Modes a full-screen
+// program sets on the alternate screen are not the saved view's.
 function trackSequence(context, sequence) {
   if (sequence === FULL_RESET) {
     Object.assign(context, freshContext());
     return "reset";
   }
-  const csi = sequence[1] === "[" && /^(\??)([0-9:;]*)([hlm])$/.exec(sequence.slice(2));
-  if (!csi) return "";
-  const modes = csi[2].split(";");
-  if (!csi[1] && csi[3] === "m") applySgr(context.state, csi[2]);
-  else if (csi[1] && csi[3] !== "m" && modes.some((mode) => ALT_SCREEN_MODES.has(mode))) {
-    const enter = csi[3] === "h";
-    if (modes.includes("1049") && enter) context.saved = new Map(context.state);
-    else if (modes.includes("1049") && context.saved) Object.assign(context, { state: context.saved, saved: null });
-    context.alternate = enter;
-    return "screen";
-  }
+  if (sequence[1] === "[") return trackCsi(context, sequence.slice(2));
+  if (context.alternate) return "";
+  const slot = DESIGNATORS.indexOf(sequence[1]);
+  if (slot >= 0 && sequence.length > 2) context.modes.charsets[slot] = sequence.slice(2);
+  else if (sequence === SHIFTS[2] || sequence === SHIFTS[3]) context.modes.shift = SHIFTS.indexOf(sequence);
   return "";
+}
+
+// Shift out and shift in are plain-text controls; the last one wins.
+function trackText(context, text) {
+  if (context.alternate) return;
+  const out = text.lastIndexOf(SHIFT_OUT);
+  const back = text.lastIndexOf(SHIFT_IN);
+  if (out !== back) context.modes.shift = out > back ? 1 : 0;
 }
 
 // A page boundary inside an escape sequence moves past it, or to its start
@@ -173,23 +240,39 @@ function pageStart(buffer, end, maxChars, maxLines) {
 // view keeps. It is shown in pages, newest last, each small enough that its
 // first line stays in the view's scrollback, and never starting inside an
 // escape sequence. Each page is [start, end, prefix, alternate, context]: the
-// rendition, screen and parser context the output before it leaves in effect.
+// modes, rendition, screen and parser context the output before it leaves in
+// effect.
 export function savedOutputPages(buffer, maxChars = 64_000, maxLines = 2_000) {
   const spans = escapeSpans(buffer);
-  const pages = [];
+  const starts = [];
   for (let end = buffer.length; end > 0;) {
     const start = outsideEscape(spans, pageStart(buffer, end, maxChars, maxLines), end);
-    pages.push([start, end]);
+    starts.push(start);
     end = start;
   }
-  pages.reverse();
+  return pagesFrom(buffer, spans, starts.reverse());
+}
+
+// Pages starting at the given ascending offsets, none inside an escape sequence.
+export function savedPagesAt(buffer, starts) {
+  return pagesFrom(buffer, escapeSpans(buffer), starts);
+}
+
+function pagesFrom(buffer, spans, starts) {
   const context = freshContext();
   let span = 0;
-  for (const page of pages) {
-    for (; span < spans.length && spans[span] < page[0]; span += 2) trackSequence(context, buffer.slice(spans[span], spans[span + 1]));
-    page.push(sgr(context.alternate && context.saved ? context.saved : context.state), context.alternate, copyContext(context));
-  }
-  return pages;
+  let from = 0;
+  return starts.map((start, index) => {
+    for (; span < spans.length && spans[span] < start; span += 2) {
+      trackText(context, buffer.slice(from, spans[span]));
+      trackSequence(context, buffer.slice(spans[span], spans[span + 1]));
+      from = spans[span + 1];
+    }
+    trackText(context, buffer.slice(from, start));
+    from = start;
+    const prefix = modesText(context.modes) + sgr(context.alternate && context.saved ? context.saved : context.state);
+    return [start, starts[index + 1] ?? buffer.length, prefix, context.alternate, copyContext(context)];
+  });
 }
 
 // What a sequence writes to the read-only view. Screen switches are dropped;
@@ -210,17 +293,23 @@ export function savedPageProjection(buffer, [start, end, , alternate = false, en
   let text = "";
   let from = 0;
   for (let index = 0; index < spans.length; index += 2) {
-    if (!context.alternate) text += page.slice(from, spans[index]);
+    text += visibleText(context, page.slice(from, spans[index]));
     const sequence = page.slice(spans[index], spans[index + 1]);
     const hidden = context.alternate;
     text += viewSequence(sequence, trackSequence(context, sequence), hidden, context);
     from = spans[index + 1];
   }
-  if (!context.alternate) text += page.slice(from);
-  return { text, alternate: context.alternate };
+  text += visibleText(context, page.slice(from));
+  return { text, alternate: context.alternate, context };
 }
 
-// The text a read-only page writes, its rendition carried in.
+function visibleText(context, text) {
+  if (context.alternate) return "";
+  trackText(context, text);
+  return text;
+}
+
+// The text a read-only page writes, its modes and rendition carried in.
 export function savedPageText(buffer, page) {
   return (page[2] ?? "") + savedPageProjection(buffer, page).text;
 }
