@@ -1,0 +1,33 @@
+server/outright-runtime.mjs
+  s_92427ff18a8304::t_841239f8586b69 1010
+server/terminal-history.mjs
+  s_92427ff18a8304::t_23ffc03fe32cdb 138,231-240,315-316,321,355,370,372-376,401-402
+server/terminal-history.test.mjs
+  s_92427ff18a8304::t_47b97b4f7c1ea1 2-5,428-432,459-460,464-548
+server/terminal-manager.mjs
+  s_92427ff18a8304::t_0731c1765130fe 32-41,107,141,319-321,323-324,336-337,339
+src/App.jsx
+  s_92427ff18a8304::t_53f8e9e882559d 91-93,658-659,1953
+src/components/TerminalPane.jsx
+  s_92427ff18a8304::t_9e4eebdbb6448f 33-40,57-59,127-128,130-131,169,217-218,281,283,324-331,337-338,342-382,390,416-425,482,484-492,509-515
+tests/ui-races.jsx
+  s_92427ff18a8304::t_1b527e6eb53b4b 2418,2421,2426-2427,2434-2435,2443,2447,2452-2456,2460-2592,3006-3008,6453-6455
+tests/ui-races.test.mjs
+  s_92427ff18a8304::t_529738bddc11e3 917
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3afcd03c6527fd5100a061abcfb927b7f2ad62c4",
+  "prompts": {},
+  "sessions": {
+    "s_92427ff18a8304": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26336501-b0e6-4534-a7c2-345f5528a4ba",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
