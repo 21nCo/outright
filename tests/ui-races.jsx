@@ -2520,6 +2520,79 @@ async function terminalSavedSessionSyncRegression() {
   assert(errors.length === 0, `Unexpected terminal errors: ${errors.join("; ")}`);
 }
 
+async function terminalListingAddsSessionsRegression() {
+  root.render(null);
+  await settle();
+  const live = (id, name) => ({ id, name, cwd: "/fixture/A", pid: 4100, status: "running", createdAt: "2026-10-21T00:00:00.000Z" });
+  const errors = [];
+  const details = [];
+  let posts = 0;
+  let listed = [live("term-A", "Shell")];
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") { posts += 1; return response({ error: "unexpected" }, 500); }
+    if (url.pathname === "/api/terminals") return response({ terminals: listed, history: { persistent: true, warning: null } });
+    details.push(url.pathname);
+    const item = listed.find((entry) => url.pathname.endsWith(entry.id));
+    return response({ ...item, buffer: "$ ", outputCursor: 1 });
+  };
+  let version = 0;
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} terminalsVersion={version}
+    onError={(error) => errors.push(error.message)} sendRuntime={() => {}} />);
+  show();
+  await until(() => terminalReady("Shell"), "first terminal selected");
+  // Another window starts a shell in this worktree.
+  listed = [...listed, live("term-B", "Other")];
+  version += 1;
+  show({ type: "terminals.changed" });
+  await until(() => host.querySelector('#terminal-tab-term-B'), "a newly listed terminal joins the tabs");
+  // The audit scan finds a prior-run owner awaiting proof.
+  listed = [...listed, { id: "term-C", name: "Terminal recovery required", cwd: "/fixture/A", pid: null, status: "unknown", createdAt: null, recoveryReservation: true }];
+  version += 1;
+  show({ type: "terminals.changed" });
+  await until(() => host.querySelector('#terminal-tab-term-C'), "a late recovery reservation joins the tabs");
+  assert(host.querySelector('[aria-label="Close terminal Terminal recovery required"]')?.disabled, "The reservation could be closed");
+  assert(terminalReady("Shell"), "New sessions changed the selection");
+  assert(details.length === 1 && posts === 0, `The pane remounted or relaunched: ${details.length} reads, ${posts} creates`);
+  assert(errors.length === 0, `Unexpected terminal errors: ${errors.join("; ")}`);
+}
+
+async function terminalSavedPagingRegression() {
+  root.render(null);
+  await settle();
+  const lines = Array.from({ length: 30_000 }, (_, index) => `saved line ${index}\r\n`);
+  lines[0] = "FIRST saved line\r\n";
+  lines[lines.length - 1] = "LAST saved line\r\n";
+  const saved = savedTerminal("term-L", "Long", "exit", 0, "2026-10-21T01:00:00.000Z");
+  const sent = [];
+  const errors = [];
+  let details = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/terminals") return response({ terminals: [saved], history: { persistent: true, warning: null } });
+    details += 1;
+    return response({ ...saved, buffer: lines.join(""), outputCursor: 0 });
+  };
+  root.render(<div className="fixture-terminal-frame" style={{ width: 360, height: 420 }}><TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null}
+    onError={(error) => errors.push(error)} sendRuntime={(message) => sent.push(message)} /></div>);
+  await until(() => terminalReady("LongSaved"), "long saved session selected");
+  const output = () => host.querySelector('.terminal-host').textContent;
+  const control = (name) => [...host.querySelectorAll('.terminal-saved-bar button')].find((button) => button.textContent === name);
+  const part = () => /Part (\d+) of (\d+)/.exec(host.querySelector('.terminal-saved-bar')?.textContent ?? "");
+  await until(() => output().includes("LAST saved line"), "newest saved output shown");
+  assert(part() && part()[1] === part()[2] && Number(part()[2]) > 1, "Long saved output is not paged");
+  assert(control("Later output").getAttribute("aria-disabled") === "true", "The newest page offers later output");
+  for (let step = 0; step < 100 && control("Earlier output").getAttribute("aria-disabled") !== "true"; step += 1) {
+    control("Earlier output").click();
+    await settle();
+  }
+  assert(part()?.[1] === "1", "Paging did not reach the earliest saved output");
+  await until(() => output().includes("FIRST saved line"), "earliest saved line shown");
+  assert(terminalStatusText().includes("part 1 of") && terminalStatusText().includes("the earliest"), "The earliest page was not announced");
+  control("Later output").click();
+  await until(() => part()?.[1] === "2", "later page shown");
+  assert(details === 1, `Paging re-read the session ${details} times`);
+  assert(!sent.length && !errors.length, "Paging saved output sent a command or failed");
+}
+
 async function terminalCloseHistoryFailureRegression() {
   root.render(null);
   await settle();
@@ -6451,6 +6524,8 @@ try {
     ["terminal saved session", terminalSavedSessionRegression, "saved output stays read-only, relaunches as a marked new shell and dismisses"],
     ["terminal reservation restored", terminalReservationRestoredRegression, "a reservation that becomes saved output updates in place and storage warnings announce once"],
     ["terminal saved session sync", terminalSavedSessionSyncRegression, "coalesced restores, eviction, expiry and dismissing an expired session converge with the server"],
+    ["terminal listing adds sessions", terminalListingAddsSessionsRegression, "a re-list adds new live sessions and late reservations without a remount"],
+    ["terminal saved paging", terminalSavedPagingRegression, "all saved output beyond one view is reachable a page at a time, earliest first line shown"],
     ["terminal close history failure", terminalCloseHistoryFailureRegression, "a close whose saved output cannot be deleted shows it ended and read-only"],
     ["terminal fenced saved session", terminalFencedSavedSessionRegression, "a saved status from the server wins over the page audit fence"],
     ["terminal selection during reconnect", terminalSelectionReconnectRegression, "selected terminal and output survive a reconnect while its buffer is pending"],

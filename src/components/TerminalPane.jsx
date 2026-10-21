@@ -5,11 +5,15 @@ import { ArrowsClockwise, Plus, TerminalWindow, X } from "@phosphor-icons/react"
 import "@xterm/xterm/css/xterm.css";
 import { Button } from "@/components/ui/button";
 import { domId, nextTabIndex } from "@/lib/accessibility";
-import { preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabLabel } from "@/lib/terminal-exit-state";
+import { preferredTerminal, pruneExitedIds, savedOutputPages, terminalEndLabel, terminalTabLabel } from "@/lib/terminal-exit-state";
 import { api } from "@/lib/runtime-api";
 
 const EMPTY_UNVERIFIED_IDS = new Set();
 const NEW_SHELL_MARKER = "\x1b[90m[new shell started; the saved session was not resumed]\x1b[0m\r\n";
+// A saved page has at most 2,000 line breaks and 64,000 characters, so even
+// double-width text wrapped at 20 columns fits this scrollback.
+const LIVE_SCROLLBACK = 5000;
+const SAVED_SCROLLBACK = 10_000;
 // One announcement per distinct storage condition for this page session.
 let announcedHistoryWarning = "";
 
@@ -59,6 +63,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
   const seenTerminalsVersionRef = useRef(terminalsVersion);
   const focusRequestRef = useRef(null);
   const terminalsRef = useRef([]);
+  const savedViewRef = useRef(null);
   const unverifiedTerminalIdsRef = useRef(unverifiedTerminalIds);
   unverifiedTerminalIdsRef.current = unverifiedTerminalIds;
   const worktreeNameRef = useRef(worktree.name);
@@ -69,6 +74,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
   const [activeId, setActiveId] = useState("");
   const [loading, setLoading] = useState(true);
   const [exitNotice, setExitNotice] = useState("");
+  const [savedPage, setSavedPage] = useState(null);
 
   useEffect(() => {
     const xterm = new Terminal({
@@ -78,7 +84,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       fontSize: 12,
       lineHeight: 1.25,
       screenReaderMode: true,
-      scrollback: 5000,
+      scrollback: LIVE_SCROLLBACK,
       theme: terminalTheme(),
     });
     const fit = new FitAddon();
@@ -217,24 +223,33 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       let status = detail.status ?? terminal.status;
       if (status !== "ended" && (pending.unknown || unverifiedTerminalIdsRef.current.has(terminal.id))) status = "unknown";
       const xterm = xtermRef.current;
-      xterm?.reset();
-      if (detail.relaunchedFrom ?? terminal.relaunchedFrom) xterm?.write(NEW_SHELL_MARKER);
-      if (detail.buffer) xterm?.write(detail.buffer);
+      const marker = Boolean(detail.relaunchedFrom ?? terminal.relaunchedFrom);
+      const savedLabel = status === "ended" ? terminalEndLabel(savedFields(detail, terminal)) : "";
       let displayedCursor = Number.isSafeInteger(detail.outputCursor) ? detail.outputCursor : 0;
-      for (const { cursor, data } of pending.chunks) {
-        if (!Number.isSafeInteger(detail.outputCursor) || !Number.isSafeInteger(cursor) || cursor > detail.outputCursor) xterm?.write(data);
-        if (Number.isSafeInteger(cursor)) displayedCursor = Math.max(displayedCursor, cursor);
+      if (savedLabel) {
+        const buffer = detail.buffer ?? "";
+        savedViewRef.current = { id: terminal.id, buffer, pages: savedOutputPages(buffer), marker, label: savedLabel };
+        showSavedPage(savedViewRef.current.pages.length - 1);
+      } else {
+        savedViewRef.current = null;
+        setSavedPage(null);
+        if (xterm) xterm.options.scrollback = LIVE_SCROLLBACK;
+        xterm?.reset();
+        if (marker) xterm?.write(NEW_SHELL_MARKER);
+        if (detail.buffer) xterm?.write(detail.buffer);
+        for (const { cursor, data } of pending.chunks) {
+          if (!Number.isSafeInteger(detail.outputCursor) || !Number.isSafeInteger(cursor) || cursor > detail.outputCursor) xterm?.write(data);
+          if (Number.isSafeInteger(cursor)) displayedCursor = Math.max(displayedCursor, cursor);
+        }
       }
       let exited = null;
       if (status !== "unknown" && status !== "ended") {
         if (pending.exit) exited = pending.exit;
         else if (status === "exited") exited = { exitCode: detail.exitCode };
       }
-      const savedLabel = status === "ended" ? terminalEndLabel(savedFields(detail, terminal)) : "";
       if (savedLabel) {
         inputReadyRef.current = false;
         awaitingVisibleFitRef.current = false;
-        xterm?.writeln(`\r\n\x1b[90m[saved output; ${savedLabel}]\x1b[0m`);
         stageTerminals(terminalsRef.current.map((item) => item.id === terminal.id ? { ...item, ...savedFields(detail, item) } : item));
       } else if (exited) {
         exitedIdsRef.current.add(terminal.id);
@@ -260,6 +275,34 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     } finally {
       if (pendingOutputRef.current === pending) pendingOutputRef.current = null;
     }
+  }
+
+  // Each page is written alone. An earlier page opens at its first line; the
+  // newest ends with the saved label.
+  function showSavedPage(index) {
+    const view = savedViewRef.current;
+    const xterm = xtermRef.current;
+    if (!view) return;
+    const [start, end] = view.pages[index] ?? [0, 0];
+    const newest = index >= view.pages.length - 1;
+    if (xterm) xterm.options.scrollback = SAVED_SCROLLBACK;
+    xterm?.reset();
+    if (view.marker && index <= 0) xterm?.write(NEW_SHELL_MARKER);
+    view.shown = index;
+    const opened = () => { if (!newest && savedViewRef.current === view && view.shown === index) xterm.scrollToTop(); };
+    xterm?.write(view.buffer.slice(start, end), opened);
+    if (newest) xterm?.writeln(`\r\n\x1b[90m[saved output; ${view.label}]\x1b[0m`);
+    setSavedPage({ id: view.id, index, count: view.pages.length });
+  }
+
+  function pageSavedOutput(step) {
+    const view = savedViewRef.current;
+    if (loading || !view || view.id !== activeIdRef.current || !savedPage) return;
+    const index = savedPage.index + step;
+    if (index < 0 || index >= view.pages.length) return;
+    showSavedPage(index);
+    const name = terminalsRef.current.find((item) => item.id === view.id)?.name ?? "Terminal";
+    setExitNotice(`${name} saved output, part ${index + 1} of ${view.pages.length}${index === 0 ? ", the earliest" : ""}`);
   }
 
   useEffect(() => {
@@ -343,11 +386,12 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     if (terminalsVersion === seenTerminalsVersionRef.current) return;
     seenTerminalsVersionRef.current = terminalsVersion;
     if (loadingRef.current || syncingRef.current) queuedSyncRef.current = true;
-    else syncListing();
+    else void syncListing();
   }, [terminalsVersion]);
 
   // Saved sessions and recovery reservations change on the server without a
-  // per-tab event. Re-list them all; live tabs keep following their events.
+  // per-tab event. The tabs become the server's listing: new sessions are
+  // added, gone ones removed, and live tabs keep following their events.
   async function syncListing() {
     if (!mountedRef.current) return;
     syncingRef.current = true;
@@ -359,11 +403,12 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       announceHistoryWarning(listing.history, onErrorRef.current);
       const listed = new Map(listing.terminals.filter((item) => item.cwd === worktree.path).map((item) => [item.id, item]));
       const active = terminalsRef.current.find((item) => item.id === activeIdRef.current);
+      const known = new Set(terminalsRef.current.map((item) => item.id));
       const next = terminalsRef.current.flatMap((item) => {
         const current = listed.get(item.id);
         if (!current) return [];
         return current.status === "ended" || item.status === "ended" || current.recoveryReservation || item.recoveryReservation ? [current] : [item];
-      });
+      }).concat([...listed.values()].filter((item) => !known.has(item.id)));
       const nextActive = next.find((item) => item.id === active?.id);
       stageTerminals(next);
       // The selected session changed underneath its view: read it again so
@@ -421,7 +466,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       reconcileConnection();
     } else if (queuedSyncRef.current) {
       queuedSyncRef.current = false;
-      syncListing();
+      void syncListing();
     }
   }
 
@@ -576,6 +621,11 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     </header>
     {activeSaved && <div className="terminal-saved-bar" role="group" aria-label="Saved terminal session">
       <span>Saved output, read-only: {terminalEndLabel(activeSaved)}.</span>
+      {savedPage?.id === activeSaved.id && savedPage.count > 1 && <>
+        <Button variant="ghost" size="xs" aria-disabled={loading || savedPage.index === 0 || undefined} onClick={() => pageSavedOutput(-1)}>Earlier output</Button>
+        <span>Part {savedPage.index + 1} of {savedPage.count}</span>
+        <Button variant="ghost" size="xs" aria-disabled={loading || savedPage.index === savedPage.count - 1 || undefined} onClick={() => pageSavedOutput(1)}>Later output</Button>
+      </>}
       <Button variant="outline" size="xs" aria-disabled={loading || undefined} onClick={() => startNewShell(activeSaved)}>Start new shell</Button>
     </div>}
     <div className="terminal-host" id="terminal-panel" ref={hostRef} role="tabpanel" aria-label="Active terminal output" aria-labelledby={activeId ? domId("terminal-tab", activeId) : undefined} aria-describedby="terminal-help" />

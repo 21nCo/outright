@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabLabel } from "../src/lib/terminal-exit-state.js";
+import { preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabLabel, savedOutputPages } from "../src/lib/terminal-exit-state.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
 
 test("audit failure fences terminal commands before a later runtime event or React commit", () => {
@@ -61,4 +61,18 @@ test("reopening a worktree shows live work first and otherwise the newest saved 
   assert.equal(preferredTerminal([older, running], "old"), older, "a selected saved session was replaced on refresh");
   assert.equal(preferredTerminal([{ id: "gone", status: "exited" }]), null);
   assert.equal(preferredTerminal([]), null);
+});
+
+test("saved output pages cover every character in order within the view's bounds", () => {
+  const cases = ["", "a\nb", "x".repeat(300_000), "\n".repeat(10_000), Array.from({ length: 30_000 }, (_, index) => `line ${index}\r\n`).join(""), `${"é😀".repeat(40_000)}\n`];
+  for (const buffer of cases) {
+    const pages = savedOutputPages(buffer, 64_000, 2_000);
+    assert.equal(pages.map(([start, end]) => buffer.slice(start, end)).join(""), buffer);
+    for (const [start, end] of pages) {
+      assert.ok(end > start && end - start <= 64_000);
+      assert.ok((buffer.slice(start, end).match(/\n/g) ?? []).length <= 2_000);
+      const code = buffer.charCodeAt(start);
+      assert.ok(!(code >= 0xdc00 && code <= 0xdfff), "a page split a surrogate pair");
+    }
+  }
 });

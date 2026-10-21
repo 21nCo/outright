@@ -112,7 +112,10 @@ export function probeWindowsHistoryAcl(directory, run = spawnSync) {
 // every item is owned by this user (or the elevated Administrators group the
 // user belongs to) and grants access to no principal beyond the hardened set.
 export function windowsAclPrivate(report, identity = null) {
-  const list = (value) => (Array.isArray(value) ? value : value == null ? [] : [value]);
+  const list = (value) => {
+    if (Array.isArray(value)) return value;
+    return value == null ? [] : [value];
+  };
   const user = identity?.user ?? report?.user;
   const groups = list(identity?.groups ?? report?.groups);
   const entries = list(report?.entries);
@@ -153,6 +156,7 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
   let closed = false;
   let warning = null;
   let stalledReported = false;
+  let stallWarning = null;
   let total = 0;
   // Files that could not be deleted (an antivirus or indexer lock, say) stay
   // charged against the global cap, and a live terminal's against its own
@@ -215,6 +219,25 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
 
   function retryResidue() {
     for (const [name, { bytes }] of residue) if (release(name, bytes)) residue.delete(name);
+    recoverStalled();
+  }
+
+  // Once a stalled terminal's undeleted output is gone it saves output again
+  // within its cap, and its warning clears when no terminal is still stalled.
+  function recoverStalled() {
+    if (!writable || closed) return;
+    for (const entry of entries.values()) {
+      if (!entry.stalled || undeletedSegments(entry)) continue;
+      entry.stalled = false;
+      if (entry.endedAt !== null) continue;
+      try { openSegment(entry); }
+      catch (error) { fail(error); return; }
+    }
+    if (!stalledReported || [...entries.values()].some((entry) => entry.stalled)) return;
+    stalledReported = false;
+    if (warning !== stallWarning) return;
+    warning = null;
+    try { onStatusChange?.({ persistent: true, warning }); } catch { /* status() is already current. */ }
   }
 
   function removeSegment(entry, index) {
@@ -236,6 +259,7 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     if (stalledReported) return;
     stalledReported = true;
     warning = stalledWarning(code);
+    stallWarning = warning;
     try { onStatusChange?.({ persistent: writable && !closed, warning }); } catch { /* The warning stays in status(). */ }
   }
 
@@ -371,18 +395,21 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     let meta = null;
     let metaBytes = 0;
     if (names.meta) {
-      try {
-        const buffer = readFileSync(file(`${id}.meta`));
-        const { records, torn } = decodeRecords(buffer, META_LIMIT);
-        if (records.length === 1 && !torn && records[0].type === META) {
-          meta = JSON.parse(records[0].payload.toString("utf8"));
-          metaBytes = buffer.length;
-        }
-      } catch { meta = null; }
+      // A failed read is a load failure that keeps every file; only
+      // metadata that was read and found invalid makes an orphan.
+      let buffer;
+      try { buffer = readFileSync(file(`${id}.meta`)); }
+      catch (error) { throw Object.assign(new Error("Terminal history metadata could not be read", { cause: error }), { code: error?.code, verification: true }); }
+      const { records, torn } = decodeRecords(buffer, META_LIMIT);
+      if (records.length === 1 && !torn && records[0].type === META) {
+        try { meta = JSON.parse(records[0].payload.toString("utf8")); } catch { meta = null; }
+        metaBytes = buffer.length;
+      }
     }
     const segments = names.segments.sort((a, b) => a.seq - b.seq);
-    if (!validMeta(meta, id)) {
-      // Metadata is written before any output, so this is an orphan.
+    // Metadata is written before any output, so without it this is an
+    // orphan. A closed marker is a user's removal that did not finish.
+    if (!validMeta(meta, id) || meta.end?.reason === "closed") {
       for (const segment of segments) discardFile(segmentName(id, segment.seq), segment.bytes);
       if (names.meta) discardFile(`${id}.meta`, sizes.get(`${id}.meta`));
       return;
@@ -545,6 +572,12 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
       const entry = entries.get(id);
       if (!entry) return false;
       if (!closed) retryResidue();
+      // A durable closed marker comes first, so a removal that fails below
+      // is finished by the next start instead of restored as a session.
+      if (writable && !closed) {
+        setEnd(entry, { reason: "closed" });
+        try { writeMeta(entry); } catch { /* The deletion below may still succeed. */ }
+      }
       let complete;
       try { complete = discard(entry); }
       catch (error) {

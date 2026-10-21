@@ -333,10 +333,15 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     const terminal = terminals.get(id);
     if (terminal) return { ...publicTerminal(terminal), buffer: terminal.buffer, outputCursor: terminal.outputCursor };
     const reservation = reservedUnknown.find((entry) => entry.target === id);
-    // Saved output restores the same tail a live terminal keeps for its pane.
+    // An unverified owner shows the tail a live terminal keeps. A saved
+    // session serves all of its output, at most the 2 MiB history cap; the
+    // pane pages through it.
     if (reservation) return { ...reservationTerminal(reservation), buffer: (history?.read(id) ?? "").slice(-maxBufferChars), outputCursor: 0 };
     const saved = savedSessions().find((entry) => entry.id === id);
-    return saved ? { ...listedSaved(saved), buffer: history.read(id).slice(-maxBufferChars), outputCursor: 0 } : null;
+    if (!saved) return null;
+    const listed = listedSaved(saved);
+    const buffer = history.read(id);
+    return { ...listed, buffer: listed.status === "ended" ? buffer : buffer.slice(-maxBufferChars), outputCursor: 0 };
   }
   function historyStatus() { return history?.status() ?? { persistent: false, warning: null }; }
   function relaunchSource(value) {
@@ -394,7 +399,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     // A user's close removes the history even when shutdown later joins or
     // retries it; only a shutdown-initiated close keeps it to restore.
     if (!shuttingDown) terminal.userClosed = true;
-    if (terminal.closePromise) return terminal.closePromise;
+    if (terminal.closePromise) return shuttingDown ? terminal.closePromise : reportCleanup(terminal);
     // An exit observed before the first close is the command's own end; any
     // exit after it comes from this termination, so it is not recorded.
     if (terminal.exitBeforeClose === undefined) {
@@ -425,14 +430,22 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
         terminal.closePromise = null;
         throw outcomeUnknown(error, evidence.operationId);
       }
-      // The process is gone. A failed history removal is reported: kept
-      // metadata leaves the session listed to dismiss again, and output left
-      // on disk stays charged against the quota until a retry deletes it.
-      if (terminal.userClosed) history?.remove(id);
-      else history?.finish(id, terminal.exitBeforeClose);
+      // The process is gone and its outcome recorded, which is all shutdown
+      // waits for. A failed history removal is reported to the user's close:
+      // kept metadata leaves the session listed to dismiss again, and output
+      // left on disk stays charged against the quota until a retry deletes it.
+      if (terminal.userClosed) {
+        try { history?.remove(id); } catch (error) { terminal.cleanupError = error; }
+      } else history?.finish(id, terminal.exitBeforeClose);
       return true;
     });
-    return terminal.closePromise;
+    return shuttingDown ? terminal.closePromise : reportCleanup(terminal);
+  }
+  function reportCleanup(terminal) {
+    return terminal.closePromise.then((closed) => {
+      if (terminal.cleanupError) throw terminal.cleanupError;
+      return closed;
+    });
   }
   // Reap every PTY even when storage is unavailable during archive maintenance.
   // A failed audit leaves terminal.created pending for lease-owned recovery.

@@ -804,7 +804,113 @@ test("a terminal that cannot delete its oldest output stops saving within its ow
   assert.equal(store.usage().undeleted, 0, "the locked output was not retried");
   assert.equal(store.usage().totalBytes, diskCharge(directory, limits.fileBytes), "usage differs from disk once the lock cleared");
   assert.ok(terminalBytes(directory, id) <= limits.terminalBytes);
+
+  // With the residue gone the terminal saves output again and the warning clears.
+  assert.equal(store.status().warning, null, "the stall warning outlived its cause");
+  assert.deepEqual(events.at(-1), { persistent: true, warning: null }, "clients were not told the stall cleared");
+  store.append(id, "saved after recovery\n");
+  for (let index = 0; index < 16; index += 1) store.append(id, "y".repeat(8 * 1024));
+  store.append(id, "newest after recovery\n");
+  assert.ok(terminalBytes(directory, id) <= limits.terminalBytes, "a recovered terminal grew past its cap");
+  assert.equal(store.usage().totalBytes, diskCharge(directory, limits.fileBytes));
   store.close();
+  const reopened = openTerminalHistory({ directory, limits });
+  assert.match(reopened.read(id), /newest after recovery\n$/, "output after recovery was not saved");
+  reopened.close();
+});
+
+test("a metadata read error keeps every history file and a later start restores the session", (t) => {
+  const { directory } = workspace(t);
+  const seed = openTerminalHistory({ directory });
+  const id = begin(seed);
+  seed.append(id, "kept through a read error\n");
+  seed.end(id, { exitCode: 3 });
+  seed.close();
+  const before = readdirSync(directory).sort();
+  const read = fs.readFileSync;
+  mock.method(fs, "readFileSync", (target, options) => {
+    if (String(target).endsWith(".meta")) throw Object.assign(new Error("I/O error"), { code: "EIO" });
+    return read(target, options);
+  });
+  syncBuiltinESMExports();
+  const restore = () => { mock.restoreAll(); syncBuiltinESMExports(); };
+  t.after(restore);
+  const failing = openTerminalHistory({ directory });
+  assert.equal(failing.status().persistent, false);
+  assert.match(failing.status().warning, /could not be loaded \(EIO\)/);
+  assert.deepEqual(failing.saved(), [], "a store that could not load served saved sessions");
+  failing.close();
+  assert.deepEqual(readdirSync(directory).sort(), before, "a read error deleted saved history");
+  restore();
+  const reopened = openTerminalHistory({ directory });
+  assert.deepEqual(reopened.saved().map(({ id: savedId, endReason, exitCode }) => [savedId, endReason, exitCode]), [[id, "exit", 3]]);
+  assert.equal(reopened.read(id), "kept through a read error\n");
+  reopened.close();
+});
+
+test("a close whose metadata cannot be deleted is finished by the next start, never restored as a restart", async (t) => {
+  const restore = () => { mock.restoreAll(); syncBuiltinESMExports(); };
+  t.after(restore);
+  const rm = fs.rmSync;
+  for (const kind of ["saved", "live"]) {
+    const { directory } = workspace(t);
+    const seed = openTerminalHistory({ directory });
+    const saved = begin(seed);
+    seed.append(saved, "dismissed\n");
+    seed.end(saved, { exitCode: 0 });
+    seed.close();
+    const { manager: terminals } = manager(openTerminalHistory({ directory }));
+    const id = kind === "saved" ? saved : terminals.create({ cwd: "/work/tree" }).id;
+    mock.method(fs, "rmSync", (target, options) => {
+      if (String(target).endsWith(".meta")) throw Object.assign(new Error("resource busy or locked"), { code: "EBUSY" });
+      return rm(target, options);
+    });
+    syncBuiltinESMExports();
+    await assert.rejects(terminals.close(id), (error) => error.statusCode === 503);
+    await terminals.shutdown();
+    restore();
+    const reopened = openTerminalHistory({ directory });
+    assert.equal(reopened.saved().some((entry) => entry.id === id), false, `a user-closed ${kind} session was restored after a failed deletion`);
+    assert.deepEqual(terminalFiles(directory, id), [], `the next start did not finish the ${kind} removal`);
+    reopened.close();
+  }
+});
+
+test("a user's close whose history cleanup fails still lets an overlapping shutdown succeed", async (t) => {
+  const { directory } = workspace(t);
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const store = openTerminalHistory({ directory });
+  const { manager: terminals } = manager(store, { terminate: () => held });
+  const terminal = terminals.create({ cwd: "/work/tree" });
+  const rm = fs.rmSync;
+  mock.method(fs, "rmSync", (target, options) => {
+    if (String(target).endsWith(".meta")) throw Object.assign(new Error("resource busy or locked"), { code: "EBUSY" });
+    return rm(target, options);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { mock.restoreAll(); syncBuiltinESMExports(); });
+  const closing = terminals.close(terminal.id);
+  const stopping = terminals.shutdown();
+  release();
+  await assert.rejects(closing, (error) => error.statusCode === 503, "the user's close hid the incomplete cleanup");
+  await stopping;
+  assert.equal(store.status().persistent, false);
+  assert.match(store.status().warning, /could not be saved \(EBUSY\)/, "the history status did not report the failed cleanup");
+});
+
+test("a restored session serves all of its saved output, beyond the live tail and the view's line limit", async (t) => {
+  const { directory } = workspace(t);
+  const first = manager(openTerminalHistory({ directory }));
+  const terminal = first.manager.create({ cwd: "/work/tree", name: "Long" });
+  const lines = Array.from({ length: 12_000 }, (_, index) => `saved line ${index}\n`);
+  for (let index = 0; index < lines.length; index += 1000) first.ptys[0].emit(lines.slice(index, index + 1000).join(""));
+  await first.manager.shutdown();
+  const second = manager(openTerminalHistory({ directory }));
+  const { buffer } = second.manager.get(terminal.id);
+  assert.ok(buffer.length > 150_000 && lines.length > 5000);
+  assert.equal(buffer, lines.join(""), "saved output kept within the cap was not restored in full");
+  await second.manager.shutdown();
 });
 
 test("an exit observed before shutdown is restored with its status, never as ended by restart", async (t) => {

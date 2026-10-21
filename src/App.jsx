@@ -97,7 +97,7 @@ export function App() {
   const [isNarrow, setIsNarrow] = useState(() => typeof window !== "undefined" && window.matchMedia("(max-width: 760px)").matches);
   const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === "undefined" || !window.matchMedia("(max-width: 760px)").matches);
   const [inspector, setInspector] = useState(null);
-  const [theme, setTheme] = useState(() => localStorage.getItem("outright.theme") || "system");
+  const [theme, setTheme] = useState(() => knownTheme(localStorage.getItem("outright.theme")));
   const [toast, setToast] = useState("");
   const [error, setError] = useState("");
   const [commandOpen, setCommandOpen] = useState(false);
@@ -839,7 +839,7 @@ export function App() {
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const apply = () => { const dark = theme === "dark" || (theme === "system" && media.matches); document.documentElement.classList.toggle("dark", dark); document.documentElement.style.colorScheme = dark ? "dark" : "light"; };
-    apply(); localStorage.setItem("outright.theme", theme); media.addEventListener("change", apply); return () => media.removeEventListener("change", apply);
+    apply(); localStorage.setItem("outright.theme", knownTheme(theme)); media.addEventListener("change", apply); return () => media.removeEventListener("change", apply);
   }, [theme]);
   useEffect(() => {
     const keyboard = (event) => {
@@ -2066,6 +2066,9 @@ function RunState({ run, outcomePending = false }) {
 }
 function GitHealth({ worktree }) { if (worktree.isPrunable) return <span className="git-health warning"><WarningCircle /></span>; if (worktree.changedCount) return <span className="git-health warning"><span className="status-dot demo" />{worktree.changedCount}</span>; return <span className="git-health clean"><Check /></span>; }
 function TemplateMenu({ templates, onSelect }) { if (!templates.length) return null; return <DropdownMenu><DropdownMenuTrigger render={<Button type="button" variant="ghost" size="icon-sm" aria-label="Prompt templates" />}><ClockCounterClockwise /></DropdownMenuTrigger><DropdownMenuContent align="start"><DropdownMenuGroup><DropdownMenuLabel>Prompt templates</DropdownMenuLabel>{templates.map((template) => <DropdownMenuItem key={template.id} onClick={() => onSelect(template.prompt)}>{template.title}</DropdownMenuItem>)}</DropdownMenuGroup></DropdownMenuContent></DropdownMenu>; }
+// Only a known theme name is read from or written to storage.
+const THEMES = Object.freeze({ light: "light", dark: "dark", system: "system" });
+function knownTheme(value) { return Object.hasOwn(THEMES, value) ? THEMES[value] : THEMES.system; }
 function ThemeMenu({ theme, onThemeChange }) { const Icon = theme === "light" ? Sun : theme === "dark" ? Moon : Desktop; return <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Change theme" />}><Icon /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup><DropdownMenuLabel>Appearance</DropdownMenuLabel></DropdownMenuGroup><DropdownMenuRadioGroup value={theme} onValueChange={onThemeChange}><DropdownMenuRadioItem value="system"><Desktop />System</DropdownMenuRadioItem><DropdownMenuRadioItem value="light"><Sun />Light</DropdownMenuRadioItem><DropdownMenuRadioItem value="dark"><Moon />Dark</DropdownMenuRadioItem></DropdownMenuRadioGroup></DropdownMenuContent></DropdownMenu>; }
 function SimpleDialog({ open, onOpenChange, title, description, onSubmit, submit, disabled, children }) { return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><form className="dialog-form" onSubmit={onSubmit}><DialogHeader><DialogTitle>{title}</DialogTitle><DialogDescription>{description}</DialogDescription></DialogHeader>{children}<DialogFooter><Button type="button" variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button><Button type="submit" disabled={disabled}>{submit}</Button></DialogFooter></form></DialogContent></Dialog>; }
 function LoadingScreen({ isScanning, error, onRetry }) { return <div className="loading-screen" role="status" aria-live="polite"><span className="brand-glyph"><Sparkle weight="fill" /></span><h1>Outright</h1>{error ? <><p role="alert">{error}</p><Button onClick={onRetry}>Retry</Button></> : <p>{isScanning ? "Starting the local runtime…" : "No projects found"}</p>}</div>; }

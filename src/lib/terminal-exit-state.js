@@ -36,3 +36,32 @@ export function preferredTerminal(terminals, previousId = "") {
   }
   return saved;
 }
+
+// Saved output can hold up to the 2 MiB history cap, more than one terminal
+// view keeps. It is shown in pages, newest last, each small enough that its
+// first line stays in the view's scrollback: at most maxLines line breaks and
+// maxChars characters, starting on a line boundary where one exists.
+export function savedOutputPages(buffer, maxChars = 64_000, maxLines = 2_000) {
+  const pages = [];
+  let end = buffer.length;
+  while (end > 0) {
+    const floor = Math.max(0, end - maxChars);
+    let start = floor;
+    let lines = 0;
+    for (let index = buffer.lastIndexOf("\n", end - 1); index >= floor; index = buffer.lastIndexOf("\n", index - 1)) {
+      lines += 1;
+      if (lines > maxLines) { start = index + 1; break; }
+      if (index === 0) break;
+    }
+    if (start === floor && start > 0) {
+      const lineStart = buffer.indexOf("\n", start) + 1;
+      if (lineStart > 0 && lineStart < end) start = lineStart;
+    }
+    // Never split a surrogate pair.
+    const code = buffer.charCodeAt(start);
+    if (start > 0 && start < end - 1 && code >= 0xdc00 && code <= 0xdfff) start += 1;
+    pages.push([start, end]);
+    end = start;
+  }
+  return pages.reverse();
+}
