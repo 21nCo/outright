@@ -776,3 +776,60 @@ test("quota eviction and retention expiry keep undeletable output charged and re
   assert.equal(store.usage().totalBytes, stopped, "a store over its cap kept writing");
   store.close();
 });
+
+test("a terminal that cannot delete its oldest output stops saving within its own cap and evicts no other session", (t) => {
+  const { directory } = workspace(t);
+  const limits = { ...TERMINAL_HISTORY_LIMITS, terminalBytes: 64 * 1024, totalBytes: 192 * 1024, fileBytes: 1024 };
+  const events = [];
+  const store = openTerminalHistory({ directory, limits, onStatusChange: (status) => events.push(status) });
+  const other = begin(store);
+  store.append(other, "o".repeat(16 * 1024));
+  store.end(other, { exitCode: 0 });
+  const locked = lockOutput(t);
+  const id = begin(store);
+  locked.add(id);
+  for (let index = 0; index < 128; index += 1) store.append(id, "x".repeat(8 * 1024));
+  assert.ok(terminalBytes(directory, id) <= limits.terminalBytes, `a locked terminal grew to ${terminalBytes(directory, id)} bytes on disk`);
+  assert.equal(store.has(other), true, "another saved session was evicted to make room for undeletable output");
+  assert.equal(events.length, 1, "the stalled terminal was not reported exactly once");
+  assert.match(events[0].warning, /could not be deleted \(EBUSY\)/);
+  assert.equal(store.status().persistent, true, "one locked terminal stopped every terminal's history");
+  assert.equal(store.usage().totalBytes, diskCharge(directory, limits.fileBytes), "usage differs from disk while output is locked");
+  const next = begin(store);
+  store.append(next, "still saved\n");
+  assert.match(store.read(next), /still saved/);
+
+  locked.clear();
+  store.sweep();
+  assert.equal(store.usage().undeleted, 0, "the locked output was not retried");
+  assert.equal(store.usage().totalBytes, diskCharge(directory, limits.fileBytes), "usage differs from disk once the lock cleared");
+  assert.ok(terminalBytes(directory, id) <= limits.terminalBytes);
+  store.close();
+});
+
+test("an exit observed before shutdown is restored with its status, never as ended by restart", async (t) => {
+  for (const settle of ["held", "failed"]) {
+    const { directory } = workspace(t);
+    let release = () => {};
+    const held = new Promise((resolve) => { release = resolve; });
+    // The exit's settle is still waiting for, or has failed, its proof when
+    // shutdown closes the terminal.
+    const terminate = async (terminal, options) => {
+      if (!options?.alreadyExited) return;
+      if (settle === "failed") throw new Error("empty-tree proof unavailable");
+      await held;
+    };
+    const { manager: terminals, ptys } = manager(openTerminalHistory({ directory }), { terminate });
+    const exited = terminals.create({ cwd: "/work/tree" });
+    const running = terminals.create({ cwd: "/work/tree" });
+    ptys[0].exit({ exitCode: 7, signal: 0 });
+    if (settle === "failed") await waitFor(() => terminals.get(exited.id).status === "unknown");
+    await terminals.shutdown();
+    release();
+    await new Promise((resolve) => setImmediate(resolve));
+    const restored = openTerminalHistory({ directory });
+    const labels = Object.fromEntries(restored.saved().map((entry) => [entry.id, [entry.endReason, entry.exitCode]]));
+    assert.deepEqual(labels, { [exited.id]: ["exit", 7], [running.id]: ["restart", null] }, `settle ${settle}`);
+    restored.close();
+  }
+});

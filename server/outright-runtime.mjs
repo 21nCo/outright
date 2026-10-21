@@ -403,7 +403,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           providers: agents.providers(),
           trustedProjects: database.listTrustedProjects(),
           templates: database.listTemplates(),
-          terminals: terminals.list(),
+          // Clients list saved sessions over /api/terminals; bootstrap
+          // stays independent of the history population.
+          terminals: terminals.list({ saved: false }),
           activeRuns: agents.activeRuns(),
           capacity: runtimeCapacity(),
         });

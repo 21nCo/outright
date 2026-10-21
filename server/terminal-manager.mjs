@@ -395,6 +395,11 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     // retries it; only a shutdown-initiated close keeps it to restore.
     if (!shuttingDown) terminal.userClosed = true;
     if (terminal.closePromise) return terminal.closePromise;
+    // An exit observed before the first close is the command's own end; any
+    // exit after it comes from this termination, so it is not recorded.
+    if (terminal.exitBeforeClose === undefined) {
+      terminal.exitBeforeClose = terminal.exitSeen ? { exitCode: terminal.exitCode, signal: terminal.signal } : null;
+    }
     const evidence = { target: id, cwd: terminal.cwd, operationId: randomUUID() };
     terminal.status = "closing";
     terminal.closePromise = Promise.resolve().then(async () => {
@@ -424,7 +429,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       // metadata leaves the session listed to dismiss again, and output left
       // on disk stays charged against the quota until a retry deletes it.
       if (terminal.userClosed) history?.remove(id);
-      else history?.finish(id);
+      else history?.finish(id, terminal.exitBeforeClose);
       return true;
     });
     return terminal.closePromise;
