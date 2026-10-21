@@ -1,0 +1,23 @@
+server/terminal-history.mjs
+  s_92427ff18a8304::t_0a8b57b0252105 33-36,39-41,43-60,101,103-106,155-157,191-192,196,198,205-216,219,250,258-260,264,267-271,300-301,304,318-324,328,336-341,357-358,363,389-390,392-397,400,402,410,421,423,433,456,512-513,517-519,526-530,532,534
+server/terminal-history.test.mjs
+  s_92427ff18a8304::t_3b926565da5a02 10,48-66,553-554,556-559,621-778
+server/terminal-manager.mjs
+  s_92427ff18a8304::t_72857c2553ccea 423-425
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3f57ffc6247a5f418bf66a411c1b3c26d2307163",
+  "prompts": {},
+  "sessions": {
+    "s_92427ff18a8304": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26336501-b0e6-4534-a7c2-345f5528a4ba",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
