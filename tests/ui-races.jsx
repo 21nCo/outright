@@ -2728,21 +2728,38 @@ async function terminalSavedBudgetRegression() {
   const other = { ...savedTerminal("term-B", "Other", "exit", 0, "2026-10-21T01:00:00.000Z"), cwd: "/fixture/B" };
   // About 2 MiB that erases a red screen 123,000 times: millions of rows.
   const erased = `${"\x1b[41m\x1b[24;1Hx\x1b[2J".repeat(Math.floor(2 ** 21 / 17))}\x1b[0mNEWEST saved line\r\n`;
+  // About 2 MiB of scrolls and repeats with counts of 2^31 - 1.
+  const dense = `${`x\x1b[${2 ** 31 - 1}S`.repeat(2 ** 16)}${`a\x1b[${2 ** 31 - 1};1b`.repeat(2 ** 16)}\r\nNEWEST dense line\r\n`;
+  let saved = erased;
   const errors = [];
   route = async (url) => {
     if (url.pathname === "/api/terminals") return response({ terminals: [huge, other], history: { persistent: true, warning: null } });
-    if (url.pathname.endsWith(huge.id)) return response({ ...huge, buffer: erased, outputCursor: 0 });
+    if (url.pathname.endsWith(huge.id)) return response({ ...huge, buffer: saved, outputCursor: 0 });
     return response({ ...other, buffer: "other saved line\r\n", outputCursor: 0 });
   };
   // Writes of the huge output to the offscreen terminal that parses it.
   let parsed = 0;
+  let finished = false;
   const write = Terminal.prototype.write;
   Terminal.prototype.write = function recordWrite(data, callback) {
     if (!this.element && data.includes("\x1b[2J")) parsed += 1;
+    if (!this.element && data.includes("NEWEST saved line")) finished = true;
     return write.call(this, data, callback);
   };
   const show = (worktree) => root.render(<div className="fixture-terminal-frame" style={{ width: 360, height: 420 }}><TerminalPane worktree={worktree}
     runtimeEvent={null} onError={(error) => errors.push(error)} sendRuntime={() => {}} /></div>);
+  // Activates the huge session and returns how long that took and the longest
+  // a 10 ms timer waited meanwhile.
+  const activate = async () => {
+    let last = performance.now();
+    let longest = 0;
+    const ticker = setInterval(() => { const now = performance.now(); longest = Math.max(longest, now - last); last = now; }, 10);
+    const started = performance.now();
+    show(projects[0].worktrees[0]);
+    try { await longWait(() => terminalReady("HugeSaved"), "huge saved session selected"); }
+    finally { clearInterval(ticker); }
+    return { elapsedMs: Math.round(performance.now() - started), longestTimerGapMs: Math.round(longest) };
+  };
   const longWait = async (check, label) => {
     const deadline = performance.now() + 20_000;
     while (!check()) {
@@ -2757,18 +2774,10 @@ async function terminalSavedBudgetRegression() {
     await until(() => terminalReady("OtherSaved"), "other worktree's saved session selected");
     const stoppedAt = parsed;
     await new Promise((resolve) => setTimeout(resolve, 300));
-    assert(parsed === stoppedAt && parsed < Math.ceil(erased.length / 65_536), `A superseded parse went on: ${parsed} writes`);
+    assert(parsed === stoppedAt && !finished, `A superseded parse went on: ${parsed} writes`);
 
-    let last = performance.now();
-    let longest = 0;
-    const ticker = setInterval(() => { const now = performance.now(); longest = Math.max(longest, now - last); last = now; }, 10);
-    const started = performance.now();
-    show(projects[0].worktrees[0]);
-    try { await longWait(() => terminalReady("HugeSaved"), "huge saved session selected"); }
-    finally { clearInterval(ticker); }
-    const elapsedMs = Math.round(performance.now() - started);
-    window.__performanceEvidence = { ...window.__performanceEvidence, savedOutput: { bytes: erased.length, elapsedMs, longestTimerGapMs: Math.round(longest) } };
-    assert(longest < 1_000, `Activation blocked the page for ${Math.round(longest)} ms`);
+    const timing = await activate();
+    assert(timing.longestTimerGapMs < 1_000, `Activation blocked the page for ${timing.longestTimerGapMs} ms`);
     const output = () => host.querySelector('.terminal-host .xterm-rows')?.textContent ?? "";
     const part = () => /Part (\d+) of (\d+)/.exec(host.querySelector('.terminal-saved-bar')?.textContent ?? "");
     await until(() => output().includes("NEWEST saved line"), "newest saved output shown");
@@ -2781,6 +2790,14 @@ async function terminalSavedBudgetRegression() {
     }
     await until(() => output().includes("[earlier saved output not shown]"), "earliest kept page discloses the left-out output");
     assert(terminalStatusText().includes("part 1 of") && terminalStatusText().includes("earlier saved output not shown"), "The earliest kept page did not announce the left-out output");
+    // Counts of any size cost at most a screen of work each.
+    show(projects[1].worktrees[0]);
+    await until(() => terminalReady("OtherSaved"), "other worktree's saved session selected again");
+    saved = dense;
+    const denseTiming = await activate();
+    window.__performanceEvidence = { ...window.__performanceEvidence, savedOutput: { bytes: erased.length, ...timing, dense: { bytes: dense.length, ...denseTiming } } };
+    assert(denseTiming.elapsedMs < 10_000 && denseTiming.longestTimerGapMs < 250, `Dense counts took ${denseTiming.elapsedMs} ms and blocked the page for ${denseTiming.longestTimerGapMs} ms`);
+    await until(() => output().includes("NEWEST dense line"), "newest dense saved output shown");
     assert(!errors.length, `Saved output failed: ${errors.map((error) => error.message).join("; ")}`);
   } finally {
     Terminal.prototype.write = write;

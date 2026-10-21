@@ -74,7 +74,7 @@ const written = (term, data) => new Promise((resolve) => term.write(data, resolv
 function drawnRow(line, cell) {
   let text = line.isWrapped ? "~" : "";
   let kept = text.length;
-  for (let x = 0; x < SIZE.cols; x += 1) {
+  for (let x = 0; x < line.length; x += 1) {
     line.getCell(x, cell);
     if (cell.getWidth() === 0) continue;
     const chars = cell.getChars() || " ";
@@ -102,10 +102,10 @@ function drawnRows(term, count = -1) {
 // view's options, each full reset starting a fresh terminal below the rows
 // read before it, and no scrollback erase. Given a scrollback, xterm itself
 // keeps only the newest rows.
-async function continuous(segments, scrollback = 0) {
+async function continuous(segments, scrollback = 0, size = SIZE) {
   // A character adds at most a screen of rows, when it erases one.
   const longest = Math.max(...segments.map((segment) => segment.length));
-  const term = new Terminal({ ...SIZE, scrollback: scrollback || Math.min(1_000_000, longest * SIZE.rows), convertEol: true, scrollOnEraseInDisplay: true });
+  const term = new Terminal({ ...size, scrollback: scrollback || Math.min(1_000_000, longest * size.rows), convertEol: true, scrollOnEraseInDisplay: true });
   let rows = [];
   await new Promise((resolve) => segments.forEach((segment, index) => term.write(`${index ? "\x1bc" : ""}${segment}`, () => {
     rows = rows.concat(drawnRows(term));
@@ -117,10 +117,10 @@ async function continuous(segments, scrollback = 0) {
 
 // The read-only view as the pane writes it: one terminal, each page drawn
 // alone after a full reset.
-async function viewed(buffer, pageRows) {
-  const { rows, dropped } = await savedOutputRows(buffer, SIZE, Terminal);
+async function viewed(buffer, pageRows, size = SIZE) {
+  const { rows, dropped } = await savedOutputRows(buffer, size, Terminal);
   const pages = savedRowPages(rows, pageRows);
-  const term = new Terminal({ ...SIZE, scrollback: 10_000, convertEol: true });
+  const term = new Terminal({ ...size, scrollback: 10_000, convertEol: true });
   let shown = [];
   await new Promise((resolve) => pages.forEach(([start, end], index) => term.write(`\x1bc${savedPageText(rows, [start, end])}`, () => {
     shown = shown.concat(drawnRows(term, end - start));
@@ -238,6 +238,55 @@ test("saved output stays within its row and character budget whatever its escape
   assert.equal(rows.at(-1), `\r\n\x1b[0;41m${" ".repeat(wide.cols)}\x1b[0m`, "the newest rows are not the final erased screen");
 });
 
+test("a count past what the screen holds ends where one continuous terminal ends", { timeout: 120_000 }, async () => {
+  const rows = "x\r\n".repeat(40);
+  const cases = [
+    // Repeats in every parameter form, of wide and combining characters, in
+    // insert, nowrap, margins and the alternate screen, then cursor-sensitive
+    // output; repeats of one character joined; a repeat after a control.
+    "a\x1b[2000001bTAIL", "a\x1b[2000040bTAIL", "a\x1b[2000001;1bTAIL", "a\x1b[2000001:1bTAIL", "a\u009b2000001bTAIL", "\x1b[31m漢\x1b[2000001bTAIL",
+    "e\u0301\x1b[2000001bTAIL", "\x1b[4hxyz\rq\x1b[2000001bTAIL", "\x1b[?7la\x1b[2000001bTAIL\r\nnext", "top\r\n\x1b[5;20r\x1b[10;1Ha\x1b[2000001bTAIL",
+    `${rows}\x1b[1;10r\x1b[5;1Ha\x1b[2000001bTAIL\x1b[r\x1b[24;1Hend`, "before\r\n\x1b[?1049ha\x1b[2000001b\x1b[?1049lafter", "a\x1b[2000001b\x1b[3;3HMID",
+    "a\x1b[2000001b\x1b[32mGREEN\r\nnext", `${"a\x1b[2000001;1b".repeat(30)}TAIL`, `${"a\x1b[300001bb\x1b[300001b".repeat(5)}TAIL`, "a\x1b[2000001\x07bTAIL",
+    // Scrolls, line inserts and deletes, and tabs in every form.
+    `${rows}\x1b[41m\x1b[100000STAIL`, `${rows}\x1b[3;9r\x1b[100000T\x1b[rTAIL`, `${rows}\x1b[5H\x1b[100000LTAIL`, `${rows}\x1b[5H\x1b[100000:2MTAIL`,
+    `${rows}\u009b100\n000STAIL`, "a\x1b[100000IT", "a\x1b[30G\x1b[100000ZT",
+  ];
+  for (const size of [SIZE, { cols: 81, rows: 24 }]) {
+    for (const buffer of cases) {
+      const { shown, pages } = await viewed(buffer, 2_000, size);
+      const oracle = paged((await continuous([buffer], MAX_SAVED_ROWS + 1, size)).slice(-shown.length), pages, 2_000);
+      assert.deepEqual([shown[0].replace("~", ""), ...shown.slice(1)], [oracle[0].replace("~", ""), ...oracle.slice(1)], `${JSON.stringify(buffer.slice(-40))} at ${size.cols} columns`);
+    }
+  }
+});
+
+test("a sequence's count adds at most a screen of work, in any parameter form", { timeout: 120_000 }, async () => {
+  const count = 2 ** 31 - 1;
+  const forms = Array.from({ length: 0x3f }, (_, index) => `\x1b[${count}${String.fromCharCode(0x40 + index)}`);
+  for (const final of "STLMIZb") forms.push(`\x1b[${count};1${final}`, `\x1b[${count}:1${final}`, `\u009b${count}${final}`, `\x1b[${count}\x07${final}`);
+  for (const sequence of forms) {
+    const started = performance.now();
+    const { rows } = await savedOutputRows(`x${sequence}TAIL`, SIZE, Terminal);
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 250 && rows.length <= MAX_SAVED_ROWS, `${JSON.stringify(sequence)} took ${Math.round(elapsed)} ms`);
+  }
+  for (const final of "STLMZIb") {
+    const unit = `x\x1b[${count}${final === "b" ? ";1" : ""}${final}`;
+    for (const bytes of [2 ** 16, 2 ** 21]) {
+      const started = performance.now();
+      const { rows } = await savedOutputRows(`${unit.repeat(Math.floor(bytes / unit.length))}TAIL`, SIZE, Terminal);
+      const elapsed = performance.now() - started;
+      assert.ok(elapsed < 3_000 && rows.length <= MAX_SAVED_ROWS, `${bytes} bytes of ${JSON.stringify(unit)} took ${Math.round(elapsed)} ms`);
+      assert.match(rows.slice(-2).join("").trimEnd(), /TAIL$/);
+    }
+  }
+  // The newest row ends where 2^31 characters end.
+  const { rows, dropped } = await savedOutputRows(`a\x1b[${count}bTAIL`, SIZE, Terminal);
+  assert.ok(dropped && rows.length === MAX_SAVED_ROWS);
+  assert.equal(rows.at(-1), `${"a".repeat(2 ** 31 % SIZE.cols)}TAIL`);
+});
+
 test("output before a full reset is never parsed once the newer output fills the budget", async () => {
   const writes = [];
   class Recorded extends Terminal {
@@ -256,25 +305,31 @@ test("output before a full reset is never parsed once the newer output fills the
   }
 });
 
-test("a parse stops and releases its terminal once its activation is superseded", async () => {
+test("a parse stops and releases its terminal once its activation is superseded", { timeout: 60_000 }, async () => {
   const disposed = [];
   const writes = [];
   class Recorded extends Terminal {
     write(data, callback) { writes.push(data); return super.write(data, callback); }
     dispose() { disposed.push(this); super.dispose(); }
   }
-  let checks = 0;
-  assert.equal(await savedOutputRows("line\r\n".repeat(200_000), SIZE, Recorded, () => ++checks < 2), null);
+  assert.equal(await savedOutputRows("line\r\n".repeat(200_000), SIZE, Recorded, () => writes.length < 2), null);
   assert.equal(writes.length, 2, "parsing went on after the activation was superseded");
   assert.equal(disposed.length, 1);
+  // Superseded while the output is read, before any of it is parsed.
+  assert.equal(await savedOutputRows("line\r\n".repeat(200_000), SIZE, Recorded, () => false), null);
+  assert.equal(writes.length, 2, "output was parsed after the activation was superseded");
   // Superseded while its rows are drawn.
-  checks = 0;
+  let checks = 0;
   assert.equal(await savedOutputRows("line\r\n".repeat(5_000), SIZE, Recorded, () => ++checks < 2), null);
   assert.equal(disposed.length, 2);
+  // Superseded within one write of scrolls that each clear the screen.
+  writes.length = 0;
+  assert.equal(await savedOutputRows(`x\x1b[${2 ** 31 - 1}S`.repeat(150_000), SIZE, Recorded, () => writes.length < 2), null);
+  assert.equal(writes.length, 2, "a write of scrolls ran past the activation");
 });
 
-test("one escape tokenizer finds every sequence class the saved view knows", () => {
-  // Each case's spans are those the round-2 regular expression found.
+test("one escape tokenizer finds every sequence class the saved view knows", async () => {
+  // Each case's spans are those xterm 6.0.0's parser reads as one sequence.
   const osc = `\x1b]52;c;${"Q".repeat(70_000)}\x07`;
   const cases = [
     ["a\x1b[1;38;5;196mb", [1, 14]],
@@ -283,12 +338,23 @@ test("one escape tokenizer finds every sequence class the saved view knows", () 
     ["\x1bP1$r\x1b\\\x1b_apc", [0, 7, 7, 12]],
     ["\x1b]open\x1bcz", [0, 6, 6, 8]],
     ["\x1bc\x1b(B\x1b7\x1b=", [0, 2, 2, 5, 5, 7, 7, 9]],
-    ["\x1b[12\x01", [0, 2]],
-    ["\x1b\x01\x1b \x01x\x1b", [6, 7]],
+    // xterm runs a C0 control inside a sequence and goes on reading it. CAN
+    // and a character past ASCII end one; 8-bit CSI, OSC and ST are read.
+    ["\x1b[12\x07", [0, 5]],
+    ["\x1b\x07\x1b \x07x\x1b", [0, 2, 2, 6, 6, 7]],
+    ["a\x1b[24\x07mb\u009b5;1mc\x1b[3\x18Jd\x1b[2\u00e9Je\u009dt\u009cf", [1, 7, 8, 13, 14, 18, 20, 24, 26, 29]],
     [`x${osc}y`, [1, 1 + osc.length]],
     [`x\x1b]52;c;${"Q".repeat(70_000)}`, [1, 70_008]],
   ];
-  for (const [buffer, spans] of cases) assert.deepEqual(escapeSpans(buffer), spans, JSON.stringify(buffer.slice(0, 40)));
+  for (const [buffer, spans] of cases) {
+    assert.deepEqual(escapeSpans(buffer), spans, JSON.stringify(buffer.slice(0, 40)));
+    // What is left between them is what xterm prints.
+    const term = new Terminal(SIZE);
+    await written(term, buffer);
+    const text = spans.reduce((left, end, index) => (index % 2 ? left : left + buffer.slice(spans[index - 1] ?? 0, end)), "") + buffer.slice(spans.at(-1) ?? 0);
+    assert.equal(term.buffer.active.getLine(0).translateToString(true), text.replaceAll("\x07", ""), JSON.stringify(buffer.slice(0, 40)));
+    term.dispose();
+  }
 });
 
 test("a full reset or scrollback erase in saved output keeps the rows before it", async () => {
