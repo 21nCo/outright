@@ -2579,7 +2579,7 @@ async function terminalListingAddsSessionsRegression() {
 async function terminalSavedPagingRegression(reservation = false) {
   root.render(null);
   await settle();
-  const lines = Array.from({ length: 30_000 }, (_, index) => `saved line ${index}\r\n`);
+  const lines = Array.from({ length: 15_000 }, (_, index) => `saved line ${index}\r\n`);
   lines[0] = "FIRST saved line\r\n";
   // A full-screen program ended by a full reset: the output before and after
   // it stays readable, the program's screen does not.
@@ -2668,8 +2668,9 @@ async function terminalSavedModesRegression() {
       }
       rows.push(text.slice(0, kept));
     }
-    let end = count >= 0 ? count : rows.length;
-    while (count < 0 && end > normal.baseY && !rows[end - 1].replace("~", "")) end -= 1;
+    if (count >= 0) return rows.slice(0, count);
+    let end = rows.length;
+    while (end > normal.baseY && !rows[end - 1].replace("~", "")) end -= 1;
     return rows.slice(0, end);
   };
   // Each write's rows are read in its callback, before the next one.
@@ -2686,7 +2687,7 @@ async function terminalSavedModesRegression() {
   const continuous = (segments) => render(segments.map((segment, index) => `${index ? "\x1bc" : ""}${segment}`), { scrollback: 100_000, scrollOnEraseInDisplay: true });
   // The pane's saved view: one terminal, a full reset before each page.
   const view = async (buffer, pageRows) => {
-    const rows = await savedOutputRows(buffer, size, Terminal);
+    const { rows } = await savedOutputRows(buffer, size, Terminal);
     const pages = savedRowPages(rows, pageRows);
     return render(pages.map((page) => `\x1bc${savedPageText(rows, page)}`), { scrollback: 10_000 }, pages.map(([start, end]) => end - start));
   };
@@ -2713,6 +2714,76 @@ async function terminalSavedModesRegression() {
       `${name} before a reset hid or redrew later saved lines`);
     const opened = `${mode}${lines("mid", 40)}`;
     same(await view(opened, 9), await continuous([opened]), `${name} on through the output`);
+  }
+}
+
+// Saved output whose escapes expand far past the row budget activates within
+// bounds and keeps the page responsive. Its newest rows are shown, and its
+// earliest page says, and announces, that older output was left out. A
+// worktree switch stops a parse in progress.
+async function terminalSavedBudgetRegression() {
+  root.render(null);
+  await settle();
+  const huge = savedTerminal("term-H", "Huge", "exit", 0, "2026-10-21T01:00:00.000Z");
+  const other = { ...savedTerminal("term-B", "Other", "exit", 0, "2026-10-21T01:00:00.000Z"), cwd: "/fixture/B" };
+  // About 2 MiB that erases a red screen 123,000 times: millions of rows.
+  const erased = `${"\x1b[41m\x1b[24;1Hx\x1b[2J".repeat(Math.floor(2 ** 21 / 17))}\x1b[0mNEWEST saved line\r\n`;
+  const errors = [];
+  route = async (url) => {
+    if (url.pathname === "/api/terminals") return response({ terminals: [huge, other], history: { persistent: true, warning: null } });
+    if (url.pathname.endsWith(huge.id)) return response({ ...huge, buffer: erased, outputCursor: 0 });
+    return response({ ...other, buffer: "other saved line\r\n", outputCursor: 0 });
+  };
+  // Writes of the huge output to the offscreen terminal that parses it.
+  let parsed = 0;
+  const write = Terminal.prototype.write;
+  Terminal.prototype.write = function recordWrite(data, callback) {
+    if (!this.element && data.includes("\x1b[2J")) parsed += 1;
+    return write.call(this, data, callback);
+  };
+  const show = (worktree) => root.render(<div className="fixture-terminal-frame" style={{ width: 360, height: 420 }}><TerminalPane worktree={worktree}
+    runtimeEvent={null} onError={(error) => errors.push(error)} sendRuntime={() => {}} /></div>);
+  const longWait = async (check, label) => {
+    const deadline = performance.now() + 20_000;
+    while (!check()) {
+      assert(performance.now() < deadline, `Timed out: ${label}`);
+      await frame();
+    }
+  };
+  try {
+    show(projects[0].worktrees[0]);
+    await until(() => parsed > 0, "huge saved output parsing");
+    show(projects[1].worktrees[0]);
+    await until(() => terminalReady("OtherSaved"), "other worktree's saved session selected");
+    const stoppedAt = parsed;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert(parsed === stoppedAt && parsed < Math.ceil(erased.length / 65_536), `A superseded parse went on: ${parsed} writes`);
+
+    let last = performance.now();
+    let longest = 0;
+    const ticker = setInterval(() => { const now = performance.now(); longest = Math.max(longest, now - last); last = now; }, 10);
+    const started = performance.now();
+    show(projects[0].worktrees[0]);
+    try { await longWait(() => terminalReady("HugeSaved"), "huge saved session selected"); }
+    finally { clearInterval(ticker); }
+    const elapsedMs = Math.round(performance.now() - started);
+    window.__performanceEvidence = { ...window.__performanceEvidence, savedOutput: { bytes: erased.length, elapsedMs, longestTimerGapMs: Math.round(longest) } };
+    assert(longest < 1_000, `Activation blocked the page for ${Math.round(longest)} ms`);
+    const output = () => host.querySelector('.terminal-host .xterm-rows')?.textContent ?? "";
+    const part = () => /Part (\d+) of (\d+)/.exec(host.querySelector('.terminal-saved-bar')?.textContent ?? "");
+    await until(() => output().includes("NEWEST saved line"), "newest saved output shown");
+    assert(part() && Number(part()[2]) <= 10, `The kept rows exceed the row budget: ${part()?.[0]}`);
+    assert(terminalStatusText().includes("Earlier saved output not shown."), "Leaving out older output was not announced");
+    const earlier = () => [...host.querySelectorAll('.terminal-saved-bar button')].find((button) => button.textContent === "Earlier output");
+    for (let step = 0; step < 20 && earlier().getAttribute("aria-disabled") !== "true"; step += 1) {
+      earlier().click();
+      await settle();
+    }
+    await until(() => output().includes("[earlier saved output not shown]"), "earliest kept page discloses the left-out output");
+    assert(terminalStatusText().includes("part 1 of") && terminalStatusText().includes("earlier saved output not shown"), "The earliest kept page did not announce the left-out output");
+    assert(!errors.length, `Saved output failed: ${errors.map((error) => error.message).join("; ")}`);
+  } finally {
+    Terminal.prototype.write = write;
   }
 }
 
@@ -6686,6 +6757,7 @@ try {
     ["terminal saved paging", terminalSavedPagingRegression, "all saved output beyond one view is reachable a page at a time, earliest first line shown"],
     ["terminal reservation paging", () => terminalSavedPagingRegression(true), "a reservation's saved output is paged read-only to its first and last lines"],
     ["terminal saved modes", terminalSavedModesRegression, "saved output that sets terminal modes renders as the terminal showed it, whole and paged"],
+    ["terminal saved budget", terminalSavedBudgetRegression, "saved output past the row budget activates responsively, discloses left-out output and stops when superseded"],
     ["terminal history event slot", terminalHistoryEventSlotRegression, "a storage status change never replaces terminal output or an exit delivered in the same task"],
     ["terminal close history failure", terminalCloseHistoryFailureRegression, "a close whose saved output cannot be deleted shows it ended and read-only"],
     ["terminal fenced saved session", terminalFencedSavedSessionRegression, "a saved status from the server wins over the page audit fence"],

@@ -18,6 +18,7 @@ const SAVED_SCROLLBACK = 10_000;
 // output still queued, so nothing written for an earlier view lands after it.
 const CLEAR_VIEW = "\x1bc";
 const RESERVATION_LABEL = "its prior-run owner is unverified and not attached";
+const EARLIER_NOT_SHOWN = "\x1b[90m[earlier saved output not shown]\x1b[0m\r\n";
 // One announcement per distinct storage condition for this page session.
 let announcedHistoryWarning = "";
 
@@ -216,10 +217,11 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       if (token !== reconcileTokenRef.current) return;
       if (!detail || typeof detail !== "object") throw new Error("Terminal detail is unavailable");
       // Saved output, ended or awaiting ownership proof, is parsed once at the
-      // view's size and shown read-only.
+      // view's size and shown read-only. A newer selection stops the parse.
       const saved = (detail.status ?? terminal.status) === "ended" || Boolean(detail.recoveryReservation);
       const visible = xtermRef.current;
-      const savedRows = saved && visible ? await savedOutputRows(detail.buffer ?? "", { cols: visible.cols, rows: visible.rows }, Terminal) : [];
+      const savedOutput = saved && visible ? await savedOutputRows(detail.buffer ?? "", { cols: visible.cols, rows: visible.rows }, Terminal,
+        () => token === reconcileTokenRef.current) : { rows: [], dropped: false };
       if (token !== reconcileTokenRef.current) return;
       // Leave output and exit events staged through the layout handoff. A
       // resize can settle while the snapshot request is in flight.
@@ -238,7 +240,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       if (detail.recoveryReservation) savedLabel = RESERVATION_LABEL;
       let displayedCursor = Number.isSafeInteger(detail.outputCursor) ? detail.outputCursor : 0;
       if (saved) {
-        savedViewRef.current = { id: terminal.id, rows: savedRows, pages: savedRowPages(savedRows), marker, label: savedLabel };
+        savedViewRef.current = { id: terminal.id, rows: savedOutput.rows, dropped: savedOutput.dropped, pages: savedRowPages(savedOutput.rows), marker, label: savedLabel };
         showSavedPage(savedViewRef.current.pages.length - 1);
       } else {
         savedViewRef.current = null;
@@ -273,7 +275,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
         stageTerminals(terminalsRef.current.map((item) => item.id === terminal.id ? { ...item, status } : item));
       }
       let notice = "";
-      if (status === "ended") notice = `${detail.name ?? terminal.name} saved output, ${savedLabel}. Read-only.`;
+      if (status === "ended") notice = `${detail.name ?? terminal.name} saved output, ${savedLabel}. Read-only.${savedOutput.dropped ? " Earlier saved output not shown." : ""}`;
       else if (exited) notice = `${terminal.name} process exited ${exited.exitCode ?? "unknown"}`;
       else if (status === "unknown") notice = `${terminal.name} ownership is unverified. Inspect local terminal recovery.`;
       setExitNotice(notice);
@@ -288,7 +290,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
 
   // Each page replaces the view in one ordered write of its rows, which need
   // nothing from the rows before them. An earlier page opens at its first
-  // line; the newest ends with the saved label.
+  // line; the earliest says when older output was left out; the newest ends
+  // with the saved label.
   function showSavedPage(index) {
     const view = savedViewRef.current;
     const xterm = xtermRef.current;
@@ -297,7 +300,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     const generation = (view.generation ?? 0) + 1;
     Object.assign(view, { shown: index, generation });
     if (xterm) xterm.options.scrollback = SAVED_SCROLLBACK;
-    const marker = view.marker && index <= 0 ? NEW_SHELL_MARKER : "";
+    const marker = (view.marker && index <= 0 ? NEW_SHELL_MARKER : "") + (view.dropped && index <= 0 ? EARLIER_NOT_SHOWN : "");
     const label = newest ? `\r\n\x1b[90m[saved output; ${view.label}]\x1b[0m\r\n` : "";
     const opened = () => { if (!newest && savedViewRef.current === view && view.generation === generation) xterm.scrollToTop(); };
     xterm?.write(CLEAR_VIEW + marker + savedPageText(view.rows, view.pages[index] ?? [0, 0]) + label, opened);
@@ -312,7 +315,9 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     if (index < 0 || index >= view.pages.length) return;
     showSavedPage(index);
     const name = terminalsRef.current.find((item) => item.id === view.id)?.name ?? "Terminal";
-    setExitNotice(`${name} saved output, part ${index + 1} of ${view.pages.length}${index === 0 ? ", the earliest" : ""}`);
+    let earliest = "";
+    if (index === 0) earliest = view.dropped ? ", the earliest kept; earlier saved output not shown" : ", the earliest";
+    setExitNotice(`${name} saved output, part ${index + 1} of ${view.pages.length}${earliest}`);
   }
 
   useEffect(() => {

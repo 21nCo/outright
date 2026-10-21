@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import xterm from "@xterm/xterm";
-import { escapeSpans, preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabLabel, savedOutputRows, savedPageText, savedRowPages } from "../src/lib/terminal-exit-state.js";
+import { MAX_SAVED_CHARS, MAX_SAVED_ROWS, escapeSpans, preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabLabel, savedOutputRows, savedPageText, savedRowPages } from "../src/lib/terminal-exit-state.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
 
 test("audit failure fences terminal commands before a later runtime event or React commit", () => {
@@ -92,18 +92,20 @@ function drawnRows(term, count = -1) {
   const cell = normal.getNullCell();
   const rows = [];
   for (let y = 0; y < normal.length; y += 1) rows.push(drawnRow(normal.getLine(y), cell));
-  let end = count >= 0 ? count : rows.length;
-  while (count < 0 && end > normal.baseY && !rows[end - 1].replace("~", "")) end -= 1;
+  if (count >= 0) return rows.slice(0, count);
+  let end = rows.length;
+  while (end > normal.baseY && !rows[end - 1].replace("~", "")) end -= 1;
   return rows.slice(0, end);
 }
 
 // The oracle: one continuous render of saved output in a terminal with the
 // view's options, each full reset starting a fresh terminal below the rows
-// read before it, and no scrollback erase.
-async function continuous(segments) {
+// read before it, and no scrollback erase. Given a scrollback, xterm itself
+// keeps only the newest rows.
+async function continuous(segments, scrollback = 0) {
   // A character adds at most a screen of rows, when it erases one.
   const longest = Math.max(...segments.map((segment) => segment.length));
-  const term = new Terminal({ ...SIZE, scrollback: Math.min(1_000_000, longest * SIZE.rows), convertEol: true, scrollOnEraseInDisplay: true });
+  const term = new Terminal({ ...SIZE, scrollback: scrollback || Math.min(1_000_000, longest * SIZE.rows), convertEol: true, scrollOnEraseInDisplay: true });
   let rows = [];
   await new Promise((resolve) => segments.forEach((segment, index) => term.write(`${index ? "\x1bc" : ""}${segment}`, () => {
     rows = rows.concat(drawnRows(term));
@@ -116,7 +118,7 @@ async function continuous(segments) {
 // The read-only view as the pane writes it: one terminal, each page drawn
 // alone after a full reset.
 async function viewed(buffer, pageRows) {
-  const rows = await savedOutputRows(buffer, SIZE, Terminal);
+  const { rows, dropped } = await savedOutputRows(buffer, SIZE, Terminal);
   const pages = savedRowPages(rows, pageRows);
   const term = new Terminal({ ...SIZE, scrollback: 10_000, convertEol: true });
   let shown = [];
@@ -125,7 +127,7 @@ async function viewed(buffer, pageRows) {
     if (index === pages.length - 1) resolve();
   })));
   term.dispose();
-  return { shown, pages };
+  return { shown, pages, dropped };
 }
 
 // The oracle's rows as the pages show them. A page opens inside a wrapped
@@ -160,7 +162,7 @@ test("saved output reads as one continuous terminal, whole and a page at a time"
     // A full-screen program's screen is not the saved view's.
     ["before\r\n\x1b[34m\x1b[?1049h\x1b[2J\x1b[HFULLSCREEN", "frame\r\n".repeat(2_500), "\x1b[?1049lafter\r\n"],
     // Erasing the screen keeps the rows before it, at most a screen at a time.
-    ["\x1b[24;1Hx\x1b[2J".repeat(5_000)],
+    ["\x1b[24;1Hx\x1b[2J".repeat(800)],
   ];
   for (const parts of cases) {
     const buffer = parts.join("");
@@ -183,21 +185,92 @@ test("saved output reads as one continuous terminal, whole and a page at a time"
   assert.ok(pages.length > 1 && shown.at(-1) === "qqqq", "the last page drew ASCII as line drawing");
 });
 
-test("saved output keeps every row up to the history cap, in pages the view's scrollback holds", async () => {
+test("saved output keeps its newest rows up to the row budget, in pages the view's scrollback holds", async () => {
   const buffer = Array.from({ length: 60_000 }, (_, index) => `\x1b[3${index % 8}mline ${index}\x1b[0m\r\n`).join("");
-  const rows = await savedOutputRows(buffer, SIZE, Terminal);
-  assert.equal(rows.length, 60_000);
+  const { rows, dropped } = await savedOutputRows(buffer, SIZE, Terminal);
+  assert.equal(rows.length, MAX_SAVED_ROWS);
+  assert.ok(dropped, "leaving out the oldest rows was not reported");
   const pages = savedRowPages(rows);
   assert.deepEqual(pages.flatMap(([start, end]) => Array.from({ length: end - start }, (_, index) => start + index)), rows.map((_, index) => index), "pages skip or repeat rows");
   assert.ok(pages.every(([start, end]) => end - start <= 2_000 && end > start));
-  assert.match(savedPageText(rows, pages[0]), /^\x1b\[0;30mline 0\x1b\[0m\r\n/);
-  assert.match(savedPageText(rows, pages.at(-1)), /line 59999\x1b\[0m$/);
+  const oldest = 60_000 - MAX_SAVED_ROWS;
+  assert.ok(savedPageText(rows, pages[0]).startsWith(`\x1b[0;3${oldest % 8}mline ${oldest}\x1b[0m\r\n`), "the oldest kept row is not the first after those left out");
+  assert.ok(savedPageText(rows, pages.at(-1)).endsWith("line 59999\x1b[0m"));
   assert.deepEqual(savedRowPages([]), [[0, 0]]);
   assert.deepEqual(savedRowPages(rows.slice(0, 2_500)), [[0, 1_250], [1_250, 2_500]], "the earliest page holds only what the others left");
   // A page opens at the start of a wrapped line, unless the line fills it.
   assert.deepEqual(savedRowPages(["a", "b", "\r\nc", "d", "\r\ne", "f"], 3), [[0, 2], [2, 4], [4, 6]]);
   assert.deepEqual(savedRowPages(["a", "b", "c", "d"], 2), [[0, 2], [2, 4]]);
-  assert.deepEqual(await savedOutputRows("", SIZE, Terminal), []);
+  assert.deepEqual(await savedOutputRows("", SIZE, Terminal), { rows: [], dropped: false });
+  assert.equal((await savedOutputRows(lines("a", 10), SIZE, Terminal)).dropped, false);
+});
+
+test("saved output stays within its row and character budget whatever its escapes expand to", async () => {
+  const cases = {
+    "erased screens": "\x1b[41m\x1b[24;1Hx\x1b[2J".repeat(Math.floor(2 ** 21 / 17)),
+    "bare line feeds": "\n".repeat(2 ** 21),
+    "a long repeat": "a\x1b[2000000b",
+  };
+  for (const [name, buffer] of Object.entries(cases)) {
+    const heap = process.memoryUsage().heapUsed;
+    const started = performance.now();
+    const { rows, dropped } = await savedOutputRows(buffer, SIZE, Terminal);
+    const elapsed = performance.now() - started;
+    assert.ok(rows.length <= MAX_SAVED_ROWS && rows.join("").length <= MAX_SAVED_CHARS, `${name}: ${rows.length} rows kept`);
+    assert.ok(elapsed < 3_000, `${name}: activation took ${Math.round(elapsed)} ms`);
+    assert.ok(process.memoryUsage().heapUsed - heap < 200 * 2 ** 20, `${name}: the heap grew by more than 200 MiB`);
+    assert.ok(dropped, `${name}: leaving out the oldest rows was not reported`);
+    // The newest rows are those one continuous terminal ends with. The first
+    // kept row cannot show that it wraps from a row left out.
+    const { shown, pages } = await viewed(buffer, 2_000);
+    const oracle = paged((await continuous([buffer], MAX_SAVED_ROWS + 1)).slice(-shown.length), pages, 2_000);
+    assert.deepEqual(shown.slice(1), oracle.slice(1), `${name}: the newest rows differ from one continuous terminal`);
+  }
+  // A repeat of any length takes no longer than one that fills the budget.
+  const started = performance.now();
+  const repeated = await savedOutputRows("a\x1b[2147483647b", SIZE, Terminal);
+  assert.ok(performance.now() - started < 3_000, `a repeat of 2^31 - 1 took ${Math.round(performance.now() - started)} ms`);
+  assert.ok(repeated.dropped && repeated.rows.length === MAX_SAVED_ROWS && repeated.rows.every((row) => /^a+ *$/.test(row)));
+  // Wide rows reach the character budget before the row budget.
+  const wide = { cols: 1_000, rows: 24 };
+  const { rows, dropped } = await savedOutputRows("\x1b[41m\x1b[24;1Hx\x1b[2J".repeat(2_000), wide, Terminal);
+  assert.ok(dropped && rows.length < MAX_SAVED_ROWS && rows.join("").length <= MAX_SAVED_CHARS, `${rows.length} wide rows kept`);
+  assert.equal(rows.at(-1), `\r\n\x1b[0;41m${" ".repeat(wide.cols)}\x1b[0m`, "the newest rows are not the final erased screen");
+});
+
+test("output before a full reset is never parsed once the newer output fills the budget", async () => {
+  const writes = [];
+  class Recorded extends Terminal {
+    write(data, callback) { writes.push(data); return super.write(data, callback); }
+  }
+  const newest = (count) => Array.from({ length: count }, (_, index) => `new ${index}\r\n`).join("");
+  for (const buffer of [
+    `OLDEST\r\n\x1bc${"middle\r\n".repeat(MAX_SAVED_ROWS - 100)}\x1bc${newest(200)}`,
+    `OLDEST\r\n\x1bc${newest(MAX_SAVED_ROWS)}`,
+  ]) {
+    writes.length = 0;
+    const { rows, dropped } = await savedOutputRows(buffer, SIZE, Recorded);
+    assert.ok(dropped && rows.length === MAX_SAVED_ROWS, "the left-out output was not reported");
+    assert.ok(!writes.some((data) => data.includes("OLDEST")), "output older than the budget was parsed");
+    assert.match(rows.at(-1), /new \d+$/);
+  }
+});
+
+test("a parse stops and releases its terminal once its activation is superseded", async () => {
+  const disposed = [];
+  const writes = [];
+  class Recorded extends Terminal {
+    write(data, callback) { writes.push(data); return super.write(data, callback); }
+    dispose() { disposed.push(this); super.dispose(); }
+  }
+  let checks = 0;
+  assert.equal(await savedOutputRows("line\r\n".repeat(200_000), SIZE, Recorded, () => ++checks < 2), null);
+  assert.equal(writes.length, 2, "parsing went on after the activation was superseded");
+  assert.equal(disposed.length, 1);
+  // Superseded while its rows are drawn.
+  checks = 0;
+  assert.equal(await savedOutputRows("line\r\n".repeat(5_000), SIZE, Recorded, () => ++checks < 2), null);
+  assert.equal(disposed.length, 2);
 });
 
 test("one escape tokenizer finds every sequence class the saved view knows", () => {

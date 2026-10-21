@@ -40,11 +40,15 @@ export function preferredTerminal(terminals, previousId = "") {
 const ESC = "\u001b";
 const STRING_INTRODUCERS = new Set(["]", "P", "X", "^", "_"]);
 const FULL_RESET = `${ESC}c`;
-// The offscreen terminal's scrollback. A character adds at most a screen of
-// rows (when it erases one), so a chunk of PARSE_SCROLLBACK / (4 * rows)
-// characters adds at most a quarter of it, and rows are read before any is
-// trimmed. A repeat (CSI b) can add more, as it can on the live view.
-const PARSE_SCROLLBACK = 10_000;
+// Saved output keeps at most its newest MAX_SAVED_ROWS rows at the view's
+// size, drawn in at most MAX_SAVED_CHARS characters, whatever its escape
+// sequences expand to. Older rows are left out and the view says so.
+export const MAX_SAVED_ROWS = 20_000;
+export const MAX_SAVED_CHARS = 4 * 1024 * 1024;
+// Characters parsed between checks that the activation is still current.
+const WRITE_SLICE = 65_536;
+// Rows drawn between yields to the page.
+const ROW_SLICE = 1_000;
 // xterm's colour modes (Attributes.CM_P16, CM_P256 and CM_RGB).
 const PALETTE_16 = 0x1000000;
 const PALETTE_256 = 0x2000000;
@@ -98,35 +102,34 @@ function clearsScrollback(sequence) {
   return Number((params.startsWith("?") ? params.slice(1) : params).split(/[;:]/)[0]) === 3;
 }
 
-// Saved output in chunks of about size characters, cut only between escape
-// sequences and never inside a surrogate pair. A full reset is a chunk of its
-// own and a scrollback erase is left out, so the view keeps earlier output.
-function savedChunks(buffer, size) {
-  const chunks = [];
+// A repeat (CSI Ps b) of more than limit characters repeats limit times:
+// more would only scroll out rows that are left out anyway.
+function clampRepeat(sequence, limit) {
+  if (sequence[1] !== "[" || !sequence.endsWith("b") || !/^\d+$/.test(sequence.slice(2, -1))) return sequence;
+  return Number(sequence.slice(2, -1)) > limit ? `${ESC}[${limit}b` : sequence;
+}
+
+// Saved output split at each full reset, oldest first, since a full reset
+// starts a fresh terminal. Scrollback erases are left out, so the view keeps
+// earlier output.
+function savedSegments(buffer, repeatLimit) {
+  const segments = [];
   const spans = escapeSpans(buffer);
-  let chunk = "";
+  let segment = "";
   let from = 0;
-  const flush = () => { if (chunk) chunks.push(chunk); chunk = ""; };
-  const text = (end) => {
-    while (from < end) {
-      let cut = Math.min(end, from + Math.max(1, size - chunk.length));
-      if (cut < end && inRange(buffer.charCodeAt(cut), 0xdc00, 0xdfff)) cut += 1;
-      chunk += buffer.slice(from, cut);
-      from = cut;
-      if (chunk.length >= size) flush();
-    }
-  };
-  for (let index = 0; index <= spans.length; index += 2) {
-    text(index < spans.length ? spans[index] : buffer.length);
-    if (index === spans.length) break;
+  for (let index = 0; index < spans.length; index += 2) {
+    segment += buffer.slice(from, spans[index]);
     const sequence = buffer.slice(spans[index], spans[index + 1]);
     from = spans[index + 1];
-    if (sequence === FULL_RESET) { flush(); chunks.push(FULL_RESET); }
-    else if (!clearsScrollback(sequence)) chunk += sequence;
-    if (chunk.length >= size) flush();
+    if (sequence === FULL_RESET) {
+      segments.push(segment);
+      segment = "";
+    } else if (!clearsScrollback(sequence)) {
+      segment += clampRepeat(sequence, repeatLimit);
+    }
   }
-  flush();
-  return chunks;
+  segments.push(segment + buffer.slice(from));
+  return segments;
 }
 
 function colorCodes(mode, value, base, bright, extended) {
@@ -168,54 +171,78 @@ function rowText(line, cols, cell, full) {
   return style ? `${text}${ESC}[0m` : text;
 }
 
-// Saved output as the terminal showed it: parsed once by xterm at the view's
-// size, then read back as the normal screen's rows, each drawn by its glyphs
-// and attributes alone. A page of rows therefore needs no state from the
-// output before it. A full-screen program's alternate screen is left out, as
-// a terminal leaves it out once the program exits. A full reset starts a
-// fresh terminal below the rows before it. Resolves with the rows, each
-// starting with the line break that ends the row before unless it wraps.
-export function savedOutputRows(buffer, { cols, rows }, Terminal) {
-  const term = new Terminal({ cols, rows, scrollback: PARSE_SCROLLBACK, convertEol: true, scrollOnEraseInDisplay: true });
-  const chunks = savedChunks(buffer, Math.max(16, Math.floor(PARSE_SCROLLBACK / (4 * rows))));
-  const cell = term.buffer.normal.getNullCell();
-  const out = [];
-  let marker = null;
-  // Rows that left the normal screen are final; at a full reset or the end,
-  // the screen's rows up to the last one drawn are too.
-  const read = (whole) => {
-    const normal = term.buffer.normal;
-    if (!whole && term.buffer.active.type !== "normal") return;
-    let end = normal.baseY;
-    if (whole) {
-      end = normal.length;
-      while (end > normal.baseY && ["", "\r\n"].includes(rowText(normal.getLine(end - 1), cols, cell, false))) end -= 1;
+const written = (term, data) => new Promise((resolve) => term.write(data, resolve));
+const yielded = () => new Promise((resolve) => setTimeout(resolve));
+
+// The newest rows of a parsed segment's normal screen, at most budget of them
+// in at most chars characters, newest first, and whether rows before them
+// were left out; null once the activation is no longer current.
+async function newestRows(term, cols, { budget, chars, isCurrent }) {
+  const normal = term.buffer.normal;
+  const cell = normal.getNullCell();
+  let end = normal.length;
+  while (end > normal.baseY && ["", "\r\n"].includes(rowText(normal.getLine(end - 1), cols, cell, false))) end -= 1;
+  const kept = [];
+  let size = 0;
+  for (let y = end - 1; y >= 0; y -= 1) {
+    const text = rowText(normal.getLine(y), cols, cell, Boolean(normal.getLine(y + 1)?.isWrapped));
+    // The terminal keeps budget + 1 rows, so one it trimmed is never kept.
+    if (kept.length >= budget || size + text.length > chars) return { kept, size, dropped: true };
+    kept.push(text);
+    size += text.length;
+    if (kept.length % ROW_SLICE === 0) {
+      await yielded();
+      if (!isCurrent()) return null;
     }
-    for (let y = marker && !marker.isDisposed ? marker.line + 1 : 0; y < end; y += 1) {
-      out.push(rowText(normal.getLine(y), cols, cell, Boolean(normal.getLine(y + 1)?.isWrapped)));
+  }
+  return { kept, size, dropped: false };
+}
+
+// One segment parsed at the view's size in a terminal that keeps only the
+// newest budget + 1 rows, a slice at a time while the activation is current.
+async function segmentRows(segment, { cols, rows }, Terminal, limits) {
+  const term = new Terminal({ cols, rows, scrollback: limits.budget + 1, convertEol: true, scrollOnEraseInDisplay: true });
+  try {
+    for (let at = 0; at < segment.length;) {
+      let cut = Math.min(segment.length, at + WRITE_SLICE);
+      if (inRange(segment.codePointAt(cut), 0xdc00, 0xdfff)) cut += 1;
+      await written(term, segment.slice(at, cut));
+      at = cut;
+      if (!limits.isCurrent()) return null;
     }
-    marker?.dispose();
-    marker = !whole && end > 0 ? term.registerMarker(end - 1 - normal.baseY - normal.cursorY) : null;
-  };
-  return new Promise((resolve, reject) => {
-    let index = 0;
-    const next = () => {
-      try {
-        if (index >= chunks.length || chunks[index] === FULL_RESET) read(true);
-        else read(false);
-        if (index >= chunks.length) {
-          term.dispose();
-          resolve(out);
-          return;
-        }
-        term.write(chunks[index++], next);
-      } catch (error) {
-        term.dispose();
-        reject(error);
-      }
-    };
-    next();
-  });
+    return await newestRows(term, cols, limits);
+  } finally {
+    term.dispose();
+  }
+}
+
+// Saved output as the terminal showed it: parsed by xterm at the view's size,
+// then read back as the normal screen's rows, each drawn by its glyphs and
+// attributes alone. A page of rows therefore needs no state from the output
+// before it. A full-screen program's alternate screen is left out, as a
+// terminal leaves it out once the program exits. A full reset starts a fresh
+// terminal below the rows before it. Segments between full resets are parsed
+// newest first, and parsing stops once the newest rows fill the budget.
+// Resolves with the rows, each starting with the line break that ends the
+// row before unless it wraps, and whether earlier rows were left out; or with
+// null, without parsing further, once isCurrent returns false.
+export async function savedOutputRows(buffer, { cols, rows }, Terminal, isCurrent = () => true) {
+  const segments = savedSegments(buffer, (MAX_SAVED_ROWS + rows + 1) * cols);
+  const kept = [];
+  let budget = MAX_SAVED_ROWS;
+  let chars = MAX_SAVED_CHARS;
+  let dropped = false;
+  for (let index = segments.length - 1; index >= 0 && !dropped; index -= 1) {
+    if (!segments[index]) continue;
+    if (budget <= 0 || chars <= 0) { dropped = true; break; }
+    const read = await segmentRows(segments[index], { cols, rows }, Terminal, { budget, chars, isCurrent });
+    if (!read) return null;
+    kept.push(...read.kept);
+    budget -= read.kept.length;
+    chars -= read.size;
+    dropped = read.dropped;
+  }
+  return { rows: kept.reverse(), dropped };
 }
 
 // Pages of at most size rows, about equal, newest last, each small enough
