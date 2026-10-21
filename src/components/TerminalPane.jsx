@@ -30,7 +30,14 @@ function savedFields(detail, item) {
     endedAt: detail.endedAt, saved: true, recoveryReservation: undefined, pid: null };
 }
 
-function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = EMPTY_UNVERIFIED_IDS, sendRuntime, onError }) {
+// The page-scoped audit fence guards live owners. A session the server lists
+// as saved output has no owner, so its status wins for display and actions;
+// input and resize stay off because a saved session never sends them.
+function fencedLive(item, unverifiedIds) {
+  return item.status !== "ended" && unverifiedIds.has(item.id);
+}
+
+function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, unverifiedTerminalIds = EMPTY_UNVERIFIED_IDS, sendRuntime, onError }) {
   const hostRef = useRef(null);
   const xtermRef = useRef(null);
   const fitSelectedRef = useRef(null);
@@ -47,6 +54,9 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
   const selectingRef = useRef(false);
   const mountedRef = useRef(false);
   const queuedReconnectRef = useRef(null);
+  const syncingRef = useRef(false);
+  const queuedSyncRef = useRef(false);
+  const seenTerminalsVersionRef = useRef(terminalsVersion);
   const focusRequestRef = useRef(null);
   const terminalsRef = useRef([]);
   const unverifiedTerminalIdsRef = useRef(unverifiedTerminalIds);
@@ -114,10 +124,11 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
   useLayoutEffect(() => {
     const pending = pendingOutputRef.current;
     if (pending && unverifiedTerminalIds.has(pending.id)) pending.unknown = true;
-    if (!terminalsRef.current.some((item) => unverifiedTerminalIds.has(item.id) && item.status !== "unknown")) return;
-    stageTerminals(terminalsRef.current.map((item) => unverifiedTerminalIds.has(item.id)
+    if (!terminalsRef.current.some((item) => fencedLive(item, unverifiedTerminalIds) && item.status !== "unknown")) return;
+    stageTerminals(terminalsRef.current.map((item) => fencedLive(item, unverifiedTerminalIds)
       ? { ...item, status: "unknown" } : item));
-    if (unverifiedTerminalIds.has(activeIdRef.current)) {
+    const active = terminalsRef.current.find((item) => item.id === activeIdRef.current);
+    if (active && fencedLive(active, unverifiedTerminalIds)) {
       inputReadyRef.current = false;
       awaitingVisibleFitRef.current = false;
       setExitNotice("Terminal ownership is unverified. Inspect local terminal recovery.");
@@ -155,7 +166,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
   }
 
   function stageTerminals(next) {
-    const guarded = next.map((item) => unverifiedTerminalIdsRef.current.has(item.id)
+    const guarded = next.map((item) => fencedLive(item, unverifiedTerminalIdsRef.current)
       ? { ...item, status: "unknown" } : item);
     terminalsRef.current = guarded;
     pruneExitedIds(exitedIdsRef.current, guarded, pendingOutputRef.current);
@@ -203,8 +214,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
       });
       if (token !== reconcileTokenRef.current) return;
       if (pending.overflow) throw new Error("Terminal output exceeded the activation buffer; retry the tab");
-      const status = pending.unknown || unverifiedTerminalIdsRef.current.has(terminal.id)
-        ? "unknown" : detail.status ?? terminal.status;
+      let status = detail.status ?? terminal.status;
+      if (status !== "ended" && (pending.unknown || unverifiedTerminalIdsRef.current.has(terminal.id))) status = "unknown";
       const xterm = xtermRef.current;
       xterm?.reset();
       if (detail.relaunchedFrom ?? terminal.relaunchedFrom) xterm?.write(NEW_SHELL_MARKER);
@@ -267,9 +278,9 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
         stageTerminals([...matching.filter((item) => item.id !== terminal.id), terminal]);
         await activateTerminal(terminal, token);
       } catch (error) { if (!cancelled && token === reconcileTokenRef.current) { recoverSelection(); onErrorRef.current(error); } }
-      finally { if (!cancelled && token === reconcileTokenRef.current) { loadingRef.current = false; setLoading(false); } }
+      finally { if (!cancelled && token === reconcileTokenRef.current) { loadingRef.current = false; setLoading(false); drainReconnect(); } }
     })();
-    return () => { cancelled = true; mountedRef.current = false; ++reconcileTokenRef.current; selectingRef.current = false; queuedReconnectRef.current = null; focusRequestRef.current = null; pendingOutputRef.current = null; activeIdRef.current = ""; displayedCursorRef.current = 0; };
+    return () => { cancelled = true; mountedRef.current = false; ++reconcileTokenRef.current; selectingRef.current = false; queuedReconnectRef.current = null; queuedSyncRef.current = false; focusRequestRef.current = null; pendingOutputRef.current = null; activeIdRef.current = ""; displayedCursorRef.current = 0; };
   }, [worktree.id, worktree.path]);
 
   useEffect(() => {
@@ -310,34 +321,65 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
     }
     if (runtimeEvent?.type === "terminal.audit-failed") {
       if (pendingOutputRef.current?.id === runtimeEvent.terminalId) pendingOutputRef.current.unknown = true;
-      stageTerminals(terminalsRef.current.map((item) => item.id === runtimeEvent.terminalId
-        ? { ...item, status: "unknown" } : item));
-      if (runtimeEvent.terminalId === activeIdRef.current) {
-        inputReadyRef.current = false;
-        awaitingVisibleFitRef.current = false;
-        setExitNotice("Terminal ownership is unverified. Inspect local terminal recovery.");
-      }
-    }
-    // A recovery reservation became saved output. Replace the tab, and re-read
-    // it when selected so its label, buffer and actions match the server.
-    if (runtimeEvent?.type === "terminal.restored" && runtimeEvent.payload?.status === "ended"
-      && terminalsRef.current.some((item) => item.id === runtimeEvent.terminalId)) {
-      if (runtimeEvent.terminalId === activeIdRef.current || pendingOutputRef.current?.id === runtimeEvent.terminalId) {
-        if (mutationRef.current || reconcilingRef.current || selectingRef.current) queuedReconnectRef.current = {};
-        else reconcileConnection({}, true);
-      } else {
-        stageTerminals(terminalsRef.current.map((item) => item.id === runtimeEvent.terminalId ? runtimeEvent.payload : item));
+      const audited = terminalsRef.current.find((item) => item.id === runtimeEvent.terminalId);
+      if (audited && audited.status !== "ended") {
+        stageTerminals(terminalsRef.current.map((item) => item === audited ? { ...item, status: "unknown" } : item));
+        if (runtimeEvent.terminalId === activeIdRef.current) {
+          inputReadyRef.current = false;
+          awaitingVisibleFitRef.current = false;
+          setExitNotice("Terminal ownership is unverified. Inspect local terminal recovery.");
+        }
       }
     }
     if (runtimeEvent?.type === "terminal.history") announceHistoryWarning(runtimeEvent.payload, onErrorRef.current);
     if (runtimeEvent?.type === "runtime.connected") announceHistoryWarning(runtimeEvent.payload?.history, onErrorRef.current);
     if (runtimeEvent?.type === "runtime.connected" && (runtimeEvent.payload?.replay?.requestedAfter > 0 || runtimeEvent.payload?.restarted) && activeIdRef.current) {
-      if (mutationRef.current || reconcilingRef.current || selectingRef.current) queuedReconnectRef.current = runtimeEvent.payload;
-      else reconcileConnection(runtimeEvent.payload);
+      if (mutationRef.current || reconcilingRef.current || selectingRef.current || syncingRef.current) queuedReconnectRef.current = true;
+      else reconcileConnection();
     }
   }, [runtimeEvent, worktree.path]);
 
-  function reconcileConnection(payload, refresh = false) {
+  useEffect(() => {
+    if (terminalsVersion === seenTerminalsVersionRef.current) return;
+    seenTerminalsVersionRef.current = terminalsVersion;
+    if (loadingRef.current || syncingRef.current) queuedSyncRef.current = true;
+    else syncListing();
+  }, [terminalsVersion]);
+
+  // Saved sessions and recovery reservations change on the server without a
+  // per-tab event. Re-list them all; live tabs keep following their events.
+  async function syncListing() {
+    if (!mountedRef.current) return;
+    syncingRef.current = true;
+    const token = reconcileTokenRef.current;
+    try {
+      const listing = await api("/api/terminals");
+      if (!mountedRef.current) return;
+      if (token !== reconcileTokenRef.current || loadingRef.current) { queuedSyncRef.current = true; return; }
+      announceHistoryWarning(listing.history, onErrorRef.current);
+      const listed = new Map(listing.terminals.filter((item) => item.cwd === worktree.path).map((item) => [item.id, item]));
+      const active = terminalsRef.current.find((item) => item.id === activeIdRef.current);
+      const next = terminalsRef.current.flatMap((item) => {
+        const current = listed.get(item.id);
+        if (!current) return [];
+        return current.status === "ended" || item.status === "ended" || current.recoveryReservation || item.recoveryReservation ? [current] : [item];
+      });
+      const nextActive = next.find((item) => item.id === active?.id);
+      stageTerminals(next);
+      // The selected session changed underneath its view: read it again so
+      // its buffer, label and actions match the server.
+      if (active && (nextActive?.status !== active.status || nextActive?.endReason !== active.endReason
+        || nextActive?.recoveryReservation !== active.recoveryReservation)) queuedReconnectRef.current = true;
+    } catch (error) {
+      if (mountedRef.current && token === reconcileTokenRef.current) onErrorRef.current(error);
+    } finally {
+      syncingRef.current = false;
+      if (mountedRef.current && !loadingRef.current) drainReconnect();
+    }
+  }
+
+  // A reconnect re-lists over HTTP: the socket snapshot omits saved sessions.
+  function reconcileConnection() {
     if (!mountedRef.current) return;
     reconcilingRef.current = true;
     const previousId = activeIdRef.current;
@@ -345,7 +387,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
     const wasAwaitingFit = awaitingVisibleFitRef.current;
     const token = beginSelection();
     const reconcile = async () => {
-      const listing = refresh ? await api("/api/terminals") : { terminals: payload.terminals ?? [] };
+      const listing = await api("/api/terminals");
       if (token !== reconcileTokenRef.current) return;
       announceHistoryWarning(listing.history, onErrorRef.current);
       const matching = listing.terminals.filter((terminal) => terminal.cwd === worktree.path);
@@ -371,10 +413,16 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
   }
 
   function drainReconnect() {
-    if (!mountedRef.current || mutationRef.current || reconcilingRef.current || selectingRef.current) return;
-    const queued = queuedReconnectRef.current;
-    queuedReconnectRef.current = null;
-    if (queued) reconcileConnection(queued, true);
+    if (!mountedRef.current || mutationRef.current || reconcilingRef.current || selectingRef.current || syncingRef.current) return;
+    // A reconnect re-lists every tab, so it also satisfies a queued sync.
+    if (queuedReconnectRef.current) {
+      queuedReconnectRef.current = null;
+      queuedSyncRef.current = false;
+      reconcileConnection();
+    } else if (queuedSyncRef.current) {
+      queuedSyncRef.current = false;
+      syncListing();
+    }
   }
 
   function finishMutation(token) {
@@ -431,8 +479,17 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
     const focusedClose = document.activeElement?.closest(".terminal-tab")?.querySelector('[role="tab"]')?.dataset.tabId === id;
     const token = beginSelection();
     if (focusedClose) focusRequestRef.current = { id: null, token };
+    let deleted = false;
     try {
-      await api(`/api/terminals/${id}`, { method: "DELETE" });
+      try { await api(`/api/terminals/${id}`, { method: "DELETE" }); }
+      catch (error) {
+        // Quota or retention may already have removed a saved session; its
+        // tab leaves too. Anything the server still lists keeps the error.
+        if (error.status !== 404) throw error;
+        const listing = await api("/api/terminals");
+        if (listing.terminals.some((item) => item.id === id)) throw error;
+      }
+      deleted = true;
       if (token !== reconcileTokenRef.current) return;
       // An exit can update another tab while DELETE is pending; the render-time
       // list is not authoritative after the asynchronous wait.
@@ -449,7 +506,13 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
       await activateTerminal(next, token);
     } catch (error) {
       if (token === reconcileTokenRef.current) {
-        recoverSelection(wasReady, wasAwaitingFit);
+        // A failed close can still have ended the process, for example when
+        // its saved output could not be deleted. Re-list before any input.
+        if (deleted) recoverSelection(wasReady, wasAwaitingFit);
+        else {
+          recoverSelection();
+          queuedReconnectRef.current = true;
+        }
         if (focusRequestRef.current?.token === token && !focusRequestRef.current.id) {
           focusRequestRef.current = null;
         }

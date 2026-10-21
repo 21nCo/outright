@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import test from "node:test";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync } from "node:fs";
+import test, { mock } from "node:test";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -423,9 +425,11 @@ test("a prior-run owner awaiting proof stays recovery-only even with saved outpu
   proven = true;
   assert.equal(await terminals.reconcileUnknown(), 1);
   assert.deepEqual(terminals.list().map(({ status, endReason, pid }) => ({ status, endReason, pid })), [{ status: "ended", endReason: "restart", pid: null }]);
-  const restored = published.filter((event) => event.type === "terminal.restored");
-  assert.deepEqual(restored.map(({ terminalId, payload }) => [terminalId, payload.status, payload.name, payload.recoveryReservation]),
-    [[id, "ended", "Shell", undefined]], "a client showing the reservation was not told it ended");
+  await Promise.resolve();
+  assert.equal(published.filter((event) => event.type === "terminals.changed").length, 1,
+    "a client showing the reservation was not told to re-list it");
+  const [listed] = terminals.list();
+  assert.deepEqual([listed.name, listed.recoveryReservation], ["Shell", undefined], "the restored listing kept reservation fields");
   assert.equal(terminals.capacity().active, 0);
   await terminals.shutdown();
 });
@@ -452,9 +456,94 @@ test("while the audit scan is pending a session with no recorded exit is not sho
   terminals.reloadUnknownReservations();
   assert.deepEqual(status(), { [unproven]: "ended", [exited]: "ended" });
   assert.equal(terminals.get(unproven).endReason, "restart");
-  assert.deepEqual(published.filter((event) => event.type === "terminal.restored").map((event) => event.terminalId), [unproven],
-    "only the masked session was announced as restored");
+  await Promise.resolve();
+  assert.equal(published.filter((event) => event.type === "terminals.changed").length, 1, "the scan result was not announced once");
   await terminals.shutdown();
+});
+
+test("quota eviction, retention expiry and dismissal each tell clients to re-list", async (t) => {
+  const { directory } = workspace(t);
+  let clock = Date.parse("2026-10-21T00:00:00.000Z");
+  const limits = { ...TERMINAL_HISTORY_LIMITS, terminalBytes: 64 * 1024, totalBytes: 28 * 1024, fileBytes: 1024 };
+  const seed = openTerminalHistory({ directory, limits, now: () => clock });
+  const [oldest, expiring, dismissed] = [begin(seed), begin(seed), begin(seed)];
+  for (const id of [oldest, expiring, dismissed]) { clock += 1000; seed.end(id, { exitCode: 0 }); }
+  seed.close();
+  const published = [];
+  const store = openTerminalHistory({ directory, limits, now: () => clock });
+  const { manager: terminals, ptys } = manager(store, { publish: (event) => published.push(event) });
+  const changes = async () => { await Promise.resolve(); return published.splice(0).filter((event) => event.type === "terminals.changed").length; };
+  const listed = () => terminals.list().map((entry) => entry.id);
+
+  const live = terminals.create({ cwd: "/work/tree" });
+  await changes();
+  ptys[0].emit("x".repeat(20 * 1024));
+  assert.equal(listed().includes(oldest), false, "the quota did not evict the oldest saved session");
+  assert.equal(await changes(), 1, "quota eviction was not announced");
+
+  clock += TERMINAL_HISTORY_LIMITS.retentionMs;
+  assert.deepEqual(listed().filter((id) => id !== live.id), [], "expired sessions were still listed");
+  assert.equal(await changes(), 1, "retention expiry was not announced once");
+
+  const saved = begin(store);
+  store.end(saved, { exitCode: 1 });
+  await changes();
+  assert.equal(await terminals.close(saved), true);
+  assert.equal(await changes(), 1, "dismissal was not announced to other clients");
+  await terminals.shutdown();
+});
+
+test("the socket connection snapshot omits saved sessions, so any admitted population still connects", async (t) => {
+  const { directory } = workspace(t);
+  const seed = openTerminalHistory({ directory });
+  for (let index = 0; index < 40; index += 1) seed.end(begin(seed), { exitCode: 0 });
+  seed.close();
+  const { manager: terminals } = manager(openTerminalHistory({ directory }));
+  const live = terminals.create({ cwd: "/work/tree" });
+  const all = terminals.list();
+  assert.equal(all.length, 41);
+  assert.deepEqual(terminals.list({ saved: false }).map((entry) => entry.id), [live.id], "the connection snapshot carried saved sessions");
+  // The quota admits one saved session per two charged files. Listing every
+  // one in a single socket frame would exceed the hub's 1 MiB client budget.
+  const admitted = Math.floor(TERMINAL_HISTORY_LIMITS.totalBytes / (2 * TERMINAL_HISTORY_LIMITS.fileBytes));
+  const perEntry = Buffer.byteLength(JSON.stringify(all.at(-1)));
+  assert.ok(admitted * perEntry > 1024 * 1024, "the admitted population no longer needs to be kept out of the snapshot");
+  await terminals.shutdown();
+});
+
+test("load cleanup is best effort, and another load failure is named and serves nothing", (t) => {
+  const { directory } = workspace(t);
+  const seed = openTerminalHistory({ directory });
+  const id = begin(seed);
+  seed.end(id, { exitCode: 0 });
+  seed.close();
+  const temp = path.join(directory, `${id}.meta.0123456789abcdef.tmp`);
+  writeFileSync(temp, "partial", { mode: 0o600 });
+  const restore = () => { mock.restoreAll(); syncBuiltinESMExports(); };
+  t.after(restore);
+  // An antivirus or indexer lock on a leftover file is not an unsafe store.
+  const rm = fs.rmSync;
+  mock.method(fs, "rmSync", (target, options) => {
+    if (String(target).endsWith(".tmp")) throw Object.assign(new Error("locked"), { code: "EBUSY" });
+    return rm(target, options);
+  });
+  syncBuiltinESMExports();
+  const locked = openTerminalHistory({ directory });
+  assert.equal(locked.status().persistent, true, "a locked temporary file made the store untrusted");
+  assert.deepEqual(locked.saved().map((entry) => entry.id), [id]);
+  locked.close();
+  restore();
+  const lstat = fs.lstatSync;
+  mock.method(fs, "lstatSync", (target, options) => {
+    if (String(target).endsWith(".meta")) throw Object.assign(new Error("I/O error"), { code: "EIO" });
+    return lstat(target, options);
+  });
+  syncBuiltinESMExports();
+  const failing = openTerminalHistory({ directory });
+  assert.equal(failing.status().persistent, false);
+  assert.match(failing.status().warning, /could not be loaded \(EIO\)/, "an I/O failure was reported as an unsafe directory");
+  assert.deepEqual(failing.saved(), [], "a store that is not persisting served saved sessions");
+  failing.close();
 });
 
 test("a real terminal's output is restored from the launch directory after the runtime restarts", { timeout: 30_000 }, async (t) => {

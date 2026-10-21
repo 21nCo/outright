@@ -29,9 +29,16 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   let reservedUnknown = unresolvedReservations();
   const verifiedCreateFailures = new Map();
   let reconciliationPromise;
-  // Saved sessions a client was shown as recovery reservations. Each one is
-  // announced when it can be shown as ended instead.
-  const maskedSaved = new Set();
+  // One coalesced signal covers every saved-session transition: restore from
+  // a reservation, quota eviction, retention expiry and removal. Clients
+  // re-list on it, so a dropped or merged event cannot strand their state.
+  let changePending = false;
+  function terminalsChanged() {
+    if (changePending) return;
+    changePending = true;
+    queueMicrotask(() => { changePending = false; publish({ type: "terminals.changed" }); });
+  }
+  history?.subscribe?.(terminalsChanged);
   let shuttingDown = false;
   let sweepingProofs = false;
   // Old audit records may lack a worktree path. Charge their unknown owner
@@ -97,8 +104,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     try { removeTerminalEmpty(entry.target, database.launchDirectory); }
     catch { /* The verified owner remains absent; retry cleanup later. */ }
     reservedUnknown = unresolvedReservations();
-    if (history?.has(entry.target)) maskedSaved.add(entry.target);
-    publishRestored();
+    terminalsChanged();
     return true;
   }
 
@@ -132,18 +138,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     reservedUnknown = unresolvedReservations();
     sweepStaleEmptyProofs();
     publish({ type: "capacity.changed" });
-    publishRestored();
-  }
-
-  function publishRestored() {
-    if (!maskedSaved.size) return;
-    for (const entry of savedSessions()) {
-      if (!maskedSaved.has(entry.id)) continue;
-      const saved = listedSaved(entry);
-      if (saved.status !== "ended") continue;
-      maskedSaved.delete(entry.id);
-      publish({ type: "terminal.restored", terminalId: entry.id, payload: saved });
-    }
+    terminalsChanged();
   }
 
   function create(input) {
@@ -317,15 +312,16 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   // exit may still have a live prior-run owner. Show it as unverified.
   function listedSaved(entry) {
     if (database.terminalAuditScanPending && entry.endReason === "restart") {
-      maskedSaved.add(entry.id);
       return reservationTerminal({ target: entry.id, cwd: entry.cwd, pid: null });
     }
     return savedTerminal(entry);
   }
-  function list() {
+  // Saved sessions are bounded by the history quota, not by a frame size, so
+  // the socket's connection snapshot omits them; clients list them over HTTP.
+  function list({ saved = true } = {}) {
     const reservations = reservedUnknown.filter((entry) => !terminals.has(entry.target));
-    if (history) for (const entry of reservations) if (history.has(entry.target)) maskedSaved.add(entry.target);
-    return [...terminals.values()].map(publicTerminal).concat(reservations.map(reservationTerminal), savedSessions().map(listedSaved));
+    return [...terminals.values()].map(publicTerminal).concat(reservations.map(reservationTerminal),
+      saved ? savedSessions().map(listedSaved) : []);
   }
   function capacity() {
     if (database.terminalAuditScanPending) return { active: maxTerminals, unknown: maxTerminals, limit: maxTerminals,
@@ -337,12 +333,10 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     const terminal = terminals.get(id);
     if (terminal) return { ...publicTerminal(terminal), buffer: terminal.buffer, outputCursor: terminal.outputCursor };
     const reservation = reservedUnknown.find((entry) => entry.target === id);
-    if (reservation) {
-      if (history?.has(id)) maskedSaved.add(id);
-      return { ...reservationTerminal(reservation), buffer: history?.read(id) ?? "", outputCursor: 0 };
-    }
+    // Saved output restores the same tail a live terminal keeps for its pane.
+    if (reservation) return { ...reservationTerminal(reservation), buffer: (history?.read(id) ?? "").slice(-maxBufferChars), outputCursor: 0 };
     const saved = savedSessions().find((entry) => entry.id === id);
-    return saved ? { ...listedSaved(saved), buffer: history.read(id), outputCursor: 0 } : null;
+    return saved ? { ...listedSaved(saved), buffer: history.read(id).slice(-maxBufferChars), outputCursor: 0 } : null;
   }
   function historyStatus() { return history?.status() ?? { persistent: false, warning: null }; }
   function relaunchSource(value) {

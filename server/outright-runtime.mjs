@@ -1007,7 +1007,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         after: url.searchParams.get("after"),
         payload: {
           activeRuns: agents.activeRuns(),
-          terminals: terminals.list(),
+          terminals: terminals.list({ saved: false }),
           history: terminals.historyStatus?.() ?? null,
           runtimeInstanceId,
           restarted: Boolean(previousInstanceId && previousInstanceId !== runtimeInstanceId),

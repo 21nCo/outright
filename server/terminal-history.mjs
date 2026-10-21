@@ -135,6 +135,7 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
   let closed = false;
   let warning = null;
   let total = 0;
+  const listeners = new Set();
   const file = (name) => path.join(directory, name);
   const segmentName = (id, seq) => `${id}.${seq}.log`;
   const entryBytes = (entry) => (entry.metaBytes ? entry.metaBytes + fileBytes : 0)
@@ -227,6 +228,16 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
       try { rmSync(file(segmentName(entry.id, segment.seq)), { force: true }); }
       catch { /* An orphan segment is deleted by the next load. */ }
     }
+    for (const listener of listeners) {
+      try { listener(); } catch { /* A listener cannot undo the removal. */ }
+    }
+  }
+
+  // Load-time cleanup is best effort: a file that cannot be deleted now (an
+  // antivirus lock, say) is neither trusted nor served, and the next load
+  // retries it.
+  function removeQuietly(name) {
+    try { rmSync(file(name), { force: true }); } catch { /* Retried by the next load. */ }
   }
 
   function fail(error) {
@@ -301,13 +312,13 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     const segments = names.segments.sort((a, b) => a.seq - b.seq);
     if (!validMeta(meta, id)) {
       // Metadata is written before any output, so this is an orphan.
-      for (const segment of segments) rmSync(file(segmentName(id, segment.seq)), { force: true });
-      if (names.meta) rmSync(file(`${id}.meta`), { force: true });
+      for (const segment of segments) removeQuietly(segmentName(id, segment.seq));
+      if (names.meta) removeQuietly(`${id}.meta`);
       return;
     }
     while (segments.length > 2) {
       const [segment] = segments.splice(0, 1);
-      rmSync(file(segmentName(id, segment.seq)), { force: true });
+      removeQuietly(segmentName(id, segment.seq));
     }
     // A record without an end is marked ended by restart after loading, so
     // its retention runs from this start rather than its last output.
@@ -341,7 +352,7 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     }
     const groups = new Map();
     for (const name of owned) {
-      if (TEMP.test(name)) { rmSync(file(name), { force: true }); continue; }
+      if (TEMP.test(name)) { removeQuietly(name); continue; }
       const match = FILE.exec(name);
       if (!ID.test(match[1])) continue;
       const group = groups.get(match[1]) ?? { meta: false, segments: [] };
@@ -356,9 +367,13 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
   try {
     trusted = load();
     if (!trusted) warning = UNSAFE_WARNING;
-  } catch {
+  } catch (error) {
     trusted = false;
-    warning = UNSAFE_WARNING;
+    // A store that is not persisting serves nothing it partly loaded.
+    entries.clear();
+    total = 0;
+    warning = ["EACCES", "EPERM"].includes(error?.code) ? UNSAFE_WARNING
+      : `Terminal history could not be loaded (${error?.code ?? "read failed"}). Terminal output stays in memory only.`;
   }
   writable = trusted;
   if (trusted) {
@@ -383,6 +398,8 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
 
   return {
     status() { return { persistent: writable && !closed, warning }; },
+    // Called after a saved session is removed for any reason.
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
     has(id) { return entries.has(id); },
     // Saved sessions, newest last. The terminal manager hides live ones.
     saved() {
