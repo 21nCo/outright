@@ -1,0 +1,27 @@
+src/components/TerminalPane.jsx
+  s_68f80a4ef534d1::t_eaaa43ab767eba 8,298-299
+src/lib/terminal-exit-state.js
+  s_68f80a4ef534d1::t_9e3da8cc7a91ab 44-54,118-120,123-181,187-191,195-202,243-244,247,250,253-261,264-275,296,302-309,312
+tests/terminal-exit-state.test.mjs
+  s_68f80a4ef534d1::t_c9f79aab260506 3,103,138-159,170,175,184-187,190
+tests/ui-races.jsx
+  s_68f80a4ef534d1::t_1aa594c423004c 17-18,2586-2587,2590-2591,2611,2644-2694,6629
+tests/ui-races.test.mjs
+  s_68f80a4ef534d1::t_6158be9d597e14 917
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "12d545cd6c6d2d45f002d5a77b47e65a82a4a82e",
+  "prompts": {},
+  "sessions": {
+    "s_68f80a4ef534d1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_68f80a4ef534d1",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
