@@ -40,21 +40,15 @@ export function preferredTerminal(terminals, previousId = "") {
 const ESC = "\u001b";
 const STRING_INTRODUCERS = new Set(["]", "P", "X", "^", "_"]);
 const FULL_RESET = `${ESC}c`;
-const CLEAR_SCROLLBACK = `${ESC}[3J`;
-const SHIFT_OUT = "\u000e";
-const SHIFT_IN = "\u000f";
-const DESIGNATORS = "()*+";
-const SHIFTS = ["", SHIFT_OUT, `${ESC}n`, `${ESC}o`];
-// Text written after saved output reads as plain text: no insert mode, line
-// wrapping on, ASCII in every character set and the default rendition.
-export const PLAIN_TEXT = `${ESC}[4l${ESC}[?7h${ESC}(B${ESC})B${ESC}*B${ESC}+B${SHIFT_IN}${ESC}[0m`;
-// A full reset in saved output resets every mode the view tracks, as the
-// reset did, and clears the screen, which the read-only view scrolls into its
-// scrollback, so the output before it stays readable.
-const RESET_VIEW = `${ESC}[r${ESC}[?6l${PLAIN_TEXT}${ESC}[H${ESC}[2J`;
-const ALT_SCREEN_MODES = new Set(["47", "1047", "1049"]);
-const SGR_OFF = { 22: ["1", "2"], 23: ["3"], 24: ["4"], 25: ["5"], 27: ["7"], 28: ["8"], 29: ["9"], 39: ["fg"], 49: ["bg"], 55: ["53"], 59: ["ul"] };
-const SGR_COLOR = { 38: "fg", 48: "bg", 58: "ul" };
+// The offscreen terminal's scrollback. A character adds at most a screen of
+// rows (when it erases one), so a chunk of PARSE_SCROLLBACK / (4 * rows)
+// characters adds at most a quarter of it, and rows are read before any is
+// trimmed. A repeat (CSI b) can add more, as it can on the live view.
+const PARSE_SCROLLBACK = 10_000;
+// xterm's colour modes (Attributes.CM_P16, CM_P256 and CM_RGB).
+const PALETTE_16 = 0x1000000;
+const PALETTE_256 = 0x2000000;
+const TRUE_COLOR = 0x3000000;
 
 const inRange = (code, low, high) => code >= low && code <= high;
 
@@ -85,8 +79,8 @@ function escapeEnd(buffer, index) {
   return inRange(buffer.codePointAt(at), 0x30, 0x7e) ? at + 1 : -1;
 }
 
-// Every escape sequence in buffer as [start, end, ...], in order. Page
-// boundaries and the read-only projection both read this one tokenizer.
+// Every escape sequence in buffer as [start, end, ...], in order. Saved
+// output is cut into chunks only between them.
 export function escapeSpans(buffer) {
   const spans = [];
   for (let index = buffer.indexOf(ESC); index >= 0;) {
@@ -97,219 +91,154 @@ export function escapeSpans(buffer) {
   return spans;
 }
 
-function applySgr(state, params) {
-  const list = params ? params.split(";") : ["0"];
-  for (let index = 0; index < list.length; index += 1) {
-    const value = list[index];
-    const code = Number(value.split(":")[0] || 0);
-    if (code === 0) state.clear();
-    else if (SGR_OFF[code]) for (const key of SGR_OFF[code]) state.delete(key);
-    else if (SGR_COLOR[code]) {
-      let take = 0;
-      if (!value.includes(":")) take = { 5: 2, 2: 4 }[list[index + 1]] ?? 0;
-      state.set(SGR_COLOR[code], list.slice(index, index + take + 1).join(";"));
-      index += take;
-    } else if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) state.set("fg", value);
-    else if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) state.set("bg", value);
-    else state.set(String({ 6: 5, 21: 4 }[code] ?? code), value);
+// Erase in display 3 (also selective, CSI ? 3 J) deletes the scrollback.
+function clearsScrollback(sequence) {
+  if (sequence[1] !== "[" || !sequence.endsWith("J")) return false;
+  const params = sequence.slice(2, -1);
+  return Number((params.startsWith("?") ? params.slice(1) : params).split(/[;:]/)[0]) === 3;
+}
+
+// Saved output in chunks of about size characters, cut only between escape
+// sequences and never inside a surrogate pair. A full reset is a chunk of its
+// own and a scrollback erase is left out, so the view keeps earlier output.
+function savedChunks(buffer, size) {
+  const chunks = [];
+  const spans = escapeSpans(buffer);
+  let chunk = "";
+  let from = 0;
+  const flush = () => { if (chunk) chunks.push(chunk); chunk = ""; };
+  const text = (end) => {
+    while (from < end) {
+      let cut = Math.min(end, from + Math.max(1, size - chunk.length));
+      if (cut < end && inRange(buffer.charCodeAt(cut), 0xdc00, 0xdfff)) cut += 1;
+      chunk += buffer.slice(from, cut);
+      from = cut;
+      if (chunk.length >= size) flush();
+    }
+  };
+  for (let index = 0; index <= spans.length; index += 2) {
+    text(index < spans.length ? spans[index] : buffer.length);
+    if (index === spans.length) break;
+    const sequence = buffer.slice(spans[index], spans[index + 1]);
+    from = spans[index + 1];
+    if (sequence === FULL_RESET) { flush(); chunks.push(FULL_RESET); }
+    else if (!clearsScrollback(sequence)) chunk += sequence;
+    if (chunk.length >= size) flush();
   }
+  flush();
+  return chunks;
 }
 
-const freshModes = () => ({ margins: "", origin: false, insert: false, nowrap: false, charsets: ["B", "B", "B", "B"], shift: 0 });
-const freshContext = () => ({ state: new Map(), saved: null, alternate: false, modes: freshModes() });
-const copyContext = ({ state, saved, alternate, modes }) => ({ state: new Map(state), saved: saved && new Map(saved), alternate, modes: { ...modes, charsets: [...modes.charsets] } });
-const sgr = (rendition) => rendition.size ? `${ESC}[${[...rendition.values()].join(";")}m` : "";
-
-// The sequences that restore the modes a page opens with after the view's
-// own full reset: character sets and shift, then scroll margins, origin,
-// insert and wrap modes.
-function modesText({ margins, origin, insert, nowrap, charsets, shift }) {
-  let text = charsets.map((set, slot) => set === "B" ? "" : `${ESC}${DESIGNATORS[slot]}${set}`).join("") + SHIFTS[shift];
-  if (margins) text += `${ESC}[${margins}r`;
-  if (origin) text += `${ESC}[?6h`;
-  if (insert) text += `${ESC}[4h`;
-  return nowrap ? `${text}${ESC}[?7l` : text;
-}
-
-// Scroll margins as set, or "" for the whole screen. Margins the terminal
-// refuses leave the previous ones in effect.
-function setMargins(modes, params) {
-  const [top = 0, bottom = 0] = params.split(";").map(Number);
-  if (bottom && Math.max(top, 1) >= bottom) return;
-  modes.margins = top > 1 || bottom ? params : "";
-}
-
-function setMode(modes, mode, on) {
-  if (mode === "?6") modes.origin = on;
-  else if (mode === "4") modes.insert = on;
-  else if (mode === "?7") modes.nowrap = !on;
-}
-
-// The alternate screen with mode 1049 restores the rendition it saved.
-function switchScreen(context, mode, enter) {
-  if (mode === "1049" && enter) context.saved = new Map(context.state);
-  else if (mode === "1049" && context.saved) Object.assign(context, { state: context.saved, saved: null });
-  context.alternate = enter;
-}
-
-function trackCsi(context, body) {
-  if (body === "!p") {
-    context.state.clear();
-    if (!context.alternate) context.modes = freshModes();
-    return "";
-  }
-  const csi = /^(\??)([0-9:;]*)([hlmr])$/.exec(body);
-  if (!csi) return "";
-  const [, prefix, params, final] = csi;
-  if (final === "m" || final === "r") {
-    if (!prefix && final === "m") applySgr(context.state, params);
-    else if (!prefix && !context.alternate) setMargins(context.modes, params);
-    return "";
-  }
-  let kind = "";
-  for (const mode of params.split(";")) {
-    if (prefix && ALT_SCREEN_MODES.has(mode)) {
-      switchScreen(context, mode, final === "h");
-      kind = "screen";
-    } else if (!context.alternate) setMode(context.modes, prefix + mode, final === "h");
-  }
-  return kind;
-}
-
-// Follows the rendition, screen and modes a sequence leaves in effect, and
-// says whether it reset the terminal or switched screens. Modes a full-screen
-// program sets on the alternate screen are not the saved view's.
-function trackSequence(context, sequence) {
-  if (sequence === FULL_RESET) {
-    Object.assign(context, freshContext());
-    return "reset";
-  }
-  if (sequence[1] === "[") return trackCsi(context, sequence.slice(2));
-  if (context.alternate) return "";
-  const slot = DESIGNATORS.indexOf(sequence[1]);
-  if (slot >= 0 && sequence.length > 2) context.modes.charsets[slot] = sequence.slice(2);
-  else if (sequence === SHIFTS[2] || sequence === SHIFTS[3]) context.modes.shift = SHIFTS.indexOf(sequence);
+function colorCodes(mode, value, base, bright, extended) {
+  if (mode === PALETTE_16) return `;${value < 8 ? base + value : bright + value - 8}`;
+  if (mode === PALETTE_256) return `;${extended};5;${value}`;
+  if (mode === TRUE_COLOR) return `;${extended};2;${(value >> 16) & 255};${(value >> 8) & 255};${value & 255}`;
   return "";
 }
 
-// Shift out and shift in are plain-text controls; the last one wins.
-function trackText(context, text) {
-  if (context.alternate) return;
-  const out = text.lastIndexOf(SHIFT_OUT);
-  const back = text.lastIndexOf(SHIFT_IN);
-  if (out !== back) context.modes.shift = out > back ? 1 : 0;
+const FLAGS = [["isBold", 1], ["isDim", 2], ["isItalic", 3], ["isUnderline", 4], ["isBlink", 5], ["isInverse", 7], ["isInvisible", 8], ["isStrikethrough", 9], ["isOverline", 53]];
+
+// The SGR parameters that draw a cell as the terminal drew it.
+function cellStyle(cell) {
+  if (cell.isAttributeDefault()) return "";
+  let codes = "";
+  for (const [flag, code] of FLAGS) if (cell[flag]()) codes += `;${code}`;
+  codes += colorCodes(cell.getFgColorMode(), cell.getFgColor(), 30, 90, 38) + colorCodes(cell.getBgColorMode(), cell.getBgColor(), 40, 100, 48);
+  return codes.slice(1);
 }
 
-// A page boundary inside an escape sequence moves past it, or to its start
-// when the sequence reaches the page end. spans is [start, end, ...] sorted.
-function outsideEscape(spans, index, end) {
-  let low = 0;
-  let high = spans.length / 2;
-  while (low < high) {
-    const middle = (low + high) >> 1;
-    if (spans[middle * 2] < index) low = middle + 1;
-    else high = middle;
+const blankCell = (cell) => (cell.getChars() || " ") === " " && cell.isAttributeDefault();
+
+// One rendered row as text and SGR, ending in the default rendition. Blank
+// cells at its end are left out, unless the next row wraps from it: then it
+// keeps its full width, so it wraps there again.
+function rowText(line, cols, cell, full) {
+  let end = cols;
+  if (!full) while (end > 0 && blankCell(line.getCell(end - 1, cell))) end -= 1;
+  let text = line.isWrapped ? "" : "\r\n";
+  let style = "";
+  for (let x = 0; x < end; x += 1) {
+    line.getCell(x, cell);
+    if (cell.getWidth() === 0) continue;
+    const next = cellStyle(cell);
+    if (next !== style) text += `${ESC}[${next ? `0;${next}` : "0"}m`;
+    style = next;
+    text += cell.getChars() || " ";
   }
-  const span = (low - 1) * 2;
-  if (span < 0 || spans[span + 1] <= index) return index;
-  return spans[span + 1] < end ? spans[span + 1] : spans[span];
+  return style ? `${text}${ESC}[0m` : text;
 }
 
-// The start of the page that ends at end: at most maxLines line breaks and
-// maxChars characters, on a line boundary where one exists, never inside a
-// surrogate pair.
-function pageStart(buffer, end, maxChars, maxLines) {
-  const floor = Math.max(0, end - maxChars);
-  let start = floor;
-  let lines = 0;
-  for (let index = buffer.lastIndexOf("\n", end - 1); index >= floor; index = buffer.lastIndexOf("\n", index - 1)) {
-    lines += 1;
-    if (lines > maxLines) { start = index + 1; break; }
-    if (index === 0) break;
-  }
-  if (start === floor && start > 0) {
-    const lineStart = buffer.indexOf("\n", start) + 1;
-    if (lineStart > 0 && lineStart < end) start = lineStart;
-  }
-  const code = buffer.codePointAt(start);
-  if (start > 0 && start < end - 1 && code >= 0xdc00 && code <= 0xdfff) start += 1;
-  return start;
-}
-
-// Saved output can hold up to the 2 MiB history cap, more than one terminal
-// view keeps. It is shown in pages, newest last, each small enough that its
-// first line stays in the view's scrollback, and never starting inside an
-// escape sequence. Each page is [start, end, prefix, alternate, context]: the
-// modes, rendition, screen and parser context the output before it leaves in
-// effect.
-export function savedOutputPages(buffer, maxChars = 64_000, maxLines = 2_000) {
-  const spans = escapeSpans(buffer);
-  const starts = [];
-  for (let end = buffer.length; end > 0;) {
-    const start = outsideEscape(spans, pageStart(buffer, end, maxChars, maxLines), end);
-    starts.push(start);
-    end = start;
-  }
-  return pagesFrom(buffer, spans, starts.reverse());
-}
-
-// Pages starting at the given ascending offsets, none inside an escape sequence.
-export function savedPagesAt(buffer, starts) {
-  return pagesFrom(buffer, escapeSpans(buffer), starts);
-}
-
-function pagesFrom(buffer, spans, starts) {
-  const context = freshContext();
-  let span = 0;
-  let from = 0;
-  return starts.map((start, index) => {
-    for (; span < spans.length && spans[span] < start; span += 2) {
-      trackText(context, buffer.slice(from, spans[span]));
-      trackSequence(context, buffer.slice(spans[span], spans[span + 1]));
-      from = spans[span + 1];
+// Saved output as the terminal showed it: parsed once by xterm at the view's
+// size, then read back as the normal screen's rows, each drawn by its glyphs
+// and attributes alone. A page of rows therefore needs no state from the
+// output before it. A full-screen program's alternate screen is left out, as
+// a terminal leaves it out once the program exits. A full reset starts a
+// fresh terminal below the rows before it. Resolves with the rows, each
+// starting with the line break that ends the row before unless it wraps.
+export function savedOutputRows(buffer, { cols, rows }, Terminal) {
+  const term = new Terminal({ cols, rows, scrollback: PARSE_SCROLLBACK, convertEol: true, scrollOnEraseInDisplay: true });
+  const chunks = savedChunks(buffer, Math.max(16, Math.floor(PARSE_SCROLLBACK / (4 * rows))));
+  const cell = term.buffer.normal.getNullCell();
+  const out = [];
+  let marker = null;
+  // Rows that left the normal screen are final; at a full reset or the end,
+  // the screen's rows up to the last one drawn are too.
+  const read = (whole) => {
+    const normal = term.buffer.normal;
+    if (!whole && term.buffer.active.type !== "normal") return;
+    let end = normal.baseY;
+    if (whole) {
+      end = normal.length;
+      while (end > normal.baseY && ["", "\r\n"].includes(rowText(normal.getLine(end - 1), cols, cell, false))) end -= 1;
     }
-    trackText(context, buffer.slice(from, start));
-    from = start;
-    const prefix = modesText(context.modes) + sgr(context.alternate && context.saved ? context.saved : context.state);
-    return [start, starts[index + 1] ?? buffer.length, prefix, context.alternate, copyContext(context)];
+    for (let y = marker && !marker.isDisposed ? marker.line + 1 : 0; y < end; y += 1) {
+      out.push(rowText(normal.getLine(y), cols, cell, Boolean(normal.getLine(y + 1)?.isWrapped)));
+    }
+    marker?.dispose();
+    marker = !whole && end > 0 ? term.registerMarker(end - 1 - normal.baseY - normal.cursorY) : null;
+  };
+  return new Promise((resolve, reject) => {
+    let index = 0;
+    const next = () => {
+      try {
+        if (index >= chunks.length || chunks[index] === FULL_RESET) read(true);
+        else read(false);
+        if (index >= chunks.length) {
+          term.dispose();
+          resolve(out);
+          return;
+        }
+        term.write(chunks[index++], next);
+      } catch (error) {
+        term.dispose();
+        reject(error);
+      }
+    };
+    next();
   });
 }
 
-// What a sequence writes to the read-only view. Screen switches are dropped;
-// leaving the alternate screen restores the rendition now in effect.
-function viewSequence(sequence, kind, hidden, context) {
-  if (kind === "reset") return RESET_VIEW;
-  if (kind === "screen") return hidden && !context.alternate ? `${ESC}[0m${sgr(context.state)}` : "";
-  return hidden || sequence === CLEAR_SCROLLBACK ? "" : sequence;
-}
-
-// The normal-screen output a page leaves readable, and the screen it ends on.
-// A full-screen program's alternate screen is left out, as it is from a
-// terminal once the program exits; it ends at a screen switch or full reset.
-export function savedPageProjection(buffer, [start, end, , alternate = false, entry = null]) {
-  const page = buffer.slice(start, end);
-  const context = entry ? copyContext(entry) : { ...freshContext(), alternate };
-  const spans = escapeSpans(page);
-  let text = "";
-  let from = 0;
-  for (let index = 0; index < spans.length; index += 2) {
-    text += visibleText(context, page.slice(from, spans[index]));
-    const sequence = page.slice(spans[index], spans[index + 1]);
-    const hidden = context.alternate;
-    text += viewSequence(sequence, trackSequence(context, sequence), hidden, context);
-    from = spans[index + 1];
+// Pages of at most size rows, about equal, newest last, each small enough
+// that its first row stays in the view's scrollback. A page opens where a
+// line starts, unless one wrapped line fills it.
+export function savedRowPages(rows, size = 2_000) {
+  const even = Math.ceil(rows.length / Math.max(1, Math.ceil(rows.length / size)));
+  const opens = (index) => index === 0 || rows[index].startsWith("\r\n");
+  const pages = [];
+  for (let end = rows.length; end > 0 || !pages.length;) {
+    let start = Math.max(0, end - even);
+    let open = start;
+    while (open < end && !opens(open)) open += 1;
+    if (open === end) for (open = start; open > Math.max(0, end - size) && !opens(open);) open -= 1;
+    if (opens(open)) start = open;
+    pages.unshift([start, end]);
+    end = start;
   }
-  text += visibleText(context, page.slice(from));
-  return { text, alternate: context.alternate, context };
+  return pages;
 }
 
-function visibleText(context, text) {
-  if (context.alternate) return "";
-  trackText(context, text);
-  return text;
-}
-
-// The text a read-only page writes, its modes and rendition carried in.
-export function savedPageText(buffer, page) {
-  return (page[2] ?? "") + savedPageProjection(buffer, page).text;
+// The text a read-only page writes after the view's own full reset.
+export function savedPageText(rows, [start, end]) {
+  const text = rows.slice(start, end).join("");
+  return text.startsWith("\r\n") ? text.slice(2) : text;
 }

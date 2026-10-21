@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { escapeSpans, PLAIN_TEXT, preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabLabel, savedOutputPages, savedPagesAt, savedPageProjection, savedPageText } from "../src/lib/terminal-exit-state.js";
+import xterm from "@xterm/xterm";
+import { escapeSpans, preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabLabel, savedOutputRows, savedPageText, savedRowPages } from "../src/lib/terminal-exit-state.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
 
 test("audit failure fences terminal commands before a later runtime event or React commit", () => {
@@ -63,45 +64,140 @@ test("reopening a worktree shows live work first and otherwise the newest saved 
   assert.equal(preferredTerminal([]), null);
 });
 
-test("saved output pages cover every character in order within the view's bounds", () => {
-  const cases = ["", "a\nb", "x".repeat(300_000), "\n".repeat(10_000), Array.from({ length: 30_000 }, (_, index) => `line ${index}\r\n`).join(""), `${"é😀".repeat(40_000)}\n`];
-  for (const buffer of cases) {
-    const pages = savedOutputPages(buffer, 64_000, 2_000);
-    assert.equal(pages.map(([start, end]) => buffer.slice(start, end)).join(""), buffer);
-    for (const [start, end] of pages) {
-      assert.ok(end > start && end - start <= 64_000);
-      assert.ok((buffer.slice(start, end).match(/\n/g) ?? []).length <= 2_000);
-      const code = buffer.charCodeAt(start);
-      assert.ok(!(code >= 0xdc00 && code <= 0xdfff), "a page split a surrogate pair");
+const { Terminal } = xterm;
+const SIZE = { cols: 80, rows: 24 };
+const written = (term, data) => new Promise((resolve) => term.write(data, resolve));
+
+// Each cell as the terminal draws it: glyph, colours and attributes, and
+// whether its row wraps from the one before. Blank default cells at a row end
+// are not drawn.
+function drawnRow(line, cell) {
+  let text = line.isWrapped ? "~" : "";
+  let kept = text.length;
+  for (let x = 0; x < SIZE.cols; x += 1) {
+    line.getCell(x, cell);
+    if (cell.getWidth() === 0) continue;
+    const chars = cell.getChars() || " ";
+    text += cell.isAttributeDefault() ? chars : `${chars}{${[cell.getFgColorMode(), cell.getFgColor(), cell.getBgColorMode(), cell.getBgColor(),
+      cell.isBold(), cell.isDim(), cell.isItalic(), cell.isUnderline(), cell.isInverse(), cell.isInvisible(), cell.isStrikethrough()].join()}}`;
+    if (chars !== " " || !cell.isAttributeDefault()) kept = text.length;
+  }
+  return text.slice(0, kept);
+}
+
+// The normal screen's rows: its scrollback and the screen up to its last
+// drawn row, or the first count rows.
+function drawnRows(term, count = -1) {
+  const normal = term.buffer.normal;
+  const cell = normal.getNullCell();
+  const rows = [];
+  for (let y = 0; y < normal.length; y += 1) rows.push(drawnRow(normal.getLine(y), cell));
+  let end = count >= 0 ? count : rows.length;
+  while (count < 0 && end > normal.baseY && !rows[end - 1].replace("~", "")) end -= 1;
+  return rows.slice(0, end);
+}
+
+// The oracle: one continuous render of saved output in a terminal with the
+// view's options, each full reset starting a fresh terminal below the rows
+// read before it, and no scrollback erase.
+async function continuous(segments) {
+  // A character adds at most a screen of rows, when it erases one.
+  const longest = Math.max(...segments.map((segment) => segment.length));
+  const term = new Terminal({ ...SIZE, scrollback: Math.min(1_000_000, longest * SIZE.rows), convertEol: true, scrollOnEraseInDisplay: true });
+  let rows = [];
+  await new Promise((resolve) => segments.forEach((segment, index) => term.write(`${index ? "\x1bc" : ""}${segment}`, () => {
+    rows = rows.concat(drawnRows(term));
+    if (index === segments.length - 1) resolve();
+  })));
+  term.dispose();
+  return rows;
+}
+
+// The read-only view as the pane writes it: one terminal, each page drawn
+// alone after a full reset.
+async function viewed(buffer, pageRows) {
+  const rows = await savedOutputRows(buffer, SIZE, Terminal);
+  const pages = savedRowPages(rows, pageRows);
+  const term = new Terminal({ ...SIZE, scrollback: 10_000, convertEol: true });
+  let shown = [];
+  await new Promise((resolve) => pages.forEach(([start, end], index) => term.write(`\x1bc${savedPageText(rows, [start, end])}`, () => {
+    shown = shown.concat(drawnRows(term, end - start));
+    if (index === pages.length - 1) resolve();
+  })));
+  term.dispose();
+  return { shown, pages };
+}
+
+// The oracle's rows as the pages show them. A page opens inside a wrapped
+// line only when that line is longer than a page; there, the row cannot show
+// that it wraps from the row before.
+function paged(whole, pages, pageRows) {
+  const expected = [...whole];
+  for (const [start] of pages) {
+    if (!whole[start]?.startsWith("~")) continue;
+    let first = start;
+    let last = start;
+    while (first > 0 && whole[first].startsWith("~")) first -= 1;
+    while (whole[last + 1]?.startsWith("~")) last += 1;
+    assert.ok(last - first + 1 > pageRows, `a page opened inside a line of ${last - first + 1} rows`);
+    expected[start] = whole[start].slice(1);
+  }
+  return expected;
+}
+
+const lines = (name, count) => Array.from({ length: count }, (_, index) => `${name} ${index}${index % 2 ? "" : ` ${"=".repeat(90)}`}\r\n`).join("");
+
+test("saved output reads as one continuous terminal, whole and a page at a time", async () => {
+  const modes = ["\x1b[5;20r", "\x1b[?6h", "\x1b[4h", "\x1b[?7l", "\x1b(0", "\x1b)0\x0e", "\x1b*0\x1bn", "\x1b[31;44m"];
+  const cases = [
+    // Emulator state a page boundary must not change: character sets ended by
+    // DECANM, cursor saves holding a rendition or character set, the cursor
+    // moving between rows, tab stops and wide characters.
+    ["\x1b(0\x1b[?2h", "qqqq\r\n".repeat(3_000)],
+    ["\x1b7\x1b(0\x1b8qqqq\r\n\x1b7\x1b[31m\x1b8plain\r\n\x1b[s\x1b[32m\x1b[uplain\r\n\x1b[?1048h\x1b(0\x1b[?1048lqq\r\n", lines("x", 40)],
+    [`\x1b7${lines("between", 30)}\x1b8OVER\x1b[10;5HMOVED\r\n\x1bH\tTAB\x1b[3g\tafter\r\n`],
+    [`${"é😀漢".repeat(4_000)}\r\n`, `\x1b]52;c;${"Q".repeat(70_000)}\x07tail\r\n`],
+    // A full-screen program's screen is not the saved view's.
+    ["before\r\n\x1b[34m\x1b[?1049h\x1b[2J\x1b[HFULLSCREEN", "frame\r\n".repeat(2_500), "\x1b[?1049lafter\r\n"],
+    // Erasing the screen keeps the rows before it, at most a screen at a time.
+    ["\x1b[24;1Hx\x1b[2J".repeat(5_000)],
+  ];
+  for (const parts of cases) {
+    const buffer = parts.join("");
+    const whole = await continuous([buffer]);
+    for (const pageRows of whole.length > 4_000 ? [2_000, 997] : [2_000, 7, 2]) {
+      const { shown, pages } = await viewed(buffer, pageRows);
+      assert.deepEqual(shown, paged(whole, pages, pageRows), `${JSON.stringify(buffer.slice(0, 40))} in pages of ${pageRows}`);
     }
   }
+  for (const mode of modes) {
+    // A mode on before a full reset ends there; one on through the output
+    // stays on where every page opens.
+    const pre = `${lines("pre", 30)}${mode}`;
+    const reset = `${pre}\x1bc${lines("post", 60)}`;
+    assert.deepEqual((await viewed(reset, 13)).shown, await continuous([pre, lines("post", 60)]), `${JSON.stringify(mode)} before a reset`);
+    const on = `${mode}${lines("mid", 40)}`;
+    assert.deepEqual((await viewed(on, 9)).shown, await continuous([on]), `${JSON.stringify(mode)} on through the output`);
+  }
+  const { shown, pages } = await viewed(`\x1b(0\x1b[?2h${"qqqq\r\n".repeat(3_000)}`, 2_000);
+  assert.ok(pages.length > 1 && shown.at(-1) === "qqqq", "the last page drew ASCII as line drawing");
 });
 
-test("saved output pages never split an escape sequence and carry the rendition and screen in effect", () => {
-  const sgr = "\x1b[1;38;2;255;0;0mab\x1b[0m";
-  const osc = `\x1b]52;c;${"Q".repeat(70_000)}\x07`;
-  const cases = [sgr.repeat(20_000), `${"x".repeat(100_000)}${osc}tail`, `${"y\n".repeat(1_500)}${"\x1b]8;;https://example.test\x1b\\link\x1b]8;;\x1b\\".repeat(3_000)}`];
-  for (const buffer of cases) {
-    const sequences = [...buffer.matchAll(/\x1b(?:\[[0-9;]*m|\][^\x07\x1b]*(?:\x07|\x1b\\))/g)].map((match) => [match.index, match.index + match[0].length]);
-    const pages = savedOutputPages(buffer, 64_000, 2_000);
-    assert.equal(pages.map(([start, end]) => buffer.slice(start, end)).join(""), buffer);
-    for (const [start] of pages) assert.ok(!sequences.some(([from, to]) => start > from && start < to), `a page starts inside an escape sequence at ${start}`);
-  }
-
-  const colored = `\x1b[1;38;5;196mred\n${"x\n".repeat(3_000)}`;
-  assert.equal(savedOutputPages(colored).at(-1)[2], "\x1b[1;38;5;196m", "a later page lost the rendition set before it");
-  assert.ok(savedPageText(colored, savedOutputPages(colored).at(-1)).startsWith("\x1b[1;38;5;196m"));
-  for (const reset of ["\x1b[0m", "\x1b[m", "\x1bc", "\x1b[22;39m"]) {
-    assert.equal(savedOutputPages(`${colored.slice(0, 15)}${reset}${colored.slice(15)}`).at(-1)[2], "", `${JSON.stringify(reset)} did not end the rendition`);
-  }
-
-  const app = `before\n\x1b[34m\x1b[?1049h\x1b[2J\x1b[HFULLSCREEN\x1b[31m${"frame\n".repeat(2_500)}\x1b[?1049lafter\x1b[3J\n`;
-  const [first, second] = savedOutputPages(app);
-  assert.deepEqual([first[3], second[3], second[2]], [false, true, "\x1b[34m"], "a page opened inside the alternate screen lost its saved rendition");
-  const text = pages(app).join("");
-  assert.ok(text.includes("before") && text.includes("after") && !/FULLSCREEN|frame|\x1b\[\?1049|\x1b\[3J/.test(text), "alternate-screen output or a scrollback erase reached the saved view");
-  assert.equal(savedPageText("a\x1bcb", [0, 4]), `a\x1b[r\x1b[?6l${PLAIN_TEXT}\x1b[H\x1b[2Jb`, "a full reset inside saved output cleared the view's scrollback");
-  function pages(buffer) { return savedOutputPages(buffer).map((page) => savedPageText(buffer, page)); }
+test("saved output keeps every row up to the history cap, in pages the view's scrollback holds", async () => {
+  const buffer = Array.from({ length: 60_000 }, (_, index) => `\x1b[3${index % 8}mline ${index}\x1b[0m\r\n`).join("");
+  const rows = await savedOutputRows(buffer, SIZE, Terminal);
+  assert.equal(rows.length, 60_000);
+  const pages = savedRowPages(rows);
+  assert.deepEqual(pages.flatMap(([start, end]) => Array.from({ length: end - start }, (_, index) => start + index)), rows.map((_, index) => index), "pages skip or repeat rows");
+  assert.ok(pages.every(([start, end]) => end - start <= 2_000 && end > start));
+  assert.match(savedPageText(rows, pages[0]), /^\x1b\[0;30mline 0\x1b\[0m\r\n/);
+  assert.match(savedPageText(rows, pages.at(-1)), /line 59999\x1b\[0m$/);
+  assert.deepEqual(savedRowPages([]), [[0, 0]]);
+  assert.deepEqual(savedRowPages(rows.slice(0, 2_500)), [[0, 1_250], [1_250, 2_500]], "the earliest page holds only what the others left");
+  // A page opens at the start of a wrapped line, unless the line fills it.
+  assert.deepEqual(savedRowPages(["a", "b", "\r\nc", "d", "\r\ne", "f"], 3), [[0, 2], [2, 4], [4, 6]]);
+  assert.deepEqual(savedRowPages(["a", "b", "c", "d"], 2), [[0, 2], [2, 4]]);
+  assert.deepEqual(await savedOutputRows("", SIZE, Terminal), []);
 });
 
 test("one escape tokenizer finds every sequence class the saved view knows", () => {
@@ -122,77 +218,41 @@ test("one escape tokenizer finds every sequence class the saved view knows", () 
   for (const [buffer, spans] of cases) assert.deepEqual(escapeSpans(buffer), spans, JSON.stringify(buffer.slice(0, 40)));
 });
 
-test("a full reset ends a full-screen program's hidden screen in the saved view", () => {
-  const text = savedPageText("a\x1b[?1049hX\x1bcb", [0, 15]);
-  assert.ok(text.includes("b") && !text.includes("X"), JSON.stringify(text));
+test("a full reset or scrollback erase in saved output keeps the rows before it", async () => {
   const probe = "before\r\n\x1b[?1049hFULLSCREEN\x1bcnormal-after-reset\r\nmore\r\n";
-  const shown = savedOutputPages(probe).map((page) => savedPageText(probe, page)).join("");
-  assert.ok(shown.includes("before") && shown.includes("normal-after-reset") && shown.includes("more") && !shown.includes("FULLSCREEN"));
-  const app = `before\n\x1b[?1049h${"frame\n".repeat(2_500)}\x1bcnormal after\n`;
-  const pages = savedOutputPages(app);
-  const opened = pages.findIndex((page) => page[3]);
-  assert.ok(opened > 0, "no page opened inside the alternate screen");
-  assert.match(savedPageText(app, pages[opened]), /normal after/, "a page opened inside the alternate screen hid output after a full reset");
+  assert.deepEqual((await viewed(probe, 2_000)).shown, ["before", "normal-after-reset", "more"]);
+  for (const erase of ["\x1b[3J", "\x1b[?3J", "\x1b[3;1J"]) {
+    assert.deepEqual((await viewed(`${lines("a", 40)}${erase}b\r\n`, 9)).shown, await continuous([`${lines("a", 40)}b\r\n`]), `${JSON.stringify(erase)} erased saved rows`);
+  }
+  const app = `before\r\n\x1b[?1049h${"frame\r\n".repeat(2_500)}\x1bcnormal after\r\n`;
+  assert.deepEqual((await viewed(app, 2_000)).shown, ["before", "normal after"]);
 });
 
-test("a full reset in saved output ends every mode, and a page opens with the modes in effect", () => {
-  const reset = savedPageText("\x1bc", [0, 2]);
-  for (const sequence of ["\x1b[r", "\x1b[?6l", "\x1b[4l", "\x1b[?7h", "\x1b(B", "\x1b)B", "\x1b*B", "\x1b+B", "\x0f", "\x1b[0m", "\x1b[2J"]) {
-    assert.ok(reset.includes(sequence), `a saved full reset left ${JSON.stringify(sequence)} out`);
-  }
-  assert.ok(!reset.includes("\x1bc") && !reset.includes("\x1b[3J"), "a saved full reset cleared the view's scrollback");
-  const modes = "\x1b[5;20r\x1b[?6h\x1b[4h\x1b[?7l\x1b(0\x1b)0\x0e\x1b[31m";
-  const buffer = `a\r\n${modes}b\r\nc\r\n\x1b[3;2rd\r\n`;
-  const [, page] = savedPagesAt(buffer, [0, buffer.indexOf("c")]);
-  assert.equal(page[2], "\x1b(0\x1b)0\x0e\x1b[5;20r\x1b[?6h\x1b[4h\x1b[?7l\x1b[31m", "a page lost the modes set before it");
-  assert.equal(savedPagesAt(buffer, [0, buffer.indexOf("d")])[1][2], page[2], "refused margins replaced the margins in effect");
-  const ended = (sequence) => savedPagesAt(`${modes}${sequence}x`, [0, modes.length + sequence.length])[1][2];
-  assert.equal(ended("\x1bc"), "", "a full reset left a mode on");
-  assert.equal(ended("\x1b[!p\x0f"), "", "a soft reset left a mode on");
-  assert.equal(ended("\x1b[r\x1b[?6;7l\x1b[?7h\x1b[4l\x1b(B\x1b)B\x0f\x1b[m"), "", "turning each mode off left it on");
-  for (const screen of ["47", "1047", "1049"]) {
-    const app = `x\x1b[?${screen}h${modes}\x1b[?${screen}l`;
-    assert.equal(savedPagesAt(`${app}y`, [0, app.length])[1][2].replace("\x1b[31m", ""), "", `modes set on the alternate screen ${screen} reached the saved view`);
-  }
-  assert.equal(savedPagesAt("\x1b(0\x1bn\x1b*0zz", [0, 9])[1][2], "\x1b(0\x1b*0\x1bn", "a locking shift was lost");
-});
-
-test("saved pages project a generated stream exactly as one continuous view", () => {
+test("generated saved output reads the same paged as in one continuous terminal", async () => {
   let seed = 7;
   const random = (count) => { seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648; return seed % count; };
+  const sequences = ["\x1b[31m", "\x1b[0m", "\x1b[1;7m", "\x1b[38;5;200m", "\x1b[48;2;1;2;3m", "\x1b]0;t\x07", "\x1b[2;5r", "\x1b[r", "\x1b[?6h", "\x1b[?6l",
+    "\x1b[4h", "\x1b[4l", "\x1b[?7l", "\x1b[?7h", "\x1b(0", "\x1b(B", "\x1b)0", "\x0e", "\x0f", "\x1b[?2h", "\x1b[!p", "\x1b7", "\x1b8", "\x1b[s", "\x1b[u",
+    "\x1b[?1048h", "\x1b[?1048l", "\x1b[?47h", "\x1b[?47l", "\x1b[?1049h", "\x1b[?1049l", "\x1b[H", "\x1b[5;9H", "\x1b[2J", "\x1b[K", "\x1b[2A", "\t", "\x1bM"];
   for (let round = 0; round < 300; round += 1) {
-    // The generator is the oracle: it knows which output a full-screen
-    // program owns (H) and which the normal screen keeps (V).
-    let alternate = false;
+    // The generator knows where each full reset starts a fresh terminal and
+    // leaves scrollback erases out of the oracle's stream.
+    const segments = [""];
     let buffer = "";
-    const visible = [];
     for (let step = 0; step < 60; step += 1) {
-      const choice = random(10);
-      if (choice === 0) { buffer += `\x1b[?${["47", "1047", "1049"][random(3)]}h`; alternate = true; }
-      else if (choice === 1) { buffer += `\x1b[?${["47", "1047", "1049"][random(3)]}l`; alternate = false; }
-      else if (choice === 2) { buffer += "\x1bc"; alternate = false; }
-      else if (choice === 3) buffer += ["\x1b[31m", "\x1b[0m", "\x1b]0;t\x07", "\x1b[3J"][random(4)];
-      else if (choice === 4) buffer += ["\x1b[2;5r", "\x1b[r", "\x1b[?6h", "\x1b[4h", "\x1b[4l", "\x1b[?7l", "\x1b(0", "\x1b)0", "\x0e", "\x0f", "\x1b[!p"][random(11)];
+      const choice = random(12);
+      if (choice === 0) { buffer += "\x1bc"; segments.push(""); }
+      else if (choice === 1) buffer += "\x1b[3J";
+      else if (choice < 5) { const sequence = sequences[random(sequences.length)]; buffer += sequence; segments[segments.length - 1] += sequence; }
       else {
-        const token = `${alternate ? "H" : "V"}${step}.${round}${random(2) ? "\n" : " "}`;
-        if (!alternate) visible.push(token.trim());
-        buffer += token;
+        const text = `${"qx漢"[random(3)]}${step}.${round}${"=".repeat(random(3) * 40)}${random(2) ? "\r\n" : " "}`;
+        buffer += text;
+        segments[segments.length - 1] += text;
       }
     }
-    const pages = savedOutputPages(buffer, 1 + random(40), 1 + random(4));
-    const projections = pages.map((page) => savedPageProjection(buffer, page));
-    projections.slice(0, -1).forEach((projection, index) => {
-      assert.equal(projection.alternate, pages[index + 1][3], `round ${round}: page ${index} ends on another screen than the next starts`);
-      assert.deepEqual(projection.context.modes, pages[index + 1][4].modes, `round ${round}: page ${index} ends in other modes than the next starts`);
-    });
-    const joined = projections.map((projection) => projection.text).join("");
-    assert.equal(joined, savedPageProjection(buffer, [0, buffer.length]).text, `round ${round}: pages differ from one continuous projection`);
-    const plain = joined.replace(/\[[0-9;?!]*[mHJrhlp]|\]0;t|[()*+][0B]/g, " ");
-    assert.ok(!/H\d/.test(plain), `round ${round}: full-screen output reached the saved view`);
-    let at = 0;
-    for (const token of visible) {
-      at = plain.indexOf(token, at);
-      assert.ok(at >= 0, `round ${round}: kept output ${token} is missing`);
-    }
+    const whole = await continuous(segments);
+    const pageRows = 1 + random(12);
+    const { shown, pages } = await viewed(buffer, pageRows);
+    assert.deepEqual(shown, paged(whole, pages, pageRows), `round ${round}: pages differ from one continuous terminal`);
   }
 });

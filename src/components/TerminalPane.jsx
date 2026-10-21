@@ -5,13 +5,13 @@ import { ArrowsClockwise, Plus, TerminalWindow, X } from "@phosphor-icons/react"
 import "@xterm/xterm/css/xterm.css";
 import { Button } from "@/components/ui/button";
 import { domId, nextTabIndex } from "@/lib/accessibility";
-import { PLAIN_TEXT, preferredTerminal, pruneExitedIds, savedOutputPages, savedPageText, terminalEndLabel, terminalTabLabel } from "@/lib/terminal-exit-state";
+import { preferredTerminal, pruneExitedIds, savedOutputRows, savedPageText, savedRowPages, terminalEndLabel, terminalTabLabel } from "@/lib/terminal-exit-state";
 import { api } from "@/lib/runtime-api";
 
 const EMPTY_UNVERIFIED_IDS = new Set();
 const NEW_SHELL_MARKER = "\x1b[90m[new shell started; the saved session was not resumed]\x1b[0m\r\n";
-// A saved page has at most 2,000 line breaks and 64,000 characters, so even
-// double-width text wrapped at 20 columns fits this scrollback.
+// A saved page has at most 2,000 rows at the view's width, so it stays in
+// this scrollback even if the view narrows to a fifth of that width.
 const LIVE_SCROLLBACK = 5000;
 const SAVED_SCROLLBACK = 10_000;
 // Replacing the view is written as a full reset (RIS) in order with any
@@ -215,6 +215,12 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       const detail = await api(`/api/terminals/${terminal.id}`);
       if (token !== reconcileTokenRef.current) return;
       if (!detail || typeof detail !== "object") throw new Error("Terminal detail is unavailable");
+      // Saved output, ended or awaiting ownership proof, is parsed once at the
+      // view's size and shown read-only.
+      const saved = (detail.status ?? terminal.status) === "ended" || Boolean(detail.recoveryReservation);
+      const visible = xtermRef.current;
+      const savedRows = saved && visible ? await savedOutputRows(detail.buffer ?? "", { cols: visible.cols, rows: visible.rows }, Terminal) : [];
+      if (token !== reconcileTokenRef.current) return;
       // Leave output and exit events staged through the layout handoff. A
       // resize can settle while the snapshot request is in flight.
       await new Promise((resolve) => {
@@ -228,18 +234,16 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       if (status !== "ended" && (pending.unknown || unverifiedTerminalIdsRef.current.has(terminal.id))) status = "unknown";
       const xterm = xtermRef.current;
       const marker = Boolean(detail.relaunchedFrom ?? terminal.relaunchedFrom);
-      // Saved output, ended or awaiting ownership proof, is shown read-only.
       let savedLabel = status === "ended" ? terminalEndLabel(savedFields(detail, terminal)) : "";
       if (detail.recoveryReservation) savedLabel = RESERVATION_LABEL;
       let displayedCursor = Number.isSafeInteger(detail.outputCursor) ? detail.outputCursor : 0;
-      if (savedLabel) {
-        const buffer = detail.buffer ?? "";
-        savedViewRef.current = { id: terminal.id, buffer, pages: savedOutputPages(buffer), marker, label: savedLabel };
+      if (saved) {
+        savedViewRef.current = { id: terminal.id, rows: savedRows, pages: savedRowPages(savedRows), marker, label: savedLabel };
         showSavedPage(savedViewRef.current.pages.length - 1);
       } else {
         savedViewRef.current = null;
         setSavedPage(null);
-        if (xterm) Object.assign(xterm.options, { scrollback: LIVE_SCROLLBACK, scrollOnEraseInDisplay: false });
+        if (xterm) xterm.options.scrollback = LIVE_SCROLLBACK;
         xterm?.write(marker ? CLEAR_VIEW + NEW_SHELL_MARKER : CLEAR_VIEW);
         if (detail.buffer) xterm?.write(detail.buffer);
         for (const { cursor, data } of pending.chunks) {
@@ -282,9 +286,9 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     }
   }
 
-  // Each page replaces the view in one ordered write, with its rendition
-  // carried in. An earlier page opens at its first line; the newest ends with
-  // the saved label.
+  // Each page replaces the view in one ordered write of its rows, which need
+  // nothing from the rows before them. An earlier page opens at its first
+  // line; the newest ends with the saved label.
   function showSavedPage(index) {
     const view = savedViewRef.current;
     const xterm = xtermRef.current;
@@ -292,13 +296,11 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     const newest = index >= view.pages.length - 1;
     const generation = (view.generation ?? 0) + 1;
     Object.assign(view, { shown: index, generation });
-    // A screen erase in saved output scrolls it up instead of deleting it.
-    if (xterm) Object.assign(xterm.options, { scrollback: SAVED_SCROLLBACK, scrollOnEraseInDisplay: true });
+    if (xterm) xterm.options.scrollback = SAVED_SCROLLBACK;
     const marker = view.marker && index <= 0 ? NEW_SHELL_MARKER : "";
-    // The label reads as plain text whatever modes the saved output left on.
-    const label = newest ? `${PLAIN_TEXT}\r\n\x1b[90m[saved output; ${view.label}]\x1b[0m\r\n` : "";
+    const label = newest ? `\r\n\x1b[90m[saved output; ${view.label}]\x1b[0m\r\n` : "";
     const opened = () => { if (!newest && savedViewRef.current === view && view.generation === generation) xterm.scrollToTop(); };
-    xterm?.write(CLEAR_VIEW + marker + savedPageText(view.buffer, view.pages[index] ?? [0, 0]) + label, opened);
+    xterm?.write(CLEAR_VIEW + marker + savedPageText(view.rows, view.pages[index] ?? [0, 0]) + label, opened);
     setSavedPage({ id: view.id, index, count: view.pages.length });
   }
 
@@ -382,7 +384,6 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
         }
       }
     }
-    if (runtimeEvent?.type === "terminal.history") announceHistoryWarning(runtimeEvent.payload, onErrorRef.current);
     if (runtimeEvent?.type === "runtime.connected") announceHistoryWarning(runtimeEvent.payload?.history, onErrorRef.current);
     if (runtimeEvent?.type === "runtime.connected" && (runtimeEvent.payload?.replay?.requestedAfter > 0 || runtimeEvent.payload?.restarted) && activeIdRef.current) {
       if (mutationRef.current || reconcilingRef.current || selectingRef.current || syncingRef.current) queuedReconnectRef.current = true;

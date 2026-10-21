@@ -14,7 +14,7 @@ import { TerminalPane } from "../src/components/TerminalPane.jsx";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
 import { scheduleLayoutTick } from "../src/lib/windowing.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
-import { savedPagesAt, savedPageText } from "../src/lib/terminal-exit-state.js";
+import { savedOutputRows, savedPageText, savedRowPages } from "../src/lib/terminal-exit-state.js";
 import { Terminal } from "@xterm/xterm";
 import "../src/styles.css";
 
@@ -2587,6 +2587,9 @@ async function terminalSavedPagingRegression(reservation = false) {
   lines[1] = "BEFORE reset line\x1b(0\x1b[?1049hFULLSCREEN\x1bcAFTER reset line\r\n";
   // A rendition set on the first page and never reset is in effect on every later page.
   lines[2] = "\x1b[31mRED saved line\r\n";
+  // Line drawing ended by DECANM, or restored with the cursor, stays ended on every later page.
+  lines[3] = "\x1b(0\x1b[?2hDECANM ended line drawing\r\n";
+  lines[4] = "\x1b7\x1b(0\x1b8RESTORED cursor ended line drawing\r\n";
   // The saved label reads as plain text after output that left modes on.
   lines[lines.length - 1] = "LAST saved line\r\n\x1b(0\x1b[4h";
   const saved = reservation
@@ -2624,6 +2627,7 @@ async function terminalSavedPagingRegression(reservation = false) {
   const shownRows = host.querySelector('.terminal-host .xterm-rows').textContent;
   assert(shownRows.includes("BEFORE reset line") && shownRows.includes("AFTER reset line") && !shownRows.includes("FULLSCREEN"),
     "A full reset after a full-screen program hid or erased saved output");
+  assert(shownRows.includes("DECANM ended line drawing") && shownRows.includes("RESTORED cursor ended line drawing"), "Saved output drew ASCII as line drawing");
   assert(terminalStatusText().includes("part 1 of") && terminalStatusText().includes("the earliest"), "The earliest page was not announced");
   // Pages requested before the previous one is written replace it whole.
   flushSync(() => control("Later output").click());
@@ -2641,55 +2645,110 @@ async function terminalSavedPagingRegression(reservation = false) {
   assert(!sent.length && !errors.length, "Paging saved output sent a command or failed");
 }
 
-// Saved output that sets terminal modes reads in the view as the terminal
-// showed it. The oracle is xterm itself: the view of a stream equals the raw
-// output before a full reset followed by the raw stream, whose real reset
-// clears everything earlier. Pages render together as one continuous view.
+// Saved output reads in the view as the terminal showed it. The oracle is
+// xterm itself: one continuous render, each full reset starting a fresh
+// terminal below the rows before it. The view's pages, each written alone
+// after a full reset, show the same glyphs, colours and wraps.
 async function terminalSavedModesRegression() {
-  const render = async (data) => {
-    // The saved view's options in the pane.
-    const xterm = new Terminal({ rows: 24, cols: 80, convertEol: true, scrollback: 10_000, scrollOnEraseInDisplay: true });
-    await new Promise((resolve) => xterm.write(data, resolve));
+  const size = { cols: 80, rows: 24 };
+  const drawnRows = (xterm, count = -1) => {
+    const normal = xterm.buffer.normal;
+    const cell = normal.getNullCell();
     const rows = [];
-    for (let index = 0; index < xterm.buffer.active.length; index += 1) {
-      const text = xterm.buffer.active.getLine(index).translateToString(true);
-      if (text.trim()) rows.push(text);
+    for (let y = 0; y < normal.length; y += 1) {
+      const line = normal.getLine(y);
+      let text = line.isWrapped ? "~" : "";
+      let kept = text.length;
+      for (let x = 0; x < size.cols; x += 1) {
+        line.getCell(x, cell);
+        if (cell.getWidth() === 0) continue;
+        const chars = cell.getChars() || " ";
+        text += cell.isAttributeDefault() ? chars : `${chars}{${[cell.getFgColorMode(), cell.getFgColor(), cell.getBgColorMode(), cell.getBgColor(), cell.isBold(), cell.isInverse()].join()}}`;
+        if (chars !== " " || !cell.isAttributeDefault()) kept = text.length;
+      }
+      rows.push(text.slice(0, kept));
     }
+    let end = count >= 0 ? count : rows.length;
+    while (count < 0 && end > normal.baseY && !rows[end - 1].replace("~", "")) end -= 1;
+    return rows.slice(0, end);
+  };
+  // Each write's rows are read in its callback, before the next one.
+  const render = async (writes, options, rowCounts = []) => {
+    const xterm = new Terminal({ ...size, convertEol: true, ...options });
+    let rows = [];
+    await new Promise((resolve) => writes.forEach((data, index) => xterm.write(data, () => {
+      rows = rows.concat(drawnRows(xterm, rowCounts[index] ?? -1));
+      if (index === writes.length - 1) resolve();
+    })));
     xterm.dispose();
     return rows;
   };
-  // Each page replaces the view with a full reset, as the pane writes it.
-  const view = async (buffer, starts) => (await Promise.all(savedPagesAt(buffer, starts).map((page) => render(`\x1bc${savedPageText(buffer, page)}`)))).flat();
-  // Overwritten lines show insert mode; wrapped lines show line wrapping.
-  const row = (name, index) => `${name} ${String(index).padStart(3, "0")} line${index % 2 ? "" : ` ${"=".repeat(80)}`}`;
-  const lines = (name, count) => Array.from({ length: count }, (_, index) => `########\r${row(name, index)}\r\n`).join("");
-  const lineStarts = (buffer, from, to) => [...buffer.slice(from, to).matchAll(/\n/g)].map((match) => from + match.index + 1).filter((_, index) => index % 9 === 4);
+  const continuous = (segments) => render(segments.map((segment, index) => `${index ? "\x1bc" : ""}${segment}`), { scrollback: 100_000, scrollOnEraseInDisplay: true });
+  // The pane's saved view: one terminal, a full reset before each page.
+  const view = async (buffer, pageRows) => {
+    const rows = await savedOutputRows(buffer, size, Terminal);
+    const pages = savedRowPages(rows, pageRows);
+    return render(pages.map((page) => `\x1bc${savedPageText(rows, page)}`), { scrollback: 10_000 }, pages.map(([start, end]) => end - start));
+  };
   const same = (actual, expected, label) => assert(JSON.stringify(actual) === JSON.stringify(expected), `${label}: ${JSON.stringify(actual.slice(0, 3))} ... differs from ${JSON.stringify(expected.slice(0, 3))} ...`);
-  const modes = { margins: "\x1b[5;20r", origin: "\x1b[?6h", insert: "\x1b[4h", nowrap: "\x1b[?7l", "line drawing": "\x1b(0", "shift out": "\x1b)0\x0e" };
-  // Absolute rows after the output show whether origin mode survived the reset.
-  const probe = "\x1b[2J\x1b[HROW1\r\nROW2\r\nROW3\x1b[3;22r\x1b[1;1HO\x1b[r";
-  for (const [name, mode] of Object.entries(modes)) {
-    // A mode on before a full reset in saved output.
-    const pre = lines("pre", 30) + mode;
-    const reset = `${pre}\x1bc${lines("post", 60)}`;
-    const buffer = reset + probe;
-    const shown = await view(buffer, [0]);
-    same(shown, [...await render(pre), ...await render(buffer)], `${name} before a reset`);
-    const post = shown.filter((text) => text.startsWith("post "));
-    assert(post.length === 60 && post.every((text, index) => text === row("post", index).slice(0, 80)),
-      `${name} before a reset hid or redrew later saved lines`);
-    for (const split of [pre.length - mode.length, pre.length, pre.length + 2, ...lineStarts(reset, 0, reset.length)]) {
-      same(await view(buffer, [0, split]), shown, `${name} before a reset, paged at ${split}`);
-    }
-    // A mode on where a page opens.
-    const opened = `${mode === modes.margins ? "\x1b[1;20r" : mode}${lines("mid", 40)}`;
-    const stream = `${opened}\x1bc${lines("post", 5)}`;
-    const continuous = await view(stream, [0]);
-    same(continuous, [...await render(opened), ...await render(stream)], `${name} on through the output`);
-    for (const split of [opened.length - lines("mid", 40).length, ...lineStarts(opened, 0, opened.length)]) {
-      same(await view(stream, [0, split]), continuous, `${name} on where a page opens at ${split}`);
-    }
+  // Short lines and lines that wrap once.
+  const lines = (name, count) => Array.from({ length: count }, (_, index) => `${name} ${String(index).padStart(3, "0")} line${index % 2 ? "" : ` ${"=".repeat(80)}`}\r\n`).join("");
+  const state = {
+    "DECANM": "\x1b(0\x1b[?2h", "DECSC character set": "\x1b7\x1b(0\x1b8", "DECSC rendition": "\x1b7\x1b[31;44m\x1b8", "SCOSC rendition": "\x1b[s\x1b[32m\x1b[u",
+    "1048 character set": "\x1b[?1048h\x1b(0\x1b[?1048l", "cursor restored on a later row": `\x1b7${lines("between", 30)}\x1b8OVER`,
+  };
+  for (const [name, sequence] of Object.entries(state)) {
+    const buffer = `${sequence}${lines("after", 40)}`;
+    for (const pageRows of [2_000, 7]) same(await view(buffer, pageRows), await continuous([buffer]), `${name} in pages of ${pageRows}`);
   }
+  const modes = { margins: "\x1b[5;20r", origin: "\x1b[?6h", insert: "\x1b[4h", nowrap: "\x1b[?7l", "line drawing": "\x1b(0", "shift out": "\x1b)0\x0e", "locking shift": "\x1b*0\x1bn" };
+  for (const [name, mode] of Object.entries(modes)) {
+    // A mode on before a full reset ends there; one on through the output
+    // stays on where every page opens.
+    const pre = `${lines("pre", 30)}${mode}`;
+    const shown = await view(`${pre}\x1bc${lines("post", 60)}`, 13);
+    same(shown, await continuous([pre, lines("post", 60)]), `${name} before a reset`);
+    const post = shown.filter((text) => text.startsWith("post "));
+    assert(post.length === 60 && post.every((text, index) => text === `post ${String(index).padStart(3, "0")} line${index % 2 ? "" : ` ${"=".repeat(80)}`}`.slice(0, 80)),
+      `${name} before a reset hid or redrew later saved lines`);
+    const opened = `${mode}${lines("mid", 40)}`;
+    same(await view(opened, 9), await continuous([opened]), `${name} on through the output`);
+  }
+}
+
+// A storage status change delivered in the same task as terminal output or
+// an exit reaches the pane through its counter; it never replaces that
+// output or exit in App's shared event slot.
+async function terminalHistoryEventSlotRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const shell = { id: "term-S", name: "Shell", cwd: "/fixture/A", pid: 4500, status: "running", createdAt: "2026-10-21T00:00:00.000Z" };
+  let history = { persistent: true, warning: null };
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [], stagedCount: 0 });
+    if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    if (url.pathname === "/api/terminals") return response({ terminals: [shell], history });
+    if (url.pathname === "/api/terminals/term-S") return response({ ...shell, buffer: "$ ", outputCursor: 1 });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[aria-label="Terminal"]'), "workspace");
+  host.querySelector('[aria-label="Terminal"]').click();
+  await until(() => terminalReady("Shell"), "live terminal ready");
+  const deliver = (...events) => {
+    for (const event of events) fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
+  };
+  history = { persistent: false, warning: "Terminal history could not be saved (EIO). Terminal output stays in memory only." };
+  deliver({ type: "terminal.output", terminalId: "term-S", payload: { data: "OUTPUT BEFORE STORAGE FAILURE\r\n", cursor: 2 } }, { type: "terminal.history", payload: history });
+  await until(() => host.querySelector(".terminal-host .xterm-rows")?.textContent.includes("OUTPUT BEFORE STORAGE FAILURE"), "output delivered with a storage status change is written");
+  await until(() => host.querySelector(".error-toast")?.textContent.includes("EIO"), "storage failure announced");
+  deliver({ type: "terminal.exit", terminalId: "term-S", payload: { exitCode: 3 } }, { type: "terminal.history", payload: history });
+  await until(() => host.querySelector("#terminal-tab-term-S")?.getAttribute("aria-label")?.includes("process exited 3"), "exit delivered with a storage status change is shown");
+  await until(() => host.querySelector(".terminal-host .xterm-rows").textContent.includes("[process exited 3]"), "exit written to the terminal");
 }
 
 async function terminalCloseHistoryFailureRegression() {
@@ -6627,6 +6686,7 @@ try {
     ["terminal saved paging", terminalSavedPagingRegression, "all saved output beyond one view is reachable a page at a time, earliest first line shown"],
     ["terminal reservation paging", () => terminalSavedPagingRegression(true), "a reservation's saved output is paged read-only to its first and last lines"],
     ["terminal saved modes", terminalSavedModesRegression, "saved output that sets terminal modes renders as the terminal showed it, whole and paged"],
+    ["terminal history event slot", terminalHistoryEventSlotRegression, "a storage status change never replaces terminal output or an exit delivered in the same task"],
     ["terminal close history failure", terminalCloseHistoryFailureRegression, "a close whose saved output cannot be deleted shows it ended and read-only"],
     ["terminal fenced saved session", terminalFencedSavedSessionRegression, "a saved status from the server wins over the page audit fence"],
     ["terminal selection during reconnect", terminalSelectionReconnectRegression, "selected terminal and output survive a reconnect while its buffer is pending"],
