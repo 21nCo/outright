@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { decodeRecords, encodeRecord, openTerminalHistory, TERMINAL_HISTORY_LIMITS, windowsAclPrivate } from "./terminal-history.mjs";
+import { decodeRecords, encodeRecord, openTerminalHistory, probeWindowsHistoryAcl, TERMINAL_HISTORY_LIMITS, windowsAclPrivate } from "./terminal-history.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 import { hardenWindowsLaunchDirectory } from "./agent-manager.mjs";
@@ -44,6 +44,25 @@ async function waitFor(predicate, timeout = 5000) {
     if (Date.now() > deadline) throw new Error("Timed out waiting for terminal history");
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
+}
+// Bytes on disk plus the per-file charge: what usage() must account for.
+function diskCharge(directory, fileBytes) {
+  const files = readdirSync(directory).map((name) => statSync(path.join(directory, name))).filter((stat) => stat.isFile());
+  return files.reduce((sum, stat) => sum + stat.size + fileBytes, 0);
+}
+// Output removal for the returned ids fails as under a Windows antivirus or
+// indexer lock, on every platform.
+function lockOutput(t) {
+  const locked = new Set();
+  const rm = fs.rmSync;
+  mock.method(fs, "rmSync", (target, options) => {
+    const name = path.basename(String(target));
+    if (name.endsWith(".log") && locked.has(name.slice(0, 36))) throw Object.assign(new Error("resource busy or locked"), { code: "EBUSY" });
+    return rm(target, options);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { mock.restoreAll(); syncBuiltinESMExports(); });
+  return locked;
 }
 // The platform's own permission model: POSIX mode bits or a Windows ACE.
 function grantEveryone(target) {
@@ -531,8 +550,13 @@ test("load cleanup is best effort, and another load failure is named and serves 
   const locked = openTerminalHistory({ directory });
   assert.equal(locked.status().persistent, true, "a locked temporary file made the store untrusted");
   assert.deepEqual(locked.saved().map((entry) => entry.id), [id]);
-  locked.close();
+  assert.equal(locked.usage().undeleted, 1);
+  assert.equal(locked.usage().totalBytes, diskCharge(directory, TERMINAL_HISTORY_LIMITS.fileBytes), "a locked leftover escaped the quota");
   restore();
+  locked.sweep();
+  assert.equal(existsSync(temp), false, "a sweep did not retry the leftover once the lock cleared");
+  assert.equal(locked.usage().totalBytes, diskCharge(directory, TERMINAL_HISTORY_LIMITS.fileBytes));
+  locked.close();
   const lstat = fs.lstatSync;
   mock.method(fs, "lstatSync", (target, options) => {
     if (String(target).endsWith(".meta")) throw Object.assign(new Error("I/O error"), { code: "EIO" });
@@ -592,5 +616,163 @@ test("a store that cannot write stops persisting and reports why", (t) => {
   assert.match(store.status().warning, /could not be saved \(EEXIST\)/);
   store.append(id, "z".repeat(70 * 1024));
   assert.equal(store.read(id).length, 24 * 1024 - 16, "a disabled store kept writing");
+  store.close();
+});
+
+test("a Windows ACL probe that cannot run is a named load failure, not an unsafe store, and a later start recovers", (t) => {
+  const { directory } = workspace(t);
+  const day = 24 * 60 * 60 * 1000;
+  let clock = Date.UTC(2026, 9, 1);
+  const seed = openTerminalHistory({ directory, now: () => clock });
+  const [expired, kept] = [begin(seed), begin(seed)];
+  seed.end(expired, { exitCode: 1 });
+  clock += 2 * day;
+  seed.end(kept, { exitCode: 2 });
+  seed.close();
+  clock += 6 * day;
+  const before = readdirSync(directory).sort();
+  const user = "S-1-5-21-9-9-9-1001";
+  const windows = (probeWindowsAcl) => openTerminalHistory({ directory, now: () => clock, platform: "win32", identity: { user, groups: [] }, probeWindowsAcl });
+
+  for (const [run, code] of [[() => ({ error: Object.assign(new Error("spawnSync powershell.exe ETIMEDOUT"), { code: "ETIMEDOUT" }) }), "ETIMEDOUT"],
+    [() => ({ error: Object.assign(new Error("stdout maxBuffer length exceeded"), { code: "ENOBUFS" }) }), "ENOBUFS"],
+    [() => ({ error: Object.assign(new Error("spawnSync powershell.exe EACCES"), { code: "EACCES" }) }), "EACCES"],
+    [() => ({ status: 1, stdout: "" }), "exit 1"]]) {
+    const failed = windows((target) => probeWindowsHistoryAcl(target, run));
+    assert.equal(failed.status().persistent, false);
+    assert.doesNotMatch(failed.status().warning, /not private/, `a ${code} probe failure was reported as an unsafe store`);
+    assert.match(failed.status().warning, new RegExp(`could not be loaded \\(ACL check ${code}\\)`));
+    assert.deepEqual(failed.saved(), [], "a store that could not verify its ACL served saved sessions");
+    failed.sweep();
+    failed.close();
+  }
+  assert.deepEqual(readdirSync(directory).sort(), before, "a failed load changed its directory");
+
+  // An observed foreign ACE is still unsafe.
+  const foreign = windows(() => ({ user, groups: [], entries: [{ name: "terminal-history", owner: user, reparse: false, allow: [user, "S-1-1-0"] }] }));
+  assert.match(foreign.status().warning, /not private to this user/);
+  foreign.close();
+
+  // Once the probe works again, the next start restores and applies retention.
+  const recovered = windows(() => ({ user, groups: [], entries: [{ name: "terminal-history", owner: user, reparse: false, allow: [user, "S-1-5-18"] }] }));
+  assert.equal(recovered.status().persistent, true);
+  assert.deepEqual(recovered.saved().map((entry) => entry.id), [kept]);
+  assert.deepEqual(terminalFiles(directory, expired), [], "retention did not run after the store recovered");
+  recovered.close();
+});
+
+test("a store at the maximum admitted population loads, lists and verifies its ACL within budget", { timeout: 300_000 }, async (t) => {
+  const { directory } = workspace(t);
+  openTerminalHistory({ directory }).close();
+  const endedAt = Date.now();
+  const meta = (id) => encodeRecord(1, JSON.stringify({ version: 1, id, name: "Shell", cwd: "/work/tree", createdAt: "2026-10-21T00:00:00.000Z",
+    end: { exitCode: 0, signal: null, endedAt } }));
+  // Every session holds a metadata file and an output file, each charged a
+  // block, so this is the most sessions the global cap admits.
+  const perSession = meta(randomUUID()).length + 2 * TERMINAL_HISTORY_LIMITS.fileBytes;
+  const admitted = Math.floor(TERMINAL_HISTORY_LIMITS.totalBytes / perSession);
+  for (let index = 0; index < admitted; index += 1) {
+    const id = randomUUID();
+    writeFileSync(path.join(directory, `${id}.meta`), meta(id), { mode: 0o600 });
+    writeFileSync(path.join(directory, `${id}.1.log`), "", { mode: 0o600 });
+  }
+  if (process.platform === "win32") {
+    // The real probe reads every file's ACL in one process and reports each
+    // distinct ACL once, well inside its 30 s timeout and 4 MiB output cap.
+    const started = performance.now();
+    const report = probeWindowsHistoryAcl(directory);
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 20_000, `the ACL probe took ${Math.round(elapsed)} ms for ${2 * admitted} files`);
+    assert.ok(report.entries.length <= 4, `the ACL probe reported ${report.entries.length} entries instead of distinct ACLs`);
+    assert.equal(windowsAclPrivate(report), true);
+  }
+  const started = performance.now();
+  const store = openTerminalHistory({ directory });
+  assert.equal(store.status().persistent, true, store.status().warning);
+  assert.equal(store.usage().terminals, admitted, "a session within the cap was evicted");
+  assert.ok(store.usage().totalBytes <= TERMINAL_HISTORY_LIMITS.totalBytes);
+  const { manager: terminals } = manager(store);
+  const listing = JSON.stringify({ terminals: terminals.list() });
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 20_000, `loading and listing ${admitted} sessions took ${Math.round(elapsed)} ms`);
+  assert.ok(Buffer.byteLength(listing) < 4 * 1024 * 1024, `GET /api/terminals would send ${Buffer.byteLength(listing)} bytes`);
+  assert.deepEqual(terminals.list({ saved: false }), [], "the socket snapshot carried saved sessions");
+  await terminals.shutdown();
+});
+
+test("output that cannot be deleted stays charged, is reported on dismissal and retried until it is gone", async (t) => {
+  const { directory } = workspace(t);
+  const store = openTerminalHistory({ directory });
+  const { manager: terminals } = manager(store);
+  const id = begin(store);
+  store.append(id, "dismissed output\n");
+  store.end(id, { exitCode: 0 });
+  const locked = lockOutput(t);
+  locked.add(id);
+  await assert.rejects(terminals.close(id), (error) => error.statusCode === 503 && /could not be deleted yet/.test(error.message),
+    "a dismissal reported success while its output stayed on disk");
+  assert.equal(terminals.list().some((entry) => entry.id === id), false, "the dismissed session was still listed");
+  assert.equal(store.usage().undeleted, 1);
+  assert.equal(store.usage().totalBytes, diskCharge(directory, TERMINAL_HISTORY_LIMITS.fileBytes), "the undeleted output was no longer charged");
+  assert.equal(store.status().persistent, true, "a lock on one file stopped persistence");
+  store.sweep();
+  assert.equal(store.usage().undeleted, 1, "a retry reported success while the file was still locked");
+  locked.clear();
+  store.sweep();
+  assert.equal(store.usage().undeleted, 0);
+  assert.equal(store.usage().totalBytes, diskCharge(directory, TERMINAL_HISTORY_LIMITS.fileBytes), "usage differs from disk once the lock cleared");
+  assert.deepEqual(terminalFiles(directory, id), []);
+  await terminals.shutdown();
+});
+
+test("quota eviction and retention expiry keep undeletable output charged and retry it", (t) => {
+  const { directory } = workspace(t);
+  const day = 24 * 60 * 60 * 1000;
+  let clock = Date.UTC(2026, 9, 1);
+  const limits = { ...TERMINAL_HISTORY_LIMITS, terminalBytes: 64 * 1024, totalBytes: 64 * 1024, fileBytes: 1024 };
+  const store = openTerminalHistory({ directory, limits, now: () => clock });
+  const block = "e".repeat(16 * 1024);
+  const locked = lockOutput(t);
+  const [evicted, running] = [begin(store), begin(store)];
+  store.append(evicted, block);
+  store.end(evicted, { exitCode: 0 });
+  locked.add(evicted);
+
+  // Quota eviction: the oldest ended session leaves, its output stays charged.
+  store.append(running, "r".repeat(30 * 1024));
+  store.append(running, "r".repeat(30 * 1024));
+  assert.equal(store.has(evicted), false, "the quota did not evict the oldest ended session");
+  assert.equal(store.usage().undeleted, 1);
+  assert.ok(store.usage().totalBytes <= limits.totalBytes);
+  assert.equal(store.usage().totalBytes, diskCharge(directory, limits.fileBytes), "the evicted session's undeleted output was not charged");
+
+  // Retention expiry takes the same path.
+  const expiring = begin(store);
+  store.append(expiring, "expiring\n");
+  store.end(expiring, { exitCode: 0 });
+  locked.add(expiring);
+  clock += 8 * day;
+  assert.equal(store.saved().some((entry) => entry.id === expiring), false);
+  assert.equal(store.usage().undeleted, 2);
+  assert.equal(store.usage().totalBytes, diskCharge(directory, limits.fileBytes), "the expired session's undeleted output was not charged");
+  locked.clear();
+  store.sweep();
+  assert.equal(store.usage().undeleted, 0);
+  assert.equal(store.usage().totalBytes, diskCharge(directory, limits.fileBytes), "usage differs from disk once the locks cleared");
+
+  // Once undeletable output alone keeps the store over its cap, it stops
+  // persisting instead of letting disk use keep growing.
+  for (let index = 0; index < 8 && store.status().persistent; index += 1) {
+    const stuck = begin(store);
+    locked.add(stuck);
+    store.append(stuck, block);
+    store.end(stuck, { exitCode: 0 });
+    store.append(running, "s".repeat(30 * 1024));
+  }
+  assert.equal(store.status().persistent, false, "persistence continued past the cap");
+  assert.match(store.status().warning, /could not be saved \(EBUSY\)/);
+  const stopped = store.usage().totalBytes;
+  store.append(running, "s".repeat(30 * 1024));
+  assert.equal(store.usage().totalBytes, stopped, "a store over its cap kept writing");
   store.close();
 });

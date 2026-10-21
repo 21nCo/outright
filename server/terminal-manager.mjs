@@ -420,8 +420,9 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
         terminal.closePromise = null;
         throw outcomeUnknown(error, evidence.operationId);
       }
-      // The process is gone. A failed history removal is reported, and the
-      // session stays listed as saved so it can be dismissed again.
+      // The process is gone. A failed history removal is reported: kept
+      // metadata leaves the session listed to dismiss again, and output left
+      // on disk stays charged against the quota until a retry deletes it.
       if (terminal.userClosed) history?.remove(id);
       else history?.finish(id);
       return true;

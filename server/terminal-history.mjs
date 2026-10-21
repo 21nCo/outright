@@ -30,20 +30,34 @@ const SYSTEM = "S-1-5-18";
 const ADMINISTRATORS = "S-1-5-32-544";
 const CREATOR_OWNER = "S-1-3-0";
 const OWNER_RIGHTS = "S-1-3-4";
+const OWNED_NAME = new RegExp(`(?:${FILE.source})|(?:${TEMP.source})`);
+// One enumeration reads each Outright file's ACL through .NET (no per-item
+// cmdlet or pipeline) and reports each distinct owner and ACE set once, with
+// the directory first. Its output stays small at any admitted population.
 const WINDOWS_ACL_SCRIPT = `$ErrorActionPreference = 'Stop'
 $sid = [Security.Principal.SecurityIdentifier]
+$sections = [Security.AccessControl.AccessControlSections]'Owner, Access'
+$allowType = [Security.AccessControl.AccessControlType]::Allow
+$reparseFlag = [IO.FileAttributes]::ReparsePoint
 $me = [Security.Principal.WindowsIdentity]::GetCurrent()
-$dir = $env:OUTRIGHT_HISTORY_DIRECTORY
-$items = @(Get-Item -LiteralPath $dir -Force) + @(Get-ChildItem -LiteralPath $dir -Force)
-$entries = @(foreach ($item in $items) {
-  $acl = Get-Acl -LiteralPath $item.FullName
-  [pscustomobject]@{
-    name = $item.Name
-    owner = $acl.GetOwner($sid).Value
-    reparse = [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
-    allow = @($acl.GetAccessRules($true, $true, $sid) | Where-Object { $_.AccessControlType -eq 'Allow' } | ForEach-Object { $_.IdentityReference.Value })
-  }
-})
+$names = $env:OUTRIGHT_HISTORY_NAMES
+$directory = New-Object IO.DirectoryInfo $env:OUTRIGHT_HISTORY_DIRECTORY
+$entries = New-Object 'Collections.Generic.List[object]'
+$seen = @{}
+$items = @($directory) + @($directory.EnumerateFileSystemInfos())
+foreach ($item in $items) {
+  $root = $entries.Count -eq 0
+  if (-not $root -and $item.Name -cnotmatch $names) { continue }
+  $acl = $item.GetAccessControl($sections)
+  $allow = New-Object 'Collections.Generic.List[string]'
+  foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) { if ($rule.AccessControlType -eq $allowType) { $allow.Add($rule.IdentityReference.Value) } }
+  $owner = $acl.GetOwner($sid).Value
+  $reparse = [bool]($item.Attributes -band $reparseFlag)
+  $key = $owner + '|' + $reparse + '|' + ($allow -join ',')
+  if (-not $root -and $seen.ContainsKey($key)) { continue }
+  $seen[$key] = $true
+  $entries.Add([pscustomobject]@{ name = $item.Name; owner = $owner; reparse = $reparse; allow = @($allow) })
+}
 [pscustomobject]@{ user = $me.User.Value; groups = @($me.Groups | ForEach-Object { $_.Value }); entries = $entries } | ConvertTo-Json -Depth 4 -Compress`;
 
 function checksum(header, payload) {
@@ -84,9 +98,12 @@ export function decodeRecords(buffer, maxPayload = TERMINAL_HISTORY_LIMITS.termi
 export function probeWindowsHistoryAcl(directory, run = spawnSync) {
   const result = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WINDOWS_ACL_SCRIPT], {
     encoding: "utf8", windowsHide: true, timeout: 30_000, maxBuffer: 4 * 1024 * 1024,
-    env: { ...process.env, OUTRIGHT_HISTORY_DIRECTORY: directory },
+    env: { ...process.env, OUTRIGHT_HISTORY_DIRECTORY: directory, OUTRIGHT_HISTORY_NAMES: OWNED_NAME.source },
   });
-  if (result.error || result.status !== 0) throw new Error("Unable to read the terminal history ACL", { cause: result.error });
+  if (result.error || result.status !== 0) {
+    throw Object.assign(new Error("Unable to read the terminal history ACL", { cause: result.error }),
+      { code: result.error?.code ?? `exit ${result.status ?? result.signal}` });
+  }
   return JSON.parse(result.stdout);
 }
 
@@ -135,6 +152,9 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
   let closed = false;
   let warning = null;
   let total = 0;
+  // Files that could not be deleted (an antivirus or indexer lock, say) stay
+  // charged against the global cap and are retried until they are gone.
+  const residue = new Map();
   const listeners = new Set();
   const file = (name) => path.join(directory, name);
   const segmentName = (id, seq) => `${id}.${seq}.log`;
@@ -168,24 +188,35 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
   function writeMeta(entry) {
     const record = encodeRecord(META, JSON.stringify(entry.meta));
     if (record.length > META_LIMIT) throw new Error("Terminal history metadata exceeds 16 KiB");
-    const temp = file(`${entry.id}.meta.${randomBytes(8).toString("hex")}.tmp`);
-    const fd = openSync(temp, "wx", 0o600);
+    const temp = `${entry.id}.meta.${randomBytes(8).toString("hex")}.tmp`;
+    const fd = openSync(file(temp), "wx", 0o600);
     try {
       try { writeAll(fd, record); fsyncSync(fd); }
       finally { closeSync(fd); }
-      renameSync(temp, file(`${entry.id}.meta`));
+      renameSync(file(temp), file(`${entry.id}.meta`));
     } catch (error) {
-      rmSync(temp, { force: true });
+      discardFile(temp, record.length);
       throw error;
     }
     total += record.length - entry.metaBytes + (entry.metaBytes ? 0 : fileBytes);
     entry.metaBytes = record.length;
   }
 
+  // Deletes a charged file, or keeps it charged for a retry.
+  function release(name, bytes) {
+    try { rmSync(file(name), { force: true }); }
+    catch (error) { residue.set(name, { bytes, code: error?.code }); return false; }
+    total -= bytes + fileBytes;
+    return true;
+  }
+
+  function retryResidue() {
+    for (const [name, { bytes }] of residue) if (release(name, bytes)) residue.delete(name);
+  }
+
   function removeSegment(entry, index) {
     const [segment] = entry.segments.splice(index, 1);
-    rmSync(file(segmentName(entry.id, segment.seq)), { force: true });
-    total -= segment.bytes + fileBytes;
+    return release(segmentName(entry.id, segment.seq), segment.bytes);
   }
 
   function openSegment(entry) {
@@ -216,6 +247,7 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     closeSync(fd);
   }
 
+  // Returns false when output stayed on disk; it remains charged and retried.
   function discard(entry) {
     try { closeEntry(entry); } catch { /* The descriptor is gone either way. */ }
     // Metadata goes first: an interrupted removal leaves only an orphan
@@ -223,21 +255,20 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     // metadata stays, so does the entry, and the caller learns why.
     rmSync(file(`${entry.id}.meta`), { force: true });
     entries.delete(entry.id);
-    total -= entryBytes(entry);
-    for (const segment of entry.segments) {
-      try { rmSync(file(segmentName(entry.id, segment.seq)), { force: true }); }
-      catch { /* An orphan segment is deleted by the next load. */ }
-    }
+    if (entry.metaBytes) total -= entry.metaBytes + fileBytes;
+    let complete = true;
+    for (const segment of entry.segments) complete = release(segmentName(entry.id, segment.seq), segment.bytes) && complete;
     for (const listener of listeners) {
       try { listener(); } catch { /* A listener cannot undo the removal. */ }
     }
+    return complete;
   }
 
-  // Load-time cleanup is best effort: a file that cannot be deleted now (an
-  // antivirus lock, say) is neither trusted nor served, and the next load
-  // retries it.
-  function removeQuietly(name) {
-    try { rmSync(file(name), { force: true }); } catch { /* Retried by the next load. */ }
+  // Cleanup of a leftover file is best effort: one that cannot be deleted now
+  // is charged like any other and retried, but never trusted or served.
+  function discardFile(name, bytes) {
+    total += bytes + fileBytes;
+    release(name, bytes);
   }
 
   function fail(error) {
@@ -266,9 +297,11 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
   }
 
   // Oldest ended sessions are evicted first. Only running sessions left
-  // over the global cap lose their oldest output.
+  // over the global cap lose their oldest output. If undeletable files keep
+  // the store over its cap, it stops persisting rather than exceed it.
   function enforce() {
     if (total <= limits.totalBytes) return;
+    retryResidue();
     const ended = [...entries.values()].filter((entry) => entry.endedAt !== null).sort((a, b) => a.endedAt - b.endedAt);
     for (const entry of ended) {
       if (total <= limits.totalBytes) break;
@@ -282,13 +315,17 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
       }
       if (!largest) break;
       const { entry } = largest;
-      if (entry.segments.length > 1) removeSegment(entry, 0);
-      else if (entry.fd !== null) { openSegment(entry); removeSegment(entry, 0); }
-      else break;
+      if (entry.segments.length < 2 && entry.fd === null) break;
+      if (entry.segments.length < 2) openSegment(entry);
+      if (!removeSegment(entry, 0)) break;
+    }
+    if (total > limits.totalBytes) {
+      const code = [...residue.values()].at(-1)?.code;
+      throw Object.assign(new Error("Terminal history is over its quota"), { code: code ?? "EQUOTA" });
     }
   }
 
-  function sweep() {
+  function expire() {
     if (!trusted || closed) return;
     const cutoff = now() - limits.retentionMs;
     try {
@@ -296,7 +333,12 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     } catch (error) { fail(error); }
   }
 
-  function loadEntry(id, names) {
+  function sweep() {
+    expire();
+    if (trusted && !closed) retryResidue();
+  }
+
+  function loadEntry(id, names, sizes) {
     let meta = null;
     let metaBytes = 0;
     if (names.meta) {
@@ -312,13 +354,13 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     const segments = names.segments.sort((a, b) => a.seq - b.seq);
     if (!validMeta(meta, id)) {
       // Metadata is written before any output, so this is an orphan.
-      for (const segment of segments) removeQuietly(segmentName(id, segment.seq));
-      if (names.meta) removeQuietly(`${id}.meta`);
+      for (const segment of segments) discardFile(segmentName(id, segment.seq), segment.bytes);
+      if (names.meta) discardFile(`${id}.meta`, sizes.get(`${id}.meta`));
       return;
     }
     while (segments.length > 2) {
       const [segment] = segments.splice(0, 1);
-      removeQuietly(segmentName(id, segment.seq));
+      discardFile(segmentName(id, segment.seq), segment.bytes);
     }
     // A record without an end is marked ended by restart after loading, so
     // its retention runs from this start rather than its last output.
@@ -344,15 +386,20 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
       stats.set(name, stat);
     }
     if (platform === "win32" && !created) {
+      // The probe reads only Outright's names. Failing to run it is a load
+      // failure; only an observed foreign owner or ACE makes the store unsafe.
       let report;
-      try { report = probeWindowsAcl(directory); } catch { return false; }
-      const items = Array.isArray(report?.entries) ? report.entries : [report?.entries];
-      const relevant = items.filter((item, index) => index === 0 || owned.includes(item?.name));
-      if (!windowsAclPrivate({ ...report, entries: relevant }, identity)) return false;
+      try { report = probeWindowsAcl(directory); }
+      catch (error) {
+        throw Object.assign(new Error("Terminal history ACL could not be verified", { cause: error }),
+          { code: `ACL check ${error?.code ?? "failed"}`, verification: true });
+      }
+      if (!windowsAclPrivate(report, identity)) return false;
     }
     const groups = new Map();
+    const sizes = new Map([...stats].map(([name, stat]) => [name, stat.size]));
     for (const name of owned) {
-      if (TEMP.test(name)) { removeQuietly(name); continue; }
+      if (TEMP.test(name)) { discardFile(name, sizes.get(name)); continue; }
       const match = FILE.exec(name);
       if (!ID.test(match[1])) continue;
       const group = groups.get(match[1]) ?? { meta: false, segments: [] };
@@ -360,7 +407,7 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
       else group.segments.push({ seq: Number(match[2]), bytes: stats.get(name).size });
       groups.set(match[1], group);
     }
-    for (const [id, group] of groups) loadEntry(id, group);
+    for (const [id, group] of groups) loadEntry(id, group, sizes);
     return true;
   }
 
@@ -371,8 +418,9 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     trusted = false;
     // A store that is not persisting serves nothing it partly loaded.
     entries.clear();
+    residue.clear();
     total = 0;
-    warning = ["EACCES", "EPERM"].includes(error?.code) ? UNSAFE_WARNING
+    warning = ["EACCES", "EPERM"].includes(error?.code) && !error.verification ? UNSAFE_WARNING
       : `Terminal history could not be loaded (${error?.code ?? "read failed"}). Terminal output stays in memory only.`;
   }
   writable = trusted;
@@ -382,7 +430,7 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     const restarted = [...entries.values()].filter((entry) => !entry.meta.end);
     for (const entry of restarted) setEnd(entry, { reason: "restart" });
     guarded(() => { for (const entry of restarted) writeMeta(entry); });
-    sweep();
+    expire();
     guarded(enforce);
   }
   const sweepTimer = trusted ? setInterval(sweep, SWEEP_INTERVAL_MS) : null;
@@ -405,7 +453,7 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     saved() {
       // A closed store belongs to a stopped runtime; the next start restores it.
       if (closed) return [];
-      sweep();
+      expire();
       return [...entries.values()].sort((a, b) => (a.endedAt ?? Infinity) - (b.endedAt ?? Infinity)).map(savedTerminal);
     },
     begin({ id, name, cwd, createdAt, relaunchedFrom }, initial = "") {
@@ -461,20 +509,29 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
       return Buffer.concat(chunks).toString("utf8");
     },
     // A failed removal would restore the session after a restart, so it is
-    // reported and the session stays listed for another dismissal.
+    // reported and the session stays listed for another dismissal. Output
+    // left behind is reported too; it stays charged and is retried.
     remove(id) {
       const entry = entries.get(id);
       if (!entry) return false;
-      try { discard(entry); return true; }
+      if (!closed) retryResidue();
+      let complete;
+      try { complete = discard(entry); }
       catch (error) {
         if (!entry.meta.end) setEnd(entry, { reason: "closed" });
         fail(error);
         throw Object.assign(new Error("Saved terminal output could not be deleted; check storage and dismiss it again"),
           { statusCode: 503, cause: error });
       }
+      if (!complete) {
+        throw Object.assign(new Error("Some saved terminal output could not be deleted yet; Outright keeps retrying"),
+          { statusCode: 503 });
+      }
+      return true;
     },
+    // Expires old sessions and retries files that could not be deleted.
     sweep,
-    usage() { return { totalBytes: total, terminals: entries.size }; },
+    usage() { return { totalBytes: total, terminals: entries.size, undeleted: residue.size }; },
     close() {
       if (closed) return;
       closed = true;
