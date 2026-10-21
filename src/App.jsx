@@ -652,7 +652,7 @@ export function App() {
     // pending reservation until that snapshot shows the terminal run; clearing
     // it here briefly announces the stale running state again.
     if (event.type === "provider-accounts.changed") setAccountsVersion((version) => version + 1);
-    if (["projects.changed", "terminal.output", "terminal.exit", "terminal.audit-failed", "runtime.connected", "capacity.changed"].includes(event.type)
+    if (["projects.changed", "terminal.output", "terminal.exit", "terminal.audit-failed", "terminal.restored", "terminal.history", "runtime.connected", "capacity.changed"].includes(event.type)
       || (event.type === "run.event" && ["run.completed", "run.failed", "run.stopped"].includes(event.payload?.type))) setRuntimeEvent(event);
     const pendingLoad = pendingConversationLoadRef.current;
     if (["message.created", "run.event"].includes(event.type)

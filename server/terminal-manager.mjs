@@ -18,7 +18,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   if (typeof terminal.process?.terminate !== "function") throw new Error("PTY owner has no termination verifier");
   return terminal.process.terminate(options);
 }, maxTerminals = 12, maxTerminalsPerCwd = 4, exitedRetentionMs = 15 * 60 * 1000, maxBufferChars = 150_000,
-  history = defaultHistory(database) }) {
+  history = defaultHistory(database, (status) => publish({ type: "terminal.history", payload: status })) }) {
   if (!Number.isSafeInteger(maxTerminals) || maxTerminals < 1 || maxTerminals > 256
     || !Number.isSafeInteger(maxTerminalsPerCwd) || maxTerminalsPerCwd < 1 || maxTerminalsPerCwd > 256) {
     throw new RangeError("Terminal process limits must be whole numbers from 1 to 256");
@@ -29,6 +29,9 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   let reservedUnknown = unresolvedReservations();
   const verifiedCreateFailures = new Map();
   let reconciliationPromise;
+  // Saved sessions a client was shown as recovery reservations. Each one is
+  // announced when it can be shown as ended instead.
+  const maskedSaved = new Set();
   let shuttingDown = false;
   let sweepingProofs = false;
   // Old audit records may lack a worktree path. Charge their unknown owner
@@ -94,6 +97,8 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     try { removeTerminalEmpty(entry.target, database.launchDirectory); }
     catch { /* The verified owner remains absent; retry cleanup later. */ }
     reservedUnknown = unresolvedReservations();
+    if (history?.has(entry.target)) maskedSaved.add(entry.target);
+    publishRestored();
     return true;
   }
 
@@ -127,6 +132,18 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     reservedUnknown = unresolvedReservations();
     sweepStaleEmptyProofs();
     publish({ type: "capacity.changed" });
+    publishRestored();
+  }
+
+  function publishRestored() {
+    if (!maskedSaved.size) return;
+    for (const entry of savedSessions()) {
+      if (!maskedSaved.has(entry.id)) continue;
+      const saved = listedSaved(entry);
+      if (saved.status !== "ended") continue;
+      maskedSaved.delete(entry.id);
+      publish({ type: "terminal.restored", terminalId: entry.id, payload: saved });
+    }
   }
 
   function create(input) {
@@ -300,12 +317,16 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   // exit may still have a live prior-run owner. Show it as unverified.
   function listedSaved(entry) {
     if (database.terminalAuditScanPending && entry.endReason === "restart") {
+      maskedSaved.add(entry.id);
       return reservationTerminal({ target: entry.id, cwd: entry.cwd, pid: null });
     }
     return savedTerminal(entry);
   }
-  function list() { return [...terminals.values()].map(publicTerminal).concat(reservedUnknown
-    .filter((entry) => !terminals.has(entry.target)).map(reservationTerminal), savedSessions().map(listedSaved)); }
+  function list() {
+    const reservations = reservedUnknown.filter((entry) => !terminals.has(entry.target));
+    if (history) for (const entry of reservations) if (history.has(entry.target)) maskedSaved.add(entry.target);
+    return [...terminals.values()].map(publicTerminal).concat(reservations.map(reservationTerminal), savedSessions().map(listedSaved));
+  }
   function capacity() {
     if (database.terminalAuditScanPending) return { active: maxTerminals, unknown: maxTerminals, limit: maxTerminals,
       recoveryPending: true, recoveryError: database.terminalAuditScanError ?? null };
@@ -316,7 +337,10 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     const terminal = terminals.get(id);
     if (terminal) return { ...publicTerminal(terminal), buffer: terminal.buffer, outputCursor: terminal.outputCursor };
     const reservation = reservedUnknown.find((entry) => entry.target === id);
-    if (reservation) return { ...reservationTerminal(reservation), buffer: history?.read(id) ?? "", outputCursor: 0 };
+    if (reservation) {
+      if (history?.has(id)) maskedSaved.add(id);
+      return { ...reservationTerminal(reservation), buffer: history?.read(id) ?? "", outputCursor: 0 };
+    }
     const saved = savedSessions().find((entry) => entry.id === id);
     return saved ? { ...listedSaved(saved), buffer: history.read(id), outputCursor: 0 } : null;
   }
@@ -352,10 +376,12 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       await terminate(terminal, { alreadyExited: true });
       if (!spawnTerminal) cleanupSocket(terminal.id);
       if (!terminals.has(terminal.id) || terminal.closePromise) return;
+      // The verified exit is saved even if its audit fails, so a later start
+      // labels it with its status rather than as ended by restart.
+      history?.end(terminal.id, { exitCode: terminal.exitCode, signal: terminal.signal });
       await database.auditRequired("terminal.exited", { target: terminal.id, exitCode: terminal.exitCode, signal: terminal.signal });
       if (!terminals.has(terminal.id) || terminal.closePromise) return;
       terminal.status = "exited";
-      history?.end(terminal.id, { exitCode: terminal.exitCode, signal: terminal.signal });
       publish({ type: "terminal.exit", terminalId: terminal.id, payload: { exitCode: terminal.exitCode, signal: terminal.signal } });
       terminal.cleanupTimer = setTimeout(() => terminals.delete(terminal.id), exitedRetentionMs);
       terminal.cleanupTimer.unref?.();
@@ -369,8 +395,11 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   function close(id) {
     const terminal = terminals.get(id);
     // Dismissing a saved session deletes its history; no process remains.
-    if (!terminal) return Promise.resolve(savedSessions().some((entry) => entry.id === id
+    if (!terminal) return Promise.resolve().then(() => savedSessions().some((entry) => entry.id === id
       && listedSaved(entry).status === "ended") && history.remove(id));
+    // A user's close removes the history even when shutdown later joins or
+    // retries it; only a shutdown-initiated close keeps it to restore.
+    if (!shuttingDown) terminal.userClosed = true;
     if (terminal.closePromise) return terminal.closePromise;
     const evidence = { target: id, cwd: terminal.cwd, operationId: randomUUID() };
     terminal.status = "closing";
@@ -390,11 +419,6 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
         await database.auditRequired("terminal.closed", evidence);
         clearTimeout(terminal.cleanupTimer);
         terminals.delete(id);
-        // Shutdown keeps output to restore as ended by restart; a user's
-        // close removes it.
-        if (shuttingDown) history?.finish(id);
-        else history?.remove(id);
-        return true;
       } catch (error) {
         terminal.status = "unknown";
         try { database.auditCritical("terminal.close.unknown", { ...evidence, error: String(error.message ?? error).slice(0, 1024) }); }
@@ -402,6 +426,11 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
         terminal.closePromise = null;
         throw outcomeUnknown(error, evidence.operationId);
       }
+      // The process is gone. A failed history removal is reported, and the
+      // session stays listed as saved so it can be dismissed again.
+      if (terminal.userClosed) history?.remove(id);
+      else history?.finish(id);
+      return true;
     });
     return terminal.closePromise;
   }
@@ -445,10 +474,10 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   return { create, list, capacity, get, write, resize, close, shutdown, reconcileUnknown, reloadUnknownReservations, historyStatus };
 }
 
-function defaultHistory(database) {
+function defaultHistory(database, onStatusChange) {
   // In-memory storage is never restored, so its terminals keep no history.
   if (!database.launchDirectory || !database.filename || database.filename === ":memory:") return null;
-  return openTerminalHistory({ directory: path.join(database.launchDirectory, "terminal-history") });
+  return openTerminalHistory({ directory: path.join(database.launchDirectory, "terminal-history"), onStatusChange });
 }
 function publicTerminal(terminal) {
   return { id: terminal.id, cwd: terminal.cwd, name: terminal.name, pid: terminal.pid, status: terminal.status, exitCode: terminal.exitCode, createdAt: terminal.createdAt,

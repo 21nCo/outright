@@ -17,15 +17,17 @@ export function TerminalPane(props) {
   return <WorktreeTerminalPane key={JSON.stringify([props.worktree.id, props.worktree.path])} {...props} />;
 }
 
-function announceHistoryWarning(listing, onError) {
-  const warning = listing?.history?.warning;
+function announceHistoryWarning(status, onError) {
+  const warning = status?.warning;
   if (!warning || warning === announcedHistoryWarning) return;
   announcedHistoryWarning = warning;
   onError(new Error(warning));
 }
 
-function savedFields(detail) {
-  return { status: "ended", endReason: detail.endReason, exitCode: detail.exitCode, endedAt: detail.endedAt, saved: true };
+// A saved detail replaces any recovery reservation the tab was listed as.
+function savedFields(detail, item) {
+  return { name: detail.name ?? item.name, status: "ended", endReason: detail.endReason, exitCode: detail.exitCode,
+    endedAt: detail.endedAt, saved: true, recoveryReservation: undefined, pid: null };
 }
 
 function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = EMPTY_UNVERIFIED_IDS, sendRuntime, onError }) {
@@ -217,12 +219,12 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
         if (pending.exit) exited = pending.exit;
         else if (status === "exited") exited = { exitCode: detail.exitCode };
       }
-      const savedLabel = status === "ended" ? terminalEndLabel(savedFields(detail)) : "";
+      const savedLabel = status === "ended" ? terminalEndLabel(savedFields(detail, terminal)) : "";
       if (savedLabel) {
         inputReadyRef.current = false;
         awaitingVisibleFitRef.current = false;
         xterm?.writeln(`\r\n\x1b[90m[saved output; ${savedLabel}]\x1b[0m`);
-        stageTerminals(terminalsRef.current.map((item) => item.id === terminal.id ? { ...item, ...savedFields(detail) } : item));
+        stageTerminals(terminalsRef.current.map((item) => item.id === terminal.id ? { ...item, ...savedFields(detail, item) } : item));
       } else if (exited) {
         exitedIdsRef.current.add(terminal.id);
         xterm?.writeln(`\r\n\x1b[90m[process exited ${exited.exitCode ?? "unknown"}]\x1b[0m`);
@@ -236,7 +238,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
         stageTerminals(terminalsRef.current.map((item) => item.id === terminal.id ? { ...item, status } : item));
       }
       let notice = "";
-      if (savedLabel) notice = `${terminal.name} saved output, ${savedLabel}. Read-only.`;
+      if (savedLabel) notice = `${detail.name ?? terminal.name} saved output, ${savedLabel}. Read-only.`;
       else if (exited) notice = `${terminal.name} process exited ${exited.exitCode ?? "unknown"}`;
       else if (status === "unknown") notice = `${terminal.name} ownership is unverified. Inspect local terminal recovery.`;
       setExitNotice(notice);
@@ -257,7 +259,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
       try {
         const listing = await api("/api/terminals");
         if (cancelled || token !== reconcileTokenRef.current) return;
-        announceHistoryWarning(listing, onErrorRef.current);
+        announceHistoryWarning(listing.history, onErrorRef.current);
         const matching = listing.terminals.filter((terminal) => terminal.cwd === worktree.path);
         let terminal = preferredTerminal(matching);
         if (!terminal) terminal = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: worktreeNameRef.current, cols: 100, rows: 30 } });
@@ -316,6 +318,19 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
         setExitNotice("Terminal ownership is unverified. Inspect local terminal recovery.");
       }
     }
+    // A recovery reservation became saved output. Replace the tab, and re-read
+    // it when selected so its label, buffer and actions match the server.
+    if (runtimeEvent?.type === "terminal.restored" && runtimeEvent.payload?.status === "ended"
+      && terminalsRef.current.some((item) => item.id === runtimeEvent.terminalId)) {
+      if (runtimeEvent.terminalId === activeIdRef.current || pendingOutputRef.current?.id === runtimeEvent.terminalId) {
+        if (mutationRef.current || reconcilingRef.current || selectingRef.current) queuedReconnectRef.current = {};
+        else reconcileConnection({}, true);
+      } else {
+        stageTerminals(terminalsRef.current.map((item) => item.id === runtimeEvent.terminalId ? runtimeEvent.payload : item));
+      }
+    }
+    if (runtimeEvent?.type === "terminal.history") announceHistoryWarning(runtimeEvent.payload, onErrorRef.current);
+    if (runtimeEvent?.type === "runtime.connected") announceHistoryWarning(runtimeEvent.payload?.history, onErrorRef.current);
     if (runtimeEvent?.type === "runtime.connected" && (runtimeEvent.payload?.replay?.requestedAfter > 0 || runtimeEvent.payload?.restarted) && activeIdRef.current) {
       if (mutationRef.current || reconcilingRef.current || selectingRef.current) queuedReconnectRef.current = runtimeEvent.payload;
       else reconcileConnection(runtimeEvent.payload);
@@ -332,7 +347,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
     const reconcile = async () => {
       const listing = refresh ? await api("/api/terminals") : { terminals: payload.terminals ?? [] };
       if (token !== reconcileTokenRef.current) return;
-      announceHistoryWarning(listing, onErrorRef.current);
+      announceHistoryWarning(listing.history, onErrorRef.current);
       const matching = listing.terminals.filter((terminal) => terminal.cwd === worktree.path);
       let terminal = preferredTerminal(matching, previousId);
       if (!terminal) terminal = await api("/api/terminals", { method: "POST", body: { cwd: worktree.path, name: worktreeNameRef.current, cols: 100, rows: 30 } });
@@ -375,23 +390,35 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
   }
 
   // A saved session is never resumed: this starts a separate shell in the
-  // same worktree that is marked as new.
+  // same worktree that is marked as new. The button leaves with the saved
+  // view, so focus moves to the new shell's tab unless it moved elsewhere.
   function startNewShell(saved) {
-    return launchTerminal({ cwd: worktree.path, name: saved.name, relaunchedFrom: saved.id });
+    return launchTerminal({ cwd: worktree.path, name: saved.name, relaunchedFrom: saved.id }, true);
   }
 
-  async function launchTerminal(body) {
+  async function launchTerminal(body, focusNew = false) {
     if (loading) return;
     mutationRef.current = true;
     const wasReady = inputReadyRef.current;
     const wasAwaitingFit = awaitingVisibleFitRef.current;
     const token = beginSelection();
+    if (focusNew) focusRequestRef.current = { id: null, token };
     try {
       const terminal = await api("/api/terminals", { method: "POST", body });
       if (token !== reconcileTokenRef.current) return;
+      if (focusRequestRef.current?.token === token) focusRequestRef.current.id = terminal.id;
       stageTerminals([...terminalsRef.current.filter((item) => item.id !== terminal.id), terminal]);
       await activateTerminal(terminal, token);
-    } catch (error) { if (token === reconcileTokenRef.current) { recoverSelection(wasReady, wasAwaitingFit); onErrorRef.current(error); } }
+      if (body.relaunchedFrom && token === reconcileTokenRef.current) {
+        setExitNotice(`${terminal.name} new shell started; the saved session was not resumed`);
+      }
+    } catch (error) {
+      if (token === reconcileTokenRef.current) {
+        recoverSelection(wasReady, wasAwaitingFit);
+        if (focusRequestRef.current?.token === token) focusRequestRef.current = null;
+        onErrorRef.current(error);
+      }
+    }
     finally { finishMutation(token); }
   }
 
@@ -486,7 +513,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, unverifiedTerminalIds = 
     </header>
     {activeSaved && <div className="terminal-saved-bar" role="group" aria-label="Saved terminal session">
       <span>Saved output, read-only: {terminalEndLabel(activeSaved)}.</span>
-      <Button variant="outline" size="xs" disabled={loading} onClick={() => startNewShell(activeSaved)}>Start new shell</Button>
+      <Button variant="outline" size="xs" aria-disabled={loading || undefined} onClick={() => startNewShell(activeSaved)}>Start new shell</Button>
     </div>}
     <div className="terminal-host" id="terminal-panel" ref={hostRef} role="tabpanel" aria-label="Active terminal output" aria-labelledby={activeId ? domId("terminal-tab", activeId) : undefined} aria-describedby="terminal-help" />
     <span className="sr-only" role="status">{exitNotice}</span>

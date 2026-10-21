@@ -39,6 +39,7 @@ test("saved sessions are labelled by how they ended and never as running", () =>
   const exited = { id: "b", name: "Build", status: "ended", endReason: "exit", exitCode: 7 };
   assert.equal(terminalEndLabel(restarted), "ended when Outright restarted");
   assert.equal(terminalEndLabel(exited), "process exited 7");
+  assert.equal(terminalEndLabel({ ...exited, endReason: "closed", exitCode: null }), "closed; its saved output could not be deleted");
   assert.equal(terminalTabLabel(restarted), "Server, saved output, ended when Outright restarted");
   assert.equal(terminalTabLabel(exited), "Build, saved output, process exited 7");
   for (const label of [terminalTabLabel(restarted), terminalTabLabel(exited)]) assert.doesNotMatch(label, /running|resum/i);

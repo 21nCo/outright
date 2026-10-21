@@ -98,7 +98,7 @@ test("each terminal keeps at most 2 MiB, dropping its oldest output first", (t) 
 test("the global quota evicts the oldest ended terminals before newer or running ones", (t) => {
   const { directory } = workspace(t);
   let clock = 1_000;
-  const limits = { ...TERMINAL_HISTORY_LIMITS, terminalBytes: 64 * 1024, totalBytes: 80 * 1024, maxEnded: 10 };
+  const limits = { ...TERMINAL_HISTORY_LIMITS, terminalBytes: 64 * 1024, totalBytes: 80 * 1024, fileBytes: 0 };
   const store = openTerminalHistory({ directory, limits, now: () => clock });
   const block = "y".repeat(20 * 1024);
   const [oldest, middle, newest, running] = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
@@ -134,6 +134,33 @@ test("the global quota evicts the oldest ended terminals before newer or running
   busy.close();
 });
 
+test("every history file is charged against the global quota, so tiny sessions cannot accumulate", (t) => {
+  const { directory } = workspace(t);
+  let clock = 1_000;
+  const limits = { ...TERMINAL_HISTORY_LIMITS, terminalBytes: 64 * 1024, totalBytes: 64 * 1024 };
+  const store = openTerminalHistory({ directory, limits, now: () => clock });
+  const ids = [];
+  for (let index = 0; index < 40; index += 1) {
+    const id = begin(store);
+    store.append(id, `${index}\n`);
+    clock += 1;
+    store.end(id, { exitCode: 0 });
+    ids.push(id);
+  }
+  const files = readdirSync(directory);
+  const disk = files.reduce((sum, name) => sum + statSync(path.join(directory, name)).size, 0);
+  assert.equal(store.usage().totalBytes, disk + files.length * limits.fileBytes);
+  assert.ok(store.usage().totalBytes <= limits.totalBytes);
+  assert.ok(store.usage().terminals < 10, `${store.usage().terminals} tiny sessions escaped the per-file charge`);
+  assert.equal(store.has(ids.at(-1)), true, "the newest ended terminal was evicted");
+  assert.equal(store.has(ids[0]), false, "the oldest ended terminal was kept");
+  store.close();
+  // A restart enumerates and charges every file again.
+  const reopened = openTerminalHistory({ directory, limits, now: () => clock });
+  assert.equal(reopened.usage().totalBytes, store.usage().totalBytes);
+  reopened.close();
+});
+
 test("ended terminals are kept for seven days and then removed", (t) => {
   const { directory } = workspace(t);
   const day = 24 * 60 * 60 * 1000;
@@ -153,6 +180,55 @@ test("ended terminals are kept for seven days and then removed", (t) => {
   assert.deepEqual(reopened.saved(), [], "a running store did not expire history");
   assert.deepEqual(terminalFiles(directory, kept), []);
   reopened.close();
+});
+
+test("a session ended by restart is kept seven days from that restart, which a later restart cannot extend", (t) => {
+  const { directory } = workspace(t);
+  const day = 24 * 60 * 60 * 1000;
+  let clock = Date.UTC(2026, 9, 1);
+  const store = openTerminalHistory({ directory, now: () => clock });
+  const crashed = begin(store);
+  const shutDown = begin(store);
+  store.append(crashed, "idle for weeks\n");
+  store.append(shutDown, "stopped cleanly\n");
+  // Idle output is old, then the runtime crashes without finish() for one
+  // terminal and shuts down cleanly for the other.
+  clock += 10 * day;
+  store.finish(shutDown);
+  store.close();
+  clock += 1_000;
+  const first = openTerminalHistory({ directory, now: () => clock });
+  assert.deepEqual(first.saved().map((entry) => [entry.id, entry.endReason]).sort(),
+    [[crashed, "restart"], [shutDown, "restart"]].sort(), "an idle session was dropped instead of restored");
+  assert.equal(first.read(crashed), "idle for weeks\n");
+  first.close();
+
+  clock += 6 * day;
+  const second = openTerminalHistory({ directory, now: () => clock });
+  assert.equal(second.saved().length, 2, "a session expired before seven days after its restart");
+  second.close();
+  clock += day;
+  const third = openTerminalHistory({ directory, now: () => clock });
+  assert.deepEqual(third.saved(), [], "a later restart extended retention");
+  assert.deepEqual(readdirSync(directory), []);
+  third.close();
+});
+
+test("published output survives an abrupt process exit without finish, close or read", { timeout: 20_000 }, (t) => {
+  const { directory } = workspace(t);
+  const id = randomUUID();
+  const module = new URL("./terminal-history.mjs", import.meta.url).href;
+  const script = `import { openTerminalHistory } from ${JSON.stringify(module)};
+const store = openTerminalHistory({ directory: ${JSON.stringify(directory)} });
+store.begin({ id: ${JSON.stringify(id)}, name: "Shell", cwd: "/work/tree", createdAt: "2026-10-21T00:00:00.000Z" }, "first\\n");
+store.append(${JSON.stringify(id)}, "published just before the crash\\n");
+process.kill(process.pid, "SIGKILL");`;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8" });
+  assert.ok(child.signal === "SIGKILL" || child.status !== 0, `the child exited normally: ${child.stderr}`);
+  const restored = openTerminalHistory({ directory });
+  assert.equal(restored.read(id), "first\npublished just before the crash\n");
+  assert.equal(restored.saved()[0].endReason, "restart");
+  restored.close();
 });
 
 test("an unsafe history directory or file is refused and terminals keep working in memory", async (t) => {
@@ -265,6 +341,62 @@ test("close and dismiss remove history; shutdown keeps it", async (t) => {
   await second.manager.shutdown();
 });
 
+test("a user's close that shutdown joins still removes its history", async (t) => {
+  const { directory } = workspace(t);
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const { manager: terminals } = manager(openTerminalHistory({ directory }), { terminate: () => held });
+  const terminal = terminals.create({ cwd: "/work/tree" });
+  const closing = terminals.close(terminal.id);
+  const stopping = terminals.shutdown();
+  release();
+  assert.equal(await closing, true);
+  await stopping;
+  assert.deepEqual(terminalFiles(directory, terminal.id), [], "shutdown kept a terminal the user closed");
+  const reopened = openTerminalHistory({ directory });
+  assert.deepEqual(reopened.saved(), []);
+  reopened.close();
+});
+
+test("a failed history removal is reported and the session stays listed instead of reappearing later", async (t) => {
+  const { directory } = workspace(t);
+  const seed = openTerminalHistory({ directory });
+  const id = begin(seed);
+  seed.end(id, { exitCode: 0 });
+  seed.close();
+  const events = [];
+  const store = openTerminalHistory({ directory, onStatusChange: (status) => events.push(status) });
+  const { manager: terminals } = manager(store);
+  const live = terminals.create({ cwd: "/work/tree", name: "Live" });
+  // A directory in place of the metadata makes its removal fail everywhere.
+  for (const target of [id, live.id]) {
+    rmSync(path.join(directory, `${target}.meta`));
+    mkdirSync(path.join(directory, `${target}.meta`));
+  }
+  await assert.rejects(terminals.close(id), (error) => error.statusCode === 503 && /could not be deleted/.test(error.message));
+  assert.equal(terminals.list().find((entry) => entry.id === id)?.status, "ended", "an undeleted session disappeared until restart");
+  assert.equal(store.status().persistent, false);
+  assert.equal(events.length, 1, "the persistence change was not reported exactly once");
+  assert.match(events[0].warning, /could not be saved/);
+  await assert.rejects(terminals.close(live.id), (error) => error.statusCode === 503);
+  const closed = terminals.list().find((entry) => entry.id === live.id);
+  assert.deepEqual([closed?.status, closed?.endReason], ["ended", "closed"], "a closed terminal was not labelled closed");
+  await terminals.shutdown();
+});
+
+test("a verified exit whose audit fails is still restored with its exit status", async (t) => {
+  const { directory } = workspace(t);
+  const database = { ...fakeDatabase(), auditRequired: async (action) => { if (action === "terminal.exited") throw new Error("audit unavailable"); } };
+  const first = manager(openTerminalHistory({ directory }), { database });
+  const terminal = first.manager.create({ cwd: "/work/tree" });
+  first.ptys[0].exit({ exitCode: 5, signal: 0 });
+  await waitFor(() => first.manager.get(terminal.id).status === "unknown");
+  await first.manager.shutdown();
+  const restored = openTerminalHistory({ directory });
+  assert.deepEqual(restored.saved().map(({ endReason, exitCode }) => ({ endReason, exitCode })), [{ endReason: "exit", exitCode: 5 }]);
+  restored.close();
+});
+
 test("a prior-run owner awaiting proof stays recovery-only even with saved output", async (t) => {
   const { directory } = workspace(t);
   const seed = openTerminalHistory({ directory });
@@ -276,7 +408,8 @@ test("a prior-run owner awaiting proof stays recovery-only even with saved outpu
   let proven = false;
   const database = { ...fakeDatabase(), launchDirectory: path.dirname(directory), terminalUnknownReservations: () => reservations,
     resolveTerminalUnknown: (target) => { assert.equal(target, id); reservations = []; } };
-  const terminals = createTerminalManager({ database, publish: () => {}, history: openTerminalHistory({ directory }),
+  const published = [];
+  const terminals = createTerminalManager({ database, publish: (event) => published.push(event), history: openTerminalHistory({ directory }),
     recoverTerminal: async () => proven, cleanupSocket: () => {} });
   assert.deepEqual(terminals.list().map(({ id: listed, status, recoveryReservation }) => ({ id: listed, status, recoveryReservation })),
     [{ id, status: "unknown", recoveryReservation: true }], "a prior-run PID was listed as live, ended or twice");
@@ -290,6 +423,9 @@ test("a prior-run owner awaiting proof stays recovery-only even with saved outpu
   proven = true;
   assert.equal(await terminals.reconcileUnknown(), 1);
   assert.deepEqual(terminals.list().map(({ status, endReason, pid }) => ({ status, endReason, pid })), [{ status: "ended", endReason: "restart", pid: null }]);
+  const restored = published.filter((event) => event.type === "terminal.restored");
+  assert.deepEqual(restored.map(({ terminalId, payload }) => [terminalId, payload.status, payload.name, payload.recoveryReservation]),
+    [[id, "ended", "Shell", undefined]], "a client showing the reservation was not told it ended");
   assert.equal(terminals.capacity().active, 0);
   await terminals.shutdown();
 });
@@ -305,7 +441,8 @@ test("while the audit scan is pending a session with no recorded exit is not sho
   seed.close();
   let scanning = true;
   const database = { ...fakeDatabase(), get terminalAuditScanPending() { return scanning; }, terminalUnknownReservations: () => [] };
-  const terminals = createTerminalManager({ database, publish: () => {}, history: openTerminalHistory({ directory }) });
+  const published = [];
+  const terminals = createTerminalManager({ database, publish: (event) => published.push(event), history: openTerminalHistory({ directory }) });
   const status = () => Object.fromEntries(terminals.list().map((entry) => [entry.id, entry.status]));
   assert.deepEqual(status(), { [unproven]: "unknown", [exited]: "ended" });
   assert.equal(terminals.get(unproven).status, "unknown");
@@ -315,6 +452,8 @@ test("while the audit scan is pending a session with no recorded exit is not sho
   terminals.reloadUnknownReservations();
   assert.deepEqual(status(), { [unproven]: "ended", [exited]: "ended" });
   assert.equal(terminals.get(unproven).endReason, "restart");
+  assert.deepEqual(published.filter((event) => event.type === "terminal.restored").map((event) => event.terminalId), [unproven],
+    "only the masked session was announced as restored");
   await terminals.shutdown();
 });
 

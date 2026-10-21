@@ -11,6 +11,7 @@ export function pruneExitedIds(exitedIds, terminals, pending) {
 // ended and never implies the process is still running or can resume.
 export function terminalEndLabel(terminal) {
   if (terminal?.status === "ended" && terminal.endReason === "restart") return "ended when Outright restarted";
+  if (terminal?.status === "ended" && terminal.endReason === "closed") return "closed; its saved output could not be deleted";
   if (terminal?.status === "ended" || terminal?.status === "exited") return `process exited ${terminal.exitCode ?? "unknown"}`;
   return "";
 }

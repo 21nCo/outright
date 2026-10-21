@@ -8,7 +8,9 @@ export const TERMINAL_HISTORY_LIMITS = Object.freeze({
   terminalBytes: 2 * 1024 * 1024,
   totalBytes: 64 * 1024 * 1024,
   retentionMs: 7 * 24 * 60 * 60 * 1000,
-  maxEnded: 128,
+  // Each file is charged a filesystem block against the global cap, so tiny
+  // histories cannot accumulate without bound under it.
+  fileBytes: 4096,
 });
 
 const RECORD_HEADER = 16;
@@ -17,10 +19,8 @@ const VERSION = 1;
 const META = 1;
 const OUTPUT = 2;
 const META_LIMIT = 16 * 1024;
-const FLUSH_CHARS = 64 * 1024;
-const FLUSH_DELAY_MS = 250;
 const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
-const SCAN_LIMIT = 4096;
+const END_REASONS = new Set(["exit", "restart", "closed"]);
 const ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const FILE = /^([0-9a-f-]{36})\.(?:meta|(\d{1,15})\.log)$/;
 const TEMP = /^[0-9a-f-]{36}\.meta\.[0-9a-f]{16}\.tmp$/;
@@ -112,7 +112,8 @@ function validMeta(meta, id) {
   if (meta.relaunchedFrom !== undefined && !ID.test(meta.relaunchedFrom)) return false;
   if (meta.end === undefined) return true;
   const code = (value) => value === null || Number.isSafeInteger(value);
-  return Boolean(meta.end) && code(meta.end.exitCode) && code(meta.end.signal) && Number.isFinite(meta.end.endedAt);
+  return Boolean(meta.end) && code(meta.end.exitCode) && code(meta.end.signal) && Number.isFinite(meta.end.endedAt)
+    && (meta.end.reason === undefined || END_REASONS.has(meta.end.reason));
 }
 
 function utf8Tail(buffer, bytes) {
@@ -123,8 +124,10 @@ function utf8Tail(buffer, bytes) {
 }
 
 export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMITS, now = Date.now, platform = process.platform,
-  identity = null, probeWindowsAcl = probeWindowsHistoryAcl, hardenWindowsDirectory = hardenWindowsLaunchDirectory } = {}) {
+  identity = null, probeWindowsAcl = probeWindowsHistoryAcl, hardenWindowsDirectory = hardenWindowsLaunchDirectory,
+  onStatusChange = null } = {}) {
   const entries = new Map();
+  const fileBytes = limits.fileBytes ?? TERMINAL_HISTORY_LIMITS.fileBytes;
   const segmentLimit = Math.floor((limits.terminalBytes - META_LIMIT) / 2);
   if (!directory || !path.isAbsolute(directory) || segmentLimit < 4096) throw new Error("Terminal history needs an absolute directory and a cap above 24 KiB");
   let trusted = false;
@@ -132,10 +135,10 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
   let closed = false;
   let warning = null;
   let total = 0;
-  let flushTimer = null;
   const file = (name) => path.join(directory, name);
   const segmentName = (id, seq) => `${id}.${seq}.log`;
-  const entryBytes = (entry) => entry.metaBytes + entry.segments.reduce((sum, segment) => sum + segment.bytes, 0);
+  const entryBytes = (entry) => (entry.metaBytes ? entry.metaBytes + fileBytes : 0)
+    + entry.segments.reduce((sum, segment) => sum + segment.bytes + fileBytes, 0);
 
   function privateItem(stat, isDirectory) {
     if (stat.isSymbolicLink() || (isDirectory ? !stat.isDirectory() : !stat.isFile())) return false;
@@ -144,12 +147,14 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     return stat.uid === uid && (stat.mode & 0o077) === 0;
   }
 
+  // Every Outright file is enumerated so none escapes quota or retention.
+  // The per-file charge bounds how many the global cap admits.
   function scanNames() {
     const names = [];
     const handle = opendirSync(directory);
     try {
       let item;
-      while (names.length < SCAN_LIMIT && (item = handle.readSync())) names.push(item.name);
+      while ((item = handle.readSync())) names.push(item.name);
     } finally { handle.closeSync(); }
     return names;
   }
@@ -172,14 +177,14 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
       rmSync(temp, { force: true });
       throw error;
     }
-    total += record.length - entry.metaBytes;
+    total += record.length - entry.metaBytes + (entry.metaBytes ? 0 : fileBytes);
     entry.metaBytes = record.length;
   }
 
   function removeSegment(entry, index) {
     const [segment] = entry.segments.splice(index, 1);
     rmSync(file(segmentName(entry.id, segment.seq)), { force: true });
-    total -= segment.bytes;
+    total -= segment.bytes + fileBytes;
   }
 
   function openSegment(entry) {
@@ -187,15 +192,15 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     const seq = (entry.segments.at(-1)?.seq ?? 0) + 1;
     entry.fd = openSync(file(segmentName(entry.id, seq)), "wx", 0o600);
     entry.segments.push({ seq, bytes: 0 });
+    total += fileBytes;
     // Two segments bound each history to its cap and drop the oldest output.
     while (entry.segments.length > 2) removeSegment(entry, 0);
   }
 
-  function flush(entry) {
-    if (!entry.pending) return;
-    const data = entry.pending;
-    entry.pending = "";
-    if (entry.fd === null) return;
+  // Output reaches the descriptor as it is published, so an abrupt exit
+  // keeps everything a client could already have seen.
+  function write(entry, data) {
+    if (entry.fd === null || !data) return;
     const record = encodeRecord(OUTPUT, utf8Tail(Buffer.from(data, "utf8"), segmentLimit - RECORD_HEADER));
     if (entry.segments.at(-1).bytes > 0 && entry.segments.at(-1).bytes + record.length > segmentLimit) openSegment(entry);
     writeAll(entry.fd, record);
@@ -211,24 +216,36 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
   }
 
   function discard(entry) {
-    entries.delete(entry.id);
-    entry.pending = "";
     try { closeEntry(entry); } catch { /* The descriptor is gone either way. */ }
-    total -= entryBytes(entry);
     // Metadata goes first: an interrupted removal leaves only an orphan
-    // segment, which the next load deletes instead of restoring.
+    // segment, which the next load deletes instead of restoring. If the
+    // metadata stays, so does the entry, and the caller learns why.
     rmSync(file(`${entry.id}.meta`), { force: true });
-    for (const segment of entry.segments) rmSync(file(segmentName(entry.id, segment.seq)), { force: true });
+    entries.delete(entry.id);
+    total -= entryBytes(entry);
+    for (const segment of entry.segments) {
+      try { rmSync(file(segmentName(entry.id, segment.seq)), { force: true }); }
+      catch { /* An orphan segment is deleted by the next load. */ }
+    }
   }
 
   function fail(error) {
+    const changed = writable;
     writable = false;
     warning = `Terminal history could not be saved (${error?.code ?? "write failed"}). Terminal output stays in memory only.`;
-    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
     for (const entry of entries.values()) {
-      entry.pending = "";
       try { closeEntry(entry); } catch { /* Persistence is already disabled. */ }
     }
+    if (changed) {
+      try { onStatusChange?.({ persistent: false, warning }); } catch { /* A listener cannot restore persistence. */ }
+    }
+  }
+
+  function setEnd(entry, { exitCode = null, signal = null, reason }) {
+    const endedAt = now();
+    entry.meta = { ...entry.meta, end: { exitCode: Number.isSafeInteger(exitCode) ? exitCode : null,
+      signal: Number.isSafeInteger(signal) ? signal : null, endedAt, ...(reason === "exit" ? {} : { reason }) } };
+    entry.endedAt = endedAt;
   }
 
   function guarded(operation) {
@@ -237,15 +254,14 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     catch (error) { fail(error); return false; }
   }
 
-  // Oldest ended sessions are evicted first, by count and then by bytes.
-  // Only running sessions left over the global cap lose their oldest output.
+  // Oldest ended sessions are evicted first. Only running sessions left
+  // over the global cap lose their oldest output.
   function enforce() {
+    if (total <= limits.totalBytes) return;
     const ended = [...entries.values()].filter((entry) => entry.endedAt !== null).sort((a, b) => a.endedAt - b.endedAt);
-    let excess = ended.length - limits.maxEnded;
     for (const entry of ended) {
-      if (excess <= 0 && total <= limits.totalBytes) break;
+      if (total <= limits.totalBytes) break;
       discard(entry);
-      excess -= 1;
     }
     while (total > limits.totalBytes) {
       let largest = null;
@@ -293,9 +309,10 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
       const [segment] = segments.splice(0, 1);
       rmSync(file(segmentName(id, segment.seq)), { force: true });
     }
-    const entry = { id, meta, metaBytes, segments: segments.map(({ seq, bytes }) => ({ seq, bytes })), fd: null, pending: "",
-      // A prior run that recorded no exit ended when that run stopped writing.
-      endedAt: meta.end?.endedAt ?? Math.max(names.mtimeMs, ...segments.map((segment) => segment.mtimeMs)) };
+    // A record without an end is marked ended by restart after loading, so
+    // its retention runs from this start rather than its last output.
+    const entry = { id, meta, metaBytes, segments: segments.map(({ seq, bytes }) => ({ seq, bytes })), fd: null,
+      endedAt: meta.end?.endedAt ?? null };
     entries.set(id, entry);
     total += entryBytes(entry);
   }
@@ -327,10 +344,9 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
       if (TEMP.test(name)) { rmSync(file(name), { force: true }); continue; }
       const match = FILE.exec(name);
       if (!ID.test(match[1])) continue;
-      const group = groups.get(match[1]) ?? { meta: false, mtimeMs: 0, segments: [] };
-      const stat = stats.get(name);
-      if (match[2] === undefined) { group.meta = true; group.mtimeMs = stat.mtimeMs; }
-      else group.segments.push({ seq: Number(match[2]), bytes: stat.size, mtimeMs: stat.mtimeMs });
+      const group = groups.get(match[1]) ?? { meta: false, segments: [] };
+      if (match[2] === undefined) group.meta = true;
+      else group.segments.push({ seq: Number(match[2]), bytes: stats.get(name).size });
       groups.set(match[1], group);
     }
     for (const [id, group] of groups) loadEntry(id, group);
@@ -346,26 +362,22 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
   }
   writable = trusted;
   if (trusted) {
+    // The prior run stopped writing without an exit: it ended by restart, now.
+    // A durable marker keeps later starts from extending or backdating that.
+    const restarted = [...entries.values()].filter((entry) => !entry.meta.end);
+    for (const entry of restarted) setEnd(entry, { reason: "restart" });
+    guarded(() => { for (const entry of restarted) writeMeta(entry); });
     sweep();
     guarded(enforce);
   }
   const sweepTimer = trusted ? setInterval(sweep, SWEEP_INTERVAL_MS) : null;
   sweepTimer?.unref?.();
 
-  function scheduleFlush() {
-    if (flushTimer) return;
-    flushTimer = setTimeout(() => {
-      flushTimer = null;
-      guarded(() => { for (const entry of entries.values()) flush(entry); enforce(); });
-    }, FLUSH_DELAY_MS);
-    flushTimer.unref?.();
-  }
-
   function savedTerminal(entry) {
     const { meta } = entry;
     return { id: entry.id, cwd: meta.cwd, name: meta.name, createdAt: meta.createdAt,
       ...(meta.relaunchedFrom ? { relaunchedFrom: meta.relaunchedFrom } : {}),
-      endReason: meta.end ? "exit" : "restart", exitCode: meta.end?.exitCode ?? null, signal: meta.end?.signal ?? null,
+      endReason: meta.end?.reason ?? (meta.end ? "exit" : "restart"), exitCode: meta.end?.exitCode ?? null, signal: meta.end?.signal ?? null,
       endedAt: entry.endedAt === null ? null : new Date(entry.endedAt).toISOString() };
   }
 
@@ -382,13 +394,13 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     begin({ id, name, cwd, createdAt, relaunchedFrom }, initial = "") {
       if (!ID.test(id) || entries.has(id)) return false;
       const entry = { id, meta: { version: 1, id, name, cwd, createdAt, ...(relaunchedFrom ? { relaunchedFrom } : {}) },
-        metaBytes: 0, segments: [], fd: null, pending: initial, endedAt: null };
+        metaBytes: 0, segments: [], fd: null, endedAt: null };
       return guarded(() => {
         entries.set(id, entry);
         try {
           writeMeta(entry);
           openSegment(entry);
-          flush(entry);
+          write(entry, initial);
         } catch (error) {
           try { discard(entry); } catch { /* Persistence is disabled below. */ }
           throw error;
@@ -399,36 +411,30 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     append(id, data) {
       const entry = entries.get(id);
       if (!writable || closed || entry?.fd == null || typeof data !== "string" || !data) return;
-      entry.pending += data;
-      if (entry.pending.length >= FLUSH_CHARS) guarded(() => { flush(entry); enforce(); });
-      else scheduleFlush();
+      guarded(() => { write(entry, data); enforce(); });
     },
     end(id, { exitCode = null, signal = null } = {}) {
       const entry = entries.get(id);
       if (!entry) return false;
-      const endedAt = now();
       // Memory stays truthful even when the exit cannot be written.
-      entry.meta = { ...entry.meta, end: { exitCode: Number.isSafeInteger(exitCode) ? exitCode : null,
-        signal: Number.isSafeInteger(signal) ? signal : null, endedAt } };
-      entry.endedAt = endedAt;
+      setEnd(entry, { exitCode, signal, reason: "exit" });
       return guarded(() => {
-        flush(entry);
         closeEntry(entry);
         writeMeta(entry);
         enforce();
       });
     },
-    // Runtime shutdown: keep the record. It restores as ended by restart.
+    // Runtime shutdown: keep the record. It restores as ended by restart,
+    // and its retention runs from this shutdown.
     finish(id) {
       const entry = entries.get(id);
       if (!entry) return;
-      guarded(() => { flush(entry); closeEntry(entry); });
-      entry.endedAt ??= now();
+      if (!entry.meta.end) setEnd(entry, { reason: "restart" });
+      guarded(() => { closeEntry(entry); writeMeta(entry); });
     },
     read(id) {
       const entry = entries.get(id);
       if (!entry || closed) return "";
-      guarded(() => flush(entry));
       const chunks = [];
       for (const segment of entry.segments) {
         let buffer;
@@ -437,19 +443,24 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
       }
       return Buffer.concat(chunks).toString("utf8");
     },
+    // A failed removal would restore the session after a restart, so it is
+    // reported and the session stays listed for another dismissal.
     remove(id) {
       const entry = entries.get(id);
       if (!entry) return false;
-      try { discard(entry); } catch (error) { fail(error); }
-      return true;
+      try { discard(entry); return true; }
+      catch (error) {
+        if (!entry.meta.end) setEnd(entry, { reason: "closed" });
+        fail(error);
+        throw Object.assign(new Error("Saved terminal output could not be deleted; check storage and dismiss it again"),
+          { statusCode: 503, cause: error });
+      }
     },
     sweep,
     usage() { return { totalBytes: total, terminals: entries.size }; },
     close() {
       if (closed) return;
-      guarded(() => { for (const entry of entries.values()) flush(entry); });
       closed = true;
-      if (flushTimer) clearTimeout(flushTimer);
       if (sweepTimer) clearInterval(sweepTimer);
       for (const entry of entries.values()) {
         try { closeEntry(entry); } catch { /* Shutdown continues. */ }
