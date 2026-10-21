@@ -1,0 +1,33 @@
+server/outright-runtime.mjs
+  s_1900bb15a7199a::t_76c2551bcca87e 938
+server/terminal-history.mjs
+  s_1900bb15a7199a::t_21fc374e7eafc7 1-459
+server/terminal-history.test.mjs
+  s_1900bb15a7199a::t_871e8e2ea955c2 1-368
+server/terminal-manager.mjs
+  s_1900bb15a7199a::t_b74d6267885456 3,6-8,20-21,138,151,154-155,175,181,204,242,253,265,287,293-306,308,319-331,358,371-373,393-396,424,445,448-452,454-458
+src/components/TerminalPane.jsx
+  s_1900bb15a7199a::t_8af3eb674c9a0c 8,12-14,20-28,208,216,220-226,239-240,258,260-262,333,335-337,373-383,390,477-479,483,487-490
+src/lib/terminal-exit-state.js
+  s_1900bb15a7199a::t_69dc4a7ffc5bd0 9-37
+src/styles.css
+  s_1900bb15a7199a::t_eccde98798ff7d 436-437,448-450
+tests/terminal-exit-state.test.mjs
+  s_1900bb15a7199a::t_dad762fcd000dc 3,36-63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8393634e23569e93c5d303d822f0232a1daa1d50",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
