@@ -1,0 +1,27 @@
+server/outright-runtime.mjs
+  s_4c442c86682261::t_b9507574902f11 406-408
+server/outright-runtime.test.mjs
+  s_4c442c86682261::t_f35f02e70b0e2d 17,3644-3665
+server/terminal-history.mjs
+  s_4c442c86682261::t_564ea1bd6f7fa8 28,155,158-159,225-243,246-254,259,267,348,521-524,527
+server/terminal-history.test.mjs
+  s_4c442c86682261::t_cc41243d89c8c8 779-835
+server/terminal-manager.mjs
+  s_4c442c86682261::t_75fa50462df311 398-402,432
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c3137328745e430bb48d0970474fa700400b0465",
+  "prompts": {},
+  "sessions": {
+    "s_4c442c86682261": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_4c442c86682261",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
