@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabLabel, savedOutputPages } from "../src/lib/terminal-exit-state.js";
+import { preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabLabel, savedOutputPages, savedPageText } from "../src/lib/terminal-exit-state.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
 
 test("audit failure fences terminal commands before a later runtime event or React commit", () => {
@@ -75,4 +75,31 @@ test("saved output pages cover every character in order within the view's bounds
       assert.ok(!(code >= 0xdc00 && code <= 0xdfff), "a page split a surrogate pair");
     }
   }
+});
+
+test("saved output pages never split an escape sequence and carry the rendition and screen in effect", () => {
+  const sgr = "\x1b[1;38;2;255;0;0mab\x1b[0m";
+  const osc = `\x1b]52;c;${"Q".repeat(70_000)}\x07`;
+  const cases = [sgr.repeat(20_000), `${"x".repeat(100_000)}${osc}tail`, `${"y\n".repeat(1_500)}${"\x1b]8;;https://example.test\x1b\\link\x1b]8;;\x1b\\".repeat(3_000)}`];
+  for (const buffer of cases) {
+    const sequences = [...buffer.matchAll(/\x1b(?:\[[0-9;]*m|\][^\x07\x1b]*(?:\x07|\x1b\\))/g)].map((match) => [match.index, match.index + match[0].length]);
+    const pages = savedOutputPages(buffer, 64_000, 2_000);
+    assert.equal(pages.map(([start, end]) => buffer.slice(start, end)).join(""), buffer);
+    for (const [start] of pages) assert.ok(!sequences.some(([from, to]) => start > from && start < to), `a page starts inside an escape sequence at ${start}`);
+  }
+
+  const colored = `\x1b[1;38;5;196mred\n${"x\n".repeat(3_000)}`;
+  assert.equal(savedOutputPages(colored).at(-1)[2], "\x1b[1;38;5;196m", "a later page lost the rendition set before it");
+  assert.ok(savedPageText(colored, savedOutputPages(colored).at(-1)).startsWith("\x1b[1;38;5;196m"));
+  for (const reset of ["\x1b[0m", "\x1b[m", "\x1bc", "\x1b[22;39m"]) {
+    assert.equal(savedOutputPages(`${colored.slice(0, 15)}${reset}${colored.slice(15)}`).at(-1)[2], "", `${JSON.stringify(reset)} did not end the rendition`);
+  }
+
+  const app = `before\n\x1b[34m\x1b[?1049h\x1b[2J\x1b[HFULLSCREEN\x1b[31m${"frame\n".repeat(2_500)}\x1b[?1049lafter\x1b[3J\n`;
+  const [first, second] = savedOutputPages(app);
+  assert.deepEqual([first[3], second[3], second[2]], [false, true, "\x1b[34m"], "a page opened inside the alternate screen lost its saved rendition");
+  const text = pages(app).join("");
+  assert.ok(text.includes("before") && text.includes("after") && !/FULLSCREEN|frame|\x1b\[\?1049|\x1b\[3J/.test(text), "alternate-screen output or a scrollback erase reached the saved view");
+  assert.equal(savedPageText("a\x1bcb", [0, 4]), "a\x1b[0m\x1b[H\x1b[2Jb", "a full reset inside saved output cleared the view's scrollback");
+  function pages(buffer) { return savedOutputPages(buffer).map((page) => savedPageText(buffer, page)); }
 });

@@ -332,16 +332,13 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   function get(id) {
     const terminal = terminals.get(id);
     if (terminal) return { ...publicTerminal(terminal), buffer: terminal.buffer, outputCursor: terminal.outputCursor };
+    // Saved output is served whole, at most the 2 MiB history cap, whether
+    // it is ended or still awaits ownership proof; the pane pages through it
+    // read-only. An unverified owner stays recovery-only, never running.
     const reservation = reservedUnknown.find((entry) => entry.target === id);
-    // An unverified owner shows the tail a live terminal keeps. A saved
-    // session serves all of its output, at most the 2 MiB history cap; the
-    // pane pages through it.
-    if (reservation) return { ...reservationTerminal(reservation), buffer: (history?.read(id) ?? "").slice(-maxBufferChars), outputCursor: 0 };
+    if (reservation) return { ...reservationTerminal(reservation), buffer: history?.read(id) ?? "", outputCursor: 0 };
     const saved = savedSessions().find((entry) => entry.id === id);
-    if (!saved) return null;
-    const listed = listedSaved(saved);
-    const buffer = history.read(id);
-    return { ...listed, buffer: listed.status === "ended" ? buffer : buffer.slice(-maxBufferChars), outputCursor: 0 };
+    return saved ? { ...listedSaved(saved), buffer: history.read(id), outputCursor: 0 } : null;
   }
   function historyStatus() { return history?.status() ?? { persistent: false, warning: null }; }
   function relaunchSource(value) {

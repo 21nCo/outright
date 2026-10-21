@@ -1,6 +1,7 @@
 // Open /tests/ui-races.html on the local Vite server. All API and socket traffic
 // is replaced in this page; no real project, conversation or terminal is changed.
 import React, { startTransition, Suspense } from "react";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { App } from "../src/App.jsx";
 import { ChangesPane } from "../src/components/ChangesPane.jsx";
@@ -2429,7 +2430,9 @@ async function terminalReservationRestoredRegression() {
   show();
   await until(() => terminalReady("Terminal recovery required"), "reservation listed before proof");
   assert(host.querySelector('[aria-label="Close terminal Terminal recovery required"]')?.disabled, "Reservation could be closed");
-  assert(!host.querySelector('.terminal-saved-bar'), "Reservation was shown as saved output");
+  const reservedBar = host.querySelector('.terminal-saved-bar')?.textContent ?? "";
+  assert(reservedBar.includes("owner is unverified") && !reservedBar.includes("Start new shell") && !reservedBar.includes("ended"),
+    "Reservation was shown as ended or relaunchable saved output");
   current = restored;
   version += 1;
   show({ type: "terminals.changed" });
@@ -2556,13 +2559,19 @@ async function terminalListingAddsSessionsRegression() {
   assert(errors.length === 0, `Unexpected terminal errors: ${errors.join("; ")}`);
 }
 
-async function terminalSavedPagingRegression() {
+// A reservation still awaiting ownership proof pages the same saved output
+// read-only, with no relaunch, dismissal or input.
+async function terminalSavedPagingRegression(reservation = false) {
   root.render(null);
   await settle();
   const lines = Array.from({ length: 30_000 }, (_, index) => `saved line ${index}\r\n`);
   lines[0] = "FIRST saved line\r\n";
+  // A rendition set on the first page and never reset is in effect on every later page.
+  lines[1] = "\x1b[31mRED saved line\r\n";
   lines[lines.length - 1] = "LAST saved line\r\n";
-  const saved = savedTerminal("term-L", "Long", "exit", 0, "2026-10-21T01:00:00.000Z");
+  const saved = reservation
+    ? { id: "term-L", name: "Terminal recovery required", cwd: "/fixture/A", pid: 4242, status: "unknown", createdAt: null, recoveryReservation: true }
+    : savedTerminal("term-L", "Long", "exit", 0, "2026-10-21T01:00:00.000Z");
   const sent = [];
   const errors = [];
   let details = 0;
@@ -2573,22 +2582,37 @@ async function terminalSavedPagingRegression() {
   };
   root.render(<div className="fixture-terminal-frame" style={{ width: 360, height: 420 }}><TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null}
     onError={(error) => errors.push(error)} sendRuntime={(message) => sent.push(message)} /></div>);
-  await until(() => terminalReady("LongSaved"), "long saved session selected");
+  await until(() => terminalReady(reservation ? saved.name : "LongSaved"), "long saved session selected");
   const output = () => host.querySelector('.terminal-host').textContent;
+  const topRow = () => host.querySelector('.terminal-host .xterm-rows')?.firstElementChild;
   const control = (name) => [...host.querySelectorAll('.terminal-saved-bar button')].find((button) => button.textContent === name);
   const part = () => /Part (\d+) of (\d+)/.exec(host.querySelector('.terminal-saved-bar')?.textContent ?? "");
   await until(() => output().includes("LAST saved line"), "newest saved output shown");
   assert(part() && part()[1] === part()[2] && Number(part()[2]) > 1, "Long saved output is not paged");
   assert(control("Later output").getAttribute("aria-disabled") === "true", "The newest page offers later output");
+  if (reservation) {
+    assert(!control("Start new shell") && host.querySelector('.terminal-tab-close').disabled, "A recovery reservation offered relaunch or dismissal");
+    assert(host.querySelector('[role="tab"][aria-selected="true"]').getAttribute("aria-label").includes("ownership unverified"), "A reservation was labelled running or ended");
+  }
   for (let step = 0; step < 100 && control("Earlier output").getAttribute("aria-disabled") !== "true"; step += 1) {
     control("Earlier output").click();
     await settle();
   }
   assert(part()?.[1] === "1", "Paging did not reach the earliest saved output");
-  await until(() => output().includes("FIRST saved line"), "earliest saved line shown");
+  await until(() => topRow()?.textContent.startsWith("FIRST saved line"), "earliest saved line shown");
   assert(terminalStatusText().includes("part 1 of") && terminalStatusText().includes("the earliest"), "The earliest page was not announced");
+  // Pages requested before the previous one is written replace it whole.
+  flushSync(() => control("Later output").click());
+  flushSync(() => control("Earlier output").click());
+  await settle();
+  await until(() => part()?.[1] === "1" && topRow()?.textContent.startsWith("FIRST saved line"), "earliest page alone after Later then Earlier");
   control("Later output").click();
-  await until(() => part()?.[1] === "2", "later page shown");
+  await settle();
+  flushSync(() => control("Earlier output").click());
+  flushSync(() => control("Later output").click());
+  await settle();
+  await until(() => part()?.[1] === "2" && /^saved line \d+/.test(topRow()?.textContent ?? ""), "second page alone after Earlier then Later");
+  assert(topRow().querySelector("span")?.classList.contains("xterm-fg-1"), "The rendition set on an earlier page was lost at the next page start");
   assert(details === 1, `Paging re-read the session ${details} times`);
   assert(!sent.length && !errors.length, "Paging saved output sent a command or failed");
 }
@@ -6526,6 +6550,7 @@ try {
     ["terminal saved session sync", terminalSavedSessionSyncRegression, "coalesced restores, eviction, expiry and dismissing an expired session converge with the server"],
     ["terminal listing adds sessions", terminalListingAddsSessionsRegression, "a re-list adds new live sessions and late reservations without a remount"],
     ["terminal saved paging", terminalSavedPagingRegression, "all saved output beyond one view is reachable a page at a time, earliest first line shown"],
+    ["terminal reservation paging", () => terminalSavedPagingRegression(true), "a reservation's saved output is paged read-only to its first and last lines"],
     ["terminal close history failure", terminalCloseHistoryFailureRegression, "a close whose saved output cannot be deleted shows it ended and read-only"],
     ["terminal fenced saved session", terminalFencedSavedSessionRegression, "a saved status from the server wins over the page audit fence"],
     ["terminal selection during reconnect", terminalSelectionReconnectRegression, "selected terminal and output survive a reconnect while its buffer is pending"],

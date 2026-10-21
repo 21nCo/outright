@@ -5,7 +5,7 @@ import { ArrowsClockwise, Plus, TerminalWindow, X } from "@phosphor-icons/react"
 import "@xterm/xterm/css/xterm.css";
 import { Button } from "@/components/ui/button";
 import { domId, nextTabIndex } from "@/lib/accessibility";
-import { preferredTerminal, pruneExitedIds, savedOutputPages, terminalEndLabel, terminalTabLabel } from "@/lib/terminal-exit-state";
+import { preferredTerminal, pruneExitedIds, savedOutputPages, savedPageText, terminalEndLabel, terminalTabLabel } from "@/lib/terminal-exit-state";
 import { api } from "@/lib/runtime-api";
 
 const EMPTY_UNVERIFIED_IDS = new Set();
@@ -14,6 +14,10 @@ const NEW_SHELL_MARKER = "\x1b[90m[new shell started; the saved session was not 
 // double-width text wrapped at 20 columns fits this scrollback.
 const LIVE_SCROLLBACK = 5000;
 const SAVED_SCROLLBACK = 10_000;
+// Replacing the view is written as a full reset (RIS) in order with any
+// output still queued, so nothing written for an earlier view lands after it.
+const CLEAR_VIEW = "\x1bc";
+const RESERVATION_LABEL = "its prior-run owner is unverified and not attached";
 // One announcement per distinct storage condition for this page session.
 let announcedHistoryWarning = "";
 
@@ -181,7 +185,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       displayedCursorRef.current = 0;
       inputReadyRef.current = false;
       awaitingVisibleFitRef.current = false;
-      xtermRef.current?.reset();
+      xtermRef.current?.write(CLEAR_VIEW);
       setActiveId("");
     }
     setTerminals(guarded);
@@ -194,7 +198,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       displayedCursorRef.current = 0;
       inputReadyRef.current = false;
       awaitingVisibleFitRef.current = false;
-      xtermRef.current?.reset();
+      xtermRef.current?.write(CLEAR_VIEW);
       setActiveId(activeIdRef.current);
     } else if (selected) {
       const running = !exitedIdsRef.current.has(selected.id) && !unverifiedTerminalIdsRef.current.has(selected.id)
@@ -224,7 +228,9 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       if (status !== "ended" && (pending.unknown || unverifiedTerminalIdsRef.current.has(terminal.id))) status = "unknown";
       const xterm = xtermRef.current;
       const marker = Boolean(detail.relaunchedFrom ?? terminal.relaunchedFrom);
-      const savedLabel = status === "ended" ? terminalEndLabel(savedFields(detail, terminal)) : "";
+      // Saved output, ended or awaiting ownership proof, is shown read-only.
+      let savedLabel = status === "ended" ? terminalEndLabel(savedFields(detail, terminal)) : "";
+      if (detail.recoveryReservation) savedLabel = RESERVATION_LABEL;
       let displayedCursor = Number.isSafeInteger(detail.outputCursor) ? detail.outputCursor : 0;
       if (savedLabel) {
         const buffer = detail.buffer ?? "";
@@ -234,8 +240,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
         savedViewRef.current = null;
         setSavedPage(null);
         if (xterm) xterm.options.scrollback = LIVE_SCROLLBACK;
-        xterm?.reset();
-        if (marker) xterm?.write(NEW_SHELL_MARKER);
+        xterm?.write(marker ? CLEAR_VIEW + NEW_SHELL_MARKER : CLEAR_VIEW);
         if (detail.buffer) xterm?.write(detail.buffer);
         for (const { cursor, data } of pending.chunks) {
           if (!Number.isSafeInteger(detail.outputCursor) || !Number.isSafeInteger(cursor) || cursor > detail.outputCursor) xterm?.write(data);
@@ -247,7 +252,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
         if (pending.exit) exited = pending.exit;
         else if (status === "exited") exited = { exitCode: detail.exitCode };
       }
-      if (savedLabel) {
+      if (status === "ended") {
         inputReadyRef.current = false;
         awaitingVisibleFitRef.current = false;
         stageTerminals(terminalsRef.current.map((item) => item.id === terminal.id ? { ...item, ...savedFields(detail, item) } : item));
@@ -264,7 +269,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
         stageTerminals(terminalsRef.current.map((item) => item.id === terminal.id ? { ...item, status } : item));
       }
       let notice = "";
-      if (savedLabel) notice = `${detail.name ?? terminal.name} saved output, ${savedLabel}. Read-only.`;
+      if (status === "ended") notice = `${detail.name ?? terminal.name} saved output, ${savedLabel}. Read-only.`;
       else if (exited) notice = `${terminal.name} process exited ${exited.exitCode ?? "unknown"}`;
       else if (status === "unknown") notice = `${terminal.name} ownership is unverified. Inspect local terminal recovery.`;
       setExitNotice(notice);
@@ -277,28 +282,29 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     }
   }
 
-  // Each page is written alone. An earlier page opens at its first line; the
-  // newest ends with the saved label.
+  // Each page replaces the view in one ordered write, with its rendition
+  // carried in. An earlier page opens at its first line; the newest ends with
+  // the saved label.
   function showSavedPage(index) {
     const view = savedViewRef.current;
     const xterm = xtermRef.current;
     if (!view) return;
-    const [start, end] = view.pages[index] ?? [0, 0];
     const newest = index >= view.pages.length - 1;
+    const generation = (view.generation ?? 0) + 1;
+    Object.assign(view, { shown: index, generation });
     if (xterm) xterm.options.scrollback = SAVED_SCROLLBACK;
-    xterm?.reset();
-    if (view.marker && index <= 0) xterm?.write(NEW_SHELL_MARKER);
-    view.shown = index;
-    const opened = () => { if (!newest && savedViewRef.current === view && view.shown === index) xterm.scrollToTop(); };
-    xterm?.write(view.buffer.slice(start, end), opened);
-    if (newest) xterm?.writeln(`\r\n\x1b[90m[saved output; ${view.label}]\x1b[0m`);
+    const marker = view.marker && index <= 0 ? NEW_SHELL_MARKER : "";
+    const label = newest ? `\x1b[0m\r\n\x1b[90m[saved output; ${view.label}]\x1b[0m\r\n` : "";
+    const opened = () => { if (!newest && savedViewRef.current === view && view.generation === generation) xterm.scrollToTop(); };
+    xterm?.write(CLEAR_VIEW + marker + savedPageText(view.buffer, view.pages[index] ?? [0, 0]) + label, opened);
     setSavedPage({ id: view.id, index, count: view.pages.length });
   }
 
+  // Navigation steps from the page last requested, not the last rendered.
   function pageSavedOutput(step) {
     const view = savedViewRef.current;
-    if (loading || !view || view.id !== activeIdRef.current || !savedPage) return;
-    const index = savedPage.index + step;
+    if (loading || !view || view.id !== activeIdRef.current) return;
+    const index = view.shown + step;
     if (index < 0 || index >= view.pages.length) return;
     showSavedPage(index);
     const name = terminalsRef.current.find((item) => item.id === view.id)?.name ?? "Terminal";
@@ -610,7 +616,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
   }
 
   const activeTerminal = terminals.find((terminal) => terminal.id === activeId);
-  const activeSaved = activeTerminal?.status === "ended" ? activeTerminal : null;
+  const activeSaved = activeTerminal?.status === "ended" || activeTerminal?.recoveryReservation ? activeTerminal : null;
 
   return <section className="terminal-pane" aria-label="Worktree terminals">
     <p className="sr-only" id="terminal-help">Terminal input and output. Use the left and right arrow keys on a terminal tab to switch sessions.</p>
@@ -620,13 +626,13 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       {loading && <span className="terminal-loading" role="status"><ArrowsClockwise className="spin" />Loading terminal</span>}
     </header>
     {activeSaved && <div className="terminal-saved-bar" role="group" aria-label="Saved terminal session">
-      <span>Saved output, read-only: {terminalEndLabel(activeSaved)}.</span>
+      <span>Saved output, read-only: {activeSaved.status === "ended" ? terminalEndLabel(activeSaved) : RESERVATION_LABEL}.</span>
       {savedPage?.id === activeSaved.id && savedPage.count > 1 && <>
         <Button variant="ghost" size="xs" aria-disabled={loading || savedPage.index === 0 || undefined} onClick={() => pageSavedOutput(-1)}>Earlier output</Button>
         <span>Part {savedPage.index + 1} of {savedPage.count}</span>
         <Button variant="ghost" size="xs" aria-disabled={loading || savedPage.index === savedPage.count - 1 || undefined} onClick={() => pageSavedOutput(1)}>Later output</Button>
       </>}
-      <Button variant="outline" size="xs" aria-disabled={loading || undefined} onClick={() => startNewShell(activeSaved)}>Start new shell</Button>
+      {activeSaved.status === "ended" && <Button variant="outline" size="xs" aria-disabled={loading || undefined} onClick={() => startNewShell(activeSaved)}>Start new shell</Button>}
     </div>}
     <div className="terminal-host" id="terminal-panel" ref={hostRef} role="tabpanel" aria-label="Active terminal output" aria-labelledby={activeId ? domId("terminal-tab", activeId) : undefined} aria-describedby="terminal-help" />
     <span className="sr-only" role="status">{exitNotice}</span>

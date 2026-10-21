@@ -913,6 +913,37 @@ test("a restored session serves all of its saved output, beyond the live tail an
   await second.manager.shutdown();
 });
 
+test("a recovery reservation and an audit-pending session serve all saved output and stay recovery-only", async (t) => {
+  const { directory } = workspace(t);
+  const seed = openTerminalHistory({ directory });
+  const lines = Array.from({ length: 12_000 }, (_, index) => `saved line ${index}\n`);
+  const reserved = begin(seed);
+  const pending = begin(seed);
+  for (const id of [reserved, pending]) {
+    for (let index = 0; index < lines.length; index += 1000) seed.append(id, lines.slice(index, index + 1000).join(""));
+    seed.finish(id);
+  }
+  seed.close();
+  let reservations = [{ target: reserved, cwd: "/work/tree", pid: 4242 }];
+  let scanning = true;
+  const database = { ...fakeDatabase(), get terminalAuditScanPending() { return scanning; }, terminalUnknownReservations: () => reservations,
+    resolveTerminalUnknown: () => { reservations = []; } };
+  const terminals = createTerminalManager({ database, publish: () => {}, history: openTerminalHistory({ directory }),
+    recoverTerminal: async () => true, cleanupSocket: () => {} });
+  terminals.reloadUnknownReservations();
+  assert.ok(lines.join("").length > 150_000 && lines.length > 5000);
+  for (const id of [reserved, pending]) {
+    const detail = terminals.get(id);
+    assert.deepEqual([detail.status, detail.recoveryReservation], ["unknown", true], "unproven saved output was shown as running or ended");
+    assert.equal(detail.buffer, lines.join(""), "saved output awaiting proof was cut to the live tail");
+  }
+  scanning = false;
+  assert.equal(await terminals.reconcileUnknown(), 1);
+  terminals.reloadUnknownReservations();
+  for (const id of [reserved, pending]) assert.deepEqual([terminals.get(id).status, terminals.get(id).buffer], ["ended", lines.join("")]);
+  await terminals.shutdown();
+});
+
 test("an exit observed before shutdown is restored with its status, never as ended by restart", async (t) => {
   for (const settle of ["held", "failed"]) {
     const { directory } = workspace(t);
