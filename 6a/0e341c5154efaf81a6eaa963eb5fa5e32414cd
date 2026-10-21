@@ -1,0 +1,37 @@
+tests/ui-races.jsx
+  s_92427ff18a8304::t_42b592e1aea4cc 2333-2451,6308-6309
+server/terminal-manager.mjs
+  s_92427ff18a8304::t_7d64325f21094e 21,32-34,100-101,135-146,320,325-329,340-343,379-381,398,400-402,429-433,477,480
+src/App.jsx
+  s_92427ff18a8304::t_71d2c67c17a900 655
+server/terminal-history.mjs
+  s_92427ff18a8304::t_caa620f4353503 11-13,23,115-116,127-128,130,140-141,150-151,157,180,187,195,200-203,221-222,224-229,233,239-248,257-258,260,263,312-315,347-349,365-369,380,397,403,414,420,427-428,432-433,446-447,451-457
+server/outright-runtime.mjs
+  s_92427ff18a8304::t_6659a2d7905771 1011
+src/lib/terminal-exit-state.js
+  s_92427ff18a8304::t_62ee65b3e08ddd 14
+server/terminal-history.test.mjs
+  s_92427ff18a8304::t_79d9283c47699a 101,137-163,185-233,344-399,411-412,426-428,444-445,455-456
+tests/terminal-exit-state.test.mjs
+  s_92427ff18a8304::t_5d4dc201aa961a 42
+src/components/TerminalPane.jsx
+  s_92427ff18a8304::t_3f1998f278a719 20-21,27-30,222,227,241,262,321-333,350,393-394,396,399,405,409,412-421,516
+tests/ui-races.test.mjs
+  s_92427ff18a8304::t_93f7eecbc56541 917
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6a0e341c5154efaf81a6eaa963eb5fa5e32414cd",
+  "prompts": {},
+  "sessions": {
+    "s_92427ff18a8304": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26336501-b0e6-4534-a7c2-345f5528a4ba",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
