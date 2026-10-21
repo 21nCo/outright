@@ -239,7 +239,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       } else {
         savedViewRef.current = null;
         setSavedPage(null);
-        if (xterm) xterm.options.scrollback = LIVE_SCROLLBACK;
+        if (xterm) Object.assign(xterm.options, { scrollback: LIVE_SCROLLBACK, scrollOnEraseInDisplay: false });
         xterm?.write(marker ? CLEAR_VIEW + NEW_SHELL_MARKER : CLEAR_VIEW);
         if (detail.buffer) xterm?.write(detail.buffer);
         for (const { cursor, data } of pending.chunks) {
@@ -292,7 +292,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     const newest = index >= view.pages.length - 1;
     const generation = (view.generation ?? 0) + 1;
     Object.assign(view, { shown: index, generation });
-    if (xterm) xterm.options.scrollback = SAVED_SCROLLBACK;
+    // A screen erase in saved output scrolls it up instead of deleting it.
+    if (xterm) Object.assign(xterm.options, { scrollback: SAVED_SCROLLBACK, scrollOnEraseInDisplay: true });
     const marker = view.marker && index <= 0 ? NEW_SHELL_MARKER : "";
     const label = newest ? `\x1b[0m\r\n\x1b[90m[saved output; ${view.label}]\x1b[0m\r\n` : "";
     const opened = () => { if (!newest && savedViewRef.current === view && view.generation === generation) xterm.scrollToTop(); };

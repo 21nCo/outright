@@ -2347,20 +2347,26 @@ async function terminalSavedSessionRegression() {
   const deletes = [];
   let failPost = true;
   let listed = [exited, restarted];
+  let listings = 0;
+  const relaunched = { id: "term-N", name: "Server", cwd: "/fixture/A", pid: 4100, status: "running", relaunchedFrom: "term-S", createdAt: "2026-10-21T02:00:00.000Z" };
   route = async (url, options) => {
     if (url.pathname === "/api/terminals" && options.method === "POST") {
       posts.push(JSON.parse(options.body));
       if (failPost) return response({ error: "Terminal capacity is full" }, 429);
-      return response({ id: "term-N", name: "Server", cwd: "/fixture/A", pid: 4100, status: "running", relaunchedFrom: "term-S", createdAt: "2026-10-21T02:00:00.000Z" }, 201);
+      listed = [...listed, relaunched];
+      return response(relaunched, 201);
     }
-    if (url.pathname === "/api/terminals") return response({ terminals: listed, history: { persistent: true, warning: null } });
+    if (url.pathname === "/api/terminals") { listings += 1; return response({ terminals: listed, history: { persistent: true, warning: null } }); }
     if (options.method === "DELETE") { deletes.push(url.pathname); listed = listed.filter((item) => !url.pathname.endsWith(item.id)); return response({}); }
+    if (url.pathname.endsWith(relaunched.id)) return response({ ...relaunched, buffer: "$ ", outputCursor: 1 });
     const item = listed.find((entry) => url.pathname.endsWith(entry.id));
-    if (item) return response({ ...item, buffer: `${item.name} saved line\r\n`, outputCursor: 0 });
-    return response({ id: "term-N", status: "running", relaunchedFrom: "term-S", buffer: "$ ", outputCursor: 1 });
+    return response({ ...item, buffer: `${item.name} saved line\r\n`, outputCursor: 0 });
   };
-  root.render(<div className="fixture-terminal-frame" style={{ width: 360, height: 420 }}><TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null}
-    onError={(error) => errors.push(error)} sendRuntime={(message) => sent.push(message)} /></div>);
+  const onError = (error) => errors.push(error);
+  const sendRuntime = (message) => sent.push(message);
+  const show = (version = 0) => root.render(<div className="fixture-terminal-frame" style={{ width: 360, height: 420 }}><TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null}
+    terminalsVersion={version} onError={onError} sendRuntime={sendRuntime} /></div>);
+  show();
   await until(() => terminalReady("ServerSaved"), "newest saved session selected without starting a shell");
   const bar = () => host.querySelector('.terminal-saved-bar');
   assert(bar()?.textContent.includes("Saved output, read-only: ended when Outright restarted."), "Restart-ended session lacks its saved label");
@@ -2397,8 +2403,15 @@ async function terminalSavedSessionRegression() {
   assert(host.querySelector('#terminal-tab-term-N').getAttribute("aria-label") === "Server, new shell", "New shell tab is not labelled as new");
   assert(host.querySelector('#terminal-tab-term-S')?.getAttribute("aria-label").includes("saved output"), "Relaunch replaced the saved session tab");
   assert(!bar(), "The saved bar remained over a running shell");
-  assert(host.querySelector('.terminal-host').textContent.includes("new shell started; the saved session was not resumed"), "New shell lacks its visible marker");
+  // xterm parses and paints its writes after the tab settles; nothing later
+  // may reset the view while the new shell stays selected.
+  const markerShown = () => host.querySelector('.terminal-host').textContent.includes("new shell started; the saved session was not resumed");
+  await until(markerShown, "new shell marker rendered");
   await until(() => terminalStatusText().includes("Server new shell started; the saved session was not resumed"), "new shell announcement");
+  const listingsBeforeSync = listings;
+  show(1);
+  await until(() => listings > listingsBeforeSync && host.querySelector('.terminal-tabs[aria-busy="false"]'), "listing sync after relaunch");
+  await remainsTrue(() => markerShown() && terminalReady("ServerNew shell"), 150, "A listing sync erased the new shell marker");
 
   const dismiss = host.querySelector('[aria-label="Dismiss saved terminal Build"]');
   assert(dismiss && !dismiss.disabled, "Saved session cannot be dismissed");
@@ -2566,8 +2579,11 @@ async function terminalSavedPagingRegression(reservation = false) {
   await settle();
   const lines = Array.from({ length: 30_000 }, (_, index) => `saved line ${index}\r\n`);
   lines[0] = "FIRST saved line\r\n";
+  // A full-screen program ended by a full reset: the output before and after
+  // it stays readable, the program's screen does not.
+  lines[1] = "BEFORE reset line\x1b[?1049hFULLSCREEN\x1bcAFTER reset line\r\n";
   // A rendition set on the first page and never reset is in effect on every later page.
-  lines[1] = "\x1b[31mRED saved line\r\n";
+  lines[2] = "\x1b[31mRED saved line\r\n";
   lines[lines.length - 1] = "LAST saved line\r\n";
   const saved = reservation
     ? { id: "term-L", name: "Terminal recovery required", cwd: "/fixture/A", pid: 4242, status: "unknown", createdAt: null, recoveryReservation: true }
@@ -2600,6 +2616,9 @@ async function terminalSavedPagingRegression(reservation = false) {
   }
   assert(part()?.[1] === "1", "Paging did not reach the earliest saved output");
   await until(() => topRow()?.textContent.startsWith("FIRST saved line"), "earliest saved line shown");
+  const shownRows = host.querySelector('.terminal-host .xterm-rows').textContent;
+  assert(shownRows.includes("BEFORE reset line") && shownRows.includes("AFTER reset line") && !shownRows.includes("FULLSCREEN"),
+    "A full reset after a full-screen program hid or erased saved output");
   assert(terminalStatusText().includes("part 1 of") && terminalStatusText().includes("the earliest"), "The earliest page was not announced");
   // Pages requested before the previous one is written replace it whole.
   flushSync(() => control("Later output").click());

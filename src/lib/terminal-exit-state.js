@@ -37,12 +37,57 @@ export function preferredTerminal(terminals, previousId = "") {
   return saved;
 }
 
-// An escape sequence: CSI, a string (OSC, DCS, SOS, PM, APC) ended by BEL, ST
-// or the next ESC, or a short ESC form. A trailing lone ESC is one too.
-const ESCAPE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|[\]PX^_][^\x07\x1b]*(?:\x07|\x1b\\)?|[ -/]*[0-~]|$)/g;
+const ESC = "\u001b";
+const STRING_INTRODUCERS = new Set(["]", "P", "X", "^", "_"]);
+const FULL_RESET = `${ESC}c`;
+const CLEAR_SCROLLBACK = `${ESC}[3J`;
+// A full reset in saved output clears the screen, which the read-only view
+// scrolls into its scrollback, so the output before it stays readable.
+const RESET_VIEW = `${ESC}[0m${ESC}[H${ESC}[2J`;
 const ALT_SCREEN_MODES = new Set(["47", "1047", "1049"]);
 const SGR_OFF = { 22: ["1", "2"], 23: ["3"], 24: ["4"], 25: ["5"], 27: ["7"], 28: ["8"], 29: ["9"], 39: ["fg"], 49: ["bg"], 55: ["53"], 59: ["ul"] };
 const SGR_COLOR = { 38: "fg", 48: "bg", 58: "ul" };
+
+const inRange = (code, low, high) => code >= low && code <= high;
+
+// The end of the escape sequence at index: a CSI, a string (OSC, DCS, SOS,
+// PM, APC) ended by BEL, ST or the next ESC, a short ESC form, or a lone ESC
+// that ends the output. -1 when this ESC starts none of them.
+function escapeEnd(buffer, index) {
+  const next = index + 1;
+  if (next === buffer.length) return next;
+  const lead = buffer[next];
+  if (lead === "[") {
+    let at = next + 1;
+    while (inRange(buffer.codePointAt(at), 0x30, 0x3f)) at += 1;
+    while (inRange(buffer.codePointAt(at), 0x20, 0x2f)) at += 1;
+    // An unfinished CSI is the short form ESC [.
+    return inRange(buffer.codePointAt(at), 0x40, 0x7e) ? at + 1 : next + 1;
+  }
+  if (STRING_INTRODUCERS.has(lead)) {
+    for (let at = next + 1; at < buffer.length; at += 1) {
+      const code = buffer.codePointAt(at);
+      if (code === 0x07) return at + 1;
+      if (code === 0x1b) return buffer[at + 1] === "\\" ? at + 2 : at;
+    }
+    return buffer.length;
+  }
+  let at = next;
+  while (inRange(buffer.codePointAt(at), 0x20, 0x2f)) at += 1;
+  return inRange(buffer.codePointAt(at), 0x30, 0x7e) ? at + 1 : -1;
+}
+
+// Every escape sequence in buffer as [start, end, ...], in order. Page
+// boundaries and the read-only projection both read this one tokenizer.
+export function escapeSpans(buffer) {
+  const spans = [];
+  for (let index = buffer.indexOf(ESC); index >= 0;) {
+    const end = escapeEnd(buffer, index);
+    if (end > index) spans.push(index, end);
+    index = buffer.indexOf(ESC, Math.max(end, index + 1));
+  }
+  return spans;
+}
 
 function applySgr(state, params) {
   const list = params ? params.split(";") : ["0"];
@@ -62,12 +107,20 @@ function applySgr(state, params) {
   }
 }
 
-// Follows the rendition and screen a sequence leaves in effect. The
-// alternate screen with mode 1049 restores the rendition it saved.
+const freshContext = () => ({ state: new Map(), saved: null, alternate: false });
+const copyContext = ({ state, saved, alternate }) => ({ state: new Map(state), saved: saved && new Map(saved), alternate });
+const sgr = (rendition) => rendition.size ? `${ESC}[${[...rendition.values()].join(";")}m` : "";
+
+// Follows the rendition and screen a sequence leaves in effect, and says
+// whether it reset the terminal or switched screens. The alternate screen
+// with mode 1049 restores the rendition it saved.
 function trackSequence(context, sequence) {
-  if (sequence === "\x1bc") Object.assign(context, { state: new Map(), saved: null, alternate: false });
-  const csi = /^\x1b\[(\??)([0-9:;]*)([hlm])$/.exec(sequence);
-  if (!csi) return;
+  if (sequence === FULL_RESET) {
+    Object.assign(context, freshContext());
+    return "reset";
+  }
+  const csi = sequence[1] === "[" && /^(\??)([0-9:;]*)([hlm])$/.exec(sequence.slice(2));
+  if (!csi) return "";
   const modes = csi[2].split(";");
   if (!csi[1] && csi[3] === "m") applySgr(context.state, csi[2]);
   else if (csi[1] && csi[3] !== "m" && modes.some((mode) => ALT_SCREEN_MODES.has(mode))) {
@@ -75,7 +128,9 @@ function trackSequence(context, sequence) {
     if (modes.includes("1049") && enter) context.saved = new Map(context.state);
     else if (modes.includes("1049") && context.saved) Object.assign(context, { state: context.saved, saved: null });
     context.alternate = enter;
+    return "screen";
   }
+  return "";
 }
 
 // A page boundary inside an escape sequence moves past it, or to its start
@@ -93,63 +148,79 @@ function outsideEscape(spans, index, end) {
   return spans[span + 1] < end ? spans[span + 1] : spans[span];
 }
 
+// The start of the page that ends at end: at most maxLines line breaks and
+// maxChars characters, on a line boundary where one exists, never inside a
+// surrogate pair.
+function pageStart(buffer, end, maxChars, maxLines) {
+  const floor = Math.max(0, end - maxChars);
+  let start = floor;
+  let lines = 0;
+  for (let index = buffer.lastIndexOf("\n", end - 1); index >= floor; index = buffer.lastIndexOf("\n", index - 1)) {
+    lines += 1;
+    if (lines > maxLines) { start = index + 1; break; }
+    if (index === 0) break;
+  }
+  if (start === floor && start > 0) {
+    const lineStart = buffer.indexOf("\n", start) + 1;
+    if (lineStart > 0 && lineStart < end) start = lineStart;
+  }
+  const code = buffer.codePointAt(start);
+  if (start > 0 && start < end - 1 && code >= 0xdc00 && code <= 0xdfff) start += 1;
+  return start;
+}
+
 // Saved output can hold up to the 2 MiB history cap, more than one terminal
 // view keeps. It is shown in pages, newest last, each small enough that its
-// first line stays in the view's scrollback: at most maxLines line breaks and
-// maxChars characters, starting on a line boundary where one exists and never
-// inside an escape sequence. Each page is [start, end, prefix, alternate]:
-// the rendition and screen the output before it leaves in effect.
+// first line stays in the view's scrollback, and never starting inside an
+// escape sequence. Each page is [start, end, prefix, alternate, context]: the
+// rendition, screen and parser context the output before it leaves in effect.
 export function savedOutputPages(buffer, maxChars = 64_000, maxLines = 2_000) {
-  const spans = [];
-  for (const match of buffer.matchAll(ESCAPE)) spans.push(match.index, match.index + match[0].length);
+  const spans = escapeSpans(buffer);
   const pages = [];
-  let end = buffer.length;
-  while (end > 0) {
-    const floor = Math.max(0, end - maxChars);
-    let start = floor;
-    let lines = 0;
-    for (let index = buffer.lastIndexOf("\n", end - 1); index >= floor; index = buffer.lastIndexOf("\n", index - 1)) {
-      lines += 1;
-      if (lines > maxLines) { start = index + 1; break; }
-      if (index === 0) break;
-    }
-    if (start === floor && start > 0) {
-      const lineStart = buffer.indexOf("\n", start) + 1;
-      if (lineStart > 0 && lineStart < end) start = lineStart;
-    }
-    // Never split a surrogate pair.
-    const code = buffer.charCodeAt(start);
-    if (start > 0 && start < end - 1 && code >= 0xdc00 && code <= 0xdfff) start += 1;
-    start = outsideEscape(spans, start, end);
+  for (let end = buffer.length; end > 0;) {
+    const start = outsideEscape(spans, pageStart(buffer, end, maxChars, maxLines), end);
     pages.push([start, end]);
     end = start;
   }
   pages.reverse();
-  const context = { state: new Map(), saved: null, alternate: false };
+  const context = freshContext();
   let span = 0;
   for (const page of pages) {
     for (; span < spans.length && spans[span] < page[0]; span += 2) trackSequence(context, buffer.slice(spans[span], spans[span + 1]));
-    const rendition = context.alternate && context.saved ? context.saved : context.state;
-    page.push(rendition.size ? `\x1b[${[...rendition.values()].join(";")}m` : "", context.alternate);
+    page.push(sgr(context.alternate && context.saved ? context.saved : context.state), context.alternate, copyContext(context));
   }
   return pages;
 }
 
-// The text a read-only page writes. A full-screen program's alternate screen
-// is left out, as it is from a terminal once the program exits; output it
-// would erase from the scrollback, or a full reset, stays readable.
-export function savedPageText(buffer, [start, end, prefix = "", alternate = false]) {
+// What a sequence writes to the read-only view. Screen switches are dropped;
+// leaving the alternate screen restores the rendition now in effect.
+function viewSequence(sequence, kind, hidden, context) {
+  if (kind === "reset") return RESET_VIEW;
+  if (kind === "screen") return hidden && !context.alternate ? `${ESC}[0m${sgr(context.state)}` : "";
+  return hidden || sequence === CLEAR_SCROLLBACK ? "" : sequence;
+}
+
+// The normal-screen output a page leaves readable, and the screen it ends on.
+// A full-screen program's alternate screen is left out, as it is from a
+// terminal once the program exits; it ends at a screen switch or full reset.
+export function savedPageProjection(buffer, [start, end, , alternate = false, entry = null]) {
+  const page = buffer.slice(start, end);
+  const context = entry ? copyContext(entry) : { ...freshContext(), alternate };
+  const spans = escapeSpans(page);
   let text = "";
-  let from = start;
-  let hidden = alternate;
-  const toggle = /\x1b\[\?([0-9;]*)([hl])/g;
-  toggle.lastIndex = start;
-  for (let match = toggle.exec(buffer); match && match.index < end; match = toggle.exec(buffer)) {
-    if (!match[1].split(";").some((mode) => ALT_SCREEN_MODES.has(mode))) continue;
-    if (!hidden) text += buffer.slice(from, match.index);
-    hidden = match[2] === "h";
-    from = match.index + match[0].length;
+  let from = 0;
+  for (let index = 0; index < spans.length; index += 2) {
+    if (!context.alternate) text += page.slice(from, spans[index]);
+    const sequence = page.slice(spans[index], spans[index + 1]);
+    const hidden = context.alternate;
+    text += viewSequence(sequence, trackSequence(context, sequence), hidden, context);
+    from = spans[index + 1];
   }
-  if (!hidden) text += buffer.slice(from, end);
-  return prefix + text.replaceAll("\x1b[3J", "").replaceAll("\x1bc", "\x1b[0m\x1b[H\x1b[2J");
+  if (!context.alternate) text += page.slice(from);
+  return { text, alternate: context.alternate };
+}
+
+// The text a read-only page writes, its rendition carried in.
+export function savedPageText(buffer, page) {
+  return (page[2] ?? "") + savedPageProjection(buffer, page).text;
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabLabel, savedOutputPages, savedPageText } from "../src/lib/terminal-exit-state.js";
+import { escapeSpans, preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabLabel, savedOutputPages, savedPageProjection, savedPageText } from "../src/lib/terminal-exit-state.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
 
 test("audit failure fences terminal commands before a later runtime event or React commit", () => {
@@ -102,4 +102,71 @@ test("saved output pages never split an escape sequence and carry the rendition 
   assert.ok(text.includes("before") && text.includes("after") && !/FULLSCREEN|frame|\x1b\[\?1049|\x1b\[3J/.test(text), "alternate-screen output or a scrollback erase reached the saved view");
   assert.equal(savedPageText("a\x1bcb", [0, 4]), "a\x1b[0m\x1b[H\x1b[2Jb", "a full reset inside saved output cleared the view's scrollback");
   function pages(buffer) { return savedOutputPages(buffer).map((page) => savedPageText(buffer, page)); }
+});
+
+test("one escape tokenizer finds every sequence class the saved view knows", () => {
+  // Each case's spans are those the round-2 regular expression found.
+  const osc = `\x1b]52;c;${"Q".repeat(70_000)}\x07`;
+  const cases = [
+    ["a\x1b[1;38;5;196mb", [1, 14]],
+    ["\x1b[?1049h\x1b[2 q", [0, 8, 8, 13]],
+    ["\x1b]0;title\x07x\x1b]8;;u\x1b\\y", [0, 10, 11, 19]],
+    ["\x1bP1$r\x1b\\\x1b_apc", [0, 7, 7, 12]],
+    ["\x1b]open\x1bcz", [0, 6, 6, 8]],
+    ["\x1bc\x1b(B\x1b7\x1b=", [0, 2, 2, 5, 5, 7, 7, 9]],
+    ["\x1b[12\x01", [0, 2]],
+    ["\x1b\x01\x1b \x01x\x1b", [6, 7]],
+    [`x${osc}y`, [1, 1 + osc.length]],
+    [`x\x1b]52;c;${"Q".repeat(70_000)}`, [1, 70_008]],
+  ];
+  for (const [buffer, spans] of cases) assert.deepEqual(escapeSpans(buffer), spans, JSON.stringify(buffer.slice(0, 40)));
+});
+
+test("a full reset ends a full-screen program's hidden screen in the saved view", () => {
+  const text = savedPageText("a\x1b[?1049hX\x1bcb", [0, 15]);
+  assert.ok(text.includes("b") && !text.includes("X"), JSON.stringify(text));
+  const probe = "before\r\n\x1b[?1049hFULLSCREEN\x1bcnormal-after-reset\r\nmore\r\n";
+  const shown = savedOutputPages(probe).map((page) => savedPageText(probe, page)).join("");
+  assert.ok(shown.includes("before") && shown.includes("normal-after-reset") && shown.includes("more") && !shown.includes("FULLSCREEN"));
+  const app = `before\n\x1b[?1049h${"frame\n".repeat(2_500)}\x1bcnormal after\n`;
+  const pages = savedOutputPages(app);
+  const opened = pages.findIndex((page) => page[3]);
+  assert.ok(opened > 0, "no page opened inside the alternate screen");
+  assert.match(savedPageText(app, pages[opened]), /normal after/, "a page opened inside the alternate screen hid output after a full reset");
+});
+
+test("saved pages project a generated stream exactly as one continuous view", () => {
+  let seed = 7;
+  const random = (count) => { seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648; return seed % count; };
+  for (let round = 0; round < 300; round += 1) {
+    // The generator is the oracle: it knows which output a full-screen
+    // program owns (H) and which the normal screen keeps (V).
+    let alternate = false;
+    let buffer = "";
+    const visible = [];
+    for (let step = 0; step < 60; step += 1) {
+      const choice = random(9);
+      if (choice === 0) { buffer += `\x1b[?${["47", "1047", "1049"][random(3)]}h`; alternate = true; }
+      else if (choice === 1) { buffer += `\x1b[?${["47", "1047", "1049"][random(3)]}l`; alternate = false; }
+      else if (choice === 2) { buffer += "\x1bc"; alternate = false; }
+      else if (choice === 3) buffer += ["\x1b[31m", "\x1b[0m", "\x1b]0;t\x07", "\x1b[3J"][random(4)];
+      else {
+        const token = `${alternate ? "H" : "V"}${step}.${round}${random(2) ? "\n" : " "}`;
+        if (!alternate) visible.push(token.trim());
+        buffer += token;
+      }
+    }
+    const pages = savedOutputPages(buffer, 1 + random(40), 1 + random(4));
+    const projections = pages.map((page) => savedPageProjection(buffer, page));
+    projections.slice(0, -1).forEach((projection, index) => assert.equal(projection.alternate, pages[index + 1][3], `round ${round}: page ${index} ends on another screen than the next starts`));
+    const joined = projections.map((projection) => projection.text).join("");
+    assert.equal(joined, savedPageProjection(buffer, [0, buffer.length]).text, `round ${round}: pages differ from one continuous projection`);
+    const plain = joined.replace(/\[[0-9;]*[mHJ]|\]0;t/g, " ");
+    assert.ok(!/H\d/.test(plain), `round ${round}: full-screen output reached the saved view`);
+    let at = 0;
+    for (const token of visible) {
+      at = plain.indexOf(token, at);
+      assert.ok(at >= 0, `round ${round}: kept output ${token} is missing`);
+    }
+  }
 });
