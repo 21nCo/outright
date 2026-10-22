@@ -1,0 +1,21 @@
+server/agent-supervisor-darwin.c
+  s_ca04ce1390fa9e::t_bc1a62ef7fb7df 1058,1072-1073,1075,1137-1143
+server/agent-supervisor-darwin.test.mjs
+  s_ca04ce1390fa9e::t_4d4a6f2e5b5193 37-39,44-46,183-200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "80b4bb4a965cd71f80d0663b0129230084a94ac3",
+  "prompts": {},
+  "sessions": {
+    "s_ca04ce1390fa9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_ca04ce1390fa9e",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
