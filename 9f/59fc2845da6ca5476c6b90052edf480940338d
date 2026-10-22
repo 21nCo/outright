@@ -1,0 +1,29 @@
+server/managed-terminal.mjs
+  s_0d12e45fa9d89b::t_091c36b9b30c7d 9,373-380,392-393,396-398,401,405-408,411-417,429-430,434-438,442-452,466-469,475,483
+server/terminal-broker.mjs
+  s_0d12e45fa9d89b::t_60716f94489dff 6,9,112,255-260,262-272
+server/terminal-broker.test.mjs
+  s_0d12e45fa9d89b::t_24c1796fe78496 11,544,546-547,551-562,566,580,599,601-607,613,615,618-619,621,627,629-631,642,653
+server/terminal-manager.mjs
+  s_0d12e45fa9d89b::t_105844b48f9a18 133-136,165,168-169,171
+server/terminal-manager.test.mjs
+  s_0d12e45fa9d89b::t_6f4d9097a63d8d 4-6,1399-1400,1402-1408,1440,1448,1501-1503,1509-1510,1516,1560-1702
+server/terminal-reattach-proof.mjs
+  s_0d12e45fa9d89b::t_af997bda9fdcb9 1-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9f59fc2845da6ca5476c6b90052edf480940338d",
+  "prompts": {},
+  "sessions": {
+    "s_0d12e45fa9d89b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_0d12e45fa9d89b",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
