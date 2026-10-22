@@ -3061,6 +3061,77 @@ async function terminalReattachAfterConnectRegression() {
   assert(commands.includes("terminal.input") && commands.includes("terminal.resize"), `Reattached terminal dropped input or resize: ${commands}`);
 }
 
+// The new runtime's listing can already show the reattach while the page
+// still holds the fence, so the pane stores the tab as unknown. When the
+// fence lifts, the tab follows the server again without a reload.
+async function terminalReattachListedBeforeReleaseRegression() {
+  root.render(null);
+  await settle();
+  const sent = [];
+  const fence = createTerminalCommandFence();
+  const base = { id: "term-Z", name: "Queue", cwd: "/fixture/A", pid: 4600, createdAt: "2026-10-21T00:00:00.000Z" };
+  let listed = [{ ...base, status: "running" }];
+  let version = 0;
+  let paneEvent = null;
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") return response({ error: "unexpected" }, 500);
+    if (url.pathname === "/api/terminals") return response({ terminals: listed, history: { persistent: true, warning: null } });
+    return response({ ...listed[0], buffer: "kept running\r\n", outputCursor: 1 });
+  };
+  const show = (event) => {
+    fence.observe(event);
+    if (["terminals.changed", "terminal.history"].includes(event.type)) version += 1;
+    if (["terminal.audit-failed", "runtime.connected", "capacity.changed"].includes(event.type)) paneEvent = event;
+    root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={paneEvent} terminalsVersion={version}
+      unverifiedTerminalIds={fence.snapshot()} onError={(error) => { throw error; }}
+      sendRuntime={(message) => { if (fence.allows(message)) sent.push(message); }} />);
+  };
+  const tabLabel = () => host.querySelector('#terminal-tab-term-Z')?.getAttribute("aria-label") ?? "";
+  const typeAndResize = async (width) => {
+    const before = sent.length;
+    const input = host.querySelector('.terminal-host .xterm-helper-textarea');
+    input.focus();
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "z", code: "KeyZ", keyCode: 90, which: 90, bubbles: true, cancelable: true }));
+    host.querySelector('.terminal-host').style.width = width;
+    await settle();
+    return sent.slice(before).filter((message) => message.terminalId === "term-Z").map((message) => message.type);
+  };
+  show({ type: "runtime.connected", payload: { runtimeInstanceId: "runtime-A", terminals: listed, replay: { requestedAfter: 0 } } });
+  await until(() => terminalReady("Queue"), "live terminal ready");
+  show({ type: "terminal.audit-failed", terminalId: "term-Z", payload: { runtimeInstanceId: "runtime-A" } });
+  await until(() => tabLabel().includes("ownership unverified"), "audit failure fences the terminal");
+  listed = [{ ...base, status: "unknown", recoveryReservation: true }];
+  show({ type: "runtime.connected", payload: { runtimeInstanceId: "runtime-B", restarted: true, terminals: listed, replay: { requestedAfter: 5, missed: true } } });
+  await settle();
+  await until(() => host.querySelector('.terminal-tabs[aria-busy="false"]') && tabLabel().includes("ownership unverified"), "the reservation is shown");
+
+  // B's listing and detail report the reattach before its event arrives.
+  listed = [{ ...base, status: "running", reattached: true }];
+  show({ type: "terminals.changed" });
+  await settle();
+  await until(() => terminalReady("Queue") && tabLabel() === "Queue, ownership unverified", "the reattach listed while fenced stays unverified");
+  assert(fence.snapshot().has("term-Z"), "A listing lifted the fence");
+  assert(!host.querySelector('.terminal-tab-badge'), "An unverified tab was badged as reattached");
+  assert(!host.querySelector('.terminal-host')?.textContent.includes("live process reattached"), "An unverified tab was marked as the live process");
+
+  // The fencing runtime's own event keeps the fence.
+  show({ type: "terminal.reattached", terminalId: "term-Z", payload: { ...listed[0], runtimeInstanceId: "runtime-A" } });
+  show({ type: "terminals.changed" });
+  await settle();
+  await until(() => terminalReady("Queue") && tabLabel() === "Queue, ownership unverified", "an A-attributed reattach settles");
+  assert((await typeAndResize("500px")).length === 0, "The fencing runtime's event reopened input or resize");
+
+  // B's event alone lifts the fence; the tab is read again from the server.
+  show({ type: "terminal.reattached", terminalId: "term-Z", payload: { ...listed[0], runtimeInstanceId: "runtime-B" } });
+  await until(() => terminalReady("QueueReattached") && tabLabel() === "Queue, live process reattached", "a lifted fence restores the server's state");
+  assert(terminalStatusText().includes("live process reattached"), "Reattached terminal lacks its spoken status");
+  assert(!terminalStatusText().includes("ownership is unverified"), "Reattached terminal still announces unknown ownership");
+  show({ type: "terminals.changed" });
+  await settle();
+  const commands = await typeAndResize("540px");
+  assert(commands.includes("terminal.input") && commands.includes("terminal.resize"), `Reattached terminal dropped input or resize: ${commands}`);
+}
+
 async function terminalSelectionReconnectRegression() {
   root.render(null);
   await settle();
@@ -6933,6 +7004,7 @@ try {
     ["terminal fenced saved session", terminalFencedSavedSessionRegression, "a saved status from the server wins over the page audit fence"],
     ["terminal reattach lifts fence", terminalReattachLiftsFenceRegression, "a later runtime's verified live reattach lifts the audit fence; a same-runtime reconnect does not"],
     ["terminal reattach after connect", terminalReattachAfterConnectRegression, "a reattach verified after the page connected lifts the audit fence without a reconnect"],
+    ["terminal reattach listed before release", terminalReattachListedBeforeReleaseRegression, "a tab listed as reattached while fenced follows the server once the fence lifts"],
     ["terminal selection during reconnect", terminalSelectionReconnectRegression, "selected terminal and output survive a reconnect while its buffer is pending"],
     ["terminal activation ownership", terminalActivationOwnershipRegression, "terminal activation commits output and current PTY size together"],
     ["rejected terminal switch", terminalRejectedSwitchRegression, "rejected terminal switch restores the selected tab focus"],

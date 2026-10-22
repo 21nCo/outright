@@ -136,6 +136,9 @@ test("a reattached live process is labelled apart from a new shell", () => {
   assert.equal(terminalTabBadge({ id: "g", name: "Shell", status: "running" }), "");
   assert.equal(terminalTabBadge({ ...reattached, status: "ended", endReason: "restart" }), "Saved");
   assert.doesNotMatch(terminalTabLabel({ ...reattached, status: "ended", endReason: "restart" }), /reattached/);
+  // An unverified owner is neither named nor badged as the live process.
+  assert.equal(terminalTabLabel({ ...reattached, status: "unknown" }), "Server, ownership unverified");
+  assert.equal(terminalTabBadge({ ...reattached, status: "unknown" }), "");
 });
 
 test("reopening a worktree shows live work first and otherwise the newest saved session without starting a shell", () => {

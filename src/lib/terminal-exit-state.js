@@ -29,7 +29,8 @@ export function terminalTabLabel(terminal) {
 
 export function terminalTabBadge(terminal) {
   if (terminal.status === "ended") return "Saved";
-  if (terminal.reattached) return "Reattached";
+  // An unverified owner is not shown as the live process.
+  if (terminal.reattached) return terminal.status === "unknown" ? "" : "Reattached";
   return terminal.relaunchedFrom ? "New shell" : "";
 }
 

@@ -73,6 +73,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
   const savedViewRef = useRef(null);
   const unverifiedTerminalIdsRef = useRef(unverifiedTerminalIds);
   unverifiedTerminalIdsRef.current = unverifiedTerminalIds;
+  const fencedIdsRef = useRef(unverifiedTerminalIds);
   const worktreeNameRef = useRef(worktree.name);
   const onErrorRef = useRef(onError);
   worktreeNameRef.current = worktree.name;
@@ -133,8 +134,16 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
   }, [activeId, loading]);
 
   // The socket callback has already fenced sends. Commit a durable warning
-  // even when a later output or capacity event replaced runtimeEvent.
+  // even when a later output or capacity event replaced runtimeEvent. A tab
+  // shown unknown only while fenced is read again from the server once its
+  // fence lifts, whichever runtime event lifted it.
   useLayoutEffect(() => {
+    const released = [...fencedIdsRef.current].filter((id) => !unverifiedTerminalIds.has(id));
+    fencedIdsRef.current = unverifiedTerminalIds;
+    if (terminalsRef.current.some((item) => item.status === "unknown" && released.includes(item.id))) {
+      if (loadingRef.current || syncingRef.current) queuedSyncRef.current = true;
+      else void syncListing();
+    }
     const pending = pendingOutputRef.current;
     if (pending && unverifiedTerminalIds.has(pending.id)) pending.unknown = true;
     if (!terminalsRef.current.some((item) => fencedLive(item, unverifiedTerminalIds) && item.status !== "unknown")) return;
@@ -239,6 +248,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       const xterm = xtermRef.current;
       const reattached = Boolean(detail.reattached ?? terminal.reattached);
       const marker = !reattached && Boolean(detail.relaunchedFrom ?? terminal.relaunchedFrom);
+      // An unverified owner is never marked as the live process.
+      const liveMarker = reattached ? (status === "unknown" ? "" : REATTACHED_MARKER) : marker ? NEW_SHELL_MARKER : "";
       let savedLabel = status === "ended" ? terminalEndLabel(savedFields(detail, terminal)) : "";
       if (detail.recoveryReservation) savedLabel = RESERVATION_LABEL;
       let displayedCursor = Number.isSafeInteger(detail.outputCursor) ? detail.outputCursor : 0;
@@ -249,7 +260,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
         savedViewRef.current = null;
         setSavedPage(null);
         if (xterm) xterm.options.scrollback = LIVE_SCROLLBACK;
-        xterm?.write(CLEAR_VIEW + (reattached ? REATTACHED_MARKER : marker ? NEW_SHELL_MARKER : ""));
+        xterm?.write(CLEAR_VIEW + liveMarker);
         if (detail.buffer) xterm?.write(detail.buffer);
         for (const { cursor, data } of pending.chunks) {
           if (!Number.isSafeInteger(detail.outputCursor) || !Number.isSafeInteger(cursor) || cursor > detail.outputCursor) xterm?.write(data);
@@ -425,7 +436,9 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       const next = terminalsRef.current.flatMap((item) => {
         const current = listed.get(item.id);
         if (!current) return [];
-        return current.status === "ended" || item.status === "ended" || current.recoveryReservation || item.recoveryReservation ? [current] : [item];
+        // An unknown tab no longer fenced follows the server again.
+        const released = item.status === "unknown" && !unverifiedTerminalIdsRef.current.has(item.id);
+        return released || current.status === "ended" || item.status === "ended" || current.recoveryReservation || item.recoveryReservation ? [current] : [item];
       }).concat([...listed.values()].filter((item) => !known.has(item.id)));
       const nextActive = next.find((item) => item.id === active?.id);
       stageTerminals(next);

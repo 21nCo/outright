@@ -54,12 +54,17 @@ function privateOwnerPath(id, launchDirectory, suffix) {
 function emptyProofPath(id, launchDirectory) { return privateOwnerPath(id, launchDirectory, "empty"); }
 
 const REATTACH_TOKEN = /^[A-Za-z0-9_-]{43}$/;
+const REATTACH_IDENTITY = /^[0-9a-f-]{36}$/i;
+// A regular expression test coerces its argument, so a record that is not
+// a string never passes for one.
+const validReattachToken = (value) => typeof value === "string" && REATTACH_TOKEN.test(value);
+const validReattachIdentity = (value) => typeof value === "string" && REATTACH_IDENTITY.test(value);
 export function reattachToken() { return randomBytes(32).toString("base64url"); }
 
 // A reattachable session's identity and current single-use token, private to
 // this user. It is replaced whole, so a reader sees one token or the next.
 export function writeReattachRecord(id, launchDirectory, { identity, token }) {
-  if (typeof identity !== "string" || !/^[0-9a-f-]{36}$/i.test(identity) || !REATTACH_TOKEN.test(token)) {
+  if (!validReattachIdentity(identity) || !validReattachToken(token)) {
     throw new Error("Invalid terminal reattach record");
   }
   const filename = privateOwnerPath(id, launchDirectory, "reattach");
@@ -82,8 +87,8 @@ export function readReattachRecord(id, launchDirectory) {
     if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > 1024
       || (process.platform !== "win32" && (info.uid !== process.getuid() || (info.mode & 0o077) !== 0))) return null;
     const record = JSON.parse(readFileSync(filename, "utf8"));
-    return record?.id === id && typeof record.identity === "string" && /^[0-9a-f-]{36}$/i.test(record.identity)
-      && REATTACH_TOKEN.test(record.token) ? { identity: record.identity, token: record.token } : null;
+    return record?.id === id && validReattachIdentity(record.identity) && validReattachToken(record.token)
+      ? { identity: record.identity, token: record.token } : null;
   } catch { return null; }
 }
 
@@ -380,6 +385,7 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
 // verifyEmpty, the native recovery that ends the owner, to prove it gone.
 export async function reattachManagedTerminal({ id, identity, token, nextToken, cols, rows, verifyEmpty,
   timeoutMs = 2000 }) {
+  if (!validReattachIdentity(identity) || !validReattachToken(token) || !validReattachToken(nextToken)) return null;
   let socket;
   try {
     socket = await new Promise((resolve, reject) => {
@@ -438,12 +444,17 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
       if (!result.verified && !await ownerEmpty()) throw new Error("PTY owned process boundary could not be verified empty");
     },
   };
+  // Any fault while proving the endpoint refuses this attempt; it never
+  // escapes the socket callback.
+  const brokerProven = (message) => {
+    try {
+      return message.type === "challenge" && validNonce(message.nonce)
+        && proofMatches(reattachProof(token, "broker", [nonce, message.nonce, label, identity]), message.proof);
+    } catch { return false; }
+  };
   const handleMessage = (message, resolve, reject) => {
     if (!provenBroker) {
-      if (message.type !== "challenge" || !validNonce(message.nonce)
-        || !proofMatches(reattachProof(token, "broker", [nonce, message.nonce, label, identity]), message.proof)) {
-        reject(new Error("PTY broker refused reattach")); socket.destroy(); return;
-      }
+      if (!brokerProven(message)) { reject(new Error("PTY broker refused reattach")); socket.destroy(); return; }
       provenBroker = true;
       socket.write(`${JSON.stringify({ type: "prove", nextToken,
         proof: reattachProof(token, "client", [message.nonce, nonce, label, identity, nextToken]),

@@ -1712,6 +1712,56 @@ test("an endpoint that cannot prove the reattach token is refused before anythin
   }
 });
 
+test("a reattach record whose token is not a string is unverifiable and takes the ended path without a crash", { timeout: 60_000 }, async () => {
+  for (const malformed of [[reattachToken()], 12345, { token: reattachToken() }]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-reattach-malformed-"));
+    const filename = path.join(directory, "runtime.db");
+    let database = createOutrightDatabase({ filename, runtimeLease: true });
+    const id = randomUUID();
+    const identity = randomUUID();
+    const ownership = terminalOwnership(id, database.launchDirectory);
+    // A private record Outright did not write, such as a corrupted one.
+    writeFileSync(path.join(database.launchDirectory, `terminal-${id}.reattach`), `${JSON.stringify({ id, identity, token: malformed })}\n`, { mode: 0o600 });
+    database.auditCritical("terminal.created", { target: id, cwd: directory, ownershipLabel: ownership.label,
+      handshakePath: ownership.handshakePath, pid: process.pid });
+    // An endpoint that answers every attempt with a challenge, so a token
+    // that reached the proof would be used as an HMAC key.
+    let received = "";
+    const endpoint = net.createServer((socket) => {
+      socket.setEncoding("utf8");
+      socket.on("error", () => {});
+      socket.on("data", (chunk) => {
+        received += chunk;
+        socket.write(`${JSON.stringify({ type: "challenge", nonce: reattachToken(), proof: reattachToken() })}\n`);
+      });
+    });
+    await new Promise((resolve) => endpoint.listen(ownership.address, resolve));
+    try {
+      assert.equal(readReattachRecord(id, database.launchDirectory), null, `a ${typeof malformed} token was read as valid`);
+      assert.equal(await reattachManagedTerminal({ id, identity, token: malformed, nextToken: reattachToken(), verifyEmpty: async () => true }), null);
+      assert.equal(received, "", "a malformed token was offered to the endpoint");
+      database = await restartDatabase(database, filename);
+      let proofs = 0;
+      const manager = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => true,
+        recoverTerminal: async () => { proofs += 1; return true; } });
+      try {
+        assert.equal(await manager.reconcileUnknown(), 1);
+        assert.equal(proofs, 1);
+        assert.equal(manager.get(id), null);
+        const audit = database.listAudit(50);
+        assert.equal(audit.some((entry) => entry.action === "terminal.reattached"), false);
+        assert.equal(audit.some((entry) => entry.action === "terminal.recovered" && entry.target === id), true);
+        assert.equal(manager.capacity().active, 0);
+        assert.equal(received, "", "recovery offered a malformed token to the endpoint");
+      } finally { await manager.shutdown(); }
+    } finally {
+      await new Promise((resolve) => endpoint.close(resolve));
+      database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
 async function waitFor(predicate, timeout = 3000, diagnostic = () => "") {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
