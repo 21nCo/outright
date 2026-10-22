@@ -1,0 +1,31 @@
+server/managed-terminal.mjs
+  s_445ad7f62aa2f2::t_856050844f1d95 57-61,67,90-91,388,447-454,457
+server/terminal-manager.test.mjs
+  s_445ad7f62aa2f2::t_e4789a0e007557 1715-1764
+src/components/TerminalPane.jsx
+  s_445ad7f62aa2f2::t_f19cd74177e8a7 76,137-139,141-146,251-252,263,439-441
+src/lib/terminal-exit-state.js
+  s_445ad7f62aa2f2::t_1beaad85613be3 32-33
+tests/terminal-exit-state.test.mjs
+  s_445ad7f62aa2f2::t_2973f06f894767 139-141
+tests/ui-races.jsx
+  s_445ad7f62aa2f2::t_2aef9ea899b933 3064-3134,7007
+tests/ui-races.test.mjs
+  s_445ad7f62aa2f2::t_8bc4d26fbda527 917
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "75394df59f6e46dec9aaab4efb3a6aa7048e43d7",
+  "prompts": {},
+  "sessions": {
+    "s_445ad7f62aa2f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_445ad7f62aa2f2",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
