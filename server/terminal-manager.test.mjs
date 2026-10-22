@@ -1920,63 +1920,142 @@ test("a reattach whose audit fails ends the shell and writes the output it was h
   assert.deepEqual(marks.map((mark) => saved.indexOf(mark)), marks.map((mark) => saved.indexOf(mark)).sort((a, b) => a - b));
 });
 
+// A broker endpoint that holds the token for a fresh id and, once proven,
+// lets the test send what follows "reattached".
+async function provenReattachEndpoint(afterProve) {
+  const id = randomUUID();
+  const identity = randomUUID();
+  const token = reattachToken();
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-early-"));
+  const ownership = terminalOwnership(id, directory);
+  const sockets = new Set();
+  const endpoint = net.createServer((socket) => {
+    let pending = "";
+    let challenge;
+    sockets.add(socket);
+    socket.setEncoding("utf8");
+    socket.on("error", () => {});
+    socket.on("data", (chunk) => {
+      pending += chunk;
+      for (let end; (end = pending.indexOf("\n")) !== -1; pending = pending.slice(end + 1)) {
+        const message = JSON.parse(pending.slice(0, end));
+        const send = (frame) => socket.write(`${JSON.stringify(frame)}\n`);
+        if (message.type === "reattach") {
+          challenge = reattachNonce();
+          send({ type: "challenge", nonce: challenge, proof: reattachProof(token, "broker", [message.nonce, challenge, ownership.label, identity]) });
+        } else if (message.type === "prove") {
+          send({ type: "reattached", identity, pid: process.pid });
+          afterProve(socket, send);
+        } else if (message.type === "release") {
+          send({ type: "released" });
+          socket.end();
+        }
+      }
+    });
+  });
+  await new Promise((resolve) => endpoint.listen(ownership.address, resolve));
+  return {
+    reattach: () => reattachManagedTerminal({ id, identity, token, nextToken: reattachToken(), verifyEmpty: async () => true }),
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => endpoint.close(resolve));
+      rmSync(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+// Hands the client its reads in batches of at least minChars, as one Windows
+// named-pipe read can, so a single read carries many complete frames.
+function coalesceClientReads(minChars) {
+  const createConnection = net.createConnection;
+  net.createConnection = (...args) => {
+    const socket = createConnection(...args);
+    const emit = socket.emit;
+    let held = "";
+    let timer;
+    const flush = () => {
+      clearTimeout(timer);
+      if (!held) return;
+      const data = held;
+      held = "";
+      emit.call(socket, "data", data);
+    };
+    socket.emit = function (event, ...rest) {
+      if (event !== "data") { flush(); return emit.call(this, event, ...rest); }
+      held += rest[0];
+      if (held.length >= minChars) flush();
+      else { clearTimeout(timer); timer = setTimeout(flush, 20); }
+      return true;
+    };
+    return socket;
+  };
+  return () => { net.createConnection = createConnection; };
+}
+
 test("replay that outgrows the reattach buffer before it is taken is announced once, by registration or by hand-back", { timeout: 60_000 }, async () => {
   // A broker that holds the token sends more replay than the client keeps
-  // before anything consumes it, in frames of distinct letters.
+  // before anything consumes it, in frames of distinct letters. Coalesced
+  // reads deliver several frames, over the per-frame limit, in one read.
   const frames = Array.from({ length: 21 }, (_, index) => String.fromCharCode(97 + index).repeat(64 * 1024));
-  for (const consumer of ["registration", "hand-back"]) {
-    const id = randomUUID();
-    const identity = randomUUID();
-    const token = reattachToken();
-    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-early-"));
-    const ownership = terminalOwnership(id, directory);
-    const endpoint = net.createServer((socket) => {
-      let pending = "";
-      let challenge;
-      socket.setEncoding("utf8");
-      socket.on("error", () => {});
-      socket.on("data", (chunk) => {
-        pending += chunk;
-        for (let end; (end = pending.indexOf("\n")) !== -1; pending = pending.slice(end + 1)) {
-          const message = JSON.parse(pending.slice(0, end));
-          const send = (frame) => socket.write(`${JSON.stringify(frame)}\n`);
-          if (message.type === "reattach") {
-            challenge = reattachNonce();
-            send({ type: "challenge", nonce: challenge, proof: reattachProof(token, "broker", [message.nonce, challenge, ownership.label, identity]) });
-          } else if (message.type === "prove") {
-            send({ type: "reattached", identity, pid: process.pid });
-            for (const data of frames) send({ type: "data", data });
-            if (consumer === "registration") socket.end();
-          } else if (message.type === "release") {
-            send({ type: "released" });
-            socket.end();
-          }
-        }
-      });
+  for (const reads of ["streamed", "coalesced"]) for (const consumer of ["registration", "hand-back"]) {
+    const label = `${consumer}, ${reads} reads`;
+    const endpoint = await provenReattachEndpoint((socket, send) => {
+      for (const data of frames) send({ type: "data", data });
+      if (consumer === "registration") socket.end();
     });
-    await new Promise((resolve) => endpoint.listen(ownership.address, resolve));
+    const restore = reads === "coalesced" ? coalesceClientReads(512 * 1024) : () => {};
     try {
-      const adapter = await reattachManagedTerminal({ id, identity, token, nextToken: reattachToken(), verifyEmpty: async () => true });
-      assert.ok(adapter, "the endpoint holding the token was refused");
+      const adapter = await endpoint.reattach();
+      assert.ok(adapter, `${label}: the endpoint holding the token was refused`);
       let delivered;
+      let exit;
       if (consumer === "registration") {
         // The close follows every frame, so all of them wait for onData.
-        await new Promise((resolve) => adapter.onExit(resolve));
+        exit = await new Promise((resolve) => adapter.onExit(resolve));
         delivered = [];
         adapter.onData((data) => delivered.push(data));
       } else delivered = await adapter.release();
+      assert.ok(delivered.length > 1, `${label}: ${delivered.length} replay frames were delivered (exit ${JSON.stringify(exit)})`);
       const notice = delivered[0].match(/^\u001b\[0m\[Outright: (\d+) earlier terminal output characters were dropped while reattaching\]\r\n$/);
-      assert.ok(notice, `${consumer}: dropped replay was not announced: ${JSON.stringify(delivered[0].slice(0, 80))}`);
+      assert.ok(notice, `${label}: dropped replay was not announced: ${JSON.stringify(delivered[0].slice(0, 80))}`);
       const kept = delivered.slice(1).join("");
       const sent = frames.join("");
-      assert.ok(kept.length <= 1_100_000, `${consumer}: ${kept.length} replay characters were held`);
-      assert.equal(Number(notice[1]) + kept.length, sent.length, `${consumer}: the notice miscounted the dropped replay`);
-      assert.ok(sent.endsWith(kept), `${consumer}: the newest replay was not what was kept`);
+      assert.ok(kept.length <= 1_100_000, `${label}: ${kept.length} replay characters were held`);
+      assert.equal(Number(notice[1]) + kept.length, sent.length, `${label}: the notice miscounted the dropped replay`);
+      assert.ok(sent.endsWith(kept), `${label}: the newest replay was not what was kept`);
       // A second consumer is told nothing twice.
-      assert.deepEqual(await adapter.release(), [], `${consumer}: the drop was announced twice`);
+      assert.deepEqual(await adapter.release(), [], `${label}: the drop was announced twice`);
     } finally {
-      await new Promise((resolve) => endpoint.close(resolve));
-      rmSync(directory, { recursive: true, force: true });
+      restore();
+      await endpoint.close();
+    }
+  }
+});
+
+test("a reattach frame over the read limit still ends the attempt, terminated or not, in any read size", { timeout: 60_000 }, async () => {
+  for (const reads of ["streamed", "coalesced"]) for (const terminated of [true, false]) {
+    const label = `${terminated ? "terminated" : "unterminated"} frame, ${reads} reads`;
+    const endpoint = await provenReattachEndpoint((socket, send) => {
+      send({ type: "data", data: "before-oversized" });
+      socket.write(`${JSON.stringify({ type: "data", data: "x".repeat(300 * 1024) })}${terminated ? "\n" : ""}`);
+      if (terminated) send({ type: "data", data: "after-oversized" });
+    });
+    const restore = reads === "coalesced" ? coalesceClientReads(512 * 1024) : () => {};
+    try {
+      const adapter = await endpoint.reattach();
+      assert.ok(adapter, `${label}: the endpoint holding the token was refused`);
+      // The client ends the attempt itself; the endpoint never closes.
+      let timer;
+      const ended = await Promise.race([new Promise((resolve) => adapter.onExit(() => resolve(true))),
+        new Promise((resolve) => { timer = setTimeout(resolve, 10_000, false); })]).finally(() => clearTimeout(timer));
+      const delivered = [];
+      adapter.onData((data) => delivered.push(data));
+      assert.equal(delivered.some((data) => data.startsWith("x") || data === "after-oversized"), false,
+        `${label}: output at or after the oversized frame was delivered`);
+      assert.ok(ended, `${label}: the client kept the attempt open past the oversized frame`);
+    } finally {
+      restore();
+      await endpoint.close();
     }
   }
 });

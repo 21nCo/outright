@@ -196,14 +196,20 @@ async function connectBroker(address, isClosed, failureDetails) {
 function waitForBrokerReady(socket, handleMessage, onClose, wasReady) {
   return new Promise((resolve, reject) => {
     let pending = "";
+    // One read may carry many complete frames; the limit bounds each frame
+    // and the unterminated remainder, not the read.
+    const overLimit = (text) => {
+      if (text.length <= 256 * 1024) return false;
+      reject(new Error("PTY broker response exceeded its limit")); socket.destroy(); return true;
+    };
     socket.setEncoding("utf8");
     socket.on("data", (chunk) => {
       pending += chunk;
-      if (pending.length > 256 * 1024) { reject(new Error("PTY broker response exceeded its limit")); socket.destroy(); return; }
       let end;
       while ((end = pending.indexOf("\n")) !== -1) {
         const line = pending.slice(0, end);
         pending = pending.slice(end + 1);
+        if (overLimit(line)) return;
         let message;
         try { message = JSON.parse(line); }
         catch { reject(new Error("PTY broker returned malformed data")); socket.destroy(); return; }
@@ -212,6 +218,7 @@ function waitForBrokerReady(socket, handleMessage, onClose, wasReady) {
         }
         handleMessage(message, resolve, reject);
       }
+      overLimit(pending);
     });
     socket.on("error", reject);
     socket.on("close", () => {

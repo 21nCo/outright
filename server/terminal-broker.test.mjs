@@ -694,3 +694,14 @@ test("without a reattach session a peer close still ends the shell", { timeout: 
   })]).finally(() => clearTimeout(timeout));
   assert.ok(!stderr().includes("peer-detached"));
 });
+
+test("an unterminated peer frame over the read limit still ends the peer and its shell", { timeout: 20_000 }, async (t) => {
+  // The limit bounds each frame and the remainder after complete frames, so
+  // a read of many frames passes while one endless frame is still refused.
+  const { start, closed } = await startSessionBroker(t);
+  start.socket.write(`{"type":"write","data":"${"x".repeat(600 * 1024)}`);
+  let timeout;
+  await Promise.race([closed, new Promise((_, reject) => {
+    timeout = setTimeout(() => reject(new Error("the broker kept a peer sending an endless frame")), 10_000);
+  })]).finally(() => clearTimeout(timeout));
+});

@@ -338,18 +338,21 @@ const server = net.createServer((socket) => {
   socket.on("data", (chunk) => {
     pending += chunk;
     // A permitted 64 KiB write may JSON-escape every control byte as six
-    // characters. Include the launch environment and framing as well.
-    if (pending.length > 512 * 1024) { socket.destroy(); return; }
+    // characters. Include the launch environment and framing as well. The
+    // limit bounds each frame and the unterminated remainder: one read may
+    // carry many complete frames.
     let end;
     while ((end = pending.indexOf("\n")) !== -1) {
       const line = pending.slice(0, end);
       pending = pending.slice(end + 1);
+      if (line.length > 512 * 1024) { socket.destroy(); return; }
       let message;
       try { message = JSON.parse(line); } catch { socket.destroy(); return; }
       if (!message || typeof message !== "object" || Array.isArray(message)) { socket.destroy(); return; }
       handleMessage(message);
       if (socket.destroyed || socket.writableEnded || !terminal) return;
     }
+    if (pending.length > 512 * 1024) socket.destroy();
   });
   socket.on("close", () => {
     clearTimeout(handshakeTimer);
