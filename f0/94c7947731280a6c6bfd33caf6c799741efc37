@@ -1,0 +1,25 @@
+server/agent-supervisor-darwin.test.mjs
+  s_98964a17a9d000::t_3a563efe251896 11-13
+server/agent-supervisor-linux.test.mjs
+  s_98964a17a9d000::t_5eb3c3d4d70c12 1-309
+server/agent-supervisor.c
+  s_98964a17a9d000::t_a9cdf13f57a470 31-38,111-120,122-123,134-143,398-444,449-454,459,464,485-489,511-525,527-528,534,566-577,581-595,635-639,644,651-656,670-671
+server/managed-terminal.mjs
+  s_98964a17a9d000::t_1b450491b4675e 231-232,235-238
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f094c7947731280a6c6bfd33caf6c799741efc37",
+  "prompts": {},
+  "sessions": {
+    "s_98964a17a9d000": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_98964a17a9d000",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
