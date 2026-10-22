@@ -1055,6 +1055,7 @@ int main(int argc, char **argv) {
   bool stdin_closed = false;
   bool owner_lost = false;
   bool reattached = false;
+  bool broker_exited = false;
   uint64_t detach_deadline = 0;
   const uint64_t detach_grace = detach_window_ms < MAX_DETACH_GRACE_MS ? (uint64_t)detach_window_ms : MAX_DETACH_GRACE_MS;
   for (;;) {
@@ -1068,8 +1069,10 @@ int main(int argc, char **argv) {
     }
     if (detach_window_ms > 0) {
       if (stdin_closed || getppid() != owner_pid) owner_lost = true;
+      // Attachment lasts only while the broker runs: a status line drained
+      // after its exit cannot pause the window.
       if (broker_status.status != 0) {
-        reattached = broker_status.status > 0;
+        reattached = broker_status.status > 0 && !broker_exited;
         broker_status.status = 0;
         detach_deadline = 0;
       }
@@ -1131,7 +1134,13 @@ int main(int argc, char **argv) {
       result = 70;
       break;
     }
-    if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL
+    if (detach_window_ms > 0 && state.runs >= 1 && state.active == 0) {
+      broker_exited = true;
+      reattached = false;
+    }
+    // A detached job whose broker has exited has nothing left to reattach
+    // to, so its escaped descendants end at once, as a utility's do.
+    if ((getenv("OUTRIGHT_UTILITY_OWNER") != NULL || (broker_exited && owner_lost))
         && state.runs >= 1 && state.active == 0 && member_count > 0) {
       if (terminate_coalition(target, coalition_id)) {
         result = provider_exit_code;

@@ -34,12 +34,16 @@ process.stdin.on("data", (command) => {
   if (command.includes("close")) child.stdin.end();
 });`;
 
-// Stands in for the broker: records its pid, and prints a broker status line
-// or exits when the test drops a request file in its directory.
+// Stands in for the broker: records its pid, and prints a broker status line,
+// starts a descendant that escapes its session, or exits when the test drops
+// a request file in its directory.
 const PROVIDER_SOURCE = `#!/bin/sh
 dir="$1"
 echo $$ > "$dir/provider.pid"
 while :; do
+  if [ -f "$dir/escape" ]; then rm -f "$dir/escape"
+    /usr/bin/perl -e 'use POSIX qw(setsid); exit 0 if fork(); setsid(); open(my $f, ">", "$ARGV[0]") or die; print $f "$$\\n"; close $f; open(STDIN, "<", "/dev/null"); open(STDOUT, ">", "/dev/null"); open(STDERR, ">", "/dev/null"); exec("/bin/sleep", "600")' "$dir/escaped.pid"
+  fi
   if [ -f "$dir/attach" ]; then rm -f "$dir/attach"; echo ${ATTACHED}; fi
   if [ -f "$dir/detach" ]; then rm -f "$dir/detach"; echo ${DETACHED}; fi
   if [ -f "$dir/exit" ]; then exit 0; fi
@@ -174,6 +178,24 @@ test("a detach-mode job ends at once on an explicit stop, and stdin EOF alone do
   await delay(300);
   exited.request("exit");
   await assertReleased(exited, 5000);
+});
+
+test("a detached job whose reattached broker exits ends its escaped descendants at once", { ...darwinOnly, timeout: 60_000 }, async (t) => {
+  const start = supervisors(t);
+  const run = await start("broker-exit", ["--detach", "500"]);
+  const escapedFile = path.join(run.directory, "escaped.pid");
+  run.request("escape");
+  await waitUntil(() => existsSync(escapedFile) && Number(readFileSync(escapedFile, "utf8")) > 0, "the provider did not start its escaped descendant");
+  const escaped = Number(readFileSync(escapedFile, "utf8"));
+  t.after(() => { if (alive(escaped)) try { process.kill(escaped, "SIGKILL"); } catch {} });
+  run.owner.kill("SIGKILL");
+  run.request("attach");
+  await delay(300);
+  // The broker exits while attached and never reports a detach.
+  run.request("exit");
+  // Well inside the 500 ms window and its grace plus slack, without recovery.
+  await assertReleased(run, 2500);
+  assert.equal(alive(escaped), false, "an escaped descendant outlived its exited broker");
 });
 
 test("recovery verifies and ends a detached job whose owner is gone", { ...darwinOnly, timeout: 60_000 }, async (t) => {
