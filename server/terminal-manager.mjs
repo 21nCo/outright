@@ -178,11 +178,12 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     } catch {
       // An unrecorded reattach is not offered as live. Ending it here lets
       // native proof settle the reservation as for any other prior-run shell.
-      // Its detached output is still saved, as the session ended by restart.
-      const output = [];
-      processInstance.onData((data) => output.push(data));
+      // Its detached output, and anything the shell prints while it ends, is
+      // written straight to the session ended by restart, never held here.
+      const saving = handedOutputWriter(entry);
+      processInstance.onData(saving.write);
       try { await processInstance.terminate(); } catch { /* Native proof decides below. */ }
-      saveHandedOutput(entry, output);
+      saving.close();
       forgetReattach(id);
       return false;
     }
@@ -205,13 +206,24 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   }
 
   // Output a broker handed to a reattach that is not kept live reaches the
-  // saved session once, in order, which then ends by restart again.
-  function saveHandedOutput(entry, frames) {
+  // saved session once, in order, which then ends by restart again. The
+  // session reopens only when output arrives.
+  function handedOutputWriter(entry) {
     const id = entry.target;
-    if (!history || !frames?.length) return;
-    if (!history.resume(id)) history.begin({ id, name: "Terminal", cwd: entry.cwd, createdAt: new Date().toISOString() });
-    for (const frame of frames) history.append(id, frame);
-    history.finish(id);
+    let open = false;
+    return {
+      write(frame) {
+        if (!history) return;
+        open ||= history.resume(id) || history.begin({ id, name: "Terminal", cwd: entry.cwd, createdAt: new Date().toISOString() });
+        if (open) history.append(id, frame);
+      },
+      close() { if (open) history.finish(id); },
+    };
+  }
+  function saveHandedOutput(entry, frames) {
+    const saving = handedOutputWriter(entry);
+    for (const frame of frames ?? []) saving.write(frame);
+    saving.close();
   }
 
   function reconcileUnknown() {

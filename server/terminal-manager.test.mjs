@@ -9,7 +9,7 @@ import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 import { AUDIT_RETENTION_LIMIT, auditTrimSql, trimAudit, trimAuditPage } from "./audit-retention.mjs";
 import { createOutrightRuntime } from "./outright-runtime.mjs";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import os from "node:os";
@@ -1770,7 +1770,7 @@ test("shutdown before the reattach proof leaves the token and the detached outpu
   assert.equal(prior.exited(), true);
 });
 
-test("a reattach whose audit fails ends the shell and still saves the output it was handed", { timeout: 60_000 }, async (t) => {
+test("a reattach whose audit fails ends the shell and writes the output it was handed straight to history", { timeout: 60_000 }, async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-reattach-unaudited-"));
   const filename = path.join(directory, "runtime.db");
   let database = createOutrightDatabase({ filename, runtimeLease: true });
@@ -1783,18 +1783,54 @@ test("a reattach whose audit fails ends the shell and still saves the output it 
     if (action === "terminal.reattached") throw new Error("audit storage unavailable");
     return auditCritical.call(database, action, evidence);
   };
+  const historyDirectory = path.join(database.launchDirectory, "terminal-history");
+  const newestSegment = () => {
+    const segments = readdirSync(historyDirectory).map((name) => name.match(new RegExp(`^${prior.id}\\.(\\d+)\\.log$`)))
+      .filter(Boolean).sort((a, b) => Number(b[1]) - Number(a[1]));
+    return segments.length ? readFileSync(path.join(historyDirectory, segments[0][0]), "utf8") : "";
+  };
+  // While the shell ends it floods more output than any reattach buffer
+  // holds. Each frame is on disk once delivered, so none is retained here.
+  const flood = Array.from({ length: 6 }, (_, index) => `flood-${index}-${"x".repeat(200_000)}`);
+  const unsaved = [];
   const manager = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => true,
-    recoverTerminal: brokerRecovery(prior) });
-  t.after(() => manager.shutdown().catch(() => {}));
+    recoverTerminal: brokerRecovery(prior),
+    reattachTerminal: async (options) => {
+      const adapter = await reattachManagedTerminal(options);
+      if (!adapter) return adapter;
+      let deliver;
+      let replayed = "";
+      const { onData, terminate } = adapter;
+      adapter.onData = (callback) => {
+        deliver = callback;
+        onData((data) => { replayed += data; callback(data); });
+      };
+      adapter.terminate = async () => {
+        // The broker's replay arrives first; the flood follows it.
+        await waitFor(() => replayed.includes("while-detached"), 10_000, () => replayed);
+        flood.forEach((frame, index) => {
+          deliver?.(frame);
+          if (!newestSegment().includes(`flood-${index}-`)) unsaved.push(index);
+        });
+        await terminate();
+      };
+      return adapter;
+    } });
   assert.equal(await manager.reconcileUnknown(), 1);
+  assert.deepEqual(unsaved, [], "output delivered during termination was held instead of written to history");
   assert.equal(prior.exited(), true);
   const audit = database.listAudit(50);
   assert.equal(audit.some((entry) => entry.action === "terminal.reattached"), false);
   assert.equal(audit.some((entry) => entry.action === "terminal.recovered" && entry.target === prior.id), true);
   const ended = manager.get(prior.id);
   assert.equal(ended.status, "ended");
-  assert.equal(ended.buffer.split("while-detached").length, 2, JSON.stringify(ended.buffer));
-  assert.ok(ended.buffer.indexOf("saved-before-restart") < ended.buffer.indexOf("while-detached"));
+  await manager.shutdown();
+  const history = openTerminalHistory({ directory: historyDirectory });
+  const saved = history.read(prior.id);
+  history.close();
+  const marks = ["saved-before-restart", "while-detached", ...flood.map((_, index) => `flood-${index}-`)];
+  for (const mark of marks) assert.equal(saved.split(mark).length, 2, `${mark} was not saved exactly once`);
+  assert.deepEqual(marks.map((mark) => saved.indexOf(mark)), marks.map((mark) => saved.indexOf(mark)).sort((a, b) => a - b));
 });
 
 test("an endpoint that cannot prove the reattach token is refused before anything spendable or typed reaches it", { timeout: 60_000 }, async () => {
