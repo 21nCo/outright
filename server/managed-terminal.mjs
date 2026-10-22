@@ -383,8 +383,10 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
 // success the old token is spent. A broker that closes without its exit frame
 // may still hold the detached shell, so termination and every close require
 // verifyEmpty, the native recovery that ends the owner, to prove it gone.
+// proceed is asked just before the token is spent; false withdraws the
+// attempt, leaving the token and the detached output with the broker.
 export async function reattachManagedTerminal({ id, identity, token, nextToken, cols, rows, verifyEmpty,
-  timeoutMs = 2000 }) {
+  proceed = () => true, timeoutMs = 2000 }) {
   if (!validReattachIdentity(identity) || !validReattachToken(token) || !validReattachToken(nextToken)) return null;
   let socket;
   try {
@@ -407,9 +409,17 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
   let provenBroker = false;
   let attachedSeen = false;
   let released = false;
+  let settleRelease;
+  const handedBack = new Promise((resolve) => { settleRelease = resolve; });
   let settleClose;
   const closeResult = new Promise((resolve) => { settleClose = resolve; });
   const socketClosed = new Promise((resolve) => socket.once("close", resolve));
+  const takeEarly = () => {
+    const frames = earlyData;
+    earlyData = [];
+    earlyChars = 0;
+    return frames;
+  };
   const ownerEmpty = async () => {
     try { return Boolean(await verifyEmpty()); } catch { return false; }
   };
@@ -417,10 +427,7 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
     pid: null,
     onData(callback) {
       onData = callback;
-      const frames = earlyData;
-      earlyData = [];
-      earlyChars = 0;
-      for (const frame of frames) callback(frame);
+      for (const frame of takeEarly()) callback(frame);
     },
     onExit(callback) { onExit = callback; if (finalResult) callback(finalResult); },
     write(data) {
@@ -445,10 +452,17 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
       if (!result.verified && !await ownerEmpty()) throw new Error("PTY owned process boundary could not be verified empty");
     },
     // Hands the shell back to its broker's detach window untouched, for a
-    // later runtime to reattach with the rotated token.
-    release() {
+    // later runtime to reattach with the rotated token. Resolves with the
+    // output frames the broker sent this attempt that were not delivered;
+    // the broker keeps everything after them.
+    async release() {
       released = true;
+      if (!socket.destroyed) socket.write(`${JSON.stringify({ type: "release" })}\n`);
+      let timeout;
+      await Promise.race([handedBack, socketClosed, new Promise((resolve) => { timeout = setTimeout(resolve, timeoutMs); })])
+        .finally(() => clearTimeout(timeout));
       socket.destroy();
+      return takeEarly();
     },
   };
   // Any fault while proving the endpoint refuses this attempt; it never
@@ -463,6 +477,9 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
     if (!provenBroker) {
       if (!brokerProven(message)) { reject(new Error("PTY broker refused reattach")); socket.destroy(); return; }
       provenBroker = true;
+      let withdrawn = true;
+      try { withdrawn = !proceed(); } catch { /* A failed check withdraws the attempt. */ }
+      if (withdrawn) { reject(new Error("PTY broker reattach withdrawn")); socket.destroy(); return; }
       socket.write(`${JSON.stringify({ type: "prove", nextToken,
         proof: reattachProof(token, "client", [message.nonce, nonce, label, identity, nextToken]),
         ...(Number.isInteger(cols) && Number.isInteger(rows) ? { cols, rows } : {}) })}\n`);
@@ -480,6 +497,7 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
       shellResult = { exitCode: message.exitCode, signal: message.signal };
       return;
     }
+    if (message.type === "released" && released) { settleRelease(); return; }
     if (message.type === "data" && typeof message.data === "string" && !shellResult) {
       if (onData) { onData(message.data); return; }
       earlyData.push(message.data);

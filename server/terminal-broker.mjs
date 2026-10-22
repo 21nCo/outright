@@ -123,6 +123,7 @@ const server = net.createServer((socket) => {
   let exitTimer;
   let stalledReaderTimer;
   let peerClosedRecorded = false;
+  let handedBack = false;
   // A reattach attempt that never completes cannot hold the only peer slot.
   const handshakeTimer = detached ? setTimeout(() => { if (!authenticated) socket.destroy(); }, 5000) : undefined;
   const flushInput = (force = false) => {
@@ -308,6 +309,18 @@ const server = net.createServer((socket) => {
       terminal.resize(message.cols, message.rows);
       return;
     }
+    // An owner that stops just after reattaching hands the shell back. Output
+    // not yet sent returns to the ring, and the peer reads every frame already
+    // sent up to "released", so no output is lost or delivered twice.
+    if (!shellExited && message.type === "release" && session) {
+      handedBack = true;
+      clearTimeout(shedTimer);
+      clearTimeout(stalledReaderTimer);
+      detach(pendingOutput.slice(outputOffset), omittedChars, { pendingInputBytes: Buffer.byteLength(pendingInput) });
+      flushInput(true);
+      socket.end(`${JSON.stringify({ type: "released" })}\n`);
+      return;
+    }
     // A reattached owner ends the shell explicitly; closing only detaches.
     if (!shellExited && message.type === "terminate") {
       session = null;
@@ -341,7 +354,7 @@ const server = net.createServer((socket) => {
     clearTimeout(exitTimer);
     clearTimeout(stalledReaderTimer);
     // A refused reattach attempt leaves the detached session as it was.
-    if (detached && !authenticated) {
+    if ((detached && !authenticated) || handedBack) {
       if (peer === socket) peer = undefined;
       return;
     }

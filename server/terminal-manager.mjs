@@ -155,16 +155,22 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     const record = readReattachRecord(id, database.launchDirectory);
     if (!record) return false;
     const nextToken = reattachToken();
+    // A runtime that began shutting down never spends the token, so the
+    // broker keeps it and its detached output for the next runtime.
     const processInstance = await reattachTerminal({ id, identity: record.identity, token: record.token, nextToken,
+      proceed: () => !shuttingDown,
       verifyEmpty: () => recoverTerminal({ ...entry, launchDirectory: database.launchDirectory, subprocesses }) });
-    // A refused token is never offered again.
-    if (!processInstance) { forgetReattach(id); return false; }
+    // A refused token is never offered again. During shutdown the record
+    // stays: a withdrawn token is still current, and a spent one is refused
+    // and removed by the next runtime.
+    if (!processInstance) { if (!shuttingDown) forgetReattach(id); return false; }
     try { writeReattachRecord(id, database.launchDirectory, { identity: record.identity, token: nextToken }); }
     catch { forgetReattach(id); }
     if (shuttingDown) {
       // The broker detaches again and keeps the shell for its window. Ending
-      // it now would take a shell the next runtime can reattach.
-      processInstance.release?.();
+      // it now would take a shell the next runtime can reattach. The output
+      // it already sent is saved here; it keeps the rest.
+      saveHandedOutput(entry, await processInstance.release());
       return false;
     }
     try {
@@ -172,7 +178,11 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     } catch {
       // An unrecorded reattach is not offered as live. Ending it here lets
       // native proof settle the reservation as for any other prior-run shell.
+      // Its detached output is still saved, as the session ended by restart.
+      const output = [];
+      processInstance.onData((data) => output.push(data));
       try { await processInstance.terminate(); } catch { /* Native proof decides below. */ }
+      saveHandedOutput(entry, output);
       forgetReattach(id);
       return false;
     }
@@ -192,6 +202,16 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     publish({ type: "terminal.reattached", terminalId: id, payload: { ...publicTerminal(terminal), runtimeInstanceId } });
     terminalsChanged();
     return true;
+  }
+
+  // Output a broker handed to a reattach that is not kept live reaches the
+  // saved session once, in order, which then ends by restart again.
+  function saveHandedOutput(entry, frames) {
+    const id = entry.target;
+    if (!history || !frames?.length) return;
+    if (!history.resume(id)) history.begin({ id, name: "Terminal", cwd: entry.cwd, createdAt: new Date().toISOString() });
+    for (const frame of frames) history.append(id, frame);
+    history.finish(id);
   }
 
   function reconcileUnknown() {
