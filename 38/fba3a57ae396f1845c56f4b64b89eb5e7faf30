@@ -1,0 +1,29 @@
+tests/ui-races.jsx
+  s_1786e4c8d6d477::t_5df52eabc026b1 2952-2955,2960-2961,2964-2965,2967-2973,2975-2979,2981,2984-2985,2987-3004,3006,3008-3017,3024,3032,3041-3042,3046,3057,3066-3067,3069,3085,3094
+server/audit-retention.mjs
+  s_1786e4c8d6d477::t_e342e66d04ab32 5-8,13-17,26,42,53,74,83
+server/managed-terminal.mjs
+  s_1786e4c8d6d477::t_6f573cb30bea9b 405-406,409,421-423,426,511-515
+server/terminal-broker.mjs
+  s_1786e4c8d6d477::t_122be24a415e15 53,55,72-74,79
+server/terminal-broker.test.mjs
+  s_1786e4c8d6d477::t_a1ae9517cd6498 675-681
+server/terminal-manager.test.mjs
+  s_1786e4c8d6d477::t_d0431641c8c223 4-5,1182-1242,1457-1473,1498-1499,1525-1527,1529-1536,1539,1551,1559,1645-1651,1681,1704,1711-1712,1727,1736,1754,1798,1818,1850,1860,1893-1901,1905,1923-1983
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "38fba3a57ae396f1845c56f4b64b89eb5e7faf30",
+  "prompts": {},
+  "sessions": {
+    "s_1786e4c8d6d477": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d3878118-ae2f-4300-8b70-b21e7f41eeb0",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
