@@ -1,0 +1,21 @@
+server/terminal-manager.mjs
+  s_92427ff18a8304::t_ab6b64e92a82e7 181-184,186,209-211,213-226
+server/terminal-manager.test.mjs
+  s_92427ff18a8304::t_7a774996b1987e 12,1773,1786-1795,1797-1818,1820,1827-1833
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b52a9dbd934af542b68cc11c8bdd1fd3b6e64ab6",
+  "prompts": {},
+  "sessions": {
+    "s_92427ff18a8304": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26336501-b0e6-4534-a7c2-345f5528a4ba",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
