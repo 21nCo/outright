@@ -41,6 +41,14 @@ const diagnostic = (event, details = {}) => {
   try { writeSync(2, `${JSON.stringify({ broker: event, ...details, ...diagnosticCounts })}\n`); }
   catch { /* Diagnostics never affect terminal ownership. */ }
 };
+// A detaching native supervisor keeps this broker only for the detach window
+// while no runtime is attached. Its stdout carries these two status lines,
+// which name a transition, never terminal data, so the supervisor can pause
+// that window for a reattached runtime and restart it on the next detach.
+const announceAttachment = (attachedNow) => {
+  try { writeSync(1, attachedNow ? "__OUTRIGHT_BROKER_ATTACHED_V1__\n" : "__OUTRIGHT_BROKER_DETACHED_V1__\n"); }
+  catch { /* A supervisor without detach mode does not read them. */ }
+};
 // Node emits the listener's close before the socket's own close event after
 // the final frame. Either path records the closed peer, exactly once.
 let recordPeerClosed = () => {};
@@ -77,6 +85,7 @@ function detach(unsent, omitted, details = {}) {
   // A peer's backpressure must not hold the shell while nobody reads it.
   if (process.platform !== "win32") try { terminal.resume(); } catch { /* The shell may already be gone. */ }
   diagnostic("peer-detached", { windowMs, ...details });
+  announceAttachment(false);
 }
 
 function onTerminalData(data) {
@@ -284,6 +293,7 @@ const server = net.createServer((socket) => {
     authenticated = true;
     attached = handlers;
     diagnostic("reattached", { bufferedChars: output.length });
+    announceAttachment(true);
     socket.write(`${JSON.stringify({ type: "reattached", identity: instance, pid: terminal.pid })}\n`);
     if (validSize(message.cols, message.rows)) terminal.resize(message.cols, message.rows);
     pendingOutput = output;
