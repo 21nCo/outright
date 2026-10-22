@@ -1465,7 +1465,9 @@ test("restart recovery reattaches a live prior-run shell with its buffered outpu
   t.after(() => { database.close(); rmSync(directory, { recursive: true, force: true }); });
   const prior = await priorRunTerminal(t, database, directory);
   database = await restartDatabase(database, filename);
-  const manager = createTerminalManager({ database, publish: () => {}, maxTerminals: 1, reattachEnabled: () => true,
+  const events = [];
+  const manager = createTerminalManager({ database, publish: (event) => events.push(event), maxTerminals: 1, reattachEnabled: () => true,
+    runtimeInstanceId: "runtime-B",
     recoverTerminal: async () => { await waitFor(prior.exited, 6000).catch(() => {}); return prior.exited(); } });
   t.after(() => manager.shutdown());
   // The detached shell holds its slot before and after it is reattached.
@@ -1479,6 +1481,13 @@ test("restart recovery reattaches a live prior-run shell with its buffered outpu
   assert.equal(live.reattached, true);
   assert.equal(live.recoveryReservation, undefined);
   assert.deepEqual(manager.capacity(), { active: 1, unknown: 0, limit: 1 });
+  // A page that connected during recovery learns which runtime verified it.
+  const announced = events.filter((event) => event.type === "terminal.reattached");
+  assert.equal(announced.length, 1);
+  assert.equal(announced[0].terminalId, prior.id);
+  assert.deepEqual({ ...announced[0].payload, pid: undefined, createdAt: undefined }, { ...manager.list().find((entry) => entry.id === prior.id),
+    pid: undefined, createdAt: undefined, runtimeInstanceId: "runtime-B" });
+  assert.equal(announced[0].payload.recoveryReservation, undefined);
   await assert.rejects(manager.create({ cwd: directory }), (error) => error.statusCode === 429);
   await waitFor(() => manager.get(prior.id).buffer.includes("while-detached"), 10_000, () => manager.get(prior.id).buffer);
   assert.equal(manager.write(prior.id, "kept + 1\r"), true);
@@ -1510,7 +1519,9 @@ test("a refused or expired reattach, or reattach switched off, ends the prior-ru
       if (scenario.expires) await waitFor(prior.exited, 10_000);
       database = await restartDatabase(database, filename);
       let proofs = 0;
-      const manager = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => scenario.enabled,
+      const events = [];
+      const manager = createTerminalManager({ database, publish: (event) => events.push(event), reattachEnabled: () => scenario.enabled,
+        runtimeInstanceId: "runtime-B",
         recoverTerminal: async () => {
           proofs += 1;
           assert.equal(prior.exited(), Boolean(scenario.expires), "the shell's end did not match the detach window");
@@ -1523,6 +1534,7 @@ test("a refused or expired reattach, or reattach switched off, ends the prior-ru
         assert.equal(proofs, 1);
         assert.equal(manager.get(prior.id), null);
         assert.equal(manager.list().some((entry) => entry.reattached), false);
+        assert.equal(events.some((event) => event.type === "terminal.reattached"), false);
         assert.equal(database.listAudit(50).some((entry) => entry.action === "terminal.reattached"), false);
         assert.equal(database.listAudit(50).some((entry) => entry.action === "terminal.recovered" && entry.target === prior.id), true);
         assert.equal(readReattachRecord(prior.id, database.launchDirectory), null);

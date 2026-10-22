@@ -563,7 +563,7 @@ async function startSessionBroker(t, { session, diagnostics = false } = {}) {
   const start = await client({ type: "start", token: broker.spawnargs.at(-1), shell: process.execPath, cwd: directory,
     env: process.env, cols: 120, rows: 30, ...(session ? { session } : {}) });
   await waitUntil(() => start.frames.some((frame) => frame.type === "ready"), "PTY did not become ready");
-  return { broker, closed, start, client, reattach, connectOnly: connect, stderr: () => stderr };
+  return { directory, broker, closed, start, client, reattach, connectOnly: connect, stderr: () => stderr };
 }
 
 async function waitUntil(predicate, message, timeout = 10_000) {
@@ -634,6 +634,32 @@ test("a reattachable broker keeps the shell through a peer close and accepts eac
   rotated.send({ type: "terminate" });
   await waitUntil(() => rotated.frames.some((frame) => frame.type === "shell-exited"), "terminate did not end the shell");
   await closed;
+});
+
+test("input queued behind output backpressure reaches the shell when its peer detaches", { timeout: 40_000 }, async (t) => {
+  const label = `com.21n.outright.terminal.${randomUUID()}`;
+  const token = randomUUID() + randomUUID();
+  const { directory, start, reattach, stderr } = await startSessionBroker(t, { session: { label, token, windowMs: 30_000 }, diagnostics: true });
+  const identity = start.frames.find((frame) => frame.type === "ready").identity;
+  // A reader that stops pulling a sustained stream backs the broker up, so
+  // input it accepts now waits for the output to drain.
+  start.socket.pause();
+  start.send({ type: "write", data: 'globalThis.flood = setInterval(() => process.stdout.write("f".repeat(65536)), 2)\r' });
+  await waitUntil(() => start.socket.readableLength >= start.socket.readableHighWaterMark, "a paused reader did not fill its read window");
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  start.send({ type: "write", data: 'clearInterval(flood); require("fs").writeFileSync("queued-ran", "ran")\r' });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  start.socket.destroy();
+  await start.ended;
+  const detached = () => stderr().split("\n").map((line) => { try { return JSON.parse(line); } catch { return null; } })
+    .find((event) => event?.broker === "peer-detached");
+  await waitUntil(detached, "the peer close did not detach the shell");
+  assert.ok(detached().pendingInputBytes > 0, `the input was not queued behind backpressure: ${stderr()}`);
+  await waitUntil(() => existsSync(path.join(directory, "queued-ran")), "queued input was lost when the peer detached");
+  const resumed = await reattach({ label, identity, token, nextToken: randomUUID() + randomUUID() });
+  await waitUntil(() => resumed.frames.some((frame) => frame.type === "reattached"), "the shell that ran the input was not kept");
+  resumed.send({ type: "terminate" });
+  await waitUntil(() => resumed.frames.some((frame) => frame.type === "shell-exited"), "terminate did not end the shell");
 });
 
 test("a detached shell ends when its window expires and the broker exits with its status", { timeout: 30_000 }, async (t) => {

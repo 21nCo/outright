@@ -16,7 +16,7 @@ function reservationTerminal(entry) {
 
 export function createTerminalManager({ publish, database, spawnTerminal = null, startManagedTerminal = spawnManagedTerminal,
   recoverTerminal = recoverManagedTerminal, cleanupSocket = cleanupTerminalSocket,
-  reattachTerminal = reattachManagedTerminal, reattachEnabled = () => false, detachWindowMs = 10 * 60 * 1000,
+  reattachTerminal = reattachManagedTerminal, reattachEnabled = () => false, detachWindowMs = 10 * 60 * 1000, runtimeInstanceId = null,
   subprocesses = utilityProcesses, terminate = (terminal, options) => {
   if (typeof terminal.process?.terminate !== "function") throw new Error("PTY owner has no termination verifier");
   return terminal.process.terminate(options);
@@ -170,6 +170,9 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     if (!history?.resume(id)) beginHistory(terminal);
     observeManaged(terminal, processInstance);
     reservedUnknown = unresolvedReservations();
+    // A page that connected while this was a reservation learns here that
+    // this runtime holds it as the verified live process.
+    publish({ type: "terminal.reattached", terminalId: id, payload: { ...publicTerminal(terminal), runtimeInstanceId } });
     terminalsChanged();
     return true;
   }
@@ -370,7 +373,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       if (!terminals.has(id)) return;
       if (!verified || (!outcomeKnown && terminal.status !== "closing")) {
         terminal.status = "unknown";
-        publish({ type: "terminal.audit-failed", terminalId: id, payload: { error: verified
+        publish({ type: "terminal.audit-failed", terminalId: id, payload: { runtimeInstanceId, error: verified
           ? "PTY exit result could not be verified" : "PTY ownership could not be verified empty" } });
         return;
       }
@@ -463,7 +466,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     } catch (error) {
       if (terminals.get(terminal.id) === terminal && !terminal.closePromise) {
         terminal.status = "unknown";
-        publish({ type: "terminal.audit-failed", terminalId: terminal.id, payload: { error: error.message } });
+        publish({ type: "terminal.audit-failed", terminalId: terminal.id, payload: { runtimeInstanceId, error: error.message } });
       }
     }
   }

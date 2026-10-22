@@ -50,6 +50,49 @@ test("only a later runtime's verified live reattach lifts an audit fence", () =>
   assert.equal(replayed.allows(input), false);
 });
 
+test("a reattach verified after the page connected lifts the fence by the same rule", () => {
+  const input = { type: "terminal.input", terminalId: "x", data: "a" };
+  const connected = (runtimeInstanceId, terminals) => ({ type: "runtime.connected", payload: { runtimeInstanceId, terminals } });
+  const reattached = (runtimeInstanceId, terminal = {}) => ({ type: "terminal.reattached", terminalId: "x",
+    payload: { id: "x", status: "running", reattached: true, runtimeInstanceId, ...terminal } });
+  const reserved = { id: "x", status: "unknown", recoveryReservation: true };
+  const fenced = () => {
+    const fence = createTerminalCommandFence();
+    fence.observe(connected("A", []));
+    fence.observe({ type: "terminal.audit-failed", terminalId: "x", payload: { runtimeInstanceId: "A" } });
+    return fence;
+  };
+
+  // Runtime B lists x as a reservation when the page connects, then
+  // verifies the reattach; only its later event can lift the fence.
+  const later = fenced();
+  assert.equal(later.observe(connected("B", [reserved])), false);
+  assert.equal(later.allows(input), false);
+  for (const event of [{ type: "terminals.changed" }, { type: "capacity.changed" }, reattached("A"),
+    reattached("B", { id: "y" }), reattached("B", { recoveryReservation: true }), reattached("B", { reattached: undefined }),
+    reattached(undefined)]) {
+    assert.equal(later.observe(event), false, `fence lifted by ${JSON.stringify(event)}`);
+  }
+  assert.equal(later.allows(input), false);
+  assert.equal(later.observe(reattached("B")), true);
+  assert.equal(later.allows(input), true);
+  later.observe({ type: "terminal.audit-failed", terminalId: "x", payload: { runtimeInstanceId: "B" } });
+  assert.equal(later.observe(reattached("B")), false, "the reattaching runtime's own audit failure must keep its fence");
+
+  // The same sequence from the fencing runtime keeps the fence.
+  const same = fenced();
+  same.observe(connected("A", [reserved]));
+  assert.equal(same.observe(reattached("A")), false);
+  assert.equal(same.allows(input), false);
+
+  // An audit failure B published, replayed before B's runtime.connected,
+  // is B's fence even though the page last connected to A.
+  const replayed = fenced();
+  replayed.observe({ type: "terminal.audit-failed", terminalId: "y", payload: { runtimeInstanceId: "B" } });
+  assert.equal(replayed.observe(connected("B", [{ id: "y", status: "running", reattached: true }])), false);
+  assert.equal(replayed.allows({ type: "terminal.input", terminalId: "y", data: "a" }), false);
+});
+
 test("exited identities are pruned across repeated closes without dropping a pending exit", () => {
   const exited = new Set(["pending-exit"]);
   for (let index = 0; index < 50; index += 1) exited.add(`closed-${index}`);

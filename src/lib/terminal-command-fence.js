@@ -6,10 +6,17 @@ export function createTerminalCommandFence() {
   let runtime = null;
   return {
     observe(event) {
-      if (event.type === "runtime.connected") return release(event.payload);
+      if (event.type === "runtime.connected") return connected(event.payload);
+      // Recovery can verify a reattach after the page connected.
+      if (event.type === "terminal.reattached") {
+        return event.payload?.id === event.terminalId && release(event.payload.runtimeInstanceId, [event.payload]);
+      }
       if (event.type !== "terminal.audit-failed" || typeof event.terminalId !== "string") return false;
+      // The runtime that reported it owns the fence; an event replayed before
+      // its runtime.connected names that runtime itself.
+      const reporter = event.payload?.runtimeInstanceId;
       unknown.delete(event.terminalId);
-      unknown.set(event.terminalId, runtime);
+      unknown.set(event.terminalId, typeof reporter === "string" && reporter ? reporter : runtime);
       // The runtime permits at most 256 terminals. Older IDs have either
       // been removed or remain protected by the server's ownership check.
       if (unknown.size > 256) unknown.delete(unknown.keys().next().value);
@@ -21,22 +28,27 @@ export function createTerminalCommandFence() {
     snapshot() { return new Set(unknown.keys()); },
   };
 
-  // A later runtime that verified a live reattach owns the same process
-  // again, so the earlier runtime's fence no longer applies. A reconnect to
-  // the runtime that fenced it, an unverified reservation or any status but
-  // running keeps the fence.
-  function release(payload) {
+  function connected(payload) {
     const instance = typeof payload?.runtimeInstanceId === "string" ? payload.runtimeInstanceId : null;
     if (!instance) return false;
     runtime = instance;
     // Events replayed before this page's first connection came from the
     // runtime that is now connecting.
     for (const [id, owner] of unknown) if (owner === null) unknown.set(id, instance);
-    if (!Array.isArray(payload.terminals)) return false;
+    return release(instance, payload.terminals);
+  }
+
+  // A later runtime that verified a live reattach owns the same process
+  // again, so the earlier runtime's fence no longer applies. Every channel
+  // that reports a reattach uses this rule. The runtime that fenced it, an
+  // unverified reservation or any status but running keeps the fence.
+  function release(instance, terminals) {
+    if (typeof instance !== "string" || !instance || !Array.isArray(terminals)) return false;
     let released = false;
-    for (const terminal of payload.terminals) {
+    for (const terminal of terminals) {
       if (!terminal || terminal.status !== "running" || terminal.reattached !== true || terminal.recoveryReservation) continue;
-      if (!unknown.has(terminal.id) || unknown.get(terminal.id) === instance) continue;
+      const owner = unknown.get(terminal.id);
+      if (owner == null || owner === instance) continue;
       unknown.delete(terminal.id);
       released = true;
     }

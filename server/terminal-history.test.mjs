@@ -1011,6 +1011,43 @@ test("an exit observed before shutdown is restored with its status, never as end
   }
 });
 
+test("a resumed session keeps saved output inside its cap and continues its last segment", (t) => {
+  const { directory } = workspace(t);
+  const limits = { ...TERMINAL_HISTORY_LIMITS, terminalBytes: 64 * 1024 };
+  const segments = (id) => terminalFiles(directory, id).filter((name) => name.endsWith(".log")).sort();
+  const store = openTerminalHistory({ directory, limits });
+  // Two segments, together inside the cap; a single-segment session; and
+  // a single-segment session whose last append was torn by a crash.
+  const twoSegments = begin(store);
+  const oneSegment = begin(store);
+  const torn = begin(store);
+  const first = "a".repeat(20 * 1024);
+  const second = "b".repeat(20 * 1024);
+  store.append(twoSegments, first);
+  store.append(twoSegments, second);
+  store.append(oneSegment, "one\n");
+  store.append(torn, "whole\n");
+  store.close();
+  assert.equal(segments(twoSegments).length, 2);
+  const [tornSegment] = segments(torn);
+  appendFileSync(path.join(directory, tornSegment), encodeRecord(2, "lost").subarray(0, 9));
+  const savedSegments = segments(oneSegment);
+
+  const restarted = openTerminalHistory({ directory, limits });
+  for (const id of [twoSegments, oneSegment, torn]) assert.equal(restarted.resume(id), true);
+  restarted.append(twoSegments, "detached\n");
+  restarted.append(oneSegment, "two\n");
+  restarted.append(torn, "after\n");
+  restarted.close();
+  assert.deepEqual(segments(oneSegment), savedSegments, "a resumed session with room started another segment");
+
+  const again = openTerminalHistory({ directory, limits });
+  assert.equal(again.read(twoSegments), `${first}${second}detached\n`, "resume dropped saved output inside the cap");
+  assert.equal(again.read(oneSegment), "one\ntwo\n");
+  assert.equal(again.read(torn), "whole\nafter\n", "output after a torn tail was not restored");
+  again.close();
+});
+
 test("a reattached session resumes its restart-ended history; a session that exited stays ended", (t) => {
   const { directory } = workspace(t);
   const store = openTerminalHistory({ directory });

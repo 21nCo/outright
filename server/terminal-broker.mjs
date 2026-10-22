@@ -65,7 +65,7 @@ function expireDetached() {
   if (server.listening) server.close();
 }
 
-function detach(unsent, omitted) {
+function detach(unsent, omitted, details = {}) {
   attached = null;
   peer = undefined;
   detached = { output: createDetachedOutput(), timer: setTimeout(expireDetached, session.windowMs) };
@@ -73,7 +73,7 @@ function detach(unsent, omitted) {
   detached.output.push(unsent);
   // A peer's backpressure must not hold the shell while nobody reads it.
   if (process.platform !== "win32") try { terminal.resume(); } catch { /* The shell may already be gone. */ }
-  diagnostic("peer-detached", { windowMs: session.windowMs });
+  diagnostic("peer-detached", { windowMs: session.windowMs, ...details });
 }
 
 function onTerminalData(data) {
@@ -125,8 +125,8 @@ const server = net.createServer((socket) => {
   let peerClosedRecorded = false;
   // A reattach attempt that never completes cannot hold the only peer slot.
   const handshakeTimer = detached ? setTimeout(() => { if (!authenticated) socket.destroy(); }, 5000) : undefined;
-  const flushInput = () => {
-    if (outputPaused || pendingOutput || !pendingInput || shellExited || !terminal) return;
+  const flushInput = (force = false) => {
+    if ((!force && (outputPaused || pendingOutput)) || !pendingInput || shellExited || !terminal) return;
     const input = pendingInput;
     pendingInput = "";
     terminal.write(input);
@@ -346,7 +346,10 @@ const server = net.createServer((socket) => {
       return;
     }
     if (session && attached === handlers && !shellExited && terminal) {
-      detach(pendingOutput.slice(outputOffset), omittedChars);
+      detach(pendingOutput.slice(outputOffset), omittedChars, { pendingInputBytes: Buffer.byteLength(pendingInput) });
+      // Input this broker accepted still reaches the shell that outlives
+      // the peer, in order, after the detached ring takes its output.
+      flushInput(true);
       return;
     }
     recordPeerClosed();

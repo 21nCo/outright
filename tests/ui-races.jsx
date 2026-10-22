@@ -3000,6 +3000,67 @@ async function terminalReattachLiftsFenceRegression() {
   assert(commands.includes("terminal.input") && commands.includes("terminal.resize"), `Reattached terminal dropped input or resize: ${commands}`);
 }
 
+// Recovery can verify the reattach after the page has connected to the new
+// runtime, while the terminal is still listed as a reservation. Its
+// terminal.reattached event lifts the fence without another reconnect.
+async function terminalReattachAfterConnectRegression() {
+  root.render(null);
+  await settle();
+  const sent = [];
+  const fence = createTerminalCommandFence();
+  const base = { id: "term-Y", name: "Worker", cwd: "/fixture/A", pid: 4500, createdAt: "2026-10-21T00:00:00.000Z" };
+  let listed = [{ ...base, status: "running" }];
+  let version = 0;
+  let paneEvent = null;
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") return response({ error: "unexpected" }, 500);
+    if (url.pathname === "/api/terminals") return response({ terminals: listed, history: { persistent: true, warning: null } });
+    return response({ ...listed[0], buffer: "kept running\r\n", outputCursor: 1 });
+  };
+  // Like App: every event reaches the fence; listings change by version and
+  // only the pane's event types are handed to it.
+  const show = (event) => {
+    fence.observe(event);
+    if (["terminals.changed", "terminal.history"].includes(event.type)) version += 1;
+    if (["terminal.audit-failed", "runtime.connected", "capacity.changed"].includes(event.type)) paneEvent = event;
+    root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={paneEvent} terminalsVersion={version}
+      unverifiedTerminalIds={fence.snapshot()} onError={(error) => { throw error; }}
+      sendRuntime={(message) => { if (fence.allows(message)) sent.push(message); }} />);
+  };
+  const tabLabel = () => host.querySelector('#terminal-tab-term-Y')?.getAttribute("aria-label") ?? "";
+  const typeAndResize = async (width) => {
+    const before = sent.length;
+    const input = host.querySelector('.terminal-host .xterm-helper-textarea');
+    input.focus();
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "y", code: "KeyY", keyCode: 89, which: 89, bubbles: true, cancelable: true }));
+    host.querySelector('.terminal-host').style.width = width;
+    await settle();
+    return sent.slice(before).filter((message) => message.terminalId === "term-Y").map((message) => message.type);
+  };
+  show({ type: "runtime.connected", payload: { runtimeInstanceId: "runtime-A", terminals: listed, replay: { requestedAfter: 0 } } });
+  await until(() => terminalReady("Worker"), "live terminal ready");
+  show({ type: "terminal.audit-failed", terminalId: "term-Y", payload: { runtimeInstanceId: "runtime-A" } });
+  await until(() => tabLabel().includes("ownership unverified"), "audit failure fences the terminal");
+
+  // Runtime B is still proving the prior-run owner when the page connects.
+  listed = [{ ...base, status: "unknown", recoveryReservation: true }];
+  show({ type: "runtime.connected", payload: { runtimeInstanceId: "runtime-B", restarted: true, terminals: listed, replay: { requestedAfter: 5, missed: true } } });
+  await settle();
+  await until(() => host.querySelector('.terminal-tabs[aria-busy="false"]') && tabLabel().includes("ownership unverified"), "the reservation is shown");
+  assert(fence.snapshot().has("term-Y"), "A reservation lifted the fence");
+
+  // B verifies the reattach and publishes it, then the coalesced listing change.
+  listed = [{ ...base, status: "running", reattached: true }];
+  show({ type: "terminal.reattached", terminalId: "term-Y", payload: { ...listed[0], runtimeInstanceId: "runtime-B" } });
+  show({ type: "terminals.changed" });
+  show({ type: "capacity.changed" });
+  await until(() => terminalReady("WorkerReattached") && tabLabel() === "Worker, live process reattached", "a reattach verified after connect lifts the fence");
+  assert(!fence.snapshot().has("term-Y"), "The unverified set kept a verified reattached terminal");
+  assert(terminalStatusText().includes("live process reattached"), "Reattached terminal lacks its spoken status");
+  const commands = await typeAndResize("540px");
+  assert(commands.includes("terminal.input") && commands.includes("terminal.resize"), `Reattached terminal dropped input or resize: ${commands}`);
+}
+
 async function terminalSelectionReconnectRegression() {
   root.render(null);
   await settle();
@@ -6871,6 +6932,7 @@ try {
     ["terminal close history failure", terminalCloseHistoryFailureRegression, "a close whose saved output cannot be deleted shows it ended and read-only"],
     ["terminal fenced saved session", terminalFencedSavedSessionRegression, "a saved status from the server wins over the page audit fence"],
     ["terminal reattach lifts fence", terminalReattachLiftsFenceRegression, "a later runtime's verified live reattach lifts the audit fence; a same-runtime reconnect does not"],
+    ["terminal reattach after connect", terminalReattachAfterConnectRegression, "a reattach verified after the page connected lifts the audit fence without a reconnect"],
     ["terminal selection during reconnect", terminalSelectionReconnectRegression, "selected terminal and output survive a reconnect while its buffer is pending"],
     ["terminal activation ownership", terminalActivationOwnershipRegression, "terminal activation commits output and current PTY size together"],
     ["rejected terminal switch", terminalRejectedSwitchRegression, "rejected terminal switch restores the selected tab focus"],
