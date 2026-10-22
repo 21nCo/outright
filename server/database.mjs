@@ -24,6 +24,9 @@ const DEFAULT_SETTINGS = {
   retentionDays: RESOURCE_BUDGETS.retentionDays,
   notifications: true,
   theme: "system",
+  // Capability switch for detachable terminals; off until supervisors keep
+  // a broker alive across an Outright restart.
+  terminalReattach: false,
 };
 
 const MAX_RUN_EVENT_PAYLOAD_BYTES = 256 * 1024;
@@ -93,7 +96,9 @@ const SETTING_RULES = {
   retentionDays: (value) => Number.isInteger(value) && value >= 1 && value <= 3650,
   notifications: (value) => typeof value === "boolean",
   theme: (value) => ["system", "light", "dark"].includes(value),
+  terminalReattach: (value) => typeof value === "boolean",
 };
+const TERMINAL_OUTCOMES = ["terminal.create.failed", "terminal.exited", "terminal.closed", "terminal.recovered"];
 
 function recordTerminalAuditRequest(scan, row, details, operationId) {
   if (["terminal.create.requested", "terminal.close.requested"].includes(row.action) && operationId) {
@@ -106,7 +111,7 @@ function recordTerminalAuditRequest(scan, row, details, operationId) {
 }
 
 function recordTerminalAuditOwner(scan, row, details) {
-  if (["terminal.create.requested", "terminal.created", "terminal.create.unknown", "terminal.unknown"].includes(row.action)
+  if (["terminal.create.requested", "terminal.created", "terminal.create.unknown", "terminal.unknown", "terminal.reattached"].includes(row.action)
     && row.target) {
     const current = scan.owners.get(row.target) ?? { target: row.target, created: 0 };
     for (const key of ["cwd", "ownershipLabel", "handshakePath", "pid", "processIdentity"]) {
@@ -114,6 +119,8 @@ function recordTerminalAuditOwner(scan, row, details) {
     }
     if (row.action === "terminal.created") current.created = 1;
     if (row.action === "terminal.unknown") current.unknownRecorded = true;
+    // A reattached owner was live again; a later restart is a new unknown.
+    if (row.action === "terminal.reattached") current.unknownRecorded = false;
     scan.owners.set(row.target, current);
   }
 }
@@ -139,7 +146,7 @@ function applyTerminalAuditRow(scan, row) {
   if (operationId) scan.requests.delete(operationId);
   recordTerminalAuditRequest(scan, row, details, operationId);
   recordTerminalAuditOwner(scan, row, details);
-  if (["terminal.create.failed", "terminal.exited", "terminal.closed", "terminal.recovered"].includes(row.action)) {
+  if (TERMINAL_OUTCOMES.includes(row.action)) {
     scan.owners.delete(row.target);
   }
   if (scan.requests.size > 10_000 || scan.owners.size > 10_000) {
@@ -521,6 +528,10 @@ export function createOutrightDatabase(options = {}) {
       writeAudit(action, details);
       reserveRecoveryHeadroom(db);
     }).immediate();
+    // A reattached prior-run owner settles in this run; its reservation goes.
+    if (terminalReservationsCache && TERMINAL_OUTCOMES.includes(action)) {
+      terminalReservationsCache = terminalReservationsCache.filter((entry) => entry.target !== details.target);
+    }
   }
 
   // Within a caller's transaction: only a queued run takes an account.

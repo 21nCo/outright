@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, opendirSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, opendirSync, readFileSync, renameSync, rmSync, truncateSync, writeSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "./child-process.mjs";
 import { hardenWindowsLaunchDirectory } from "./agent-manager.mjs";
@@ -283,6 +283,23 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
     return true;
   }
 
+  // A resumed session appends to its last segment, so saved output inside
+  // the cap stays until new output rolls it out as write() would. A tail torn
+  // by the prior run is cut first, so new records follow the last whole one.
+  function continueSegment(entry) {
+    const last = entry.segments.at(-1);
+    if (!last) return openSegment(entry);
+    const name = file(segmentName(entry.id, last.seq));
+    const { validBytes } = decodeRecords(readFileSync(name), segmentLimit);
+    if (validBytes !== last.bytes) {
+      truncateSync(name, validBytes);
+      total -= last.bytes - validBytes;
+      last.bytes = validBytes;
+    }
+    entry.fd = openSync(name, "a", 0o600);
+    return true;
+  }
+
   // Output reaches the descriptor as it is published, so an abrupt exit
   // keeps everything a client could already have seen.
   function write(entry, data) {
@@ -526,6 +543,20 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
           try { discard(entry); } catch { /* Persistence is disabled below. */ }
           throw error;
         }
+        enforce();
+      });
+    },
+    // A reattached live process continues the session this start marked as
+    // ended by restart. Any other ended session stays as it ended.
+    resume(id) {
+      const entry = entries.get(id);
+      if (entry?.meta.end?.reason !== "restart" || entry.stalled) return false;
+      return guarded(() => {
+        const { end, ...meta } = entry.meta;
+        entry.meta = meta;
+        entry.endedAt = null;
+        writeMeta(entry);
+        continueSegment(entry);
         enforce();
       });
     },

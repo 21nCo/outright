@@ -2,10 +2,19 @@
 // archive shadow. Pending effects and live terminals are recovery evidence.
 export const MAX_PENDING_RETENTION_CLEANUPS = 16;
 export const AUDIT_RETENTION_LIMIT = 10_000;
+// A terminal's owner rows stay until an outcome follows them. A reattach is
+// one: startup replay reads it to record a later restart's unknown again.
+const TERMINAL_OWNERS = "'terminal.create.requested', 'terminal.created', 'terminal.create.unknown', 'terminal.unknown', 'terminal.reattached'";
+const TERMINAL_EVIDENCE = `${TERMINAL_OWNERS}, 'terminal.exited', 'terminal.closed', 'terminal.recovered', 'terminal.create.failed'`;
 // A small indexed projection contains only rows that can participate in a
 // recovery dependency. Triggers cover direct SQLite writers and the bounded
 // startup audit scan backfills legacy rows before any trimming is allowed.
 export function prepareAuditEvidence(db, hadAudit) {
+  // A database from before terminal.reattached keeps triggers that omit it.
+  for (const name of ["audit_evidence_insert", "audit_evidence_update"]) {
+    const trigger = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?").get(name);
+    if (trigger && !trigger.sql.includes("'terminal.reattached'")) db.exec(`DROP TRIGGER ${name}`);
+  }
   db.exec(`CREATE TABLE IF NOT EXISTS audit_evidence (
       id INTEGER PRIMARY KEY, action TEXT NOT NULL, target TEXT, operation_id TEXT);
     CREATE INDEX IF NOT EXISTS audit_evidence_target ON audit_evidence(target, id);
@@ -14,8 +23,7 @@ export function prepareAuditEvidence(db, hadAudit) {
     CREATE TABLE IF NOT EXISTS audit_evidence_state (
       id INTEGER PRIMARY KEY CHECK (id = 1), complete INTEGER NOT NULL);
     CREATE TRIGGER IF NOT EXISTS audit_evidence_insert AFTER INSERT ON audit_log
-    WHEN NEW.action IN ('terminal.create.requested', 'terminal.created', 'terminal.create.unknown',
-      'terminal.unknown', 'terminal.exited', 'terminal.closed', 'terminal.recovered', 'terminal.create.failed')
+    WHEN NEW.action IN (${TERMINAL_EVIDENCE})
       OR NEW.action LIKE '%.requested'
       OR (json_valid(NEW.details) AND json_extract(NEW.details, '$.operationId') IS NOT NULL)
     BEGIN
@@ -31,8 +39,7 @@ export function prepareAuditEvidence(db, hadAudit) {
       INSERT INTO audit_evidence (id, action, target, operation_id)
         SELECT NEW.id, NEW.action, NEW.target,
           CASE WHEN json_valid(NEW.details) THEN json_extract(NEW.details, '$.operationId') END
-        WHERE NEW.action IN ('terminal.create.requested', 'terminal.created', 'terminal.create.unknown',
-          'terminal.unknown', 'terminal.exited', 'terminal.closed', 'terminal.recovered', 'terminal.create.failed')
+        WHERE NEW.action IN (${TERMINAL_EVIDENCE})
           OR NEW.action LIKE '%.requested'
           OR (json_valid(NEW.details) AND json_extract(NEW.details, '$.operationId') IS NOT NULL);
     END;`);
@@ -43,8 +50,7 @@ export function backfillAuditEvidencePage(db, afterId, throughId) {
   db.prepare(`INSERT OR IGNORE INTO audit_evidence (id, action, target, operation_id)
     SELECT id, action, target, CASE WHEN json_valid(details) THEN json_extract(details, '$.operationId') END
     FROM audit_log WHERE id > ? AND id <= ? AND (
-      action IN ('terminal.create.requested', 'terminal.created', 'terminal.create.unknown',
-        'terminal.unknown', 'terminal.exited', 'terminal.closed', 'terminal.recovered', 'terminal.create.failed')
+      action IN (${TERMINAL_EVIDENCE})
       OR action LIKE '%.requested'
       OR (json_valid(details) AND json_extract(details, '$.operationId') IS NOT NULL))`).run(afterId, throughId);
 }
@@ -65,8 +71,7 @@ export const auditTrimSql = `WITH candidates AS MATERIALIZED (
         (candidate.action LIKE '%.requested' AND candidate.operation_id IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM audit_evidence AS outcome
             WHERE outcome.operation_id = candidate.operation_id AND outcome.id > candidate.id))
-        OR (candidate.action IN ('terminal.create.requested', 'terminal.created',
-            'terminal.create.unknown', 'terminal.unknown')
+        OR (candidate.action IN (${TERMINAL_OWNERS})
           AND NOT EXISTS (SELECT 1 FROM audit_evidence AS outcome
             WHERE outcome.target = candidate.target AND outcome.id > candidate.id
               AND outcome.action IN ('terminal.exited', 'terminal.closed',
@@ -75,8 +80,7 @@ export const auditTrimSql = `WITH candidates AS MATERIALIZED (
             'terminal.recovered', 'terminal.create.failed')
           AND EXISTS (SELECT 1 FROM audit_evidence AS owner
             WHERE owner.target = candidate.target AND owner.id < candidate.id
-              AND owner.action IN ('terminal.create.requested', 'terminal.created',
-                'terminal.create.unknown', 'terminal.unknown')))
+              AND owner.action IN (${TERMINAL_OWNERS})))
         OR (candidate.operation_id IS NOT NULL
           AND EXISTS (SELECT 1 FROM audit_evidence AS request
             WHERE request.operation_id = candidate.operation_id AND request.id < candidate.id

@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createTerminalManager } from "./terminal-manager.mjs";
-import { cleanupTerminalSocket, recordTerminalEmpty, recoverManagedTerminal, terminalOwnership } from "./managed-terminal.mjs";
+import { openTerminalHistory, probeWindowsHistoryAcl, windowsAclPrivate } from "./terminal-history.mjs";
+import { reattachNonce, reattachProof } from "./terminal-reattach-proof.mjs";
+import { cleanupTerminalSocket, readReattachRecord, reattachManagedTerminal, reattachToken, recordTerminalEmpty, recoverManagedTerminal, terminalOwnership,
+  writeReattachRecord } from "./managed-terminal.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 import { AUDIT_RETENTION_LIMIT, auditTrimSql, trimAudit, trimAuditPage } from "./audit-retention.mjs";
 import { createOutrightRuntime } from "./outright-runtime.mjs";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import net from "node:net";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -1175,6 +1179,67 @@ test("legacy audit evidence backfills in startup pages before retention can reti
   } finally { await database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("a reattach stays with its unknown owner through live and archive retention, so the next restart records it again", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-audit-reattached-"));
+  const filename = path.join(directory, "runtime.db");
+  const id = randomUUID();
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  database.auditCritical("terminal.created", { target: id, cwd: directory, ownershipLabel: `com.21n.outright.terminal.${id}`,
+    handshakePath: path.join(directory, `terminal-${id}.json`), pid: 4321 });
+  const unknowns = () => {
+    const proof = new Database(filename, { readonly: true });
+    try { return proof.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'terminal.unknown' AND target = ?").get(id).count; }
+    finally { proof.close(); }
+  };
+  const restart = async () => {
+    database.close();
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    database.reconcileTerminalAudit();
+    await database.waitForTerminalAuditReconciliation();
+  };
+  try {
+    await restart();
+    assert.equal(unknowns(), 1);
+    database.close();
+    // A database from before terminal.reattached has projection triggers
+    // that omit it; opening it again replaces them.
+    const legacy = new Database(filename);
+    try {
+      for (const name of ["audit_evidence_insert", "audit_evidence_update"]) {
+        const { sql } = legacy.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?").get(name);
+        legacy.exec(`DROP TRIGGER ${name}; ${sql.replaceAll("'terminal.reattached', ", "")}`);
+      }
+    } finally { legacy.close(); }
+    database = createOutrightDatabase({ filename, runtimeLease: true });
+    database.auditCritical("terminal.reattached", { target: id, cwd: directory, ownershipLabel: `com.21n.outright.terminal.${id}` });
+    const writer = new Database(filename);
+    try {
+      // The outcome rule finds owners through the projection.
+      assert.ok(writer.prepare("SELECT 1 FROM audit_evidence WHERE target = ? AND action = 'terminal.reattached'").get(id),
+        "the projection of an upgraded database omits the reattach");
+      const insert = writer.prepare("INSERT INTO audit_log (action, target, details, created_at) VALUES ('telemetry', '', '{}', '2026-09-01')");
+      writer.transaction(() => { for (let index = 0; index < AUDIT_RETENTION_LIMIT + 50; index += 1) insert.run(); }).immediate();
+      // The archive worker trims a shadow copy with the same rule.
+      const shadowFile = path.join(directory, "shadow.db");
+      writer.exec(`VACUUM INTO '${shadowFile.replaceAll("'", "''")}'`);
+      const shadow = new Database(shadowFile);
+      try {
+        for (let page = 0; page < 800 && !trimAuditPage(shadow).complete; page += 1);
+        assert.deepEqual(shadow.prepare("SELECT action FROM audit_log WHERE target = ? ORDER BY id").all(id).map((row) => row.action),
+          ["terminal.created", "terminal.unknown", "terminal.reattached"], "archive retention dropped the reattach");
+      } finally { shadow.close(); }
+      for (let page = 0; page < 800 && !trimAuditPage(writer).complete; page += 1);
+      assert.deepEqual(writer.prepare("SELECT action FROM audit_log WHERE target = ? ORDER BY id").all(id).map((row) => row.action),
+        ["terminal.created", "terminal.unknown", "terminal.reattached"], "live retention dropped the reattach");
+      assert.ok(writer.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'telemetry'").get().count < AUDIT_RETENTION_LIMIT);
+    } finally { writer.close(); }
+    // The owner went live again, so the next restart finds it unknown anew.
+    await restart();
+    assert.equal(unknowns(), 2, "a restart after the reattach did not record the owner unknown");
+    assert.ok(database.terminalUnknownReservations().some((entry) => entry.target === id));
+  } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("legacy unknown terminal ownership consumes each worktree limit", async () => {
   const reservation = { target: "56b5370b-7ff3-470c-bb68-469b01c96915", cwd: null };
   let launched = false;
@@ -1387,6 +1452,714 @@ test("restart settles crash and maintenance-interrupted PTY evidence before rete
       assert.ok(proof.prepare("SELECT COUNT(*) AS count FROM audit_log").get().count <= AUDIT_RETENTION_LIMIT + 10);
     } finally { proof.close(); }
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+// A runtime directory for a reattach test, cleaned up in one fixed order:
+// its managers shut down, its prior-run brokers end, then the database
+// closes and the directory goes. Windows refuses to remove a live shell's
+// working directory, and a failed hook skips every later one.
+const runtimes = new WeakMap();
+function reattachRuntime(t, prefix, currentDatabase) {
+  const directory = mkdtempSync(path.join(os.tmpdir(), prefix));
+  const runtime = { directory, filename: path.join(directory, "runtime.db"), stops: [] };
+  runtimes.set(t, runtime);
+  t.after(async () => {
+    for (const stop of runtime.stops.reverse()) await Promise.resolve().then(stop).catch(() => {});
+    currentDatabase().close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  return runtime;
+}
+
+// A terminal a previous Outright process launched with reattach on: a broker
+// at the managed address, its private record and created audit. Its peer
+// then closes as when that process crashed, while the broker stays alive.
+async function priorRunTerminal(t, database, cwd, { recordToken, windowMs = 60_000, savedOutput = null,
+  detachedCommand = "setTimeout(() => console.log('while-' + 'detached'), 300)" } = {}) {
+  const id = randomUUID();
+  if (savedOutput) {
+    // That process's history, as its abrupt end left it.
+    const history = openTerminalHistory({ directory: path.join(database.launchDirectory, "terminal-history") });
+    assert.equal(history.begin({ id, name: "Terminal", cwd, createdAt: new Date().toISOString() }, savedOutput), true);
+    history.finish(id);
+    history.close();
+  }
+  const ownership = terminalOwnership(id, database.launchDirectory);
+  const token = reattachToken();
+  const brokerScript = fileURLToPath(new URL("./terminal-broker.mjs", import.meta.url));
+  const broker = spawn(process.execPath, [brokerScript, ownership.address, ownership.token],
+    { stdio: "ignore", detached: process.platform !== "win32", windowsHide: true });
+  const exited = () => broker.exitCode !== null || broker.signalCode !== null;
+  const kill = () => {
+    if (exited()) return;
+    if (process.platform === "win32") spawnSync("taskkill", ["/T", "/F", "/PID", String(broker.pid)], { windowsHide: true, stdio: "ignore", timeout: 5000 });
+    else try { process.kill(-broker.pid, "SIGKILL"); } catch {}
+  };
+  if (runtimes.has(t)) runtimes.get(t).stops.push(kill);
+  else t.after(kill);
+  let socket;
+  const deadline = Date.now() + 8000;
+  while (!socket) {
+    try {
+      socket = await new Promise((resolve, reject) => {
+        const candidate = net.createConnection(ownership.address);
+        candidate.once("connect", () => resolve(candidate));
+        candidate.once("error", reject);
+      });
+    } catch (error) {
+      if (Date.now() > deadline || exited()) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  let frames = "";
+  socket.setEncoding("utf8");
+  socket.on("data", (chunk) => { frames += chunk; });
+  const send = (message) => socket.write(`${JSON.stringify(message)}\n`);
+  send({ type: "start", token: ownership.token, shell: process.execPath, cwd, env: process.env, cols: 100, rows: 30,
+    session: { label: ownership.label, token, windowMs } });
+  await waitFor(() => frames.includes('"type":"ready"'), 10_000, () => frames);
+  const identity = JSON.parse(frames.slice(0, frames.indexOf("\n"))).identity;
+  writeReattachRecord(id, database.launchDirectory, { identity, token: recordToken ?? token });
+  database.auditCritical("terminal.created", { target: id, cwd, ownershipLabel: ownership.label,
+    handshakePath: ownership.handshakePath, pid: broker.pid });
+  // Only the shell's output counts; the ready frame's identity can hold any digits.
+  const output = () => frames.slice(0, frames.lastIndexOf("\n")).split("\n")
+    .filter((line) => line.startsWith('{"type":"data"')).map((line) => JSON.parse(line).data).join("");
+  send({ type: "write", data: "globalThis.kept = 41\r" });
+  await waitFor(() => output().includes("41"), 10_000, output);
+  // The shell runs detachedCommand once the peer is gone. It acknowledges
+  // the command first, so the broker has read it before the close: input
+  // still unread when a peer closes can be lost, as in a crash.
+  const peerGone = path.join(cwd, `${id}.detached`);
+  send({ type: "write", data: `globalThis.armed = setInterval(() => { if (!require('node:fs').existsSync(${JSON.stringify(peerGone)})) return; `
+    + `clearInterval(armed); ${detachedCommand}; }, 25); console.log('ar' + 'med')\r` });
+  await waitFor(() => output().includes("armed"), 10_000, output);
+  socket.destroy();
+  await new Promise((resolve) => socket.once("close", resolve));
+  writeFileSync(peerGone, "");
+  return { id, token, identity, broker, exited, kill };
+}
+
+function restartDatabase(database, filename) {
+  database.close();
+  const reopened = createOutrightDatabase({ filename, runtimeLease: true });
+  reopened.reconcileTerminalAudit();
+  return reopened.waitForTerminalAuditReconciliation().then(() => reopened);
+}
+
+test("restart recovery reattaches a live prior-run shell with its buffered output, audit and capacity", { timeout: 60_000 }, async (t) => {
+  const { directory, filename, stops } = reattachRuntime(t, "outright-terminal-reattach-", () => database);
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  const prior = await priorRunTerminal(t, database, directory);
+  database = await restartDatabase(database, filename);
+  const events = [];
+  const manager = createTerminalManager({ database, publish: (event) => events.push(event), maxTerminals: 1, reattachEnabled: () => true,
+    runtimeInstanceId: "runtime-B",
+    recoverTerminal: async () => { await waitFor(prior.exited, 6000).catch(() => {}); return prior.exited(); } });
+  stops.push(() => manager.shutdown());
+  // The detached shell holds its slot before and after it is reattached.
+  assert.equal(manager.capacity().active, 1);
+  assert.equal(manager.get(prior.id).recoveryReservation, true);
+  await assert.rejects(manager.create({ cwd: directory }), (error) => error.statusCode === 429);
+  assert.equal(await manager.reconcileUnknown(), 1);
+  assert.equal(prior.exited(), false, "recovery ended a shell it could reattach");
+  const live = manager.get(prior.id);
+  assert.equal(live.status, "running");
+  assert.equal(live.reattached, true);
+  assert.equal(live.recoveryReservation, undefined);
+  assert.deepEqual(manager.capacity(), { active: 1, unknown: 0, limit: 1 });
+  // A page that connected during recovery learns which runtime verified it.
+  const announced = events.filter((event) => event.type === "terminal.reattached");
+  assert.equal(announced.length, 1);
+  assert.equal(announced[0].terminalId, prior.id);
+  assert.deepEqual({ ...announced[0].payload, pid: undefined, createdAt: undefined }, { ...manager.list().find((entry) => entry.id === prior.id),
+    pid: undefined, createdAt: undefined, runtimeInstanceId: "runtime-B" });
+  assert.equal(announced[0].payload.recoveryReservation, undefined);
+  await assert.rejects(manager.create({ cwd: directory }), (error) => error.statusCode === 429);
+  await waitFor(() => manager.get(prior.id).buffer.includes("while-detached"), 10_000, () => manager.get(prior.id).buffer);
+  assert.equal(manager.write(prior.id, "kept + 1\r"), true);
+  await waitFor(() => manager.get(prior.id).buffer.includes("42"), 10_000, () => manager.get(prior.id).buffer);
+  const reattached = database.listAudit(50).filter((entry) => entry.action === "terminal.reattached");
+  assert.deepEqual(reattached.map((entry) => entry.target), [prior.id]);
+  assert.equal(JSON.stringify(database.listAudit(50)).includes(prior.token), false, "a reattach token reached the audit log");
+  const rotated = readReattachRecord(prior.id, database.launchDirectory);
+  assert.equal(rotated.identity, prior.identity);
+  assert.notEqual(rotated.token, prior.token, "a successful reattach kept its spent token");
+  assert.equal(await manager.close(prior.id), true);
+  assert.equal(prior.exited(), true);
+  assert.equal(readReattachRecord(prior.id, database.launchDirectory), null);
+  // The settled prior-run owner never returns as a reservation.
+  manager.reloadUnknownReservations();
+  assert.deepEqual(manager.capacity(), { active: 0, unknown: 0, limit: 1 });
+  assert.equal(database.terminalUnknownReservations().some((entry) => entry.target === prior.id), false);
+});
+
+test("a refused or expired reattach, or reattach switched off, ends the prior-run shell through native recovery", { timeout: 90_000 }, async (t) => {
+  for (const scenario of [{ enabled: true, recordToken: reattachToken() }, { enabled: false },
+    { enabled: true, windowMs: 300, expires: true }]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-reattach-refused-"));
+    const filename = path.join(directory, "runtime.db");
+    let database = createOutrightDatabase({ filename, runtimeLease: true });
+    try {
+      const prior = await priorRunTerminal(t, database, directory, scenario);
+      // The detach window ends the shell and its broker before any restart.
+      if (scenario.expires) await waitFor(prior.exited, 10_000);
+      database = await restartDatabase(database, filename);
+      let proofs = 0;
+      const events = [];
+      const manager = createTerminalManager({ database, publish: (event) => events.push(event), reattachEnabled: () => scenario.enabled,
+        runtimeInstanceId: "runtime-B",
+        recoverTerminal: async () => {
+          proofs += 1;
+          assert.equal(prior.exited(), Boolean(scenario.expires), "the shell's end did not match the detach window");
+          prior.kill();
+          await waitFor(prior.exited, 6000);
+          return true;
+        } });
+      try {
+        assert.equal(await manager.reconcileUnknown(), 1);
+        assert.equal(proofs, 1);
+        assert.equal(manager.get(prior.id), null);
+        assert.equal(manager.list().some((entry) => entry.reattached), false);
+        assert.equal(events.some((event) => event.type === "terminal.reattached"), false);
+        assert.equal(database.listAudit(50).some((entry) => entry.action === "terminal.reattached"), false);
+        assert.equal(database.listAudit(50).some((entry) => entry.action === "terminal.recovered" && entry.target === prior.id), true);
+        assert.equal(readReattachRecord(prior.id, database.launchDirectory), null);
+        assert.equal(manager.capacity().active, 0);
+      } finally { await manager.shutdown(); }
+    } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+  }
+});
+
+test("a managed terminal keeps a private reattach record only while reattach is on", { timeout: 40_000 }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-reattach-record-"));
+  const database = createOutrightDatabase({ filename: path.join(directory, "runtime.db"), runtimeLease: true });
+  let enabled = true;
+  const manager = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => enabled });
+  try {
+    const terminal = await manager.create({ cwd: directory });
+    const file = path.join(database.launchDirectory, `terminal-${terminal.id}.reattach`);
+    const record = readReattachRecord(terminal.id, database.launchDirectory);
+    assert.ok(record, "no reattach record was kept for a reattachable terminal");
+    if (process.platform !== "win32") assert.equal(statSync(file).mode & 0o777, 0o600);
+    else {
+      // Windows keeps it private through the launch directory's hardened ACL:
+      // the directory and the record grant no principal beyond the owner set.
+      const report = probeWindowsHistoryAcl(database.launchDirectory, (command, args, options) => spawnSync(command, args,
+        { ...options, env: { ...options.env, OUTRIGHT_HISTORY_NAMES: `^terminal-${terminal.id}\\.reattach$` } }));
+      assert.equal(windowsAclPrivate(report), true, `the reattach record is not private: ${JSON.stringify(report)}`);
+    }
+    assert.equal(JSON.stringify(database.listAudit(20)).includes(record.token), false);
+    assert.equal(manager.get(terminal.id).reattached, undefined, "a new shell was labeled as reattached");
+    assert.equal(await manager.close(terminal.id), true);
+    assert.equal(existsSync(file), false);
+    enabled = false;
+    const plain = await manager.create({ cwd: directory });
+    assert.equal(existsSync(path.join(database.launchDirectory, `terminal-${plain.id}.reattach`)), false);
+  } finally {
+    await manager.shutdown();
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// Native recovery for a prior-run broker the test launched: it ends that
+// broker, unless a call is told to fail as a transient proof failure would.
+function brokerRecovery(prior, { failFirst = false } = {}) {
+  const recovery = async () => {
+    recovery.calls += 1;
+    if (failFirst && recovery.calls === 1) return false;
+    prior.kill();
+    await waitFor(prior.exited, 6000).catch(() => {});
+    return prior.exited();
+  };
+  recovery.calls = 0;
+  return recovery;
+}
+
+test("a reattached shell's detached output reaches saved history once, after the output saved before the restart", { timeout: 120_000 }, async (t) => {
+  const { directory, filename, stops } = reattachRuntime(t, "outright-terminal-reattach-history-", () => database);
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  const saved = await priorRunTerminal(t, database, directory, { savedOutput: "saved-before-restart\r\n" });
+  // Enough output while detached to overflow the 1 MiB ring on every PTY,
+  // then a marker and a completion file, so the ring has dropped its oldest
+  // output first. ConPTY renders rather than relays output; 8 MiB still
+  // yields well over 1 MiB there.
+  const done = path.join(directory, "overflow.done");
+  const overflow = await priorRunTerminal(t, database, directory, { detachedCommand: "setTimeout(() => { "
+    + "process.stdout.write('x'.repeat(8 * 1024 * 1024) + '\\r\\ntail-' + 'marker\\r\\n'); "
+    + `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(done)}, '1'), 500); }, 300)` });
+  await waitFor(() => existsSync(done), 60_000);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  assert.equal(saved.exited() || overflow.exited(), false, "a detached shell ended inside its window");
+  database = await restartDatabase(database, filename);
+  // Holding each adapter back lets its whole replay arrive before the manager
+  // observes it, as when the event loop is busy, so registration delivers it.
+  const manager = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => true,
+    recoverTerminal: async () => true, reattachTerminal: async (options) => {
+      const adapter = await reattachManagedTerminal(options);
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      return adapter;
+    } });
+  stops.push(() => manager.shutdown());
+  assert.equal(await manager.reconcileUnknown(), 2);
+  const notice = /earlier terminal output characters were dropped while detached/g;
+  const live = (id) => manager.get(id).buffer;
+  await waitFor(() => live(saved.id).includes("while-detached") && live(overflow.id).includes("tail-marker"), 20_000);
+  // A later restart restores exactly what this runtime saved.
+  await manager.shutdown().catch(() => {});
+  saved.kill();
+  overflow.kill();
+  const restored = openTerminalHistory({ directory: path.join(database.launchDirectory, "terminal-history") });
+  try {
+    const first = restored.read(saved.id);
+    assert.equal(first.split("saved-before-restart").length, 2, first.slice(-2000));
+    assert.equal(first.split("while-detached").length, 2, first.slice(-2000));
+    assert.ok(first.indexOf("saved-before-restart") < first.indexOf("while-detached"));
+    const second = restored.read(overflow.id);
+    assert.equal(second.match(notice)?.length, 1, `the overflowed ring's notice was not saved once: ${second.length} ${JSON.stringify(second.slice(0, 600))}`);
+    assert.equal(second.split("tail-marker").length, 2);
+    assert.ok(second.search(notice) < second.indexOf("tail-marker"));
+  } finally { restored.close(); }
+});
+
+test("a reattached terminal closed unexpectedly is still ended, audited and released by a later close", { timeout: 60_000 }, async (t) => {
+  const { directory, filename, stops } = reattachRuntime(t, "outright-terminal-reattach-unexpected-", () => database);
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  const prior = await priorRunTerminal(t, database, directory);
+  database = await restartDatabase(database, filename);
+  // The first native proof fails transiently; a later one must be asked for.
+  const recoverTerminal = brokerRecovery(prior, { failFirst: true });
+  let adapter;
+  const manager = createTerminalManager({ database, publish: () => {}, maxTerminals: 1, reattachEnabled: () => true,
+    recoverTerminal, reattachTerminal: async (options) => (adapter = await reattachManagedTerminal(options)) });
+  stops.push(() => manager.shutdown());
+  assert.equal(await manager.reconcileUnknown(), 1);
+  assert.equal(manager.get(prior.id).reattached, true);
+  // A frame the broker refuses drops this connection; the broker detaches again.
+  adapter.write("x".repeat(70 * 1024));
+  await waitFor(() => manager.get(prior.id).status === "unknown", 10_000);
+  assert.equal(recoverTerminal.calls, 1);
+  assert.equal(prior.exited(), false);
+  assert.deepEqual(manager.capacity(), { active: 1, unknown: 1, limit: 1 });
+  assert.equal(await manager.close(prior.id), true);
+  assert.equal(recoverTerminal.calls, 2, "termination reused a stale unverified proof");
+  assert.equal(prior.exited(), true);
+  assert.equal(database.listAudit(50).some((entry) => entry.action === "terminal.closed" && entry.target === prior.id), true);
+  manager.reloadUnknownReservations();
+  assert.deepEqual(manager.capacity(), { active: 0, unknown: 0, limit: 1 });
+});
+
+test("shutdown joins a reattach in flight and hands its shell back to the broker for the next runtime", { timeout: 60_000 }, async (t) => {
+  const { directory, filename, stops } = reattachRuntime(t, "outright-terminal-reattach-shutdown-", () => database);
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  const prior = await priorRunTerminal(t, database, directory);
+  // The shell prints while detached, before this runtime's reattach drains it.
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  database = await restartDatabase(database, filename);
+  const order = [];
+  let deliver;
+  let nextToken;
+  // The broker accepts the reattach, but its adapter reaches this runtime
+  // only after shutdown has begun.
+  const stopping = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => true,
+    recoverTerminal: async () => { order.push("native-recovery"); return false; },
+    reattachTerminal: async (options) => {
+      nextToken = options.nextToken;
+      const adapter = await reattachManagedTerminal(options);
+      assert.ok(adapter, "the live broker refused its current token");
+      const { terminate, release } = adapter;
+      adapter.terminate = () => { order.push("terminate"); return terminate(); };
+      adapter.release = () => { order.push("release"); return release(); };
+      await new Promise((resolve) => { deliver = resolve; });
+      order.push("adapter-delivered");
+      return adapter;
+    } });
+  const reconcile = stopping.reconcileUnknown();
+  await waitFor(() => deliver, 10_000);
+  const shutdown = stopping.shutdown().then(() => order.push("shutdown-returned"));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.deepEqual(order, [], "shutdown returned before the reattach in flight settled");
+  deliver();
+  await shutdown;
+  assert.equal(await reconcile, 0);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.deepEqual(order, ["adapter-delivered", "release", "shutdown-returned"]);
+  assert.equal(prior.exited(), false, "shutdown ended a shell the next runtime could reattach");
+  assert.equal(readReattachRecord(prior.id, database.launchDirectory)?.token, nextToken, "the rotated token was not kept");
+  assert.equal(database.listAudit(50).some((entry) => entry.action === "terminal.reattached" || entry.target === prior.id
+    && entry.action === "terminal.recovered"), false);
+  // The successor reattaches the same live shell with the rotated token, and
+  // the output the stopping runtime was handed reaches it once, before new
+  // output.
+  database = await restartDatabase(database, filename);
+  const successor = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => true,
+    recoverTerminal: brokerRecovery(prior) });
+  stops.push(() => successor.shutdown());
+  assert.equal(await successor.reconcileUnknown(), 1);
+  assert.equal(successor.get(prior.id).reattached, true);
+  assert.equal(successor.write(prior.id, "kept + 1\r"), true);
+  await waitFor(() => successor.get(prior.id).buffer.includes("42"), 10_000, () => successor.get(prior.id).buffer);
+  const live = successor.get(prior.id).buffer;
+  assert.equal(live.split("while-detached").length, 2, `the handed-back output was not kept once: ${JSON.stringify(live)}`);
+  assert.ok(live.indexOf("while-detached") < live.lastIndexOf("42"));
+  await successor.shutdown();
+  assert.equal(prior.exited(), true);
+  // A further restart restores it once, in order, from saved history.
+  const restored = openTerminalHistory({ directory: path.join(database.launchDirectory, "terminal-history") });
+  try {
+    const saved = restored.read(prior.id);
+    assert.equal(saved.split("while-detached").length, 2, JSON.stringify(saved));
+    assert.ok(saved.indexOf("while-detached") < saved.lastIndexOf("42"));
+  } finally { restored.close(); }
+});
+
+test("shutdown before the reattach proof leaves the token and the detached output with the broker", { timeout: 60_000 }, async (t) => {
+  const { directory, filename, stops } = reattachRuntime(t, "outright-terminal-reattach-withdrawn-", () => database);
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  const prior = await priorRunTerminal(t, database, directory);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  database = await restartDatabase(database, filename);
+  const order = [];
+  let shutdown;
+  // Shutdown begins once the broker has proven itself, just before this
+  // runtime would spend the token.
+  const stopping = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => true,
+    recoverTerminal: async () => { order.push("native-recovery"); return false; },
+    reattachTerminal: async (options) => {
+      const adapter = await reattachManagedTerminal({ ...options, proceed: () => {
+        order.push("proceed");
+        shutdown = stopping.shutdown();
+        return options.proceed();
+      } });
+      order.push(adapter ? "reattached" : "withdrawn");
+      return adapter;
+    } });
+  assert.equal(await stopping.reconcileUnknown(), 0);
+  await shutdown;
+  assert.deepEqual(order, ["proceed", "withdrawn"]);
+  assert.equal(prior.exited(), false);
+  assert.equal(readReattachRecord(prior.id, database.launchDirectory)?.token, prior.token, "the token was spent or removed");
+  assert.equal(database.listAudit(50).some((entry) => entry.target === prior.id
+    && (entry.action === "terminal.reattached" || entry.action === "terminal.recovered")), false);
+  // The successor spends the original token and still receives the output
+  // the shell printed while detached.
+  database = await restartDatabase(database, filename);
+  const successor = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => true,
+    recoverTerminal: brokerRecovery(prior) });
+  stops.push(() => successor.shutdown());
+  assert.equal(await successor.reconcileUnknown(), 1);
+  assert.equal(successor.get(prior.id).reattached, true);
+  await waitFor(() => successor.get(prior.id).buffer.includes("while-detached"), 10_000, () => successor.get(prior.id).buffer);
+  assert.equal(successor.get(prior.id).buffer.split("while-detached").length, 2);
+  assert.equal(await successor.close(prior.id), true);
+  assert.equal(prior.exited(), true);
+});
+
+test("a reattach whose audit fails ends the shell and writes the output it was handed straight to history", { timeout: 60_000 }, async (t) => {
+  const { directory, filename, stops } = reattachRuntime(t, "outright-terminal-reattach-unaudited-", () => database);
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  const prior = await priorRunTerminal(t, database, directory, { savedOutput: "saved-before-restart\r\n" });
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  database = await restartDatabase(database, filename);
+  const { auditCritical } = database;
+  database.auditCritical = (action, evidence) => {
+    if (action === "terminal.reattached") throw new Error("audit storage unavailable");
+    return auditCritical.call(database, action, evidence);
+  };
+  const historyDirectory = path.join(database.launchDirectory, "terminal-history");
+  const newestSegment = () => {
+    const segments = readdirSync(historyDirectory).map((name) => name.match(new RegExp(`^${prior.id}\\.(\\d+)\\.log$`)))
+      .filter(Boolean).sort((a, b) => Number(b[1]) - Number(a[1]));
+    return segments.length ? readFileSync(path.join(historyDirectory, segments[0][0]), "utf8") : "";
+  };
+  // While the shell ends it floods more output than any reattach buffer
+  // holds. Each frame is on disk once delivered, so none is retained here.
+  const flood = Array.from({ length: 6 }, (_, index) => `flood-${index}-${"x".repeat(200_000)}`);
+  const unsaved = [];
+  const manager = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => true,
+    recoverTerminal: brokerRecovery(prior),
+    reattachTerminal: async (options) => {
+      const adapter = await reattachManagedTerminal(options);
+      if (!adapter) return adapter;
+      let deliver;
+      let replayed = "";
+      const { onData, terminate } = adapter;
+      adapter.onData = (callback) => {
+        deliver = callback;
+        onData((data) => { replayed += data; callback(data); });
+      };
+      adapter.terminate = async () => {
+        // The broker's replay arrives first; the flood follows it. The
+        // shell still ends if the replay never comes.
+        try {
+          await waitFor(() => replayed.includes("while-detached"), 10_000, () => replayed);
+          flood.forEach((frame, index) => {
+            deliver?.(frame);
+            if (!newestSegment().includes(`flood-${index}-`)) unsaved.push(index);
+          });
+        } finally { await terminate(); }
+      };
+      return adapter;
+    } });
+  stops.push(() => manager.shutdown());
+  assert.equal(await manager.reconcileUnknown(), 1);
+  assert.deepEqual(unsaved, [], "output delivered during termination was held instead of written to history");
+  assert.equal(prior.exited(), true);
+  const audit = database.listAudit(50);
+  assert.equal(audit.some((entry) => entry.action === "terminal.reattached"), false);
+  assert.equal(audit.some((entry) => entry.action === "terminal.recovered" && entry.target === prior.id), true);
+  const ended = manager.get(prior.id);
+  assert.equal(ended.status, "ended");
+  await manager.shutdown();
+  const history = openTerminalHistory({ directory: historyDirectory });
+  const saved = history.read(prior.id);
+  history.close();
+  const marks = ["saved-before-restart", "while-detached", ...flood.map((_, index) => `flood-${index}-`)];
+  for (const mark of marks) assert.equal(saved.split(mark).length, 2, `${mark} was not saved exactly once`);
+  assert.deepEqual(marks.map((mark) => saved.indexOf(mark)), marks.map((mark) => saved.indexOf(mark)).sort((a, b) => a - b));
+});
+
+// A broker endpoint that holds the token for a fresh id and, once proven,
+// lets the test send what follows "reattached".
+async function provenReattachEndpoint(afterProve) {
+  const id = randomUUID();
+  const identity = randomUUID();
+  const token = reattachToken();
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-early-"));
+  const ownership = terminalOwnership(id, directory);
+  const sockets = new Set();
+  const endpoint = net.createServer((socket) => {
+    let pending = "";
+    let challenge;
+    sockets.add(socket);
+    socket.setEncoding("utf8");
+    socket.on("error", () => {});
+    socket.on("data", (chunk) => {
+      pending += chunk;
+      for (let end; (end = pending.indexOf("\n")) !== -1; pending = pending.slice(end + 1)) {
+        const message = JSON.parse(pending.slice(0, end));
+        const send = (frame) => socket.write(`${JSON.stringify(frame)}\n`);
+        if (message.type === "reattach") {
+          challenge = reattachNonce();
+          send({ type: "challenge", nonce: challenge, proof: reattachProof(token, "broker", [message.nonce, challenge, ownership.label, identity]) });
+        } else if (message.type === "prove") {
+          send({ type: "reattached", identity, pid: process.pid });
+          afterProve(socket, send);
+        } else if (message.type === "release") {
+          send({ type: "released" });
+          socket.end();
+        }
+      }
+    });
+  });
+  await new Promise((resolve) => endpoint.listen(ownership.address, resolve));
+  return {
+    reattach: () => reattachManagedTerminal({ id, identity, token, nextToken: reattachToken(), verifyEmpty: async () => true }),
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => endpoint.close(resolve));
+      rmSync(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+// Hands the client its reads in batches of at least minChars, as one Windows
+// named-pipe read can, so a single read carries many complete frames.
+function coalesceClientReads(minChars) {
+  const createConnection = net.createConnection;
+  net.createConnection = (...args) => {
+    const socket = createConnection(...args);
+    const emit = socket.emit;
+    let held = "";
+    let timer;
+    const flush = () => {
+      clearTimeout(timer);
+      if (!held) return;
+      const data = held;
+      held = "";
+      emit.call(socket, "data", data);
+    };
+    socket.emit = function (event, ...rest) {
+      if (event !== "data") { flush(); return emit.call(this, event, ...rest); }
+      held += rest[0];
+      if (held.length >= minChars) flush();
+      else { clearTimeout(timer); timer = setTimeout(flush, 20); }
+      return true;
+    };
+    return socket;
+  };
+  return () => { net.createConnection = createConnection; };
+}
+
+test("replay that outgrows the reattach buffer before it is taken is announced once, by registration or by hand-back", { timeout: 60_000 }, async () => {
+  // A broker that holds the token sends more replay than the client keeps
+  // before anything consumes it, in frames of distinct letters. Coalesced
+  // reads deliver several frames, over the per-frame limit, in one read.
+  const frames = Array.from({ length: 21 }, (_, index) => String.fromCharCode(97 + index).repeat(64 * 1024));
+  for (const reads of ["streamed", "coalesced"]) for (const consumer of ["registration", "hand-back"]) {
+    const label = `${consumer}, ${reads} reads`;
+    const endpoint = await provenReattachEndpoint((socket, send) => {
+      for (const data of frames) send({ type: "data", data });
+      if (consumer === "registration") socket.end();
+    });
+    const restore = reads === "coalesced" ? coalesceClientReads(512 * 1024) : () => {};
+    try {
+      const adapter = await endpoint.reattach();
+      assert.ok(adapter, `${label}: the endpoint holding the token was refused`);
+      let delivered;
+      let exit;
+      if (consumer === "registration") {
+        // The close follows every frame, so all of them wait for onData.
+        exit = await new Promise((resolve) => adapter.onExit(resolve));
+        delivered = [];
+        adapter.onData((data) => delivered.push(data));
+      } else delivered = await adapter.release();
+      assert.ok(delivered.length > 1, `${label}: ${delivered.length} replay frames were delivered (exit ${JSON.stringify(exit)})`);
+      const notice = delivered[0].match(/^\u001b\[0m\[Outright: (\d+) earlier terminal output characters were dropped while reattaching\]\r\n$/);
+      assert.ok(notice, `${label}: dropped replay was not announced: ${JSON.stringify(delivered[0].slice(0, 80))}`);
+      const kept = delivered.slice(1).join("");
+      const sent = frames.join("");
+      assert.ok(kept.length <= 1_100_000, `${label}: ${kept.length} replay characters were held`);
+      assert.equal(Number(notice[1]) + kept.length, sent.length, `${label}: the notice miscounted the dropped replay`);
+      assert.ok(sent.endsWith(kept), `${label}: the newest replay was not what was kept`);
+      // A second consumer is told nothing twice.
+      assert.deepEqual(await adapter.release(), [], `${label}: the drop was announced twice`);
+    } finally {
+      restore();
+      await endpoint.close();
+    }
+  }
+});
+
+test("a reattach frame over the read limit still ends the attempt, terminated or not, in any read size", { timeout: 60_000 }, async () => {
+  for (const reads of ["streamed", "coalesced"]) for (const terminated of [true, false]) {
+    const label = `${terminated ? "terminated" : "unterminated"} frame, ${reads} reads`;
+    const endpoint = await provenReattachEndpoint((socket, send) => {
+      send({ type: "data", data: "before-oversized" });
+      socket.write(`${JSON.stringify({ type: "data", data: "x".repeat(300 * 1024) })}${terminated ? "\n" : ""}`);
+      if (terminated) send({ type: "data", data: "after-oversized" });
+    });
+    const restore = reads === "coalesced" ? coalesceClientReads(512 * 1024) : () => {};
+    try {
+      const adapter = await endpoint.reattach();
+      assert.ok(adapter, `${label}: the endpoint holding the token was refused`);
+      // The client ends the attempt itself; the endpoint never closes.
+      let timer;
+      const ended = await Promise.race([new Promise((resolve) => adapter.onExit(() => resolve(true))),
+        new Promise((resolve) => { timer = setTimeout(resolve, 10_000, false); })]).finally(() => clearTimeout(timer));
+      const delivered = [];
+      adapter.onData((data) => delivered.push(data));
+      assert.equal(delivered.some((data) => data.startsWith("x") || data === "after-oversized"), false,
+        `${label}: output at or after the oversized frame was delivered`);
+      assert.ok(ended, `${label}: the client kept the attempt open past the oversized frame`);
+    } finally {
+      restore();
+      await endpoint.close();
+    }
+  }
+});
+
+test("an endpoint that cannot prove the reattach token is refused before anything spendable or typed reaches it", { timeout: 60_000 }, async () => {
+  for (const reply of ["echo", "forged"]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-reattach-forged-"));
+    const filename = path.join(directory, "runtime.db");
+    let database = createOutrightDatabase({ filename, runtimeLease: true });
+    const id = randomUUID();
+    const ownership = terminalOwnership(id, database.launchDirectory);
+    const record = { identity: randomUUID(), token: reattachToken() };
+    writeReattachRecord(id, database.launchDirectory, record);
+    database.auditCritical("terminal.created", { target: id, cwd: directory, ownershipLabel: ownership.label,
+      handshakePath: ownership.handshakePath, pid: process.pid });
+    // Another local user's endpoint at the managed address. It knows the
+    // session's public identity, but not its token.
+    let received = "";
+    const endpoint = net.createServer((socket) => {
+      socket.setEncoding("utf8");
+      socket.on("error", () => {});
+      socket.on("data", (chunk) => {
+        received += chunk;
+        const frames = reply === "echo" ? [{ type: "reattached", identity: record.identity, pid: process.pid }]
+          : [{ type: "challenge", nonce: reattachToken(), proof: reattachProof(reattachToken(), "broker", ["", "", ownership.label, record.identity]) },
+            { type: "reattached", identity: record.identity, pid: process.pid }];
+        for (const frame of frames) socket.write(`${JSON.stringify(frame)}\n`);
+      });
+    });
+    await new Promise((resolve) => endpoint.listen(ownership.address, resolve));
+    try {
+      database = await restartDatabase(database, filename);
+      let proofs = 0;
+      const manager = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => true,
+        recoverTerminal: async () => { proofs += 1; return true; } });
+      try {
+        assert.equal(await manager.reconcileUnknown(), 1);
+        assert.equal(proofs, 1);
+        assert.equal(manager.get(id), null);
+        assert.equal(manager.list().some((entry) => entry.reattached), false);
+        const audit = database.listAudit(50);
+        assert.equal(audit.some((entry) => entry.action === "terminal.reattached"), false);
+        assert.equal(audit.some((entry) => entry.action === "terminal.recovered" && entry.target === id), true);
+        assert.equal(readReattachRecord(id, database.launchDirectory), null);
+        const messages = received.trim().split("\n").map((line) => JSON.parse(line));
+        assert.deepEqual(messages.map((message) => Object.keys(message).sort()), [["nonce", "type"]], received);
+        assert.equal(received.includes(record.token), false, "the token reached an unproven endpoint");
+      } finally { await manager.shutdown(); }
+    } finally {
+      await new Promise((resolve) => endpoint.close(resolve));
+      database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a reattach record whose token is not a string is unverifiable and takes the ended path without a crash", { timeout: 60_000 }, async () => {
+  for (const malformed of [[reattachToken()], 12345, { token: reattachToken() }]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-reattach-malformed-"));
+    const filename = path.join(directory, "runtime.db");
+    let database = createOutrightDatabase({ filename, runtimeLease: true });
+    const id = randomUUID();
+    const identity = randomUUID();
+    const ownership = terminalOwnership(id, database.launchDirectory);
+    // A private record Outright did not write, such as a corrupted one.
+    writeFileSync(path.join(database.launchDirectory, `terminal-${id}.reattach`), `${JSON.stringify({ id, identity, token: malformed })}\n`, { mode: 0o600 });
+    database.auditCritical("terminal.created", { target: id, cwd: directory, ownershipLabel: ownership.label,
+      handshakePath: ownership.handshakePath, pid: process.pid });
+    // An endpoint that answers every attempt with a challenge, so a token
+    // that reached the proof would be used as an HMAC key.
+    let received = "";
+    const endpoint = net.createServer((socket) => {
+      socket.setEncoding("utf8");
+      socket.on("error", () => {});
+      socket.on("data", (chunk) => {
+        received += chunk;
+        socket.write(`${JSON.stringify({ type: "challenge", nonce: reattachToken(), proof: reattachToken() })}\n`);
+      });
+    });
+    await new Promise((resolve) => endpoint.listen(ownership.address, resolve));
+    try {
+      assert.equal(readReattachRecord(id, database.launchDirectory), null, `a ${typeof malformed} token was read as valid`);
+      assert.equal(await reattachManagedTerminal({ id, identity, token: malformed, nextToken: reattachToken(), verifyEmpty: async () => true }), null);
+      assert.equal(received, "", "a malformed token was offered to the endpoint");
+      database = await restartDatabase(database, filename);
+      let proofs = 0;
+      const manager = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => true,
+        recoverTerminal: async () => { proofs += 1; return true; } });
+      try {
+        assert.equal(await manager.reconcileUnknown(), 1);
+        assert.equal(proofs, 1);
+        assert.equal(manager.get(id), null);
+        const audit = database.listAudit(50);
+        assert.equal(audit.some((entry) => entry.action === "terminal.reattached"), false);
+        assert.equal(audit.some((entry) => entry.action === "terminal.recovered" && entry.target === id), true);
+        assert.equal(manager.capacity().active, 0);
+        assert.equal(received, "", "recovery offered a malformed token to the endpoint");
+      } finally { await manager.shutdown(); }
+    } finally {
+      await new Promise((resolve) => endpoint.close(resolve));
+      database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
 });
 
 async function waitFor(predicate, timeout = 3000, diagnostic = () => "") {
