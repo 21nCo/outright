@@ -1,0 +1,31 @@
+server/terminal-manager.test.mjs
+  s_e1c5fc1a65c0cf::t_3b1b8bfa214d29 1663-1714
+server/managed-terminal.mjs
+  s_92427ff18a8304::t_e607043537a64f 409,447-452,493
+server/terminal-manager.mjs
+  s_92427ff18a8304::t_bfb5b0416a36b5 111-115,145-151,154,164-169,549
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e24649cb9d122ce02828dfc96753beddc45918fd",
+  "prompts": {},
+  "sessions": {
+    "s_92427ff18a8304": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26336501-b0e6-4534-a7c2-345f5528a4ba",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_e1c5fc1a65c0cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13e18-4241-7662-a24f-782076addabe",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
