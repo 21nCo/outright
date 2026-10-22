@@ -1,0 +1,25 @@
+src/lib/terminal-command-fence.js
+  s_966899b056e6d7::t_5bb5252a4e4578 4-6,9,12,15,21,23-44
+tests/terminal-exit-state.test.mjs
+  s_966899b056e6d7::t_1371d12e1e3917 22-52
+tests/ui-races.jsx
+  s_966899b056e6d7::t_8fcbbabbfe2343 2952-3002,6873
+tests/ui-races.test.mjs
+  s_966899b056e6d7::t_e41eda7fa52177 917
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6b75ca1e8fd7f8cc1befc8f6821a76cd6a841b17",
+  "prompts": {},
+  "sessions": {
+    "s_966899b056e6d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_966899b056e6d7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
