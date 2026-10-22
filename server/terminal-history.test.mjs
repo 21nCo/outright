@@ -512,6 +512,46 @@ test("quota eviction, retention expiry and dismissal each tell clients to re-lis
   await terminals.shutdown();
 });
 
+test("an exited terminal leaving memory becomes saved output and tells clients to re-list once", async (t) => {
+  const { directory } = workspace(t);
+  const published = [];
+  const changes = async () => { await Promise.resolve(); return published.splice(0).filter((event) => event.type === "terminals.changed").length; };
+  // The live tail keeps 16 characters; the saved session serves them all.
+  const output = "build output that outgrows the live tail\n";
+  const exited = async ({ manager: terminals, ptys }, cwd = "/work/tree") => {
+    const terminal = terminals.create({ cwd, name: "Build" });
+    ptys.at(-1).emit(output);
+    ptys.at(-1).exit({ exitCode: 3, signal: 0 });
+    await waitFor(() => terminals.get(terminal.id).status === "exited");
+    await changes();
+    return terminal.id;
+  };
+  const savedAs = (terminals, id) => {
+    const { status, endReason, exitCode, pid, buffer } = terminals.get(id);
+    assert.deepEqual({ status, endReason, exitCode, pid, buffer }, { status: "ended", endReason: "exit", exitCode: 3, pid: null, buffer: output });
+    assert.equal(terminals.list().find((entry) => entry.id === id)?.status, "ended");
+  };
+  const options = { publish: (event) => published.push(event), maxBufferChars: 16 };
+
+  const expiring = manager(openTerminalHistory({ directory }), { ...options, exitedRetentionMs: 30 });
+  const expired = await exited(expiring);
+  await waitFor(() => expiring.manager.list().find((entry) => entry.id === expired)?.status === "ended");
+  assert.equal(await changes(), 1, "retention of an exited terminal did not tell clients it is now saved");
+  savedAs(expiring.manager, expired);
+  await expiring.manager.shutdown();
+
+  for (const [name, limits, cwd] of [["global", { maxTerminals: 2 }, "/work/other"], ["per-worktree", { maxTerminalsPerCwd: 1 }, "/work/tree"]]) {
+    const pruning = manager(openTerminalHistory({ directory }), { ...options, ...limits });
+    const pruned = await exited(pruning);
+    if (name === "global") pruning.manager.create({ cwd: "/work/tree" });
+    await changes();
+    pruning.manager.create({ cwd });
+    assert.equal(await changes(), 1, `${name} capacity pruning did not tell clients the exited terminal is now saved`);
+    savedAs(pruning.manager, pruned);
+    await pruning.manager.shutdown();
+  }
+});
+
 test("the socket connection snapshot omits saved sessions, so any admitted population still connects", async (t) => {
   const { directory } = workspace(t);
   const seed = openTerminalHistory({ directory });

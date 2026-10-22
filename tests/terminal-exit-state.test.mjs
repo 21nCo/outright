@@ -263,21 +263,46 @@ test("a count past what the screen holds ends where one continuous terminal ends
 
 test("a sequence's count adds at most a screen of work, in any parameter form", { timeout: 120_000 }, async () => {
   const count = 2 ** 31 - 1;
+  // What xterm does for each count: lines scrolled, inserted or deleted, tab
+  // stops crossed or characters repeated. None may exceed what the screen
+  // holds; a repeat writes at most about two screens, plus whole rows.
+  const limits = { S: SIZE.rows, T: SIZE.rows, L: SIZE.rows, M: SIZE.rows, I: SIZE.cols, Z: SIZE.cols, b: (2 * SIZE.rows + 3) * SIZE.cols };
+  const executed = [];
+  let writtenChars = 0;
+  class Counted extends Terminal {
+    constructor(options) {
+      super(options);
+      for (const final of Object.keys(limits)) {
+        this.parser.registerCsiHandler({ final }, (params) => { executed.push([final, params[0] || 1]); return false; });
+      }
+    }
+    write(data, callback) { writtenChars += data.length; return super.write(data, callback); }
+  }
+  // Parses buffer, holding sequences sequences, and checks the work it did.
+  const parse = async (buffer, sequences, name) => {
+    executed.length = 0;
+    writtenChars = 0;
+    const { rows } = await savedOutputRows(buffer, SIZE, Counted);
+    const over = executed.filter(([final, n]) => n > limits[final]);
+    assert.deepEqual(over.slice(0, 3), [], `${name}: ${over.length} sequences ran past the screen`);
+    assert.ok(writtenChars <= buffer.length + 16 * sequences, `${name}: ${writtenChars} characters written for ${buffer.length}`);
+    assert.ok(rows.length <= MAX_SAVED_ROWS, `${name}: ${rows.length} rows kept`);
+    return { rows, finals: new Set(executed.map(([final]) => final)) };
+  };
   const forms = Array.from({ length: 0x3f }, (_, index) => `\x1b[${count}${String.fromCharCode(0x40 + index)}`);
   for (const final of "STLMIZb") forms.push(`\x1b[${count};1${final}`, `\x1b[${count}:1${final}`, `\u009b${count}${final}`, `\x1b[${count}\x07${final}`);
   for (const sequence of forms) {
-    const started = performance.now();
-    const { rows } = await savedOutputRows(`x${sequence}TAIL`, SIZE, Terminal);
-    const elapsed = performance.now() - started;
-    assert.ok(elapsed < 250 && rows.length <= MAX_SAVED_ROWS, `${JSON.stringify(sequence)} took ${Math.round(elapsed)} ms`);
+    const { finals } = await parse(`x${sequence}TAIL`, 1, JSON.stringify(sequence));
+    const final = sequence.at(-1);
+    // Each counted sequence still runs; only its count is cut. A repeat after
+    // a control repeats nothing in xterm, so it is left out.
+    if (final in limits && !(final === "b" && sequence.includes("\x07"))) assert.ok(finals.has(final), `${JSON.stringify(sequence)} never ran`);
   }
   for (const final of "STLMZIb") {
     const unit = `x\x1b[${count}${final === "b" ? ";1" : ""}${final}`;
     for (const bytes of [2 ** 16, 2 ** 21]) {
-      const started = performance.now();
-      const { rows } = await savedOutputRows(`${unit.repeat(Math.floor(bytes / unit.length))}TAIL`, SIZE, Terminal);
-      const elapsed = performance.now() - started;
-      assert.ok(elapsed < 3_000 && rows.length <= MAX_SAVED_ROWS, `${bytes} bytes of ${JSON.stringify(unit)} took ${Math.round(elapsed)} ms`);
+      const repeats = Math.floor(bytes / unit.length);
+      const { rows } = await parse(`${unit.repeat(repeats)}TAIL`, repeats, `${bytes} bytes of ${JSON.stringify(unit)}`);
       assert.match(rows.slice(-2).join("").trimEnd(), /TAIL$/);
     }
   }

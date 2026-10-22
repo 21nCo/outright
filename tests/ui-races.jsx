@@ -2538,6 +2538,46 @@ async function terminalSavedSessionSyncRegression() {
   assert(errors.length === 0, `Unexpected terminal errors: ${errors.join("; ")}`);
 }
 
+// The server stops holding an exited terminal once its retention ends or
+// capacity needs the slot, and lists it as saved output. The open pane
+// follows that listing in place, with no re-selection or new shell.
+async function terminalExitedBecomesSavedRegression() {
+  root.render(null);
+  await settle();
+  const errors = [];
+  let posts = 0;
+  let listed = [{ ...terminal("A"), name: "Build" }];
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") { posts += 1; return response({ error: "unexpected" }, 500); }
+    if (url.pathname === "/api/terminals") return response({ terminals: listed, history: { persistent: true, warning: null } });
+    const [item] = listed;
+    return item.status === "ended"
+      ? response({ ...item, buffer: "earliest saved line\r\nlive tail line\r\n", outputCursor: 0 })
+      : response({ ...item, buffer: "live tail line\r\n", outputCursor: 1 });
+  };
+  let version = 0;
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} terminalsVersion={version}
+    onError={(error) => errors.push(error.message)} sendRuntime={() => {}} />);
+  const tab = () => host.querySelector('#terminal-tab-term-A');
+  const bar = () => host.querySelector('.terminal-saved-bar');
+  show();
+  await until(() => terminalReady("Build"), "running terminal selected");
+  show({ type: "terminal.exit", terminalId: "term-A", payload: { exitCode: 3 } });
+  await until(() => tab()?.getAttribute("aria-label").includes("process exited 3"), "live exit shown");
+  assert(!bar(), "An exited live terminal was shown as saved before the server listed it so");
+
+  listed = [savedTerminal("term-A", "Build", "exit", 3, "2026-10-21T00:00:00.000Z")];
+  version += 1;
+  show({ type: "terminals.changed" });
+  await until(() => terminalReady("BuildSaved") && bar(), "exited terminal follows the listing to saved output");
+  assert(bar().textContent.includes("Saved output, read-only: process exited 3."), "Saved bar lacks the exit label");
+  assert([...bar().querySelectorAll('button')].some((button) => button.textContent === "Start new shell"), "Saved output lacks Start new shell");
+  await until(() => host.querySelector('.terminal-host .xterm-rows')?.textContent.includes("earliest saved line"), "saved output beyond the live tail shown");
+  assert(tab().getAttribute("aria-selected") === "true" && host.querySelectorAll('.terminal-tab').length === 1, "The selection changed");
+  assert(posts === 0, "Saved output started a shell");
+  assert(errors.length === 0, `Unexpected terminal errors: ${errors.join("; ")}`);
+}
+
 async function terminalListingAddsSessionsRegression() {
   root.render(null);
   await settle();
@@ -6770,6 +6810,7 @@ try {
     ["terminal saved session", terminalSavedSessionRegression, "saved output stays read-only, relaunches as a marked new shell and dismisses"],
     ["terminal reservation restored", terminalReservationRestoredRegression, "a reservation that becomes saved output updates in place and storage warnings announce once"],
     ["terminal saved session sync", terminalSavedSessionSyncRegression, "coalesced restores, eviction, expiry and dismissing an expired session converge with the server"],
+    ["terminal exited becomes saved", terminalExitedBecomesSavedRegression, "an open exited terminal the server lists as saved shows saved output in place"],
     ["terminal listing adds sessions", terminalListingAddsSessionsRegression, "a re-list adds new live sessions and late reservations without a remount"],
     ["terminal saved paging", terminalSavedPagingRegression, "all saved output beyond one view is reachable a page at a time, earliest first line shown"],
     ["terminal reservation paging", () => terminalSavedPagingRegression(true), "a reservation's saved output is paged read-only to its first and last lines"],

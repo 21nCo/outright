@@ -38,6 +38,13 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     changePending = true;
     queueMicrotask(() => { changePending = false; publish({ type: "terminals.changed" }); });
   }
+  // Leaving the map changes the listing: the terminal is gone, or its saved
+  // history now lists as an ended session. No history record changes then.
+  function forget(terminal) {
+    clearTimeout(terminal.cleanupTimer);
+    terminals.delete(terminal.id);
+    terminalsChanged();
+  }
   history?.subscribe?.(terminalsChanged);
   let shuttingDown = false;
   let sweepingProofs = false;
@@ -208,7 +215,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
           await terminate(terminal);
           try { database.auditCritical("terminal.create.failed", { ...evidence, reason: "created outcome could not be recorded; PTY termination verified" }); }
           catch { /* The request remains for lease-owned reconciliation. */ }
-          terminals.delete(id);
+          forget(terminal);
         } catch { terminal.status = "unknown"; terminal.closePromise = null; }
       });
       throw outcomeUnknown(error, evidence.operationId);
@@ -240,14 +247,14 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       cleanupSocket(id);
       database.auditCritical("terminal.create.failed", failureEvidence);
     } catch {
-      terminals.delete(id);
+      forget(terminal);
       if (verifiedEmpty) verifiedCreateFailures.set(id, failureEvidence);
       reservedUnknown = [...reservedUnknown, { ...evidence, ownershipLabel: ownership.label,
         handshakePath: ownership.handshakePath, created: 0 }];
       throw outcomeUnknown(error, evidence.operationId);
     }
     try { removeTerminalEmpty(id, database.launchDirectory); } catch { /* A stale proof is harmless for this unique id. */ }
-    terminals.delete(id);
+    forget(terminal);
     throw error;
   }
 
@@ -379,7 +386,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       if (!terminals.has(terminal.id) || terminal.closePromise) return;
       terminal.status = "exited";
       publish({ type: "terminal.exit", terminalId: terminal.id, payload: { exitCode: terminal.exitCode, signal: terminal.signal } });
-      terminal.cleanupTimer = setTimeout(() => terminals.delete(terminal.id), exitedRetentionMs);
+      terminal.cleanupTimer = setTimeout(() => forget(terminal), exitedRetentionMs);
       terminal.cleanupTimer.unref?.();
     } catch (error) {
       if (terminals.get(terminal.id) === terminal && !terminal.closePromise) {
@@ -418,8 +425,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
         catch (error) { error.terminationUnknown = true; throw error; }
         if (!spawnTerminal) cleanupSocket(id);
         await database.auditRequired("terminal.closed", evidence);
-        clearTimeout(terminal.cleanupTimer);
-        terminals.delete(id);
+        forget(terminal);
       } catch (error) {
         terminal.status = "unknown";
         try { database.auditCritical("terminal.close.unknown", { ...evidence, error: String(error.message ?? error).slice(0, 1024) }); }
@@ -469,14 +475,12 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     while (terminals.size + reservedUnknown.length >= maxTerminals) {
       const exited = [...terminals.values()].find((terminal) => terminal.status === "exited");
       if (!exited) break;
-      clearTimeout(exited.cleanupTimer);
-      terminals.delete(exited.id);
+      forget(exited);
     }
     while ([...terminals.values()].filter((terminal) => terminal.cwd === cwd).length + reservedForCwd(cwd) >= maxTerminalsPerCwd) {
       const exited = [...terminals.values()].find((terminal) => terminal.cwd === cwd && terminal.status === "exited");
       if (!exited) break;
-      clearTimeout(exited.cleanupTimer);
-      terminals.delete(exited.id);
+      forget(exited);
     }
   }
 
