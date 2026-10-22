@@ -402,8 +402,11 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
   let onData;
   let onExit;
   // Replay arrives as bounded frames; each reaches history as its own record.
+  // Frames held before a consumer exists are bounded too, and whoever takes
+  // them learns once how much was dropped.
   let earlyData = [];
   let earlyChars = 0;
+  let earlyDropped = 0;
   let shellResult;
   let finalResult;
   let provenBroker = false;
@@ -415,9 +418,12 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
   const closeResult = new Promise((resolve) => { settleClose = resolve; });
   const socketClosed = new Promise((resolve) => socket.once("close", resolve));
   const takeEarly = () => {
-    const frames = earlyData;
+    const frames = earlyDropped
+      ? [`\u001b[0m[Outright: ${earlyDropped} earlier terminal output characters were dropped while reattaching]\r\n`, ...earlyData]
+      : earlyData;
     earlyData = [];
     earlyChars = 0;
+    earlyDropped = 0;
     return frames;
   };
   const ownerEmpty = async () => {
@@ -502,7 +508,11 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
       if (onData) { onData(message.data); return; }
       earlyData.push(message.data);
       earlyChars += message.data.length;
-      while (earlyChars > 1_100_000 && earlyData.length > 1) earlyChars -= earlyData.shift().length;
+      while (earlyChars > 1_100_000 && earlyData.length > 1) {
+        const dropped = earlyData.shift().length;
+        earlyChars -= dropped;
+        earlyDropped = Math.min(Number.MAX_SAFE_INTEGER, earlyDropped + dropped);
+      }
       return;
     }
     socket.destroy();

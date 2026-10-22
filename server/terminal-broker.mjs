@@ -50,8 +50,9 @@ const finishAfterNativeExit = () => {
 const validToken = (value) => typeof value === "string" && value.length >= 32 && value.length <= 256;
 const validSize = (cols, rows) => Number.isInteger(cols) && cols >= 20 && cols <= 400
   && Number.isInteger(rows) && rows >= 5 && rows <= 200;
+const MAX_DETACH_WINDOW_MS = 10 * 60 * 1000;
 const validSession = (value) => value && typeof value === "object" && SESSION_LABEL.test(value.label)
-  && validToken(value.token) && Number.isInteger(value.windowMs) && value.windowMs >= 50 && value.windowMs <= 10 * 60 * 1000;
+  && validToken(value.token) && Number.isInteger(value.windowMs) && value.windowMs >= 50 && value.windowMs <= MAX_DETACH_WINDOW_MS;
 
 // The window ends the shell. Its exit is the broker's own process status,
 // which the native supervisor reports to its owner.
@@ -68,12 +69,14 @@ function expireDetached() {
 function detach(unsent, omitted, details = {}) {
   attached = null;
   peer = undefined;
-  detached = { output: createDetachedOutput(), timer: setTimeout(expireDetached, session.windowMs) };
+  // validSession already bounds the window; the timer keeps that bound itself.
+  const windowMs = session.windowMs <= MAX_DETACH_WINDOW_MS ? session.windowMs : MAX_DETACH_WINDOW_MS;
+  detached = { output: createDetachedOutput(), timer: setTimeout(expireDetached, windowMs) };
   detached.output.drop(omitted);
   detached.output.push(unsent);
   // A peer's backpressure must not hold the shell while nobody reads it.
   if (process.platform !== "win32") try { terminal.resume(); } catch { /* The shell may already be gone. */ }
-  diagnostic("peer-detached", { windowMs: session.windowMs, ...details });
+  diagnostic("peer-detached", { windowMs, ...details });
 }
 
 function onTerminalData(data) {

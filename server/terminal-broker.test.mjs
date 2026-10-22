@@ -672,9 +672,13 @@ test("a detached shell ends when its window expires and the broker exits with it
   const result = await Promise.race([closed, new Promise((_, reject) => {
     timeout = setTimeout(() => reject(new Error(`detached broker outlived its window: ${stderr()}`)), 12_000);
   })]).finally(() => clearTimeout(timeout));
-  const events = stderr().trim().split("\n").filter(Boolean).map((line) => JSON.parse(line).broker);
-  assert.deepEqual(events.filter((event) => ["peer-detached", "detach-expired", "shell-exit"].includes(event)),
-    ["peer-detached", "detach-expired", "shell-exit"]);
+  // On Windows, node-pty's kill forks a console-list helper that shares the
+  // broker's stderr and can report its own failure there; only the broker's
+  // diagnostic lines are its lifecycle.
+  const lines = stderr().trim().split("\n").filter(Boolean);
+  const diagnostics = lines.map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter((event) => event?.broker);
+  assert.deepEqual(diagnostics.map((event) => event.broker).filter((event) => ["peer-detached", "detach-expired", "shell-exit"].includes(event)),
+    ["peer-detached", "detach-expired", "shell-exit"], `broker stderr: ${lines.join("\n").slice(-4000)}`);
   assert.notEqual(result.code, 0, "an expired shell was reported as a clean exit");
   await assert.rejects(reattach({ label, identity, token, nextToken: randomUUID() + randomUUID() }),
     "an expired session still accepted a connection");
