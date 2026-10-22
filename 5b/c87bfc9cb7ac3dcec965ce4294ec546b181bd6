@@ -1,0 +1,21 @@
+server/terminal-detached-output.mjs
+  s_92427ff18a8304::t_a16758a8c119ec 2-5,9-25,28,32-70,74-90,92,96-97,100,103
+server/terminal-detached-output.test.mjs
+  s_92427ff18a8304::t_2f718f7feb583c 35-102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5bc87bfc9cb7ac3dcec965ce4294ec546b181bd6",
+  "prompts": {},
+  "sessions": {
+    "s_92427ff18a8304": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26336501-b0e6-4534-a7c2-345f5528a4ba",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
