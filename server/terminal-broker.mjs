@@ -3,9 +3,10 @@
 // submitted job to its submitter's stdin.
 import * as pty from "node-pty";
 import net from "node:net";
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { chmodSync, unlinkSync, writeSync } from "node:fs";
 import { createDetachedOutput } from "./terminal-detached-output.mjs";
+import { proofMatches, reattachNonce, reattachProof, validNonce } from "./terminal-reattach-proof.mjs";
 
 const [address, token] = process.argv.slice(2);
 if (!address || !token || token.length < 32) process.exit(64);
@@ -46,7 +47,6 @@ let recordPeerClosed = () => {};
 const finishAfterNativeExit = () => {
   if (listenerClosed && (!terminal || shellExited)) process.exit(shellResult?.processCode ?? 0);
 };
-const digest = (value) => createHash("sha256").update(value).digest();
 const validToken = (value) => typeof value === "string" && value.length >= 32 && value.length <= 256;
 const validSize = (cols, rows) => Number.isInteger(cols) && cols >= 20 && cols <= 400
   && Number.isInteger(rows) && rows >= 5 && rows <= 200;
@@ -109,6 +109,7 @@ const server = net.createServer((socket) => {
   socket.setEncoding("utf8");
   let pending = "";
   let authenticated = false;
+  let challenge = null;
   // Keep the PTY behind the socket's writable high-water mark. Pausing the
   // PTY also backpressures a shell that produces output faster than its owner
   // can read it, without treating a slow reader as loss of ownership.
@@ -251,12 +252,24 @@ const server = net.createServer((socket) => {
     terminal.onData(onTerminalData);
     terminal.onExit(onTerminalExit);
   };
-  // A wrong label, identity or token, or one already used, is refused the
-  // same way, so a refusal does not tell whether the session exists.
+  // A detached broker first proves its current token over the client's
+  // nonce, so a client never trusts or feeds an endpoint that lacks it. The
+  // client's proof then binds the owner label, this broker's identity and the
+  // token that replaces it. Any wrong label, identity or token, or one already
+  // spent, fails that proof and is refused the same way, so a refusal does
+  // not tell whether the session exists.
   const reattach = (message) => {
-    if (!detached || !session || shellExited || message.type !== "reattach" || message.label !== session.label
-      || message.identity !== instance || !validToken(message.token) || !validToken(message.nextToken)
-      || !timingSafeEqual(digest(message.token), digest(session.token)) || message.nextToken === message.token) {
+    if (!detached || !session || shellExited) { socket.destroy(); return; }
+    if (!challenge) {
+      if (message.type !== "reattach" || !validNonce(message.nonce)) { socket.destroy(); return; }
+      challenge = { client: message.nonce, broker: reattachNonce() };
+      socket.write(`${JSON.stringify({ type: "challenge", nonce: challenge.broker,
+        proof: reattachProof(session.token, "broker", [challenge.client, challenge.broker, session.label, instance]) })}\n`);
+      return;
+    }
+    if (message.type !== "prove" || !validToken(message.nextToken) || message.nextToken === session.token
+      || !proofMatches(reattachProof(session.token, "client",
+        [challenge.broker, challenge.client, session.label, instance, message.nextToken]), message.proof)) {
       socket.destroy(); return;
     }
     clearTimeout(detached.timer);

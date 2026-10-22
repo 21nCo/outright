@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
 import { utilityProcesses } from "./subprocess-budget.mjs";
+import { proofMatches, reattachNonce, reattachProof, validNonce } from "./terminal-reattach-proof.mjs";
 
 const BROKER = fileURLToPath(new URL("./terminal-broker.mjs", import.meta.url));
 const START_TIMEOUT_MS = 8000;
@@ -369,11 +370,14 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
 }
 
 // Reattaches to a detached broker that a previous Outright process launched.
-// The broker must accept the owner label, its process identity and the
-// current token; any refusal, timeout or malformed reply returns null, as
-// does a broker that is gone. On success the token is spent and nextToken is
-// the only one the broker accepts. Termination asks the broker to end the
-// shell, then requires verifyEmpty to prove the native owner is gone.
+// The broker must first prove the current token over this client's nonce;
+// only then does the client prove the same token for the owner label and the
+// broker's process identity, naming nextToken to replace it. Any failed
+// proof, refusal, timeout or malformed reply returns null, as does a broker
+// that is gone, and nothing spendable or typed reaches that endpoint. On
+// success the old token is spent. A broker that closes without its exit frame
+// may still hold the detached shell, so termination and every close require
+// verifyEmpty, the native recovery that ends the owner, to prove it gone.
 export async function reattachManagedTerminal({ id, identity, token, nextToken, cols, rows, verifyEmpty,
   timeoutMs = 2000 }) {
   let socket;
@@ -385,17 +389,32 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
       candidate.once("error", (error) => { clearTimeout(timer); reject(error); });
     });
   } catch { return null; }
+  const label = `com.21n.outright.terminal.${id}`;
+  const nonce = reattachNonce();
   let onData;
   let onExit;
-  let earlyData = "";
+  // Replay arrives as bounded frames; each reaches history as its own record.
+  let earlyData = [];
+  let earlyChars = 0;
   let shellResult;
   let finalResult;
+  let provenBroker = false;
   let attachedSeen = false;
   let settleClose;
   const closeResult = new Promise((resolve) => { settleClose = resolve; });
+  const socketClosed = new Promise((resolve) => socket.once("close", resolve));
+  const ownerEmpty = async () => {
+    try { return Boolean(await verifyEmpty()); } catch { return false; }
+  };
   const adapter = {
     pid: null,
-    onData(callback) { onData = callback; if (earlyData) { callback(earlyData); earlyData = ""; } },
+    onData(callback) {
+      onData = callback;
+      const frames = earlyData;
+      earlyData = [];
+      earlyChars = 0;
+      for (const frame of frames) callback(frame);
+    },
     onExit(callback) { onExit = callback; if (finalResult) callback(finalResult); },
     write(data) {
       if (socket.destroyed || socket.writableLength > 256 * 1024) return false;
@@ -407,16 +426,30 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
       socket.write(`${JSON.stringify({ type: "resize", cols: nextCols, rows: nextRows })}\n`);
       return true;
     },
+    // The broker gets a bounded turn to end its shell. Native proof is then
+    // never cut short, and an earlier unverified close is proven afresh.
     async terminate() {
       if (!socket.destroyed) socket.write(`${JSON.stringify({ type: "terminate" })}\n`);
       let timeout;
-      const result = await Promise.race([closeResult, new Promise((_, reject) => {
-        timeout = setTimeout(() => reject(new Error("PTY ownership teardown timed out")), 6000);
-      })]).finally(() => clearTimeout(timeout));
-      if (!result.verified) throw new Error("PTY owned process boundary could not be verified empty");
+      await Promise.race([socketClosed, new Promise((resolve) => { timeout = setTimeout(resolve, 6000); })])
+        .finally(() => clearTimeout(timeout));
+      socket.destroy();
+      const result = await closeResult;
+      if (!result.verified && !await ownerEmpty()) throw new Error("PTY owned process boundary could not be verified empty");
     },
   };
   const handleMessage = (message, resolve, reject) => {
+    if (!provenBroker) {
+      if (message.type !== "challenge" || !validNonce(message.nonce)
+        || !proofMatches(reattachProof(token, "broker", [nonce, message.nonce, label, identity]), message.proof)) {
+        reject(new Error("PTY broker refused reattach")); socket.destroy(); return;
+      }
+      provenBroker = true;
+      socket.write(`${JSON.stringify({ type: "prove", nextToken,
+        proof: reattachProof(token, "client", [message.nonce, nonce, label, identity, nextToken]),
+        ...(Number.isInteger(cols) && Number.isInteger(rows) ? { cols, rows } : {}) })}\n`);
+      return;
+    }
     if (!attachedSeen) {
       if (message.type !== "reattached" || message.identity !== identity) { reject(new Error("PTY broker refused reattach")); socket.destroy(); return; }
       attachedSeen = true;
@@ -430,17 +463,16 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
       return;
     }
     if (message.type === "data" && typeof message.data === "string" && !shellResult) {
-      if (onData) onData(message.data);
-      else earlyData = `${earlyData}${message.data}`.slice(-1_100_000);
+      if (onData) { onData(message.data); return; }
+      earlyData.push(message.data);
+      earlyChars += message.data.length;
+      while (earlyChars > 1_100_000 && earlyData.length > 1) earlyChars -= earlyData.shift().length;
       return;
     }
     socket.destroy();
   };
-  // A broker that closes without its exit frame may still be detached and
-  // alive, so only proof that the owner is empty makes that outcome known.
   const finish = async () => {
-    let verified = false;
-    try { verified = Boolean(await verifyEmpty()); } catch { /* The owner stays unverified. */ }
+    const verified = await ownerEmpty();
     finalResult = { exitCode: shellResult?.exitCode ?? null, signal: shellResult?.signal ?? null,
       verified, outcomeKnown: Boolean(shellResult) };
     settleClose(finalResult);
@@ -448,8 +480,7 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
   };
   const ready = waitForBrokerReady(socket, handleMessage, () => { if (attachedSeen) void finish(); }, () => attachedSeen);
   ready.catch(() => {});
-  socket.write(`${JSON.stringify({ type: "reattach", label: `com.21n.outright.terminal.${id}`, identity, token, nextToken,
-    ...(Number.isInteger(cols) && Number.isInteger(rows) ? { cols, rows } : {}) })}\n`);
+  socket.write(`${JSON.stringify({ type: "reattach", nonce })}\n`);
   let timeout;
   try {
     await Promise.race([ready, new Promise((_, reject) => {

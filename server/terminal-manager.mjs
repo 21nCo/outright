@@ -130,9 +130,10 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   }
 
   // A prior-run shell that its broker kept through the detach window becomes
-  // live again only when the broker accepts this runtime's stored identity
-  // and token and the reattach is recorded. Otherwise the caller proves the
-  // owner empty, so the session ends as after any restart.
+  // live again only when the broker and this runtime prove the stored token
+  // to each other for its identity and the reattach is recorded. Otherwise
+  // the caller proves the owner empty, so the session ends as after any
+  // restart.
   function reattachable(entry) {
     return reattachEnabled() && entry.created === 1 && Boolean(database.launchDirectory) && !terminals.has(entry.target)
       && entry.ownershipLabel === `com.21n.outright.terminal.${entry.target}` && typeof entry.cwd === "string";
@@ -161,11 +162,13 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     const saved = history?.saved().find((item) => item.id === id);
     const terminal = { id, cwd: entry.cwd, name: saved?.name ?? "Terminal", pid: entry.pid ?? processInstance.pid,
       process: processInstance, buffer: (history?.read(id) ?? "").slice(-maxBufferChars), outputCursor: 0,
-      createdAt: saved?.createdAt ?? null, status: "running", exitSeen: false, recorded: true, reattached: true,
+      createdAt: saved?.createdAt ?? new Date().toISOString(), status: "running", exitSeen: false, recorded: true, reattached: true,
       relaunchedFrom: saved?.relaunchedFrom };
     terminals.set(id, terminal);
-    observeManaged(terminal, processInstance);
+    // The saved session is writable again before the broker's buffered
+    // output can arrive, so that output reaches history once, after it.
     if (!history?.resume(id)) beginHistory(terminal);
+    observeManaged(terminal, processInstance);
     reservedUnknown = unresolvedReservations();
     terminalsChanged();
     return true;

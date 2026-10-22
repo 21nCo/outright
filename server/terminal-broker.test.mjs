@@ -8,6 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
+import { proofMatches, reattachNonce, reattachProof } from "./terminal-reattach-proof.mjs";
 
 const brokerScript = fileURLToPath(new URL("./terminal-broker.mjs", import.meta.url));
 
@@ -540,17 +541,29 @@ async function startSessionBroker(t, { session, diagnostics = false } = {}) {
     socket.on("error", () => {});
     const send = (message) => socket.write(`${JSON.stringify(message)}\n`);
     send(first);
-    // A refusal closes the connection without any frame.
+    // A refusal closes the connection without any frame after the challenge.
     const refusal = async () => {
-      await waitUntil(() => isClosed || frames.length, "a reattach attempt was neither accepted nor refused");
-      return frames;
+      await waitUntil(() => isClosed, "a refused reattach attempt kept its connection");
+      return frames.filter((frame) => frame.type !== "challenge");
     };
     return { socket, frames, ended, send, refusal, output: () => frames.filter((frame) => frame.type === "data").map((frame) => frame.data).join("") };
+  };
+  // The managed client's handshake: the broker proves the token it holds over
+  // this nonce, then the client proves its own token for label and identity.
+  const reattach = async ({ label, identity, token, nextToken }) => {
+    const nonce = reattachNonce();
+    const attempt = await client({ type: "reattach", nonce });
+    await waitUntil(() => attempt.frames.length, "a detached broker sent no challenge");
+    const [challenge] = attempt.frames;
+    assert.equal(challenge.type, "challenge");
+    attempt.brokerProven = proofMatches(reattachProof(token, "broker", [nonce, challenge.nonce, label, identity]), challenge.proof);
+    attempt.send({ type: "prove", nextToken, proof: reattachProof(token, "client", [challenge.nonce, nonce, label, identity, nextToken]) });
+    return attempt;
   };
   const start = await client({ type: "start", token: broker.spawnargs.at(-1), shell: process.execPath, cwd: directory,
     env: process.env, cols: 120, rows: 30, ...(session ? { session } : {}) });
   await waitUntil(() => start.frames.some((frame) => frame.type === "ready"), "PTY did not become ready");
-  return { broker, closed, start, client, connectOnly: connect, stderr: () => stderr };
+  return { broker, closed, start, client, reattach, connectOnly: connect, stderr: () => stderr };
 }
 
 async function waitUntil(predicate, message, timeout = 10_000) {
@@ -564,7 +577,7 @@ async function waitUntil(predicate, message, timeout = 10_000) {
 test("a reattachable broker keeps the shell through a peer close and accepts each token once", { timeout: 40_000 }, async (t) => {
   const label = `com.21n.outright.terminal.${randomUUID()}`;
   const first = randomUUID() + randomUUID();
-  const { broker, start, client, connectOnly } = await startSessionBroker(t, { session: { label, token: first, windowMs: 30_000 } });
+  const { broker, start, client, reattach, connectOnly } = await startSessionBroker(t, { session: { label, token: first, windowMs: 30_000 } });
   const identity = start.frames.find((frame) => frame.type === "ready").identity;
   assert.match(identity, /^[0-9a-f-]{36}$/);
   start.send({ type: "write", data: "globalThis.kept = 41\r" });
@@ -583,28 +596,39 @@ test("a reattachable broker keeps the shell through a peer close and accepts eac
   idle.on("error", () => {});
   await waitUntil(() => idleClosed, "an idle connection held the detached session", 8000);
 
-  // Every refusal looks the same: the connection closes with no frame.
+  // Neither a client proof without a challenge nor the token itself opens it.
   const second = randomUUID() + randomUUID();
+  for (const unchallenged of [{ type: "prove", nextToken: second, proof: reattachProof(first, "client", [label, identity, second]) },
+    { type: "reattach", label, identity, token: first, nextToken: second }]) {
+    const refused = await client(unchallenged);
+    assert.deepEqual(await refused.refusal(), []);
+  }
+  // Every refusal looks the same: the same challenge, then a close with no
+  // frame. Only the holder of the broker's token can check its proof.
   for (const wrong of [
     { label, identity, token: randomUUID() + randomUUID() },
     { label: `com.21n.outright.terminal.${randomUUID()}`, identity, token: first },
     { label, identity: randomUUID(), token: first },
   ]) {
-    const refused = await client({ type: "reattach", ...wrong, nextToken: second });
+    const refused = await reattach({ ...wrong, nextToken: second });
     assert.deepEqual(await refused.refusal(), []);
+    assert.equal(refused.brokerProven, false, "a broker proof verified for the wrong session");
   }
 
-  const resumed = await client({ type: "reattach", label, identity, token: first, nextToken: second });
+  const resumed = await reattach({ label, identity, token: first, nextToken: second });
+  assert.equal(resumed.brokerProven, true, "the broker did not prove the token it holds");
   await waitUntil(() => resumed.output().includes("while-detached"), "buffered output was not replayed");
-  assert.deepEqual(resumed.frames[0], { type: "reattached", identity, pid: resumed.frames[0].pid });
+  assert.deepEqual(resumed.frames[1], { type: "reattached", identity, pid: resumed.frames[1].pid });
   resumed.send({ type: "write", data: "kept + 1\r" });
   await waitUntil(() => resumed.output().includes("42"), "the reattached shell is not the live process");
   resumed.socket.destroy();
   await resumed.ended;
 
-  const reused = await client({ type: "reattach", label, identity, token: first, nextToken: randomUUID() + randomUUID() });
+  const reused = await reattach({ label, identity, token: first, nextToken: randomUUID() + randomUUID() });
   assert.deepEqual(await reused.refusal(), [], "a spent token reattached");
-  const rotated = await client({ type: "reattach", label, identity, token: second, nextToken: randomUUID() + randomUUID() });
+  assert.equal(reused.brokerProven, false, "the broker still proved a spent token");
+  const rotated = await reattach({ label, identity, token: second, nextToken: randomUUID() + randomUUID() });
+  assert.equal(rotated.brokerProven, true);
   await waitUntil(() => rotated.frames.some((frame) => frame.type === "reattached"), "the rotated token was refused");
   const closed = new Promise((resolve) => broker.once("close", resolve));
   rotated.send({ type: "terminate" });
@@ -615,7 +639,7 @@ test("a reattachable broker keeps the shell through a peer close and accepts eac
 test("a detached shell ends when its window expires and the broker exits with its status", { timeout: 30_000 }, async (t) => {
   const label = `com.21n.outright.terminal.${randomUUID()}`;
   const token = randomUUID() + randomUUID();
-  const { start, closed, client, stderr } = await startSessionBroker(t, { session: { label, token, windowMs: 300 }, diagnostics: true });
+  const { start, closed, reattach, stderr } = await startSessionBroker(t, { session: { label, token, windowMs: 300 }, diagnostics: true });
   const identity = start.frames.find((frame) => frame.type === "ready").identity;
   start.socket.destroy();
   let timeout;
@@ -626,7 +650,7 @@ test("a detached shell ends when its window expires and the broker exits with it
   assert.deepEqual(events.filter((event) => ["peer-detached", "detach-expired", "shell-exit"].includes(event)),
     ["peer-detached", "detach-expired", "shell-exit"]);
   assert.notEqual(result.code, 0, "an expired shell was reported as a clean exit");
-  await assert.rejects(client({ type: "reattach", label, identity, token, nextToken: randomUUID() + randomUUID() }),
+  await assert.rejects(reattach({ label, identity, token, nextToken: randomUUID() + randomUUID() }),
     "an expired session still accepted a connection");
 });
 
