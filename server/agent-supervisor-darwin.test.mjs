@@ -8,8 +8,9 @@ import test from "node:test";
 import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
 import { reattachManagedTerminal, reattachToken } from "./managed-terminal.mjs";
 
-// Detach mode is macOS-only in this slice; Linux and Windows keep their
-// existing stop-on-owner-exit supervisors until their own slices.
+// The macOS supervisor's detach mode; Linux has its own in
+// agent-supervisor-linux.test.mjs, and Windows keeps its supervisor until its
+// own slice.
 const darwinOnly = { skip: process.platform !== "darwin" };
 const temporaryRoot = process.platform === "darwin"
   ? realpathSync(execFileSync("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"], { encoding: "utf8" }).trim()) : "";

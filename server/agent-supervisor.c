@@ -28,6 +28,14 @@
 #define AUTHORIZED_CONTROL "__OUTRIGHT_LAUNCH_AUTHORIZED_V1__"
 #define UTILITY_TREE_EMPTY "__OUTRIGHT_UTILITY_TREE_EMPTY_V1__"
 #define CONTROL_FD 3
+#define STOP_ON_OWNER_EXIT "--stop-on-owner-exit"
+#define DETACH_ON_OWNER_EXIT "--detach-on-owner-exit"
+// A reattachable terminal broker reports on its stdout when a successor
+// runtime reattaches and when it detaches again.
+#define BROKER_ATTACHED "__OUTRIGHT_BROKER_ATTACHED_V1__"
+#define BROKER_DETACHED "__OUTRIGHT_BROKER_DETACHED_V1__"
+#define MAX_DETACH_WINDOW_MS 600000
+#define MAX_DETACH_GRACE_MS 10000
 
 static int utility_prelaunch_exit(int code) {
   if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL)
@@ -100,8 +108,19 @@ static bool process_identity(pid_t pid, char *identity, size_t identity_size) {
   return written > 0 && (size_t)written < identity_size;
 }
 
+// --detach-on-owner-exit WINDOW_MS: the same bound as the broker's own
+// detach window.
+static long parse_detach_window(const char *raw) {
+  char *end = NULL;
+  errno = 0;
+  long value = strtol(raw, &end, 10);
+  if (errno != 0 || end == raw || *end != '\0' || value < 50 || value > MAX_DETACH_WINDOW_MS) return -1;
+  return value;
+}
+
 // Recovery only signals the native owner that still carries this terminal's
-// private launch marker. A same-tick recycled PID must not inherit ownership.
+// private launch marker, in either owner-exit mode. A same-tick recycled PID
+// must not inherit ownership.
 static bool terminal_owner_command(pid_t pid, const char *handshake_path) {
   char filename[64];
   snprintf(filename, sizeof(filename), "/proc/%ld/cmdline", (long)pid);
@@ -112,15 +131,16 @@ static bool terminal_owner_command(pid_t pid, const char *handshake_path) {
   bool complete = feof(file) && !ferror(file);
   fclose(file);
   if (!complete || length < 3 || command[length - 1] != '\0') return false;
-  size_t first = strnlen(command, length);
-  if (first == length) return false;
-  size_t second = first + 1;
-  if (second >= length) return false;
-  size_t second_length = strnlen(command + second, length - second);
-  size_t third = second + second_length + 1;
-  if (third >= length) return false;
-  return strcmp(command + second, "--stop-on-owner-exit") == 0
-    && strcmp(command + third, handshake_path) == 0;
+  const char *arguments[4];
+  int count = 0;
+  for (size_t offset = 0; offset < length && count < 4; count++) {
+    arguments[count] = command + offset;
+    offset += strlen(command + offset) + 1;
+  }
+  if (count >= 3 && strcmp(arguments[1], STOP_ON_OWNER_EXIT) == 0)
+    return strcmp(arguments[2], handshake_path) == 0;
+  return count >= 4 && strcmp(arguments[1], DETACH_ON_OWNER_EXIT) == 0
+    && parse_detach_window(arguments[2]) > 0 && strcmp(arguments[3], handshake_path) == 0;
 }
 
 // A pidfd binds the signal to the same kernel process whose boot-scoped
@@ -375,19 +395,73 @@ static void exit_like_provider(int status) {
   _exit(1);
 }
 
-static int authorize_provider(char **provider_argv, const char *handshake_path, pid_t *provider_pid) {
+// Last broker status line seen on the provider's stdout: 1 attached, -1
+// detached, 0 none since the caller last took it.
+typedef struct {
+  char line[40];
+  size_t used;
+  bool overflow;
+  int status;
+} broker_scanner;
+
+static void scan_broker_status(broker_scanner *scanner, const char *data, size_t length) {
+  for (size_t index = 0; index < length; index++) {
+    if (data[index] != '\n') {
+      if (scanner->used < sizeof(scanner->line)) scanner->line[scanner->used++] = data[index];
+      else scanner->overflow = true;
+      continue;
+    }
+    if (!scanner->overflow && scanner->used == strlen(BROKER_ATTACHED)
+        && memcmp(scanner->line, BROKER_ATTACHED, scanner->used) == 0) scanner->status = 1;
+    else if (!scanner->overflow && scanner->used == strlen(BROKER_DETACHED)
+        && memcmp(scanner->line, BROKER_DETACHED, scanner->used) == 0) scanner->status = -1;
+    scanner->used = 0;
+    scanner->overflow = false;
+  }
+}
+
+// Drains a bounded amount of the provider's status pipe without blocking and
+// closes it at EOF, when the broker and every holder of its stdout are gone.
+static void drain_broker_status(int *status_fd, broker_scanner *scanner) {
+  for (size_t drained = 0; *status_fd >= 0 && drained < 64 * 1024;) {
+    char buffer[4096];
+    ssize_t count = read(*status_fd, buffer, sizeof(buffer));
+    if (count > 0) {
+      scan_broker_status(scanner, buffer, (size_t)count);
+      drained += (size_t)count;
+      continue;
+    }
+    if (count < 0 && errno == EINTR) continue;
+    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+    close(*status_fd);
+    *status_fd = -1;
+  }
+}
+
+// With status_fd, the provider's stdout is a pipe only this supervisor reads:
+// detach mode is for terminal brokers, whose stdout carries only status lines,
+// and an owner that is gone could not read them anyway.
+static int authorize_provider(char **provider_argv, const char *handshake_path, pid_t *provider_pid, int *status_fd) {
   int authorization_pipe[2];
   if (pipe(authorization_pipe) != 0) return -1;
   fcntl(authorization_pipe[0], F_SETFD, FD_CLOEXEC);
   fcntl(authorization_pipe[1], F_SETFD, FD_CLOEXEC);
-  pid_t child = fork();
-  if (child < 0) {
+  int status_pipe[2] = { -1, -1 };
+  if (status_fd != NULL && pipe2(status_pipe, O_CLOEXEC) != 0) {
     close(authorization_pipe[0]);
     close(authorization_pipe[1]);
     return -1;
   }
+  pid_t child = fork();
+  if (child < 0) {
+    close(authorization_pipe[0]);
+    close(authorization_pipe[1]);
+    if (status_fd != NULL) { close(status_pipe[0]); close(status_pipe[1]); }
+    return -1;
+  }
   if (child == 0) {
     close(authorization_pipe[1]);
+    if (status_fd != NULL && dup2(status_pipe[1], STDOUT_FILENO) < 0) _exit(126);
     signal(SIGTERM, SIG_DFL);
     signal(SIGINT, SIG_DFL);
     char authorization = '\0';
@@ -408,6 +482,11 @@ static int authorize_provider(char **provider_argv, const char *handshake_path, 
     _exit(127);
   }
   close(authorization_pipe[0]);
+  if (status_fd != NULL) {
+    close(status_pipe[1]);
+    fcntl(status_pipe[0], F_SETFL, fcntl(status_pipe[0], F_GETFL) | O_NONBLOCK);
+    *status_fd = status_pipe[0];
+  }
   *provider_pid = child;
   if (write_handshake(handshake_path, true, child) != 0) {
     close(authorization_pipe[1]);
@@ -429,16 +508,30 @@ int main(int argc, char **argv) {
   if (argc == 5 && strcmp(argv[1], "--terminate-owned") == 0) {
     return terminate_owned_process(argv[2], argv[3], argv[4]);
   }
-  bool stop_on_owner_exit = argc > 1 && strcmp(argv[1], "--stop-on-owner-exit") == 0;
-  int first = stop_on_owner_exit ? 2 : 1;
+  bool stop_on_owner_exit = argc > 1 && strcmp(argv[1], STOP_ON_OWNER_EXIT) == 0;
+  // Detach mode keeps the provider after its owner leaves, for at most the
+  // window while no successor is attached. Utility owners never detach.
+  bool detach_on_owner_exit = argc > 1 && strcmp(argv[1], DETACH_ON_OWNER_EXIT) == 0;
+  long detach_window_ms = 0;
+  if (detach_on_owner_exit) {
+    detach_window_ms = argc > 2 ? parse_detach_window(argv[2]) : -1;
+    if (detach_window_ms < 0 || getenv("OUTRIGHT_UTILITY_OWNER") != NULL) {
+      dprintf(STDERR_FILENO, "Usage: %s %s WINDOW_MS HANDSHAKE_PATH EXECUTABLE [ARG...]\n", argv[0], DETACH_ON_OWNER_EXIT);
+      return utility_prelaunch_exit(64);
+    }
+  }
+  int first = 1;
+  if (stop_on_owner_exit) first = 2;
+  if (detach_on_owner_exit) first = 3;
   if (argc < first + 2) {
-    dprintf(STDERR_FILENO, "Usage: %s [--stop-on-owner-exit] HANDSHAKE_PATH EXECUTABLE [ARG...]\n", argv[0]);
+    dprintf(STDERR_FILENO, "Usage: %s [%s | %s WINDOW_MS] HANDSHAKE_PATH EXECUTABLE [ARG...]\n", argv[0],
+      STOP_ON_OWNER_EXIT, DETACH_ON_OWNER_EXIT);
     return utility_prelaunch_exit(64);
   }
   // Crash recovery signals a numeric PID only through a verified pidfd. Do
   // not admit a managed PTY on a kernel where its owner cannot later be
   // terminated safely after a runtime restart.
-  if (stop_on_owner_exit && !supports_owned_termination()) {
+  if ((stop_on_owner_exit || detach_on_owner_exit) && !supports_owned_termination()) {
     dprintf(STDERR_FILENO, "Managed terminals require Linux pidfd_open and pidfd_send_signal support\n");
     return utility_prelaunch_exit(69);
   }
@@ -470,9 +563,36 @@ int main(int argc, char **argv) {
   long long teardown_deadline = 0;
   char input[INPUT_CAPACITY];
   size_t input_length = 0;
+  // Detach state. An explicit stop or termination request still ends the
+  // provider at once; only the owner's exit (stdin EOF or reparenting) starts
+  // the window. The window allows the broker's own expiry to end its shell
+  // first, then ends whatever remains. It pauses while a successor runtime is
+  // reattached; the provider's own exit settles it as before.
+  const pid_t owner_pid = getppid();
+  int status_fd = -1;
+  broker_scanner broker_status = { .used = 0 };
+  bool owner_lost = false;
+  bool reattached = false;
+  long long detach_deadline = 0;
+  const long long detach_grace = detach_window_ms < MAX_DETACH_GRACE_MS ? detach_window_ms : MAX_DETACH_GRACE_MS;
 
   for (;;) {
     reap_children(provider_pid, &provider_reaped, &provider_status);
+    if (detach_on_owner_exit && authorized && !stopping) {
+      if (input_closed || getppid() != owner_pid) owner_lost = true;
+      if (broker_status.status != 0) {
+        reattached = broker_status.status > 0;
+        broker_status.status = 0;
+        detach_deadline = 0;
+      }
+      if (owner_lost && !reattached && detach_deadline == 0)
+        detach_deadline = monotonic_ms() + detach_window_ms + detach_grace;
+      if (detach_deadline != 0 && monotonic_ms() >= detach_deadline) {
+        stopping = true;
+        stop_requested = true;
+        teardown_deadline = monotonic_ms() + TEARDOWN_BUDGET_MS;
+      }
+    }
     if (authorized && (termination_requested || (stop_on_owner_exit && input_closed)) && !stopping) {
       stopping = true;
       stop_requested = true;
@@ -512,19 +632,28 @@ int main(int argc, char **argv) {
       return 0;
     }
 
-    if (input_closed) {
+    struct pollfd descriptors[2];
+    nfds_t descriptor_count = 0;
+    if (!input_closed) descriptors[descriptor_count++] = (struct pollfd){ .fd = STDIN_FILENO, .events = POLLIN | POLLHUP };
+    if (status_fd >= 0) descriptors[descriptor_count++] = (struct pollfd){ .fd = status_fd, .events = POLLIN };
+    if (descriptor_count == 0) {
       sleep_ms(25);
       continue;
     }
 
-    struct pollfd descriptor = { .fd = STDIN_FILENO, .events = POLLIN | POLLHUP };
-    int poll_result = poll(&descriptor, 1, 25);
+    int poll_result = poll(descriptors, descriptor_count, 25);
     if (poll_result < 0 && errno != EINTR) {
       if (!authorized) { unlink(handshake_path); return utility_prelaunch_exit(74); }
       termination_requested = 1;
       continue;
     }
     if (poll_result <= 0) continue;
+    if (status_fd >= 0 && descriptors[descriptor_count - 1].revents != 0) drain_broker_status(&status_fd, &broker_status);
+    if (input_closed) {
+      sleep_ms(1);
+      continue;
+    }
+    struct pollfd descriptor = descriptors[0];
     if (descriptor.revents & POLLIN) {
       ssize_t read_count = read(STDIN_FILENO, input + input_length, sizeof(input) - input_length - 1);
       if (read_count > 0) {
@@ -538,7 +667,8 @@ int main(int argc, char **argv) {
           while (line_length > 0 && (line_start[line_length - 1] == '\r' || line_start[line_length - 1] == ' ' || line_start[line_length - 1] == '\t')) line_start[--line_length] = '\0';
           while (*line_start == ' ' || *line_start == '\t') line_start++;
           if (strcmp(line_start, "go") == 0 && !authorized) {
-            if (authorize_provider(&argv[first + 1], handshake_path, &provider_pid) != 0) {
+            if (authorize_provider(&argv[first + 1], handshake_path, &provider_pid,
+                detach_on_owner_exit ? &status_fd : NULL) != 0) {
               unlink(handshake_path);
               return utility_prelaunch_exit(75);
             }
