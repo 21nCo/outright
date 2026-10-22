@@ -108,7 +108,11 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       verifiedCreateFailures.delete(entry.target);
     } else {
       // With reattach off, recovery runs exactly as before, with no added turn.
-      if (reattachable(entry) && await reattachReserved(entry)) return true;
+      if (reattachable(entry)) {
+        if (await joinReattach(entry)) return true;
+        // Shutdown leaves this owner, untouched, to the next runtime's recovery.
+        if (shuttingDown) return false;
+      }
       const empty = await recoverTerminal({ ...entry, launchDirectory: database.launchDirectory, subprocesses });
       if (!empty || shuttingDown) return false;
       // Socket removal belongs to the same proof as native emptiness.
@@ -138,8 +142,16 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     return reattachEnabled() && entry.created === 1 && Boolean(database.launchDirectory) && !terminals.has(entry.target)
       && entry.ownershipLabel === `com.21n.outright.terminal.${entry.target}` && typeof entry.cwd === "string";
   }
+  // Shutdown joins every attempt in flight, so none acts after the lease ends.
+  const pendingReattaches = new Set();
+  function joinReattach(entry) {
+    const attempt = reattachReserved(entry);
+    pendingReattaches.add(attempt);
+    return attempt.finally(() => pendingReattaches.delete(attempt));
+  }
   async function reattachReserved(entry) {
     const id = entry.target;
+    if (shuttingDown) return false;
     const record = readReattachRecord(id, database.launchDirectory);
     if (!record) return false;
     const nextToken = reattachToken();
@@ -149,8 +161,13 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     if (!processInstance) { forgetReattach(id); return false; }
     try { writeReattachRecord(id, database.launchDirectory, { identity: record.identity, token: nextToken }); }
     catch { forgetReattach(id); }
+    if (shuttingDown) {
+      // The broker detaches again and keeps the shell for its window. Ending
+      // it now would take a shell the next runtime can reattach.
+      processInstance.release?.();
+      return false;
+    }
     try {
-      if (shuttingDown) throw new Error("Runtime is shutting down");
       database.auditCritical("terminal.reattached", { target: id, cwd: entry.cwd, ownershipLabel: entry.ownershipLabel });
     } catch {
       // An unrecorded reattach is not offered as live. Ending it here lets
@@ -529,6 +546,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   // A failed audit leaves terminal.created pending for lease-owned recovery.
   async function shutdown() {
     shuttingDown = true;
+    await Promise.allSettled([...pendingReattaches]);
     const results = await Promise.allSettled([...terminals.values()].map((terminal) => Promise.resolve().then(async () => {
       try { await close(terminal.id); }
       catch (error) {

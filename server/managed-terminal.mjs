@@ -406,6 +406,7 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
   let finalResult;
   let provenBroker = false;
   let attachedSeen = false;
+  let released = false;
   let settleClose;
   const closeResult = new Promise((resolve) => { settleClose = resolve; });
   const socketClosed = new Promise((resolve) => socket.once("close", resolve));
@@ -442,6 +443,12 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
       socket.destroy();
       const result = await closeResult;
       if (!result.verified && !await ownerEmpty()) throw new Error("PTY owned process boundary could not be verified empty");
+    },
+    // Hands the shell back to its broker's detach window untouched, for a
+    // later runtime to reattach with the rotated token.
+    release() {
+      released = true;
+      socket.destroy();
     },
   };
   // Any fault while proving the endpoint refuses this attempt; it never
@@ -483,7 +490,7 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
     socket.destroy();
   };
   const finish = async () => {
-    const verified = await ownerEmpty();
+    const verified = !released && await ownerEmpty();
     finalResult = { exitCode: shellResult?.exitCode ?? null, signal: shellResult?.signal ?? null,
       verified, outcomeKnown: Boolean(shellResult) };
     settleClose(finalResult);

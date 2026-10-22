@@ -1660,6 +1660,58 @@ test("a reattached terminal closed unexpectedly is still ended, audited and rele
   assert.deepEqual(manager.capacity(), { active: 0, unknown: 0, limit: 1 });
 });
 
+test("shutdown joins a reattach in flight and hands its shell back to the broker for the next runtime", { timeout: 60_000 }, async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-reattach-shutdown-"));
+  const filename = path.join(directory, "runtime.db");
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  t.after(() => { database.close(); rmSync(directory, { recursive: true, force: true }); });
+  const prior = await priorRunTerminal(t, database, directory);
+  database = await restartDatabase(database, filename);
+  const order = [];
+  let deliver;
+  let nextToken;
+  // The broker accepts the reattach, but its adapter reaches this runtime
+  // only after shutdown has begun.
+  const stopping = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => true,
+    recoverTerminal: async () => { order.push("native-recovery"); return false; },
+    reattachTerminal: async (options) => {
+      nextToken = options.nextToken;
+      const adapter = await reattachManagedTerminal(options);
+      assert.ok(adapter, "the live broker refused its current token");
+      const { terminate, release } = adapter;
+      adapter.terminate = () => { order.push("terminate"); return terminate(); };
+      adapter.release = () => { order.push("release"); release(); };
+      await new Promise((resolve) => { deliver = resolve; });
+      order.push("adapter-delivered");
+      return adapter;
+    } });
+  const reconcile = stopping.reconcileUnknown();
+  await waitFor(() => deliver, 10_000);
+  const shutdown = stopping.shutdown().then(() => order.push("shutdown-returned"));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.deepEqual(order, [], "shutdown returned before the reattach in flight settled");
+  deliver();
+  await shutdown;
+  assert.equal(await reconcile, 0);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.deepEqual(order, ["adapter-delivered", "release", "shutdown-returned"]);
+  assert.equal(prior.exited(), false, "shutdown ended a shell the next runtime could reattach");
+  assert.equal(readReattachRecord(prior.id, database.launchDirectory)?.token, nextToken, "the rotated token was not kept");
+  assert.equal(database.listAudit(50).some((entry) => entry.action === "terminal.reattached" || entry.target === prior.id
+    && entry.action === "terminal.recovered"), false);
+  // The successor reattaches the same live shell with the rotated token.
+  database = await restartDatabase(database, filename);
+  const successor = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => true,
+    recoverTerminal: brokerRecovery(prior) });
+  t.after(() => successor.shutdown().catch(() => {}));
+  assert.equal(await successor.reconcileUnknown(), 1);
+  assert.equal(successor.get(prior.id).reattached, true);
+  assert.equal(successor.write(prior.id, "kept + 1\r"), true);
+  await waitFor(() => successor.get(prior.id).buffer.includes("42"), 10_000, () => successor.get(prior.id).buffer);
+  assert.equal(await successor.close(prior.id), true);
+  assert.equal(prior.exited(), true);
+});
+
 test("an endpoint that cannot prove the reattach token is refused before anything spendable or typed reaches it", { timeout: 60_000 }, async () => {
   for (const reply of ["echo", "forged"]) {
     const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-reattach-forged-"));
