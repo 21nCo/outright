@@ -134,7 +134,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     return eventHub.publish(event);
   };
 
-  terminals = terminalManagerFactory({ database, publish, subprocesses });
+  terminals = terminalManagerFactory({ database, publish, subprocesses, reattachEnabled: () => {
+    try { return database.getSettings().terminalReattach === true; } catch { return false; }
+  } });
   const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl), subprocesses });
   runtimeCapacity = function runtimeCapacity() {
     const capacity = database.capacity();

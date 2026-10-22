@@ -16,11 +16,21 @@ export function terminalEndLabel(terminal) {
   return "";
 }
 
+// A reattached terminal is the same live process that kept running across a
+// restart; a relaunch is a new shell. The two are never shown alike.
 export function terminalTabLabel(terminal) {
   if (terminal.status === "ended") return `${terminal.name}, saved output, ${terminalEndLabel(terminal)}`;
   if (terminal.status === "unknown") return `${terminal.name}, ownership unverified`;
-  const name = terminal.relaunchedFrom ? `${terminal.name}, new shell` : terminal.name;
+  let name = terminal.name;
+  if (terminal.reattached) name = `${terminal.name}, live process reattached`;
+  else if (terminal.relaunchedFrom) name = `${terminal.name}, new shell`;
   return terminal.status === "exited" ? `${name}, ${terminalEndLabel(terminal)}` : name;
+}
+
+export function terminalTabBadge(terminal) {
+  if (terminal.status === "ended") return "Saved";
+  if (terminal.reattached) return "Reattached";
+  return terminal.relaunchedFrom ? "New shell" : "";
 }
 
 // Reopening a worktree shows a live or unverified terminal first, then its

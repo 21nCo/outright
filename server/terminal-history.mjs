@@ -529,6 +529,20 @@ export function openTerminalHistory({ directory, limits = TERMINAL_HISTORY_LIMIT
         enforce();
       });
     },
+    // A reattached live process continues the session this start marked as
+    // ended by restart. Any other ended session stays as it ended.
+    resume(id) {
+      const entry = entries.get(id);
+      if (entry?.meta.end?.reason !== "restart" || entry.stalled) return false;
+      return guarded(() => {
+        const { end, ...meta } = entry.meta;
+        entry.meta = meta;
+        entry.endedAt = null;
+        writeMeta(entry);
+        openSegment(entry);
+        enforce();
+      });
+    },
     append(id, data) {
       const entry = entries.get(id);
       if (!writable || closed || entry?.fd == null || typeof data !== "string" || !data) return;

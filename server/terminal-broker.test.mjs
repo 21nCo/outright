@@ -485,3 +485,158 @@ test("disconnecting a live owner releases the broker and its PTY child", { timeo
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+// A broker started like the managed launcher, with an optional reattach
+// session, and a framed client for each connection the test opens.
+async function startSessionBroker(t, { session, diagnostics = false } = {}) {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "pty-broker-session-"));
+  const address = process.platform === "win32"
+    ? `\\\\.\\pipe\\outright-broker-session-${randomUUID()}` : path.join(directory, "broker.sock");
+  const broker = spawn(process.execPath, [brokerScript, address, randomUUID() + randomUUID()], {
+    stdio: ["ignore", "ignore", "pipe"], detached: process.platform !== "win32", windowsHide: true,
+    env: { ...process.env, ...(diagnostics ? { OUTRIGHT_BROKER_DIAGNOSTICS: "1" } : {}) },
+  });
+  let stderr = "";
+  broker.stderr.setEncoding("utf8");
+  broker.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-16_384); });
+  const closed = new Promise((resolve) => broker.once("close", (code, signal) => resolve({ code, signal })));
+  t.after(() => {
+    if (broker.exitCode === null && broker.signalCode === null) {
+      if (process.platform === "win32") spawnSync("taskkill", ["/T", "/F", "/PID", String(broker.pid)],
+        { windowsHide: true, stdio: "ignore", timeout: 5000 });
+      else try { process.kill(-broker.pid, "SIGKILL"); } catch {}
+    }
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const connect = async (deadline = Date.now() + 8000) => {
+    for (;;) {
+      try {
+        return await new Promise((resolve, reject) => {
+          const candidate = net.createConnection(address);
+          candidate.once("connect", () => resolve(candidate));
+          candidate.once("error", reject);
+        });
+      } catch (error) {
+        if (Date.now() > deadline || broker.exitCode !== null) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+  };
+  const client = async (first) => {
+    const socket = await connect();
+    const frames = [];
+    let pending = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      pending += chunk;
+      let end;
+      while ((end = pending.indexOf("\n")) !== -1) {
+        frames.push(JSON.parse(pending.slice(0, end)));
+        pending = pending.slice(end + 1);
+      }
+    });
+    let isClosed = false;
+    const ended = new Promise((resolve) => socket.once("close", () => { isClosed = true; resolve(); }));
+    socket.on("error", () => {});
+    const send = (message) => socket.write(`${JSON.stringify(message)}\n`);
+    send(first);
+    // A refusal closes the connection without any frame.
+    const refusal = async () => {
+      await waitUntil(() => isClosed || frames.length, "a reattach attempt was neither accepted nor refused");
+      return frames;
+    };
+    return { socket, frames, ended, send, refusal, output: () => frames.filter((frame) => frame.type === "data").map((frame) => frame.data).join("") };
+  };
+  const start = await client({ type: "start", token: broker.spawnargs.at(-1), shell: process.execPath, cwd: directory,
+    env: process.env, cols: 120, rows: 30, ...(session ? { session } : {}) });
+  await waitUntil(() => start.frames.some((frame) => frame.type === "ready"), "PTY did not become ready");
+  return { broker, closed, start, client, connectOnly: connect, stderr: () => stderr };
+}
+
+async function waitUntil(predicate, message, timeout = 10_000) {
+  const deadline = Date.now() + timeout;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(message);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+test("a reattachable broker keeps the shell through a peer close and accepts each token once", { timeout: 40_000 }, async (t) => {
+  const label = `com.21n.outright.terminal.${randomUUID()}`;
+  const first = randomUUID() + randomUUID();
+  const { broker, start, client, connectOnly } = await startSessionBroker(t, { session: { label, token: first, windowMs: 30_000 } });
+  const identity = start.frames.find((frame) => frame.type === "ready").identity;
+  assert.match(identity, /^[0-9a-f-]{36}$/);
+  start.send({ type: "write", data: "globalThis.kept = 41\r" });
+  await waitUntil(() => start.output().includes("41"), "the shell did not evaluate input");
+  // Output produced after the peer is gone must be kept for the reattach.
+  start.send({ type: "write", data: "setTimeout(() => console.log('while-' + 'detached'), 400)\r" });
+  start.socket.destroy();
+  await start.ended;
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  assert.equal(broker.exitCode, null, "closing the peer ended a reattachable shell");
+
+  // An attempt that never completes its handshake loses the peer slot.
+  const idle = await connectOnly();
+  let idleClosed = false;
+  idle.once("close", () => { idleClosed = true; });
+  idle.on("error", () => {});
+  await waitUntil(() => idleClosed, "an idle connection held the detached session", 8000);
+
+  // Every refusal looks the same: the connection closes with no frame.
+  const second = randomUUID() + randomUUID();
+  for (const wrong of [
+    { label, identity, token: randomUUID() + randomUUID() },
+    { label: `com.21n.outright.terminal.${randomUUID()}`, identity, token: first },
+    { label, identity: randomUUID(), token: first },
+  ]) {
+    const refused = await client({ type: "reattach", ...wrong, nextToken: second });
+    assert.deepEqual(await refused.refusal(), []);
+  }
+
+  const resumed = await client({ type: "reattach", label, identity, token: first, nextToken: second });
+  await waitUntil(() => resumed.output().includes("while-detached"), "buffered output was not replayed");
+  assert.deepEqual(resumed.frames[0], { type: "reattached", identity, pid: resumed.frames[0].pid });
+  resumed.send({ type: "write", data: "kept + 1\r" });
+  await waitUntil(() => resumed.output().includes("42"), "the reattached shell is not the live process");
+  resumed.socket.destroy();
+  await resumed.ended;
+
+  const reused = await client({ type: "reattach", label, identity, token: first, nextToken: randomUUID() + randomUUID() });
+  assert.deepEqual(await reused.refusal(), [], "a spent token reattached");
+  const rotated = await client({ type: "reattach", label, identity, token: second, nextToken: randomUUID() + randomUUID() });
+  await waitUntil(() => rotated.frames.some((frame) => frame.type === "reattached"), "the rotated token was refused");
+  const closed = new Promise((resolve) => broker.once("close", resolve));
+  rotated.send({ type: "terminate" });
+  await waitUntil(() => rotated.frames.some((frame) => frame.type === "shell-exited"), "terminate did not end the shell");
+  await closed;
+});
+
+test("a detached shell ends when its window expires and the broker exits with its status", { timeout: 30_000 }, async (t) => {
+  const label = `com.21n.outright.terminal.${randomUUID()}`;
+  const token = randomUUID() + randomUUID();
+  const { start, closed, client, stderr } = await startSessionBroker(t, { session: { label, token, windowMs: 300 }, diagnostics: true });
+  const identity = start.frames.find((frame) => frame.type === "ready").identity;
+  start.socket.destroy();
+  let timeout;
+  const result = await Promise.race([closed, new Promise((_, reject) => {
+    timeout = setTimeout(() => reject(new Error(`detached broker outlived its window: ${stderr()}`)), 12_000);
+  })]).finally(() => clearTimeout(timeout));
+  const events = stderr().trim().split("\n").filter(Boolean).map((line) => JSON.parse(line).broker);
+  assert.deepEqual(events.filter((event) => ["peer-detached", "detach-expired", "shell-exit"].includes(event)),
+    ["peer-detached", "detach-expired", "shell-exit"]);
+  assert.notEqual(result.code, 0, "an expired shell was reported as a clean exit");
+  await assert.rejects(client({ type: "reattach", label, identity, token, nextToken: randomUUID() + randomUUID() }),
+    "an expired session still accepted a connection");
+});
+
+test("without a reattach session a peer close still ends the shell", { timeout: 20_000 }, async (t) => {
+  const { start, closed, stderr } = await startSessionBroker(t, { diagnostics: true });
+  assert.equal(start.frames.find((frame) => frame.type === "ready").identity, undefined);
+  start.socket.destroy();
+  let timeout;
+  await Promise.race([closed, new Promise((_, reject) => {
+    timeout = setTimeout(() => reject(new Error("a broker without a session kept its shell after the peer closed")), 10_000);
+  })]).finally(() => clearTimeout(timeout));
+  assert.ok(!stderr().includes("peer-detached"));
+});

@@ -1010,3 +1010,27 @@ test("an exit observed before shutdown is restored with its status, never as end
     restored.close();
   }
 });
+
+test("a reattached session resumes its restart-ended history; a session that exited stays ended", (t) => {
+  const { directory } = workspace(t);
+  const store = openTerminalHistory({ directory });
+  const live = begin(store);
+  const exited = begin(store);
+  store.append(live, "before restart\n");
+  store.end(exited, { exitCode: 0 });
+  store.close();
+  const restarted = openTerminalHistory({ directory });
+  assert.equal(restarted.saved().find((entry) => entry.id === live).endReason, "restart");
+  assert.equal(restarted.resume(exited), false, "an exited session was resumed");
+  assert.equal(restarted.resume(randomUUID()), false);
+  assert.equal(restarted.resume(live), true);
+  restarted.append(live, "after reattach\n");
+  assert.equal(restarted.read(live), "before restart\nafter reattach\n");
+  assert.equal(restarted.saved().find((entry) => entry.id === live).endedAt, null);
+  restarted.close();
+  // A crash after the reattach ends it by that later restart, output intact.
+  const again = openTerminalHistory({ directory });
+  assert.equal(again.saved().find((entry) => entry.id === live).endReason, "restart");
+  assert.equal(again.read(live), "before restart\nafter reattach\n");
+  again.close();
+});

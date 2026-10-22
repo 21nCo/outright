@@ -5,11 +5,13 @@ import { ArrowsClockwise, Plus, TerminalWindow, X } from "@phosphor-icons/react"
 import "@xterm/xterm/css/xterm.css";
 import { Button } from "@/components/ui/button";
 import { domId, nextTabIndex } from "@/lib/accessibility";
-import { preferredTerminal, pruneExitedIds, savedOutputRows, savedPageText, savedRowPages, terminalEndLabel, terminalTabLabel } from "@/lib/terminal-exit-state";
+import { preferredTerminal, pruneExitedIds, savedOutputRows, savedPageText, savedRowPages, terminalEndLabel, terminalTabBadge, terminalTabLabel } from "@/lib/terminal-exit-state";
 import { api } from "@/lib/runtime-api";
 
 const EMPTY_UNVERIFIED_IDS = new Set();
 const NEW_SHELL_MARKER = "\x1b[90m[new shell started; the saved session was not resumed]\x1b[0m\r\n";
+// Only a verified reattach to the process that kept running is marked live.
+const REATTACHED_MARKER = "\x1b[90m[live process reattached; this shell kept running while Outright restarted]\x1b[0m\r\n";
 // A saved page has at most 2,000 rows at the view's width, so it stays in
 // this scrollback even if the view narrows to a fifth of that width.
 const LIVE_SCROLLBACK = 5000;
@@ -235,7 +237,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       let status = detail.status ?? terminal.status;
       if (status !== "ended" && (pending.unknown || unverifiedTerminalIdsRef.current.has(terminal.id))) status = "unknown";
       const xterm = xtermRef.current;
-      const marker = Boolean(detail.relaunchedFrom ?? terminal.relaunchedFrom);
+      const reattached = Boolean(detail.reattached ?? terminal.reattached);
+      const marker = !reattached && Boolean(detail.relaunchedFrom ?? terminal.relaunchedFrom);
       let savedLabel = status === "ended" ? terminalEndLabel(savedFields(detail, terminal)) : "";
       if (detail.recoveryReservation) savedLabel = RESERVATION_LABEL;
       let displayedCursor = Number.isSafeInteger(detail.outputCursor) ? detail.outputCursor : 0;
@@ -246,7 +249,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
         savedViewRef.current = null;
         setSavedPage(null);
         if (xterm) xterm.options.scrollback = LIVE_SCROLLBACK;
-        xterm?.write(marker ? CLEAR_VIEW + NEW_SHELL_MARKER : CLEAR_VIEW);
+        xterm?.write(CLEAR_VIEW + (reattached ? REATTACHED_MARKER : marker ? NEW_SHELL_MARKER : ""));
         if (detail.buffer) xterm?.write(detail.buffer);
         for (const { cursor, data } of pending.chunks) {
           if (!Number.isSafeInteger(detail.outputCursor) || !Number.isSafeInteger(cursor) || cursor > detail.outputCursor) xterm?.write(data);
@@ -278,6 +281,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       if (status === "ended") notice = `${detail.name ?? terminal.name} saved output, ${savedLabel}. Read-only.${savedOutput.dropped ? " Earlier saved output not shown." : ""}`;
       else if (exited) notice = `${terminal.name} process exited ${exited.exitCode ?? "unknown"}`;
       else if (status === "unknown") notice = `${terminal.name} ownership is unverified. Inspect local terminal recovery.`;
+      else if (reattached) notice = `${terminal.name} live process reattached; it kept running while Outright restarted`;
       setExitNotice(notice);
       activeIdRef.current = terminal.id;
       displayedCursorRef.current = displayedCursor;
@@ -629,7 +633,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
   return <section className="terminal-pane" aria-label="Worktree terminals">
     <p className="sr-only" id="terminal-help">Terminal input and output. Use the left and right arrow keys on a terminal tab to switch sessions.</p>
     <header className="terminal-tabs" role="tablist" aria-label="Open terminals" aria-orientation="horizontal" aria-busy={loading} onKeyDown={navigateTerminalTabs}>
-      {terminals.map((terminal) => <div className={`terminal-tab ${terminal.id === activeId ? "is-active" : ""}`} key={terminal.id}><button className="terminal-tab-select" id={domId("terminal-tab", terminal.id)} data-tab-id={terminal.id} role="tab" aria-selected={terminal.id === activeId} aria-controls="terminal-panel" tabIndex={terminal.id === activeId || (!activeId && terminals[0]?.id === terminal.id) ? 0 : -1} aria-disabled={loading || undefined} aria-label={terminalTabLabel(terminal)} onClick={() => selectTerminal(terminal)}><TerminalWindow /><span>{terminal.name}</span>{terminal.status === "ended" ? <span className="terminal-tab-badge">Saved</span> : terminal.relaunchedFrom && <span className="terminal-tab-badge">New shell</span>}</button><button className="terminal-tab-close" aria-label={terminal.status === "ended" ? `Dismiss saved terminal ${terminal.name}` : `Close terminal ${terminal.name}`} disabled={loading || terminal.recoveryReservation} onClick={() => closeTerminal(terminal.id)}><X /></button></div>)}
+      {terminals.map((terminal) => <div className={`terminal-tab ${terminal.id === activeId ? "is-active" : ""}`} key={terminal.id}><button className="terminal-tab-select" id={domId("terminal-tab", terminal.id)} data-tab-id={terminal.id} role="tab" aria-selected={terminal.id === activeId} aria-controls="terminal-panel" tabIndex={terminal.id === activeId || (!activeId && terminals[0]?.id === terminal.id) ? 0 : -1} aria-disabled={loading || undefined} aria-label={terminalTabLabel(terminal)} onClick={() => selectTerminal(terminal)}><TerminalWindow /><span>{terminal.name}</span>{terminalTabBadge(terminal) && <span className="terminal-tab-badge">{terminalTabBadge(terminal)}</span>}</button><button className="terminal-tab-close" aria-label={terminal.status === "ended" ? `Dismiss saved terminal ${terminal.name}` : `Close terminal ${terminal.name}`} disabled={loading || terminal.recoveryReservation} onClick={() => closeTerminal(terminal.id)}><X /></button></div>)}
       <Button variant="ghost" size="icon-xs" disabled={loading} onClick={createTerminal} aria-label="New terminal"><Plus /></Button>
       {loading && <span className="terminal-loading" role="status"><ArrowsClockwise className="spin" />Loading terminal</span>}
     </header>

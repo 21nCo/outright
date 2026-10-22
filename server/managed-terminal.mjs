@@ -1,6 +1,6 @@
 import { spawn } from "./child-process.mjs";
-import { randomUUID } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomBytes, randomUUID } from "node:crypto";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,10 +12,14 @@ const START_TIMEOUT_MS = 8000;
 
 export function terminalOwnership(id, launchDirectory) {
   const token = randomUUID();
-  const socketDirectory = process.platform === "win32" ? null : privateSocketDirectory();
-  return { label: `com.21n.outright.terminal.${id}`, token,
-    address: process.platform === "win32" ? String.raw`\\.\pipe\outright-terminal-${id}` : path.join(socketDirectory, `${id}.sock`),
+  return { label: `com.21n.outright.terminal.${id}`, token, address: terminalAddress(id),
     handshakePath: path.join(launchDirectory, `terminal-${id}.json`) };
+}
+
+// The broker address follows from the terminal id alone, so a reattach never
+// connects where a stored record points.
+function terminalAddress(id) {
+  return process.platform === "win32" ? String.raw`\\.\pipe\outright-terminal-${id}` : path.join(privateSocketDirectory(), `${id}.sock`);
 }
 
 function privateSocketDirectory() {
@@ -36,14 +40,55 @@ export function cleanupTerminalSocket(id) {
   catch (error) { if (error.code !== "ENOENT") throw error; }
 }
 
-function emptyProofPath(id, launchDirectory) {
+function privateOwnerPath(id, launchDirectory, suffix) {
   if (typeof id !== "string" || !/^[0-9a-f-]{36}$/i.test(id)) throw new Error("Invalid terminal owner id");
   const directory = lstatSync(launchDirectory);
   if (!directory.isDirectory() || directory.isSymbolicLink()
     || (process.platform !== "win32" && (directory.uid !== process.getuid() || (directory.mode & 0o077) !== 0))) {
     throw new Error("Terminal proof directory is not private");
   }
-  return path.join(launchDirectory, `terminal-${id}.empty`);
+  return path.join(launchDirectory, `terminal-${id}.${suffix}`);
+}
+
+function emptyProofPath(id, launchDirectory) { return privateOwnerPath(id, launchDirectory, "empty"); }
+
+const REATTACH_TOKEN = /^[A-Za-z0-9_-]{43}$/;
+export function reattachToken() { return randomBytes(32).toString("base64url"); }
+
+// A reattachable session's identity and current single-use token, private to
+// this user. It is replaced whole, so a reader sees one token or the next.
+export function writeReattachRecord(id, launchDirectory, { identity, token }) {
+  if (typeof identity !== "string" || !/^[0-9a-f-]{36}$/i.test(identity) || !REATTACH_TOKEN.test(token)) {
+    throw new Error("Invalid terminal reattach record");
+  }
+  const filename = privateOwnerPath(id, launchDirectory, "reattach");
+  const temporary = `${filename}.${randomBytes(8).toString("hex")}.tmp`;
+  const descriptor = openSync(temporary, "wx", 0o600);
+  try {
+    try { writeFileSync(descriptor, `${JSON.stringify({ id, identity, token })}\n`); fsyncSync(descriptor); }
+    finally { closeSync(descriptor); }
+    renameSync(temporary, filename);
+  } catch (error) {
+    try { unlinkSync(temporary); } catch { /* Leftovers are swept with stale proofs. */ }
+    throw error;
+  }
+}
+
+export function readReattachRecord(id, launchDirectory) {
+  try {
+    const filename = privateOwnerPath(id, launchDirectory, "reattach");
+    const info = lstatSync(filename);
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > 1024
+      || (process.platform !== "win32" && (info.uid !== process.getuid() || (info.mode & 0o077) !== 0))) return null;
+    const record = JSON.parse(readFileSync(filename, "utf8"));
+    return record?.id === id && typeof record.identity === "string" && /^[0-9a-f-]{36}$/i.test(record.identity)
+      && REATTACH_TOKEN.test(record.token) ? { identity: record.identity, token: record.token } : null;
+  } catch { return null; }
+}
+
+export function removeReattachRecord(id, launchDirectory) {
+  try { unlinkSync(privateOwnerPath(id, launchDirectory, "reattach")); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
 }
 
 // A creation audit may fail after the native owner has been verified empty.
@@ -193,7 +238,7 @@ async function teardownFailedLaunch(error, adapter, id, ownership) {
   return error;
 }
 
-export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, rows, env,
+export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, rows, env, session = null,
   subprocesses = utilityProcesses }) {
   const child = spawn(AGENT_SUPERVISOR, terminalSupervisorArgs(ownership), { cwd, env: { ...env,
     ...(process.platform === "darwin" ? { OUTRIGHT_LAUNCH_GATE_FD: "3", OUTRIGHT_TERMINAL_CONTROL: "1" } : {}) },
@@ -275,7 +320,10 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
     },
   };
   const handleBrokerMessage = (message, resolve, reject) => {
-    if (message.type === "ready") { readySeen = true; resolve(); return; }
+    if (message.type === "ready") {
+      if (session && typeof message.identity === "string" && /^[0-9a-f-]{36}$/i.test(message.identity)) adapter.sessionIdentity = message.identity;
+      readySeen = true; resolve(); return;
+    }
     if (message.type === "error") { reject(new Error(message.message)); return; }
     if (message.type === "shell-exited") {
       if (shellExited || !Number.isSafeInteger(message.exitCode) || message.exitCode < 0
@@ -301,7 +349,8 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
       settleSocket();
       if (readySeen && !shellExited && !closed) void adapter.terminate().catch(() => {});
     }, () => readySeen);
-    socket.write(`${JSON.stringify({ type: "start", token: ownership.token, shell, cwd, cols, rows, env })}\n`);
+    socket.write(`${JSON.stringify({ type: "start", token: ownership.token, shell, cwd, cols, rows, env,
+      ...(session ? { session } : {}) })}\n`);
     let timeout;
     await Promise.race([ready, new Promise((_, reject) => {
       timeout = setTimeout(() => reject(new Error("PTY broker launch timed out")), START_TIMEOUT_MS);
@@ -317,6 +366,100 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
   } catch (error) {
     throw await teardownFailedLaunch(error, adapter, id, ownership);
   }
+}
+
+// Reattaches to a detached broker that a previous Outright process launched.
+// The broker must accept the owner label, its process identity and the
+// current token; any refusal, timeout or malformed reply returns null, as
+// does a broker that is gone. On success the token is spent and nextToken is
+// the only one the broker accepts. Termination asks the broker to end the
+// shell, then requires verifyEmpty to prove the native owner is gone.
+export async function reattachManagedTerminal({ id, identity, token, nextToken, cols, rows, verifyEmpty,
+  timeoutMs = 2000 }) {
+  let socket;
+  try {
+    socket = await new Promise((resolve, reject) => {
+      const candidate = net.createConnection(terminalAddress(id));
+      const timer = setTimeout(() => { candidate.destroy(); reject(new Error("PTY broker reattach timed out")); }, timeoutMs);
+      candidate.once("connect", () => { clearTimeout(timer); resolve(candidate); });
+      candidate.once("error", (error) => { clearTimeout(timer); reject(error); });
+    });
+  } catch { return null; }
+  let onData;
+  let onExit;
+  let earlyData = "";
+  let shellResult;
+  let finalResult;
+  let attachedSeen = false;
+  let settleClose;
+  const closeResult = new Promise((resolve) => { settleClose = resolve; });
+  const adapter = {
+    pid: null,
+    onData(callback) { onData = callback; if (earlyData) { callback(earlyData); earlyData = ""; } },
+    onExit(callback) { onExit = callback; if (finalResult) callback(finalResult); },
+    write(data) {
+      if (socket.destroyed || socket.writableLength > 256 * 1024) return false;
+      socket.write(`${JSON.stringify({ type: "write", data })}\n`);
+      return true;
+    },
+    resize(nextCols, nextRows) {
+      if (socket.destroyed || socket.writableLength > 256 * 1024) return false;
+      socket.write(`${JSON.stringify({ type: "resize", cols: nextCols, rows: nextRows })}\n`);
+      return true;
+    },
+    async terminate() {
+      if (!socket.destroyed) socket.write(`${JSON.stringify({ type: "terminate" })}\n`);
+      let timeout;
+      const result = await Promise.race([closeResult, new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("PTY ownership teardown timed out")), 6000);
+      })]).finally(() => clearTimeout(timeout));
+      if (!result.verified) throw new Error("PTY owned process boundary could not be verified empty");
+    },
+  };
+  const handleMessage = (message, resolve, reject) => {
+    if (!attachedSeen) {
+      if (message.type !== "reattached" || message.identity !== identity) { reject(new Error("PTY broker refused reattach")); socket.destroy(); return; }
+      attachedSeen = true;
+      if (Number.isSafeInteger(message.pid) && message.pid > 0) adapter.pid = message.pid;
+      resolve();
+      return;
+    }
+    if (message.type === "shell-exited" && !shellResult && Number.isSafeInteger(message.exitCode) && message.exitCode >= 0
+      && Number.isSafeInteger(message.signal) && message.signal >= 0) {
+      shellResult = { exitCode: message.exitCode, signal: message.signal };
+      return;
+    }
+    if (message.type === "data" && typeof message.data === "string" && !shellResult) {
+      if (onData) onData(message.data);
+      else earlyData = `${earlyData}${message.data}`.slice(-1_100_000);
+      return;
+    }
+    socket.destroy();
+  };
+  // A broker that closes without its exit frame may still be detached and
+  // alive, so only proof that the owner is empty makes that outcome known.
+  const finish = async () => {
+    let verified = false;
+    try { verified = Boolean(await verifyEmpty()); } catch { /* The owner stays unverified. */ }
+    finalResult = { exitCode: shellResult?.exitCode ?? null, signal: shellResult?.signal ?? null,
+      verified, outcomeKnown: Boolean(shellResult) };
+    settleClose(finalResult);
+    onExit?.(finalResult);
+  };
+  const ready = waitForBrokerReady(socket, handleMessage, () => { if (attachedSeen) void finish(); }, () => attachedSeen);
+  ready.catch(() => {});
+  socket.write(`${JSON.stringify({ type: "reattach", label: `com.21n.outright.terminal.${id}`, identity, token, nextToken,
+    ...(Number.isInteger(cols) && Number.isInteger(rows) ? { cols, rows } : {}) })}\n`);
+  let timeout;
+  try {
+    await Promise.race([ready, new Promise((_, reject) => {
+      timeout = setTimeout(() => reject(new Error("PTY broker reattach timed out")), timeoutMs);
+    })]).finally(() => clearTimeout(timeout));
+  } catch {
+    socket.destroy();
+    return null;
+  }
+  return adapter;
 }
 
 async function recoverDarwinTerminal(label, subprocesses) {

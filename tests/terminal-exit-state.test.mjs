@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import xterm from "@xterm/xterm";
-import { MAX_SAVED_CHARS, MAX_SAVED_ROWS, escapeSpans, preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabLabel, savedOutputRows, savedPageText, savedRowPages } from "../src/lib/terminal-exit-state.js";
+import { MAX_SAVED_CHARS, MAX_SAVED_ROWS, escapeSpans, preferredTerminal, pruneExitedIds, terminalEndLabel, terminalTabBadge, terminalTabLabel, savedOutputRows, savedPageText, savedRowPages } from "../src/lib/terminal-exit-state.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
 
 test("audit failure fences terminal commands before a later runtime event or React commit", () => {
@@ -48,6 +48,20 @@ test("saved sessions are labelled by how they ended and never as running", () =>
   assert.equal(terminalTabLabel(relaunched), "Server, new shell");
   assert.equal(terminalTabLabel({ ...relaunched, status: "exited", exitCode: 0 }), "Server, new shell, process exited 0");
   assert.equal(terminalTabLabel({ id: "d", name: "Shell", status: "running" }), "Shell");
+});
+
+test("a reattached live process is labelled apart from a new shell", () => {
+  const reattached = { id: "e", name: "Server", status: "running", reattached: true, relaunchedFrom: "a" };
+  const relaunched = { id: "f", name: "Server", status: "running", relaunchedFrom: "a" };
+  assert.equal(terminalTabLabel(reattached), "Server, live process reattached");
+  assert.equal(terminalTabBadge(reattached), "Reattached");
+  assert.equal(terminalTabLabel(relaunched), "Server, new shell");
+  assert.equal(terminalTabBadge(relaunched), "New shell");
+  assert.equal(terminalTabLabel({ ...reattached, status: "exited", exitCode: 0 }), "Server, live process reattached, process exited 0");
+  // Without a verified reattach the state never appears.
+  assert.equal(terminalTabBadge({ id: "g", name: "Shell", status: "running" }), "");
+  assert.equal(terminalTabBadge({ ...reattached, status: "ended", endReason: "restart" }), "Saved");
+  assert.doesNotMatch(terminalTabLabel({ ...reattached, status: "ended", endReason: "restart" }), /reattached/);
 });
 
 test("reopening a worktree shows live work first and otherwise the newest saved session without starting a shell", () => {
