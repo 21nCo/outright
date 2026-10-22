@@ -489,14 +489,17 @@ test("disconnecting a live owner releases the broker and its PTY child", { timeo
 
 // A broker started like the managed launcher, with an optional reattach
 // session, and a framed client for each connection the test opens.
-async function startSessionBroker(t, { session, diagnostics = false } = {}) {
+async function startSessionBroker(t, { session, diagnostics = false, captureStdout = false } = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), "pty-broker-session-"));
   const address = process.platform === "win32"
     ? `\\\\.\\pipe\\outright-broker-session-${randomUUID()}` : path.join(directory, "broker.sock");
   const broker = spawn(process.execPath, [brokerScript, address, randomUUID() + randomUUID()], {
-    stdio: ["ignore", "ignore", "pipe"], detached: process.platform !== "win32", windowsHide: true,
+    stdio: ["ignore", captureStdout ? "pipe" : "ignore", "pipe"], detached: process.platform !== "win32", windowsHide: true,
     env: { ...process.env, ...(diagnostics ? { OUTRIGHT_BROKER_DIAGNOSTICS: "1" } : {}) },
   });
+  let stdout = "";
+  broker.stdout?.setEncoding("utf8");
+  broker.stdout?.on("data", (chunk) => { stdout = `${stdout}${chunk}`.slice(-4096); });
   let stderr = "";
   broker.stderr.setEncoding("utf8");
   broker.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-16_384); });
@@ -563,7 +566,7 @@ async function startSessionBroker(t, { session, diagnostics = false } = {}) {
   const start = await client({ type: "start", token: broker.spawnargs.at(-1), shell: process.execPath, cwd: directory,
     env: process.env, cols: 120, rows: 30, ...(session ? { session } : {}) });
   await waitUntil(() => start.frames.some((frame) => frame.type === "ready"), "PTY did not become ready");
-  return { directory, broker, closed, start, client, reattach, connectOnly: connect, stderr: () => stderr };
+  return { directory, broker, closed, start, client, reattach, connectOnly: connect, stderr: () => stderr, stdout: () => stdout };
 }
 
 async function waitUntil(predicate, message, timeout = 10_000) {
@@ -634,6 +637,33 @@ test("a reattachable broker keeps the shell through a peer close and accepts eac
   rotated.send({ type: "terminate" });
   await waitUntil(() => rotated.frames.some((frame) => frame.type === "shell-exited"), "terminate did not end the shell");
   await closed;
+});
+
+// A detaching native supervisor pauses its own window only while a runtime is
+// reattached, so the broker reports each detach and each reattach, and only
+// those, on its stdout.
+test("a reattachable broker reports each detach and reattach to its supervisor", { timeout: 40_000 }, async (t) => {
+  const label = `com.21n.outright.terminal.${randomUUID()}`;
+  const token = randomUUID() + randomUUID();
+  const { start, reattach, stdout } = await startSessionBroker(t, { session: { label, token, windowMs: 30_000 }, captureStdout: true });
+  const identity = start.frames.find((frame) => frame.type === "ready").identity;
+  const statuses = () => stdout().split("\n").filter(Boolean);
+  start.send({ type: "write", data: "console.log('__OUTRIGHT_BROKER_' + 'ATTACHED_V1__')\r" });
+  await waitUntil(() => start.output().includes("__OUTRIGHT_BROKER_ATTACHED_V1__"), "the shell did not run");
+  assert.deepEqual(statuses(), [], "the first owner's attach or the shell's own output reached the supervisor");
+  start.socket.destroy();
+  await waitUntil(() => statuses().length === 1, "a detach was not reported");
+  const second = randomUUID() + randomUUID();
+  const resumed = await reattach({ label, identity, token, nextToken: second });
+  await waitUntil(() => resumed.frames.some((frame) => frame.type === "reattached"), "the reattach was refused");
+  await waitUntil(() => statuses().length === 2, "a reattach was not reported");
+  resumed.send({ type: "release" });
+  await waitUntil(() => statuses().length === 3, "a hand-back was not reported");
+  assert.deepEqual(statuses(), ["__OUTRIGHT_BROKER_DETACHED_V1__", "__OUTRIGHT_BROKER_ATTACHED_V1__", "__OUTRIGHT_BROKER_DETACHED_V1__"]);
+  const last = await reattach({ label, identity, token: second, nextToken: randomUUID() + randomUUID() });
+  await waitUntil(() => last.frames.some((frame) => frame.type === "reattached"), "the rotated token was refused");
+  last.send({ type: "terminate" });
+  await waitUntil(() => last.frames.some((frame) => frame.type === "shell-exited"), "terminate did not end the shell");
 });
 
 test("input queued behind output backpressure reaches the shell when its peer detaches", { timeout: 40_000 }, async (t) => {

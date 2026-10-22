@@ -228,10 +228,14 @@ function waitForBrokerReady(socket, handleMessage, onClose, wasReady) {
   });
 }
 
-function terminalSupervisorArgs(ownership) {
+// A reattach session asks the macOS supervisor to keep its launchd job after
+// this runtime exits, for the session's detach window.
+function terminalSupervisorArgs(ownership, session) {
   const brokerArgs = [process.execPath, BROKER, ownership.address, ownership.token];
   if (process.platform === "linux") return ["--stop-on-owner-exit", ownership.handshakePath, ...brokerArgs];
-  if (process.platform === "darwin") return [ownership.label, ...brokerArgs];
+  if (process.platform === "darwin") {
+    return [...(session ? ["--detach", String(session.windowMs)] : []), ownership.label, ...brokerArgs];
+  }
   return brokerArgs;
 }
 
@@ -253,7 +257,7 @@ async function teardownFailedLaunch(error, adapter, id, ownership) {
 
 export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, rows, env, session = null,
   subprocesses = utilityProcesses }) {
-  const child = spawn(AGENT_SUPERVISOR, terminalSupervisorArgs(ownership), { cwd, env: { ...env,
+  const child = spawn(AGENT_SUPERVISOR, terminalSupervisorArgs(ownership, session), { cwd, env: { ...env,
     ...(process.platform === "darwin" ? { OUTRIGHT_LAUNCH_GATE_FD: "3", OUTRIGHT_TERMINAL_CONTROL: "1" } : {}) },
     stdio: ["pipe", "pipe", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true });
   child.stdout.resume();

@@ -21,6 +21,12 @@
 #define LAUNCH_ENVIRONMENT "environment"
 #define LAUNCH_DEFINITION "launch.plist"
 #define LAUNCH_STATUS "status"
+// A reattachable terminal broker reports on its stdout when a successor
+// runtime reattaches and when it detaches again.
+#define BROKER_ATTACHED "__OUTRIGHT_BROKER_ATTACHED_V1__"
+#define BROKER_DETACHED "__OUTRIGHT_BROKER_DETACHED_V1__"
+#define MAX_DETACH_WINDOW_MS 600000
+#define MAX_DETACH_GRACE_MS 10000
 extern char **environ;
 
 static int run_launchctl(char *const arguments[], char *output, size_t output_capacity);
@@ -229,7 +235,8 @@ static bool remove_private_entry(int directory_fd, const char *name, bool privat
     && info.st_uid == getuid() && info.st_nlink == 1
     && (!private_mode || (info.st_mode & 077) == 0);
   close(descriptor);
-  return safe && unlinkat(directory_fd, name, 0) == 0;
+  // A concurrent recovery may remove the same entry first.
+  return safe && (unlinkat(directory_fd, name, 0) == 0 || errno == ENOENT);
 }
 
 // Recovery removes only this invocation's private entry after launchd has
@@ -598,26 +605,75 @@ static char *service_target(const char *label) {
   return target;
 }
 
-static void relay(int fd, int destination) {
+// Last broker status line seen on the job's stdout: 1 attached, -1
+// detached, 0 none since the caller last took it.
+typedef struct {
+  char line[40];
+  size_t used;
+  bool overflow;
+  int status;
+} broker_scanner;
+
+static void scan_broker_status(broker_scanner *scanner, const char *data, size_t length) {
+  for (size_t index = 0; index < length; index++) {
+    if (data[index] != '\n') {
+      if (scanner->used < sizeof(scanner->line)) scanner->line[scanner->used++] = data[index];
+      else scanner->overflow = true;
+      continue;
+    }
+    if (!scanner->overflow && scanner->used == strlen(BROKER_ATTACHED)
+        && memcmp(scanner->line, BROKER_ATTACHED, scanner->used) == 0) scanner->status = 1;
+    else if (!scanner->overflow && scanner->used == strlen(BROKER_DETACHED)
+        && memcmp(scanner->line, BROKER_DETACHED, scanner->used) == 0) scanner->status = -1;
+    scanner->used = 0;
+    scanner->overflow = false;
+  }
+}
+
+// A detached job's owner is gone, so its output has no reader. A detachable
+// relay keeps draining the FIFO after the destination fails: the job never
+// blocks on its output and broker status lines still reach the scanner.
+static void relay(int fd, int destination, bool detachable, broker_scanner *scanner) {
   size_t relayed = 0;
   const size_t relay_budget = 256 * 1024;
+  bool sink_open = true;
   while (relayed < relay_budget) {
     char buffer[8192];
     size_t remaining = relay_budget - relayed;
     ssize_t count = read(fd, buffer, remaining < sizeof(buffer) ? remaining : sizeof(buffer));
     if (count > 0) {
+      if (scanner != NULL) scan_broker_status(scanner, buffer, (size_t)count);
       ssize_t written = 0;
-      while (written < count) {
+      while (sink_open && written < count) {
         ssize_t next = write(destination, buffer + written, (size_t)(count - written));
-        if (next > 0) { written += next; relayed += (size_t)next; continue; }
+        if (next > 0) { written += next; continue; }
         if (next < 0 && errno == EINTR && !stop_requested) continue;
-        return;
+        if (!detachable) return;
+        sink_open = false;
       }
+      relayed += (size_t)count;
       continue;
     }
     if (count < 0 && errno == EINTR) continue;
     return;
   }
+}
+
+// CLOCK_MONOTONIC keeps counting while the Mac sleeps, so sleep cannot
+// extend a detached job past its window.
+static uint64_t monotonic_ms(void) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+
+// --detach WINDOW_MS: the same bound as the broker's own detach window.
+static long parse_detach_window(const char *raw) {
+  char *end = NULL;
+  errno = 0;
+  long value = strtol(raw, &end, 10);
+  if (errno != 0 || end == raw || *end != '\0' || value < 50 || value > MAX_DETACH_WINDOW_MS) return -1;
+  return value;
 }
 
 static void bootout(const char *target) {
@@ -718,7 +774,10 @@ static bool terminate_coalition(const char *target, uint64_t coalition_id) {
   for (int attempt = 0; attempt < 100; attempt++) {
     pid_t pids[1024];
     int count = coalition_members(coalition_id, pids, sizeof(pids) / sizeof(pids[0]));
-    if (count < 0) return false;
+    // A detached job's own supervisor may finish it concurrently with
+    // recovery. launchd's coalition, once reaped, is empty for good, which
+    // proves the tree empty after the service is confirmed gone.
+    if (count < 0) return errno == ESRCH && bootout_checked(target);
     if (count == 0) return bootout_checked(target);
     for (int index = 0; index < count; index++) {
       if (pids[index] > 0 && pids[index] != getpid()) {
@@ -886,8 +945,21 @@ int main(int argc, char **argv) {
   bool supervisor_resolved = resolve_supervisor_path(supervisor, sizeof(supervisor));
   if (argc == 3 && strcmp(argv[1], "--self-test") == 0)
     return supervisor_resolved ? self_test(supervisor, argv[2]) : 71;
+  // Detach mode keeps the job after its owner leaves, for at most the
+  // window while no successor is attached. Utility owners never detach.
+  long detach_window_ms = 0;
+  char *program = argv[0];
+  if (argc > 2 && strcmp(argv[1], "--detach") == 0) {
+    detach_window_ms = parse_detach_window(argv[2]);
+    if (detach_window_ms < 0 || getenv("OUTRIGHT_UTILITY_OWNER") != NULL) {
+      dprintf(STDERR_FILENO, "Usage: %s --detach WINDOW_MS LABEL EXECUTABLE [ARG...]\n", program);
+      return utility_prelaunch_exit(64);
+    }
+    argc -= 2;
+    argv += 2;
+  }
   if (argc < 3 || !valid_label(argv[1])) {
-    dprintf(STDERR_FILENO, "Usage: %s LABEL EXECUTABLE [ARG...]\n", argv[0]);
+    dprintf(STDERR_FILENO, "Usage: %s [--detach WINDOW_MS] LABEL EXECUTABLE [ARG...]\n", program);
     return utility_prelaunch_exit(64);
   }
   if (!launch_authorized()) return utility_prelaunch_exit(75);
@@ -975,15 +1047,40 @@ int main(int argc, char **argv) {
   int provider_exit_code = 1;
   int state_failures = 0;
   bool tree_empty_proven = false;
+  // Detach state. An explicit stop request still ends the job at once; only
+  // the owner's exit (stdin EOF or reparenting) starts the window. The window
+  // allows the broker's own expiry to end its shell first, then ends whatever
+  // remains. It pauses while a successor runtime is reattached.
+  broker_scanner broker_status = { .used = 0 };
+  bool stdin_closed = false;
+  bool owner_lost = false;
+  bool reattached = false;
+  bool broker_exited = false;
+  uint64_t detach_deadline = 0;
+  const uint64_t detach_grace = detach_window_ms < MAX_DETACH_GRACE_MS ? (uint64_t)detach_window_ms : MAX_DETACH_GRACE_MS;
   for (;;) {
-    relay(stdout_fd, STDOUT_FILENO);
-    relay(stderr_fd, STDERR_FILENO);
-    if (terminal_control) {
+    relay(stdout_fd, STDOUT_FILENO, detach_window_ms > 0, detach_window_ms > 0 ? &broker_status : NULL);
+    relay(stderr_fd, STDERR_FILENO, detach_window_ms > 0, NULL);
+    if (terminal_control && !stdin_closed) {
       char command[16];
       ssize_t received = read(STDIN_FILENO, command, sizeof(command));
-      if (received > 0 || received == 0) stop_requested = 1;
+      if (received > 0 || (received == 0 && detach_window_ms == 0)) stop_requested = 1;
+      else if (received == 0) stdin_closed = true;
     }
-    if ((stop_requested || getppid() != owner_pid) && !stopping) {
+    if (detach_window_ms > 0) {
+      if (stdin_closed || getppid() != owner_pid) owner_lost = true;
+      // Attachment lasts only while the broker runs: a status line drained
+      // after its exit cannot pause the window.
+      if (broker_status.status != 0) {
+        reattached = broker_status.status > 0 && !broker_exited;
+        broker_status.status = 0;
+        detach_deadline = 0;
+      }
+      if (owner_lost && !reattached && detach_deadline == 0)
+        detach_deadline = monotonic_ms() + (uint64_t)detach_window_ms + detach_grace;
+      if (detach_deadline != 0 && monotonic_ms() >= detach_deadline) stop_requested = 1;
+    }
+    if ((stop_requested || (detach_window_ms == 0 && getppid() != owner_pid)) && !stopping) {
       stopping = true;
     }
     service_state state;
@@ -1037,7 +1134,13 @@ int main(int argc, char **argv) {
       result = 70;
       break;
     }
-    if (getenv("OUTRIGHT_UTILITY_OWNER") != NULL
+    if (detach_window_ms > 0 && state.runs >= 1 && state.active == 0) {
+      broker_exited = true;
+      reattached = false;
+    }
+    // A detached job whose broker has exited has nothing left to reattach
+    // to, so its escaped descendants end at once, as a utility's do.
+    if ((getenv("OUTRIGHT_UTILITY_OWNER") != NULL || (broker_exited && owner_lost))
         && state.runs >= 1 && state.active == 0 && member_count > 0) {
       if (terminate_coalition(target, coalition_id)) {
         result = provider_exit_code;
@@ -1057,8 +1160,8 @@ int main(int argc, char **argv) {
     nanosleep(&delay, NULL);
   }
 
-  relay(stdout_fd, STDOUT_FILENO);
-  relay(stderr_fd, STDERR_FILENO);
+  relay(stdout_fd, STDOUT_FILENO, detach_window_ms > 0, detach_window_ms > 0 ? &broker_status : NULL);
+  relay(stderr_fd, STDERR_FILENO, detach_window_ms > 0, NULL);
   close(stdout_fd);
   close(stderr_fd);
   unlink(stdout_path);
