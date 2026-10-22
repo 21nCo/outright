@@ -403,7 +403,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           providers: agents.providers(),
           trustedProjects: database.listTrustedProjects(),
           templates: database.listTemplates(),
-          terminals: terminals.list(),
+          // Clients list saved sessions over /api/terminals; bootstrap
+          // stays independent of the history population.
+          terminals: terminals.list({ saved: false }),
           activeRuns: agents.activeRuns(),
           capacity: runtimeCapacity(),
         });
@@ -935,7 +937,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         return json(response, 200, { trusted: false });
       }
 
-      if (url.pathname === "/api/terminals" && request.method === "GET") return json(response, 200, { terminals: terminals.list() });
+      if (url.pathname === "/api/terminals" && request.method === "GET") return json(response, 200, { terminals: terminals.list(), history: terminals.historyStatus?.() ?? null });
       if (url.pathname === "/api/terminals" && request.method === "POST") {
         const body = await readJson(request);
         if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.cwd !== "string" || !body.cwd
@@ -1007,7 +1009,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         after: url.searchParams.get("after"),
         payload: {
           activeRuns: agents.activeRuns(),
-          terminals: terminals.list(),
+          terminals: terminals.list({ saved: false }),
+          history: terminals.historyStatus?.() ?? null,
           runtimeInstanceId,
           restarted: Boolean(previousInstanceId && previousInstanceId !== runtimeInstanceId),
         },

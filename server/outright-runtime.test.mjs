@@ -14,6 +14,7 @@ import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAliv
 import { createOutrightDatabase } from "./database.mjs";
 import { AGENT_SUPERVISOR, createAgentManager, LAUNCH_AUTHORIZED_CONTROL } from "./agent-manager.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
+import { openTerminalHistory } from "./terminal-history.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { randomUUID } from "node:crypto";
 import { writeNodeCommand } from "../tests/fixtures/node-command.mjs";
@@ -3640,3 +3641,25 @@ console.log("Logged in using ChatGPT");\n`);
   assert.equal(retried.statusCode, 202, JSON.stringify(retried.body));
   assert.deepEqual([scheduled.length, scheduled[0].forceFreshSession, scheduled[0].run.accountPinId], [1, true, work.id]);
 }));
+
+test("bootstrap omits saved terminal sessions, which clients list over /api/terminals", async () => {
+  const historyRoot = mkdtempSync(path.join(os.tmpdir(), "outright-bootstrap-history-"));
+  const directory = path.join(historyRoot, "terminal-history");
+  const configFile = path.join(historyRoot, "outright.config.json");
+  writeFileSync(configFile, JSON.stringify({ scanRoots: [], maxDepth: 1, maxProjects: 1 }));
+  try {
+    const seed = openTerminalHistory({ directory });
+    const saved = randomUUID();
+    seed.begin({ id: saved, name: "Saved", cwd: "/work/tree", createdAt: new Date().toISOString() }, "saved output\n");
+    seed.end(saved, { exitCode: 0 });
+    seed.close();
+    await withRuntime(async (runtime) => {
+      const bootstrap = await getRoute(runtime, "/api/bootstrap");
+      assert.equal(bootstrap.statusCode, 200);
+      assert.deepEqual(bootstrap.body.terminals, [], "bootstrap carried saved sessions it never uses");
+      const listing = await getRoute(runtime, "/api/terminals");
+      assert.deepEqual(listing.body.terminals.map(({ id, status }) => ({ id, status })), [{ id: saved, status: "ended" }]);
+    }, { configUrl: pathToFileURL(configFile),
+      terminalManagerFactory: (options) => createTerminalManager({ ...options, history: openTerminalHistory({ directory }) }) })();
+  } finally { rmSync(historyRoot, { recursive: true, force: true }); }
+});

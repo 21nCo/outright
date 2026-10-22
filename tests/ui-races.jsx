@@ -1,6 +1,7 @@
 // Open /tests/ui-races.html on the local Vite server. All API and socket traffic
 // is replaced in this page; no real project, conversation or terminal is changed.
 import React, { startTransition, Suspense } from "react";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { App } from "../src/App.jsx";
 import { ChangesPane } from "../src/components/ChangesPane.jsx";
@@ -13,6 +14,8 @@ import { TerminalPane } from "../src/components/TerminalPane.jsx";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
 import { scheduleLayoutTick } from "../src/lib/windowing.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
+import { savedOutputRows, savedPageText, savedRowPages } from "../src/lib/terminal-exit-state.js";
+import { Terminal } from "@xterm/xterm";
 import "../src/styles.css";
 
 const host = document.getElementById("root");
@@ -2330,6 +2333,622 @@ async function terminalUnknownDuringActivationRegression() {
   assert(created === 0, "unknown terminal started a replacement process");
 }
 
+function savedTerminal(id, name, endReason, exitCode, endedAt) {
+  return { id, name, cwd: "/fixture/A", pid: null, status: "ended", saved: true, endReason, exitCode, endedAt, createdAt: "2026-10-20T00:00:00.000Z" };
+}
+function terminalStatusText() { return [...host.querySelectorAll('.terminal-pane [role="status"]')].map((node) => node.textContent).join(" "); }
+
+async function terminalSavedSessionRegression() {
+  root.render(null);
+  await settle();
+  const restarted = savedTerminal("term-S", "Server", "restart", null, "2026-10-21T01:00:00.000Z");
+  const exited = savedTerminal("term-E", "Build", "exit", 7, "2026-10-21T00:00:00.000Z");
+  const sent = [];
+  const errors = [];
+  const posts = [];
+  const deletes = [];
+  let failPost = true;
+  let listed = [exited, restarted];
+  let listings = 0;
+  const relaunched = { id: "term-N", name: "Server", cwd: "/fixture/A", pid: 4100, status: "running", relaunchedFrom: "term-S", createdAt: "2026-10-21T02:00:00.000Z" };
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") {
+      posts.push(JSON.parse(options.body));
+      if (failPost) return response({ error: "Terminal capacity is full" }, 429);
+      listed = [...listed, relaunched];
+      return response(relaunched, 201);
+    }
+    if (url.pathname === "/api/terminals") { listings += 1; return response({ terminals: listed, history: { persistent: true, warning: null } }); }
+    if (options.method === "DELETE") { deletes.push(url.pathname); listed = listed.filter((item) => !url.pathname.endsWith(item.id)); return response({}); }
+    if (url.pathname.endsWith(relaunched.id)) return response({ ...relaunched, buffer: "$ ", outputCursor: 1 });
+    const item = listed.find((entry) => url.pathname.endsWith(entry.id));
+    return response({ ...item, buffer: `${item.name} saved line\r\n`, outputCursor: 0 });
+  };
+  const onError = (error) => errors.push(error);
+  const sendRuntime = (message) => sent.push(message);
+  const show = (version = 0) => root.render(<div className="fixture-terminal-frame" style={{ width: 360, height: 420 }}><TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null}
+    terminalsVersion={version} onError={onError} sendRuntime={sendRuntime} /></div>);
+  show();
+  await until(() => terminalReady("ServerSaved"), "newest saved session selected without starting a shell");
+  const bar = () => host.querySelector('.terminal-saved-bar');
+  assert(bar()?.textContent.includes("Saved output, read-only: ended when Outright restarted."), "Restart-ended session lacks its saved label");
+  assert(host.querySelector('#terminal-tab-term-S').getAttribute("aria-label") === "Server, saved output, ended when Outright restarted", "Saved tab label is not truthful");
+  assert(terminalStatusText().includes("Server saved output, ended when Outright restarted. Read-only."), "Saved session was not announced");
+  assert(posts.length === 0, "A saved session auto-started a shell");
+  const input = host.querySelector('.terminal-host .xterm-helper-textarea');
+  input.focus();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "x", code: "KeyX", keyCode: 88, which: 88, bubbles: true, cancelable: true }));
+  host.querySelector('.terminal-host').style.width = "300px";
+  await settle();
+  assert(!sent.some((message) => message.type === "terminal.input" || message.type === "terminal.resize"), "Saved output accepted input or resize");
+
+  host.querySelector('#terminal-tab-term-E').click();
+  await until(() => terminalReady("BuildSaved"), "exit-ended saved session selected");
+  assert(bar()?.textContent.includes("process exited 7"), "Exit-ended session lacks its exit status");
+  assert(!sent.length, "Selecting saved output sent a terminal command");
+  host.querySelector('#terminal-tab-term-S').click();
+  await until(() => terminalReady("ServerSaved"), "restart-ended session reselected");
+
+  const startButton = () => [...host.querySelectorAll('.terminal-saved-bar button')].find((button) => button.textContent === "Start new shell");
+  startButton().focus();
+  startButton().click();
+  await until(() => errors.length === 1, "failed relaunch reported");
+  await until(() => host.querySelector('.terminal-tabs[aria-busy="false"]'), "failed relaunch settles");
+  assert(document.activeElement === startButton(), "A failed relaunch dropped focus from Start new shell");
+  assert(posts[0].relaunchedFrom === "term-S" && posts[0].cwd === "/fixture/A", "Relaunch did not name its saved session and worktree");
+
+  failPost = false;
+  startButton().click();
+  await until(() => terminalReady("ServerNew shell"), "new shell selected after relaunch");
+  assert(posts.length === 2 && posts[1].relaunchedFrom === "term-S", "Relaunch POST lacked its source");
+  assert(document.activeElement === host.querySelector('#terminal-tab-term-N'), "Focus did not move to the new shell's tab");
+  assert(host.querySelector('#terminal-tab-term-N').getAttribute("aria-label") === "Server, new shell", "New shell tab is not labelled as new");
+  assert(host.querySelector('#terminal-tab-term-S')?.getAttribute("aria-label").includes("saved output"), "Relaunch replaced the saved session tab");
+  assert(!bar(), "The saved bar remained over a running shell");
+  // xterm parses and paints its writes after the tab settles; nothing later
+  // may reset the view while the new shell stays selected.
+  const markerShown = () => host.querySelector('.terminal-host').textContent.includes("new shell started; the saved session was not resumed");
+  await until(markerShown, "new shell marker rendered");
+  await until(() => terminalStatusText().includes("Server new shell started; the saved session was not resumed"), "new shell announcement");
+  const listingsBeforeSync = listings;
+  show(1);
+  await until(() => listings > listingsBeforeSync && host.querySelector('.terminal-tabs[aria-busy="false"]'), "listing sync after relaunch");
+  await remainsTrue(() => markerShown() && terminalReady("ServerNew shell"), 150, "A listing sync erased the new shell marker");
+
+  const dismiss = host.querySelector('[aria-label="Dismiss saved terminal Build"]');
+  assert(dismiss && !dismiss.disabled, "Saved session cannot be dismissed");
+  dismiss.click();
+  await until(() => !host.querySelector('#terminal-tab-term-E') && host.querySelector('.terminal-tabs[aria-busy="false"]'), "dismissed saved tab removed");
+  assert(deletes.length === 1 && deletes[0] === "/api/terminals/term-E", "Dismiss did not delete its saved session");
+  assert(errors.length === 1, `Unexpected terminal errors: ${errors.map((error) => error.message).join("; ")}`);
+}
+
+async function terminalReservationRestoredRegression() {
+  root.render(null);
+  await settle();
+  const reservation = { id: "term-R", name: "Terminal recovery required", cwd: "/fixture/A", pid: null, status: "unknown", createdAt: null, recoveryReservation: true };
+  const restored = savedTerminal("term-R", "Server", "restart", null, "2026-10-21T01:00:00.000Z");
+  const errors = [];
+  let posts = 0;
+  let current = reservation;
+  let historyStatus = null;
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") { posts += 1; return response({ error: "unexpected" }, 500); }
+    if (url.pathname === "/api/terminals") return response({ terminals: [current], history: historyStatus });
+    if (options.method === "DELETE") return response({});
+    return response({ ...current, buffer: "before restart\r\n", outputCursor: 0 });
+  };
+  const warning = "Terminal history is not saved because its storage directory is not private to this user. Terminal output stays in memory only.";
+  let version = 0;
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} terminalsVersion={version}
+    onError={(error) => errors.push(error.message)} sendRuntime={() => {}} />);
+  show();
+  await until(() => terminalReady("Terminal recovery required"), "reservation listed before proof");
+  assert(host.querySelector('[aria-label="Close terminal Terminal recovery required"]')?.disabled, "Reservation could be closed");
+  const reservedBar = host.querySelector('.terminal-saved-bar')?.textContent ?? "";
+  assert(reservedBar.includes("owner is unverified") && !reservedBar.includes("Start new shell") && !reservedBar.includes("ended"),
+    "Reservation was shown as ended or relaunchable saved output");
+  current = restored;
+  version += 1;
+  show({ type: "terminals.changed" });
+  await until(() => terminalReady("ServerSaved"), "reservation replaced by saved session without a remount");
+  const dismiss = host.querySelector('[aria-label="Dismiss saved terminal Server"]');
+  assert(dismiss && !dismiss.disabled, "Restored session cannot be dismissed");
+  assert([...host.querySelectorAll('.terminal-saved-bar button')].some((button) => button.textContent === "Start new shell"), "Restored session lacks Start new shell");
+  assert(host.querySelector('.terminal-saved-bar')?.textContent.includes("ended when Outright restarted"), "Restored session lacks its label");
+  assert(posts === 0, "Restoring a reservation started a shell");
+
+  const connected = { type: "runtime.connected", payload: { restarted: true, terminals: [], history: { persistent: false, warning } } };
+  show(connected);
+  await until(() => errors.length === 1 && host.querySelector('.terminal-tabs[aria-busy="false"]'), "unsafe store announced on restart reconnect");
+  assert(errors[0] === warning, "The unsafe store warning was not announced");
+  assert(terminalReady("ServerSaved"), "A reconnect snapshot without saved sessions removed the saved tab");
+  show({ ...connected, payload: { ...connected.payload, restarted: false } });
+  show({ type: "terminal.history", payload: { persistent: false, warning } });
+  await settle();
+  assert(errors.length === 1, "The same storage warning was announced twice");
+  // A write failure whose event was replaced in the shared slot still
+  // reaches the pane through the change counter and its listing.
+  historyStatus = { persistent: false, warning: "Terminal history could not be saved (ENOSPC). Terminal output stays in memory only." };
+  version += 1;
+  show({ type: "capacity.changed" });
+  await until(() => errors.length === 2, "a later write failure announced to the mounted pane");
+}
+
+async function terminalSavedSessionSyncRegression() {
+  root.render(null);
+  await settle();
+  const reserved = (id) => ({ id, name: "Terminal recovery required", cwd: "/fixture/A", pid: null, status: "unknown", createdAt: null, recoveryReservation: true });
+  const errors = [];
+  const deletes = [];
+  let posts = 0;
+  let listed = [reserved("term-A"), reserved("term-B"), reserved("term-C")];
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") {
+      posts += 1;
+      return response({ id: "term-N", name: "A", cwd: "/fixture/A", pid: 4100, status: "running", createdAt: "2026-10-21T02:00:00.000Z" }, 201);
+    }
+    if (url.pathname === "/api/terminals") return response({ terminals: listed, history: { persistent: true, warning: null } });
+    const item = listed.find((entry) => url.pathname.endsWith(entry.id));
+    if (options.method === "DELETE") { deletes.push(url.pathname); return item ? response({}) : response({ error: "Terminal not found" }, 404); }
+    if (item) return response({ ...item, buffer: `${item.name} line\r\n`, outputCursor: 0 });
+    return response({ id: "term-N", status: "running", buffer: "$ ", outputCursor: 1 });
+  };
+  let version = 0;
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} terminalsVersion={version}
+    onError={(error) => errors.push(error.message)} sendRuntime={() => {}} />);
+  show();
+  await until(() => terminalReady("Terminal recovery required") && host.querySelectorAll('.terminal-tab').length === 3, "three reservations listed");
+
+  // Proof resolves every reservation; capacity.changed replaces the change
+  // event in the same tick, and the counter still carries it.
+  listed = [savedTerminal("term-A", "Server", "restart", null, "2026-10-21T01:00:00.000Z"),
+    savedTerminal("term-B", "Build", "exit", 3, "2026-10-21T00:30:00.000Z"),
+    savedTerminal("term-C", "Logs", "exit", 0, "2026-10-21T00:10:00.000Z")];
+  version += 1;
+  show({ type: "terminals.changed" });
+  show({ type: "capacity.changed" });
+  await until(() => terminalReady("ServerSaved"), "selected reservation becomes saved output");
+  for (const name of ["Server", "Build", "Logs"]) {
+    const dismiss = host.querySelector(`[aria-label="Dismiss saved terminal ${name}"]`);
+    assert(dismiss && !dismiss.disabled, `${name} was left as a reservation that cannot be dismissed`);
+  }
+  assert(host.querySelector('.terminal-saved-bar')?.textContent.includes("ended when Outright restarted"), "Restored session lacks its label");
+
+  // Quota eviction of a session that is not selected removes its tab.
+  listed = listed.filter((item) => item.id !== "term-C");
+  version += 1;
+  show({ type: "terminals.changed" });
+  await until(() => !host.querySelector('#terminal-tab-term-C'), "evicted saved tab removed");
+  assert(terminalReady("ServerSaved"), "Eviction of another tab changed the selection");
+
+  // Dismissing a session retention already expired removes the tab quietly.
+  listed = listed.filter((item) => item.id !== "term-B");
+  host.querySelector('[aria-label="Dismiss saved terminal Build"]').click();
+  await until(() => !host.querySelector('#terminal-tab-term-B') && host.querySelector('.terminal-tabs[aria-busy="false"]'), "expired saved tab dismissed");
+  assert(deletes.at(-1) === "/api/terminals/term-B", "Dismiss did not reach the server");
+
+  // The selected session expires too: its view leaves with it.
+  listed = [];
+  version += 1;
+  show({ type: "terminals.changed" });
+  await until(() => !host.querySelector('#terminal-tab-term-A') && terminalReady("A"), "expired selected session replaced");
+  assert(!host.querySelector('.terminal-saved-bar'), "Saved bar remained for an expired session");
+  assert(posts === 1, `Expected one replacement shell, saw ${posts}`);
+  assert(errors.length === 0, `Unexpected terminal errors: ${errors.join("; ")}`);
+}
+
+// The server stops holding an exited terminal once its retention ends or
+// capacity needs the slot, and lists it as saved output. The open pane
+// follows that listing in place, with no re-selection or new shell.
+async function terminalExitedBecomesSavedRegression() {
+  root.render(null);
+  await settle();
+  const errors = [];
+  let posts = 0;
+  let listed = [{ ...terminal("A"), name: "Build" }];
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") { posts += 1; return response({ error: "unexpected" }, 500); }
+    if (url.pathname === "/api/terminals") return response({ terminals: listed, history: { persistent: true, warning: null } });
+    const [item] = listed;
+    return item.status === "ended"
+      ? response({ ...item, buffer: "earliest saved line\r\nlive tail line\r\n", outputCursor: 0 })
+      : response({ ...item, buffer: "live tail line\r\n", outputCursor: 1 });
+  };
+  let version = 0;
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} terminalsVersion={version}
+    onError={(error) => errors.push(error.message)} sendRuntime={() => {}} />);
+  const tab = () => host.querySelector('#terminal-tab-term-A');
+  const bar = () => host.querySelector('.terminal-saved-bar');
+  show();
+  await until(() => terminalReady("Build"), "running terminal selected");
+  show({ type: "terminal.exit", terminalId: "term-A", payload: { exitCode: 3 } });
+  await until(() => tab()?.getAttribute("aria-label").includes("process exited 3"), "live exit shown");
+  assert(!bar(), "An exited live terminal was shown as saved before the server listed it so");
+
+  listed = [savedTerminal("term-A", "Build", "exit", 3, "2026-10-21T00:00:00.000Z")];
+  version += 1;
+  show({ type: "terminals.changed" });
+  await until(() => terminalReady("BuildSaved") && bar(), "exited terminal follows the listing to saved output");
+  assert(bar().textContent.includes("Saved output, read-only: process exited 3."), "Saved bar lacks the exit label");
+  assert([...bar().querySelectorAll('button')].some((button) => button.textContent === "Start new shell"), "Saved output lacks Start new shell");
+  await until(() => host.querySelector('.terminal-host .xterm-rows')?.textContent.includes("earliest saved line"), "saved output beyond the live tail shown");
+  assert(tab().getAttribute("aria-selected") === "true" && host.querySelectorAll('.terminal-tab').length === 1, "The selection changed");
+  assert(posts === 0, "Saved output started a shell");
+  assert(errors.length === 0, `Unexpected terminal errors: ${errors.join("; ")}`);
+}
+
+async function terminalListingAddsSessionsRegression() {
+  root.render(null);
+  await settle();
+  const live = (id, name) => ({ id, name, cwd: "/fixture/A", pid: 4100, status: "running", createdAt: "2026-10-21T00:00:00.000Z" });
+  const errors = [];
+  const details = [];
+  let posts = 0;
+  let listed = [live("term-A", "Shell")];
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") { posts += 1; return response({ error: "unexpected" }, 500); }
+    if (url.pathname === "/api/terminals") return response({ terminals: listed, history: { persistent: true, warning: null } });
+    details.push(url.pathname);
+    const item = listed.find((entry) => url.pathname.endsWith(entry.id));
+    return response({ ...item, buffer: "$ ", outputCursor: 1 });
+  };
+  let version = 0;
+  const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} terminalsVersion={version}
+    onError={(error) => errors.push(error.message)} sendRuntime={() => {}} />);
+  show();
+  await until(() => terminalReady("Shell"), "first terminal selected");
+  // Another window starts a shell in this worktree.
+  listed = [...listed, live("term-B", "Other")];
+  version += 1;
+  show({ type: "terminals.changed" });
+  await until(() => host.querySelector('#terminal-tab-term-B'), "a newly listed terminal joins the tabs");
+  // The audit scan finds a prior-run owner awaiting proof.
+  listed = [...listed, { id: "term-C", name: "Terminal recovery required", cwd: "/fixture/A", pid: null, status: "unknown", createdAt: null, recoveryReservation: true }];
+  version += 1;
+  show({ type: "terminals.changed" });
+  await until(() => host.querySelector('#terminal-tab-term-C'), "a late recovery reservation joins the tabs");
+  assert(host.querySelector('[aria-label="Close terminal Terminal recovery required"]')?.disabled, "The reservation could be closed");
+  assert(terminalReady("Shell"), "New sessions changed the selection");
+  assert(details.length === 1 && posts === 0, `The pane remounted or relaunched: ${details.length} reads, ${posts} creates`);
+  assert(errors.length === 0, `Unexpected terminal errors: ${errors.join("; ")}`);
+}
+
+// A reservation still awaiting ownership proof pages the same saved output
+// read-only, with no relaunch, dismissal or input.
+async function terminalSavedPagingRegression(reservation = false) {
+  root.render(null);
+  await settle();
+  const lines = Array.from({ length: 15_000 }, (_, index) => `saved line ${index}\r\n`);
+  lines[0] = "FIRST saved line\r\n";
+  // A full-screen program ended by a full reset: the output before and after
+  // it stays readable, the program's screen does not.
+  // The reset also ends a line-drawing character set.
+  lines[1] = "BEFORE reset line\x1b(0\x1b[?1049hFULLSCREEN\x1bcAFTER reset line\r\n";
+  // A rendition set on the first page and never reset is in effect on every later page.
+  lines[2] = "\x1b[31mRED saved line\r\n";
+  // Line drawing ended by DECANM, or restored with the cursor, stays ended on every later page.
+  lines[3] = "\x1b(0\x1b[?2hDECANM ended line drawing\r\n";
+  lines[4] = "\x1b7\x1b(0\x1b8RESTORED cursor ended line drawing\r\n";
+  // The saved label reads as plain text after output that left modes on.
+  lines[lines.length - 1] = "LAST saved line\r\n\x1b(0\x1b[4h";
+  const saved = reservation
+    ? { id: "term-L", name: "Terminal recovery required", cwd: "/fixture/A", pid: 4242, status: "unknown", createdAt: null, recoveryReservation: true }
+    : savedTerminal("term-L", "Long", "exit", 0, "2026-10-21T01:00:00.000Z");
+  const sent = [];
+  const errors = [];
+  let details = 0;
+  route = async (url) => {
+    if (url.pathname === "/api/terminals") return response({ terminals: [saved], history: { persistent: true, warning: null } });
+    details += 1;
+    return response({ ...saved, buffer: lines.join(""), outputCursor: 0 });
+  };
+  root.render(<div className="fixture-terminal-frame" style={{ width: 360, height: 420 }}><TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null}
+    onError={(error) => errors.push(error)} sendRuntime={(message) => sent.push(message)} /></div>);
+  await until(() => terminalReady(reservation ? saved.name : "LongSaved"), "long saved session selected");
+  const output = () => host.querySelector('.terminal-host').textContent;
+  const topRow = () => host.querySelector('.terminal-host .xterm-rows')?.firstElementChild;
+  const control = (name) => [...host.querySelectorAll('.terminal-saved-bar button')].find((button) => button.textContent === name);
+  const part = () => /Part (\d+) of (\d+)/.exec(host.querySelector('.terminal-saved-bar')?.textContent ?? "");
+  await until(() => output().includes("LAST saved line"), "newest saved output shown");
+  assert(output().includes("[saved output; "), "The saved label was drawn in the modes saved output left on");
+  assert(part() && part()[1] === part()[2] && Number(part()[2]) > 1, "Long saved output is not paged");
+  assert(control("Later output").getAttribute("aria-disabled") === "true", "The newest page offers later output");
+  if (reservation) {
+    assert(!control("Start new shell") && host.querySelector('.terminal-tab-close').disabled, "A recovery reservation offered relaunch or dismissal");
+    assert(host.querySelector('[role="tab"][aria-selected="true"]').getAttribute("aria-label").includes("ownership unverified"), "A reservation was labelled running or ended");
+  }
+  for (let step = 0; step < 100 && control("Earlier output").getAttribute("aria-disabled") !== "true"; step += 1) {
+    control("Earlier output").click();
+    await settle();
+  }
+  assert(part()?.[1] === "1", "Paging did not reach the earliest saved output");
+  await until(() => topRow()?.textContent.startsWith("FIRST saved line"), "earliest saved line shown");
+  const shownRows = host.querySelector('.terminal-host .xterm-rows').textContent;
+  assert(shownRows.includes("BEFORE reset line") && shownRows.includes("AFTER reset line") && !shownRows.includes("FULLSCREEN"),
+    "A full reset after a full-screen program hid or erased saved output");
+  assert(shownRows.includes("DECANM ended line drawing") && shownRows.includes("RESTORED cursor ended line drawing"), "Saved output drew ASCII as line drawing");
+  assert(terminalStatusText().includes("part 1 of") && terminalStatusText().includes("the earliest"), "The earliest page was not announced");
+  // Pages requested before the previous one is written replace it whole.
+  flushSync(() => control("Later output").click());
+  flushSync(() => control("Earlier output").click());
+  await settle();
+  await until(() => part()?.[1] === "1" && topRow()?.textContent.startsWith("FIRST saved line"), "earliest page alone after Later then Earlier");
+  control("Later output").click();
+  await settle();
+  flushSync(() => control("Earlier output").click());
+  flushSync(() => control("Later output").click());
+  await settle();
+  await until(() => part()?.[1] === "2" && /^saved line \d+/.test(topRow()?.textContent ?? ""), "second page alone after Earlier then Later");
+  assert(topRow().querySelector("span")?.classList.contains("xterm-fg-1"), "The rendition set on an earlier page was lost at the next page start");
+  assert(details === 1, `Paging re-read the session ${details} times`);
+  assert(!sent.length && !errors.length, "Paging saved output sent a command or failed");
+}
+
+// Saved output reads in the view as the terminal showed it. The oracle is
+// xterm itself: one continuous render, each full reset starting a fresh
+// terminal below the rows before it. The view's pages, each written alone
+// after a full reset, show the same glyphs, colours and wraps.
+async function terminalSavedModesRegression() {
+  const size = { cols: 80, rows: 24 };
+  const drawnRows = (xterm, count = -1) => {
+    const normal = xterm.buffer.normal;
+    const cell = normal.getNullCell();
+    const rows = [];
+    for (let y = 0; y < normal.length; y += 1) {
+      const line = normal.getLine(y);
+      let text = line.isWrapped ? "~" : "";
+      let kept = text.length;
+      for (let x = 0; x < size.cols; x += 1) {
+        line.getCell(x, cell);
+        if (cell.getWidth() === 0) continue;
+        const chars = cell.getChars() || " ";
+        text += cell.isAttributeDefault() ? chars : `${chars}{${[cell.getFgColorMode(), cell.getFgColor(), cell.getBgColorMode(), cell.getBgColor(), cell.isBold(), cell.isInverse()].join()}}`;
+        if (chars !== " " || !cell.isAttributeDefault()) kept = text.length;
+      }
+      rows.push(text.slice(0, kept));
+    }
+    if (count >= 0) return rows.slice(0, count);
+    let end = rows.length;
+    while (end > normal.baseY && !rows[end - 1].replace("~", "")) end -= 1;
+    return rows.slice(0, end);
+  };
+  // Each write's rows are read in its callback, before the next one.
+  const render = async (writes, options, rowCounts = []) => {
+    const xterm = new Terminal({ ...size, convertEol: true, ...options });
+    let rows = [];
+    await new Promise((resolve) => writes.forEach((data, index) => xterm.write(data, () => {
+      rows = rows.concat(drawnRows(xterm, rowCounts[index] ?? -1));
+      if (index === writes.length - 1) resolve();
+    })));
+    xterm.dispose();
+    return rows;
+  };
+  const continuous = (segments) => render(segments.map((segment, index) => `${index ? "\x1bc" : ""}${segment}`), { scrollback: 100_000, scrollOnEraseInDisplay: true });
+  // The pane's saved view: one terminal, a full reset before each page.
+  const view = async (buffer, pageRows) => {
+    const { rows } = await savedOutputRows(buffer, size, Terminal);
+    const pages = savedRowPages(rows, pageRows);
+    return render(pages.map((page) => `\x1bc${savedPageText(rows, page)}`), { scrollback: 10_000 }, pages.map(([start, end]) => end - start));
+  };
+  const same = (actual, expected, label) => assert(JSON.stringify(actual) === JSON.stringify(expected), `${label}: ${JSON.stringify(actual.slice(0, 3))} ... differs from ${JSON.stringify(expected.slice(0, 3))} ...`);
+  // Short lines and lines that wrap once.
+  const lines = (name, count) => Array.from({ length: count }, (_, index) => `${name} ${String(index).padStart(3, "0")} line${index % 2 ? "" : ` ${"=".repeat(80)}`}\r\n`).join("");
+  const state = {
+    "DECANM": "\x1b(0\x1b[?2h", "DECSC character set": "\x1b7\x1b(0\x1b8", "DECSC rendition": "\x1b7\x1b[31;44m\x1b8", "SCOSC rendition": "\x1b[s\x1b[32m\x1b[u",
+    "1048 character set": "\x1b[?1048h\x1b(0\x1b[?1048l", "cursor restored on a later row": `\x1b7${lines("between", 30)}\x1b8OVER`,
+  };
+  for (const [name, sequence] of Object.entries(state)) {
+    const buffer = `${sequence}${lines("after", 40)}`;
+    for (const pageRows of [2_000, 7]) same(await view(buffer, pageRows), await continuous([buffer]), `${name} in pages of ${pageRows}`);
+  }
+  const modes = { margins: "\x1b[5;20r", origin: "\x1b[?6h", insert: "\x1b[4h", nowrap: "\x1b[?7l", "line drawing": "\x1b(0", "shift out": "\x1b)0\x0e", "locking shift": "\x1b*0\x1bn" };
+  for (const [name, mode] of Object.entries(modes)) {
+    // A mode on before a full reset ends there; one on through the output
+    // stays on where every page opens.
+    const pre = `${lines("pre", 30)}${mode}`;
+    const shown = await view(`${pre}\x1bc${lines("post", 60)}`, 13);
+    same(shown, await continuous([pre, lines("post", 60)]), `${name} before a reset`);
+    const post = shown.filter((text) => text.startsWith("post "));
+    assert(post.length === 60 && post.every((text, index) => text === `post ${String(index).padStart(3, "0")} line${index % 2 ? "" : ` ${"=".repeat(80)}`}`.slice(0, 80)),
+      `${name} before a reset hid or redrew later saved lines`);
+    const opened = `${mode}${lines("mid", 40)}`;
+    same(await view(opened, 9), await continuous([opened]), `${name} on through the output`);
+  }
+}
+
+// Saved output whose escapes expand far past the row budget activates within
+// bounds and keeps the page responsive. Its newest rows are shown, and its
+// earliest page says, and announces, that older output was left out. A
+// worktree switch stops a parse in progress.
+async function terminalSavedBudgetRegression() {
+  root.render(null);
+  await settle();
+  const huge = savedTerminal("term-H", "Huge", "exit", 0, "2026-10-21T01:00:00.000Z");
+  const other = { ...savedTerminal("term-B", "Other", "exit", 0, "2026-10-21T01:00:00.000Z"), cwd: "/fixture/B" };
+  // About 2 MiB that erases a red screen 123,000 times: millions of rows.
+  const erased = `${"\x1b[41m\x1b[24;1Hx\x1b[2J".repeat(Math.floor(2 ** 21 / 17))}\x1b[0mNEWEST saved line\r\n`;
+  // About 2 MiB of scrolls and repeats with counts of 2^31 - 1.
+  const dense = `${`x\x1b[${2 ** 31 - 1}S`.repeat(2 ** 16)}${`a\x1b[${2 ** 31 - 1};1b`.repeat(2 ** 16)}\r\nNEWEST dense line\r\n`;
+  let saved = erased;
+  const errors = [];
+  route = async (url) => {
+    if (url.pathname === "/api/terminals") return response({ terminals: [huge, other], history: { persistent: true, warning: null } });
+    if (url.pathname.endsWith(huge.id)) return response({ ...huge, buffer: saved, outputCursor: 0 });
+    return response({ ...other, buffer: "other saved line\r\n", outputCursor: 0 });
+  };
+  // Writes of the huge output to the offscreen terminal that parses it.
+  let parsed = 0;
+  let finished = false;
+  const write = Terminal.prototype.write;
+  Terminal.prototype.write = function recordWrite(data, callback) {
+    if (!this.element && data.includes("\x1b[2J")) parsed += 1;
+    if (!this.element && data.includes("NEWEST saved line")) finished = true;
+    return write.call(this, data, callback);
+  };
+  const show = (worktree) => root.render(<div className="fixture-terminal-frame" style={{ width: 360, height: 420 }}><TerminalPane worktree={worktree}
+    runtimeEvent={null} onError={(error) => errors.push(error)} sendRuntime={() => {}} /></div>);
+  // Activates the huge session and returns how long that took and the longest
+  // a 10 ms timer waited meanwhile.
+  const activate = async () => {
+    let last = performance.now();
+    let longest = 0;
+    const ticker = setInterval(() => { const now = performance.now(); longest = Math.max(longest, now - last); last = now; }, 10);
+    const started = performance.now();
+    show(projects[0].worktrees[0]);
+    try { await longWait(() => terminalReady("HugeSaved"), "huge saved session selected"); }
+    finally { clearInterval(ticker); }
+    return { elapsedMs: Math.round(performance.now() - started), longestTimerGapMs: Math.round(longest) };
+  };
+  const longWait = async (check, label) => {
+    const deadline = performance.now() + 20_000;
+    while (!check()) {
+      assert(performance.now() < deadline, `Timed out: ${label}`);
+      await frame();
+    }
+  };
+  try {
+    show(projects[0].worktrees[0]);
+    await until(() => parsed > 0, "huge saved output parsing");
+    show(projects[1].worktrees[0]);
+    await until(() => terminalReady("OtherSaved"), "other worktree's saved session selected");
+    const stoppedAt = parsed;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert(parsed === stoppedAt && !finished, `A superseded parse went on: ${parsed} writes`);
+
+    const timing = await activate();
+    assert(timing.longestTimerGapMs < 1_000, `Activation blocked the page for ${timing.longestTimerGapMs} ms`);
+    const output = () => host.querySelector('.terminal-host .xterm-rows')?.textContent ?? "";
+    const part = () => /Part (\d+) of (\d+)/.exec(host.querySelector('.terminal-saved-bar')?.textContent ?? "");
+    await until(() => output().includes("NEWEST saved line"), "newest saved output shown");
+    assert(part() && Number(part()[2]) <= 10, `The kept rows exceed the row budget: ${part()?.[0]}`);
+    assert(terminalStatusText().includes("Earlier saved output not shown."), "Leaving out older output was not announced");
+    const earlier = () => [...host.querySelectorAll('.terminal-saved-bar button')].find((button) => button.textContent === "Earlier output");
+    for (let step = 0; step < 20 && earlier().getAttribute("aria-disabled") !== "true"; step += 1) {
+      earlier().click();
+      await settle();
+    }
+    await until(() => output().includes("[earlier saved output not shown]"), "earliest kept page discloses the left-out output");
+    assert(terminalStatusText().includes("part 1 of") && terminalStatusText().includes("earlier saved output not shown"), "The earliest kept page did not announce the left-out output");
+    // Counts of any size cost at most a screen of work each.
+    show(projects[1].worktrees[0]);
+    await until(() => terminalReady("OtherSaved"), "other worktree's saved session selected again");
+    saved = dense;
+    const denseTiming = await activate();
+    window.__performanceEvidence = { ...window.__performanceEvidence, savedOutput: { bytes: erased.length, ...timing, dense: { bytes: dense.length, ...denseTiming } } };
+    assert(denseTiming.elapsedMs < 10_000 && denseTiming.longestTimerGapMs < 250, `Dense counts took ${denseTiming.elapsedMs} ms and blocked the page for ${denseTiming.longestTimerGapMs} ms`);
+    await until(() => output().includes("NEWEST dense line"), "newest dense saved output shown");
+    assert(!errors.length, `Saved output failed: ${errors.map((error) => error.message).join("; ")}`);
+  } finally {
+    Terminal.prototype.write = write;
+  }
+}
+
+// A storage status change delivered in the same task as terminal output or
+// an exit reaches the pane through its counter; it never replaces that
+// output or exit in App's shared event slot.
+async function terminalHistoryEventSlotRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const shell = { id: "term-S", name: "Shell", cwd: "/fixture/A", pid: 4500, status: "running", createdAt: "2026-10-21T00:00:00.000Z" };
+  let history = { persistent: true, warning: null };
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [], stagedCount: 0 });
+    if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    if (url.pathname === "/api/terminals") return response({ terminals: [shell], history });
+    if (url.pathname === "/api/terminals/term-S") return response({ ...shell, buffer: "$ ", outputCursor: 1 });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[aria-label="Terminal"]'), "workspace");
+  host.querySelector('[aria-label="Terminal"]').click();
+  await until(() => terminalReady("Shell"), "live terminal ready");
+  const deliver = (...events) => {
+    for (const event of events) fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
+  };
+  history = { persistent: false, warning: "Terminal history could not be saved (EIO). Terminal output stays in memory only." };
+  deliver({ type: "terminal.output", terminalId: "term-S", payload: { data: "OUTPUT BEFORE STORAGE FAILURE\r\n", cursor: 2 } }, { type: "terminal.history", payload: history });
+  await until(() => host.querySelector(".terminal-host .xterm-rows")?.textContent.includes("OUTPUT BEFORE STORAGE FAILURE"), "output delivered with a storage status change is written");
+  await until(() => host.querySelector(".error-toast")?.textContent.includes("EIO"), "storage failure announced");
+  deliver({ type: "terminal.exit", terminalId: "term-S", payload: { exitCode: 3 } }, { type: "terminal.history", payload: history });
+  await until(() => host.querySelector("#terminal-tab-term-S")?.getAttribute("aria-label")?.includes("process exited 3"), "exit delivered with a storage status change is shown");
+  await until(() => host.querySelector(".terminal-host .xterm-rows").textContent.includes("[process exited 3]"), "exit written to the terminal");
+}
+
+async function terminalCloseHistoryFailureRegression() {
+  root.render(null);
+  await settle();
+  const sent = [];
+  const errors = [];
+  const failure = "Saved terminal output could not be deleted; check storage and dismiss it again";
+  let listed = [{ id: "term-L", name: "Shell", cwd: "/fixture/A", pid: 4200, status: "running", createdAt: "2026-10-21T00:00:00.000Z" }];
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") return response({ error: "unexpected" }, 500);
+    if (url.pathname === "/api/terminals") return response({ terminals: listed, history: { persistent: false, warning: null } });
+    if (options.method === "DELETE") {
+      // The process is gone; only its saved output could not be removed.
+      listed = [savedTerminal("term-L", "Shell", "closed", null, "2026-10-21T01:00:00.000Z")];
+      return response({ error: failure }, 503);
+    }
+    return response({ ...listed[0], buffer: "$ ", outputCursor: 1 });
+  };
+  root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={null}
+    onError={(error) => errors.push(error.message)} sendRuntime={(message) => sent.push(message)} />);
+  await until(() => terminalReady("Shell") && sent.some((message) => message.type === "terminal.resize"), "live terminal ready");
+  const before = sent.length;
+  host.querySelector('[aria-label="Close terminal Shell"]').click();
+  await until(() => terminalReady("ShellSaved"), "failed close re-lists the ended session");
+  assert(errors.length === 1 && errors[0] === failure, `Close failure was not reported once: ${errors.join("; ")}`);
+  assert(host.querySelector('.terminal-saved-bar')?.textContent.includes("closed; its saved output could not be deleted"), "Closed session lacks its label");
+  const dismiss = host.querySelector('[aria-label="Dismiss saved terminal Shell"]');
+  assert(dismiss && !dismiss.disabled, "Closed session cannot be dismissed again");
+  const input = host.querySelector('.terminal-host .xterm-helper-textarea');
+  input.focus();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "x", code: "KeyX", keyCode: 88, which: 88, bubbles: true, cancelable: true }));
+  host.querySelector('.terminal-host').style.width = "320px";
+  await settle();
+  assert(!sent.slice(before).some((message) => message.type === "terminal.input" || message.type === "terminal.resize"),
+    "A closed session accepted input or resize after the failed close");
+}
+
+async function terminalFencedSavedSessionRegression() {
+  root.render(null);
+  await settle();
+  const sent = [];
+  let listed = [{ id: "term-F", name: "Server", cwd: "/fixture/A", pid: 4300, status: "running", createdAt: "2026-10-21T00:00:00.000Z" }];
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") return response({ error: "unexpected" }, 500);
+    if (url.pathname === "/api/terminals") return response({ terminals: listed, history: { persistent: true, warning: null } });
+    return response({ ...listed[0], buffer: "server output\r\n", outputCursor: 1 });
+  };
+  const show = (event = null, fenced = new Set()) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event}
+    unverifiedTerminalIds={fenced} onError={(error) => { throw error; }} sendRuntime={(message) => sent.push(message)} />);
+  show();
+  await until(() => terminalReady("Server"), "live terminal ready");
+  const fence = new Set(["term-F"]);
+  show({ type: "terminal.audit-failed", terminalId: "term-F" }, fence);
+  await until(() => host.querySelector('#terminal-tab-term-F')?.getAttribute("aria-label").includes("ownership unverified"), "audit failure fences the terminal");
+  const before = sent.length;
+  // Outright restarts; native proof shows the owner is gone.
+  listed = [savedTerminal("term-F", "Server", "restart", null, "2026-10-21T01:00:00.000Z")];
+  show({ type: "runtime.connected", payload: { restarted: true, terminals: listed } }, fence);
+  await until(() => terminalReady("ServerSaved"), "the server's saved status wins over the page fence");
+  assert(host.querySelector('#terminal-tab-term-F').getAttribute("aria-label") === "Server, saved output, ended when Outright restarted", "Fenced saved tab label is not truthful");
+  assert(host.querySelector('.terminal-saved-bar')?.textContent.includes("ended when Outright restarted"), "Fenced saved session lacks its label");
+  assert([...host.querySelectorAll('.terminal-saved-bar button')].some((button) => button.textContent === "Start new shell"), "Fenced saved session lacks Start new shell");
+  const input = host.querySelector('.terminal-host .xterm-helper-textarea');
+  input.focus();
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "x", code: "KeyX", keyCode: 88, which: 88, bubbles: true, cancelable: true }));
+  host.querySelector('.terminal-host').style.width = "330px";
+  await settle();
+  assert(!sent.slice(before).some((message) => message.type === "terminal.input" || message.type === "terminal.resize"),
+    "A fenced saved session sent input or resize");
+}
+
 async function terminalSelectionReconnectRegression() {
   root.render(null);
   await settle();
@@ -2743,7 +3362,9 @@ async function terminalReconnectOwnershipRegression() {
   const show = (event = null) => root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} onError={onError} sendRuntime={sendRuntime} />);
   show();
   await until(() => terminalReady("Terminal A"), "terminal before overlapping reconnects");
-  const reconnect = () => ({ type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [{ ...terminal("A"), status: "exited" }] } });
+  // A reconnect lists over HTTP; the socket snapshot omits saved sessions.
+  all = [{ ...terminal("A"), status: "exited" }];
+  const reconnect = () => ({ type: "runtime.connected", payload: { replay: { requestedAfter: 1 }, terminals: [] } });
   show(reconnect());
   await until(() => posts === 1, "first reconnect creation");
   show(reconnect());
@@ -6186,6 +6807,18 @@ try {
     ["terminal keyboard", terminalKeyboardRegression, "terminal keyboard switching retains focus and ignores non-tab controls"],
     ["terminal unknown", terminalUnknownRegression, "unverified terminal ownership blocks interaction and survives restart"],
     ["terminal unknown during activation", terminalUnknownDuringActivationRegression, "a newer unknown event wins over an in-flight running detail"],
+    ["terminal saved session", terminalSavedSessionRegression, "saved output stays read-only, relaunches as a marked new shell and dismisses"],
+    ["terminal reservation restored", terminalReservationRestoredRegression, "a reservation that becomes saved output updates in place and storage warnings announce once"],
+    ["terminal saved session sync", terminalSavedSessionSyncRegression, "coalesced restores, eviction, expiry and dismissing an expired session converge with the server"],
+    ["terminal exited becomes saved", terminalExitedBecomesSavedRegression, "an open exited terminal the server lists as saved shows saved output in place"],
+    ["terminal listing adds sessions", terminalListingAddsSessionsRegression, "a re-list adds new live sessions and late reservations without a remount"],
+    ["terminal saved paging", terminalSavedPagingRegression, "all saved output beyond one view is reachable a page at a time, earliest first line shown"],
+    ["terminal reservation paging", () => terminalSavedPagingRegression(true), "a reservation's saved output is paged read-only to its first and last lines"],
+    ["terminal saved modes", terminalSavedModesRegression, "saved output that sets terminal modes renders as the terminal showed it, whole and paged"],
+    ["terminal saved budget", terminalSavedBudgetRegression, "saved output past the row budget activates responsively, discloses left-out output and stops when superseded"],
+    ["terminal history event slot", terminalHistoryEventSlotRegression, "a storage status change never replaces terminal output or an exit delivered in the same task"],
+    ["terminal close history failure", terminalCloseHistoryFailureRegression, "a close whose saved output cannot be deleted shows it ended and read-only"],
+    ["terminal fenced saved session", terminalFencedSavedSessionRegression, "a saved status from the server wins over the page audit fence"],
     ["terminal selection during reconnect", terminalSelectionReconnectRegression, "selected terminal and output survive a reconnect while its buffer is pending"],
     ["terminal activation ownership", terminalActivationOwnershipRegression, "terminal activation commits output and current PTY size together"],
     ["rejected terminal switch", terminalRejectedSwitchRegression, "rejected terminal switch restores the selected tab focus"],
