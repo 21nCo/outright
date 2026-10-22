@@ -1,0 +1,25 @@
+server/managed-terminal.mjs
+  s_92427ff18a8304::t_20eff5733ec21a 386-387,389,412-413,417-422,430,455-458,460-463,465,480-482,500
+server/terminal-broker.mjs
+  s_92427ff18a8304::t_85e09054f59473 126,312-323,357
+server/terminal-manager.mjs
+  s_92427ff18a8304::t_872fb28ca6d633 158-159,161,163-166,171-173,181-183,185,207-216
+server/terminal-manager.test.mjs
+  s_92427ff18a8304::t_472f854a062636 1669-1670,1685,1704-1706,1715-1768,1773-1799
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "48681cdadc34eafab04b788ce85ada500935b328",
+  "prompts": {},
+  "sessions": {
+    "s_92427ff18a8304": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26336501-b0e6-4534-a7c2-345f5528a4ba",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
