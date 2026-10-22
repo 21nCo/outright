@@ -19,6 +19,37 @@ test("audit failure fences terminal commands before a later runtime event or Rea
   assert.equal(fence.snapshot().size, 256, "long sessions must not retain unbounded old terminal IDs");
 });
 
+test("only a later runtime's verified live reattach lifts an audit fence", () => {
+  const fence = createTerminalCommandFence();
+  const input = { type: "terminal.input", terminalId: "x", data: "a" };
+  const resize = { type: "terminal.resize", terminalId: "x", cols: 80, rows: 24 };
+  const connected = (runtimeInstanceId, terminals) => ({ type: "runtime.connected", payload: { runtimeInstanceId, terminals } });
+  const live = { id: "x", status: "running", reattached: true };
+  fence.observe(connected("A", []));
+  fence.observe({ type: "terminal.audit-failed", terminalId: "x" });
+  fence.observe({ type: "terminal.audit-failed", terminalId: "y" });
+  assert.equal(fence.observe(connected("A", [live])), false, "a reconnect to the fencing runtime must not lift the fence");
+  assert.equal(fence.allows(input), false);
+  for (const terminal of [{ ...live, reattached: undefined }, { ...live, status: "unknown" },
+    { ...live, status: "unknown", recoveryReservation: true }, { ...live, recoveryReservation: true }]) {
+    assert.equal(fence.observe(connected("B", [terminal])), false, `fence lifted for ${JSON.stringify(terminal)}`);
+  }
+  assert.equal(fence.allows(input), false);
+  assert.equal(fence.observe(connected("C", [live])), true);
+  assert.equal(fence.allows(input), true);
+  assert.equal(fence.allows(resize), true);
+  assert.deepEqual([...fence.snapshot()], ["y"], "an unrelated fenced terminal stays fenced");
+  fence.observe({ type: "terminal.audit-failed", terminalId: "x" });
+  assert.equal(fence.allows(input), false, "a new audit failure in the reattaching runtime fences again");
+  assert.equal(fence.observe(connected("C", [live])), false);
+
+  // Events replayed before a page's first connection belong to that runtime.
+  const replayed = createTerminalCommandFence();
+  replayed.observe({ type: "terminal.audit-failed", terminalId: "x" });
+  assert.equal(replayed.observe(connected("A", [live])), false);
+  assert.equal(replayed.allows(input), false);
+});
+
 test("exited identities are pruned across repeated closes without dropping a pending exit", () => {
   const exited = new Set(["pending-exit"]);
   for (let index = 0; index < 50; index += 1) exited.add(`closed-${index}`);

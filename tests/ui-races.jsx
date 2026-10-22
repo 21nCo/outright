@@ -2949,6 +2949,57 @@ async function terminalFencedSavedSessionRegression() {
     "A fenced saved session sent input or resize");
 }
 
+// The App fence is page state from the runtime that failed its audit. A
+// later runtime that verifies a live reattach of the same terminal lifts it;
+// a reconnect to the fencing runtime does not.
+async function terminalReattachLiftsFenceRegression() {
+  root.render(null);
+  await settle();
+  const sent = [];
+  const fence = createTerminalCommandFence();
+  let listed = [{ id: "term-X", name: "Server", cwd: "/fixture/A", pid: 4400, status: "running", createdAt: "2026-10-21T00:00:00.000Z" }];
+  route = async (url, options) => {
+    if (url.pathname === "/api/terminals" && options.method === "POST") return response({ error: "unexpected" }, 500);
+    if (url.pathname === "/api/terminals") return response({ terminals: listed, history: { persistent: true, warning: null } });
+    return response({ ...listed[0], buffer: "kept running\r\n", outputCursor: 1 });
+  };
+  const show = (event = null) => {
+    if (event) fence.observe(event);
+    root.render(<TerminalPane worktree={projects[0].worktrees[0]} runtimeEvent={event} unverifiedTerminalIds={fence.snapshot()}
+      onError={(error) => { throw error; }} sendRuntime={(message) => { if (fence.allows(message)) sent.push(message); }} />);
+  };
+  const tabLabel = () => host.querySelector('#terminal-tab-term-X')?.getAttribute("aria-label") ?? "";
+  const typeAndResize = async (width) => {
+    const before = sent.length;
+    const input = host.querySelector('.terminal-host .xterm-helper-textarea');
+    input.focus();
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "x", code: "KeyX", keyCode: 88, which: 88, bubbles: true, cancelable: true }));
+    host.querySelector('.terminal-host').style.width = width;
+    await settle();
+    return sent.slice(before).filter((message) => message.terminalId === "term-X").map((message) => message.type);
+  };
+  show({ type: "runtime.connected", payload: { runtimeInstanceId: "runtime-A", terminals: listed, replay: { requestedAfter: 0 } } });
+  await until(() => terminalReady("Server"), "live terminal ready");
+  show({ type: "terminal.audit-failed", terminalId: "term-X" });
+  await until(() => tabLabel().includes("ownership unverified"), "audit failure fences the terminal");
+
+  // The same runtime reconnects; its listing cannot lift the page fence.
+  listed = [{ ...listed[0], status: "running", reattached: true }];
+  show({ type: "runtime.connected", payload: { runtimeInstanceId: "runtime-A", terminals: listed, replay: { requestedAfter: 5 } } });
+  await until(() => host.querySelector('.terminal-tabs[aria-busy="false"]') && tabLabel().includes("ownership unverified"), "same-runtime reconnect settles");
+  assert(fence.snapshot().has("term-X"), "A same-runtime reconnect lifted the fence");
+  assert((await typeAndResize("520px")).length === 0, "A same-runtime reconnect reopened input or resize");
+
+  // Outright restarts inside the detach window and verifies a live reattach.
+  show({ type: "runtime.connected", payload: { runtimeInstanceId: "runtime-B", restarted: true, terminals: listed, replay: { requestedAfter: 5, missed: true } } });
+  await until(() => terminalReady("ServerReattached") && tabLabel() === "Server, live process reattached", "a verified reattach in a new runtime lifts the fence");
+  assert(!fence.snapshot().has("term-X"), "The unverified set kept a verified reattached terminal");
+  assert(terminalStatusText().includes("live process reattached"), "Reattached terminal lacks its spoken status");
+  assert(!terminalStatusText().includes("ownership is unverified"), "Reattached terminal still announces unknown ownership");
+  const commands = await typeAndResize("560px");
+  assert(commands.includes("terminal.input") && commands.includes("terminal.resize"), `Reattached terminal dropped input or resize: ${commands}`);
+}
+
 async function terminalSelectionReconnectRegression() {
   root.render(null);
   await settle();
@@ -6819,6 +6870,7 @@ try {
     ["terminal history event slot", terminalHistoryEventSlotRegression, "a storage status change never replaces terminal output or an exit delivered in the same task"],
     ["terminal close history failure", terminalCloseHistoryFailureRegression, "a close whose saved output cannot be deleted shows it ended and read-only"],
     ["terminal fenced saved session", terminalFencedSavedSessionRegression, "a saved status from the server wins over the page audit fence"],
+    ["terminal reattach lifts fence", terminalReattachLiftsFenceRegression, "a later runtime's verified live reattach lifts the audit fence; a same-runtime reconnect does not"],
     ["terminal selection during reconnect", terminalSelectionReconnectRegression, "selected terminal and output survive a reconnect while its buffer is pending"],
     ["terminal activation ownership", terminalActivationOwnershipRegression, "terminal activation commits output and current PTY size together"],
     ["rejected terminal switch", terminalRejectedSwitchRegression, "rejected terminal switch restores the selected tab focus"],
