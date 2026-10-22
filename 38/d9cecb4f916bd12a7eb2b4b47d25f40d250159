@@ -1,0 +1,39 @@
+server/outright-runtime.mjs
+  s_a684d1ea17ab6a::t_4ff5654b852e20 137
+server/terminal-broker.mjs
+  s_a684d1ea17ab6a::t_0383a711a9d247 68,76,128-129,349-352
+server/terminal-broker.test.mjs
+  s_a684d1ea17ab6a::t_eced4f60d8bdca 566,639-664
+server/terminal-history.mjs
+  s_a684d1ea17ab6a::t_ae153814e0e4a7 2,286-302,559
+server/terminal-history.test.mjs
+  s_a684d1ea17ab6a::t_b4078301475d01 1014-1050
+server/terminal-manager.mjs
+  s_a684d1ea17ab6a::t_5afdeb636b4dce 19,173-175,376,469
+server/terminal-manager.test.mjs
+  s_a684d1ea17ab6a::t_ae9822770eb879 1468-1470,1484-1490,1522-1524,1537
+src/lib/terminal-command-fence.js
+  s_a684d1ea17ab6a::t_1d576430a4f969 9-13,15-17,19,31,38-46,48,50-51
+tests/terminal-exit-state.test.mjs
+  s_a684d1ea17ab6a::t_e94413c1970936 53-95
+tests/ui-races.jsx
+  s_a684d1ea17ab6a::t_aaa7e222528c6a 3003-3063,6935
+tests/ui-races.test.mjs
+  s_a684d1ea17ab6a::t_88f68ac69e1f2c 917
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "38d9cecb4f916bd12a7eb2b4b47d25f40d250159",
+  "prompts": {},
+  "sessions": {
+    "s_a684d1ea17ab6a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_a684d1ea17ab6a",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
