@@ -1,0 +1,25 @@
+server/managed-terminal.mjs
+  s_e1c5fc1a65c0cf::t_c73b5f3f4daa69 199-204,212,221
+server/terminal-broker.mjs
+  s_e1c5fc1a65c0cf::t_27ec185acd3d50 341-343,348,355
+server/terminal-broker.test.mjs
+  s_e1c5fc1a65c0cf::t_8a50870f8283fa 697-707
+server/terminal-manager.test.mjs
+  s_e1c5fc1a65c0cf::t_73245bd2bacfb4 1923-1994,1997-1998,2000-2004,2006,2008-2009,2011,2014,2018,2020,2023-2025,2027,2029-2058
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5847e8563a9faa3da0d0fc3eee59f124f71f6922",
+  "prompts": {},
+  "sessions": {
+    "s_e1c5fc1a65c0cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13e18-4241-7662-a24f-782076addabe",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
