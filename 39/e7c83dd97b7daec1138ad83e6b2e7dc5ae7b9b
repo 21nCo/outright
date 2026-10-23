@@ -1,0 +1,45 @@
+src/styles.css
+  s_e1c5fc1a65c0cf::t_cb139fc5756714 337,339-372
+README.md
+  s_1900bb15a7199a::t_3ca03655050c27 15,59-66,71-72
+accessibility-qa.md
+  s_1900bb15a7199a::t_67fe8b6d84c850 23
+scripts/run-tests.mjs
+  s_1900bb15a7199a::t_07eec40932387a 23
+src/App.jsx
+  s_1900bb15a7199a::t_0788e20c1d0138 6,8,27,36,101-105,319-345,880,887,1934-1956,1967-1970
+src/components/PaneLayout.jsx
+  s_1900bb15a7199a::t_2fd769c9799046 1-345
+src/lib/pane-layout.js
+  s_1900bb15a7199a::t_db07ec3fded7db 1-310
+tests/pane-layout.test.mjs
+  s_1900bb15a7199a::t_0c8d5f6308b9f5 1-173
+tests/ui-races.jsx
+  s_1900bb15a7199a::t_fe0042b7061d5e 28-30,187-188,190-198,3898,3951,3982,4036,4064,4091,4211,4213-4214,6422-6626,6721-6728,6739,6741-6755,6757-6759,7219,7249-7250,7263,7281-7282
+tests/ui-races.test.mjs
+  s_1900bb15a7199a::t_779892bac4a416 917
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "39e7c83dd97b7daec1138ad83e6b2e7dc5ae7b9b",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_e1c5fc1a65c0cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13e18-4241-7662-a24f-782076addabe",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
