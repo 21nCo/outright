@@ -13,25 +13,40 @@ const shuttingDownRuntimes = globalThis[shutdownRegistry] ??= new Map();
 // close with no successor is a quit and ends them.
 const serverRegistry = Symbol.for("outright.viteRuntimeServers");
 const configuredPlugins = globalThis[serverRegistry] ??= new Map();
-// Vite closes its server on SIGTERM but leaves Ctrl-C (SIGINT) to Node,
-// which exits without any shutdown, so shells would outlive the quit as
-// after a crash. Ctrl-C is an explicit quit: it closes every configured
-// server, which has no successor, then exits. A second Ctrl-C exits at once.
-// Config reloads load this module afresh, so the handler and its state are
-// process-wide.
+// Ctrl-C (SIGINT) and SIGTERM are an explicit quit of the whole process.
+// Vite closes its current server on SIGTERM but leaves Ctrl-C to Node, which
+// exits without any shutdown. Either signal forwards the quit to every
+// runtime in the process, including one still shutting down for a restart,
+// and the process exits only after each has stopped: a quit wins over a
+// restart until its shells are handed back. A second Ctrl-C exits at once.
+// Config reloads load this module afresh, so the handlers and their state
+// are process-wide.
 const interrupt = globalThis[Symbol.for("outright.viteInterrupt")] ??= { installed: false, stopping: false, servers: new Set() };
-interrupt.handler ??= () => {
-  if (interrupt.stopping) process.exit(130);
+interrupt.plugins ??= new Set();
+interrupt.quit ??= () => {
   interrupt.stopping = true;
-  void Promise.allSettled([...interrupt.servers].map((server) => server.close()))
+  return Promise.allSettled([...interrupt.plugins].map((plugin) => plugin.quit()));
+};
+interrupt.handler ??= () => {
+  if (interrupt.interrupted) process.exit(130);
+  interrupt.interrupted = true;
+  void Promise.allSettled([interrupt.quit(), ...[...interrupt.servers].map((server) => server.close())])
     .finally(() => { process.exitCode ??= 130; process.exit(); });
 };
+// Vite's own SIGTERM handler closes the current server and exits once its
+// closeBundle settles, which awaits every quitting runtime.
+interrupt.terminate ??= () => { void interrupt.quit(); };
 function watchInterrupt() {
   const wanted = interrupt.servers.size > 0;
   if (wanted === interrupt.installed) return;
   interrupt.installed = wanted;
-  if (wanted) process.on("SIGINT", interrupt.handler);
-  else process.off("SIGINT", interrupt.handler);
+  if (wanted) {
+    process.on("SIGINT", interrupt.handler);
+    process.prependListener("SIGTERM", interrupt.terminate);
+  } else {
+    process.off("SIGINT", interrupt.handler);
+    process.off("SIGTERM", interrupt.terminate);
+  }
 }
 
 export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRuntime, recoverArchive = recoverArchiveBeforeStartup }) {
@@ -40,8 +55,10 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
   let closing;
   let startupError;
   let stopping = false;
+  let closeRequested = false;
+  let runtimeStopping = false;
   const leaseKey = configUrl.href;
-  const instance = { succeeded: false };
+  const instance = { succeeded: false, inherited: false };
   // A restart is a successor's configure, never a close that Ctrl-C began.
   const restarting = () => instance.succeeded && !interrupt.stopping;
   let interruptServer = null;
@@ -76,14 +93,21 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
   };
   const shutdown = () => {
     if (!recovery) return undefined;
-    stopping = true;
-    abort.abort();
+    // A quit must reach shells a predecessor handed to this server for a
+    // restart, so a successor still starting finishes and then quits. Any
+    // other close abandons startup. The first close decides.
+    if (closeRequested ? stopping : !instance.inherited || restarting() || runtime) {
+      stopping = true;
+      abort.abort();
+    }
+    closeRequested = true;
     if (configuredPlugins.get(leaseKey) === instance) configuredPlugins.delete(leaseKey);
     interrupt.servers.delete(interruptServer);
     watchInterrupt();
-    const restart = restarting();
     closing ??= recovery.then(async () => {
-      try { await runtime?.shutdown({ restart }); }
+      // Asked when the runtime starts to stop, after any quit signal.
+      runtimeStopping = true;
+      try { await runtime?.shutdown({ restart: restarting() }); }
       catch (error) {
         if (error.code !== "OUTRIGHT_SHUTDOWN_RECOVERY_PENDING") throw error;
         await runtime.whenShutdownComplete();
@@ -93,17 +117,31 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
     // Register its disposal too, so a successor does not apply the deadline
     // for an unknown external owner to a known local handoff.
     shuttingDownRuntimes.set(leaseKey, closing);
-    const clear = () => { if (shuttingDownRuntimes.get(leaseKey) === closing) shuttingDownRuntimes.delete(leaseKey); };
+    const clear = () => {
+      if (shuttingDownRuntimes.get(leaseKey) === closing) shuttingDownRuntimes.delete(leaseKey);
+      interrupt.plugins.delete(quitter);
+    };
     closing.then(clear, clear);
     return closing;
   };
+  // An explicit quit for this plugin's runtime, whether or not it is already
+  // shutting down for a restart.
+  const quitter = { quit() {
+    const done = shutdown() ?? Promise.resolve();
+    if (runtimeStopping) runtime?.shutdown({ restart: false }).catch(() => {});
+    return done;
+  } };
 
   return {
     name: "outright-local-runtime",
     configureServer(server) {
       const predecessor = configuredPlugins.get(leaseKey);
-      if (predecessor && predecessor !== instance) predecessor.succeeded = true;
+      if (predecessor && predecessor !== instance) {
+        predecessor.succeeded = true;
+        instance.inherited = true;
+      }
       configuredPlugins.set(leaseKey, instance);
+      interrupt.plugins.add(quitter);
       // A middleware-mode server belongs to a host that owns its signals.
       if (server.httpServer && !server.config?.server?.middlewareMode && typeof server.close === "function") {
         interruptServer = server;
@@ -140,7 +178,7 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
         // to keep its terminals, whichever close event starts its shutdown.
         runtime = await retryLease(() => createRuntime({ configUrl, hostRestarting: restarting }),
           ["OUTRIGHT_RUNTIME_LEASE_HELD"]);
-        if (stopping) return;
+        if (stopping || closeRequested) return;
         runtime.attach({ ...server, middlewares: { use() {} } });
       }).catch(async (error) => {
         try { await runtime?.shutdown(); }
@@ -152,7 +190,8 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
     },
     // Vite awaits plugin disposal before its signal handler exits the process.
     closeBundle() {
-      return shutdown();
+      const done = shutdown();
+      return interrupt.stopping ? interrupt.quit().then(() => done) : done;
     },
   };
 }

@@ -310,6 +310,80 @@ process.stdout.write("ready\\n");
   }
 });
 
+// A quit during a Vite restart reaches the old runtime while it is still
+// handing its shells to the new one, and the new one quits too.
+test("Ctrl-C or SIGTERM during a Vite restart quits the old runtime still shutting down and exits only after it stops", { timeout: 60_000 }, async () => {
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    const directory = mkdtempSync(join(tmpdir(), "outright-vite-restart-quit-"));
+    writeFileSync(join(directory, "vite.config.mjs"), `import { defineConfig } from ${JSON.stringify(import.meta.resolve("vite"))};
+import { outrightApiPlugin } from ${JSON.stringify(new URL("./outright-vite-plugin.mjs", import.meta.url).href)};
+export default defineConfig({ plugins: [outrightApiPlugin({ configUrl: new URL("file:///fixture/restart-quit.json"),
+  recoverArchive: async () => {}, createRuntime: globalThis.restartQuitFixture })] });
+`);
+    const source = `import { createServer } from ${JSON.stringify(import.meta.resolve("vite"))};
+const log = (line) => process.stdout.write(line + "\\n");
+let leaseHeld = false;
+let count = 0;
+globalThis.restartQuitFixture = () => {
+  if (leaseHeld) throw Object.assign(new Error("lease held"), { code: "OUTRIGHT_RUNTIME_LEASE_HELD" });
+  leaseHeld = true;
+  const name = "runtime" + ++count;
+  let quit = false;
+  let done;
+  return { attach() {}, async handleRequest() { return false; },
+    shutdown(options) {
+      log(name + ":" + (options?.restart === false ? "quit" : options?.restart === true ? "restart" : "none"));
+      if (options?.restart === false) quit = true;
+      done ??= (async () => {
+        // The old runtime is still handing its shells back.
+        if (name === "runtime1") { log("runtime1:handing-back"); await new Promise((resolve) => setTimeout(resolve, 1500)); }
+        log(name + ":stopped-as-" + (quit ? "quit" : "restart"));
+        leaseHeld = false;
+      })();
+      return done;
+    } };
+};
+const server = await createServer({ configFile: ${JSON.stringify(join(directory, "vite.config.mjs"))}, root: ${JSON.stringify(directory)},
+  logLevel: "silent", server: { host: "127.0.0.1", port: 0 } });
+await server.listen();
+// Windows cannot deliver these signals to another process; the launcher asks.
+process.on("message", (message) => { if (message === "restart") server.restart().catch(() => {}); else process.emit(message); });
+log("ready");
+`;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", source],
+      { cwd: directory, stdio: ["pipe", "pipe", "pipe", "ipc"], env: { ...process.env, CI: "true" } });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    const exited = new Promise((resolve) => child.once("exit", (code, exitSignal) => resolve({ code, signal: exitSignal })));
+    const until = async (text) => {
+      for (let turn = 0; !stdout.includes(text) && turn < 400; turn += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+      assert.match(stdout, new RegExp(text), `${signal}: ${stdout}${stderr}`);
+    };
+    try {
+      await until("ready");
+      child.send("restart");
+      await until("runtime1:handing-back");
+      if (process.platform === "win32") child.send(signal);
+      else child.kill(signal);
+      const { signal: killedBy } = await exited;
+      assert.equal(killedBy, null, `${signal}: the process died without its shutdown`);
+      // Each quit request is forwarded; the runtime joins repeats.
+      const lines = [...new Set(stdout.trim().split("\n"))];
+      // The quit wins over the restart already under way, the process exits
+      // only after the old runtime stopped, and the new one quits as well.
+      assert.deepEqual(lines.filter((line) => line.startsWith("runtime1")),
+        ["runtime1:restart", "runtime1:handing-back", "runtime1:quit", "runtime1:stopped-as-quit"], `${signal}: ${stdout}${stderr}`);
+      assert.deepEqual(lines.filter((line) => line.startsWith("runtime2")), ["runtime2:quit", "runtime2:stopped-as-quit"],
+        `${signal}: ${stdout}${stderr}`);
+    } finally {
+      child.kill("SIGKILL");
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
 test("Vite retries a transient archive worker lease conflict before opening the runtime", async () => {
   let attempts = 0;
   let attached = false;

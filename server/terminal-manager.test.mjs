@@ -3,7 +3,7 @@ import test from "node:test";
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { openTerminalHistory, probeWindowsHistoryAcl, windowsAclPrivate } from "./terminal-history.mjs";
 import { reattachNonce, reattachProof } from "./terminal-reattach-proof.mjs";
-import { cleanupTerminalSocket, readReattachRecord, reattachManagedTerminal, reattachToken, recordTerminalEmpty, recoverManagedTerminal, terminalOwnership,
+import { cleanupTerminalSocket, readReattachRecord, reattachManagedTerminal, reattachToken, recordTerminalEmpty, recoverManagedTerminal, spawnManagedTerminal, terminalOwnership,
   writeReattachRecord } from "./managed-terminal.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { createOutrightDatabase } from "./database.mjs";
@@ -2036,21 +2036,205 @@ test("a restart and an explicit quit at the same time quit, in either order; a c
     { name: "no intent while the host restarts", calls: [{}], host: true, kept: true },
     { name: "quit while the host restarts", calls: [{ restart: false }], host: true, kept: false },
     { name: "no intent alone", calls: [{}], kept: false },
+    // The broker has acknowledged, so the shell is already in its detach
+    // window when the quit arrives: native recovery ends it.
+    { name: "restart, then quit after the hand-back", calls: [{ restart: true }], quitAfterRelease: true, ended: true },
+    { name: "host restart, then quit after the hand-back", calls: [{}], host: true, quitAfterRelease: true, ended: true },
   ]) {
     const directory = mkdtempSync(path.join(os.tmpdir(), "outright-runtime-shutdown-intent-"));
     const launch = fakeLaunch({ handBack: true });
-    const runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json", hostRestarting: () => scenario.host === true,
+    let runtime;
+    const runtimeOptions = { configUrl: "file:///nonexistent-config.json", hostRestarting: () => scenario.host === true,
       databaseFactory: (options) => createOutrightDatabase({ ...options, filename: path.join(directory, "runtime.db") }),
-      terminalManagerFactory: (options) => createTerminalManager({ ...options, startManagedTerminal: launch.start, cleanupSocket: () => {} }) });
+      terminalManagerFactory: (options) => createTerminalManager({ ...options, cleanupSocket: () => {},
+        startManagedTerminal: async (launchOptions) => {
+          const adapter = await launch.start(launchOptions);
+          const { release } = adapter;
+          adapter.release = async () => {
+            const frames = await release();
+            if (scenario.quitAfterRelease) void runtime.shutdown({ restart: false });
+            return frames;
+          };
+          return adapter;
+        },
+        recoverTerminal: async (entry) => { launch.calls.push(`recover ${entry.ownershipLabel === `com.21n.outright.terminal.${entry.target}`}`); return true; } }) };
+    runtime = createOutrightRuntime(runtimeOptions);
     try {
       await runtime.database.waitForTerminalAuditReconciliation?.();
-      await runtime.terminals.create({ cwd: directory });
+      const { id } = await runtime.terminals.create({ cwd: directory });
+      const { launchDirectory } = runtime.database;
       await Promise.all(scenario.calls.map((options) => runtime.shutdown(options)));
-      assert.deepEqual(launch.calls, scenario.kept ? ["session", "release"] : ["session", "terminate"], scenario.name);
+      const expected = { kept: ["session", "release"], ended: ["session", "release", "recover true"] }[
+        scenario.kept ? "kept" : scenario.ended ? "ended" : "closed"] ?? ["session", "terminate"];
+      assert.deepEqual(launch.calls, expected, scenario.name);
+      assert.equal(Boolean(readReattachRecord(id, launchDirectory)), Boolean(scenario.kept), scenario.name);
     } finally {
       await runtime.shutdown().catch(() => {});
       rmSync(directory, { recursive: true, force: true });
     }
+  }
+});
+
+// The broker has already acknowledged, so the shell is in its detach window
+// when the quit wins: only native recovery can still end it.
+test("a quit that wins after brokers acknowledged a hand-back ends those shells natively, and the next start never reattaches them", { timeout: 60_000 }, async () => {
+  for (const verified of [true, false]) {
+    const name = verified ? "verified" : "unverified";
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-quit-after-handback-"));
+    const filename = path.join(directory, "runtime.db");
+    let database = createOutrightDatabase({ filename, runtimeLease: true });
+    try {
+      // As at runtime start: the inventory then holds only prior-run owners.
+      database.reconcileTerminalAudit();
+      await database.waitForTerminalAuditReconciliation();
+      let restart = true;
+      let released = 0;
+      const recovered = [];
+      const manager = createTerminalManager({ database, publish: () => {}, cleanupSocket: () => {},
+        recoverTerminal: async (entry) => { recovered.push(entry); return verified; },
+        startManagedTerminal: async () => {
+          const adapter = { pid: 4242, processIdentity: "identity", sessionIdentity: randomUUID(), handedBack: false,
+            onData() {}, onExit() {}, write: () => true, resize: () => true,
+            async terminate() { throw new Error("a handed-back shell was terminated through its closed connection"); },
+            async release() {
+              adapter.handedBack = true;
+              // The second acknowledgement arrives after the first shell was
+              // handed back; the quit comes with it.
+              if (++released === 2) {
+                await new Promise((resolve) => setTimeout(resolve, 50));
+                restart = false;
+              }
+              return ["handed-back output\r\n"];
+            } };
+          return adapter;
+        } });
+      const ids = [(await manager.create({ cwd: directory })).id, (await manager.create({ cwd: directory })).id];
+      await manager.shutdown({ detach: () => restart });
+      assert.deepEqual(recovered.map((entry) => entry.target).sort(), [...ids].sort(), name);
+      for (const entry of recovered) {
+        assert.deepEqual([entry.created, entry.ownershipLabel, entry.pid, entry.processIdentity],
+          [1, `com.21n.outright.terminal.${entry.target}`, 4242, "identity"], name);
+      }
+      for (const id of ids) {
+        assert.equal(readReattachRecord(id, database.launchDirectory), null, `${name}: the quit left a reattach record`);
+        assert.equal(database.listAudit(50).some((entry) => entry.target === id
+          && ["terminal.closed", "terminal.recovered"].includes(entry.action)), verified, name);
+      }
+      // An unproven owner stays reserved for native recovery, never offered
+      // for reattach; a proven one is settled.
+      database = await restartDatabase(database, filename);
+      for (const id of ids) assert.equal(database.terminalUnknownReservations().some((entry) => entry.target === id), !verified, name);
+      const successor = createTerminalManager({ database, publish: () => {}, cleanupSocket: () => {},
+        recoverTerminal: async () => true, reattachTerminal: async () => { throw new Error("reattached after a quit"); } });
+      try {
+        assert.equal(await successor.reconcileUnknown(), verified ? 0 : 2, name);
+        for (const id of ids) {
+          const saved = successor.get(id);
+          assert.deepEqual([saved.status, saved.reattached], ["ended", undefined], name);
+          assert.match(saved.buffer, /handed-back output/, name);
+        }
+      } finally { await successor.shutdown(); }
+    } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+  }
+});
+
+test("a quit after a real broker accepted the hand-back ends the live shell, and the next start shows its saved output", { timeout: 90_000 }, async (t) => {
+  const { directory, filename, stops } = reattachRuntime(t, "outright-terminal-quit-after-native-handback-", () => database);
+  let database = createOutrightDatabase({ filename, runtimeLease: true });
+  const shell = process.env.SHELL;
+  process.env.SHELL = process.execPath;
+  t.after(() => { if (shell === undefined) delete process.env.SHELL; else process.env.SHELL = shell; });
+  // As at runtime start: the inventory then holds only prior-run owners.
+  database.reconcileTerminalAudit();
+  await database.waitForTerminalAuditReconciliation();
+  let restart = true;
+  const order = [];
+  const manager = createTerminalManager({ database, publish: () => {},
+    recoverTerminal: async (entry) => { order.push("native-recovery"); return recoverManagedTerminal(entry); },
+    startManagedTerminal: async (options) => {
+      const adapter = await spawnManagedTerminal(options);
+      const { release } = adapter;
+      adapter.release = async (...args) => {
+        const frames = await release(...args);
+        order.push(adapter.handedBack ? "handed-back" : "refused");
+        restart = false;
+        return frames;
+      };
+      return adapter;
+    } });
+  stops.push(() => manager.shutdown());
+  const live = await manager.create({ cwd: directory });
+  const pidFile = path.join(directory, "shell.pid");
+  assert.equal(manager.write(live.id, `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); console.log('before-' + 'quit')\r`), true);
+  await waitFor(() => manager.get(live.id)?.buffer.includes("before-quit"), 10_000, () => manager.get(live.id)?.buffer);
+  const pid = Number(readFileSync(pidFile, "utf8"));
+  const alive = () => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === "EPERM"; } };
+  assert.equal(alive(), true);
+  await manager.shutdown({ detach: () => restart });
+  assert.deepEqual(order, ["handed-back", "native-recovery"]);
+  assert.equal(readReattachRecord(live.id, database.launchDirectory), null);
+  await waitFor(() => !alive(), 10_000, () => `shell ${pid} outlived the quit`);
+
+  database = await restartDatabase(database, filename);
+  assert.equal(database.terminalUnknownReservations().some((entry) => entry.target === live.id), false);
+  const successor = createTerminalManager({ database, publish: () => {} });
+  stops.push(() => successor.shutdown());
+  assert.equal(await successor.reconcileUnknown(), 0);
+  const saved = successor.get(live.id);
+  assert.deepEqual([saved.status, saved.reattached], ["ended", undefined]);
+  assert.doesNotMatch(terminalTabLabel(saved), /reattached|running/);
+  assert.match(saved.buffer, /before-quit/);
+});
+
+// Until the audit scan rebuilds it, the inherited owner inventory is unknown,
+// never empty.
+test("an explicit quit waits for the ownership scan before ending a prior-run shell; a scan that cannot finish fails the quit and leaves nothing to reattach", { timeout: 120_000 }, async (t) => {
+  for (const scan of ["completes", "stalls"]) {
+    const { directory, filename } = reattachRuntime(t, "outright-terminal-quit-scan-", () => database);
+    let database = createOutrightDatabase({ filename, runtimeLease: true });
+    const prior = await priorRunTerminal(t, database, directory, { savedOutput: "saved-before-restart\r\n" });
+    database.close();
+    let gated = true;
+    const held = [];
+    database = createOutrightDatabase({ filename, runtimeLease: true,
+      terminalAuditSchedule: (tick) => {
+        if (!gated) return setImmediate(tick);
+        held.push(tick);
+        return undefined;
+      } });
+    database.reconcileTerminalAudit();
+    assert.equal(database.terminalAuditScanPending, true, scan);
+    const recovery = brokerRecovery(prior);
+    const recovered = [];
+    const manager = createTerminalManager({ database, publish: () => {}, quitInventoryTimeoutMs: scan === "stalls" ? 300 : 30_000,
+      recoverTerminal: async (entry) => { recovered.push(entry.target); return recovery(entry); } });
+    const quit = manager.shutdown();
+    if (scan === "completes") {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      gated = false;
+      for (const tick of held.splice(0)) setImmediate(tick);
+      await quit;
+      assert.deepEqual(recovered, [prior.id], scan);
+      assert.equal(prior.exited(), true, "the quit left a prior-run shell running");
+      assert.equal(database.terminalUnknownReservations().some((entry) => entry.target === prior.id), false);
+    } else {
+      await assert.rejects(quit, (error) => error.errors?.some((cause) => /not recovered before quit/.test(cause.message)));
+      assert.deepEqual(recovered, [], scan);
+    }
+    assert.equal(readReattachRecord(prior.id, database.launchDirectory), null, `${scan}: the quit left a reattach record`);
+    // The next start never reattaches it; an owner the quit could not reach
+    // is ended there by native recovery.
+    database = await restartDatabase(database, filename);
+    const successor = createTerminalManager({ database, publish: () => {},
+      recoverTerminal: async (entry) => { recovered.push(entry.target); return recovery(entry); },
+      reattachTerminal: async () => { throw new Error("reattached after a quit"); } });
+    try {
+      assert.equal(await successor.reconcileUnknown(), scan === "stalls" ? 1 : 0, scan);
+      assert.equal(prior.exited(), true, scan);
+      const saved = successor.get(prior.id);
+      assert.deepEqual([saved.status, saved.reattached], ["ended", undefined], scan);
+      assert.match(saved.buffer, /saved-before-restart/, scan);
+    } finally { await successor.shutdown(); }
   }
 });
 
