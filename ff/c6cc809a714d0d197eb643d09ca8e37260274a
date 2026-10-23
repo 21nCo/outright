@@ -1,0 +1,27 @@
+server/agent-supervisor-darwin.test.mjs
+  s_c9b4da3f33559b::t_7c4c3ba93f40ac 12-13
+server/agent-supervisor-windows.c
+  s_c9b4da3f33559b::t_9b64f6c50263a6 16-21,218-338,538-543,569,580,582-588,592,624-627,644,660-661,668-671
+server/agent-supervisor-windows.test.mjs
+  s_c9b4da3f33559b::t_eec6431187a989 1-256
+server/managed-terminal.mjs
+  s_c9b4da3f33559b::t_3fb5050ca65698 231-232,242,265-267
+tests/fixtures/supervisor-detach.mjs
+  s_c9b4da3f33559b::t_36bf2ec1260885 50-54,66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ffc6cc809a714d0d197eb643d09ca8e37260274a",
+  "prompts": {},
+  "sessions": {
+    "s_c9b4da3f33559b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_c9b4da3f33559b",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
