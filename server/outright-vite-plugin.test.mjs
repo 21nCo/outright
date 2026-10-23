@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +10,9 @@ import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 import Database from "better-sqlite3";
 import { outrightApiPlugin } from "./outright-vite-plugin.mjs";
+import { createOutrightRuntime } from "./outright-runtime.mjs";
+import { createOutrightDatabase } from "./database.mjs";
+import { createTerminalManager } from "./terminal-manager.mjs";
 
 test("Vite disposal awaits runtime process supervision before completing", async () => {
   let release;
@@ -228,6 +232,82 @@ test("a Vite config restart keeps terminals for the successor runtime; a close w
   await new Promise((resolve) => setImmediate(resolve));
   await second.closeBundle();
   assert.deepEqual(intents, ["restart", "quit"]);
+});
+
+// The real runtime registers its own HTTP close listener, which asks for a
+// shutdown without an intent and can run before or after the plugin's.
+test("a Vite restart keeps a live terminal whichever close event reaches the real runtime first; a close without a successor ends it", { timeout: 60_000 }, async () => {
+  for (const successor of [true, false]) for (const closeFirst of [true, false]) {
+    const name = `${successor ? "restart" : "quit"}, ${closeFirst ? "HTTP close first" : "closeBundle first"}`;
+    const directory = mkdtempSync(join(tmpdir(), "outright-vite-intent-"));
+    const calls = [];
+    const adapter = { pid: 4242, sessionIdentity: randomUUID(), handedBack: false, onData() {}, onExit() {},
+      write: () => true, resize: () => true,
+      async terminate() { calls.push("terminate"); },
+      async release() { calls.push("release"); adapter.handedBack = true; return []; } };
+    let runtime;
+    const options = { configUrl: new URL(`file:///fixture/${randomUUID()}.json`), recoverArchive: async () => {},
+      createRuntime: (runtimeOptions) => (runtime = createOutrightRuntime({ ...runtimeOptions,
+        databaseFactory: (databaseOptions) => createOutrightDatabase({ ...databaseOptions, filename: join(directory, "runtime.db") }),
+        terminalManagerFactory: (managerOptions) => createTerminalManager({ ...managerOptions,
+          startManagedTerminal: async () => adapter, cleanupSocket: () => {} }) })) };
+    const server = { httpServer: new EventEmitter(), middlewares: { use() {} } };
+    const plugin = outrightApiPlugin(options);
+    try {
+      plugin.configureServer(server);
+      for (let turn = 0; !runtime && turn < 100; turn += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+      await runtime.database.waitForTerminalAuditReconciliation();
+      await runtime.terminals.create({ cwd: directory });
+      // Vite configures the replacement before it closes the old server.
+      if (successor) outrightApiPlugin({ ...options, createRuntime: () => ({ attach() {}, async shutdown() {} }) })
+        .configureServer({ httpServer: new EventEmitter(), middlewares: { use() {} } });
+      if (closeFirst) server.httpServer.emit("close");
+      const closing = plugin.closeBundle();
+      if (!closeFirst) server.httpServer.emit("close");
+      await closing;
+      await runtime.whenShutdownComplete();
+      assert.deepEqual(calls, [successor ? "release" : "terminate"], name);
+    } finally {
+      await runtime?.shutdown().catch(() => {});
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+// Vite leaves SIGINT to Node, which would exit without any shutdown.
+test("Ctrl-C on the Vite dev server is an explicit quit that shuts the runtime down before exiting", { timeout: 30_000 }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "outright-vite-interrupt-"));
+  const source = `import { createServer } from ${JSON.stringify(import.meta.resolve("vite"))};
+import { outrightApiPlugin } from ${JSON.stringify(new URL("./outright-vite-plugin.mjs", import.meta.url).href)};
+const server = await createServer({ configFile: false, root: ${JSON.stringify(directory)}, logLevel: "silent",
+  server: { host: "127.0.0.1", port: 0 },
+  plugins: [outrightApiPlugin({ configUrl: new URL("file:///fixture/${randomUUID()}.json"), recoverArchive: async () => {},
+    createRuntime: () => ({ attach() {}, async shutdown(options) {
+      process.stdout.write("shutdown:" + (options?.restart === false ? "quit" : "other") + "\\n");
+    } }) })] });
+await server.listen();
+// Windows cannot deliver SIGINT to another process; the launcher asks.
+process.on("message", () => process.emit("SIGINT"));
+process.stdout.write("ready\\n");
+`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", source],
+    { cwd: directory, stdio: ["pipe", "pipe", "pipe", "ipc"], env: { ...process.env, CI: "true" } });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+  const exited = new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
+  try {
+    for (let turn = 0; !stdout.includes("ready") && turn < 400; turn += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.match(stdout, /ready/, stderr);
+    if (process.platform === "win32") child.send("interrupt");
+    else child.kill("SIGINT");
+    assert.deepEqual(await exited, { code: 130, signal: null }, stderr);
+    assert.match(stdout, /shutdown:quit/);
+  } finally {
+    child.kill("SIGKILL");
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("Vite retries a transient archive worker lease conflict before opening the runtime", async () => {

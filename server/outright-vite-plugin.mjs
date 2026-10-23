@@ -13,6 +13,26 @@ const shuttingDownRuntimes = globalThis[shutdownRegistry] ??= new Map();
 // close with no successor is a quit and ends them.
 const serverRegistry = Symbol.for("outright.viteRuntimeServers");
 const configuredPlugins = globalThis[serverRegistry] ??= new Map();
+// Vite closes its server on SIGTERM but leaves Ctrl-C (SIGINT) to Node,
+// which exits without any shutdown, so shells would outlive the quit as
+// after a crash. Ctrl-C is an explicit quit: it closes every configured
+// server, which has no successor, then exits. A second Ctrl-C exits at once.
+// Config reloads load this module afresh, so the handler and its state are
+// process-wide.
+const interrupt = globalThis[Symbol.for("outright.viteInterrupt")] ??= { installed: false, stopping: false, servers: new Set() };
+interrupt.handler ??= () => {
+  if (interrupt.stopping) process.exit(130);
+  interrupt.stopping = true;
+  void Promise.allSettled([...interrupt.servers].map((server) => server.close()))
+    .finally(() => { process.exitCode ??= 130; process.exit(); });
+};
+function watchInterrupt() {
+  const wanted = interrupt.servers.size > 0;
+  if (wanted === interrupt.installed) return;
+  interrupt.installed = wanted;
+  if (wanted) process.on("SIGINT", interrupt.handler);
+  else process.off("SIGINT", interrupt.handler);
+}
 
 export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRuntime, recoverArchive = recoverArchiveBeforeStartup }) {
   let runtime = null;
@@ -22,6 +42,9 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
   let stopping = false;
   const leaseKey = configUrl.href;
   const instance = { succeeded: false };
+  // A restart is a successor's configure, never a close that Ctrl-C began.
+  const restarting = () => instance.succeeded && !interrupt.stopping;
+  let interruptServer = null;
   const abort = new AbortController();
   const wait = (promise) => new Promise((resolve, reject) => {
     if (stopping) return resolve();
@@ -56,7 +79,9 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
     stopping = true;
     abort.abort();
     if (configuredPlugins.get(leaseKey) === instance) configuredPlugins.delete(leaseKey);
-    const restart = instance.succeeded;
+    interrupt.servers.delete(interruptServer);
+    watchInterrupt();
+    const restart = restarting();
     closing ??= recovery.then(async () => {
       try { await runtime?.shutdown({ restart }); }
       catch (error) {
@@ -79,6 +104,12 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
       const predecessor = configuredPlugins.get(leaseKey);
       if (predecessor && predecessor !== instance) predecessor.succeeded = true;
       configuredPlugins.set(leaseKey, instance);
+      // A middleware-mode server belongs to a host that owns its signals.
+      if (server.httpServer && !server.config?.server?.middlewareMode && typeof server.close === "function") {
+        interruptServer = server;
+        interrupt.servers.add(server);
+        watchInterrupt();
+      }
       server.middlewares.use((request, response, next) => {
         if (!request.url.startsWith("/api/")) return next();
         if (runtime) {
@@ -105,7 +136,10 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
         // The replacement server may configure before the prior server's
         // asynchronous shutdown releases SQLite. Both recovery and runtime
         // construction share that temporary lease overlap.
-        runtime = await retryLease(() => createRuntime({ configUrl }), ["OUTRIGHT_RUNTIME_LEASE_HELD"]);
+        // The runtime asks whether a successor has configured when it decides
+        // to keep its terminals, whichever close event starts its shutdown.
+        runtime = await retryLease(() => createRuntime({ configUrl, hostRestarting: restarting }),
+          ["OUTRIGHT_RUNTIME_LEASE_HELD"]);
         if (stopping) return;
         runtime.attach({ ...server, middlewares: { use() {} } });
       }).catch(async (error) => {

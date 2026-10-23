@@ -1861,7 +1861,7 @@ test("a reattached terminal closed unexpectedly is still ended, audited and rele
   assert.deepEqual(manager.capacity(), { active: 0, unknown: 0, limit: 1 });
 });
 
-test("shutdown joins a reattach in flight and hands its shell back to the broker for the next runtime", { timeout: 60_000 }, async (t) => {
+test("a graceful restart joins a reattach in flight and hands its shell back to the broker for the next runtime", { timeout: 60_000 }, async (t) => {
   const { directory, filename, stops } = reattachRuntime(t, "outright-terminal-reattach-shutdown-", () => database);
   let database = createOutrightDatabase({ filename, runtimeLease: true });
   const prior = await priorRunTerminal(t, database, directory);
@@ -1888,7 +1888,7 @@ test("shutdown joins a reattach in flight and hands its shell back to the broker
     } });
   const reconcile = stopping.reconcileUnknown();
   await waitFor(() => deliver, 10_000);
-  const shutdown = stopping.shutdown().then(() => order.push("shutdown-returned"));
+  const shutdown = stopping.shutdown({ detach: true }).then(() => order.push("shutdown-returned"));
   await new Promise((resolve) => setTimeout(resolve, 200));
   assert.deepEqual(order, [], "shutdown returned before the reattach in flight settled");
   deliver();
@@ -1925,7 +1925,7 @@ test("shutdown joins a reattach in flight and hands its shell back to the broker
   } finally { restored.close(); }
 });
 
-test("shutdown before the reattach proof leaves the token and the detached output with the broker", { timeout: 60_000 }, async (t) => {
+test("a graceful restart before the reattach proof leaves the token and the detached output with the broker", { timeout: 60_000 }, async (t) => {
   const { directory, filename, stops } = reattachRuntime(t, "outright-terminal-reattach-withdrawn-", () => database);
   let database = createOutrightDatabase({ filename, runtimeLease: true });
   const prior = await priorRunTerminal(t, database, directory);
@@ -1940,7 +1940,7 @@ test("shutdown before the reattach proof leaves the token and the detached outpu
     reattachTerminal: async (options) => {
       const adapter = await reattachManagedTerminal({ ...options, proceed: () => {
         order.push("proceed");
-        shutdown = stopping.shutdown();
+        shutdown = stopping.shutdown({ detach: true });
         return options.proceed();
       } });
       order.push(adapter ? "reattached" : "withdrawn");
@@ -1965,6 +1965,93 @@ test("shutdown before the reattach proof leaves the token and the detached outpu
   assert.equal(successor.get(prior.id).buffer.split("while-detached").length, 2);
   assert.equal(await successor.close(prior.id), true);
   assert.equal(prior.exited(), true);
+});
+
+// An explicit quit ends every prior-run shell this runtime has not
+// reattached, whether its reattach was accepted, withdrawn before the proof,
+// or never began, and proves its owner gone; a restart leaves each to the
+// next runtime.
+test("an explicit quit ends a prior-run shell whose reattach is in flight, withdrawn or not begun, and settles its reservation", { timeout: 120_000 }, async (t) => {
+  for (const stage of ["accepted", "withdrawn", "not begun"]) {
+    const { directory, filename, stops } = reattachRuntime(t, "outright-terminal-reattach-quit-", () => database);
+    let database = createOutrightDatabase({ filename, runtimeLease: true });
+    const prior = await priorRunTerminal(t, database, directory, { savedOutput: "saved-before-restart\r\n" });
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    database = await restartDatabase(database, filename);
+    const order = [];
+    let deliver;
+    let shutdown;
+    const recovery = brokerRecovery(prior);
+    const stopping = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => true,
+      recoverTerminal: async (entry) => { order.push("native-recovery"); return recovery(entry); },
+      reattachTerminal: async (options) => {
+        const adapter = await reattachManagedTerminal({ ...options, proceed: () => {
+          if (stage === "withdrawn") shutdown = stopping.shutdown();
+          return options.proceed();
+        } });
+        if (!adapter) return null;
+        const { terminate, release } = adapter;
+        adapter.terminate = () => { order.push("terminate"); return terminate(); };
+        adapter.release = () => { order.push("release"); return release(); };
+        await new Promise((resolve) => { deliver = resolve; });
+        return adapter;
+      } });
+    let reconcile = Promise.resolve(0);
+    if (stage === "accepted") {
+      reconcile = stopping.reconcileUnknown();
+      await waitFor(() => deliver, 10_000);
+      shutdown = stopping.shutdown();
+      deliver();
+    } else if (stage === "withdrawn") {
+      reconcile = stopping.reconcileUnknown();
+      await waitFor(() => shutdown !== undefined, 10_000);
+    } else shutdown = stopping.shutdown();
+    await shutdown;
+    assert.equal(await reconcile, 0, stage);
+    // The broker ends an accepted shell; native proof then settles every one.
+    assert.equal(order.includes("release"), false, stage);
+    assert.equal(order[0], stage === "accepted" ? "terminate" : "native-recovery", stage);
+    assert.equal(order.at(-1), "native-recovery", stage);
+    assert.equal(prior.exited(), true, `${stage}: the quit left a shell for the next start to reattach`);
+    assert.equal(readReattachRecord(prior.id, database.launchDirectory), null, stage);
+    assert.equal(database.terminalUnknownReservations().some((entry) => entry.target === prior.id), false, stage);
+    // The next start shows only saved output, never a resumed shell; what the
+    // shell printed while detached is kept when this runtime received it.
+    database = await restartDatabase(database, filename);
+    const successor = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => true });
+    stops.push(() => successor.shutdown());
+    assert.equal(await successor.reconcileUnknown(), 0, stage);
+    const saved = successor.get(prior.id);
+    assert.deepEqual([saved.status, saved.reattached], ["ended", undefined], stage);
+    assert.match(saved.buffer, /saved-before-restart/);
+    assert.equal(saved.buffer.includes("while-detached"), stage === "accepted", `${stage}: ${JSON.stringify(saved.buffer)}`);
+  }
+});
+
+test("a restart and an explicit quit at the same time quit, in either order; a call without intent leaves it to the host", { timeout: 60_000 }, async () => {
+  for (const scenario of [
+    { name: "restart, then quit", calls: [{ restart: true }, { restart: false }], kept: false },
+    { name: "quit, then restart", calls: [{ restart: false }, { restart: true }], kept: false },
+    { name: "no intent, then restart", calls: [{}, { restart: true }], kept: true },
+    { name: "no intent while the host restarts", calls: [{}], host: true, kept: true },
+    { name: "quit while the host restarts", calls: [{ restart: false }], host: true, kept: false },
+    { name: "no intent alone", calls: [{}], kept: false },
+  ]) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "outright-runtime-shutdown-intent-"));
+    const launch = fakeLaunch({ handBack: true });
+    const runtime = createOutrightRuntime({ configUrl: "file:///nonexistent-config.json", hostRestarting: () => scenario.host === true,
+      databaseFactory: (options) => createOutrightDatabase({ ...options, filename: path.join(directory, "runtime.db") }),
+      terminalManagerFactory: (options) => createTerminalManager({ ...options, startManagedTerminal: launch.start, cleanupSocket: () => {} }) });
+    try {
+      await runtime.database.waitForTerminalAuditReconciliation?.();
+      await runtime.terminals.create({ cwd: directory });
+      await Promise.all(scenario.calls.map((options) => runtime.shutdown(options)));
+      assert.deepEqual(launch.calls, scenario.kept ? ["session", "release"] : ["session", "terminate"], scenario.name);
+    } finally {
+      await runtime.shutdown().catch(() => {});
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
 });
 
 test("a reattach whose audit fails ends the shell and writes the output it was handed straight to history", { timeout: 60_000 }, async (t) => {

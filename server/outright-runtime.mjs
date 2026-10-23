@@ -49,7 +49,7 @@ function abortableDelay(ms, signal) {
   });
 }
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, databaseFactory = createOutrightDatabase, agentManagerFactory = createAgentManager, providerAccountsFactory = createProviderAccounts, hardenLaunchDirectory = process.platform === "win32" ? hardenWindowsLaunchDirectory : () => {}, terminalManagerFactory = createTerminalManager } = {}) {
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, databaseFactory = createOutrightDatabase, agentManagerFactory = createAgentManager, providerAccountsFactory = createProviderAccounts, hardenLaunchDirectory = process.platform === "win32" ? hardenWindowsLaunchDirectory : () => {}, terminalManagerFactory = createTerminalManager, hostRestarting = () => false } = {}) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
   let agents;
@@ -1033,14 +1033,24 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     });
   }
 
-  // A graceful restart (restart: true) keeps live terminals for the next
-  // runtime to reattach; any other shutdown is an explicit quit that closes
-  // them. The intent of the call that starts a shutdown holds for it, and a
-  // retry that names none keeps it.
-  let restartOnShutdown = false;
+  // A graceful restart keeps live terminals for the next runtime to
+  // reattach; an explicit quit closes them. Every call's intent counts,
+  // whichever call starts the shutdown, until each shell is handed back or
+  // closed: an explicit quit (restart: false) always wins, and a restart is
+  // named by a call (restart: true) or by the host (hostRestarting). A call
+  // that names neither, such as the HTTP server's close, decides nothing,
+  // and a shutdown nobody named as a restart is a quit.
+  let quitRequested = false;
+  let restartRequested = false;
+  const restartIntended = () => {
+    if (quitRequested) return false;
+    if (restartRequested) return true;
+    try { return hostRestarting() === true; } catch { return false; }
+  };
   function shutdown({ restart } = {}) {
+    if (restart === false) quitRequested = true;
+    if (restart === true) restartRequested = true;
     if (shutdownPromise) return shutdownPromise;
-    if (restart !== undefined) restartOnShutdown = restart === true;
     shuttingDown = true;
     runRecoveryController.abort();
     clearTimeout(watcherTimer);
@@ -1061,7 +1071,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       await runRecovery.cycle;
       // Native-owner probes may remain slow or stuck. Terminal shutdown fences
       // their late results before the database lease is released.
-      try { await terminals.shutdown({ detach: restartOnShutdown }); }
+      try { await terminals.shutdown({ detach: restartIntended }); }
       catch (error) { shutdownErrors.push(error); }
       eventHub.shutdown();
       wss.close();
