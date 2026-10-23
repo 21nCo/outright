@@ -16,9 +16,10 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === "EPERM"; } };
 
 // Either host, started as a user would run it, with archive recovery that
-// can be held pending and terminal disposal that can be made to hang.
+// can be held pending and terminal disposal that can be made to hang. A Vite
+// host can load a config file and reload it, as an edited vite.config does.
 // Windows cannot signal another process, so the test asks over IPC there.
-function hostSource(kind, { gated = false, stuck = false } = {}) {
+function hostSource(kind, { gated = false, stuck = false, config = null } = {}) {
   const module = (name) => JSON.stringify(new URL(name, import.meta.url).href);
   return `import { createOutrightRuntime } from ${module("./outright-runtime.mjs")};
 let release;
@@ -27,15 +28,23 @@ process.on("message", (message) => { if (message === "recover") release(); else 
 const recoverArchive = async () => { ${gated ? `process.stdout.write("recovering\\n"); await recovered;` : ""} };
 const createRuntime = (options) => {
   const runtime = createOutrightRuntime(options);
+  process.stdout.write("runtime-created\\n");
   ${stuck ? "runtime.terminals.shutdown = () => new Promise(() => {});" : ""}
   return runtime;
 };
 ${kind === "vite" ? `const { createServer } = await import(${JSON.stringify(import.meta.resolve("vite"))});
 const { outrightApiPlugin } = await import(${module("./outright-vite-plugin.mjs")});
-const server = await createServer({ configFile: false, root: process.env.OUTRIGHT_CLIENT_DIR, logLevel: "silent",
-  server: { host: "127.0.0.1", port: 0 },
-  plugins: [outrightApiPlugin({ configUrl: new URL(${module("../outright.config.json")}), recoverArchive, createRuntime })] });
+globalThis.outrightFixture = { recoverArchive, createRuntime, failNext: false };
+const server = await createServer({ configFile: ${config ? JSON.stringify(config) : "false"}, root: process.env.OUTRIGHT_CLIENT_DIR,
+  logLevel: "silent", server: { host: "127.0.0.1", port: 0 },
+  ${config ? "" : `plugins: [outrightApiPlugin({ configUrl: new URL(${module("../outright.config.json")}), recoverArchive, createRuntime })]`} });
 await server.listen();
+process.on("message", (message) => {
+  if (message === "fail-restart") globalThis.outrightFixture.failNext = true;
+  else if (message === "restart") server.restart().then(() => process.stdout.write("restart-done\\n"));
+  // As Vite's q shortcut does.
+  else if (message === "close") server.close().then(() => process.exit(0));
+});
 console.info("Outright is running at http://127.0.0.1:" + server.httpServer.address().port);`
     : `const { startStandalone } = await import(${module("./standalone-host.mjs")});
 startStandalone({ recoverArchive, createRuntime });`}
@@ -258,4 +267,51 @@ test("a quit before the runtime exists leaves no shell to reattach, in either ho
     await host.ended(shell);
   }
   await host.stop("quit");
+});
+
+// Vite keeps the old server when a config reload fails, for example when a
+// later plugin throws while configuring the new one. That is not a restart:
+// closing the server afterwards is still a quit, and the next successful
+// reload hands the shells to the server that actually serves.
+test("a Vite config reload that fails is no restart: the served server reattaches after the next one, and a close still quits", { timeout: 180_000 }, async (t) => {
+  const { repo, env } = workspace(t);
+  const config = path.join(path.dirname(repo), "vite.config.mjs");
+  writeFileSync(config, `import { outrightApiPlugin } from ${JSON.stringify(new URL("./outright-vite-plugin.mjs", import.meta.url).href)};
+const fixture = globalThis.outrightFixture;
+export default { plugins: [
+  outrightApiPlugin({ configUrl: new URL(${JSON.stringify(new URL("../outright.config.json", import.meta.url).href)}),
+    recoverArchive: fixture.recoverArchive, createRuntime: fixture.createRuntime }),
+  { name: "configures-after-outright", configureServer() {
+    if (!fixture.failNext) return;
+    fixture.failNext = false;
+    process.stdout.write("reload-failed\\n");
+    throw new Error("a later plugin failed to configure");
+  } }] };
+`);
+  const host = await startOutright(t, env, { kind: "vite", config });
+  const reload = async ({ fail }) => {
+    const done = host.stdout().split("restart-done").length;
+    if (fail) host.send("fail-restart");
+    host.send("restart");
+    await waitUntil(() => host.stdout().split("restart-done").length > done, "the Vite reload did not finish");
+    if (fail) assert.match(host.stdout(), /reload-failed/);
+  };
+  const shell = await host.shell(repo);
+  await reload({ fail: true });
+  await reload({ fail: false });
+  // The server Vite now serves owns the runtime and reattached the same shell.
+  const reattached = await waitUntil(async () => {
+    const entry = await host.listed(shell.id).catch(() => null);
+    return entry?.reattached && entry.status === "running" ? entry : null;
+  }, async () => `the served server did not reattach the shell: ${host.stdout()}`);
+  assert.equal(terminalTabLabel(reattached), "Terminal, live process reattached");
+  assert.equal(host.stdout().split("runtime-created").length - 1, 2, "the failed reload started a runtime");
+  assert.equal(alive(shell.pid), true);
+
+  await reload({ fail: true });
+  host.send("close");
+  assert.deepEqual(await host.exited, { code: 0, signal: null }, host.stdout());
+  const next = await startOutright(t, env);
+  await next.ended(shell);
+  await next.stop("quit");
 });

@@ -9,7 +9,8 @@ import { writeStartupUnavailable } from "./startup-response.mjs";
 const shutdownRegistry = Symbol.for("outright.viteRuntimeShutdowns");
 const shuttingDownRuntimes = globalThis[shutdownRegistry] ??= new Map();
 // Vite's restart configures the replacement server before it closes the old
-// one, so a plugin whose successor has configured is closing for a restart.
+// one, so a plugin whose successor has finished configuring is closing for a
+// restart.
 // Its runtime then keeps live terminals for the successor to reattach; a
 // close with no successor is a quit and ends them.
 const serverRegistry = Symbol.for("outright.viteRuntimeServers");
@@ -148,19 +149,7 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
   return {
     name: "outright-local-runtime",
     configureServer(server) {
-      const predecessor = configuredPlugins.get(leaseKey);
-      if (predecessor && predecessor !== instance) {
-        predecessor.succeeded = true;
-        instance.inherited = true;
-      }
-      configuredPlugins.set(leaseKey, instance);
-      interrupt.plugins.add(quitter);
-      // A middleware-mode server belongs to a host that owns its signals.
-      if (server.httpServer && !server.config?.server?.middlewareMode && typeof server.close === "function") {
-        interruptServer = server;
-        interrupt.servers.add(server);
-        watchInterrupt();
-      }
+      // Registered now, so it precedes Vite's SPA fallback.
       server.middlewares.use((request, response, next) => {
         if (!request.url.startsWith("/api/")) return next();
         if (runtime) {
@@ -179,27 +168,49 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
           socket.destroy();
         }
       });
-      // Vite can rebuild its config in the same process. closeBundle is not
-      // guaranteed on that path, so release the old lease with its server.
-      server.httpServer?.once("close", () => { void shutdown()?.catch((error) => console.error("Runtime shutdown failed", error)); });
-      recovery = Promise.resolve().then(() => retryLease(recoverArchive, ["SQLITE_BUSY"])).then(async () => {
-        if (stopping) return;
-        // The replacement server may configure before the prior server's
-        // asynchronous shutdown releases SQLite. Both recovery and runtime
-        // construction share that temporary lease overlap.
-        // The runtime asks whether a successor has configured when it decides
-        // to keep its terminals, whichever close event starts its shutdown.
-        runtime = await retryLease(() => createRuntime({ configUrl, hostRestarting: restarting }),
-          ["OUTRIGHT_RUNTIME_LEASE_HELD"]);
-        if (stopping || closeRequested) return;
-        runtime.attach({ ...server, middlewares: { use() {} } });
-      }).catch(async (error) => {
-        try { await runtime?.shutdown(); }
-        catch (shutdownError) { console.error("Runtime initialization cleanup failed", shutdownError); }
-        runtime = null;
-        startupError = error;
-        console.error("Runtime recovery failed; database requires inspection", error);
-      });
+      // Vite runs this only after every configureServer hook and its own
+      // middleware setup succeeded. A config reload that fails before then
+      // keeps the old server running, so this server never takes over: it
+      // must not mark the old one as restarting, register, or start a
+      // runtime that would take the lease and the shells handed back.
+      return () => {
+        // A quit already under way ends the shells; this server never starts.
+        if (interrupt.stopping) return;
+        const predecessor = configuredPlugins.get(leaseKey);
+        if (predecessor && predecessor !== instance) {
+          predecessor.succeeded = true;
+          instance.inherited = true;
+        }
+        configuredPlugins.set(leaseKey, instance);
+        interrupt.plugins.add(quitter);
+        // A middleware-mode server belongs to a host that owns its signals.
+        if (server.httpServer && !server.config?.server?.middlewareMode && typeof server.close === "function") {
+          interruptServer = server;
+          interrupt.servers.add(server);
+          watchInterrupt();
+        }
+        // Vite can rebuild its config in the same process. closeBundle is not
+        // guaranteed on that path, so release the old lease with its server.
+        server.httpServer?.once("close", () => { void shutdown()?.catch((error) => console.error("Runtime shutdown failed", error)); });
+        recovery = Promise.resolve().then(() => retryLease(recoverArchive, ["SQLITE_BUSY"])).then(async () => {
+          if (stopping) return;
+          // The replacement server may configure before the prior server's
+          // asynchronous shutdown releases SQLite. Both recovery and runtime
+          // construction share that temporary lease overlap.
+          // The runtime asks whether a successor has configured when it decides
+          // to keep its terminals, whichever close event starts its shutdown.
+          runtime = await retryLease(() => createRuntime({ configUrl, hostRestarting: restarting }),
+            ["OUTRIGHT_RUNTIME_LEASE_HELD"]);
+          if (stopping || closeRequested) return;
+          runtime.attach({ ...server, middlewares: { use() {} } });
+        }).catch(async (error) => {
+          try { await runtime?.shutdown(); }
+          catch (shutdownError) { console.error("Runtime initialization cleanup failed", shutdownError); }
+          runtime = null;
+          startupError = error;
+          console.error("Runtime recovery failed; database requires inspection", error);
+        });
+      };
     },
     // Vite awaits plugin disposal before its signal handler exits the process.
     closeBundle() {
