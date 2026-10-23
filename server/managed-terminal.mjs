@@ -228,11 +228,14 @@ function waitForBrokerReady(socket, handleMessage, onClose, wasReady) {
   });
 }
 
-// A reattach session asks the macOS supervisor to keep its launchd job after
-// this runtime exits, for the session's detach window.
+// A reattach session asks the macOS and Linux supervisors to keep the broker
+// after this runtime exits, for the session's detach window.
 function terminalSupervisorArgs(ownership, session) {
   const brokerArgs = [process.execPath, BROKER, ownership.address, ownership.token];
-  if (process.platform === "linux") return ["--stop-on-owner-exit", ownership.handshakePath, ...brokerArgs];
+  if (process.platform === "linux") {
+    return [...(session ? ["--detach-on-owner-exit", String(session.windowMs)] : ["--stop-on-owner-exit"]),
+      ownership.handshakePath, ...brokerArgs];
+  }
   if (process.platform === "darwin") {
     return [...(session ? ["--detach", String(session.windowMs)] : []), ownership.label, ...brokerArgs];
   }
