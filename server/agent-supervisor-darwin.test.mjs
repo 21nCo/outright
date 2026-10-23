@@ -9,9 +9,8 @@ import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
 import { MANAGED_OWNER_SOURCE, assertKeptShell, assertReattachPausesWindow, assertStopEndsDetachedProvider, brokerStandIn,
   delay, reattachCrashedTerminal, waitUntil } from "../tests/fixtures/supervisor-detach.mjs";
 
-// The macOS supervisor's detach mode; Linux has its own in
-// agent-supervisor-linux.test.mjs, and Windows keeps its supervisor until its
-// own slice.
+// The macOS supervisor's detach mode; Linux and Windows have their own in
+// agent-supervisor-linux.test.mjs and agent-supervisor-windows.test.mjs.
 const darwinOnly = { skip: process.platform !== "darwin" };
 const temporaryRoot = process.platform === "darwin"
   ? realpathSync(execFileSync("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"], { encoding: "utf8" }).trim()) : "";

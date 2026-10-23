@@ -13,6 +13,12 @@
 
 #define UTILITY_TREE_EMPTY "__OUTRIGHT_UTILITY_TREE_EMPTY_V1__\n"
 #define UTILITY_JOB_PREFIX L"Local\\OutrightUtility-"
+// A reattachable terminal broker reports on its stdout when a successor
+// runtime reattaches and when it detaches again.
+#define BROKER_ATTACHED "__OUTRIGHT_BROKER_ATTACHED_V1__"
+#define BROKER_DETACHED "__OUTRIGHT_BROKER_DETACHED_V1__"
+#define MAX_DETACH_WINDOW_MS 600000
+#define MAX_DETACH_GRACE_MS 10000
 static bool utility_proof_enabled = false;
 static const wchar_t *utility_job_name = NULL;
 static const wchar_t *utility_empty_marker = NULL;
@@ -207,6 +213,127 @@ static DWORD WINAPI watch_owner(void *raw_job) {
   ReadFile(input, buffer, sizeof(buffer), &count, NULL);
   TerminateJobObject(job, 137);
   return 0;
+}
+
+// Set once the owner of a detach-mode supervisor has closed its control pipe.
+static volatile LONG owner_lost = 0;
+
+// --detach WINDOW_MS: the same bound as the broker's own detach window.
+static long parse_detach_window(const wchar_t *raw) {
+  long value = 0;
+  if (!*raw) return -1;
+  for (const wchar_t *cursor = raw; *cursor; cursor++) {
+    if (*cursor < L'0' || *cursor > L'9') return -1;
+    value = value * 10 + (*cursor - L'0');
+    if (value > MAX_DETACH_WINDOW_MS) return -1;
+  }
+  return value < 50 ? -1 : value;
+}
+
+// In detach mode a command still means stop at once, but the owner's exit,
+// which closes the only writer, starts the detach window instead.
+static DWORD WINAPI watch_detaching_owner(void *raw_job) {
+  HANDLE job = (HANDLE)raw_job;
+  HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+  if (input == NULL || input == INVALID_HANDLE_VALUE) {
+    TerminateJobObject(job, 137);
+    return 0;
+  }
+  char buffer[32];
+  DWORD count = 0;
+  // A closed pipe fails the read; end of file reads nothing.
+  if (!ReadFile(input, buffer, sizeof(buffer), &count, NULL) || count == 0) InterlockedExchange(&owner_lost, 1);
+  else TerminateJobObject(job, 137);
+  return 0;
+}
+
+// Last broker status line seen on the broker's stdout: 1 attached, -1
+// detached, 0 none since the caller last took it.
+typedef struct {
+  char line[40];
+  size_t used;
+  bool overflow;
+  int status;
+} broker_scanner;
+
+static void scan_broker_status(broker_scanner *scanner, const char *data, size_t length) {
+  for (size_t index = 0; index < length; index++) {
+    if (data[index] != '\n') {
+      if (scanner->used < sizeof(scanner->line)) scanner->line[scanner->used++] = data[index];
+      else scanner->overflow = true;
+      continue;
+    }
+    if (!scanner->overflow && scanner->used == strlen(BROKER_ATTACHED)
+        && memcmp(scanner->line, BROKER_ATTACHED, scanner->used) == 0) scanner->status = 1;
+    else if (!scanner->overflow && scanner->used == strlen(BROKER_DETACHED)
+        && memcmp(scanner->line, BROKER_DETACHED, scanner->used) == 0) scanner->status = -1;
+    scanner->used = 0;
+    scanner->overflow = false;
+  }
+}
+
+// Drains a bounded amount of the status pipe without blocking and closes it
+// once the broker and every other holder of its stdout are gone.
+static void drain_broker_status(HANDLE *status, broker_scanner *scanner) {
+  for (DWORD drained = 0; *status && drained < 64 * 1024;) {
+    char buffer[4096];
+    DWORD available = 0, count = 0;
+    bool open = PeekNamedPipe(*status, NULL, 0, NULL, &available, NULL);
+    if (open && available == 0) return;
+    if (open) open = ReadFile(*status, buffer, available < (DWORD)sizeof(buffer) ? available : (DWORD)sizeof(buffer),
+      &count, NULL) && count > 0;
+    if (!open) {
+      CloseHandle(*status);
+      *status = NULL;
+      return;
+    }
+    scan_broker_status(scanner, buffer, count);
+    drained += count;
+  }
+}
+
+// Waits for the broker of a detach-mode supervisor. An explicit stop ends the
+// job at once through the owner thread; the owner's exit starts the window
+// instead. The window allows the broker's own expiry to end its shell first,
+// then ends whatever remains. It pauses while a successor runtime is
+// reattached and starts again on its next detach. Returns false only when the
+// broker can no longer be waited on, after ending its job.
+static bool supervise_detached(HANDLE job, HANDLE broker, HANDLE status, long window_ms) {
+  const ULONGLONG grace = window_ms < MAX_DETACH_GRACE_MS ? (ULONGLONG)window_ms : MAX_DETACH_GRACE_MS;
+  broker_scanner scanner = {0};
+  bool reattached = false;
+  ULONGLONG deadline = 0;
+  bool waiting = true;
+  while (waiting) {
+    DWORD wait = WaitForSingleObject(broker, 25);
+    if (wait == WAIT_OBJECT_0) break;
+    if (wait == WAIT_FAILED) {
+      TerminateJobObject(job, 137);
+      waiting = false;
+      continue;
+    }
+    bool lost = InterlockedCompareExchange(&owner_lost, 0, 0) != 0;
+    // Either clock sample may be stale by however long this supervisor was
+    // descheduled, so each decision uses the one that errs toward the shell:
+    // an existing deadline is compared with a sample taken before draining,
+    // so a reattach the broker announced before that instant keeps the shell,
+    // and a new window starts from a sample taken after the drain.
+    const ULONGLONG expiry_check = GetTickCount64();
+    drain_broker_status(&status, &scanner);
+    if (scanner.status != 0) {
+      reattached = scanner.status > 0;
+      scanner.status = 0;
+      deadline = 0;
+    }
+    if (deadline != 0 && expiry_check >= deadline) {
+      TerminateJobObject(job, 137);
+      WaitForSingleObject(broker, INFINITE);
+      break;
+    }
+    if (lost && !reattached && deadline == 0) deadline = GetTickCount64() + (ULONGLONG)window_ms + grace;
+  }
+  if (status) CloseHandle(status);
+  return waiting;
 }
 
 static unsigned long long process_birth(HANDLE process) {
@@ -408,6 +535,12 @@ int wmain(int argc, wchar_t **argv) {
   if (wcscmp(argv[1], L"--boot-identity") == 0) return print_boot_identity(argc);
   bool test_mode = wcscmp(argv[1], L"--test-runner") == 0;
   bool utility_mode = wcscmp(argv[1], L"--utility-owner") == 0;
+  // Detach mode keeps the broker after its owner leaves, for at most the
+  // window while no successor is attached. Utility owners never detach.
+  bool detach_mode = wcscmp(argv[1], L"--detach") == 0;
+  long detach_window_ms = detach_mode && argc > 2 ? parse_detach_window(argv[2]) : 0;
+  if (detach_mode && (detach_window_ms < 0 || argc < 4
+      || GetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", NULL, 0) != 0)) return 64;
   utility_proof_enabled = utility_mode;
   if (test_mode && argc < 4) return 64;
   if (utility_mode && (argc < 5 || !valid_utility_job(argv[2]) || !valid_empty_marker(argv[3], argv[2])
@@ -433,7 +566,7 @@ int wmain(int argc, wchar_t **argv) {
 
   int first_argument = 1;
   if (utility_mode) first_argument = 4;
-  else if (test_mode) first_argument = 3;
+  else if (test_mode || detach_mode) first_argument = 3;
   wchar_t *line = command_line(argc, argv, first_argument);
   if (!line) return utility_prelaunch_exit(job, 72);
   // The native child owns no control input. Forward only output and error;
@@ -444,13 +577,19 @@ int wmain(int argc, wchar_t **argv) {
   HANDLE null_input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
     &inherited, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
   if (null_input == INVALID_HANDLE_VALUE) { free(line); return utility_prelaunch_exit(job, 72); }
-  HANDLE output = NULL, error_output = NULL;
+  HANDLE output = NULL, error_output = NULL, status = NULL;
   HANDLE own_process = GetCurrentProcess();
-  if (!DuplicateHandle(own_process, GetStdHandle(STD_OUTPUT_HANDLE), own_process, &output,
-        0, TRUE, DUPLICATE_SAME_ACCESS)
+  // A detach-mode broker's stdout is a pipe only this supervisor reads: it
+  // carries only status lines, and an owner that is gone could not read them.
+  bool output_ready = detach_mode
+    ? CreatePipe(&status, &output, &inherited, 0) && SetHandleInformation(status, HANDLE_FLAG_INHERIT, 0)
+    : DuplicateHandle(own_process, GetStdHandle(STD_OUTPUT_HANDLE), own_process, &output,
+        0, TRUE, DUPLICATE_SAME_ACCESS);
+  if (!output_ready
       || !DuplicateHandle(own_process, GetStdHandle(STD_ERROR_HANDLE), own_process, &error_output,
         0, TRUE, DUPLICATE_SAME_ACCESS)) {
     if (output) CloseHandle(output);
+    if (status) CloseHandle(status);
     CloseHandle(null_input);
     free(line);
     return utility_prelaunch_exit(job, 72);
@@ -482,8 +621,10 @@ int wmain(int argc, wchar_t **argv) {
     return utility_prelaunch_exit(job, 72);
   }
   PROCESS_INFORMATION process = {0};
-  BOOL launched = CreateProcessW(NULL, line, NULL, NULL, TRUE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-    NULL, NULL, &startup, &process);
+  // The runtime launches a detach-mode supervisor without a console, so it
+  // can outlive its owner. Its broker gets a console that shows no window.
+  DWORD creation = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | (detach_mode ? CREATE_NO_WINDOW : 0);
+  BOOL launched = CreateProcessW(NULL, line, NULL, NULL, TRUE, creation, NULL, NULL, &startup, &process);
   if (inherited_utility_flag) SetEnvironmentVariableW(L"OUTRIGHT_UTILITY_OWNER", L"1");
   CloseHandle(null_input);
   CloseHandle(output);
@@ -500,7 +641,7 @@ int wmain(int argc, wchar_t **argv) {
   CloseHandle(process.hThread);
 
   if (!test_mode) {
-    HANDLE owner_thread = CreateThread(NULL, 0, watch_owner, job, 0, NULL);
+    HANDLE owner_thread = CreateThread(NULL, 0, detach_mode ? watch_detaching_owner : watch_owner, job, 0, NULL);
     if (owner_thread == NULL) return utility_abandon_exit(job, 137, 79);
     CloseHandle(owner_thread);
   }
@@ -516,14 +657,18 @@ int wmain(int argc, wchar_t **argv) {
         break;
       }
     }
+  } else if (detach_mode) {
+    if (!supervise_detached(job, process.hProcess, status, detach_window_ms)) return 78;
   } else WaitForSingleObject(process.hProcess, INFINITE);
   DWORD exit_code = 1;
   GetExitCodeProcess(process.hProcess, &exit_code);
   CloseHandle(process.hProcess);
 
   // A finished direct command must not hold a utility permit indefinitely
-  // through an escaped helper. The Job Object owns and reaps that tree.
-  if ((utility_owner || test_mode) && !TerminateJobObject(job, exit_code)) return 77;
+  // through an escaped helper. The Job Object owns and reaps that tree. A
+  // detach-mode broker's exit, its shell's or the window's, also ends what it
+  // left behind: its owner may be gone and unable to stop it.
+  if ((utility_owner || test_mode || detach_mode) && !TerminateJobObject(job, exit_code)) return 77;
 
   // The job owns descendants even when they detach from the provider. Keep
   // this supervisor alive until the kernel reports that the job is empty.

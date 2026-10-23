@@ -228,8 +228,8 @@ function waitForBrokerReady(socket, handleMessage, onClose, wasReady) {
   });
 }
 
-// A reattach session asks the macOS and Linux supervisors to keep the broker
-// after this runtime exits, for the session's detach window.
+// A reattach session asks the native supervisor to keep the broker after this
+// runtime exits, for the session's detach window.
 function terminalSupervisorArgs(ownership, session) {
   const brokerArgs = [process.execPath, BROKER, ownership.address, ownership.token];
   if (process.platform === "linux") {
@@ -239,7 +239,7 @@ function terminalSupervisorArgs(ownership, session) {
   if (process.platform === "darwin") {
     return [...(session ? ["--detach", String(session.windowMs)] : []), ownership.label, ...brokerArgs];
   }
-  return brokerArgs;
+  return [...(session ? ["--detach", String(session.windowMs)] : []), ...brokerArgs];
 }
 
 // A launch that failed after the native owner started must prove that owner
@@ -262,7 +262,9 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
   subprocesses = utilityProcesses }) {
   const child = spawn(AGENT_SUPERVISOR, terminalSupervisorArgs(ownership, session), { cwd, env: { ...env,
     ...(process.platform === "darwin" ? { OUTRIGHT_LAUNCH_GATE_FD: "3", OUTRIGHT_TERMINAL_CONTROL: "1" } : {}) },
-    stdio: ["pipe", "pipe", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true });
+    // libuv puts an attached Windows child in a job this runtime's exit kills.
+    // A detach-mode supervisor must outlive that exit to keep its own job.
+    stdio: ["pipe", "pipe", "pipe", "pipe"], detached: process.platform !== "win32" || Boolean(session), windowsHide: true });
   child.stdout.resume();
   let stderr = "";
   child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-2048); });
