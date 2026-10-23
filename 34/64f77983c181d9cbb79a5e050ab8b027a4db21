@@ -1,0 +1,51 @@
+server/database.mjs
+  s_e1c5fc1a65c0cf::t_8cd65091f4feb9 27-29
+server/database.test.mjs
+  s_e1c5fc1a65c0cf::t_aac50d1dc95752 32-33,36-37
+server/managed-terminal.mjs
+  s_e1c5fc1a65c0cf::t_7b45310b44c7bf 283-287,304-305,350-368,376-379,402,519-521,555
+server/outright-runtime.mjs
+  s_e1c5fc1a65c0cf::t_db33528ffbcfd6 1036-1041,1043,1064
+server/outright-vite-plugin.mjs
+  s_e1c5fc1a65c0cf::t_70c1d51b42654b 10-15,24,58-59,61,79-81
+README.md
+  s_153723e133ab3a::t_301ed5cdc9f1f9 76-87
+server/outright-vite-plugin.test.mjs
+  s_153723e133ab3a::t_c0d43067b10c63 213-232,359,366-367,384-387
+server/standalone.mjs
+  s_153723e133ab3a::t_52e65696a8be10 41,63-86,89,91-95
+server/terminal-manager.mjs
+  s_153723e133ab3a::t_41f7601b417b08 19,422-423,578-601,604,607-608,610
+server/terminal-manager.test.mjs
+  s_153723e133ab3a::t_4b35f451dc3433 12,613-614,623,1669-1776
+server/terminal-restart.test.mjs
+  s_153723e133ab3a::t_27866e547d48f0 1-145
+src/components/SettingsDialog.jsx
+  s_153723e133ab3a::t_782d32a60ae758 2,225
+tests/ui-accessibility.test.mjs
+  s_153723e133ab3a::t_c87fe05ad65e75 47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3464f77983c181d9cbb79a5e050ab8b027a4db21",
+  "prompts": {},
+  "sessions": {
+    "s_153723e133ab3a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_153723e133ab3a",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_e1c5fc1a65c0cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13e18-4241-7662-a24f-782076addabe",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
