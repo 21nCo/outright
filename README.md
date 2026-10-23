@@ -73,6 +73,18 @@ npm run test:sites
 
 The suite covers provider command construction and event normalization, SQLite recovery, PTY input/output, Git review/staging/commits, guarded worktree lifecycle, scanner parsing, and browser interaction regressions. Install Chrome or Chromium before running `npm test`; the browser suite fails explicitly rather than skipping coverage if it cannot find an executable. GitHub CI runners include Chrome, and `CHROME_PATH` overrides the detected location.
 
+## Terminals across restarts
+
+Outright saves terminal output in its data directory, at most 2 MiB per terminal and 64 MiB in total, and keeps a session's output for 7 days after it ends. After a restart, a terminal that did not keep running opens as read-only saved output, labelled with how it ended: its exit status, or "ended when Outright restarted".
+
+With **Keep shells running when Outright restarts** on (Settings → Terminals, the default), live shells survive a graceful restart:
+
+- **Graceful restart.** A Vite dev server restart (a config change or the `r` shortcut), or a launcher that sends `{ "type": "outright.shutdown", "intent": "restart" }` over the IPC channel of `npm start`. Each live shell keeps running in its native supervisor. The next Outright reattaches it after proving its private single-use token and the broker's identity, shows the output it printed meanwhile, and labels it "live process reattached".
+- **Quit.** `Ctrl-C`, `SIGINT` or `SIGTERM`, closing the Vite server, or the IPC intent `"quit"`. Every shell is closed, and its output is restored as saved output.
+- **Crash.** Shells keep running, and the next start reattaches only those it can verify the same way. It ends the rest through native recovery and shows their saved output.
+
+Limits: a shell that is not reattached within 10 minutes is ended. While no Outright is attached, a shell's newest 1 MiB of output is kept, and a notice marks any output dropped before it. A command that exited before the restart is shown with its exit status and never as resumed. A shell that exits or does not answer while Outright stops is closed instead of kept. Turning the setting off ends every shell with its Outright process, as a quit does.
+
 ## Unverified terminal capacity
 
 Terminals run inside a native process ownership boundary. If Outright cannot verify that a boundary is empty after a crash or failed helper call, Settings keeps its slot charged. Stop Outright and inspect the unresolved owner before releasing it:

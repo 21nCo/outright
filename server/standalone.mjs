@@ -38,7 +38,7 @@ app.use(sirv(process.env.OUTRIGHT_CLIENT_DIR || path.resolve(import.meta.dirname
 }));
 
 httpServer.listen(port, host, () => {
-  console.info(`Outright is running at http://${host}:${port}`);
+  console.info(`Outright is running at http://${host}:${httpServer.address()?.port ?? port}`);
 });
 
 const recovery = recoverArchiveBeforeStartup().catch((error) => {
@@ -60,28 +60,36 @@ const recovery = recoverArchiveBeforeStartup().catch((error) => {
   }
 });
 
-for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.once(signal, async () => {
-    stopping = true;
-    try {
-      await recovery;
-      try { await runtime?.shutdown(); }
-      catch (error) {
-        if (error.code !== "OUTRIGHT_SHUTDOWN_RECOVERY_PENDING") throw error;
-        await runtime.whenShutdownComplete();
-      }
-      httpServer.close(() => process.exit(0));
-      httpServer.closeIdleConnections?.();
-    } catch (error) {
-      console.error("Runtime shutdown failed", error);
-      process.exitCode = 1;
-      // The runtime has released its database lease, but terminal disposal
-      // failed. End the HTTP host with a failing status instead of waiting
-      // forever on a server that can no longer serve work.
-      if (error.code === "OUTRIGHT_SHUTDOWN_DISPOSAL_FAILED") {
-        httpServer.close(() => process.exit(1));
-        httpServer.closeIdleConnections?.();
-      }
+// SIGINT and SIGTERM are an explicit quit, which ends every terminal. A
+// launcher that restarts Outright (an update or a settings change) sends
+// { type: "outright.shutdown", intent: "restart" } over its IPC channel
+// instead; live terminals then survive for the next runtime to reattach.
+// The runtime joins overlapping requests into its one shutdown.
+async function stop({ restart = false } = {}) {
+  stopping = true;
+  try {
+    await recovery;
+    try { await runtime?.shutdown({ restart }); }
+    catch (error) {
+      if (error.code !== "OUTRIGHT_SHUTDOWN_RECOVERY_PENDING") throw error;
+      await runtime.whenShutdownComplete();
     }
-  });
+    httpServer.close(() => process.exit(0));
+    httpServer.closeIdleConnections?.();
+  } catch (error) {
+    console.error("Runtime shutdown failed", error);
+    process.exitCode = 1;
+    // The runtime has released its database lease, but terminal disposal
+    // failed. End the HTTP host with a failing status instead of waiting
+    // forever on a server that can no longer serve work.
+    if (error.code === "OUTRIGHT_SHUTDOWN_DISPOSAL_FAILED") {
+      httpServer.close(() => process.exit(1));
+      httpServer.closeIdleConnections?.();
+    }
+  }
 }
+for (const signal of ["SIGINT", "SIGTERM"]) process.once(signal, () => { void stop(); });
+process.on("message", (message) => {
+  if (message?.type !== "outright.shutdown" || !["restart", "quit"].includes(message.intent)) return;
+  void stop({ restart: message.intent === "restart" });
+});

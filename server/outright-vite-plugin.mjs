@@ -7,6 +7,12 @@ import { writeStartupUnavailable } from "./startup-response.mjs";
 // process holding the same database.
 const shutdownRegistry = Symbol.for("outright.viteRuntimeShutdowns");
 const shuttingDownRuntimes = globalThis[shutdownRegistry] ??= new Map();
+// Vite's restart configures the replacement server before it closes the old
+// one, so a plugin whose successor has configured is closing for a restart.
+// Its runtime then keeps live terminals for the successor to reattach; a
+// close with no successor is a quit and ends them.
+const serverRegistry = Symbol.for("outright.viteRuntimeServers");
+const configuredPlugins = globalThis[serverRegistry] ??= new Map();
 
 export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRuntime, recoverArchive = recoverArchiveBeforeStartup }) {
   let runtime = null;
@@ -15,6 +21,7 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
   let startupError;
   let stopping = false;
   const leaseKey = configUrl.href;
+  const instance = { succeeded: false };
   const abort = new AbortController();
   const wait = (promise) => new Promise((resolve, reject) => {
     if (stopping) return resolve();
@@ -48,8 +55,10 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
     if (!recovery) return undefined;
     stopping = true;
     abort.abort();
+    if (configuredPlugins.get(leaseKey) === instance) configuredPlugins.delete(leaseKey);
+    const restart = instance.succeeded;
     closing ??= recovery.then(async () => {
-      try { await runtime?.shutdown(); }
+      try { await runtime?.shutdown({ restart }); }
       catch (error) {
         if (error.code !== "OUTRIGHT_SHUTDOWN_RECOVERY_PENDING") throw error;
         await runtime.whenShutdownComplete();
@@ -67,6 +76,9 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
   return {
     name: "outright-local-runtime",
     configureServer(server) {
+      const predecessor = configuredPlugins.get(leaseKey);
+      if (predecessor && predecessor !== instance) predecessor.succeeded = true;
+      configuredPlugins.set(leaseKey, instance);
       server.middlewares.use((request, response, next) => {
         if (!request.url.startsWith("/api/")) return next();
         if (runtime) {

@@ -44,6 +44,7 @@ test("core surfaces retain their semantic wiring and narrow-screen fallbacks", a
   assert.match(palette, /role="combobox"/);
   assert.match(palette, /className="command-options" id="command-results" role="listbox"/);
   assert.match(settings, /type="checkbox" aria-label="Notify when runs finish"/);
+  assert.match(settings, /type="checkbox" aria-label="Keep shells running when Outright restarts"/);
   assert.match(context, /tabIndex=\{0\} aria-label=\{`Preview of \$\{file\.name\}`\}/);
   assert.match(changes, /status && !status\.files\.length/);
   assert.match(styles, /@media \(max-width: 760px\)/);

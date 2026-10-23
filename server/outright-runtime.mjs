@@ -1033,8 +1033,14 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     });
   }
 
-  function shutdown() {
+  // A graceful restart (restart: true) keeps live terminals for the next
+  // runtime to reattach; any other shutdown is an explicit quit that closes
+  // them. The intent of the call that starts a shutdown holds for it, and a
+  // retry that names none keeps it.
+  let restartOnShutdown = false;
+  function shutdown({ restart } = {}) {
     if (shutdownPromise) return shutdownPromise;
+    if (restart !== undefined) restartOnShutdown = restart === true;
     shuttingDown = true;
     runRecoveryController.abort();
     clearTimeout(watcherTimer);
@@ -1055,7 +1061,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       await runRecovery.cycle;
       // Native-owner probes may remain slow or stuck. Terminal shutdown fences
       // their late results before the database lease is released.
-      try { await terminals.shutdown(); }
+      try { await terminals.shutdown({ detach: restartOnShutdown }); }
       catch (error) { shutdownErrors.push(error); }
       eventHub.shutdown();
       wss.close();

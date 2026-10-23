@@ -24,9 +24,9 @@ const DEFAULT_SETTINGS = {
   retentionDays: RESOURCE_BUDGETS.retentionDays,
   notifications: true,
   theme: "system",
-  // Capability switch for detachable terminals; off until supervisors keep
-  // a broker alive across an Outright restart.
-  terminalReattach: false,
+  // Detachable terminals: a graceful restart keeps live shells for the next
+  // runtime to reattach. Turning it off ends every shell with its runtime.
+  terminalReattach: true,
 };
 
 const MAX_RUN_EVENT_PAYLOAD_BYTES = 256 * 1024;

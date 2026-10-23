@@ -210,6 +210,26 @@ test("Vite config restart releases the old runtime lease before the replacement 
   assert.equal(released, 2, "plugin disposal did not close each runtime once");
 });
 
+test("a Vite config restart keeps terminals for the successor runtime; a close with no successor quits", async () => {
+  const intents = [];
+  const createRuntime = () => ({ attach() {}, async shutdown(options) { intents.push(options?.restart === true ? "restart" : "quit"); } });
+  const options = { configUrl: new URL(`file:///fixture/${randomUUID()}.json`), recoverArchive: async () => {}, createRuntime };
+  const firstServer = { httpServer: new EventEmitter(), middlewares: { use() {} } };
+  const secondServer = { httpServer: new EventEmitter(), middlewares: { use() {} } };
+  const first = outrightApiPlugin(options);
+  first.configureServer(firstServer);
+  await new Promise((resolve) => setImmediate(resolve));
+  // Vite configures the replacement before it closes the old server.
+  const second = outrightApiPlugin(options);
+  second.configureServer(secondServer);
+  firstServer.httpServer.emit("close");
+  await first.closeBundle();
+  assert.deepEqual(intents, ["restart"]);
+  await new Promise((resolve) => setImmediate(resolve));
+  await second.closeBundle();
+  assert.deepEqual(intents, ["restart", "quit"]);
+});
+
 test("Vite retries a transient archive worker lease conflict before opening the runtime", async () => {
   let attempts = 0;
   let attached = false;
@@ -336,13 +356,15 @@ export default defineConfig({ plugins: [outrightApiPlugin({
 })] });\n`);
   let leaseHeld = false;
   let attached = 0;
+  const intents = [];
   globalThis.__out30ViteRestartFixture = { createRuntime: () => {
     if (leaseHeld) throw Object.assign(new Error("predecessor lease held"), { code: "OUTRIGHT_RUNTIME_LEASE_HELD" });
     leaseHeld = true;
     return {
       attach() { attached += 1; },
       async handleRequest(_request, response) { response.writeHead(200); response.end("ready"); return true; },
-      async shutdown() {
+      async shutdown(options) {
+        intents.push(options?.restart === true ? "restart" : "quit");
         await new Promise((resolve) => setTimeout(resolve, attached === 1 ? 16_000 : 0));
         leaseHeld = false;
       },
@@ -359,6 +381,10 @@ export default defineConfig({ plugins: [outrightApiPlugin({
     await server.restart();
     assert.equal(await apiStatus(), 200, "restart left a permanent API error after the local lease was released");
     assert.equal(attached, 2);
+    // Vite's restart is a graceful restart; closing the server is a quit.
+    assert.deepEqual(intents, ["restart"]);
+    await server.close();
+    assert.deepEqual(intents, ["restart", "quit"]);
   } finally {
     try { await server?.close(); }
     finally { rmSync(directory, { recursive: true }); delete globalThis.__out30ViteRestartFixture; }

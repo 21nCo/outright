@@ -280,6 +280,11 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
   let readySeen = false;
   let shellExited = false;
   let shellResult;
+  // Set once this runtime hands the shell to its broker's detach window, so
+  // the end of this connection or of this owner never terminates it.
+  let releasing = false;
+  let settleRelease;
+  const handedBack = new Promise((resolve) => { settleRelease = resolve; });
   let settleFrame;
   let settleSocket;
   const frameSettled = new Promise((resolve) => { settleFrame = resolve; });
@@ -296,6 +301,8 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
     child.on("error", (error) => { stderr = `${stderr}${error.message}`.slice(-2048); });
     child.on("close", async (exitCode, signal) => {
       closed = true;
+      // A released supervisor outlives this owner; a successor proves its end.
+      if (releasing && adapter.handedBack) return;
       // The native owner can close just before Node delivers the final socket
       // frame. Give the independently bounded frame/close event its turn
       // before deciding that the outcome is unknown.
@@ -340,6 +347,25 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
       })]).finally(() => clearTimeout(timeout));
       if (!result.verified && !await verifyEmpty(result.signal, result.exitCode)) throw new Error("PTY owned process boundary could not be verified empty");
     },
+    // Hands a reattachable shell to its broker's detach window for a later
+    // runtime. Only the broker's acknowledgement sets handedBack; the owner's
+    // stdin EOF then starts the native supervisor's window. Without it, the
+    // shell exited or the broker did not answer, and the caller terminates
+    // it as usual. Output arrives through onData until the acknowledgement.
+    async release(timeoutMs = 2000) {
+      if (!session || !adapter.sessionIdentity || closed || shellExited || !socket || socket.destroyed) return [];
+      releasing = true;
+      socket.write(`${JSON.stringify({ type: "release" })}\n`);
+      let timeout;
+      await Promise.race([handedBack, frameSettled, socketSettled, new Promise((resolve) => { timeout = setTimeout(resolve, timeoutMs); })])
+        .finally(() => clearTimeout(timeout));
+      if (!adapter.handedBack) { releasing = false; return []; }
+      socket.destroy();
+      child.stdin.end();
+      child.unref();
+      return [];
+    },
+    handedBack: false,
   };
   const handleBrokerMessage = (message, resolve, reject) => {
     if (message.type === "ready") {
@@ -347,6 +373,10 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
       readySeen = true; resolve(); return;
     }
     if (message.type === "error") { reject(new Error(message.message)); return; }
+    if (message.type === "released") {
+      if (releasing && !shellExited) { adapter.handedBack = true; settleRelease(); }
+      return;
+    }
     if (message.type === "shell-exited") {
       if (shellExited || !Number.isSafeInteger(message.exitCode) || message.exitCode < 0
         || !Number.isSafeInteger(message.signal) || message.signal < 0) {
@@ -369,7 +399,7 @@ export async function spawnManagedTerminal({ id, ownership, shell, cwd, cols, ro
     socket = await connectBroker(ownership.address, () => closed, () => stderr);
     const ready = waitForBrokerReady(socket, handleBrokerMessage, () => {
       settleSocket();
-      if (readySeen && !shellExited && !closed) void adapter.terminate().catch(() => {});
+      if (readySeen && !shellExited && !closed && !releasing) void adapter.terminate().catch(() => {});
     }, () => readySeen);
     socket.write(`${JSON.stringify({ type: "start", token: ownership.token, shell, cwd, cols, rows, env,
       ...(session ? { session } : {}) })}\n`);
@@ -486,6 +516,9 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
       socket.destroy();
       return takeEarly();
     },
+    // Whether the broker acknowledged release, so it holds the shell and
+    // everything it printed after the frames release returned.
+    handedBack: false,
   };
   // Any fault while proving the endpoint refuses this attempt; it never
   // escapes the socket callback.
@@ -519,7 +552,7 @@ export async function reattachManagedTerminal({ id, identity, token, nextToken, 
       shellResult = { exitCode: message.exitCode, signal: message.signal };
       return;
     }
-    if (message.type === "released" && released) { settleRelease(); return; }
+    if (message.type === "released" && released) { adapter.handedBack = true; settleRelease(); return; }
     if (message.type === "data" && typeof message.data === "string" && !shellResult) {
       if (onData) { onData(message.data); return; }
       earlyData.push(message.data);

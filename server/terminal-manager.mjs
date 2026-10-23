@@ -16,7 +16,7 @@ function reservationTerminal(entry) {
 
 export function createTerminalManager({ publish, database, spawnTerminal = null, startManagedTerminal = spawnManagedTerminal,
   recoverTerminal = recoverManagedTerminal, cleanupSocket = cleanupTerminalSocket,
-  reattachTerminal = reattachManagedTerminal, reattachEnabled = () => false, detachWindowMs = 10 * 60 * 1000, runtimeInstanceId = null,
+  reattachTerminal = reattachManagedTerminal, reattachEnabled = () => true, detachWindowMs = 10 * 60 * 1000, runtimeInstanceId = null,
   subprocesses = utilityProcesses, terminate = (terminal, options) => {
   if (typeof terminal.process?.terminate !== "function") throw new Error("PTY owner has no termination verifier");
   return terminal.process.terminate(options);
@@ -419,7 +419,8 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       publish({ type: "terminal.output", terminalId: id, payload: { data: data.slice(-64 * 1024), cursor: terminal.outputCursor } });
     });
     processInstance.onExit(({ exitCode, signal, verified, outcomeKnown }) => {
-      if (!terminals.has(id)) return;
+      // A shell handed back to its broker is the next runtime's to prove.
+      if (!terminals.has(id) || processInstance.handedBack === true) return;
       if (!verified || (!outcomeKnown && terminal.status !== "closing")) {
         terminal.status = "unknown";
         publish({ type: "terminal.audit-failed", terminalId: id, payload: { runtimeInstanceId, error: verified
@@ -574,12 +575,39 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       return closed;
     });
   }
+  // A graceful restart hands each live reattachable shell to its broker's
+  // detach window. Its created audit stays open, so the next runtime holds
+  // its slot as a recovery reservation until it reattaches the shell with the
+  // stored token or proves it gone. Its history ends by restart, which a
+  // reattach resumes. Any other terminal, and every terminal on an explicit
+  // quit, is closed as before.
+  async function detachForRestart(terminal) {
+    if (terminal.status !== "running" || terminal.closePromise || terminal.exitSeen || !terminal.recorded
+      || typeof terminal.process?.release !== "function" || !database.launchDirectory
+      || !readReattachRecord(terminal.id, database.launchDirectory)) return false;
+    terminal.status = "detaching";
+    let frames = [];
+    try { frames = await terminal.process.release(); } catch { /* Not handed back: closed below. */ }
+    // Without the broker's acknowledgement, the shell exited or the broker
+    // did not answer: it stays ours to close, recording any exit it reported.
+    if (terminal.process.handedBack !== true) {
+      if (terminal.status === "detaching") terminal.status = "running";
+      return false;
+    }
+    for (const frame of frames ?? []) history?.append(terminal.id, frame);
+    history?.finish(terminal.id);
+    forget(terminal);
+    return true;
+  }
   // Reap every PTY even when storage is unavailable during archive maintenance.
   // A failed audit leaves terminal.created pending for lease-owned recovery.
-  async function shutdown() {
+  async function shutdown({ detach = false } = {}) {
     shuttingDown = true;
     await Promise.allSettled([...pendingReattaches]);
+    let detaching = false;
+    try { detaching = detach === true && reattachEnabled() === true; } catch { /* Close every shell. */ }
     const results = await Promise.allSettled([...terminals.values()].map((terminal) => Promise.resolve().then(async () => {
+      if (detaching && await detachForRestart(terminal)) return;
       try { await close(terminal.id); }
       catch (error) {
         // A failed first native termination must receive one more attempt
