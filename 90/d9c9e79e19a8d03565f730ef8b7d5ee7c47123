@@ -1,0 +1,47 @@
+tests/ui-races.test.mjs
+  s_1900bb15a7199a::t_779892bac4a416 917
+src/styles.css
+  s_e1c5fc1a65c0cf::t_cb139fc5756714 337,339-372
+src/components/PaneLayout.jsx
+  s_1900bb15a7199a::t_2fd769c9799046 1-347
+src/App.jsx
+  s_1900bb15a7199a::t_0788e20c1d0138 6,8,27,36,101-105,319-345,880,887,1934-1956,1967-1970
+accessibility-qa.md
+  s_1900bb15a7199a::t_67fe8b6d84c850 23
+README.md
+  s_1900bb15a7199a::t_3ca03655050c27 15,59-66,71-72
+scripts/run-tests.mjs
+  s_1900bb15a7199a::t_07eec40932387a 23
+src/lib/pane-layout.js
+  s_1900bb15a7199a::t_db07ec3fded7db 1-310
+tests/pane-layout.test.mjs
+  s_1900bb15a7199a::t_0c8d5f6308b9f5 1-173
+tests/ui-races.jsx
+  s_1900bb15a7199a::t_fe0042b7061d5e 28-30,187-188,190-198,3898,3951,3982,4036,4064,4091,4211,4213-4214,6422-6647,6742-6749,6760,6762-6776,6778-6780,7240,7270-7271,7284,7302-7303
+docs/out-32-performance.md
+  s_1900bb15a7199a::t_874cc3a6156d2e 11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "90d9c9e79e19a8d03565f730ef8b7d5ee7c47123",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_e1c5fc1a65c0cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13e18-4241-7662-a24f-782076addabe",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
