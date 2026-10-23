@@ -1,0 +1,21 @@
+server/agent-supervisor-linux.test.mjs
+  s_4287456b9a30ff::t_3e851f22c90994 4,177,209-211,219,221-227,232,239-245,248,255,257-258,280,299-356
+server/agent-supervisor.c
+  s_4287456b9a30ff::t_c15e39d0f7b358 583-590,597,601-603
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a0218f38222a731b986e19f473b558c73d68a7b8",
+  "prompts": {},
+  "sessions": {
+    "s_4287456b9a30ff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_4287456b9a30ff",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
