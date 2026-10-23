@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -174,7 +174,7 @@ test("a malformed detach request starts nothing", linuxOnly, () => {
 
 // A managed terminal whose owner crashed, for a later runtime to reattach
 // through slice 2 or recover through its native owner. With pause, the
-// supervisor stops itself after its next empty poll once the test drops
+// supervisor stops itself at the pause point once the test drops
 // pause.trigger.
 async function crashedManagedTerminal(t, windowMs, pause = null) {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-linux-detach-managed-"));
@@ -206,9 +206,9 @@ async function crashedManagedTerminal(t, windowMs, pause = null) {
   return { ...started, id, handshakePath, recover, ownerGone };
 }
 
-// Interposes poll() in the supervisor alone: after a poll that saw nothing,
-// it stops itself once the trigger file exists, standing for a supervisor
-// descheduled before it next evaluates its deadline.
+// Interposes poll() and clock_gettime() in the supervisor alone: once the
+// trigger file exists, it stops itself after the chosen point (an empty poll,
+// or a CLOCK_MONOTONIC sample), standing for a supervisor descheduled there.
 const PAUSE_SOURCE = `#define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
@@ -216,32 +216,46 @@ const PAUSE_SOURCE = `#define _GNU_SOURCE
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+static void pause_after(const char *point) {
+  const char *program = getenv("OUTRIGHT_TEST_PAUSE_PROGRAM");
+  const char *at = getenv("OUTRIGHT_TEST_PAUSE_AT");
+  const char *trigger = getenv("OUTRIGHT_TEST_PAUSE_TRIGGER");
+  if (program && at && trigger && strcmp(at, point) == 0 && strcmp(program_invocation_short_name, program) == 0
+      && unlink(trigger) == 0) raise(SIGSTOP);
+}
 int poll(struct pollfd *descriptors, nfds_t count, int timeout) {
   static int (*next)(struct pollfd *, nfds_t, int);
   if (!next) next = (int (*)(struct pollfd *, nfds_t, int))dlsym(RTLD_NEXT, "poll");
   int result = next(descriptors, count, timeout);
-  const char *program = getenv("OUTRIGHT_TEST_PAUSE_PROGRAM");
-  const char *trigger = getenv("OUTRIGHT_TEST_PAUSE_TRIGGER");
-  if (result == 0 && program && trigger && strcmp(program_invocation_short_name, program) == 0 && unlink(trigger) == 0) raise(SIGSTOP);
+  if (result == 0) pause_after("poll");
   return result;
 }
 int __poll_chk(struct pollfd *descriptors, nfds_t count, int timeout, size_t length) {
   (void)length;
   return poll(descriptors, count, timeout);
 }
+int clock_gettime(clockid_t clock, struct timespec *now) {
+  static int (*next)(clockid_t, struct timespec *);
+  if (!next) next = (int (*)(clockid_t, struct timespec *))dlsym(RTLD_NEXT, "clock_gettime");
+  int result = next(clock, now);
+  if (clock == CLOCK_MONOTONIC) pause_after("clock");
+  return result;
+}
 `;
 
-function pausingPoll(t) {
+function pausing(t, at) {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-linux-detach-pause-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const source = path.join(directory, "pause.c");
   const library = path.join(directory, "pause.so");
   writeFileSync(source, PAUSE_SOURCE);
   const build = spawnSync(process.env.CC || "cc", ["-shared", "-fPIC", "-O2", source, "-o", library, "-ldl"], { encoding: "utf8" });
-  assert.equal(build.status, 0, `the poll shim did not build: ${build.stderr}`);
+  assert.equal(build.status, 0, `the pause shim did not build: ${build.stderr}`);
   const trigger = path.join(directory, "trigger");
-  return { trigger, env: { LD_PRELOAD: library, OUTRIGHT_TEST_PAUSE_PROGRAM: path.basename(AGENT_SUPERVISOR), OUTRIGHT_TEST_PAUSE_TRIGGER: trigger } };
+  return { trigger, env: { LD_PRELOAD: library, OUTRIGHT_TEST_PAUSE_PROGRAM: path.basename(AGENT_SUPERVISOR),
+    OUTRIGHT_TEST_PAUSE_AT: at, OUTRIGHT_TEST_PAUSE_TRIGGER: trigger } };
 }
 
 const stopped = (pid) => {
@@ -263,7 +277,7 @@ test("a crashed runtime's terminal survives its supervisor's owner and a reattac
 });
 
 test("a reattach queued while the supervisor is descheduled past its deadline keeps the shell", { ...linuxOnly, timeout: 90_000 }, async (t) => {
-  const pause = pausingPoll(t);
+  const pause = pausing(t, "poll");
   const { id, identity, token, pid: supervisorPid, handshakePath, recover, ownerGone } = await crashedManagedTerminal(t, 1000, pause);
   // Once the supervisor has started its window, stop it after an empty poll.
   await delay(200);
@@ -280,6 +294,64 @@ test("a reattach queued while the supervisor is descheduled past its deadline ke
   await adapter.release();
   await waitUntil(() => !alive(supervisorPid), "a released shell outlived its window", 20_000);
   assert.equal(existsSync(handshakePath), false, "an expired detached terminal left its launch handshake");
+});
+
+// Running processes below root, from /proc's parent links.
+function descendants(root) {
+  const parents = new Map();
+  for (const entry of readdirSync("/proc").filter((name) => /^\d+$/.test(name))) {
+    try {
+      const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+      const [state, parent] = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      if (state !== "Z") parents.set(Number(entry), Number(parent));
+    } catch (error) { if (error.code !== "ENOENT" && error.code !== "ESRCH") throw error; }
+  }
+  const found = [];
+  for (let frontier = [root]; frontier.length;) {
+    frontier = [...parents].filter(([, parent]) => frontier.includes(parent)).map(([pid]) => pid);
+    found.push(...frontier);
+  }
+  return found;
+}
+
+// The supervisor stops just after a clock sample while a successor holds the
+// shell past the old window and its grace, then the successor hands it back:
+// the DETACHED it observes late still starts a whole window, whether its
+// ATTACHED came before the pause or was queued with the DETACHED during it.
+async function assertLateDetachGetsWholeWindow(t, attachDuringPause) {
+  const windowMs = 1000;
+  const pause = pausing(t, "clock");
+  const { id, identity, token, pid: supervisorPid, handshakePath, recover, ownerGone } = await crashedManagedTerminal(t, windowMs, pause);
+  const reattach = () => reattachCrashedTerminal({ id, identity, token, verifyEmpty: recover });
+  let adapter = attachDuringPause ? null : await reattach();
+  // Let the supervisor take its owner's loss and any reattach first.
+  await delay(300);
+  writeFileSync(pause.trigger, "");
+  await waitUntil(() => stopped(supervisorPid), "the supervisor did not stop after a clock sample", 5000);
+  adapter ??= await reattach();
+  await delay(Math.max(0, ownerGone + 2 * windowMs + 1500 - Date.now()));
+  // The broker has written DETACHED and started its own window by the time
+  // release resolves.
+  await adapter.release();
+  const released = Date.now();
+  process.kill(supervisorPid, "SIGCONT");
+  await delay(Math.max(0, released + 0.8 * windowMs - Date.now()));
+  const tree = descendants(supervisorPid);
+  assert.equal(alive(supervisorPid), true, "a detach observed late ended its terminal before the window");
+  assert.equal(existsSync(handshakePath), true, "a detach observed late removed its launch handshake before the window");
+  assert.ok(tree.length >= 2, `the released broker and shell did not outlive the supervisor's pause: ${tree}`);
+  // Window, grace, the 750 ms teardown budget and slack.
+  await waitUntil(() => !alive(supervisorPid), "a released shell outlived its window", released + 2 * windowMs + 750 + 2000 - Date.now());
+  assert.equal(existsSync(handshakePath), false, "an expired detached terminal left its launch handshake");
+  assert.deepEqual(tree.filter(alive), [], "an expired detached terminal left a descendant behind");
+}
+
+test("a detach observed late after a clock-sample pause still gets its whole window", { ...linuxOnly, timeout: 90_000 }, async (t) => {
+  await assertLateDetachGetsWholeWindow(t, false);
+});
+
+test("a reattach and release queued together during a clock-sample pause start a whole window", { ...linuxOnly, timeout: 90_000 }, async (t) => {
+  await assertLateDetachGetsWholeWindow(t, true);
 });
 
 test("recovery verifies and ends a crashed runtime's detached terminal", { ...linuxOnly, timeout: 60_000 }, async (t) => {

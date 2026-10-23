@@ -580,22 +580,27 @@ int main(int argc, char **argv) {
     reap_children(provider_pid, &provider_reaped, &provider_status);
     if (detach_on_owner_exit && authorized && !stopping) {
       if (input_closed || getppid() != owner_pid) owner_lost = true;
-      // Sample the clock, then take any status already queued: a reattach the
-      // broker announced before that instant keeps the shell even when this
-      // supervisor was descheduled past its deadline.
-      const long long now = monotonic_ms();
+      // Either clock sample may be stale by however long this supervisor was
+      // descheduled, so each decision uses the one that errs toward the shell.
+      // I1, expiry: an existing deadline is compared with a sample taken
+      // before draining, so a reattach the broker announced before that
+      // instant keeps the shell. I2, window start: a new window starts from a
+      // sample taken after the drain, so a detach observed late still gets
+      // its whole window, and never expires in the iteration that started it.
+      const long long expiry_check = monotonic_ms();
       drain_broker_status(&status_fd, &broker_status);
       if (broker_status.status != 0) {
         reattached = broker_status.status > 0;
         broker_status.status = 0;
         detach_deadline = 0;
       }
-      if (owner_lost && !reattached && detach_deadline == 0)
-        detach_deadline = now + detach_window_ms + detach_grace;
-      if (detach_deadline != 0 && now >= detach_deadline) {
+      if (detach_deadline != 0 && expiry_check >= detach_deadline) {
         stopping = true;
         stop_requested = true;
         teardown_deadline = monotonic_ms() + TEARDOWN_BUDGET_MS;
+      } else if (owner_lost && !reattached && detach_deadline == 0) {
+        const long long window_start = monotonic_ms();
+        detach_deadline = window_start + detach_window_ms + detach_grace;
       }
     }
     if (authorized && (termination_requested || (stop_on_owner_exit && input_closed)) && !stopping) {
