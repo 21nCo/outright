@@ -1,0 +1,31 @@
+README.md
+  s_1900bb15a7199a::t_5421b26318c6da 63
+src/App.jsx
+  s_1900bb15a7199a::t_4d6fa5c9f27cae 1965-1974
+src/components/PaneLayout.jsx
+  s_1900bb15a7199a::t_ea4d8697c337a0 47-50,55
+src/lib/pane-layout.js
+  s_1900bb15a7199a::t_617209cd8203b9 12-14,17
+src/styles.css
+  s_1900bb15a7199a::t_f42e3e1215e4e5 300-301,336-342,604,616,636,645-648
+tests/ui-races.jsx
+  s_1900bb15a7199a::t_236e3a267987e8 6423-6432,6757,6798,6846-6971,7075-7083,7794-7795
+tests/ui-races.test.mjs
+  s_1900bb15a7199a::t_f5ab8034f86e29 917
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1ea1acf31ee6209daafb8ee5049fe2134431bf46",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
