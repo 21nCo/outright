@@ -270,10 +270,11 @@ test("a quit before the runtime exists leaves no shell to reattach, in either ho
 });
 
 // Vite keeps the old server when a config reload fails, for example when a
-// later plugin throws while configuring the new one. That is not a restart:
-// closing the server afterwards is still a quit, and the next successful
-// reload hands the shells to the server that actually serves.
-test("a Vite config reload that fails is no restart: the served server reattaches after the next one, and a close still quits", { timeout: 180_000 }, async (t) => {
+// later plugin throws in its configureServer hook (before Vite runs
+// Outright's post hook) or in its own post hook (after Outright's). That is
+// not a restart: closing the server afterwards is still a quit, and the next
+// successful reload hands the shells to the server that actually serves.
+for (const phase of ["configureServer", "post hook"]) test(`a Vite config reload that fails in a later ${phase} is no restart: the served server reattaches after the next one, and a close still quits`, { timeout: 180_000 }, async (t) => {
   const { repo, env } = workspace(t);
   const config = path.join(path.dirname(repo), "vite.config.mjs");
   writeFileSync(config, `import { outrightApiPlugin } from ${JSON.stringify(new URL("./outright-vite-plugin.mjs", import.meta.url).href)};
@@ -282,10 +283,13 @@ export default { plugins: [
   outrightApiPlugin({ configUrl: new URL(${JSON.stringify(new URL("../outright.config.json", import.meta.url).href)}),
     recoverArchive: fixture.recoverArchive, createRuntime: fixture.createRuntime }),
   { name: "configures-after-outright", configureServer() {
-    if (!fixture.failNext) return;
-    fixture.failNext = false;
-    process.stdout.write("reload-failed\\n");
-    throw new Error("a later plugin failed to configure");
+    const fail = () => {
+      if (!fixture.failNext) return;
+      fixture.failNext = false;
+      process.stdout.write("reload-failed\\n");
+      throw new Error("a later plugin failed to configure");
+    };
+    ${phase === "post hook" ? "return fail;" : "fail();"}
   } }] };
 `);
   const host = await startOutright(t, env, { kind: "vite", config });

@@ -14,8 +14,14 @@ import { createOutrightRuntime } from "./outright-runtime.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
 
-// Vite runs the hook configureServer returns once the server is configured.
-const configure = (plugin, server) => plugin.configureServer(server)?.();
+// As Vite does: run the hook configureServer returns, then append its error
+// middleware and finish creating the server. A later plugin's post hook that
+// throws (fail) stops Vite before that, and the reload fails.
+const configure = async (plugin, server, { fail = false } = {}) => {
+  plugin.configureServer(server)?.();
+  if (!fail) (server.middlewares.stack ??= []).push({ route: "", handle: function viteErrorMiddleware() {} });
+  await Promise.resolve();
+};
 
 test("Vite disposal awaits runtime process supervision before completing", async () => {
   let release;
@@ -23,7 +29,7 @@ test("Vite disposal awaits runtime process supervision before completing", async
   let attached;
   const plugin = outrightApiPlugin({ configUrl: new URL("file:///fixture/config.json"), recoverArchive: async () => {}, createRuntime: () => ({ attach: (server) => { attached = server; }, shutdown: () => termination }) });
   const server = { middlewares: { use() {} } };
-  configure(plugin, server);
+  await configure(plugin, server);
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(attached);
   let closed = false;
@@ -49,7 +55,7 @@ test("Vite disposal waits for storage recovery instead of caching a rejected clo
         whenShutdownComplete: () => recovered };
     } };
   const first = outrightApiPlugin(options);
-  configure(first, { middlewares: { use() {} } });
+  await configure(first, { middlewares: { use() {} } });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(attached, 1);
   const closing = first.closeBundle();
@@ -62,7 +68,7 @@ test("Vite disposal waits for storage recovery instead of caching a rejected clo
   await closing;
   assert.equal(settled, true);
   const successor = outrightApiPlugin(options);
-  configure(successor, { middlewares: { use() {} } });
+  await configure(successor, { middlewares: { use() {} } });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(attached, 2);
   held = false;
@@ -83,14 +89,14 @@ test("Vite reports a final disposal error after storage recovery releases the le
       }, whenShutdownComplete: () => completion };
     } };
   const first = outrightApiPlugin(options);
-  configure(first, { middlewares: { use() {} } });
+  await configure(first, { middlewares: { use() {} } });
   await new Promise((resolve) => setImmediate(resolve));
   const closing = first.closeBundle();
   held = false;
   rejectRecovery(Object.assign(new Error("terminal disposal failed"), { code: "OUTRIGHT_SHUTDOWN_DISPOSAL_FAILED" }));
   await assert.rejects(closing, /terminal disposal failed/);
   const successor = outrightApiPlugin(options);
-  configure(successor, { middlewares: { use() {} } });
+  await configure(successor, { middlewares: { use() {} } });
   await new Promise((resolve) => setImmediate(resolve));
   await assert.rejects(successor.closeBundle(), /terminal disposal failed/);
 });
@@ -99,6 +105,32 @@ test("build-only plugin disposal does not start a runtime", () => {
   const plugin = outrightApiPlugin({ configUrl: new URL("file:///fixture/config.json"), createRuntime: () => { throw new Error("Unexpected runtime"); } });
   assert.equal(plugin.closeBundle(), undefined);
 });
+
+for (const thenReload of [false, true]) {
+  test(`a Vite reload that fails after Outright's post hook starts nothing and is no restart${thenReload ? ", unlike the next reload" : ""}`, async () => {
+    const calls = [];
+    const options = { configUrl: new URL(`file:///fixture/${randomUUID()}.json`), recoverArchive: async () => {},
+      createRuntime: ({ hostRestarting }) => ({ attach() {},
+        async shutdown({ restart } = {}) { calls.push({ restart, hostRestarting: hostRestarting() }); } }) };
+    const first = outrightApiPlugin(options);
+    await configure(first, { middlewares: { use() {} } });
+    await new Promise((resolve) => setImmediate(resolve));
+    // A later plugin's post hook throws, so Vite keeps the old server.
+    let failedRuntimes = 0;
+    await configure(outrightApiPlugin({ ...options, createRuntime: () => { failedRuntimes += 1; return { attach() {}, async shutdown() {} }; } }),
+      { middlewares: { use() {} } }, { fail: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    let successor;
+    if (thenReload) {
+      successor = outrightApiPlugin({ ...options, createRuntime: () => ({ attach() {}, async shutdown() {} }) });
+      await configure(successor, { middlewares: { use() {} } });
+    }
+    await first.closeBundle();
+    assert.deepEqual(calls, [{ restart: thenReload, hostRestarting: thenReload }]);
+    assert.equal(failedRuntimes, 0, "a failed reload started a runtime");
+    await successor?.closeBundle();
+  });
+}
 
 test("Vite serves a retryable API response while archive recovery is pending", async () => {
   let finishRecovery;
@@ -114,7 +146,7 @@ test("Vite serves a retryable API response while archive recovery is pending", a
       shutdown: async () => {},
     }),
   });
-  configure(plugin, { httpServer, middlewares: { use(fn) { middleware = fn; } } });
+  await configure(plugin, { httpServer, middlewares: { use(fn) { middleware = fn; } } });
   await Promise.resolve();
   let status;
   let headers;
@@ -153,7 +185,7 @@ test("failed Vite recovery reports a terminal API error without taking HMR owner
   const priorError = console.error;
   console.error = () => {};
   try {
-    configure(plugin, { httpServer, middlewares: { use(fn) { middleware = fn; } } });
+    await configure(plugin, { httpServer, middlewares: { use(fn) { middleware = fn; } } });
     await new Promise((resolve) => setImmediate(resolve));
     let status;
     let headers;
@@ -201,11 +233,11 @@ test("Vite config restart releases the old runtime lease before the replacement 
   const secondServer = { httpServer: new EventEmitter(), middlewares: { use() {} } };
   const options = { configUrl: new URL("file:///fixture/config.json"), recoverArchive: async () => {}, createRuntime };
   const first = outrightApiPlugin(options);
-  configure(first, firstServer);
+  await configure(first, firstServer);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(attached, 1);
   const second = outrightApiPlugin(options);
-  configure(second, secondServer);
+  await configure(second, secondServer);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(attached, 1, "replacement bypassed the old runtime lease");
   firstServer.httpServer.emit("close");
@@ -224,11 +256,11 @@ test("a Vite config restart keeps terminals for the successor runtime; a close w
   const firstServer = { httpServer: new EventEmitter(), middlewares: { use() {} } };
   const secondServer = { httpServer: new EventEmitter(), middlewares: { use() {} } };
   const first = outrightApiPlugin(options);
-  configure(first, firstServer);
+  await configure(first, firstServer);
   await new Promise((resolve) => setImmediate(resolve));
   // Vite configures the replacement before it closes the old server.
   const second = outrightApiPlugin(options);
-  configure(second, secondServer);
+  await configure(second, secondServer);
   firstServer.httpServer.emit("close");
   await first.closeBundle();
   assert.deepEqual(intents, ["restart"]);
@@ -257,12 +289,12 @@ test("a Vite restart keeps a live terminal whichever close event reaches the rea
     const server = { httpServer: new EventEmitter(), middlewares: { use() {} } };
     const plugin = outrightApiPlugin(options);
     try {
-      configure(plugin, server);
+      await configure(plugin, server);
       for (let turn = 0; !runtime && turn < 100; turn += 1) await new Promise((resolve) => setTimeout(resolve, 10));
       await runtime.database.waitForTerminalAuditReconciliation();
       await runtime.terminals.create({ cwd: directory });
       // Vite configures the replacement before it closes the old server.
-      if (successor) configure(outrightApiPlugin({ ...options, createRuntime: () => ({ attach() {}, async shutdown() {} }) }),
+      if (successor) await configure(outrightApiPlugin({ ...options, createRuntime: () => ({ attach() {}, async shutdown() {} }) }),
         { httpServer: new EventEmitter(), middlewares: { use() {} } });
       if (closeFirst) server.httpServer.emit("close");
       const closing = plugin.closeBundle();
@@ -397,7 +429,7 @@ test("Vite retries a transient archive worker lease conflict before opening the 
     },
     createRuntime: () => ({ attach() { attached = true; }, shutdown: async () => {} }),
   });
-  configure(plugin, { middlewares: { use() {} } });
+  await configure(plugin, { middlewares: { use() {} } });
   const deadline = Date.now() + 1000;
   while (!attached && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(attempts, 2);
@@ -434,10 +466,10 @@ test("a rejected predecessor shutdown lets the successor recheck a released leas
   };
   const first = outrightApiPlugin(options);
   const firstServer = { httpServer: new EventEmitter(), middlewares: { use() {} } };
-  configure(first, firstServer);
+  await configure(first, firstServer);
   await new Promise((resolve) => setImmediate(resolve));
   const second = outrightApiPlugin(options);
-  configure(second, { middlewares: { use(fn) { middleware = fn; } } });
+  await configure(second, { middlewares: { use(fn) { middleware = fn; } } });
   firstServer.httpServer.emit("close");
   try {
     const contentionDeadline = Date.now() + 1_000;
@@ -476,14 +508,14 @@ test("a slow local Vite shutdown remains retryable beyond the unknown-owner leas
   const options = { configUrl: new URL("file:///fixture/slow-restart.json"), recoverArchive: async () => {}, createRuntime };
   const first = outrightApiPlugin(options);
   const firstServer = { httpServer: new EventEmitter(), middlewares: { use() {} } };
-  configure(first, firstServer);
+  await configure(first, firstServer);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(attached, 1);
   // Vite evaluates a fresh config module before closing the prior server.
   const { outrightApiPlugin: reloadedPlugin } = await import("./outright-vite-plugin.mjs?slow-restart");
   const second = reloadedPlugin(options);
   const secondServer = { httpServer: new EventEmitter(), middlewares: { use(fn) { middleware = fn; } } };
-  configure(second, secondServer);
+  await configure(second, secondServer);
   firstServer.httpServer.emit("close");
   try {
     await new Promise((resolve) => setTimeout(resolve, 15_300));

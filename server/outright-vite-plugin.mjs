@@ -168,12 +168,18 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
           socket.destroy();
         }
       });
-      // Vite runs this only after every configureServer hook and its own
-      // middleware setup succeeded. A config reload that fails before then
-      // keeps the old server running, so this server never takes over: it
-      // must not mark the old one as restarting, register, or start a
-      // runtime that would take the lease and the shells handed back.
-      return () => {
+      // A config reload that fails keeps the old server running, so this
+      // server never takes over: it must not mark the old one as restarting,
+      // register, or start a runtime that would take the lease and the shells
+      // handed back. Vite runs this post hook only after every configureServer
+      // hook and its own middleware setup succeeded, but later plugins' post
+      // hooks still follow it. Only once they all returned does Vite append
+      // its error middleware and finish creating the server, synchronously, so
+      // a microtask sees whether it did before a restart closes the old server.
+      // In middleware mode Vite still runs buildStart afterwards; a failure
+      // there is not seen.
+      return () => queueMicrotask(() => {
+        if (server.middlewares.stack?.at(-1)?.handle?.name !== "viteErrorMiddleware") return;
         // A quit already under way ends the shells; this server never starts.
         if (interrupt.stopping) return;
         const predecessor = configuredPlugins.get(leaseKey);
@@ -210,7 +216,7 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
           startupError = error;
           console.error("Runtime recovery failed; database requires inspection", error);
         });
-      };
+      });
     },
     // Vite awaits plugin disposal before its signal handler exits the process.
     closeBundle() {
