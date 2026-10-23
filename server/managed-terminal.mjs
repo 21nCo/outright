@@ -1,6 +1,6 @@
 import { spawn } from "./child-process.mjs";
 import { randomBytes, randomUUID } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -95,6 +95,20 @@ export function readReattachRecord(id, launchDirectory) {
 export function removeReattachRecord(id, launchDirectory) {
   try { unlinkSync(privateOwnerPath(id, launchDirectory, "reattach")); }
   catch (error) { if (error.code !== "ENOENT") throw error; }
+}
+
+// An explicit quit's first step: every reattach record in the directory goes
+// at once, synchronously, so no later start reattaches a shell whatever the
+// quitting process does next. A record that cannot be removed stays.
+export function withdrawReattachRecords(launchDirectory) {
+  if (!launchDirectory) return;
+  let names = [];
+  try { names = readdirSync(launchDirectory); } catch { return; }
+  for (const name of names) {
+    const match = /^terminal-([0-9a-f-]{36})\.reattach$/.exec(name);
+    if (!match) continue;
+    try { removeReattachRecord(match[1], launchDirectory); } catch { /* The next quit or the stale-proof sweep retries it. */ }
+  }
 }
 
 // A creation audit may fail after the native owner has been verified empty.

@@ -291,7 +291,7 @@ process.on("message", () => process.emit("SIGINT"));
 process.stdout.write("ready\\n");
 `;
   const child = spawn(process.execPath, ["--input-type=module", "-e", source],
-    { cwd: directory, stdio: ["pipe", "pipe", "pipe", "ipc"], env: { ...process.env, CI: "true" } });
+    { cwd: directory, stdio: ["pipe", "pipe", "pipe", "ipc"], env: { ...process.env, CI: "true", OUTRIGHT_DATA_DIR: join(directory, "data") } });
   let stdout = "";
   let stderr = "";
   child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
@@ -351,7 +351,7 @@ process.on("message", (message) => { if (message === "restart") server.restart()
 log("ready");
 `;
     const child = spawn(process.execPath, ["--input-type=module", "-e", source],
-      { cwd: directory, stdio: ["pipe", "pipe", "pipe", "ipc"], env: { ...process.env, CI: "true" } });
+      { cwd: directory, stdio: ["pipe", "pipe", "pipe", "ipc"], env: { ...process.env, CI: "true", OUTRIGHT_DATA_DIR: join(directory, "data") } });
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });

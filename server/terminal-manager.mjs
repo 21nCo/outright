@@ -1,14 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { lstatSync, opendirSync, readdirSync, unlinkSync } from "node:fs";
+import { lstatSync, opendirSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { utilityProcesses } from "./subprocess-budget.mjs";
 import { cleanupTerminalSocket, reattachManagedTerminal, reattachToken, readReattachRecord, recoverManagedTerminal, removeReattachRecord,
-  removeTerminalEmpty, recordTerminalEmpty, spawnManagedTerminal, terminalOwnership, writeReattachRecord } from "./managed-terminal.mjs";
+  removeTerminalEmpty, recordTerminalEmpty, spawnManagedTerminal, terminalOwnership, withdrawReattachRecords, writeReattachRecord } from "./managed-terminal.mjs";
 import { openTerminalHistory } from "./terminal-history.mjs";
 
 const TERMINAL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const OWNER_FILE = /^terminal-([0-9a-f-]{36})\.(?:empty|reattach(?:\.[0-9a-f]{16}\.tmp)?)$/;
-const REATTACH_FILE = /^terminal-([0-9a-f-]{36})\.reattach$/;
 
 function reservationTerminal(entry) {
   return { id: entry.target, cwd: entry.cwd, name: "Terminal recovery required", pid: entry.pid,
@@ -137,6 +136,14 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     if (!database.launchDirectory) return;
     try { removeReattachRecord(id, database.launchDirectory); } catch { /* The stale-proof sweep retries it. */ }
   }
+  // An explicit quit withdraws every reattach record before any asynchronous
+  // step, and none is written after it. However the host then exits, no
+  // later start reattaches a shell: it ends them through native recovery.
+  let reattachWithdrawn = false;
+  function withdrawReattach() {
+    reattachWithdrawn = true;
+    if (!spawnTerminal) withdrawReattachRecords(database.launchDirectory);
+  }
 
   // A prior-run shell that its broker kept through the detach window becomes
   // live again only when the broker and this runtime prove the stored token
@@ -182,8 +189,10 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     // stays: a withdrawn token is still current, and a spent one is refused
     // and removed by the next runtime.
     if (!processInstance) { if (!shuttingDown) forgetReattach(id); return false; }
-    try { writeReattachRecord(id, database.launchDirectory, { identity: record.identity, token: nextToken }); }
-    catch { forgetReattach(id); }
+    try {
+      if (reattachWithdrawn) throw new Error("Reattach was withdrawn by a quit");
+      writeReattachRecord(id, database.launchDirectory, { identity: record.identity, token: nextToken });
+    } catch { forgetReattach(id); }
     if (shuttingDown) {
       // On a graceful restart the broker detaches again and keeps the shell
       // for its window, for the next runtime to reattach. The output it
@@ -428,7 +437,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
         ownershipLabel: ownership.label, handshakePath: ownership.handshakePath };
       if (terminal.status === "unknown") throw new Error("PTY ownership could not be verified after launch");
       if (terminal.status === "launching") terminal.status = "running";
-      if (session && processInstance.sessionIdentity) {
+      if (session && processInstance.sessionIdentity && !reattachWithdrawn) {
         try { writeReattachRecord(id, database.launchDirectory, { identity: processInstance.sessionIdentity, token: session.token }); }
         catch { /* Without a record this shell ends with its runtime, as before. */ }
       }
@@ -680,12 +689,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     if (!database.launchDirectory || spawnTerminal) return;
     // A quit never leaves a shell to be reattached, even one the inventory
     // does not show yet. Every shell of this run is closed or ended by now.
-    let records = [];
-    try { records = readdirSync(database.launchDirectory); } catch { /* No records to remove. */ }
-    for (const name of records) {
-      const match = REATTACH_FILE.exec(name);
-      if (match) forgetReattach(match[1]);
-    }
+    withdrawReattach();
     if (database.terminalAuditScanPending) {
       let timer;
       await Promise.race([Promise.resolve(database.waitForTerminalAuditReconciliation?.()).catch(() => {}),
@@ -751,7 +755,8 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   }
 
   queueMicrotask(sweepStaleEmptyProofs);
-  return { create, list, capacity, get, write, resize, close, shutdown, reconcileUnknown, reloadUnknownReservations, historyStatus };
+  return { create, list, capacity, get, write, resize, close, shutdown, withdrawReattach, reconcileUnknown, reloadUnknownReservations,
+    historyStatus };
 }
 
 function defaultHistory(database, onStatusChange) {

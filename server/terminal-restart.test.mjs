@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { fork, spawnSync } from "node:child_process";
+import { fork, spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,19 +12,50 @@ import { terminalTabLabel } from "../src/lib/terminal-exit-state.js";
 // supervisors and broker, and a real process exit between runtimes. A
 // launcher asks for a graceful restart or a quit over the host's IPC channel.
 const STANDALONE = fileURLToPath(new URL("./standalone.mjs", import.meta.url));
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === "EPERM"; } };
+
+// Either host, started as a user would run it, with archive recovery that
+// can be held pending and terminal disposal that can be made to hang.
+// Windows cannot signal another process, so the test asks over IPC there.
+function hostSource(kind, { gated = false, stuck = false } = {}) {
+  const module = (name) => JSON.stringify(new URL(name, import.meta.url).href);
+  return `import { createOutrightRuntime } from ${module("./outright-runtime.mjs")};
+let release;
+const recovered = new Promise((resolve) => { release = resolve; });
+process.on("message", (message) => { if (message === "recover") release(); else if (typeof message === "string") process.emit(message); });
+const recoverArchive = async () => { ${gated ? `process.stdout.write("recovering\\n"); await recovered;` : ""} };
+const createRuntime = (options) => {
+  const runtime = createOutrightRuntime(options);
+  ${stuck ? "runtime.terminals.shutdown = () => new Promise(() => {});" : ""}
+  return runtime;
+};
+${kind === "vite" ? `const { createServer } = await import(${JSON.stringify(import.meta.resolve("vite"))});
+const { outrightApiPlugin } = await import(${module("./outright-vite-plugin.mjs")});
+const server = await createServer({ configFile: false, root: process.env.OUTRIGHT_CLIENT_DIR, logLevel: "silent",
+  server: { host: "127.0.0.1", port: 0 },
+  plugins: [outrightApiPlugin({ configUrl: new URL(${module("../outright.config.json")}), recoverArchive, createRuntime })] });
+await server.listen();
+console.info("Outright is running at http://127.0.0.1:" + server.httpServer.address().port);`
+    : `const { startStandalone } = await import(${module("./standalone-host.mjs")});
+startStandalone({ recoverArchive, createRuntime });`}
+`;
+}
 
 async function waitUntil(predicate, message, timeout = 20_000) {
   const deadline = Date.now() + timeout;
   for (;;) {
     const value = await predicate();
     if (value) return value;
-    if (Date.now() > deadline) throw new Error(typeof message === "function" ? message() : message);
+    if (Date.now() > deadline) throw new Error(typeof message === "function" ? await message() : message);
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
 }
 
-function startOutright(t, env) {
-  const child = fork(STANDALONE, [], { env, stdio: ["ignore", "pipe", "pipe", "ipc"] });
+function startOutright(t, env, { kind = null, ...fixture } = {}) {
+  const child = kind
+    ? spawn(process.execPath, ["--input-type=module", "-e", hostSource(kind, fixture)], { env: { ...env, CI: "true" }, stdio: ["ignore", "pipe", "pipe", "ipc"] })
+    : fork(STANDALONE, [], { env, stdio: ["ignore", "pipe", "pipe", "ipc"] });
   let stdout = "";
   let stderr = "";
   child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
@@ -33,12 +64,21 @@ function startOutright(t, env) {
   const running = () => child.exitCode === null && child.signalCode === null;
   t.after(async () => {
     if (!running()) return;
-    child.send({ type: "outright.shutdown", intent: "quit" });
+    if (kind === "vite") child.send("SIGTERM");
+    else child.send({ type: "outright.shutdown", intent: "quit" });
     const timer = setTimeout(() => child.kill("SIGKILL"), 20_000);
     await exited;
     clearTimeout(timer);
   });
   const host = {
+    exited,
+    running,
+    stdout: () => stdout,
+    send: (message) => child.send(message),
+    signal(name) {
+      if (process.platform === "win32") child.send(name);
+      else child.kill(name);
+    },
     async ready() {
       const match = await waitUntil(() => /running at (http:\/\/[^\s]+)/.exec(stdout) || !running(),
         () => `Outright did not start: ${stderr}`);
@@ -70,6 +110,25 @@ function startOutright(t, env) {
       t.after(() => socket.terminate());
       return { input: (terminalId, data) => socket.send(JSON.stringify({ type: "terminal.input", terminalId, data })) };
     },
+    // A live shell, and the pid of the shell process itself.
+    async shell(cwd) {
+      const terminal = await host.create(cwd);
+      (await host.socket()).input(terminal.id, "console.log('shell-' + 'pid=' + process.pid)\r");
+      const [, pid] = await waitUntil(async () => /shell-pid=(\d+)/.exec((await host.terminal(terminal.id))?.buffer ?? ""),
+        "the shell did not report its pid");
+      return { id: terminal.id, pid: Number(pid) };
+    },
+    // The next start shows the shell as saved output, never as live, and
+    // has ended it.
+    async ended(shell) {
+      const saved = await waitUntil(async () => {
+        const entry = await host.listed(shell.id);
+        return entry?.status === "ended" ? entry : null;
+      }, async () => `shell ${shell.id} was not restored as saved output: ${JSON.stringify(await host.listed(shell.id))}`);
+      assert.equal(saved.reattached, undefined);
+      assert.doesNotMatch(terminalTabLabel(saved), /reattached|running/);
+      await waitUntil(() => !alive(shell.pid), `shell process ${shell.pid} outlived the next start`);
+    },
     async output(id, text) {
       return waitUntil(async () => {
         const terminal = await host.terminal(id);
@@ -86,7 +145,7 @@ function startOutright(t, env) {
   return host.ready();
 }
 
-test("a live shell survives a graceful restart and reattaches with its output; after a quit, and once exited, it never resumes", { timeout: 180_000 }, async (t) => {
+function workspace(t) {
   const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-restart-")));
   t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }));
   const repo = path.join(root, "repo");
@@ -100,6 +159,11 @@ test("a live shell survives a graceful restart and reattaches with its output; a
   writeFileSync(path.join(client, "index.html"), "<!doctype html><title>Fixture</title>");
   const env = { ...process.env, OUTRIGHT_DATA_DIR: path.join(root, "data"), OUTRIGHT_SCAN_ROOTS: root, OUTRIGHT_SCAN_DEPTH: "2",
     OUTRIGHT_CLIENT_DIR: client, PORT: "0", HOST: "127.0.0.1", SHELL: process.execPath, GIT_TRACE2_EVENT: "0" };
+  return { repo, env };
+}
+
+test("a live shell survives a graceful restart and reattaches with its output; after a quit, and once exited, it never resumes", { timeout: 180_000 }, async (t) => {
+  const { repo, env } = workspace(t);
 
   const first = await startOutright(t, env);
   const live = await first.create(repo);
@@ -142,4 +206,56 @@ test("a live shell survives a graceful restart and reattaches with its output; a
   assert.match((await third.terminal(live.id)).buffer, /kept-42/);
   assert.equal((await third.api("GET", "/api/capacity")).body.terminalProcesses.active, 0);
   await third.stop("quit");
+});
+
+// One Ctrl-C reaches a process started by `npm run` twice at once: the
+// terminal signals the process group and npm forwards the same signal.
+test("one Ctrl-C delivered twice quits once; a later Ctrl-C forces the exit; neither leaves a shell to reattach", { timeout: 300_000 }, async (t) => {
+  for (const kind of ["standalone", "vite"]) {
+    const { repo, env } = workspace(t);
+    const quitCode = kind === "vite" ? 130 : 0;
+    const first = await startOutright(t, env, { kind });
+    const shell = await first.shell(repo);
+    first.signal("SIGINT");
+    await delay(20);
+    first.signal("SIGINT");
+    assert.deepEqual(await first.exited, { code: quitCode, signal: null }, `${kind}: ${first.stdout()}`);
+    // The quit ran to the end: it ended the shell before the host exited.
+    assert.equal(alive(shell.pid), false, `${kind}: the repeated Ctrl-C abandoned the quit`);
+
+    // Terminal disposal hangs here, so only a later Ctrl-C ends the host. The
+    // shell it leaves running is ended, not reattached, by the next start.
+    const stuck = await startOutright(t, env, { kind, stuck: true });
+    await stuck.ended(shell);
+    const left = await stuck.shell(repo);
+    stuck.signal("SIGINT");
+    await delay(1500);
+    assert.equal(stuck.running(), true, `${kind}: the quit did not wait for terminal disposal`);
+    stuck.signal("SIGINT");
+    assert.deepEqual(await stuck.exited, { code: 130, signal: null }, `${kind}: ${stuck.stdout()}`);
+    assert.equal(alive(left.pid), true, `${kind}: the forced exit was not the path under test`);
+
+    const next = await startOutright(t, env);
+    await next.ended(left);
+    await next.stop("quit");
+  }
+});
+
+test("a quit before the runtime exists leaves no shell to reattach, in either host", { timeout: 300_000 }, async (t) => {
+  const { repo, env } = workspace(t);
+  let host = await startOutright(t, env);
+  for (const kind of ["vite", "standalone"]) {
+    const shell = await host.shell(repo);
+    await host.stop("restart");
+    // Archive recovery holds startup; the quit arrives before the runtime.
+    const quitting = await startOutright(t, env, { kind, gated: true });
+    await waitUntil(() => quitting.stdout().includes("recovering"), `${kind}: recovery did not start`);
+    quitting.signal("SIGINT");
+    await delay(300);
+    quitting.send("recover");
+    assert.deepEqual(await quitting.exited, { code: kind === "vite" ? 130 : 0, signal: null }, `${kind}: ${quitting.stdout()}`);
+    host = await startOutright(t, env);
+    await host.ended(shell);
+  }
+  await host.stop("quit");
 });

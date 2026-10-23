@@ -154,6 +154,14 @@ function applyTerminalAuditRow(scan, row) {
   }
 }
 
+// The launch directory of a runtime opened with default options, once its
+// data directory exists. A host that quits before its runtime exists
+// withdraws reattach records there.
+export function runtimeLaunchDirectory() {
+  const dataDirectory = path.resolve(process.env.OUTRIGHT_DATA_DIR ?? path.join(os.homedir(), ".outright"));
+  try { return path.join(realpathSync(dataDirectory), "launches"); } catch { return null; }
+}
+
 export function createOutrightDatabase(options = {}) {
   const dataDirectory = path.resolve(options.dataDirectory
     ?? process.env.OUTRIGHT_DATA_DIR

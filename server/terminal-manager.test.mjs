@@ -1681,6 +1681,38 @@ function fakeLaunch({ handBack }) {
   return { calls, start: async ({ session }) => { calls.push(session ? "session" : "no-session"); return adapter; } };
 }
 
+// A quit's withdrawal is synchronous, so a host that then exits at once
+// leaves nothing to reattach; a shell still launching must not add a record.
+test("a quit withdraws every reattach record at once, and a shell launching meanwhile writes none", { timeout: 30_000 }, async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-terminal-withdraw-"));
+  const database = createOutrightDatabase({ filename: path.join(directory, "runtime.db"), runtimeLease: true });
+  try {
+    const launch = fakeLaunch({ handBack: true });
+    let launched;
+    const gate = new Promise((resolve) => { launched = resolve; });
+    let gated = false;
+    const manager = createTerminalManager({ database, publish: () => {}, cleanupSocket: () => {},
+      startManagedTerminal: async (options) => { if (gated) await gate; return launch.start(options); } });
+    const live = await manager.create({ cwd: directory });
+    // A record the previous run left for its shell.
+    const inherited = randomUUID();
+    writeReattachRecord(inherited, database.launchDirectory, { identity: randomUUID(), token: reattachToken() });
+    gated = true;
+    const launching = manager.create({ cwd: directory });
+    await new Promise((resolve) => setImmediate(resolve));
+    manager.withdrawReattach();
+    assert.equal(readReattachRecord(live.id, database.launchDirectory), null);
+    assert.equal(readReattachRecord(inherited, database.launchDirectory), null);
+    launched();
+    const late = await launching;
+    assert.equal(readReattachRecord(late.id, database.launchDirectory), null);
+    await manager.shutdown();
+  } finally {
+    await database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("a graceful restart hands back only a live shell its broker accepts; reattach off, a refusal or a quit closes it", { timeout: 30_000 }, async () => {
   for (const scenario of [
     { name: "graceful restart", detach: true, handBack: true, kept: true, calls: ["session", "release"] },
@@ -2040,6 +2072,9 @@ test("a restart and an explicit quit at the same time quit, in either order; a c
     // window when the quit arrives: native recovery ends it.
     { name: "restart, then quit after the hand-back", calls: [{ restart: true }], quitAfterRelease: true, ended: true },
     { name: "host restart, then quit after the hand-back", calls: [{}], host: true, quitAfterRelease: true, ended: true },
+    // Too late to end the shell here, but never too late to stop a reattach:
+    // the next start ends it through native recovery.
+    { name: "restart, then quit once shutdown finished", calls: [{ restart: true }], quitAfterShutdown: true, kept: true },
   ]) {
     const directory = mkdtempSync(path.join(os.tmpdir(), "outright-runtime-shutdown-intent-"));
     const launch = fakeLaunch({ handBack: true });
@@ -2064,10 +2099,11 @@ test("a restart and an explicit quit at the same time quit, in either order; a c
       const { id } = await runtime.terminals.create({ cwd: directory });
       const { launchDirectory } = runtime.database;
       await Promise.all(scenario.calls.map((options) => runtime.shutdown(options)));
+      if (scenario.quitAfterShutdown) await runtime.shutdown({ restart: false });
       const expected = { kept: ["session", "release"], ended: ["session", "release", "recover true"] }[
         scenario.kept ? "kept" : scenario.ended ? "ended" : "closed"] ?? ["session", "terminate"];
       assert.deepEqual(launch.calls, expected, scenario.name);
-      assert.equal(Boolean(readReattachRecord(id, launchDirectory)), Boolean(scenario.kept), scenario.name);
+      assert.equal(Boolean(readReattachRecord(id, launchDirectory)), Boolean(scenario.kept && !scenario.quitAfterShutdown), scenario.name);
     } finally {
       await runtime.shutdown().catch(() => {});
       rmSync(directory, { recursive: true, force: true });

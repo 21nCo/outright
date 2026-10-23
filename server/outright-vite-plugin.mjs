@@ -1,5 +1,6 @@
 import { createOutrightRuntime } from "./outright-runtime.mjs";
-import { recoverArchiveBeforeStartup } from "./database.mjs";
+import { recoverArchiveBeforeStartup, runtimeLaunchDirectory } from "./database.mjs";
+import { withdrawReattachRecords } from "./managed-terminal.mjs";
 import { writeStartupUnavailable } from "./startup-response.mjs";
 
 // Config reloads can create the successor plugin before Vite closes the old
@@ -18,9 +19,12 @@ const configuredPlugins = globalThis[serverRegistry] ??= new Map();
 // exits without any shutdown. Either signal forwards the quit to every
 // runtime in the process, including one still shutting down for a restart,
 // and the process exits only after each has stopped: a quit wins over a
-// restart until its shells are handed back. A second Ctrl-C exits at once.
-// Config reloads load this module afresh, so the handlers and their state
-// are process-wide.
+// restart until its shells are handed back. One Ctrl-C can arrive twice at
+// once (the terminal's process group and `npm run`'s forwarding), so only a
+// later Ctrl-C forces the exit; the quit already withdrew every reattach
+// record, so the shells it leaves are never reattached. Config reloads load
+// this module afresh, so the handlers and their state are process-wide.
+const REPEATED_SIGNAL_MS = 1000;
 const interrupt = globalThis[Symbol.for("outright.viteInterrupt")] ??= { installed: false, stopping: false, servers: new Set() };
 interrupt.plugins ??= new Set();
 interrupt.quit ??= () => {
@@ -28,8 +32,11 @@ interrupt.quit ??= () => {
   return Promise.allSettled([...interrupt.plugins].map((plugin) => plugin.quit()));
 };
 interrupt.handler ??= () => {
-  if (interrupt.interrupted) process.exit(130);
-  interrupt.interrupted = true;
+  if (interrupt.interrupted) {
+    if (Date.now() - interrupt.interrupted >= REPEATED_SIGNAL_MS) process.exit(130);
+    return;
+  }
+  interrupt.interrupted = Date.now();
   void Promise.allSettled([interrupt.quit(), ...[...interrupt.servers].map((server) => server.close())])
     .finally(() => { process.exitCode ??= 130; process.exit(); });
 };
@@ -37,7 +44,9 @@ interrupt.handler ??= () => {
 // closeBundle settles, which awaits every quitting runtime.
 interrupt.terminate ??= () => { void interrupt.quit(); };
 function watchInterrupt() {
-  const wanted = interrupt.servers.size > 0;
+  // A quitting process keeps its handlers while its servers close, so a
+  // repeated signal never takes Node's default exit.
+  const wanted = interrupt.servers.size > 0 || interrupt.stopping;
   if (wanted === interrupt.installed) return;
   interrupt.installed = wanted;
   if (wanted) {
@@ -49,7 +58,8 @@ function watchInterrupt() {
   }
 }
 
-export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRuntime, recoverArchive = recoverArchiveBeforeStartup }) {
+export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRuntime, recoverArchive = recoverArchiveBeforeStartup,
+  launchDirectory = runtimeLaunchDirectory }) {
   let runtime = null;
   let recovery;
   let closing;
@@ -125,8 +135,11 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
     return closing;
   };
   // An explicit quit for this plugin's runtime, whether or not it is already
-  // shutting down for a restart.
+  // shutting down for a restart. Its first step withdraws every reattach
+  // record, synchronously, even before a runtime exists.
   const quitter = { quit() {
+    if (runtime) runtime.withdrawReattach?.();
+    else withdrawReattachRecords(launchDirectory());
     const done = shutdown() ?? Promise.resolve();
     if (runtimeStopping) runtime?.shutdown({ restart: false }).catch(() => {});
     return done;

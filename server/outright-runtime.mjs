@@ -1039,7 +1039,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   // closed: an explicit quit (restart: false) always wins, and a restart is
   // named by a call (restart: true) or by the host (hostRestarting). A call
   // that names neither, such as the HTTP server's close, decides nothing,
-  // and a shutdown nobody named as a restart is a quit.
+  // and a shutdown nobody named as a restart is a quit. Every quit, even one
+  // after the shells were handed back, first withdraws their reattach
+  // records, so the next start ends them rather than reattach them.
   let quitRequested = false;
   let restartRequested = false;
   const restartIntended = () => {
@@ -1047,8 +1049,14 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     if (restartRequested) return true;
     try { return hostRestarting() === true; } catch { return false; }
   };
+  function withdrawReattach() {
+    try { terminals?.withdrawReattach?.(); } catch (error) { console.error("Terminal reattach records could not be withdrawn", error); }
+  }
   function shutdown({ restart } = {}) {
-    if (restart === false) quitRequested = true;
+    if (restart === false) {
+      quitRequested = true;
+      withdrawReattach();
+    }
     if (restart === true) restartRequested = true;
     if (shutdownPromise) return shutdownPromise;
     shuttingDown = true;
@@ -1094,7 +1102,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     return shutdownPromise;
   }
 
-  return { attach, handleRequest, projects, publish, eventHub, database, agents, terminals, git, shutdown,
+  return { attach, handleRequest, projects, publish, eventHub, database, agents, terminals, git, shutdown, withdrawReattach,
     whenShutdownComplete: () => shutdownCompletion, whenRunRecoveryComplete: () => runRecovery.cycle };
   } catch (error) {
     runRecoveryController.abort();
