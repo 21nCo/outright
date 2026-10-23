@@ -100,11 +100,13 @@ export function removeReattachRecord(id, launchDirectory) {
 // An explicit quit's first step: every reattach record in the directory goes
 // at once, synchronously, so no later start reattaches a shell whatever the
 // quitting process does next. A record that cannot be removed stays.
-// Returns how many records it found.
+// Returns how many records it found, or null when the directory could not
+// be read, so a caller never mistakes an unknown inventory for an empty one.
 export function withdrawReattachRecords(launchDirectory) {
   if (!launchDirectory) return 0;
   let names = [];
-  try { names = readdirSync(launchDirectory); } catch { return 0; }
+  try { names = readdirSync(launchDirectory); }
+  catch (error) { return error.code === "ENOENT" ? 0 : null; }
   let found = 0;
   for (const name of names) {
     const match = /^terminal-([0-9a-f-]{36})\.reattach$/.exec(name);

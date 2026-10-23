@@ -143,11 +143,12 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   // step, and none is written after it. However the host then exits, no
   // later start reattaches a shell: it ends them through native recovery.
   let reattachWithdrawn = false;
-  // Whether a withdrawal found a record: a shell a broker may keep alive.
+  // Whether a withdrawal found a record, or could not tell: a shell a broker
+  // may keep alive.
   let reattachRecordsFound = false;
   function withdrawReattach() {
     reattachWithdrawn = true;
-    if (!spawnTerminal && withdrawReattachRecords(database.launchDirectory) > 0) reattachRecordsFound = true;
+    if (!spawnTerminal && withdrawReattachRecords(database.launchDirectory) !== 0) reattachRecordsFound = true;
   }
 
   // A prior-run shell that its broker kept through the detach window becomes
@@ -701,8 +702,8 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     withdrawReattach();
     // With reattach off, a shell outlives its runtime only in a previous
     // run's detach window, with a reattach record unless writing it failed.
-    // Without a record there is nothing to wait for; the next start ends any
-    // such shell through native recovery.
+    // Only a launch directory read and found without a record leaves nothing
+    // to wait for; the next start ends any such shell through native recovery.
     if (database.terminalAuditScanPending && !reattachEnabledNow() && !reattachRecordsFound) return;
     if (database.terminalAuditScanPending) {
       let timer;

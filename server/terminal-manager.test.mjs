@@ -11,6 +11,8 @@ import { AUDIT_RETENTION_LIMIT, auditTrimSql, trimAudit, trimAuditPage } from ".
 import { createOutrightRuntime } from "./outright-runtime.mjs";
 import { terminalTabLabel } from "../src/lib/terminal-exit-state.js";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import net from "node:net";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import os from "node:os";
@@ -2275,12 +2277,15 @@ test("an explicit quit waits for the ownership scan before ending a prior-run sh
 });
 
 // With reattach off this run launched no shell a broker keeps, so a quit
-// waits for the inventory only if a previous run left one with a record.
-test("with reattach off, a quit waits for the ownership scan only when a previous run left a shell to reattach", { timeout: 120_000 }, async (t) => {
-  for (const prior of [false, true]) {
+// waits for the inventory only if a previous run left one with a record, or
+// if the records cannot be listed to tell.
+test("with reattach off, a quit waits for the ownership scan only when a previous run left a shell to reattach", { timeout: 180_000 }, async (t) => {
+  for (const scenario of ["empty", "prior", "unreadable"]) {
+    const prior = scenario !== "empty";
     const { directory, filename } = reattachRuntime(t, "outright-terminal-quit-off-", () => database);
     let database = createOutrightDatabase({ filename, runtimeLease: true });
     const shell = prior ? await priorRunTerminal(t, database, directory) : null;
+    const { launchDirectory } = database;
     database.close();
     let gated = true;
     const held = [];
@@ -2295,10 +2300,29 @@ test("with reattach off, a quit waits for the ownership scan only when a previou
     const recovered = [];
     const manager = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => false, quitInventoryTimeoutMs: 30_000,
       recoverTerminal: async (entry) => { recovered.push(entry.target); return brokerRecovery(shell)(entry); } });
+    // An unreadable launch directory leaves the record inventory unknown,
+    // which is not proof that no previous run left a shell.
+    const readdir = fs.readdirSync;
+    if (scenario === "unreadable") {
+      fs.readdirSync = (target, ...rest) => {
+        if (path.resolve(String(target)) === path.resolve(launchDirectory)) {
+          throw Object.assign(new Error("EIO: i/o error, scandir"), { code: "EIO" });
+        }
+        return readdir(target, ...rest);
+      };
+      syncBuiltinESMExports();
+    }
     let settled = null;
-    const quit = manager.shutdown().then(() => { settled = "resolved"; }, (error) => { settled = error; });
-    if (prior) {
+    let quit;
+    try {
+      quit = manager.shutdown().then(() => { settled = "resolved"; }, (error) => { settled = error; });
       await new Promise((resolve) => setTimeout(resolve, 300));
+      if (scenario === "unreadable") assert.notEqual(readReattachRecord(shell.id, launchDirectory), null, "the fault did not hide the record");
+    } finally {
+      fs.readdirSync = readdir;
+      syncBuiltinESMExports();
+    }
+    if (prior) {
       assert.equal(settled, null, "the quit did not wait for the scan to find the previous run's shell");
       gated = false;
       for (const tick of held.splice(0)) setImmediate(tick);
@@ -2306,6 +2330,18 @@ test("with reattach off, a quit waits for the ownership scan only when a previou
       assert.equal(settled, "resolved");
       assert.deepEqual(recovered, [shell.id]);
       assert.equal(shell.exited(), true, "the quit left the previous run's shell running");
+      if (scenario === "unreadable") {
+        database = await restartDatabase(database, filename);
+        const later = createTerminalManager({ database, publish: () => {}, reattachEnabled: () => true,
+          recoverTerminal: async () => shell.exited() });
+        try {
+          await later.reconcileUnknown();
+          assert.equal(later.list().some((entry) => entry.id === shell.id && (entry.reattached || entry.status === "running")), false,
+            "a later start resumed the shell the quit should have ended");
+        } finally {
+          await later.shutdown();
+        }
+      }
     } else {
       await waitFor(() => settled, 5000, () => "the quit waited for the ownership scan with nothing to end");
       assert.equal(settled, "resolved", settled?.stack);
