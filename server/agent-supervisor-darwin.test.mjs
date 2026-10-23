@@ -6,7 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AGENT_SUPERVISOR } from "./agent-manager.mjs";
-import { reattachManagedTerminal, reattachToken } from "./managed-terminal.mjs";
+import { MANAGED_OWNER_SOURCE, assertKeptShell, assertReattachPausesWindow, assertStopEndsDetachedProvider, brokerStandIn,
+  delay, reattachCrashedTerminal, waitUntil } from "../tests/fixtures/supervisor-detach.mjs";
 
 // The macOS supervisor's detach mode; Linux has its own in
 // agent-supervisor-linux.test.mjs, and Windows keeps its supervisor until its
@@ -14,8 +15,7 @@ import { reattachManagedTerminal, reattachToken } from "./managed-terminal.mjs";
 const darwinOnly = { skip: process.platform !== "darwin" };
 const temporaryRoot = process.platform === "darwin"
   ? realpathSync(execFileSync("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"], { encoding: "utf8" }).trim()) : "";
-const ATTACHED = "__OUTRIGHT_BROKER_ATTACHED_V1__";
-const DETACHED = "__OUTRIGHT_BROKER_DETACHED_V1__";
+const detach = (windowMs) => ["--detach", String(windowMs)];
 
 // The Outright owner: it launches the supervisor as managed terminals do,
 // reports its pid and exit, and forwards a stop or closes its stdin on
@@ -35,32 +35,8 @@ process.stdin.on("data", (command) => {
   if (command.includes("close")) child.stdin.end();
 });`;
 
-// Stands in for the broker: records its pid, and prints a broker status line,
-// starts a descendant that escapes its session, or exits when the test drops
-// a request file in its directory.
-const PROVIDER_SOURCE = `#!/bin/sh
-dir="$1"
-echo $$ > "$dir/provider.pid"
-while :; do
-  if [ -f "$dir/escape" ]; then rm -f "$dir/escape"
-    /usr/bin/perl -e 'use POSIX qw(setsid); exit 0 if fork(); setsid(); open(my $f, ">", "$ARGV[0]") or die; print $f "$$\\n"; close $f; open(STDIN, "<", "/dev/null"); open(STDOUT, ">", "/dev/null"); open(STDERR, ">", "/dev/null"); exec("/bin/sleep", "600")' "$dir/escaped.pid"
-  fi
-  if [ -f "$dir/attach" ]; then rm -f "$dir/attach"; echo ${ATTACHED}; fi
-  if [ -f "$dir/detach" ]; then rm -f "$dir/detach"; echo ${DETACHED}; fi
-  if [ -f "$dir/exit" ]; then exit 0; fi
-  sleep 0.05
-done
-`;
-
-async function waitUntil(predicate, message, timeout = 10_000) {
-  const deadline = Date.now() + timeout;
-  while (!(await predicate())) {
-    if (Date.now() > deadline) throw new Error(typeof message === "function" ? message() : message);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-}
-
-const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+// The broker stand-in's descendant escapes its session.
+const PROVIDER_SOURCE = brokerStandIn(`/usr/bin/perl -e 'use POSIX qw(setsid); exit 0 if fork(); setsid(); open(my $f, ">", "$ARGV[0]") or die; print $f "$$\\n"; close $f; open(STDIN, "<", "/dev/null"); open(STDOUT, ">", "/dev/null"); open(STDERR, ">", "/dev/null"); exec("/bin/sleep", "600")' "$dir/escaped.pid"`);
 
 function alive(pid) {
   try { process.kill(pid, 0); return true; }
@@ -142,43 +118,11 @@ test("a detach-mode job outlives its owner until the window ends; without detach
 });
 
 test("a reattached broker pauses the detach window and its next detach starts it again", { ...darwinOnly, timeout: 60_000 }, async (t) => {
-  const start = supervisors(t);
-  const run = await start("reattach", ["--detach", "500"]);
-  run.owner.kill("SIGKILL");
-  run.request("attach");
-  // Far past the window and its grace: the reattached runtime keeps the job.
-  await delay(3000);
-  assert.equal(alive(run.providerPid()), true, "the supervisor ended a reattached shell at the window");
-  const detachedAgain = Date.now();
-  run.request("detach");
-  await assertReleased(run, 10_000);
-  assert.ok(Date.now() - detachedAgain >= 500, "a fresh detach did not get its own window");
+  await assertReattachPausesWindow({ start: supervisors(t), detach, alive, assertReleased });
 });
 
 test("a detach-mode job ends at once on an explicit stop, and stdin EOF alone does not end it", { ...darwinOnly, timeout: 60_000 }, async (t) => {
-  const start = supervisors(t);
-  const stopped = await start("stop", ["--detach", "60000"]);
-  stopped.owner.stdin.write("stop\n");
-  await waitUntil(() => stopped.supervisorExit(), "an explicit stop did not end the detach-mode job");
-  assert.deepEqual(stopped.supervisorExit(), ["137", "null"]);
-  await assertReleased(stopped, 5000);
-
-  const eof = await start("eof", ["--detach", "60000"]);
-  eof.owner.stdin.write("close\n");
-  await delay(800);
-  assert.equal(eof.supervisorExit(), null, "stdin EOF ended a detach-mode job");
-  assert.equal(alive(eof.providerPid()), true);
-  process.kill(eof.supervisorPid, "SIGTERM");
-  await waitUntil(() => eof.supervisorExit(), "a termination request did not end the detach-mode job");
-  assert.deepEqual(eof.supervisorExit(), ["137", "null"]);
-  await assertReleased(eof, 5000);
-
-  // The shell's own exit while detached settles the job without the window.
-  const exited = await start("exit", ["--detach", "60000"]);
-  exited.owner.kill("SIGKILL");
-  await delay(300);
-  exited.request("exit");
-  await assertReleased(exited, 5000);
+  await assertStopEndsDetachedProvider({ start: supervisors(t), detach, alive, assertReleased });
 });
 
 test("a detached job whose reattached broker exits ends its escaped descendants at once", { ...darwinOnly, timeout: 60_000 }, async (t) => {
@@ -223,23 +167,7 @@ test("a malformed detach request starts nothing", darwinOnly, () => {
   assert.equal(spawnSync(AGENT_SUPERVISOR, ["--detach"], { stdio: "ignore", timeout: 10_000 }).status, 64);
 });
 
-// The whole path: a managed terminal launched with a reattach session, an
-// owner that crashes, and a later runtime that reattaches through slice 2.
-const MANAGED_OWNER_SOURCE = `
-const [managed, id, launchDirectory, cwd, windowMs] = process.argv.slice(1);
-const { reattachToken, spawnManagedTerminal, terminalOwnership } = await import(managed);
-const ownership = terminalOwnership(id, launchDirectory);
-const token = reattachToken();
-const adapter = await spawnManagedTerminal({ id, ownership, shell: process.execPath, cwd, cols: 80, rows: 24,
-  env: process.env, session: { label: ownership.label, token, windowMs: Number(windowMs) } });
-let output = "";
-adapter.onData((data) => {
-  output += data;
-  if (output.includes("41")) console.log(JSON.stringify({ identity: adapter.sessionIdentity, token, pid: adapter.pid }));
-  if (output.includes("41")) output = "";
-});
-adapter.write("globalThis.kept = 41\\r");`;
-
+// The whole path, through a later runtime that reattaches through slice 2.
 test("a crashed runtime's terminal survives in its launchd job and a reattached runtime keeps it past the window", { ...darwinOnly, timeout: 90_000 }, async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-darwin-detach-managed-"));
   const id = randomUUID();
@@ -261,22 +189,10 @@ test("a crashed runtime's terminal survives in its launchd job and a reattached 
   const { identity, token, pid: supervisorPid } = JSON.parse(lines.slice(0, lines.indexOf("\n")));
   owner.kill("SIGKILL");
   const verifyEmpty = () => control("--probe", label).state === "absent";
-  let output = "";
-  // The broker takes a reattach once it has seen its crashed peer close; a
-  // refused attempt before then spends nothing.
-  let adapter = null;
-  const reattachDeadline = Date.now() + 2000;
-  const nextToken = reattachToken();
-  while (!adapter && Date.now() < reattachDeadline) {
-    adapter = await reattachManagedTerminal({ id, identity, token, nextToken, cols: 80, rows: 24, verifyEmpty });
-    if (!adapter) await delay(50);
-  }
-  assert.ok(adapter, "the crashed runtime's terminal was not kept to reattach");
-  adapter.onData((data) => { output += data; });
+  const adapter = await reattachCrashedTerminal({ id, identity, token, verifyEmpty });
   // Well past both the broker's window and the supervisor's: still live.
   await delay(7000);
-  assert.equal(adapter.write("kept + 1\r"), true, "the reattached broker went away");
-  await waitUntil(() => output.includes("42"), () => `the reattached shell is not the live process: ${JSON.stringify(output.slice(-400))}`);
+  await assertKeptShell(adapter);
   assert.equal(alive(supervisorPid), true, "the crashed owner's supervisor left the reattached job");
   // Handing the shell back starts a new window, after which nothing remains.
   await adapter.release();

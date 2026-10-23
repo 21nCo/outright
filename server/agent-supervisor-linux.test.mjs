@@ -6,13 +6,14 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AGENT_SUPERVISOR, LAUNCH_AUTHORIZED_CONTROL } from "./agent-manager.mjs";
-import { reattachManagedTerminal, reattachToken, recoverManagedTerminal } from "./managed-terminal.mjs";
+import { recoverManagedTerminal } from "./managed-terminal.mjs";
+import { MANAGED_OWNER_SOURCE, assertKeptShell, assertReattachPausesWindow, assertStopEndsDetachedProvider, brokerStandIn,
+  delay, reattachCrashedTerminal, waitUntil } from "../tests/fixtures/supervisor-detach.mjs";
 
 // Linux detach mode is this slice's; the other platforms' supervisors keep
 // their own tests, so these run on Linux only.
 const linuxOnly = { skip: process.platform !== "linux" };
-const ATTACHED = "__OUTRIGHT_BROKER_ATTACHED_V1__";
-const DETACHED = "__OUTRIGHT_BROKER_DETACHED_V1__";
+const detach = (windowMs) => ["--detach-on-owner-exit", String(windowMs)];
 
 // The Outright owner: it launches and authorizes the supervisor as managed
 // terminals do, reports its pid and exit, and forwards a stop or closes its
@@ -35,32 +36,8 @@ process.stdin.on("data", (command) => {
   if (command.includes("close")) child.stdin.end();
 });`;
 
-// Stands in for the broker: records its pid, and prints a broker status line,
-// starts a descendant orphaned to the supervisor, or exits when the test drops
-// a request file in its directory.
-const PROVIDER_SOURCE = `#!/bin/sh
-dir="$1"
-echo $$ > "$dir/provider.pid"
-while :; do
-  if [ -f "$dir/escape" ]; then rm -f "$dir/escape"
-    ( sh -c 'echo $$ > "$1.tmp" && mv "$1.tmp" "$1"; exec sleep 600' sh "$dir/escaped.pid" </dev/null >/dev/null 2>&1 & )
-  fi
-  if [ -f "$dir/attach" ]; then rm -f "$dir/attach"; echo ${ATTACHED}; fi
-  if [ -f "$dir/detach" ]; then rm -f "$dir/detach"; echo ${DETACHED}; fi
-  if [ -f "$dir/exit" ]; then exit 0; fi
-  sleep 0.05
-done
-`;
-
-async function waitUntil(predicate, message, timeout = 10_000) {
-  const deadline = Date.now() + timeout;
-  while (!(await predicate())) {
-    if (Date.now() > deadline) throw new Error(typeof message === "function" ? message() : message);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-}
-
-const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+// The broker stand-in's descendant is orphaned to the supervisor.
+const PROVIDER_SOURCE = brokerStandIn(`( sh -c 'echo $$ > "$1.tmp" && mv "$1.tmp" "$1"; exec sleep 600' sh "$dir/escaped.pid" </dev/null >/dev/null 2>&1 & )`);
 
 // A zombie awaiting its reaper has ended; only a running process counts.
 function alive(pid) {
@@ -142,43 +119,11 @@ test("a detach-mode provider outlives its owner until the window ends; stop-on-o
 });
 
 test("a reattached broker pauses the detach window and its next detach starts it again", { ...linuxOnly, timeout: 60_000 }, async (t) => {
-  const start = supervisors(t);
-  const run = await start("reattach", ["--detach-on-owner-exit", "500"]);
-  run.owner.kill("SIGKILL");
-  run.request("attach");
-  // Far past the window and its grace: the reattached runtime keeps it.
-  await delay(3000);
-  assert.equal(alive(run.providerPid()), true, "the supervisor ended a reattached shell at the window");
-  const detachedAgain = Date.now();
-  run.request("detach");
-  await assertReleased(run, 10_000);
-  assert.ok(Date.now() - detachedAgain >= 500, "a fresh detach did not get its own window");
+  await assertReattachPausesWindow({ start: supervisors(t), detach, alive, assertReleased });
 });
 
 test("a detach-mode provider ends at once on an explicit stop, and stdin EOF alone does not end it", { ...linuxOnly, timeout: 60_000 }, async (t) => {
-  const start = supervisors(t);
-  const stopped = await start("stop", ["--detach-on-owner-exit", "60000"]);
-  stopped.owner.stdin.write("stop\n");
-  await waitUntil(() => stopped.supervisorExit(), "an explicit stop did not end the detach-mode provider");
-  assert.deepEqual(stopped.supervisorExit(), ["137", "null"]);
-  await assertReleased(stopped, 5000);
-
-  const eof = await start("eof", ["--detach-on-owner-exit", "60000"]);
-  eof.owner.stdin.write("close\n");
-  await delay(800);
-  assert.equal(eof.supervisorExit(), null, "stdin EOF ended a detach-mode provider");
-  assert.equal(alive(eof.providerPid()), true);
-  process.kill(eof.supervisorPid, "SIGTERM");
-  await waitUntil(() => eof.supervisorExit(), "a termination request did not end the detach-mode provider");
-  assert.deepEqual(eof.supervisorExit(), ["137", "null"]);
-  await assertReleased(eof, 5000);
-
-  // The shell's own exit while detached settles it without the window.
-  const exited = await start("exit", ["--detach-on-owner-exit", "60000"]);
-  exited.owner.kill("SIGKILL");
-  await delay(300);
-  exited.request("exit");
-  await assertReleased(exited, 5000);
+  await assertStopEndsDetachedProvider({ start: supervisors(t), detach, alive, assertReleased });
 });
 
 test("a detached provider whose reattached broker exits ends its orphaned descendants at once", { ...linuxOnly, timeout: 60_000 }, async (t) => {
@@ -227,25 +172,11 @@ test("a malformed detach request starts nothing", linuxOnly, () => {
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-// The whole path: a managed terminal launched with a reattach session, an
-// owner that crashes, and a later runtime that reattaches through slice 2 or
-// recovers the terminal through its native owner.
-const MANAGED_OWNER_SOURCE = `
-const [managed, id, launchDirectory, cwd, windowMs] = process.argv.slice(1);
-const { reattachToken, spawnManagedTerminal, terminalOwnership } = await import(managed);
-const ownership = terminalOwnership(id, launchDirectory);
-const token = reattachToken();
-const adapter = await spawnManagedTerminal({ id, ownership, shell: process.execPath, cwd, cols: 80, rows: 24,
-  env: process.env, session: { label: ownership.label, token, windowMs: Number(windowMs) } });
-let output = "";
-adapter.onData((data) => {
-  output += data;
-  if (output.includes("41")) console.log(JSON.stringify({ identity: adapter.sessionIdentity, token, pid: adapter.pid }));
-  if (output.includes("41")) output = "";
-});
-adapter.write("globalThis.kept = 41\\r");`;
-
-async function crashedManagedTerminal(t, windowMs) {
+// A managed terminal whose owner crashed, for a later runtime to reattach
+// through slice 2 or recover through its native owner. With pause, the
+// supervisor stops itself after its next empty poll once the test drops
+// pause.trigger.
+async function crashedManagedTerminal(t, windowMs, pause = null) {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-linux-detach-managed-"));
   const launchDirectory = path.join(directory, "launch");
   mkdirSync(launchDirectory, { mode: 0o700 });
@@ -253,11 +184,11 @@ async function crashedManagedTerminal(t, windowMs) {
   const handshakePath = path.join(launchDirectory, `terminal-${id}.json`);
   const managed = new URL("./managed-terminal.mjs", import.meta.url).href;
   const owner = spawn(process.execPath, ["--input-type=module", "-e", MANAGED_OWNER_SOURCE, managed, id, launchDirectory, directory, String(windowMs)],
-    { cwd: directory, stdio: ["ignore", "pipe", "pipe"] });
+    { cwd: directory, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...pause?.env } });
   let supervisorPid = 0;
   t.after(() => {
     try { owner.kill("SIGKILL"); } catch {}
-    if (alive(supervisorPid)) try { process.kill(supervisorPid, "SIGTERM"); } catch {}
+    if (alive(supervisorPid)) try { process.kill(supervisorPid, "SIGTERM"); process.kill(supervisorPid, "SIGCONT"); } catch {}
     rmSync(directory, { recursive: true, force: true });
   });
   let lines = "";
@@ -270,30 +201,82 @@ async function crashedManagedTerminal(t, windowMs) {
   supervisorPid = started.pid;
   assert.equal(existsSync(handshakePath), true, "the managed terminal has no launch handshake");
   owner.kill("SIGKILL");
+  const ownerGone = Date.now();
   const recover = () => recoverManagedTerminal({ target: id, created: 1, ownershipLabel: `com.21n.outright.terminal.${id}`, launchDirectory });
-  return { ...started, id, handshakePath, recover };
+  return { ...started, id, handshakePath, recover, ownerGone };
 }
+
+// Interposes poll() in the supervisor alone: after a poll that saw nothing,
+// it stops itself once the trigger file exists, standing for a supervisor
+// descheduled before it next evaluates its deadline.
+const PAUSE_SOURCE = `#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int poll(struct pollfd *descriptors, nfds_t count, int timeout) {
+  static int (*next)(struct pollfd *, nfds_t, int);
+  if (!next) next = (int (*)(struct pollfd *, nfds_t, int))dlsym(RTLD_NEXT, "poll");
+  int result = next(descriptors, count, timeout);
+  const char *program = getenv("OUTRIGHT_TEST_PAUSE_PROGRAM");
+  const char *trigger = getenv("OUTRIGHT_TEST_PAUSE_TRIGGER");
+  if (result == 0 && program && trigger && strcmp(program_invocation_short_name, program) == 0 && unlink(trigger) == 0) raise(SIGSTOP);
+  return result;
+}
+int __poll_chk(struct pollfd *descriptors, nfds_t count, int timeout, size_t length) {
+  (void)length;
+  return poll(descriptors, count, timeout);
+}
+`;
+
+function pausingPoll(t) {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-linux-detach-pause-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const source = path.join(directory, "pause.c");
+  const library = path.join(directory, "pause.so");
+  writeFileSync(source, PAUSE_SOURCE);
+  const build = spawnSync(process.env.CC || "cc", ["-shared", "-fPIC", "-O2", source, "-o", library, "-ldl"], { encoding: "utf8" });
+  assert.equal(build.status, 0, `the poll shim did not build: ${build.stderr}`);
+  const trigger = path.join(directory, "trigger");
+  return { trigger, env: { LD_PRELOAD: library, OUTRIGHT_TEST_PAUSE_PROGRAM: path.basename(AGENT_SUPERVISOR), OUTRIGHT_TEST_PAUSE_TRIGGER: trigger } };
+}
+
+const stopped = (pid) => {
+  const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+  return /^[Tt]$/.test(stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3));
+};
 
 test("a crashed runtime's terminal survives its supervisor's owner and a reattached runtime keeps it past the window", { ...linuxOnly, timeout: 90_000 }, async (t) => {
   const { id, identity, token, pid: supervisorPid, handshakePath, recover } = await crashedManagedTerminal(t, 3000);
-  let output = "";
-  // The broker takes a reattach once it has seen its crashed peer close; a
-  // refused attempt before then spends nothing.
-  let adapter = null;
-  const reattachDeadline = Date.now() + 2000;
-  const nextToken = reattachToken();
-  while (!adapter && Date.now() < reattachDeadline) {
-    adapter = await reattachManagedTerminal({ id, identity, token, nextToken, cols: 80, rows: 24, verifyEmpty: recover });
-    if (!adapter) await delay(50);
-  }
-  assert.ok(adapter, "the crashed runtime's terminal was not kept to reattach");
-  adapter.onData((data) => { output += data; });
+  const adapter = await reattachCrashedTerminal({ id, identity, token, verifyEmpty: recover });
   // Well past both the broker's window and the supervisor's: still live.
   await delay(7000);
-  assert.equal(adapter.write("kept + 1\r"), true, "the reattached broker went away");
-  await waitUntil(() => output.includes("42"), () => `the reattached shell is not the live process: ${JSON.stringify(output.slice(-400))}`);
+  await assertKeptShell(adapter);
   assert.equal(alive(supervisorPid), true, "the crashed owner's supervisor left the reattached terminal");
   // Handing the shell back starts a new window, after which nothing remains.
+  await adapter.release();
+  await waitUntil(() => !alive(supervisorPid), "a released shell outlived its window", 20_000);
+  assert.equal(existsSync(handshakePath), false, "an expired detached terminal left its launch handshake");
+});
+
+test("a reattach queued while the supervisor is descheduled past its deadline keeps the shell", { ...linuxOnly, timeout: 90_000 }, async (t) => {
+  const pause = pausingPoll(t);
+  const { id, identity, token, pid: supervisorPid, handshakePath, recover, ownerGone } = await crashedManagedTerminal(t, 1000, pause);
+  // Once the supervisor has started its window, stop it after an empty poll.
+  await delay(200);
+  writeFileSync(pause.trigger, "");
+  await waitUntil(() => stopped(supervisorPid), "the supervisor did not stop after an empty poll", 5000);
+  // An authenticated reattach inside the broker's window queues ATTACHED.
+  const adapter = await reattachCrashedTerminal({ id, identity, token, verifyEmpty: recover });
+  // Resume it well past its deadline, the 1000 ms window and its grace.
+  await delay(Math.max(0, ownerGone + 3500 - Date.now()));
+  process.kill(supervisorPid, "SIGCONT");
+  await delay(1500);
+  assert.equal(alive(supervisorPid), true, "a stale deadline ended a terminal reattached inside its window");
+  await assertKeptShell(adapter);
   await adapter.release();
   await waitUntil(() => !alive(supervisorPid), "a released shell outlived its window", 20_000);
   assert.equal(existsSync(handshakePath), false, "an expired detached terminal left its launch handshake");

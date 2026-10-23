@@ -580,14 +580,19 @@ int main(int argc, char **argv) {
     reap_children(provider_pid, &provider_reaped, &provider_status);
     if (detach_on_owner_exit && authorized && !stopping) {
       if (input_closed || getppid() != owner_pid) owner_lost = true;
+      // Sample the clock, then take any status already queued: a reattach the
+      // broker announced before that instant keeps the shell even when this
+      // supervisor was descheduled past its deadline.
+      const long long now = monotonic_ms();
+      drain_broker_status(&status_fd, &broker_status);
       if (broker_status.status != 0) {
         reattached = broker_status.status > 0;
         broker_status.status = 0;
         detach_deadline = 0;
       }
       if (owner_lost && !reattached && detach_deadline == 0)
-        detach_deadline = monotonic_ms() + detach_window_ms + detach_grace;
-      if (detach_deadline != 0 && monotonic_ms() >= detach_deadline) {
+        detach_deadline = now + detach_window_ms + detach_grace;
+      if (detach_deadline != 0 && now >= detach_deadline) {
         stopping = true;
         stop_requested = true;
         teardown_deadline = monotonic_ms() + TEARDOWN_BUDGET_MS;
