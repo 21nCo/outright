@@ -255,7 +255,7 @@ button, input, textarea, select { font: inherit; }
 .conversation-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
 .conversation-meta span { padding: 2px 7px; border-radius: 999px; color: var(--foreground); background: var(--muted); font-size: 9px; font-weight: 650; }
 .conversation-meta small { color: var(--muted-foreground); font-size: 9px; }
-.conversation-meta .conversation-account { max-width: min(260px, 38vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-meta .conversation-account { max-width: min(260px, 38cqw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .message-scroll { min-height: 0; height: 100%; overflow: hidden; }
 .message-scroll [data-slot="scroll-area-viewport"] { height: 100%; overflow-y: auto; }
@@ -319,8 +319,6 @@ button, input, textarea, select { font: inherit; }
 
 @media (max-width: 920px) {
   .app-shell { grid-template-columns: 292px minmax(0,1fr); min-width: 0; }
-  /* The settings button stays: it is the keyboard entry to the conversation's provider and model. */
-  .conversation-meta small:not(.conversation-account) { display: none; }
 }
 
 @media (max-width: 760px) {
@@ -328,7 +326,6 @@ button, input, textarea, select { font: inherit; }
   .sidebar { position: fixed; z-index: 50; inset: 0 auto 0 0; width: min(86vw, 320px); box-shadow: 18px 0 50px rgba(0,0,0,.18); }
   .workspace { width: 100%; }
   .workspace-tools .worktree-state { display: none; }
-  .message-column, .composer, .history-live-tail { width: calc(100% - 28px); }
 }
 
 /* Runtime workspace */
@@ -560,9 +557,6 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
 @media (max-width: 760px) {
   .app-shell { position: relative; display: block; min-width: 0; }
   .sidebar { position: fixed; z-index: 50; inset: 0 auto 0 0; width: min(88vw, 336px); max-width: calc(100vw - 44px); box-shadow: 18px 0 50px rgba(0,0,0,.22); }
-  .recovery-notice { flex-wrap: wrap; }
-  .recovery-actions { width: 100%; flex: 0 0 100%; align-items: stretch; }
-  .recovery-actions [data-slot="button"] { min-width: 0; white-space: normal; }
   .sidebar-is-closed .sidebar { transform: translateX(-100%); }
   .mobile-scrim { position: fixed; z-index: 49; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; display: block; background: rgba(0,0,0,.32); cursor: default; }
   .workspace { width: 100%; }
@@ -572,10 +566,7 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .workspace-tools { gap: 0; }
   .workspace-tools .worktree-state, .workspace-tools .run-state { display: none; }
   .chat-tab { min-width: 150px; max-width: 190px; }
-  .message-column, .composer, .history-live-tail { width: calc(100% - 16px); }
-  .message-column { padding-top: 18px; }
   .composer { margin-bottom: max(8px, env(safe-area-inset-bottom)); }
-  .conversation-header { padding: 0 16px; }
   .settings-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); }
   [data-slot="dialog-content"] { max-height: calc(100dvh - 16px); padding: 18px; overflow-y: auto; }
   .command-dialog { inset: 8px; width: auto; max-width: none; max-height: calc(100dvh - 16px); padding: 0; display: block; overflow: hidden; translate: 0 0; }
@@ -594,11 +585,31 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .workspace-context { min-width: 48px; }
   .workspace-context strong { max-width: 78px; }
   .workspace-tools [data-slot="button"] { width: 34px; }
+  .chat-tab { min-width: 138px; }
+  .manage-actions { align-items: stretch; flex-direction: column; gap: 7px; }
+  .manage-actions button { width: 100%; }
+}
+
+/* A pane's size, not the window's, compacts its view, so each view keeps its
+   primary content usable down to the pane minimums in src/lib/pane-layout.js.
+   Window media queries above only style the shell around the panes. */
+@container pane (max-width: 760px) {
+  .message-column, .composer, .history-live-tail { width: calc(100% - 16px); }
+  .message-column { padding-top: 18px; }
+  .conversation-header { padding: 0 16px; }
+  .recovery-notice { flex-wrap: wrap; }
+  .recovery-actions { width: 100%; flex: 0 0 100%; align-items: stretch; }
+  .recovery-actions [data-slot="button"] { min-width: 0; white-space: normal; }
+}
+@container pane (max-width: 640px) {
+  /* The settings button stays: it is the keyboard entry to the conversation's provider and model. */
+  .conversation-meta small:not(.conversation-account) { display: none; }
+}
+@container pane (max-width: 520px) {
   .conversation-pane { grid-template-rows: 68px minmax(0, 1fr) auto; }
   .conversation-header { grid-template-columns: minmax(0,1fr) auto; padding: 0 12px; }
   .conversation-symbol { display: none; }
   .conversation-header h1 { font-size: 14px; }
-  .chat-tab { min-width: 138px; }
   .message { grid-template-columns: 28px minmax(0,1fr); gap: 9px; margin-bottom: 20px; }
   .avatar { width: 27px; height: 27px; }
   .composer { min-height: 106px; border-radius: 9px; }
@@ -607,29 +618,12 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .composer-actions > div { min-width: 0; overflow: hidden; }
   .model-button { min-width: 0; max-width: 150px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   .send-hint { display: none; }
-  .manage-actions { align-items: stretch; flex-direction: column; gap: 7px; }
-  .manage-actions button { width: 100%; }
+  .recovery-actions [data-slot="button"] { width: 100%; }
   .changes-layout { grid-template-rows: minmax(110px, 34%) minmax(0,1fr); }
   .commit-bar { grid-template-columns: minmax(0,1fr); }
   .commit-bar button { width: 100%; }
   .terminal-tab { min-width: 130px; }
   .terminal-loading { font-size: 0; }
-  .recovery-actions [data-slot="button"] { width: 100%; }
-}
-
-/* A pane's size, not the window's, compacts its view, so each view keeps its
-   primary content usable down to the pane minimums in src/lib/pane-layout.js. */
-@container pane (max-width: 519px) {
-  .conversation-header { grid-template-columns: minmax(0,1fr) auto; padding: 0 12px; }
-  .conversation-symbol { display: none; }
-  .conversation-header h1 { font-size: 14px; }
-  .message-column, .composer, .history-live-tail { width: calc(100% - 16px); }
-  .message { grid-template-columns: 28px minmax(0,1fr); gap: 9px; }
-  .avatar { width: 27px; height: 27px; }
-  .composer-actions { grid-template-columns: minmax(0,1fr) 36px; gap: 5px; padding-inline: 5px; }
-  .composer-actions > div { min-width: 0; overflow: hidden; }
-  .model-button { min-width: 0; max-width: 150px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-  .send-hint { display: none; }
 }
 @container pane (max-height: 479px) {
   .conversation-pane { grid-template-rows: 56px minmax(0, 1fr) auto; }
@@ -641,6 +635,8 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .changes-pane { grid-template-rows: 40px minmax(0, 1fr) auto; }
   .changes-layout { grid-template-rows: minmax(64px, 30%) minmax(0, 1fr); }
   .commit-bar { padding-block: 5px; }
+  /* Short panes keep recovery actions on shared rows rather than one per row. */
+  .recovery-actions [data-slot="button"] { width: auto; flex: 1 1 auto; }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -44,6 +44,20 @@ class PreserveMovedState extends Component {
   render() { return this.props.children; }
 }
 
+// Switching between split and one-at-a-time panes unmounts the separators or
+// the pane tabs. Focus on one of them moves to the shown pane, not the page.
+class KeepFocusAcrossModes extends Component {
+  getSnapshotBeforeUpdate(previous) {
+    if (previous.compact === this.props.compact) return null;
+    const active = document.activeElement;
+    return Boolean(this.props.containerRef.current?.contains(active) && active.matches(".pane-separator, .pane-switcher [role='tab']"));
+  }
+  componentDidUpdate(_previous, _state, lost) {
+    if (lost && (!document.activeElement || document.activeElement === document.body)) this.props.onFocusLost();
+  }
+  render() { return this.props.children; }
+}
+
 function preferredSide(rect, target, view) {
   if (!rect) return "right";
   const targetMin = MIN_PANE_SIZE[target];
@@ -104,9 +118,18 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
     return () => observer.disconnect();
   }, []);
 
+  // A separator drag belongs to the tree it started on. Switching worktree or
+  // changing the panes replaces that tree, which cancels the drag unsaved.
+  const dragCurrent = drag && drag.root === layout.root;
+  useLayoutEffect(() => {
+    if (!dragRef.current || dragRef.current.root === layout.root) return;
+    dragRef.current = null;
+    setDrag(null);
+  }, [layout.root]);
+
   const views = layoutViews(layout.root);
   const multiple = views.length > 1;
-  const shownRoot = drag ? resizeSplit(layout, drag.path, drag.ratio).root : layout.root;
+  const shownRoot = dragCurrent ? resizeSplit(layout, drag.path, drag.ratio).root : layout.root;
   const geometry = computePaneRects(shownRoot, size.width, size.height);
   const compact = multiple && (compactPreferred || !geometry.fits);
   const geometryRef = useRef(geometry);
@@ -215,8 +238,9 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
     try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* not capturable */ }
     const stage = stageRef.current.getBoundingClientRect();
     const ratio = separator.size / separator.available;
-    dragRef.current = { separator, origin: separator.axis === "row" ? stage.left : stage.top, pointerId: event.pointerId, ratio };
-    setDrag({ path: separator.path, ratio });
+    const { root } = layoutRef.current;
+    dragRef.current = { separator, origin: separator.axis === "row" ? stage.left : stage.top, pointerId: event.pointerId, ratio, root };
+    setDrag({ path: separator.path, ratio, root });
   }
 
   function separatorPointerMove(event) {
@@ -226,7 +250,7 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
     const position = (separator.axis === "row" ? event.clientX : event.clientY) - active.origin - separator.start - PANE_SEPARATOR_SIZE / 2;
     const first = Math.min(separator.max, Math.max(separator.min, position));
     active.ratio = first / separator.available;
-    setDrag({ path: separator.path, ratio: active.ratio });
+    setDrag({ path: separator.path, ratio: active.ratio, root: active.root });
   }
 
   // The drag shows its ratio locally and saves the layout once, on release.
@@ -235,6 +259,7 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
     if (!active || active.pointerId !== event.pointerId) return;
     dragRef.current = null;
     setDrag(null);
+    if (active.root !== layoutRef.current.root) return;
     commit(resizeSplit(layoutRef.current, active.separator.path, active.ratio));
   }
 
@@ -305,7 +330,7 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
     </DropdownMenu>;
   }
 
-  return <div ref={containerRef} className={`pane-layout ${compact ? "is-compact" : ""} ${className}`}>
+  return <div ref={containerRef} className={`pane-layout ${compact ? "is-compact" : ""} ${className}`}><KeepFocusAcrossModes compact={compact} containerRef={containerRef} onFocusLost={() => focusPane(focused)}>
     {compact && <div className="pane-switcher">
       <div role="tablist" aria-label="Panes" aria-orientation="horizontal" onKeyDown={compactTabKeyDown}>
         {views.map((view) => { const Icon = VIEW_ICONS[view]; return <button key={view} type="button" role="tab" id={`pane-tab-${view}`} data-pane-view={view} aria-selected={view === focused} aria-controls={paneId(view)} tabIndex={view === focused ? 0 : -1} className={view === focused ? "is-active" : ""} onClick={() => selectCompactTab(view)}><Icon />{PANE_VIEW_LABELS[view]}</button>; })}
@@ -339,7 +364,7 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
         const percent = (value) => separator.available ? Math.round((value / separator.available) * 100) : 0;
         const firstLabel = separator.first.map((view) => PANE_VIEW_LABELS[view]).join(" and ");
         const secondLabel = separator.second.map((view) => PANE_VIEW_LABELS[view]).join(" and ");
-        return <div key={separator.path.join(".") || "root"} role="separator" tabIndex={0} className={`pane-separator ${drag && drag.path.join(".") === separator.path.join(".") ? "is-dragging" : ""}`}
+        return <div key={separator.path.join(".") || "root"} role="separator" tabIndex={0} className={`pane-separator ${dragCurrent && drag.path.join(".") === separator.path.join(".") ? "is-dragging" : ""}`}
           aria-orientation={separator.axis === "row" ? "vertical" : "horizontal"} aria-label={`Resize ${firstLabel} and ${secondLabel}`}
           aria-controls={[...separator.first, ...separator.second].map(paneId).join(" ")}
           aria-valuenow={percent(separator.size)} aria-valuemin={percent(separator.min)} aria-valuemax={percent(separator.max)} aria-valuetext={`${firstLabel} ${percent(separator.size)}%`}
@@ -349,5 +374,5 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
       })}
     </div>
     <span className="sr-only" role="status" aria-live="polite">{announcement}</span>
-  </div>;
+  </KeepFocusAcrossModes></div>;
 }

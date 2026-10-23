@@ -289,8 +289,25 @@ export function loadPaneLayout(storage, worktreeId) {
   try { store = readStore(storage); }
   catch { return { layout: defaultPaneLayout(), problems: ["storage"] }; }
   const entry = store.entries.get(worktreeId);
-  if (!entry) return { layout: defaultPaneLayout(), problems: store.damaged ? ["unreadable"] : [] };
+  if (!entry) return { layout: defaultPaneLayout(), problems: store.damaged ? ["store"] : [] };
   return normalizePaneLayout(entry.layout);
+}
+
+// "storage" and "store" describe every worktree's saved layouts, not one.
+export const PANE_STORE_PROBLEMS = Object.freeze(["storage", "store"]);
+const UNREADABLE_PROBLEMS = new Set([...PANE_STORE_PROBLEMS, "unreadable", "version"]);
+
+// The notice names what restoring changed, or "" when nothing did.
+export function paneRestoreMessage(problems) {
+  if (!problems.length) return "";
+  if (problems.some((problem) => UNREADABLE_PROBLEMS.has(problem))) return "The saved pane layout could not be read; showing the default layout";
+  const repairs = [];
+  if (problems.some((problem) => ["node", "view", "duplicate"].includes(problem))) repairs.push("panes that could not be restored were left out");
+  if (problems.includes("conversation")) repairs.push("the conversation pane was added back");
+  if (problems.includes("ratio")) repairs.push("pane sizes that were not valid were reset");
+  if (!repairs.length) return "";
+  const listed = repairs.length > 1 ? `${repairs.slice(0, -1).join(", ")} and ${repairs.at(-1)}` : repairs[0];
+  return `Restored the pane layout; ${listed}`;
 }
 
 // Read-modify-write keeps other worktrees' layouts saved by another tab.

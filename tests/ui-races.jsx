@@ -6638,6 +6638,14 @@ async function splitPaneLayoutRegression() {
     root.render(<TooltipProvider><App /></TooltipProvider>);
     await until(() => host.querySelector(".toast")?.textContent.includes("could not be read; showing the default layout"), "unreadable layout notice");
     assert(paneOrder() === "conversation" && !host.querySelector(".pane-header"), "An unreadable layout did not fall back to the default");
+    // The damaged store is announced once, not again for each worktree.
+    await until(() => !host.querySelector(".toast"), "unreadable layout notice dismissed");
+    host.querySelector('[aria-label="Expand Review B"]')?.click();
+    await until(() => [...host.querySelectorAll(".worktree-row")].some((row) => row.textContent.includes("B")), "worktree B row after unreadable store");
+    [...host.querySelectorAll(".worktree-row")].find((row) => row.querySelector("strong")?.textContent === "B").click();
+    await until(() => host.querySelector('textarea[placeholder*="in B"]'), "worktree B after unreadable store");
+    for (let index = 0; index < 4; index += 1) await frame(); // NOSONAR S9382: a repeated notice would render within these frames
+    assert(!host.querySelector(".toast")?.textContent.includes("could not be read"), "The unreadable layout store was announced again for another worktree");
   } finally {
     root.render(null);
     await settle();
@@ -6742,6 +6750,203 @@ async function paneMinimumContentRegression() {
     usable.context();
     usable.changes();
   } finally {
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
+// Notices and controls inside a pane follow the pane's width, not the
+// window's: on a wide window a conversation at its minimum width keeps the
+// recovery explanation and every decision readable and clickable, the unsent
+// first-prompt notice keeps its buttons, and the commit bar fits Changes at
+// its minimum width.
+async function paneNoticeMinimumRegression() {
+  if (!window.__fixtureSetViewport) return false;
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const interrupted = { id: "run-interrupted", conversationId: "chat-A", status: "interrupted", recoveryClass: "exited", provider: "codex", providerSessionId: "session-A" };
+  const recoveryChat = { ...chats.A, providerSessionId: "session-A", runs: [interrupted] };
+  const created = { ...chats.A, id: "chat-unsent", title: "Unsent first prompt" };
+  let conversations = [recoveryChat];
+  route = async (url, options = {}) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations" && options.method === "POST") { conversations = [created]; return response(created, 201); }
+    if (url.pathname === "/api/conversations") return response({ conversations });
+    if (url.pathname === "/api/conversations/chat-A") return response(recoveryChat);
+    if (url.pathname === "/api/conversations/chat-unsent") return response({ error: "Chat details unavailable" }, 503);
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [{ path: "src/notice.js", status: "M" }], stagedCount: 12 });
+    if (url.pathname === "/api/git/diff") return response({ diff: "+notice line" });
+    if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    return response({});
+  };
+  const leaf = (view) => ({ type: "pane", view });
+  const saveMinimumLayout = () => localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { A: { savedAt: 1, layout: { version: 1, focused: "conversation", root: {
+    type: "split", axis: "row", ratio: 0.05, first: leaf("conversation"), second: { type: "split", axis: "row", ratio: 0.95, first: leaf("context"), second: leaf("changes") },
+  } } } } }));
+  // A control is usable when it lies inside its pane and is what a click at its centre reaches.
+  const reachable = (element, view, label) => {
+    const rect = element?.getBoundingClientRect();
+    const pane = paneRect(view);
+    assert(rect && rect.width > 0 && rect.height > 0 && rect.left >= pane.left - 1 && rect.right <= pane.right + 1 && rect.top >= pane.top - 1 && rect.bottom <= pane.bottom + 1,
+      `${label} is clipped by its ${view} pane: ${JSON.stringify([rect?.toJSON(), pane.toJSON()])}`);
+    assert(element.scrollWidth <= element.clientWidth + 1, `${label} clips its text: ${element.scrollWidth} > ${element.clientWidth}`);
+    const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    assert(element.contains(hit), `${label} is covered by ${hit?.outerHTML.slice(0, 120)}`);
+  };
+  try {
+    await window.__fixtureSetViewport(1280);
+    await until(() => window.innerWidth === 1280, "wide notice viewport");
+    window.dispatchEvent(new Event("resize"));
+
+    saveMinimumLayout();
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelectorAll("#pane-conversation .recovery-actions button").length === 3
+      && host.querySelector('#pane-changes .commit-bar [aria-label="Commit message"]'), "recovery notice beside Changes at their minimum widths");
+    await settle();
+    assert(Math.abs(paneRect("conversation").width - 320) <= 1 && Math.abs(paneRect("changes").width - 280) <= 1,
+      `The panes are not at their minimum widths: ${JSON.stringify([paneRect("conversation").toJSON(), paneRect("changes").toJSON()])}`);
+    const copy = host.querySelector("#pane-conversation .recovery-copy");
+    assert(copy.getBoundingClientRect().width >= 200, `The recovery explanation is ${copy.getBoundingClientRect().width}px wide in a 320px conversation pane`);
+    reachable(copy, "conversation", "The recovery explanation");
+    for (const button of host.querySelectorAll("#pane-conversation .recovery-actions button")) reachable(button, "conversation", button.textContent.trim());
+    const commitMessage = host.querySelector('#pane-changes .commit-bar [aria-label="Commit message"]');
+    assert(commitMessage.getBoundingClientRect().width >= 200, `The commit message field is ${commitMessage.getBoundingClientRect().width}px wide in a 280px Changes pane`);
+    reachable(commitMessage, "changes", "The commit message");
+    setControlValue(commitMessage, "Commit from a narrow pane");
+    await until(() => [...host.querySelectorAll("#pane-changes .commit-bar button")].some((button) => button.textContent.includes("Commit") && !button.disabled), "commit enabled");
+    reachable([...host.querySelectorAll("#pane-changes .commit-bar button")].find((button) => button.textContent.includes("Commit")), "changes", "The commit button");
+
+    // A first prompt whose chat was created but not sent, in the same pane.
+    root.render(null);
+    await settle();
+    conversations = [];
+    localStorage.removeItem(keys[2]);
+    saveMinimumLayout();
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('#pane-conversation textarea[aria-label="Message the agent"]:not(:disabled)'), "empty worktree composer");
+    setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "First prompt in a narrow pane");
+    await until(() => host.querySelector('[aria-label="Send message"]:not(:disabled)'), "first prompt enabled");
+    host.querySelector('[aria-label="Send message"]').click();
+    await until(() => host.querySelector("#pane-conversation .first-prompt-notice button"), "unsent first-prompt notice");
+    await until(() => !host.querySelector(".toast"), "notices settle");
+    await settle();
+    const notice = host.querySelector("#pane-conversation .first-prompt-notice");
+    assert(notice.getBoundingClientRect().width >= 260, `The unsent prompt notice is ${notice.getBoundingClientRect().width}px wide`);
+    for (const button of notice.querySelectorAll("button")) reachable(button, "conversation", button.textContent.trim());
+  } finally {
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
+// A separator drag belongs to the layout it started on. Switching worktree or
+// opening a pane while the pointer is down cancels it without saving. Focus
+// on a separator or pane tab that a responsive change removes moves to the
+// shown pane, and the layout menu's F6 hint is a description, not menu content.
+async function paneLayoutReplacementRegression() {
+  if (!window.__fixtureSetViewport) return false;
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats[url.searchParams.get("projectId")] ?? chats.A] });
+    const match = url.pathname.match(/^\/api\/conversations\/chat-([AB])$/);
+    if (match) return response(chats[match[1]]);
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [], stagedCount: 0 });
+    if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    return response({});
+  };
+  const split = (ratio) => ({ version: 1, focused: "conversation", root: { type: "split", axis: "row", ratio, first: { type: "pane", view: "conversation" }, second: { type: "pane", view: "changes" } } });
+  localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { A: { savedAt: 2, layout: split(0.5) }, B: { savedAt: 1, layout: split(0.6) } } }));
+  const savedLayout = (id) => JSON.parse(localStorage.getItem(LAYOUT_KEY)).worktrees[id].layout;
+  const setWidth = async (width) => {
+    await window.__fixtureSetViewport(width);
+    await until(() => window.innerWidth === width, `real ${width}px layout`);
+    window.dispatchEvent(new Event("resize"));
+    await settle();
+  };
+  const separator = () => host.querySelector('.pane-separator[role="separator"]');
+  const pointer = (target, type, x) => target.dispatchEvent(new PointerEvent(type, { pointerId: 9, button: 0, clientX: x, clientY: target.getBoundingClientRect().top + 100, bubbles: true, cancelable: true }));
+  const layoutWrites = [];
+  const setItem = Storage.prototype.setItem;
+  Storage.prototype.setItem = function recordLayoutWrite(key, value) {
+    if (key === LAYOUT_KEY) layoutWrites.push(value);
+    return setItem.call(this, key, value);
+  };
+  try {
+    await setWidth(1280);
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('textarea[placeholder*="in A"]') && host.querySelector("#pane-changes .changes-pane"), "worktree A split");
+    const savedA = JSON.stringify(savedLayout("A"));
+    const savedB = JSON.stringify(savedLayout("B"));
+
+    // Drag in A, switch to B mid-drag, release: B keeps its own split.
+    const dragged = separator();
+    const startX = dragged.getBoundingClientRect().left + 3;
+    const widthA = paneRect("conversation").width;
+    pointer(dragged, "pointerdown", startX);
+    pointer(dragged, "pointermove", startX + 80);
+    await until(() => paneRect("conversation").width > widthA + 40, "the drag widens A's conversation");
+    host.querySelector('[aria-label="Expand Review B"]')?.click();
+    await until(() => [...host.querySelectorAll(".worktree-row")].some((row) => row.textContent.includes("B")), "worktree B row");
+    [...host.querySelectorAll(".worktree-row")].find((row) => row.querySelector("strong")?.textContent === "B").click();
+    await until(() => host.querySelector('textarea[placeholder*="in B"]') && host.querySelector("#pane-changes .changes-pane"), "worktree B split");
+    await settle();
+    const widthB = paneRect("conversation").width;
+    pointer(dragged.isConnected ? dragged : separator(), "pointermove", startX + 160);
+    await settle();
+    assert(Math.abs(paneRect("conversation").width - widthB) <= 1, "A drag started in worktree A resized worktree B");
+    pointer(dragged.isConnected ? dragged : separator(), "pointerup", startX + 160);
+    await settle();
+    assert(layoutWrites.length === 0, `Releasing a drag from another worktree saved ${layoutWrites.length} layouts`);
+    assert(Math.abs(paneRect("conversation").width - widthB) <= 1, "Releasing a drag from another worktree resized worktree B");
+    assert(JSON.stringify(savedLayout("A")) === savedA && JSON.stringify(savedLayout("B")) === savedB, "A cancelled drag changed a saved layout");
+
+    // Drag in B, open a pane mid-drag, release: only the open is saved.
+    const before = separator();
+    const beforeX = before.getBoundingClientRect().left + 3;
+    pointer(before, "pointerdown", beforeX);
+    pointer(before, "pointermove", beforeX - 80);
+    await until(() => paneRect("conversation").width < widthB - 40, "the drag narrows B's conversation");
+    host.querySelector('[aria-label="Project context"]').click();
+    await until(() => host.querySelector("#pane-context") && layoutWrites.length === 1, "context opened and saved during the drag");
+    await settle();
+    const opened = layoutWrites[0];
+    const rects = ["conversation", "context", "changes"].map((view) => JSON.stringify(paneRect(view).toJSON()));
+    pointer(before.isConnected ? before : separator(), "pointerup", beforeX - 160);
+    await settle();
+    assert(layoutWrites.length === 1 && JSON.stringify(savedLayout("B")) === JSON.stringify(JSON.parse(opened).worktrees.B.layout),
+      `Releasing a drag after a pane opened changed the new layout: ${layoutWrites.slice(1).join(" | ")}`);
+    assert(["conversation", "context", "changes"].every((view, index) => JSON.stringify(paneRect(view).toJSON()) === rects[index]), "Releasing a drag after a pane opened resized the new layout");
+
+    // The F6 hint describes the layout menu instead of sitting in it.
+    const layoutMenu = host.querySelector('[aria-label="Pane layout"]');
+    assert(document.getElementById(layoutMenu.getAttribute("aria-describedby"))?.textContent === "F6 moves focus between panes", "The pane layout button does not describe F6");
+    layoutMenu.click();
+    let menu;
+    await until(() => (menu = document.querySelector('[role="menu"]')) && menu.querySelector('[role="menuitem"]'), "pane layout menu");
+    const exposed = [...menu.querySelectorAll("p, span")].filter((node) => node.textContent.includes("F6") && !node.closest('[aria-hidden="true"]'));
+    assert(!exposed.length && menu.getAttribute("aria-describedby") === "pane-layout-hint", "The F6 hint is exposed as content inside the menu");
+    pressKey(document.activeElement, "Escape");
+    await until(() => !document.querySelector('[role="menu"]'), "pane layout menu closed");
+
+    // Focus on chrome removed by a responsive change moves to the shown pane.
+    const focusedView = () => host.querySelector(".pane.is-focused")?.dataset.paneView;
+    separator().focus();
+    const viewBefore = focusedView();
+    await setWidth(640);
+    await until(() => host.querySelector(".pane-switcher"), "panes one at a time");
+    await until(() => document.activeElement === host.querySelector(`#pane-${viewBefore}`), `focus on a removed separator moves to the ${viewBefore} pane instead of ${document.activeElement?.outerHTML.slice(0, 80)}`);
+    host.querySelector(`#pane-tab-${viewBefore}`).focus();
+    await setWidth(1280);
+    await until(() => !host.querySelector(".pane-switcher") && separator(), "split panes again");
+    await until(() => document.activeElement === host.querySelector(`#pane-${viewBefore}`), `focus on a removed pane tab moves to the ${viewBefore} pane instead of ${document.activeElement?.outerHTML.slice(0, 80)}`);
+  } finally {
+    Storage.prototype.setItem = setItem;
     root.render(null);
     await settle();
   }
@@ -7449,6 +7654,8 @@ try {
     ["conversation settings keyboard", conversationSettingsKeyboardRegression, "conversation settings stay keyboard reachable at 360, 760 and 900px", "keyboard and width checks require the CDP bridges"],
     ["split pane layout", splitPaneLayoutRegression, "nested panes resize, move, cycle focus, restore and repair without restarting their views"],
     ["pane minimum content", paneMinimumContentRegression, "every view keeps usable content at its minimum pane size, including restored layouts", "minimum pane geometry requires the CDP viewport bridge"],
+    ["pane notices at minimum", paneNoticeMinimumRegression, "recovery, unsent-prompt and commit controls stay readable and clickable at the pane minimums on a wide window", "minimum pane geometry requires the CDP viewport bridge"],
+    ["pane layout replacement", paneLayoutReplacementRegression, "a separator drag on a replaced layout is discarded unsaved and focus on removed pane chrome moves to the shown pane", "responsive transition requires the CDP viewport bridge"],
     ["pane drag isolation", paneDragChatTabRegression, "pane title drags never reorder chat tabs, even after an unfinished tab drag"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and one-at-a-time panes contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],

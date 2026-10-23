@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   MAX_SAVED_LAYOUTS, MIN_PANE_SIZE, PANE_LAYOUT_STORAGE_KEY, PANE_SEPARATOR_SIZE, PANE_VIEWS, applyPreset, closeView, computePaneRects,
-  defaultPaneLayout, layoutViews, loadPaneLayout, moveView, neighborView, normalizePaneLayout, openView, resizeSplit, savePaneLayout, swapViews,
+  defaultPaneLayout, layoutViews, loadPaneLayout, moveView, neighborView, normalizePaneLayout, openView, paneRestoreMessage, resizeSplit, savePaneLayout, swapViews,
 } from "../src/lib/pane-layout.js";
 
 const pane = (view) => ({ type: "pane", view });
@@ -158,7 +158,7 @@ test("saved layouts are bounded to the most recently arranged worktrees", () => 
 
 test("unreadable or unavailable storage falls back to the default layout and says so", () => {
   const damaged = memoryStorage({ [PANE_LAYOUT_STORAGE_KEY]: "{not json" });
-  assert.deepEqual(loadPaneLayout(damaged, "wt-a"), { layout: defaultPaneLayout(), problems: ["unreadable"] });
+  assert.deepEqual(loadPaneLayout(damaged, "wt-a"), { layout: defaultPaneLayout(), problems: ["store"] });
   assert.equal(savePaneLayout(damaged, "wt-a", review(), 1), true, "A damaged store blocked new saves");
   assert.deepEqual(loadPaneLayout(damaged, "wt-a"), { layout: review(), problems: [] });
 
@@ -170,4 +170,13 @@ test("unreadable or unavailable storage falls back to the default layout and say
   assert.equal(savePaneLayout(refusing, "wt-a", review()), false);
   const full = { ...memoryStorage(), setItem() { throw new Error("QuotaExceededError"); } };
   assert.equal(savePaneLayout(full, "wt-a", review()), false);
+});
+
+test("the restore notice names the repair that happened", () => {
+  assert.equal(paneRestoreMessage([]), "");
+  assert.equal(paneRestoreMessage(["ratio"]), "Restored the pane layout; pane sizes that were not valid were reset");
+  assert.equal(paneRestoreMessage(["node", "conversation"]), "Restored the pane layout; panes that could not be restored were left out and the conversation pane was added back");
+  assert.equal(paneRestoreMessage(["view", "ratio", "conversation"]),
+    "Restored the pane layout; panes that could not be restored were left out, the conversation pane was added back and pane sizes that were not valid were reset");
+  for (const problem of ["storage", "store", "unreadable", "version"]) assert.match(paneRestoreMessage([problem]), /could not be read; showing the default layout/);
 });

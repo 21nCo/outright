@@ -62,7 +62,7 @@ The main view is a pane layout for the selected worktree. The conversation, cont
 
 Separators resize with the pointer or, when focused, with the arrow keys, `Home`, and `End`; every pane keeps a minimum usable size that fits its view's own controls plus several message, diff, or terminal lines, and each view compacts its chrome to the size of its pane rather than the window. When the window is too small for every pane's minimum, or narrower than 760px, panes are shown one at a time with tabs, and their views stay mounted.
 
-Layouts are saved in the browser's local storage per worktree, for the 64 most recently arranged worktrees. A saved layout with an unknown or duplicate view or an invalid size is repaired on restore, and an unreadable one falls back to the conversation alone; Outright says which happened.
+Layouts are saved in the browser's local storage per worktree, for the 64 most recently arranged worktrees. A saved layout with an unknown or duplicate view or an invalid size is repaired on restore, and an unreadable one falls back to the conversation alone; Outright names the repair it made, and says only once per session when the saved layouts cannot be read at all.
 
 ## Keyboard shortcuts
 
