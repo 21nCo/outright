@@ -25,6 +25,9 @@ const originalFetch = window.fetch;
 const OriginalSocket = window.WebSocket;
 const keys = ["outright.selected-project", "outright.selected-worktree", "outright.selected-conversation"];
 const saved = keys.map((key) => localStorage.getItem(key));
+// Pane layouts persist per worktree; each step starts from the default.
+const LAYOUT_KEY = "outright.pane-layouts";
+const savedLayouts = localStorage.getItem(LAYOUT_KEY);
 const projects = ["A", "B"].map((id) => ({ id, name: `Review ${id}`, path: `/fixture/${id}`, worktrees: [{ id, name: id, path: `/fixture/${id}`, branch: "main", changedCount: 0 }] }));
 const chats = Object.fromEntries(projects.map(({ id }) => [id, { id: `chat-${id}`, title: `Conversation ${id}`, projectId: id, worktreeId: id, worktreePath: `/fixture/${id}`, provider: "codex", messages: [], runs: [] }]));
 const terminal = (id) => ({ id: `term-${id}`, name: `Terminal ${id}`, cwd: `/fixture/${id[0]}`, status: "running" });
@@ -181,18 +184,18 @@ async function chatTabControlRegression() {
   nextChat.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true }));
   await until(() => selected.getAttribute("aria-selected") === "true", "Home returns to first chat");
   const changes = host.querySelector('[aria-label="Changes"]');
-  assert(!host.querySelector("#workspace-inspector"), "Inspector was already open before Changes click");
+  assert(!host.querySelector("#pane-changes") && changes.getAttribute("aria-pressed") === "false", "Changes pane was already open before Changes click");
+  changes.focus();
   changes.click();
-  await settle();
-  assert(host.querySelector('#workspace-inspector'), `Inspector did not open: changes=${changes.outerHTML.slice(0, 400)}, connected=${changes.isConnected}, active=${document.activeElement?.outerHTML.slice(0, 250)}`);
-  assert(host.querySelector('#inspector-tab-changes[aria-selected="true"]'),
-    `Changes did not select the inspector tab: ${host.querySelector('#workspace-inspector')?.outerHTML.slice(0, 600)}`);
-  const inspectorTab = host.querySelector("#inspector-tab-changes");
-  await assertVerticalKeysIgnored(inspectorTab, inspectorTab, "Inspector");
-  inspectorTab.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true, cancelable: true }));
-  await until(() => host.querySelector('#inspector-tab-context[aria-selected="true"]'), "End selects final inspector tab");
-  host.querySelector("#inspector-tab-context").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
-  await until(() => host.querySelector('#inspector-tab-terminal[aria-selected="true"]'), "left arrow selects terminal inspector tab");
+  await until(() => document.activeElement === host.querySelector("#pane-changes"), "Changes pane opened with focus");
+  assert(changes.getAttribute("aria-pressed") === "true" && changes.getAttribute("aria-controls") === "pane-changes",
+    `Changes toggle does not report its pane: ${changes.outerHTML.slice(0, 300)}`);
+  assert(host.querySelector('[role="tab"][aria-selected="true"]') === selected, "Opening a pane changed the selected chat");
+  changes.focus();
+  changes.click();
+  await until(() => !host.querySelector("#pane-changes"), "Changes toggle closes its pane");
+  assert(changes.getAttribute("aria-pressed") === "false" && !changes.hasAttribute("aria-controls"), "Closed Changes pane is still reported open");
+  assert(document.activeElement === changes, "Closing from the toolbar moved focus away from the toggle");
 }
 
 async function sameWorktreeChatSelectionRegression() {
@@ -3892,7 +3895,7 @@ async function changesSelectionRefreshRegression() {
     return response({});
   };
   const tree = projects[0].worktrees[0];
-  const pane = (event) => <div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>;
+  const pane = (event) => <div className="pane-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>;
   root.render(pane(null));
   await until(() => host.querySelectorAll('.change-file-select').length === 2, "change selection ready");
   holdStatus = true;
@@ -3945,7 +3948,7 @@ async function changesDiffFailureOwnershipRegression() {
     }
     return response({});
   };
-  root.render(<div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>);
+  root.render(<div className="pane-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>);
   await until(() => host.querySelector('.diff-view')?.textContent.includes("A content"), "initial A diff");
   [...host.querySelectorAll('.change-file-select')].find((button) => button.textContent.includes("b.txt")).click();
   await settle();
@@ -3976,7 +3979,7 @@ async function diffRefreshAnchorRegression() {
     return response({});
   };
   const tree = projects[0].worktrees[0];
-  const pane = (event) => <div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>;
+  const pane = (event) => <div className="pane-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>;
   root.render(pane(null));
   await until(() => host.querySelector(".diff-view")?.textContent.includes("line 0"), "large diff ready");
   const viewport = host.querySelector(".diff-view");
@@ -4030,7 +4033,7 @@ async function changesMutationOwnerRegression(reject = false, mode = "stage") {
     if (url.pathname === `/api/git/${mode}`) return pending.promise;
     return response({});
   };
-  const pane = (tree) => <div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>;
+  const pane = (tree) => <div className="pane-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>;
   root.render(pane(projects[0].worktrees[0]));
   await until(() => host.querySelector('.pane-toolbar strong')?.textContent === "A branch", "A changes ready");
   host.querySelector(`[aria-label="${mode === "unstage" ? "Unstage" : "Stage"} file.txt"]`).click();
@@ -4058,7 +4061,7 @@ async function changesCommitOwnerRegression(reject = false) {
     if (url.pathname === "/api/git/commit") return pending.promise;
     return response({});
   };
-  const pane = (tree) => <div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={(message) => toasts.push(message)} /></div>;
+  const pane = (tree) => <div className="pane-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={(message) => toasts.push(message)} /></div>;
   root.render(pane(projects[0].worktrees[0]));
   await until(() => host.querySelector('.pane-toolbar strong')?.textContent === "A branch", "A commit pane ready");
   setControlValue(host.querySelector('[aria-label="Commit message"]'), "Commit A");
@@ -4085,7 +4088,7 @@ async function productionDiffViewportRegression() {
     if (url.pathname === "/api/git/diff") return response({ diff: url.searchParams.get("staged") === "true" ? staged : unstaged });
     return response({});
   };
-  root.render(<div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>);
+  root.render(<div className="pane-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>);
   await until(() => host.querySelector('.diff-view')?.textContent.includes("-unstaged 0"), "initial production diff");
   host.querySelector('[aria-label="Diff view"] button[aria-pressed="false"]').click();
   await until(() => host.querySelector('.diff-view')?.textContent.includes("+staged 0"), "staged production diff");
@@ -4205,10 +4208,10 @@ async function productionDiffViewportRegression() {
   await until(() => viewport.textContent.includes("unstaged 49999"), "real End takes ownership after Find");
   host.querySelector('[aria-label="Next diff match"]').click();
   await until(matchIsVisible, "Find realigns after a real End key");
-  root.render(<div className="inspector-body" style={{ width: 320, height: 480 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>);
+  root.render(<div className="pane-body" style={{ width: 320, height: 480 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>);
   await settle();
-  assert(host.querySelector('.diff-view').clientHeight > 0 && host.querySelector('.diff-view').clientHeight < 480, "Narrow inspector lost its bounded diff viewport");
-  assert(host.querySelector('.diff-view').querySelectorAll("span").length < 200, "Narrow inspector mounted all diff lines");
+  assert(host.querySelector('.diff-view').clientHeight > 0 && host.querySelector('.diff-view').clientHeight < 480, "Narrow pane lost its bounded diff viewport");
+  assert(host.querySelector('.diff-view').querySelectorAll("span").length < 200, "Narrow pane mounted all diff lines");
 }
 
 async function longTranscriptWindowRegression() {
@@ -6416,6 +6419,232 @@ async function spaceSidebarRegression() {
   assertNoGroupCopy(sidebarCopy(), "Updated sidebar");
 }
 
+function paneRect(view) { return host.querySelector(`#pane-${view}`)?.getBoundingClientRect(); }
+function paneOrder() { return [...host.querySelectorAll(".pane-stage > .pane")].map((element) => element.dataset.paneView).join(","); }
+async function choosePaneMenuItem(view, label) {
+  host.querySelector(`[aria-label="${view} pane options"]`).click();
+  let item;
+  await until(() => (item = [...document.querySelectorAll('[role="menuitem"]')].find((entry) => entry.textContent === label || entry.getAttribute("aria-label") === label)), `${view} pane menu item ${label}`);
+  item.click();
+}
+function pressKey(target, key, options = {}) {
+  const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...options });
+  target.dispatchEvent(event);
+  return event;
+}
+
+// A conversation beside a terminal and a diff: nested splits with minimum
+// sizes, keyboard resizing, moves that keep each view's mounted session,
+// F6 focus cycling, restore after reload, and repair of a damaged layout.
+async function splitPaneLayoutRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const requests = [];
+  route = async (url, options = {}) => {
+    requests.push(`${options.method ?? "GET"} ${url.pathname}`);
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats[url.searchParams.get("projectId")] ?? chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/conversations/chat-B") return response(chats.B);
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("B")] });
+    if (url.pathname.startsWith("/api/terminals/")) return response({ buffer: "Split pane fixture\r\n" });
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [], stagedCount: 0 });
+    if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    return response({});
+  };
+  const terminalRequests = () => requests.filter((request) => request.includes("/api/terminals")).length;
+  try {
+    if (window.__fixtureSetViewport) {
+      await window.__fixtureSetViewport(1280);
+      await until(() => window.innerWidth === 1280, "wide split viewport");
+      window.dispatchEvent(new Event("resize"));
+    }
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('textarea[aria-label="Message the agent"]'), "split fixture");
+    assert(!host.querySelector(".pane-header") && !host.querySelector('.pane-separator'), "A lone conversation showed split chrome");
+    const composer = host.querySelector('textarea[aria-label="Message the agent"]');
+    setControlValue(composer, "Draft kept across pane moves");
+
+    host.querySelector('[aria-label="Terminal"]').click();
+    await until(() => terminalReady("Terminal A") && document.activeElement === host.querySelector("#pane-terminal"), "terminal pane beside the conversation");
+    assert(paneRect("terminal").left >= paneRect("conversation").right && Math.abs(paneRect("terminal").top - paneRect("conversation").top) < 1,
+      "The terminal did not open beside the conversation");
+    // The focused terminal is taller than its split share is wide: Changes nests below it.
+    host.querySelector('[aria-label="Changes"]').click();
+    await until(() => host.querySelector("#pane-changes .changes-pane"), "changes pane");
+    assert(Math.abs(paneRect("terminal").left - paneRect("changes").left) < 1 && paneRect("changes").top >= paneRect("terminal").bottom,
+      `Changes did not nest below the terminal: ${JSON.stringify([paneRect("terminal"), paneRect("changes")])}`);
+    assert(paneOrder() === "conversation,terminal,changes", `Panes are not in reading order: ${paneOrder()}`);
+    const xterm = host.querySelector(".terminal-host .xterm");
+    const listedTerminals = terminalRequests();
+
+    const outer = host.querySelector('.pane-separator[role="separator"][aria-label="Resize Conversation and Terminal and Changes"]');
+    assert(outer?.getAttribute("aria-orientation") === "vertical" && outer.getAttribute("aria-controls") === "pane-conversation pane-terminal pane-changes", "The outer split has no labelled vertical separator");
+    const before = paneRect("conversation").width;
+    const valueBefore = Number(outer.getAttribute("aria-valuenow"));
+    outer.focus();
+    assert(pressKey(outer, "ArrowRight").defaultPrevented, "ArrowRight on a separator was not handled");
+    await until(() => paneRect("conversation").width > before, "ArrowRight widens the conversation");
+    assert(Number(outer.getAttribute("aria-valuenow")) > valueBefore, "The separator value did not follow the resize");
+    pressKey(outer, "End");
+    await until(() => Math.abs(paneRect("changes").width - 280) <= 1, "End stops at the right column's minimum width");
+    pressKey(outer, "Home");
+    await until(() => Math.abs(paneRect("conversation").width - 320) <= 1, "Home stops at the conversation's minimum width");
+    assert(pressKey(outer, "ArrowUp").defaultPrevented === false, "A vertical separator handled ArrowUp");
+    // A pointer drag follows the pointer and saves the layout once, on release.
+    const layoutWrites = [];
+    const setItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function recordLayoutWrite(key, value) {
+      if (key === LAYOUT_KEY) layoutWrites.push(value);
+      return setItem.call(this, key, value);
+    };
+    try {
+      const start = outer.getBoundingClientRect();
+      const pointer = (type, dx) => outer.dispatchEvent(new PointerEvent(type, { pointerId: 7, button: 0, clientX: start.left + start.width / 2 + dx, clientY: start.top + 100, bubbles: true, cancelable: true }));
+      pointer("pointerdown", 0);
+      for (const dx of [20, 40, 60]) { pointer("pointermove", dx); await frame(); }
+      await until(() => Math.abs(paneRect("conversation").width - 380) <= 1, "the conversation follows the dragged separator");
+      assert(layoutWrites.length === 0, `A separator drag saved the layout ${layoutWrites.length} times before release`);
+      pointer("pointerup", 60);
+      await until(() => layoutWrites.length === 1, "releasing the separator saves the layout");
+      await settle();
+      assert(layoutWrites.length === 1 && Math.abs(paneRect("conversation").width - 380) <= 1, `Release saved ${layoutWrites.length} times or moved the separator`);
+    } finally {
+      Storage.prototype.setItem = setItem;
+    }
+    const inner = host.querySelector('.pane-separator[role="separator"][aria-label="Resize Terminal and Changes"]');
+    inner.focus();
+    pressKey(inner, "End");
+    await until(() => Math.abs(paneRect("changes").height - 200) <= 1, "End stops at the diff's minimum height");
+    pressKey(inner, "Home");
+    await until(() => Math.abs(paneRect("terminal").height - 150) <= 1, "Home stops at the terminal's minimum height");
+    pressKey(inner, "ArrowDown");
+    await until(() => paneRect("terminal").height > 151, "ArrowDown grows the terminal");
+
+    await choosePaneMenuItem("Terminal", "Move left");
+    await until(() => paneRect("terminal").right <= paneRect("conversation").left + 1, "Move left swaps the terminal with the conversation");
+    await until(() => document.activeElement === host.querySelector("#pane-terminal"), "the moved pane keeps focus");
+    assert(paneOrder() === "terminal,conversation,changes", `Moved panes are not in reading order: ${paneOrder()}`);
+    assert(host.querySelector(".terminal-host .xterm") === xterm && xterm.isConnected, "Moving the terminal remounted its view");
+    assert(host.querySelector('textarea[aria-label="Message the agent"]') === composer && composer.value === "Draft kept across pane moves", "Moving panes lost the conversation draft");
+    assert(terminalRequests() === listedTerminals, `Moving the terminal reloaded its session: ${requests.slice(-4).join(", ")}`);
+
+    // F6 and Shift+F6 cycle panes in reading order, even from terminal input.
+    pressKey(document.activeElement, "F6");
+    await until(() => document.activeElement === host.querySelector("#pane-conversation"), "F6 reaches the conversation pane");
+    pressKey(document.activeElement, "F6");
+    await until(() => document.activeElement === host.querySelector("#pane-changes"), "F6 reaches the changes pane");
+    pressKey(document.activeElement, "F6");
+    await until(() => document.activeElement === host.querySelector("#pane-terminal"), "F6 wraps to the first pane");
+    pressKey(document.activeElement, "F6", { shiftKey: true });
+    await until(() => document.activeElement === host.querySelector("#pane-changes"), "Shift+F6 moves backwards");
+    const terminalInput = host.querySelector(".terminal-host .xterm-helper-textarea");
+    terminalInput.focus();
+    assert(pressKey(terminalInput, "F6").defaultPrevented, "F6 from terminal input was not handled");
+    await until(() => document.activeElement === host.querySelector("#pane-conversation"), "F6 leaves terminal input for the next pane");
+
+    // Dragging a pane header onto another pane's edge docks it there.
+    const dataTransfer = new DataTransfer();
+    const handle = host.querySelector("#pane-changes .pane-title");
+    handle.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer }));
+    const target = host.querySelector("#pane-terminal");
+    const targetRect = target.getBoundingClientRect();
+    const point = { clientX: targetRect.left + 6, clientY: targetRect.top + targetRect.height / 2 };
+    target.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer, ...point }));
+    await until(() => host.querySelector("#pane-terminal .pane-drop-indicator.is-left"), "left-edge drop indicator");
+    target.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer, ...point }));
+    handle.dispatchEvent(new DragEvent("dragend", { bubbles: true, dataTransfer }));
+    await until(() => paneOrder() === "changes,terminal,conversation" && paneRect("changes").right <= paneRect("terminal").left + 1, "drop docks Changes left of the terminal");
+    assert(!host.querySelector(".pane-drop-indicator"), "The drop indicator remained after the drop");
+    assert(host.querySelector(".terminal-host .xterm") === xterm && terminalRequests() === listedTerminals, "Docking another pane restarted the terminal view");
+    for (const [view, width, height] of [["changes", 280, 200], ["terminal", 260, 150], ["conversation", 320, 260]]) {
+      const rect = paneRect(view);
+      assert(rect.width >= width - 1 && rect.height >= height - 1, `${view} is below its minimum size: ${JSON.stringify(rect.toJSON())}`);
+    }
+
+    if (window.__fixtureSetViewport) {
+      // Too narrow for every minimum: one pane at a time, same mounted views.
+      await window.__fixtureSetViewport(900);
+      await until(() => window.innerWidth === 900, "900px viewport");
+      window.dispatchEvent(new Event("resize"));
+      await until(() => host.querySelector('[role="tablist"][aria-label="Panes"]'), "panes that no longer fit are shown one at a time");
+      assert(host.querySelectorAll(".pane-stage > .pane:not([inert])").length === 1 && !host.querySelector('.pane-separator'), "A layout below its minimum stayed split");
+      assert(host.querySelector(".terminal-host .xterm") === xterm, "Entering one-at-a-time panes remounted the terminal");
+      await window.__fixtureSetViewport(1280);
+      await until(() => window.innerWidth === 1280, "wide viewport again");
+      window.dispatchEvent(new Event("resize"));
+      await until(() => !host.querySelector('[role="tablist"][aria-label="Panes"]') && host.querySelectorAll('.pane-separator[role="separator"]').length === 2, "a wide window splits panes again");
+      assert(host.querySelector(".terminal-host .xterm") === xterm, "Leaving one-at-a-time panes remounted the terminal");
+    }
+
+    // A reload restores the worktree's arrangement and sizes.
+    // The sidebar's width transition and the layout's next measurement settle
+    // before sizes are compared: the same pane sizes across several frames.
+    let previousSizes = "";
+    let stableFrames = 0;
+    await until(() => {
+      const sizes = JSON.stringify(["changes", "terminal", "conversation"].map((view) => paneRect(view).toJSON()));
+      stableFrames = sizes === previousSizes && !document.getAnimations().some((animation) => animation.playState === "running") ? stableFrames + 1 : 0;
+      previousSizes = sizes;
+      return stableFrames >= 3;
+    }, "settled pane sizes");
+    const arranged = Object.fromEntries(["changes", "terminal", "conversation"].map((view) => [view, paneRect(view).toJSON()]));
+    root.render(null);
+    await settle();
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => terminalReady("Terminal A") && host.querySelector("#pane-changes .changes-pane"), "restored split layout");
+    assert(paneOrder() === "changes,terminal,conversation", `Reload restored another arrangement: ${paneOrder()}`);
+    for (const [view, rect] of Object.entries(arranged)) {
+      const restored = paneRect(view);
+      assert(Math.abs(restored.left - rect.left) <= 1 && Math.abs(restored.width - rect.width) <= 1 && Math.abs(restored.height - rect.height) <= 1,
+        `Reload restored ${view} at another size: ${JSON.stringify([rect, restored.toJSON()])}`);
+    }
+
+    // Another worktree keeps its own layout; returning restores this one.
+    const restoredXterm = host.querySelector(".terminal-host .xterm");
+    host.querySelector('[aria-label="Expand Review B"]')?.click();
+    await until(() => [...host.querySelectorAll(".worktree-row")].some((row) => row.textContent.includes("B")), "worktree B row");
+    [...host.querySelectorAll(".worktree-row")].find((row) => row.querySelector("strong")?.textContent === "B").click();
+    await until(() => host.querySelector('textarea[placeholder*="in B"]') && !host.querySelector("#pane-terminal") && !host.querySelector(".pane-header"), "worktree B opens its own default layout");
+    [...host.querySelectorAll(".worktree-row")].find((row) => row.querySelector("strong")?.textContent === "A").click();
+    await until(() => terminalReady("Terminal A") && paneOrder() === "changes,terminal,conversation", "worktree A's layout returns");
+    assert(restoredXterm !== host.querySelector(".terminal-host .xterm"), "The worktree switch reused another worktree's terminal view");
+
+    // Closing a pane unmounts its view but leaves the shell running.
+    const closeFrom = terminalRequests();
+    host.querySelector("#pane-terminal").focus();
+    await choosePaneMenuItem("Terminal", "Close Terminal pane");
+    await until(() => !host.querySelector("#pane-terminal"), "terminal pane closed");
+    await until(() => document.activeElement === host.querySelector("#pane-changes") || document.activeElement === host.querySelector("#pane-conversation"), "focus moves to the pane that took the closed pane's place");
+    assert(!host.querySelector(".terminal-host") && !requests.slice(closeFrom).some((request) => request.startsWith("DELETE")), `Closing the pane ended the shell: ${requests.slice(closeFrom).join(", ")}`);
+
+    // A saved layout with an unknown view, a duplicate and a bad size is repaired.
+    root.render(null);
+    await settle();
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { A: { savedAt: 1, layout: { version: 1, focused: "browser", root: {
+      type: "split", axis: "row", ratio: "wide", first: { type: "pane", view: "terminal" },
+      second: { type: "split", axis: "column", ratio: 0.5, first: { type: "pane", view: "browser" }, second: { type: "pane", view: "terminal" } },
+    } } } } }));
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => terminalReady("Terminal A"), "repaired layout");
+    assert(paneOrder() === "conversation,terminal", `Repair kept invalid panes: ${paneOrder()}`);
+    await until(() => host.querySelector(".toast")?.textContent.includes("panes that could not be restored were left out"), "repair notice");
+    assert(JSON.parse(localStorage.getItem(LAYOUT_KEY)).worktrees.A.layout.root.first.view === "terminal", "Restoring rewrote the saved layout before a change");
+
+    root.render(null);
+    await settle();
+    localStorage.setItem(LAYOUT_KEY, "{unreadable");
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector(".toast")?.textContent.includes("could not be read; showing the default layout"), "unreadable layout notice");
+    assert(paneOrder() === "conversation" && !host.querySelector(".pane-header"), "An unreadable layout did not fall back to the default");
+  } finally {
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
 async function responsiveFocusRegression() {
   root.render(null);
   await settle();
@@ -6510,8 +6739,14 @@ async function responsiveFocusRegression() {
 
     const terminalTrigger = host.querySelector('[aria-label="Terminal"]');
     terminalTrigger.click();
-    await until(() => host.querySelector("#workspace-inspector"), "narrow inspector");
-    await until(() => document.activeElement?.id === "inspector-tab-terminal", "inspector tab focus");
+    await until(() => host.querySelector('#pane-tab-terminal[aria-selected="true"]'), "narrow terminal pane tab");
+    await until(() => document.activeElement === host.querySelector("#pane-terminal"), "narrow terminal pane focus");
+    const conversationPane = host.querySelector("#pane-conversation");
+    const terminalPane = host.querySelector("#pane-terminal");
+    assert(conversationPane.inert && getComputedStyle(conversationPane).visibility === "hidden", "The narrow layout showed two panes at once");
+    const terminalRect = terminalPane.getBoundingClientRect();
+    assert(terminalRect.left >= -1 && terminalRect.right <= window.innerWidth + 1 && terminalRect.width >= window.innerWidth - 2,
+      `The narrow terminal pane does not use the viewport width: ${JSON.stringify(terminalRect.toJSON())}`);
     const terminalInput = host.querySelector(".terminal-host .xterm-helper-textarea");
     assert(terminalInput, "Terminal input did not mount");
     await until(() => host.querySelector('.terminal-tabs [role="tab"][aria-selected="true"]'), "active terminal for Escape input");
@@ -6522,26 +6757,27 @@ async function responsiveFocusRegression() {
     await window.__fixtureSendKey("Escape");
     await settle();
     document.removeEventListener("keydown", observeKey, true);
-    assert(host.querySelector("#workspace-inspector"), "Escape from terminal input dismissed the inspector");
+    assert(host.querySelector("#pane-terminal") && !terminalPane.inert, "Escape from terminal input changed the pane layout");
     assert(keyEvents.some((event) => event.key === "Escape" && event.target === terminalInput && event.trusted), "Trusted Escape did not reach the terminal input");
-    const terminalTab = host.querySelector("#inspector-tab-terminal");
-    terminalTab.focus();
-    terminalTab.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
-    await until(() => !host.querySelector("#workspace-inspector"), "inspector escape close");
-    assert(document.activeElement === terminalTrigger, "Escape did not restore focus to the inspector invoker");
+    const xterm = host.querySelector(".terminal-host .xterm");
+    const paneTab = host.querySelector("#pane-tab-terminal");
+    paneTab.focus();
+    paneTab.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
+    await until(() => host.querySelector('#pane-tab-conversation[aria-selected="true"]') && document.activeElement?.id === "pane-tab-conversation", "arrow key selects the conversation pane");
+    assert(!conversationPane.inert && terminalPane.inert && getComputedStyle(terminalPane).visibility === "hidden", "Pane tabs did not switch the visible pane");
+    assert(host.querySelector(".terminal-host .xterm") === xterm && xterm.isConnected, "Switching narrow panes remounted the terminal");
+    document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true, cancelable: true }));
+    await until(() => host.querySelector('#pane-tab-terminal[aria-selected="true"]') && document.activeElement?.id === "pane-tab-terminal", "End selects the last pane");
+    host.querySelector('[role="tab"][id^="chat-tab-"][aria-selected="true"]').click();
+    await until(() => host.querySelector('#pane-tab-conversation[aria-selected="true"]') && !conversationPane.inert, "choosing a chat shows its conversation pane");
+    host.querySelector("#pane-tab-terminal").click();
+    await until(() => !terminalPane.inert && conversationPane.inert, "pane tab click shows the terminal again");
 
+    terminalTrigger.focus();
     terminalTrigger.click();
-    await until(() => host.querySelector("#workspace-inspector"), "inspector reopened for composer Escape");
-    host.querySelector('textarea[aria-label="Message the agent"]').focus();
-    host.querySelector('textarea[aria-label="Message the agent"]').dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
-    await until(() => !host.querySelector("#workspace-inspector"), "composer Escape closes inspector");
-    assert(document.activeElement === terminalTrigger, "Composer Escape did not restore inspector invoker focus");
-
-    terminalTrigger.click();
-    await until(() => host.querySelector('[aria-label="Close inspector"]'), "inspector close control");
-    host.querySelector('[aria-label="Close inspector"]').click();
-    await until(() => !host.querySelector("#workspace-inspector"), "inspector button close");
-    assert(document.activeElement === terminalTrigger, "Inspector close control did not restore invoker focus");
+    await until(() => !host.querySelector("#pane-terminal") && !host.querySelector('[role="tablist"][aria-label="Panes"]'), "toolbar closes the narrow terminal pane");
+    assert(document.activeElement === terminalTrigger, "Closing from the toolbar moved focus away from its toggle");
+    assert(!host.querySelector("#pane-conversation").inert, "The remaining conversation pane stayed inert");
   } finally {
     root.render(null);
     await settle();
@@ -7001,7 +7237,7 @@ try {
     ["extreme diff height", extremeDiffHeightRegression, "a clamped-height diff still reaches its final line with End and Find"],
     ["Unicode diff find", unicodeDiffFindRegression, "length-changing case folding keeps the correct diff line"],
     ["reverse diff Find wrap", reverseDiffFindWrapRegression, "Previous wraps left of offset zero and continues through earlier matches"],
-    ["production diff viewport", productionDiffViewportRegression, "staged and unstaged large diffs stay bounded in the inspector"],
+    ["production diff viewport", productionDiffViewportRegression, "staged and unstaged large diffs stay bounded in a pane"],
     ["paged transcript anchor", pagedTranscriptAnchorRegression, "loading earlier history preserves its visible reading anchor"],
     ["stale page measured follow", () => pagedTranscriptFindRegression({ measuredOnly: true }), "a newly measured row cannot erase latest-page bottom intent before a live append"],
     ["paged transcript find", pagedTranscriptFindRegression, "find navigates older persisted messages with bounded mounted rows"],
@@ -7031,7 +7267,8 @@ try {
     ["bootstrap hard failures", bootstrapHardFailureRegression, "authorization, server, and network failures surface once"],
     ["provider checking rate", providerCheckingRateRegression, "repeated checking snapshots keep a bounded poll cadence"],
     ["conversation settings keyboard", conversationSettingsKeyboardRegression, "conversation settings stay keyboard reachable at 360, 760 and 900px", "keyboard and width checks require the CDP bridges"],
-    ["responsive focus", responsiveFocusRegression, "narrow drawer and inspector contain and restore focus", "responsive transition requires the CDP viewport bridge"],
+    ["split pane layout", splitPaneLayoutRegression, "nested panes resize, move, cycle focus, restore and repair without restarting their views"],
+    ["responsive focus", responsiveFocusRegression, "narrow drawer and one-at-a-time panes contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],
   ];
   const selectedStep = new URLSearchParams(location.search).get("only");
@@ -7044,6 +7281,7 @@ try {
   for (const [index, [step, run, success, skipped]] of selectedSteps.entries()) {
     const stepStartedAt = performance.now();
     window.__fixtureProgress = { step, completed: index, total: selectedSteps.length, stepStartedAt };
+    localStorage.removeItem(LAYOUT_KEY);
     const ran = await run();
     window.__fixtureTimings.push({ step, ms: Math.round(performance.now() - stepStartedAt) });
     results.textContent += `${ran === false && skipped ? `SKIP: ${skipped}` : `PASS: ${success}`}\n`;
@@ -7061,4 +7299,6 @@ try {
   window.fetch = originalFetch;
   window.WebSocket = OriginalSocket;
   keys.forEach((key, index) => saved[index] === null ? localStorage.removeItem(key) : localStorage.setItem(key, saved[index]));
+  if (savedLayouts === null) localStorage.removeItem(LAYOUT_KEY);
+  else localStorage.setItem(LAYOUT_KEY, savedLayouts);
 }

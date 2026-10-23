@@ -20,7 +20,7 @@ Tested against the live local runtime with the browser accessibility tree.
 - 390 × 844 narrow viewport: sidebar starts closed, opens as a modal overlay, makes the workspace inert and hidden from assistive technology, contains keyboard focus, closes with Escape or the backdrop, and returns focus to the opener.
 - Project navigation: Up/Down/Home/End move focus through the visible group, project, worktree, and project-action controls.
 - Chat tabs: expose `tablist`/`tab`/`tabpanel` relationships with roving focus and Arrow/Home/End navigation.
-- Inspector: becomes a full-width narrow-screen surface; Changes, Terminal, and Context expose tabs, support arrow-key switching, and restore focus to the toolbar invoker after Escape or close-button dismissal.
+- Split panes (OUT-10): each pane is a labelled region; toolbar toggles report `aria-pressed` and control their pane; separators are focusable `separator` elements with orientation, value, and Arrow/Home/End resizing; F6/Shift+F6 cycle focus through panes in reading order, including from terminal input; pane menus split, move, and close with focus following the pane. Below 760px, or when panes no longer fit their minimum sizes, panes become a `tablist` of one-at-a-time `tabpanel`s with Arrow/Home/End switching, and hidden panes are inert.
 - Terminal: exposes a labeled panel, screen-reader buffer, session tabs, loading status, and keyboard session switching.
 - Command palette: exposes a combobox/listbox relationship, result count announcements, active-descendant state, and Arrow/Home/End/Enter navigation.
 - Dialogs: retain labeled fields and reachable actions at 390px, including the full settings form without horizontal clipping.
