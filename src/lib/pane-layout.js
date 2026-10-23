@@ -6,13 +6,17 @@
 export const PANE_LAYOUT_VERSION = 1;
 export const PANE_VIEWS = Object.freeze(["conversation", "changes", "terminal", "context"]);
 export const PANE_VIEW_LABELS = Object.freeze({ conversation: "Conversation", changes: "Changes", terminal: "Terminal", context: "Context" });
-// Smallest usable size of each pane in CSS pixels, its header included. A
-// layout that cannot give every pane its minimum shows one pane at a time.
+// Smallest usable size of each pane in CSS pixels, its header included. Each
+// covers the view's fixed chrome in its compact styles (the `pane` container
+// queries in styles.css) plus primary content: several message lines beside
+// the composer, a few changed files and diff lines with the commit bar, and a
+// few terminal rows. A layout that cannot give every pane its minimum shows
+// one pane at a time.
 export const MIN_PANE_SIZE = Object.freeze({
-  conversation: Object.freeze({ width: 320, height: 260 }),
-  changes: Object.freeze({ width: 280, height: 200 }),
-  terminal: Object.freeze({ width: 260, height: 150 }),
-  context: Object.freeze({ width: 240, height: 160 }),
+  conversation: Object.freeze({ width: 320, height: 300 }),
+  changes: Object.freeze({ width: 280, height: 340 }),
+  terminal: Object.freeze({ width: 260, height: 200 }),
+  context: Object.freeze({ width: 240, height: 180 }),
 });
 export const PANE_SEPARATOR_SIZE = 6;
 export const PANE_SIDES = Object.freeze(["left", "right", "up", "down"]);

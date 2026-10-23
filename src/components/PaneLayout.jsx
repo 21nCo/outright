@@ -238,8 +238,14 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
     commit(resizeSplit(layoutRef.current, active.separator.path, active.ratio));
   }
 
-  function dragOver(event, view) {
+  // Only a pane title dragged in this layout docks; chat tabs and files do not.
+  function paneDragged(event) {
     const dragged = draggedViewRef.current;
+    return dragged && [...(event.dataTransfer?.types ?? [])].includes(PANE_DRAG_TYPE) ? dragged : null;
+  }
+
+  function dragOver(event, view) {
+    const dragged = paneDragged(event);
     if (!dragged || compact) return;
     event.preventDefault();
     event.stopPropagation();
@@ -249,7 +255,7 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
   }
 
   function drop(event, view) {
-    const dragged = draggedViewRef.current;
+    const dragged = paneDragged(event);
     if (!dragged) return;
     event.preventDefault();
     event.stopPropagation();

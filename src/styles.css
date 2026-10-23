@@ -346,7 +346,7 @@ button, input, textarea, select { font: inherit; }
 .pane:focus-visible { box-shadow: inset 0 0 0 2px var(--ring); }
 .pane-layout.is-compact .pane { inset: 0; }
 .pane.is-concealed { visibility: hidden; }
-.pane-body { min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-rows: minmax(0, 1fr); }
+.pane-body { min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-rows: minmax(0, 1fr); container: pane / size; }
 .pane-header { min-width: 0; padding: 0 4px 0 4px; display: flex; align-items: center; justify-content: space-between; gap: 4px; border-bottom: 1px solid var(--line-soft); background: var(--subtle-canvas); color: var(--muted-foreground); font-size: 10px; font-weight: 550; }
 .pane.is-focused .pane-header { color: var(--foreground); }
 .pane.is-focused .pane-header::after { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: var(--foreground); }
@@ -615,6 +615,32 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .terminal-tab { min-width: 130px; }
   .terminal-loading { font-size: 0; }
   .recovery-actions [data-slot="button"] { width: 100%; }
+}
+
+/* A pane's size, not the window's, compacts its view, so each view keeps its
+   primary content usable down to the pane minimums in src/lib/pane-layout.js. */
+@container pane (max-width: 519px) {
+  .conversation-header { grid-template-columns: minmax(0,1fr) auto; padding: 0 12px; }
+  .conversation-symbol { display: none; }
+  .conversation-header h1 { font-size: 14px; }
+  .message-column, .composer, .history-live-tail { width: calc(100% - 16px); }
+  .message { grid-template-columns: 28px minmax(0,1fr); gap: 9px; }
+  .avatar { width: 27px; height: 27px; }
+  .composer-actions { grid-template-columns: minmax(0,1fr) 36px; gap: 5px; padding-inline: 5px; }
+  .composer-actions > div { min-width: 0; overflow: hidden; }
+  .model-button { min-width: 0; max-width: 150px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .send-hint { display: none; }
+}
+@container pane (max-height: 479px) {
+  .conversation-pane { grid-template-rows: 56px minmax(0, 1fr) auto; }
+  .conversation-header h1 { margin-bottom: 2px; font-size: 14px; }
+  .message-column { padding-block: 12px 8px; }
+  .composer { min-height: 96px; margin-bottom: 8px; }
+  .composer textarea { height: 48px; padding-block: 10px 4px; }
+  .composer-actions { min-height: 44px; }
+  .changes-pane { grid-template-rows: 40px minmax(0, 1fr) auto; }
+  .changes-layout { grid-template-rows: minmax(64px, 30%) minmax(0, 1fr); }
+  .commit-bar { padding-block: 5px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -6516,11 +6516,11 @@ async function splitPaneLayoutRegression() {
     const inner = host.querySelector('.pane-separator[role="separator"][aria-label="Resize Terminal and Changes"]');
     inner.focus();
     pressKey(inner, "End");
-    await until(() => Math.abs(paneRect("changes").height - 200) <= 1, "End stops at the diff's minimum height");
+    await until(() => Math.abs(paneRect("changes").height - 340) <= 1, "End stops at the diff's minimum height");
     pressKey(inner, "Home");
-    await until(() => Math.abs(paneRect("terminal").height - 150) <= 1, "Home stops at the terminal's minimum height");
+    await until(() => Math.abs(paneRect("terminal").height - 200) <= 1, "Home stops at the terminal's minimum height");
     pressKey(inner, "ArrowDown");
-    await until(() => paneRect("terminal").height > 151, "ArrowDown grows the terminal");
+    await until(() => paneRect("terminal").height > 201, "ArrowDown grows the terminal");
 
     await choosePaneMenuItem("Terminal", "Move left");
     await until(() => paneRect("terminal").right <= paneRect("conversation").left + 1, "Move left swaps the terminal with the conversation");
@@ -6558,7 +6558,7 @@ async function splitPaneLayoutRegression() {
     await until(() => paneOrder() === "changes,terminal,conversation" && paneRect("changes").right <= paneRect("terminal").left + 1, "drop docks Changes left of the terminal");
     assert(!host.querySelector(".pane-drop-indicator"), "The drop indicator remained after the drop");
     assert(host.querySelector(".terminal-host .xterm") === xterm && terminalRequests() === listedTerminals, "Docking another pane restarted the terminal view");
-    for (const [view, width, height] of [["changes", 280, 200], ["terminal", 260, 150], ["conversation", 320, 260]]) {
+    for (const [view, width, height] of [["changes", 280, 340], ["terminal", 260, 200], ["conversation", 320, 300]]) {
       const rect = paneRect(view);
       assert(rect.width >= width - 1 && rect.height >= height - 1, `${view} is below its minimum size: ${JSON.stringify(rect.toJSON())}`);
     }
@@ -6645,6 +6645,166 @@ async function splitPaneLayoutRegression() {
   return true;
 }
 
+// Every view stays usable at its minimum pane size: message lines beside the
+// composer, changed files and diff lines with the commit bar, terminal rows
+// and context content, also when a saved layout restores those minimums.
+async function paneMinimumContentRegression() {
+  if (!window.__fixtureSetViewport) return false;
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const messages = Array.from({ length: 8 }, (_, index) => ({ id: `minimum-${index}`, role: index % 2 ? "assistant" : "user", kind: "text", body: `Minimum size message ${index}`, createdAt: "2026-10-24T00:00:00Z" }));
+  const chat = { ...chats.A, messages };
+  const files = Array.from({ length: 6 }, (_, index) => ({ path: `src/file-${index}.js`, status: "M" }));
+  const diff = Array.from({ length: 60 }, (_, index) => `${index % 3 ? "+" : "-"}minimum diff line ${index}`).join("\n");
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chat] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chat);
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A")] });
+    if (url.pathname.startsWith("/api/terminals/")) return response({ buffer: "Minimum pane fixture\r\n" });
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files, stagedCount: 0 });
+    if (url.pathname === "/api/git/diff") return response({ diff });
+    if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    return response({});
+  };
+  const saved = (focused, layout) => localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { A: { savedAt: 1, layout: { version: 1, focused, root: layout } } } }));
+  const leaf = (view) => ({ type: "pane", view });
+  const inside = (element, view, label) => {
+    const rect = element?.getBoundingClientRect();
+    const pane = paneRect(view);
+    assert(rect && rect.width > 0 && rect.height > 0 && rect.left >= pane.left - 1 && rect.right <= pane.right + 1 && rect.top >= pane.top - 1 && rect.bottom <= pane.bottom + 1,
+      `${label} is clipped by its ${view} pane: ${JSON.stringify([rect?.toJSON(), pane.toJSON()])}`);
+  };
+  const usable = {
+    conversation: () => {
+      const viewport = host.querySelector('#pane-conversation [aria-label="Conversation messages"]');
+      assert(viewport.clientHeight >= 90, `The conversation at ${JSON.stringify(paneRect("conversation").toJSON())} shows ${viewport.clientHeight}px of messages`);
+      inside(viewport, "conversation", "The message list");
+      inside(host.querySelector('#pane-conversation textarea[aria-label="Message the agent"]'), "conversation", "The composer");
+      inside(host.querySelector('#pane-conversation [aria-label="Send message"]'), "conversation", "The send button");
+    },
+    changes: () => {
+      const list = host.querySelector("#pane-changes .changed-files");
+      const lines = host.querySelector("#pane-changes .diff-view");
+      assert(list.clientHeight >= 60, `The changed file list is ${list.clientHeight}px high`);
+      assert(lines.clientHeight >= 70, `The diff at ${JSON.stringify(paneRect("changes").toJSON())} shows ${lines.clientHeight}px of lines`);
+      inside(lines, "changes", "The diff");
+      inside(host.querySelector('#pane-changes [aria-label="Commit message"]'), "changes", "The commit message");
+      inside([...host.querySelectorAll("#pane-changes .commit-bar button")].find((button) => button.textContent.includes("Commit")), "changes", "The commit button");
+    },
+    terminal: () => {
+      const screen = host.querySelector("#pane-terminal .xterm-screen");
+      assert(screen.getBoundingClientRect().height >= 60, `The terminal shows ${screen.getBoundingClientRect().height}px of rows`);
+      inside(host.querySelector("#pane-terminal .terminal-host"), "terminal", "The terminal");
+    },
+    context: () => {
+      const content = host.querySelector("#pane-context .context-pane-content");
+      assert(content.clientHeight >= 100 && content.clientWidth >= 200, `The context content is ${content.clientWidth}x${content.clientHeight}`);
+    },
+  };
+  const near = (value, expected, label) => assert(Math.abs(value - expected) <= 1, `${label}: ${value} instead of ${expected}`);
+  try {
+    await window.__fixtureSetViewport(1280);
+    await until(() => window.innerWidth === 1280, "wide minimum viewport");
+    window.dispatchEvent(new Event("resize"));
+
+    // Restored at the narrowest conversation and the shortest diff.
+    saved("conversation", { type: "split", axis: "row", ratio: 0.05, first: leaf("conversation"),
+      second: { type: "split", axis: "column", ratio: 0.95, first: leaf("terminal"), second: leaf("changes") } });
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => terminalReady("Terminal A") && host.querySelector("#pane-changes .diff-view span:not(.diff-empty)")
+      && host.querySelector("#pane-conversation .message-text"), "restored minimum layout");
+    await settle();
+    near(paneRect("conversation").width, 320, "The restored conversation width");
+    near(paneRect("changes").height, 340, "The restored changes height");
+    usable.conversation();
+    usable.changes();
+    const inner = host.querySelector('.pane-separator[role="separator"][aria-label="Resize Terminal and Changes"]');
+    inner.focus();
+    pressKey(inner, "Home");
+    await until(() => Math.abs(paneRect("terminal").height - 200) <= 1, "terminal at its minimum height");
+    await settle();
+    usable.terminal();
+
+    // Restored at the shortest conversation and the narrowest context.
+    root.render(null);
+    await settle();
+    saved("conversation", { type: "split", axis: "column", ratio: 0.05, first: leaf("conversation"),
+      second: { type: "split", axis: "row", ratio: 0.95, first: leaf("changes"), second: leaf("context") } });
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector("#pane-context .context-pane-content") && host.querySelector("#pane-changes .diff-view span:not(.diff-empty)")
+      && host.querySelector("#pane-conversation .message-text"), "restored short conversation layout");
+    await settle();
+    near(paneRect("conversation").height, 300, "The restored conversation height");
+    near(paneRect("context").width, 240, "The restored context width");
+    usable.conversation();
+    usable.context();
+    usable.changes();
+  } finally {
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
+// Pane titles and chat tabs are both draggable and sit next to each other:
+// only a chat tab dragged in the tab strip reorders chats.
+async function paneDragChatTabRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const second = { ...chats.A, id: "chat-A2", title: "Conversation A2" };
+  const patches = [];
+  route = async (url, options = {}) => {
+    if (options.method === "PATCH") { patches.push(url.pathname); return response({}); }
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A, second] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/conversations/chat-A2") return response(second);
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [], stagedCount: 0 });
+    return response({});
+  };
+  const tab = (id) => host.querySelector(`#chat-tab-${id}`).closest(".chat-tab");
+  const tabOrder = () => [...host.querySelectorAll('[role="tab"][id^="chat-tab-"]')].map((item) => item.dataset.tabId).join(",");
+  const drag = (type, target, dataTransfer) => {
+    const event = new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer });
+    target.dispatchEvent(event);
+    return event;
+  };
+  try {
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => tabOrder() === "chat-A,chat-A2", "two chat tabs");
+    host.querySelector('[aria-label="Changes"]').click();
+    await until(() => host.querySelector("#pane-changes .pane-title"), "pane title beside the chat tabs");
+
+    // A chat tab dragged onto another tab still reorders and saves the order.
+    const tabTransfer = new DataTransfer();
+    drag("dragstart", tab("chat-A2"), tabTransfer);
+    assert(drag("dragover", tab("chat-A"), tabTransfer).defaultPrevented, "A chat tab did not accept a chat tab drag");
+    drag("drop", tab("chat-A"), tabTransfer);
+    drag("dragend", tab("chat-A2"), tabTransfer);
+    await until(() => tabOrder() === "chat-A2,chat-A" && patches.length === 2, "chat tab drag reorders chats");
+
+    // A tab drag that never ends here (its source left mid-drag) is followed
+    // by a pane title dropped on a tab: chats keep their order and no request.
+    drag("dragstart", tab("chat-A"), new DataTransfer());
+    const paneTransfer = new DataTransfer();
+    const title = host.querySelector("#pane-changes .pane-title");
+    drag("dragstart", title, paneTransfer);
+    assert(!drag("dragover", tab("chat-A2"), paneTransfer).defaultPrevented, "A chat tab accepted a pane title drag");
+    drag("drop", tab("chat-A2"), paneTransfer);
+    drag("dragend", title, paneTransfer);
+    await settle();
+    assert(tabOrder() === "chat-A2,chat-A" && patches.length === 2, `A pane title drop reordered chats: ${tabOrder()} after ${JSON.stringify(patches)}`);
+    assert(paneOrder() === "conversation,changes", `A pane title dropped on a chat tab moved panes: ${paneOrder()}`);
+  } finally {
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
 async function responsiveFocusRegression() {
   root.render(null);
   await settle();
@@ -6661,9 +6821,19 @@ async function responsiveFocusRegression() {
   };
   if (!window.__fixtureSetViewport) return false; // Manual preview still runs width-independent cases.
   await setWidth(1280);
-  route = async (url) => {
+  let createdChat = null;
+  route = async (url, options = {}) => {
     if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
-    if (url.pathname === "/api/conversations") return response({ conversations: [chats[url.searchParams.get("projectId")]] });
+    if (url.pathname === "/api/conversations" && options.method === "POST") {
+      const body = JSON.parse(options.body);
+      createdChat = { ...chats.A, id: "chat-narrow", title: body.title, projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: body.worktreePath };
+      return response(createdChat, 201);
+    }
+    if (url.pathname === "/api/conversations") {
+      const owner = url.searchParams.get("projectId");
+      return response({ conversations: [chats[owner], ...(createdChat?.projectId === owner ? [createdChat] : [])] });
+    }
+    if (url.pathname === "/api/conversations/chat-narrow") return response(createdChat);
     if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A")] });
     if (url.pathname.startsWith("/api/terminals/")) return response({ buffer: "Responsive focus fixture\r\n" });
     const match = url.pathname.match(/^\/api\/conversations\/chat-([AB])$/);
@@ -6772,6 +6942,16 @@ async function responsiveFocusRegression() {
     await until(() => host.querySelector('#pane-tab-conversation[aria-selected="true"]') && !conversationPane.inert, "choosing a chat shows its conversation pane");
     host.querySelector("#pane-tab-terminal").click();
     await until(() => !terminalPane.inert && conversationPane.inert, "pane tab click shows the terminal again");
+    // A chat created from the + tab takes the front from the terminal.
+    host.querySelector('[aria-label="New chat tab"]').click();
+    await until(() => document.querySelector('[role="dialog"] input#chat-title'), "narrow new chat dialog");
+    setControlValue(document.querySelector("input#chat-title"), "Narrow chat");
+    [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Create chat").click();
+    await until(() => host.querySelector('#chat-tab-chat-narrow[aria-selected="true"]') && host.querySelector('#pane-tab-conversation[aria-selected="true"]')
+      && !conversationPane.inert && terminalPane.inert, "a new chat shows its conversation pane");
+    assert(host.querySelector(".terminal-host .xterm") === xterm && xterm.isConnected, "Creating a chat remounted the terminal");
+    host.querySelector("#pane-tab-terminal").click();
+    await until(() => !terminalPane.inert && conversationPane.inert, "pane tab click shows the terminal after the new chat");
 
     terminalTrigger.focus();
     terminalTrigger.click();
@@ -7268,6 +7448,8 @@ try {
     ["provider checking rate", providerCheckingRateRegression, "repeated checking snapshots keep a bounded poll cadence"],
     ["conversation settings keyboard", conversationSettingsKeyboardRegression, "conversation settings stay keyboard reachable at 360, 760 and 900px", "keyboard and width checks require the CDP bridges"],
     ["split pane layout", splitPaneLayoutRegression, "nested panes resize, move, cycle focus, restore and repair without restarting their views"],
+    ["pane minimum content", paneMinimumContentRegression, "every view keeps usable content at its minimum pane size, including restored layouts", "minimum pane geometry requires the CDP viewport bridge"],
+    ["pane drag isolation", paneDragChatTabRegression, "pane title drags never reorder chat tabs, even after an unfinished tab drag"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and one-at-a-time panes contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],
   ];

@@ -35,6 +35,7 @@ import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission
 import { createTerminalCommandFence } from "@/lib/terminal-command-fence";
 import { PANE_LAYOUT_PRESETS, applyPreset, defaultPaneLayout, focusView, layoutViews, loadPaneLayout, savePaneLayout } from "@/lib/pane-layout";
 
+const CHAT_TAB_DRAG_TYPE = "application/x-outright-chat-tab";
 const MAX_RENDERED_MESSAGES = 1000;
 function moveMessageViewport(viewport, top) {
   if (!viewport) return;
@@ -323,7 +324,8 @@ export function App() {
   const changePaneLayout = useCallback((next) => {
     setPaneState((current) => current.layout === next ? current : { ...current, layout: next, problems: [], dirty: true });
   }, []);
-  // Choosing a chat shows its conversation when panes are shown one at a time.
+  // Choosing a chat focuses its conversation pane, which brings it to the front
+  // when panes are shown one at a time.
   const revealConversationPane = useCallback(() => {
     setPaneState((current) => {
       const next = focusView(current.layout, "conversation");
@@ -372,11 +374,16 @@ export function App() {
       if (request !== conversationListRequestRef.current || selectedProjectRef.current !== forProjectId || selectedWorktreeRef.current !== forWorktreeId) return;
       const available = result.conversations.filter((item) => !item.archived);
       stageConversations(available);
-      const wanted = preferredId || pendingConversationRef.current || selectedConversationRef.current;
+      const requested = pendingConversationRef.current;
+      const wanted = preferredId || requested || selectedConversationRef.current;
       const selected = available.find((item) => item.id === wanted) ?? available[0];
       conversationListPendingRef.current = false;
       setConversationListPending(false);
       pendingConversationRef.current = "";
+      // A chat the user chose outside the tabs (new chat, command palette,
+      // recovery, a moved or created chat) is shown even when another pane is
+      // in front. Runtime list refreshes never take the front.
+      if (requested && selected?.id === requested) revealConversationPane();
       const changedSelection = selectedConversationRef.current !== (selected?.id ?? "");
       if (changedSelection) selectConversation(selected?.id ?? "");
       if (!changedSelection && selected && readyConversationRef.current?.id === selected.id) {
@@ -1417,6 +1424,7 @@ export function App() {
         await api(`/api/conversations/${recoveryConversation.id}`, { method: "PATCH", body: { archived: false } });
       }
       if (recoveryConversation.projectId === selectedProjectRef.current && recoveryConversation.worktreeId === selectedWorktreeRef.current) {
+        pendingConversationRef.current = recoveryConversation.id;
         await loadConversations(recoveryConversation.id);
         return;
       }
@@ -1864,11 +1872,19 @@ export function App() {
     } catch (nextError) { setError(nextError.message); }
   }
 
+  // Only a chat tab dragged in this worktree's tab strip reorders chats; a
+  // pane title or anything else dropped on a tab is ignored.
+  function isChatTabDrag(event) {
+    return Boolean(dragConversationRef.current) && [...(event.dataTransfer?.types ?? [])].includes(CHAT_TAB_DRAG_TYPE);
+  }
+
   async function reorderConversation(targetId) {
     const sourceId = dragConversationRef.current;
-    if (!sourceId || sourceId === targetId) return;
+    dragConversationRef.current = "";
+    const sourceIndex = conversations.findIndex((item) => item.id === sourceId);
+    if (sourceIndex < 0 || sourceId === targetId || !conversations.some((item) => item.id === targetId)) return;
     const next = [...conversations];
-    const [source] = next.splice(next.findIndex((item) => item.id === sourceId), 1);
+    const [source] = next.splice(sourceIndex, 1);
     next.splice(next.findIndex((item) => item.id === targetId), 0, source);
     stageConversations(next);
     await Promise.all(next.map((item, index) => api(`/api/conversations/${item.id}`, { method: "PATCH", body: { tabPosition: index } })));
@@ -1944,7 +1960,7 @@ export function App() {
     {conversation?.messagePage?.hasLater && <div className="history-forward"><button className="history-later" onClick={loadLaterMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading later messages…" : `Load later messages · ${conversation.messagePage.newerCount} remaining`}</button><button className="history-return" onClick={() => loadConversation({ returnToLatest: true })}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button></div>}
     {outcomePending && <div className="recovery-notice"><WarningCircle weight="fill" /><span className="recovery-copy"><strong>Run outcome waiting for storage</strong><span>The agent process has exited. Outright is saving the final result for {pendingOutcomeRuns.length === 1 ? "run" : "runs"} {pendingOutcomeRuns.map((run, index) => <code key={run.id}>{run.id}{index < pendingOutcomeRuns.length - 1 ? ", " : ""}</code>)} and will update this chat when storage recovers.</span></span></div>}
     {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}
-    <form className="composer" onSubmit={sendPrompt}>{unsentCreatedChat && <div className="first-prompt-notice" role="status" aria-live="polite">Chat created, but your message was not sent. {unsentHelp}{unsentForOwner && firstPromptAwaitingSelection && conversations.some((item) => item.id === unsentForOwner.id) && <Button type="button" variant="outline" size="sm" onClick={() => selectConversation(unsentForOwner.id)}>Open created chat</Button>}{!unsentForOwner && unsentProject && unsentWorktree && <Button type="button" variant="outline" size="sm" onClick={() => { pendingConversationRef.current = unsentCreatedChat.id; chooseProject(unsentProject, unsentWorktree); }}>Return to created chat</Button>}<Button type="button" variant="ghost" size="sm" onClick={() => { setUnsentCreatedChat(null); editDraft(""); }}>Discard unsent message</Button></div>}<textarea aria-label="Message the agent" disabled={Boolean(interruptedRun) || submissionUnavailable} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={composerPlaceholder} value={draft} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={editDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{composerHint}{composerAction}</div></form>
+    <form className="composer" onSubmit={sendPrompt}>{unsentCreatedChat && <div className="first-prompt-notice" role="status" aria-live="polite">Chat created, but your message was not sent. {unsentHelp}{unsentForOwner && firstPromptAwaitingSelection && conversations.some((item) => item.id === unsentForOwner.id) && <Button type="button" variant="outline" size="sm" onClick={() => { revealConversationPane(); selectConversation(unsentForOwner.id); }}>Open created chat</Button>}{!unsentForOwner && unsentProject && unsentWorktree && <Button type="button" variant="outline" size="sm" onClick={() => { pendingConversationRef.current = unsentCreatedChat.id; chooseProject(unsentProject, unsentWorktree); }}>Return to created chat</Button>}<Button type="button" variant="ghost" size="sm" onClick={() => { setUnsentCreatedChat(null); editDraft(""); }}>Discard unsent message</Button></div>}<textarea aria-label="Message the agent" disabled={Boolean(interruptedRun) || submissionUnavailable} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={composerPlaceholder} value={draft} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={editDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{composerHint}{composerAction}</div></form>
   </section>;
   // Only views in the layout mount; the others are inert element objects.
   const paneViewElements = {
@@ -1966,7 +1982,7 @@ export function App() {
 
     <main id="main-workspace" className="workspace" inert={isNarrow && sidebarOpen ? true : undefined} aria-hidden={isNarrow && sidebarOpen ? true : undefined}>
       <header className="workspace-bar">{!sidebarOpen && <Button variant="ghost" size="icon-sm" onClick={openSidebar} aria-label="Open projects sidebar" aria-controls="project-sidebar" aria-expanded={sidebarOpen}><SidebarSimple /></Button>}<div className="workspace-context"><span>{project.name}</span><CaretRight /><GitBranch /><strong>{worktree.name}</strong></div><div className="workspace-tools"><RunState run={pendingOutcomeRun ?? activeRun ?? latestRun} outcomePending={outcomePending} /><WorktreeState worktree={worktree} />{paneToggle("changes", "Changes", GitDiff, "Changes")}{paneToggle("terminal", "Terminal", TerminalWindow, "Terminal ⌘⇧T")}{paneToggle("context", "Project context", Info, "Project context")}<DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Pane layout" />}><Layout /></DropdownMenuTrigger><DropdownMenuContent align="end" className="w-auto min-w-60"><DropdownMenuGroup><DropdownMenuLabel>Pane layout</DropdownMenuLabel>{PANE_LAYOUT_PRESETS.map((preset) => <DropdownMenuItem key={preset.id} onClick={() => changePaneLayout(applyPreset(paneState.layout, preset.id))}>{preset.label}</DropdownMenuItem>)}</DropdownMenuGroup><DropdownMenuSeparator /><p className="pane-layout-hint">F6 moves focus between panes</p></DropdownMenuContent></DropdownMenu><ThemeMenu theme={theme} onThemeChange={setTheme} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Worktree options" />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, editor: settings.editor } }).then(() => setToast(`Opened in ${settings.editor}`)).catch((nextError) => setError(nextError.message))}><PencilSimple />Open in {settings.editor}</DropdownMenuItem><DropdownMenuItem onClick={() => setWorktreeDialog(project)}><GitBranch />New worktree</DropdownMenuItem>{worktree.isLinked && <><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onClick={() => setRemoveWorktreeOpen(true)}><Trash />Remove worktree</DropdownMenuItem></>}</DropdownMenuContent></DropdownMenu></div></header>
-      <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll" role="tablist" aria-label="Open agent chats" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', (id) => { revealConversationPane(); selectConversation(id); })}>{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={() => { dragConversationRef.current = item.id; }} onDragOver={(event) => event.preventDefault()} onDrop={() => reorderConversation(item.id)}><button className="tab-select" id={domId("chat-tab", item.id)} data-tab-id={item.id} role="tab" aria-selected={item.id === selectedConversationId} aria-controls="conversation-panel" tabIndex={item.id === selectedConversationId ? 0 : -1} onClick={() => { revealConversationPane(); selectConversation(item.id); }} onDoubleClick={() => { selectConversation(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); archiveChat(item, event.currentTarget); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
+      <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll" role="tablist" aria-label="Open agent chats" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', (id) => { revealConversationPane(); selectConversation(id); })}>{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={(event) => { dragConversationRef.current = item.id; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData(CHAT_TAB_DRAG_TYPE, item.id); }} onDragEnd={() => { dragConversationRef.current = ""; }} onDragOver={(event) => { if (isChatTabDrag(event)) event.preventDefault(); }} onDrop={(event) => { if (!isChatTabDrag(event)) return; event.preventDefault(); reorderConversation(item.id); }}><button className="tab-select" id={domId("chat-tab", item.id)} data-tab-id={item.id} role="tab" aria-selected={item.id === selectedConversationId} aria-controls="conversation-panel" tabIndex={item.id === selectedConversationId ? 0 : -1} onClick={() => { revealConversationPane(); selectConversation(item.id); }} onDoubleClick={() => { selectConversation(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); archiveChat(item, event.currentTarget); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
       <PaneLayout ref={paneLayoutRef} className="work-area" layout={paneState.layout} onChange={changePaneLayout} compactPreferred={isNarrow} views={paneViewElements} />
     </main>
 
