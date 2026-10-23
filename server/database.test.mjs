@@ -29,11 +29,12 @@ test("persists settings, spaces, conversations, messages, runs, and search", () 
   const database = createOutrightDatabase({ filename: ":memory:" });
   try {
     assert.equal(database.updateSettings({ provider: "claude", maxConcurrentRuns: 5 }).provider, "claude");
-    // Terminal reattach is a capability switch that stays off by default.
-    assert.equal(database.getSettings().terminalReattach, false);
+    // Terminal reattach is on by default, and a user can turn it off.
+    assert.equal(database.getSettings().terminalReattach, true);
     assert.throws(() => database.updateSettings({ terminalReattach: "on" }), (error) => error.statusCode === 400);
-    assert.equal(database.updateSettings({ terminalReattach: true }).terminalReattach, true);
     assert.equal(database.updateSettings({ terminalReattach: false }).terminalReattach, false);
+    assert.equal(database.getSettings().terminalReattach, false);
+    assert.equal(database.updateSettings({ terminalReattach: true }).terminalReattach, true);
     const space = database.createSpace("Client work");
     database.setProjectSpace("project-1", space.id);
     assert.equal(database.listSpaces().memberships["project-1"], space.id);

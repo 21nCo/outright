@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Bell, Brain, Code, ShieldCheck, Trash } from "@phosphor-icons/react";
+import { Bell, Brain, Code, ShieldCheck, TerminalWindow, Trash } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -222,6 +222,7 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
     <Setting icon={Brain} label="Reasoning effort"><select value={draft.reasoningEffort} {...problemProps(Boolean(selectedProvider?.capabilities) && !efforts.includes(draft.reasoningEffort))} onChange={(event) => setDraft({ ...draft, reasoningEffort: event.target.value })}>{efforts.includes(draft.reasoningEffort) ? null : <option value={draft.reasoningEffort} disabled>{draft.reasoningEffort} (not supported)</option>}{efforts.map((value) => <option key={value}>{value}</option>)}</select></Setting>
     <Setting icon={Code} label="Editor"><select value={draft.editor} onChange={(event) => setDraft({ ...draft, editor: event.target.value })}><option value="zed">Zed</option><option value="code">VS Code</option><option value="cursor">Cursor</option><option value="finder">Finder</option></select></Setting>
     <Setting icon={Bell} label="Notifications"><span className="switch-row"><input type="checkbox" aria-label="Notify when runs finish" checked={draft.notifications} onChange={(event) => setDraft({ ...draft, notifications: event.target.checked })} /> Notify when runs finish</span></Setting>
+    <Setting icon={TerminalWindow} label="Terminals"><span className="switch-row"><input type="checkbox" aria-label="Keep shells running when Outright restarts" checked={Boolean(draft.terminalReattach)} onChange={(event) => setDraft({ ...draft, terminalReattach: event.target.checked })} /> Keep shells running when Outright restarts</span></Setting>
     {Object.entries(BUDGET_RANGES).map(([name, [label, min, max]]) =>
       <BudgetSetting key={name} name={name} label={label} min={min} max={max} value={draft[name]} setDraft={setDraft} />)}
   </div>

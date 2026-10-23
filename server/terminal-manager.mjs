@@ -3,7 +3,7 @@ import { lstatSync, opendirSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { utilityProcesses } from "./subprocess-budget.mjs";
 import { cleanupTerminalSocket, reattachManagedTerminal, reattachToken, readReattachRecord, recoverManagedTerminal, removeReattachRecord,
-  removeTerminalEmpty, recordTerminalEmpty, spawnManagedTerminal, terminalOwnership, writeReattachRecord } from "./managed-terminal.mjs";
+  removeTerminalEmpty, recordTerminalEmpty, spawnManagedTerminal, terminalOwnership, withdrawReattachRecords, writeReattachRecord } from "./managed-terminal.mjs";
 import { openTerminalHistory } from "./terminal-history.mjs";
 
 const TERMINAL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -16,12 +16,12 @@ function reservationTerminal(entry) {
 
 export function createTerminalManager({ publish, database, spawnTerminal = null, startManagedTerminal = spawnManagedTerminal,
   recoverTerminal = recoverManagedTerminal, cleanupSocket = cleanupTerminalSocket,
-  reattachTerminal = reattachManagedTerminal, reattachEnabled = () => false, detachWindowMs = 10 * 60 * 1000, runtimeInstanceId = null,
+  reattachTerminal = reattachManagedTerminal, reattachEnabled = () => true, detachWindowMs = 10 * 60 * 1000, runtimeInstanceId = null,
   subprocesses = utilityProcesses, terminate = (terminal, options) => {
   if (typeof terminal.process?.terminate !== "function") throw new Error("PTY owner has no termination verifier");
   return terminal.process.terminate(options);
 }, maxTerminals = 12, maxTerminalsPerCwd = 4, exitedRetentionMs = 15 * 60 * 1000, maxBufferChars = 150_000,
-  history = defaultHistory(database, (status) => publish({ type: "terminal.history", payload: status })) }) {
+  quitInventoryTimeoutMs = 10_000, history = defaultHistory(database, (status) => publish({ type: "terminal.history", payload: status })) }) {
   if (!Number.isSafeInteger(maxTerminals) || maxTerminals < 1 || maxTerminals > 256
     || !Number.isSafeInteger(maxTerminalsPerCwd) || maxTerminalsPerCwd < 1 || maxTerminalsPerCwd > 256) {
     throw new RangeError("Terminal process limits must be whole numbers from 1 to 256");
@@ -90,6 +90,9 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   }
 
   function assertCapacity(cwd) {
+    // Shutdown ends or hands back the shells in the map when it begins, so
+    // none may launch after that.
+    if (shuttingDown) throw terminalError(503, "Outright is shutting down; terminals cannot start");
     if (database.terminalAuditScanPending) throw terminalError(503,
       database.terminalAuditScanError
         ? "Terminal ownership recovery stopped; restart Outright after checking storage"
@@ -110,10 +113,14 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       // With reattach off, recovery runs exactly as before, with no added turn.
       if (reattachable(entry)) {
         if (await joinReattach(entry)) return true;
-        // Shutdown leaves this owner, untouched, to the next runtime's recovery.
+        // Shutdown decides this owner: a restart leaves it untouched to the
+        // next runtime, and a quit ends it.
         if (shuttingDown) return false;
       }
-      const empty = await recoverTerminal({ ...entry, launchDirectory: database.launchDirectory, subprocesses });
+      recovering.add(entry.target);
+      let empty;
+      try { empty = await recoverTerminal({ ...entry, launchDirectory: database.launchDirectory, subprocesses }); }
+      finally { recovering.delete(entry.target); }
       if (!empty || shuttingDown) return false;
       // Socket removal belongs to the same proof as native emptiness.
       // A failed unlink must leave the durable reservation charged.
@@ -132,6 +139,17 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     if (!database.launchDirectory) return;
     try { removeReattachRecord(id, database.launchDirectory); } catch { /* The stale-proof sweep retries it. */ }
   }
+  // An explicit quit withdraws every reattach record before any asynchronous
+  // step, and none is written after it. However the host then exits, no
+  // later start reattaches a shell: it ends them through native recovery.
+  let reattachWithdrawn = false;
+  // Whether a withdrawal found a record, or could not tell: a shell a broker
+  // may keep alive.
+  let reattachRecordsFound = false;
+  function withdrawReattach() {
+    reattachWithdrawn = true;
+    if (!spawnTerminal && withdrawReattachRecords(database.launchDirectory) !== 0) reattachRecordsFound = true;
+  }
 
   // A prior-run shell that its broker kept through the detach window becomes
   // live again only when the broker and this runtime prove the stored token
@@ -144,6 +162,22 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   }
   // Shutdown joins every attempt in flight, so none acts after the lease ends.
   const pendingReattaches = new Set();
+  // Prior-run owners whose native recovery is running, which an explicit
+  // quit leaves to that recovery instead of ending them twice at once.
+  const recovering = new Set();
+  // Whether shutdown hands live shells back to their brokers. Shutdown sets
+  // it before anything joins, and it is asked again before each hand-back,
+  // so an explicit quit that arrives while shutdown runs still ends them.
+  let shutdownDetach = () => false;
+  // Owner evidence for each shell this shutdown handed back, kept until its
+  // intent is final.
+  const handedBack = [];
+  function detachingForRestart() {
+    try { return shutdownDetach() === true && reattachEnabled() === true; } catch { return false; }
+  }
+  function reattachEnabledNow() {
+    try { return reattachEnabled() !== false; } catch { return true; }
+  }
   function joinReattach(entry) {
     const attempt = reattachReserved(entry);
     pendingReattaches.add(attempt);
@@ -164,13 +198,24 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     // stays: a withdrawn token is still current, and a spent one is refused
     // and removed by the next runtime.
     if (!processInstance) { if (!shuttingDown) forgetReattach(id); return false; }
-    try { writeReattachRecord(id, database.launchDirectory, { identity: record.identity, token: nextToken }); }
-    catch { forgetReattach(id); }
+    try {
+      if (reattachWithdrawn) throw new Error("Reattach was withdrawn by a quit");
+      writeReattachRecord(id, database.launchDirectory, { identity: record.identity, token: nextToken });
+    } catch { forgetReattach(id); }
     if (shuttingDown) {
-      // The broker detaches again and keeps the shell for its window. Ending
-      // it now would take a shell the next runtime can reattach. The output
-      // it already sent is saved here; it keeps the rest.
-      saveHandedOutput(entry, await processInstance.release());
+      // On a graceful restart the broker detaches again and keeps the shell
+      // for its window, for the next runtime to reattach. The output it
+      // already sent is saved here; it keeps the rest.
+      if (detachingForRestart()) {
+        saveHandedOutput(entry, await processInstance.release());
+        return false;
+      }
+      // An explicit quit ends it. Its output reaches the saved session, and
+      // shutdown's native proof then settles or keeps its reservation.
+      const saving = handedOutputWriter(entry);
+      processInstance.onData(saving.write);
+      try { await processInstance.terminate(); } catch { /* Native proof decides in shutdown. */ }
+      saving.close();
       return false;
     }
     try {
@@ -191,7 +236,7 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     const terminal = { id, cwd: entry.cwd, name: saved?.name ?? "Terminal", pid: entry.pid ?? processInstance.pid,
       process: processInstance, buffer: (history?.read(id) ?? "").slice(-maxBufferChars), outputCursor: 0,
       createdAt: saved?.createdAt ?? new Date().toISOString(), status: "running", exitSeen: false, recorded: true, reattached: true,
-      relaunchedFrom: saved?.relaunchedFrom };
+      relaunchedFrom: saved?.relaunchedFrom, owner: entry };
     terminals.set(id, terminal);
     // The saved session is writable again before the broker's buffered
     // output can arrive, so that output reaches history once, after it.
@@ -397,9 +442,11 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
         processIdentity: processInstance.processIdentity,
         ownershipLabel: ownership.label, handshakePath: ownership.handshakePath });
       terminal.recorded = true;
+      terminal.owner = { target: id, cwd, created: 1, pid: terminal.pid, processIdentity: processInstance.processIdentity,
+        ownershipLabel: ownership.label, handshakePath: ownership.handshakePath };
       if (terminal.status === "unknown") throw new Error("PTY ownership could not be verified after launch");
       if (terminal.status === "launching") terminal.status = "running";
-      if (session && processInstance.sessionIdentity) {
+      if (session && processInstance.sessionIdentity && !reattachWithdrawn) {
         try { writeReattachRecord(id, database.launchDirectory, { identity: processInstance.sessionIdentity, token: session.token }); }
         catch { /* Without a record this shell ends with its runtime, as before. */ }
       }
@@ -419,7 +466,8 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       publish({ type: "terminal.output", terminalId: id, payload: { data: data.slice(-64 * 1024), cursor: terminal.outputCursor } });
     });
     processInstance.onExit(({ exitCode, signal, verified, outcomeKnown }) => {
-      if (!terminals.has(id)) return;
+      // A shell handed back to its broker is the next runtime's to prove.
+      if (!terminals.has(id) || processInstance.handedBack === true) return;
       if (!verified || (!outcomeKnown && terminal.status !== "closing")) {
         terminal.status = "unknown";
         publish({ type: "terminal.audit-failed", terminalId: id, payload: { runtimeInstanceId, error: verified
@@ -574,12 +622,44 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
       return closed;
     });
   }
+  // A graceful restart hands each live reattachable shell to its broker's
+  // detach window. Its created audit stays open, so the next runtime holds
+  // its slot as a recovery reservation until it reattaches the shell with the
+  // stored token or proves it gone. Its history ends by restart, which a
+  // reattach resumes. Any other terminal, and every terminal on an explicit
+  // quit, is closed as before.
+  async function detachForRestart(terminal) {
+    if (!detachingForRestart() || terminal.status !== "running" || terminal.closePromise || terminal.exitSeen || !terminal.recorded
+      || typeof terminal.process?.release !== "function" || !database.launchDirectory
+      || !readReattachRecord(terminal.id, database.launchDirectory)) return false;
+    terminal.status = "detaching";
+    let frames = [];
+    try { frames = await terminal.process.release(); } catch { /* Not handed back: closed below. */ }
+    // Without the broker's acknowledgement, the shell exited or the broker
+    // did not answer: it stays ours to close, recording any exit it reported.
+    if (terminal.process.handedBack !== true) {
+      if (terminal.status === "detaching") terminal.status = "running";
+      return false;
+    }
+    for (const frame of frames ?? []) history?.append(terminal.id, frame);
+    history?.finish(terminal.id);
+    // Its owner evidence stays until shutdown settles, so a quit that wins
+    // after the broker acknowledged still ends this shell.
+    handedBack.push(terminal.owner);
+    forget(terminal);
+    return true;
+  }
   // Reap every PTY even when storage is unavailable during archive maintenance.
   // A failed audit leaves terminal.created pending for lease-owned recovery.
-  async function shutdown() {
+  // detach is a boolean or a function asked when each shell would be handed
+  // back; an explicit quit (false) closes every shell.
+  async function shutdown({ detach = false } = {}) {
+    shutdownDetach = typeof detach === "function" ? detach : () => detach === true;
     shuttingDown = true;
     await Promise.allSettled([...pendingReattaches]);
     const results = await Promise.allSettled([...terminals.values()].map((terminal) => Promise.resolve().then(async () => {
+      // A quit joins a close already under way in this same turn.
+      if (detachingForRestart() && await detachForRestart(terminal)) return;
       try { await close(terminal.id); }
       catch (error) {
         // A failed first native termination must receive one more attempt
@@ -591,9 +671,89 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
         throw error;
       }
     })));
+    // Intent is final here: nothing after this check yields before the
+    // runtime releases its lease. A quit that arrived during any hand-back
+    // ends every shell this runtime handed back or inherited.
+    if (!detachingForRestart()) {
+      try { await endHandedBack(); }
+      catch (error) { results.push({ status: "rejected", reason: error }); }
+      try { await endPriorRunShells(); }
+      catch (error) { results.push({ status: "rejected", reason: error }); }
+    }
     history?.close();
     const errors = results.filter((result) => result.status === "rejected").map((result) => result.reason);
     if (errors.length) throw new AggregateError(errors, "Terminal shutdown could not record every outcome");
+  }
+
+  // A prior-run shell can outlive a quit in its broker's detach window, to
+  // be reattached by the next start. An explicit quit ends each one this
+  // runtime has not reattached and proves its owner empty, so its record
+  // goes and its session stays ended by restart. One that cannot be proven
+  // stays reserved for the next runtime's recovery. The inherited inventory
+  // is known only once the audit scan has rebuilt it, so a quit waits a
+  // bounded time for that scan, unless reattach is off and no previous run
+  // left a reattach record. If it still cannot be known, the quit fails
+  // rather than treating it as empty: those shells keep running until their
+  // detach window ends or the next start ends them through native recovery.
+  async function endPriorRunShells() {
+    if (!database.launchDirectory || spawnTerminal) return;
+    // A quit never leaves a shell to be reattached, even one the inventory
+    // does not show yet. Every shell of this run is closed or ended by now.
+    withdrawReattach();
+    // With reattach off, a shell outlives its runtime only in a previous
+    // run's detach window, with a reattach record unless writing it failed.
+    // Only a launch directory read and found without a record leaves nothing
+    // to wait for; the next start ends any such shell through native recovery.
+    if (database.terminalAuditScanPending && !reattachEnabledNow() && !reattachRecordsFound) return;
+    if (database.terminalAuditScanPending) {
+      let timer;
+      await Promise.race([Promise.resolve(database.waitForTerminalAuditReconciliation?.()).catch(() => {}),
+        new Promise((resolve) => { timer = setTimeout(resolve, quitInventoryTimeoutMs); })])
+        .finally(() => clearTimeout(timer));
+      if (database.terminalAuditScanPending) {
+        throw new Error("Terminal ownership was not recovered before quit; shells a previous run left are kept for the next start to verify");
+      }
+    }
+    let entries;
+    try { entries = unresolvedReservations(); }
+    catch (error) {
+      // Archive maintenance can hold storage while shutdown still reaps
+      // every PTY and releases the lease. With the records gone, none of
+      // these shells is reattached; the next start ends them.
+      console.warn("Terminal ownership could not be read at quit; the next start ends shells a previous run left", error);
+      return;
+    }
+    await endOwners(entries.filter((entry) => entry.created === 1 && !recovering.has(entry.target)
+      && !quitAttempted.has(entry.target)));
+  }
+  // Shells this shutdown handed back before a quit won. Their created audit
+  // is this run's own, or an inherited reservation for a reattached shell.
+  async function endHandedBack() {
+    if (!database.launchDirectory) return;
+    await endOwners(handedBack.splice(0));
+  }
+  // Each owner gets one native attempt per quit; an unproven one is retried
+  // by the next start.
+  const quitAttempted = new Set();
+  async function endOwners(entries) {
+    for (const entry of entries) quitAttempted.add(entry.target);
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(4, entries.length) }, async () => {
+      while (next < entries.length) {
+        const entry = entries[next++];
+        // A quit never leaves a shell to be reattached, even one whose end
+        // cannot be proven: that one stays reserved for native recovery.
+        forgetReattach(entry.target);
+        try {
+          if (!await recoverTerminal({ ...entry, launchDirectory: database.launchDirectory, subprocesses })) continue; // NOSONAR S9382: one worker of a bounded shutdown pool
+          cleanupSocket(entry.target);
+          const evidence = `Native ${process.platform} owner was verified empty at quit`;
+          if (unresolvedReservations().some((owner) => owner.target === entry.target)) database.resolveTerminalUnknown(entry.target, evidence);
+          else database.auditCritical("terminal.closed", { target: entry.target, cwd: entry.cwd, operationId: randomUUID(), evidence });
+          try { removeTerminalEmpty(entry.target, database.launchDirectory); } catch { /* The stale-proof sweep retries it. */ }
+        } catch { /* The reservation stays for the next runtime's recovery. */ }
+      }
+    }));
   }
 
   function pruneExitedForCapacity(cwd) {
@@ -610,7 +770,8 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   }
 
   queueMicrotask(sweepStaleEmptyProofs);
-  return { create, list, capacity, get, write, resize, close, shutdown, reconcileUnknown, reloadUnknownReservations, historyStatus };
+  return { create, list, capacity, get, write, resize, close, shutdown, withdrawReattach, reconcileUnknown, reloadUnknownReservations,
+    historyStatus };
 }
 
 function defaultHistory(database, onStatusChange) {
