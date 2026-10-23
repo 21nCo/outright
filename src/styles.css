@@ -297,7 +297,8 @@ button, input, textarea, select { font: inherit; }
 
 .composer { width: min(820px, calc(100% - 44px)); min-height: 116px; margin: 0 auto 18px; overflow: hidden; border: 1px solid color-mix(in oklab, var(--foreground) 24%, transparent); border-radius: 11px; background: var(--card); box-shadow: 0 12px 32px rgba(0,0,0,.07), inset 0 0 0 1px color-mix(in oklab, var(--background) 50%, transparent); }
 .composer:focus-within { border-color: color-mix(in oklab, var(--foreground) 42%, transparent); box-shadow: 0 12px 32px rgba(0,0,0,.08), 0 0 0 3px color-mix(in oklab, var(--ring) 13%, transparent); }
-.first-prompt-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 15px 0; color: var(--foreground); font-size: 11px; line-height: 1.4; }
+.first-prompt-notice { width: min(820px, calc(100% - 44px)); margin: 0 auto; padding: 8px 4px 6px; display: flex; flex-direction: column; gap: 6px; color: var(--foreground); font-size: 11px; line-height: 1.4; }
+.first-prompt-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .composer textarea { width: 100%; height: 66px; padding: 14px 15px 7px; resize: none; border: 0; outline: 0; color: var(--foreground); background: transparent; font-size: 12px; line-height: 1.5; }
 .composer textarea::placeholder { color: var(--muted-foreground); }
 .composer-actions { min-height: 48px; padding: 3px 7px 7px; display: grid; grid-template-columns: minmax(0,1fr) auto 36px; align-items: center; gap: 8px; }
@@ -332,7 +333,13 @@ button, input, textarea, select { font: inherit; }
 .sidebar-actions kbd { margin-left: auto; color: var(--muted-foreground); font-size: 9px; font-weight: 500; }
 .workspace { grid-template-rows: 50px 45px minmax(0, 1fr); }
 .work-area { min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
-.conversation-pane { min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-rows: 83px minmax(0, 1fr) auto; overflow: hidden; }
+/* Header, transcript, notices and composer. The transcript keeps a minimum
+   share; the notices take what is left up to a bounded height and scroll, with
+   their actions pinned in view. */
+.conversation-pane { min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-rows: 83px minmax(72px, 1fr) minmax(0, auto) auto; overflow: hidden; }
+.conversation-notices { min-height: 0; max-height: 45cqh; overflow-y: auto; overscroll-behavior: contain; }
+.conversation-notices .recovery-actions { position: sticky; bottom: 0; background: var(--subtle-canvas); }
+.first-prompt-actions { position: sticky; bottom: 0; background: var(--canvas); }
 /* Split panes: every pane is absolutely placed in one stage so a moved view
    keeps its mounted component; the layout model owns the geometry. */
 .pane-layout { position: relative; display: grid; grid-template-rows: minmax(0, 1fr); }
@@ -594,7 +601,7 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
    primary content usable down to the pane minimums in src/lib/pane-layout.js.
    Window media queries above only style the shell around the panes. */
 @container pane (max-width: 760px) {
-  .message-column, .composer, .history-live-tail { width: calc(100% - 16px); }
+  .message-column, .composer, .history-live-tail, .first-prompt-notice { width: calc(100% - 16px); }
   .message-column { padding-top: 18px; }
   .conversation-header { padding: 0 16px; }
   .recovery-notice { flex-wrap: wrap; }
@@ -606,7 +613,7 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .conversation-meta small:not(.conversation-account) { display: none; }
 }
 @container pane (max-width: 520px) {
-  .conversation-pane { grid-template-rows: 68px minmax(0, 1fr) auto; }
+  .conversation-pane { grid-template-rows: 68px minmax(72px, 1fr) minmax(0, auto) auto; }
   .conversation-header { grid-template-columns: minmax(0,1fr) auto; padding: 0 12px; }
   .conversation-symbol { display: none; }
   .conversation-header h1 { font-size: 14px; }
@@ -626,7 +633,7 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .terminal-loading { font-size: 0; }
 }
 @container pane (max-height: 479px) {
-  .conversation-pane { grid-template-rows: 56px minmax(0, 1fr) auto; }
+  .conversation-pane { grid-template-rows: 56px minmax(72px, 1fr) minmax(0, auto) auto; }
   .conversation-header h1 { margin-bottom: 2px; font-size: 14px; }
   .message-column { padding-block: 12px 8px; }
   .composer { min-height: 96px; margin-bottom: 8px; }
@@ -635,8 +642,10 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .changes-pane { grid-template-rows: 40px minmax(0, 1fr) auto; }
   .changes-layout { grid-template-rows: minmax(64px, 30%) minmax(0, 1fr); }
   .commit-bar { padding-block: 5px; }
-  /* Short panes keep recovery actions on shared rows rather than one per row. */
-  .recovery-actions [data-slot="button"] { width: auto; flex: 1 1 auto; }
+  /* Short panes keep recovery actions compact on shared rows, so the pinned
+     actions leave the notices region room for the explanation. */
+  .recovery-actions { gap: 4px; }
+  .recovery-actions [data-slot="button"] { width: auto; flex: 1 1 auto; height: 28px; padding-inline: 6px; font-size: 12px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

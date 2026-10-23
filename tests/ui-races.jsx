@@ -6420,6 +6420,16 @@ async function spaceSidebarRegression() {
 }
 
 function paneRect(view) { return host.querySelector(`#pane-${view}`)?.getBoundingClientRect(); }
+// A control is usable when it lies inside its pane and is what a click at its centre reaches.
+function assertReachableInPane(element, view, label) {
+  const rect = element?.getBoundingClientRect();
+  const pane = paneRect(view);
+  assert(rect && rect.width > 0 && rect.height > 0 && rect.left >= pane.left - 1 && rect.right <= pane.right + 1 && rect.top >= pane.top - 1 && rect.bottom <= pane.bottom + 1,
+    `${label} is clipped by its ${view} pane: ${JSON.stringify([rect?.toJSON(), pane.toJSON()])}`);
+  assert(element.scrollWidth <= element.clientWidth + 1, `${label} clips its text: ${element.scrollWidth} > ${element.clientWidth}`);
+  const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+  assert(element.contains(hit), `${label} is covered by ${hit?.outerHTML.slice(0, 120)}`);
+}
 function paneOrder() { return [...host.querySelectorAll(".pane-stage > .pane")].map((element) => element.dataset.paneView).join(","); }
 async function choosePaneMenuItem(view, label) {
   host.querySelector(`[aria-label="${view} pane options"]`).click();
@@ -6744,7 +6754,7 @@ async function paneMinimumContentRegression() {
     await until(() => host.querySelector("#pane-context .context-pane-content") && host.querySelector("#pane-changes .diff-view span:not(.diff-empty)")
       && host.querySelector("#pane-conversation .message-text"), "restored short conversation layout");
     await settle();
-    near(paneRect("conversation").height, 300, "The restored conversation height");
+    near(paneRect("conversation").height, 400, "The restored conversation height");
     near(paneRect("context").width, 240, "The restored context width");
     usable.conversation();
     usable.context();
@@ -6785,16 +6795,7 @@ async function paneNoticeMinimumRegression() {
   const saveMinimumLayout = () => localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { A: { savedAt: 1, layout: { version: 1, focused: "conversation", root: {
     type: "split", axis: "row", ratio: 0.05, first: leaf("conversation"), second: { type: "split", axis: "row", ratio: 0.95, first: leaf("context"), second: leaf("changes") },
   } } } } }));
-  // A control is usable when it lies inside its pane and is what a click at its centre reaches.
-  const reachable = (element, view, label) => {
-    const rect = element?.getBoundingClientRect();
-    const pane = paneRect(view);
-    assert(rect && rect.width > 0 && rect.height > 0 && rect.left >= pane.left - 1 && rect.right <= pane.right + 1 && rect.top >= pane.top - 1 && rect.bottom <= pane.bottom + 1,
-      `${label} is clipped by its ${view} pane: ${JSON.stringify([rect?.toJSON(), pane.toJSON()])}`);
-    assert(element.scrollWidth <= element.clientWidth + 1, `${label} clips its text: ${element.scrollWidth} > ${element.clientWidth}`);
-    const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-    assert(element.contains(hit), `${label} is covered by ${hit?.outerHTML.slice(0, 120)}`);
-  };
+  const reachable = assertReachableInPane;
   try {
     await window.__fixtureSetViewport(1280);
     await until(() => window.innerWidth === 1280, "wide notice viewport");
@@ -6835,6 +6836,132 @@ async function paneNoticeMinimumRegression() {
     const notice = host.querySelector("#pane-conversation .first-prompt-notice");
     assert(notice.getBoundingClientRect().width >= 260, `The unsent prompt notice is ${notice.getBoundingClientRect().width}px wide`);
     for (const button of notice.querySelectorAll("button")) reachable(button, "conversation", button.textContent.trim());
+  } finally {
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
+// At the conversation's minimum height its notices share one bounded region
+// between the transcript and the composer: the transcript keeps several
+// message lines, recovery and first-prompt actions stay pinned in view, and
+// every other notice control is reachable by scrolling that region alone.
+async function paneNoticeShortRegression() {
+  if (!window.__fixtureSetViewport) return false;
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const messages = Array.from({ length: 8 }, (_, index) => ({ id: `short-${index}`, role: index % 2 ? "assistant" : "user", kind: "text", body: `Short pane message ${index}`, createdAt: "2026-10-24T00:00:00Z" }));
+  const interrupted = { id: "run-interrupted", conversationId: "chat-A", status: "interrupted", recoveryClass: "exited", provider: "codex", providerSessionId: "session-A" };
+  const pendingRun = { id: "run-pending", conversationId: "chat-A", status: "running", outcomePending: true, provider: "codex" };
+  const checkpoint = { id: "short-checkpoint", role: "assistant", kind: "text", body: Array.from({ length: 12 }, (_, index) => `Live checkpoint line ${index}`).join("\n"), payload: { runId: "run-pending", checkpointEventSeq: 1 }, createdAt: "2026-10-24T00:00:01Z" };
+  const details = {
+    interrupted: { ...chats.A, providerSessionId: "session-A", runs: [interrupted], messages },
+    pending: { ...chats.A, runs: [pendingRun], messages: [...messages, checkpoint], messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 4, total: 13, beforeId: "short-0" } },
+  };
+  const created = { ...chats.A, id: "chat-unsent", title: "Unsent first prompt" };
+  let mode = "interrupted";
+  let conversations = [details.interrupted];
+  route = async (url, options = {}) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations" && options.method === "POST") { conversations = [created]; return response(created, 201); }
+    if (url.pathname === "/api/conversations") return response({ conversations });
+    if (url.pathname === "/api/conversations/chat-A") return response(details[mode]);
+    if (url.pathname === "/api/conversations/chat-unsent") return response({ error: "Chat details unavailable" }, 503);
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [], stagedCount: 0 });
+    if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    return response({});
+  };
+  const leaf = (view) => ({ type: "pane", view });
+  const render = async () => {
+    root.render(null);
+    await settle();
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { A: { savedAt: 1, layout: { version: 1, focused: "conversation", root: {
+      type: "split", axis: "row", ratio: 0.05, first: { type: "split", axis: "column", ratio: 0.05, first: leaf("conversation"), second: leaf("context") }, second: leaf("changes"),
+    } } } } }));
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+  };
+  const query = (selector) => host.querySelector(`#pane-conversation ${selector}`);
+  const notices = () => query(".conversation-notices");
+  const transcriptKept = (label) => {
+    const viewport = query('[aria-label="Conversation messages"]');
+    assert(viewport.clientHeight >= 60, `${label}: the transcript of a ${JSON.stringify(paneRect("conversation").toJSON())} conversation shows ${viewport.clientHeight}px`);
+    assertReachableInPane(viewport, "conversation", `${label}: the message list`);
+    assertReachableInPane(query('textarea[aria-label="Message the agent"]'), "conversation", `${label}: the composer`);
+  };
+  // Shows a control by scrolling the notices region, never the pane around it.
+  const reveal = (element) => {
+    element.scrollIntoView({ block: "nearest", inline: "nearest" });
+    for (const outer of [host.querySelector("#pane-conversation"), query(".pane-body") ?? host.querySelector("#pane-conversation .pane-body"), query(".conversation-pane")]) {
+      assert(!outer?.scrollTop, `Revealing ${element.textContent.trim().slice(0, 40)} scrolled ${outer?.className} instead of the notices`);
+    }
+    return element;
+  };
+  // How much of an element shows in the notices region, above any actions pinned over it.
+  const visibleHeight = (element, pinned = null) => {
+    const rect = element.getBoundingClientRect();
+    const region = notices().getBoundingClientRect();
+    const bottom = Math.min(rect.bottom, region.bottom, pinned ? pinned.getBoundingClientRect().top : Infinity);
+    return Math.max(0, bottom - Math.max(rect.top, region.top));
+  };
+  try {
+    await window.__fixtureSetViewport(1280);
+    await until(() => window.innerWidth === 1280, "wide short-pane viewport");
+    window.dispatchEvent(new Event("resize"));
+
+    // An interrupted run: the explanation and every decision beside the transcript.
+    await render();
+    await until(() => query(".recovery-actions button") && query('[data-message-id="short-7"]'), "interrupted run at the minimum height");
+    await settle();
+    const minimum = paneRect("conversation");
+    assert(Math.abs(minimum.width - 320) <= 1 && !host.querySelector(".pane-switcher"), `The conversation is not a split pane at its minimum width: ${JSON.stringify(minimum.toJSON())}`);
+    assert(Math.abs(paneRect("context").top - minimum.bottom - 6) <= 1, "The conversation is not at its minimum height above Context");
+    transcriptKept("Interrupted run");
+    const copy = query(".recovery-copy");
+    assert(copy.getBoundingClientRect().width >= 200 && visibleHeight(copy, query(".recovery-actions")) >= 48,
+      `Only ${visibleHeight(copy, query(".recovery-actions"))}px of the recovery explanation shows above its actions in ${notices().clientHeight}px of notices`);
+    const actions = [...host.querySelectorAll("#pane-conversation .recovery-actions button")];
+    assert(actions.length === 3, "The recovery decisions are missing");
+    for (const button of actions) assertReachableInPane(button, "conversation", button.textContent.trim());
+    notices().scrollTop = notices().scrollHeight;
+    await settle();
+    for (const button of actions) assertReachableInPane(button, "conversation", `${button.textContent.trim()} after scrolling the notices`);
+    assert(reveal(copy.querySelector("p")).getBoundingClientRect().top >= notices().getBoundingClientRect().top - 1, "The start of the recovery explanation cannot be scrolled into view");
+
+    // A pending outcome while reading history with a live tail: three notices at once.
+    mode = "pending";
+    conversations = [details.pending];
+    await render();
+    await until(() => query(".history-live-tail")?.textContent.includes("Live checkpoint line 11") && query(".history-forward .history-return")
+      && query(".recovery-notice")?.textContent.includes("Run outcome waiting for storage"), "pending outcome, history and live tail together");
+    await settle();
+    transcriptKept("Pending outcome");
+    for (const control of [query(".history-live-tail"), query(".history-later"), query(".history-return")]) {
+      assertReachableInPane(reveal(control), "conversation", control.getAttribute("aria-label") ?? control.textContent.trim());
+    }
+    const pending = query(".recovery-notice .recovery-copy");
+    reveal(pending);
+    assert(visibleHeight(pending) >= Math.min(60, pending.getBoundingClientRect().height - 1), `Only ${visibleHeight(pending)}px of the pending outcome notice shows`);
+    transcriptKept("Pending outcome after scrolling the notices");
+
+    // A first prompt whose chat was created but not sent.
+    mode = "interrupted";
+    conversations = [];
+    localStorage.removeItem(keys[2]);
+    await render();
+    await until(() => query('textarea[aria-label="Message the agent"]:not(:disabled)'), "empty worktree composer at the minimum height");
+    setControlValue(query('textarea[aria-label="Message the agent"]'), "First prompt in a short pane");
+    await until(() => query('[aria-label="Send message"]:not(:disabled)'), "first prompt enabled");
+    query('[aria-label="Send message"]').click();
+    await until(() => query(".first-prompt-notice button"), "unsent first-prompt notice at the minimum height");
+    await until(() => !host.querySelector(".toast"), "short notices settle");
+    await settle();
+    transcriptKept("Unsent first prompt");
+    const unsent = query(".first-prompt-notice");
+    const unsentActions = unsent.querySelector(".first-prompt-actions");
+    assert(visibleHeight(unsent.firstElementChild, unsentActions) >= 30, `Only ${visibleHeight(unsent.firstElementChild, unsentActions)}px of the unsent prompt explanation shows above its actions`);
+    for (const button of unsent.querySelectorAll("button")) assertReachableInPane(button, "conversation", button.textContent.trim());
   } finally {
     root.render(null);
     await settle();
@@ -6945,6 +7072,15 @@ async function paneLayoutReplacementRegression() {
     await setWidth(1280);
     await until(() => !host.querySelector(".pane-switcher") && separator(), "split panes again");
     await until(() => document.activeElement === host.querySelector(`#pane-${viewBefore}`), `focus on a removed pane tab moves to the ${viewBefore} pane instead of ${document.activeElement?.outerHTML.slice(0, 80)}`);
+    // Pane options buttons in split headers and in the pane tab strip as well.
+    host.querySelector(`#pane-${viewBefore} .pane-header [aria-label$=" pane options"]`).focus();
+    await setWidth(640);
+    await until(() => host.querySelector(".pane-switcher"), "panes one at a time from an options button");
+    await until(() => document.activeElement === host.querySelector(`#pane-${viewBefore}`), `focus on a removed split options button moves to the ${viewBefore} pane instead of ${document.activeElement?.outerHTML.slice(0, 80)}`);
+    host.querySelector('.pane-switcher [aria-label$=" pane options"]').focus();
+    await setWidth(1280);
+    await until(() => !host.querySelector(".pane-switcher") && separator(), "split panes again from an options button");
+    await until(() => document.activeElement === host.querySelector(`#pane-${viewBefore}`), `focus on a removed pane tab options button moves to the ${viewBefore} pane instead of ${document.activeElement?.outerHTML.slice(0, 80)}`);
   } finally {
     Storage.prototype.setItem = setItem;
     root.render(null);
@@ -7655,7 +7791,8 @@ try {
     ["split pane layout", splitPaneLayoutRegression, "nested panes resize, move, cycle focus, restore and repair without restarting their views"],
     ["pane minimum content", paneMinimumContentRegression, "every view keeps usable content at its minimum pane size, including restored layouts", "minimum pane geometry requires the CDP viewport bridge"],
     ["pane notices at minimum", paneNoticeMinimumRegression, "recovery, unsent-prompt and commit controls stay readable and clickable at the pane minimums on a wide window", "minimum pane geometry requires the CDP viewport bridge"],
-    ["pane layout replacement", paneLayoutReplacementRegression, "a separator drag on a replaced layout is discarded unsaved and focus on removed pane chrome moves to the shown pane", "responsive transition requires the CDP viewport bridge"],
+    ["pane notices at minimum height", paneNoticeShortRegression, "at the conversation's minimum height the transcript keeps message lines while recovery, history, live and unsent-prompt notices stay readable and reachable", "minimum pane geometry requires the CDP viewport bridge"],
+    ["pane layout replacement", paneLayoutReplacementRegression, "a separator drag on a replaced layout is discarded unsaved and focus on any removed pane chrome moves to the shown pane", "responsive transition requires the CDP viewport bridge"],
     ["pane drag isolation", paneDragChatTabRegression, "pane title drags never reorder chat tabs, even after an unfinished tab drag"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and one-at-a-time panes contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],

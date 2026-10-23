@@ -44,13 +44,15 @@ class PreserveMovedState extends Component {
   render() { return this.props.children; }
 }
 
-// Switching between split and one-at-a-time panes unmounts the separators or
-// the pane tabs. Focus on one of them moves to the shown pane, not the page.
+// Switching between split and one-at-a-time panes replaces the layout's own
+// chrome: separators, pane headers, the pane tabs and their options buttons.
+// Focus on any of it that the switch drops moves to the shown pane, not the
+// page. Focus inside a view's body is left to the view.
 class KeepFocusAcrossModes extends Component {
   getSnapshotBeforeUpdate(previous) {
     if (previous.compact === this.props.compact) return null;
     const active = document.activeElement;
-    return Boolean(this.props.containerRef.current?.contains(active) && active.matches(".pane-separator, .pane-switcher [role='tab']"));
+    return Boolean(this.props.containerRef.current?.contains(active) && !active.closest(".pane-body"));
   }
   componentDidUpdate(_previous, _state, lost) {
     if (lost && (!document.activeElement || document.activeElement === document.body)) this.props.onFocusLost();
