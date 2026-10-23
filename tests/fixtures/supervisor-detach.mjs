@@ -47,7 +47,11 @@ export async function assertReattachPausesWindow({ start, detach, alive, assertR
   assert.ok(Date.now() - detachedAgain >= 500, "a fresh detach did not get its own window");
 }
 
-export async function assertStopEndsDetachedProvider({ start, detach, alive, assertReleased }) {
+// terminate stands for a termination request to the supervisor; Windows has
+// no SIGTERM, so its recovery's terminate request stands in.
+const sigterm = (run) => process.kill(run.supervisorPid, "SIGTERM");
+
+export async function assertStopEndsDetachedProvider({ start, detach, alive, assertReleased, terminate = sigterm }) {
   const stopped = await start("stop", detach(60_000));
   stopped.owner.stdin.write("stop\n");
   await waitUntil(() => stopped.supervisorExit(), "an explicit stop did not end the detach-mode provider");
@@ -59,7 +63,7 @@ export async function assertStopEndsDetachedProvider({ start, detach, alive, ass
   await delay(800);
   assert.equal(eof.supervisorExit(), null, "stdin EOF ended a detach-mode provider");
   assert.equal(alive(eof.providerPid()), true);
-  process.kill(eof.supervisorPid, "SIGTERM");
+  terminate(eof);
   await waitUntil(() => eof.supervisorExit(), "a termination request did not end the detach-mode provider");
   assert.deepEqual(eof.supervisorExit(), ["137", "null"]);
   await assertReleased(eof, 5000);
