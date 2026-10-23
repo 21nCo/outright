@@ -250,19 +250,23 @@ test("one Ctrl-C delivered twice quits once; a later Ctrl-C forces the exit; nei
   }
 });
 
-test("a quit before the runtime exists leaves no shell to reattach, in either host", { timeout: 300_000 }, async (t) => {
+test("a quit before the runtime exists leaves no shell to reattach, in either host, by signal or by closing the server", { timeout: 420_000 }, async (t) => {
   const { repo, env } = workspace(t);
   let host = await startOutright(t, env);
-  for (const kind of ["vite", "standalone"]) {
+  for (const [kind, quit] of [["vite", "SIGINT"], ["vite", "close"], ["standalone", "SIGINT"]]) {
     const shell = await host.shell(repo);
     await host.stop("restart");
     // Archive recovery holds startup; the quit arrives before the runtime.
     const quitting = await startOutright(t, env, { kind, gated: true });
     await waitUntil(() => quitting.stdout().includes("recovering"), `${kind}: recovery did not start`);
-    quitting.signal("SIGINT");
+    // Closing the server is the q shortcut's quit, which Vite does not signal.
+    if (quit === "close") quitting.send("close");
+    else quitting.signal(quit);
     await delay(300);
     quitting.send("recover");
-    assert.deepEqual(await quitting.exited, { code: kind === "vite" ? 130 : 0, signal: null }, `${kind}: ${quitting.stdout()}`);
+    assert.deepEqual(await quitting.exited, { code: kind === "vite" && quit === "SIGINT" ? 130 : 0, signal: null },
+      `${kind} ${quit}: ${quitting.stdout()}`);
+    assert.doesNotMatch(quitting.stdout(), /runtime-created/, `${kind} ${quit}`);
     host = await startOutright(t, env);
     await host.ended(shell);
   }

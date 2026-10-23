@@ -13,6 +13,7 @@ import { outrightApiPlugin } from "./outright-vite-plugin.mjs";
 import { createOutrightRuntime } from "./outright-runtime.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 import { createTerminalManager } from "./terminal-manager.mjs";
+import { readReattachRecord, reattachToken, writeReattachRecord } from "./managed-terminal.mjs";
 
 // As Vite does: run the hook configureServer returns, then append its error
 // middleware and finish creating the server. A later plugin's post hook that
@@ -131,6 +132,59 @@ for (const thenReload of [false, true]) {
     await successor?.closeBundle();
   });
 }
+
+// Closing the server (the q shortcut, or a host) is a quit like Ctrl-C:
+// before any await it withdraws every reattach record, even while recovery
+// is pending or after it failed with no runtime. A successor's restart, and
+// a reload Vite never completed, withdraw none.
+test("a Vite close with no successor withdraws every reattach record at once, with or without a runtime", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "outright-vite-withdraw-"));
+  const record = () => readReattachRecord(id, directory);
+  const id = randomUUID();
+  const leave = () => writeReattachRecord(id, directory, { identity: randomUUID(), token: reattachToken() });
+  const priorError = console.error;
+  console.error = () => {};
+  try {
+    for (const recovery of ["pending", "failed"]) {
+      leave();
+      let finish;
+      const plugin = outrightApiPlugin({ configUrl: new URL(`file:///fixture/${randomUUID()}.json`), launchDirectory: () => directory,
+        recoverArchive: () => (recovery === "pending" ? new Promise((resolve) => { finish = resolve; }) : Promise.reject(new Error("invalid archive"))),
+        createRuntime: () => assert.fail("a closed startup created a runtime") });
+      await configure(plugin, { httpServer: new EventEmitter(), middlewares: { use() {} } });
+      await new Promise((resolve) => setImmediate(resolve));
+      const closing = plugin.closeBundle();
+      assert.equal(record(), null, `${recovery}: the close left a reattach record`);
+      finish?.();
+      await closing;
+    }
+
+    const intents = [];
+    const options = { configUrl: new URL(`file:///fixture/${randomUUID()}.json`), recoverArchive: async () => {}, launchDirectory: () => directory,
+      createRuntime: () => ({ attach() {}, withdrawReattach() { intents.push("withdraw"); },
+        async shutdown({ restart } = {}) { intents.push(restart); } }) };
+    leave();
+    const first = outrightApiPlugin(options);
+    await configure(first, { middlewares: { use() {} } });
+    await new Promise((resolve) => setImmediate(resolve));
+    const failed = outrightApiPlugin(options);
+    await configure(failed, { middlewares: { use() {} } }, { fail: true });
+    await failed.closeBundle();
+    assert.ok(record(), "a reload Vite never completed withdrew the records on close");
+    const successor = outrightApiPlugin(options);
+    await configure(successor, { middlewares: { use() {} } });
+    await first.closeBundle();
+    assert.deepEqual(intents, [true]);
+    assert.ok(record(), "a restart withdrew the records");
+    await new Promise((resolve) => setImmediate(resolve));
+    // With a runtime, its withdrawal comes first.
+    await successor.closeBundle();
+    assert.deepEqual(intents, [true, "withdraw", false]);
+  } finally {
+    console.error = priorError;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("Vite serves a retryable API response while archive recovery is pending", async () => {
   let finishRecovery;

@@ -100,15 +100,19 @@ export function removeReattachRecord(id, launchDirectory) {
 // An explicit quit's first step: every reattach record in the directory goes
 // at once, synchronously, so no later start reattaches a shell whatever the
 // quitting process does next. A record that cannot be removed stays.
+// Returns how many records it found.
 export function withdrawReattachRecords(launchDirectory) {
-  if (!launchDirectory) return;
+  if (!launchDirectory) return 0;
   let names = [];
-  try { names = readdirSync(launchDirectory); } catch { return; }
+  try { names = readdirSync(launchDirectory); } catch { return 0; }
+  let found = 0;
   for (const name of names) {
     const match = /^terminal-([0-9a-f-]{36})\.reattach$/.exec(name);
     if (!match) continue;
+    found += 1;
     try { removeReattachRecord(match[1], launchDirectory); } catch { /* The next quit or the stale-proof sweep retries it. */ }
   }
+  return found;
 }
 
 // A creation audit may fail after the native owner has been verified empty.

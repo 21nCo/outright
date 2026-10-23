@@ -102,8 +102,18 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
       }
     }
   };
+  // An explicit quit's first step withdraws every reattach record,
+  // synchronously, even before a runtime exists.
+  const withdraw = () => {
+    if (runtime) runtime.withdrawReattach?.();
+    else withdrawReattachRecords(launchDirectory());
+  };
   const shutdown = () => {
     if (!recovery) return undefined;
+    // Every close but a successor's restart is a quit: Ctrl-C, SIGTERM, the
+    // q shortcut or a host closing the server, before or after the runtime
+    // exists, and after a failed recovery.
+    if (!restarting()) withdraw();
     // A quit must reach shells a predecessor handed to this server for a
     // restart, so a successor still starting finishes and then quits. Any
     // other close abandons startup. The first close decides.
@@ -136,11 +146,9 @@ export function outrightApiPlugin({ configUrl, createRuntime = createOutrightRun
     return closing;
   };
   // An explicit quit for this plugin's runtime, whether or not it is already
-  // shutting down for a restart. Its first step withdraws every reattach
-  // record, synchronously, even before a runtime exists.
+  // shutting down for a restart.
   const quitter = { quit() {
-    if (runtime) runtime.withdrawReattach?.();
-    else withdrawReattachRecords(launchDirectory());
+    withdraw();
     const done = shutdown() ?? Promise.resolve();
     if (runtimeStopping) runtime?.shutdown({ restart: false }).catch(() => {});
     return done;

@@ -90,6 +90,9 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   }
 
   function assertCapacity(cwd) {
+    // Shutdown ends or hands back the shells in the map when it begins, so
+    // none may launch after that.
+    if (shuttingDown) throw terminalError(503, "Outright is shutting down; terminals cannot start");
     if (database.terminalAuditScanPending) throw terminalError(503,
       database.terminalAuditScanError
         ? "Terminal ownership recovery stopped; restart Outright after checking storage"
@@ -140,9 +143,11 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   // step, and none is written after it. However the host then exits, no
   // later start reattaches a shell: it ends them through native recovery.
   let reattachWithdrawn = false;
+  // Whether a withdrawal found a record: a shell a broker may keep alive.
+  let reattachRecordsFound = false;
   function withdrawReattach() {
     reattachWithdrawn = true;
-    if (!spawnTerminal) withdrawReattachRecords(database.launchDirectory);
+    if (!spawnTerminal && withdrawReattachRecords(database.launchDirectory) > 0) reattachRecordsFound = true;
   }
 
   // A prior-run shell that its broker kept through the detach window becomes
@@ -168,6 +173,9 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   const handedBack = [];
   function detachingForRestart() {
     try { return shutdownDetach() === true && reattachEnabled() === true; } catch { return false; }
+  }
+  function reattachEnabledNow() {
+    try { return reattachEnabled() !== false; } catch { return true; }
   }
   function joinReattach(entry) {
     const attempt = reattachReserved(entry);
@@ -682,7 +690,8 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
   // goes and its session stays ended by restart. One that cannot be proven
   // stays reserved for the next runtime's recovery. The inherited inventory
   // is known only once the audit scan has rebuilt it, so a quit waits a
-  // bounded time for that scan. If it still cannot be known, the quit fails
+  // bounded time for that scan, unless reattach is off and no previous run
+  // left a reattach record. If it still cannot be known, the quit fails
   // rather than treating it as empty: those shells keep running until their
   // detach window ends or the next start ends them through native recovery.
   async function endPriorRunShells() {
@@ -690,6 +699,11 @@ export function createTerminalManager({ publish, database, spawnTerminal = null,
     // A quit never leaves a shell to be reattached, even one the inventory
     // does not show yet. Every shell of this run is closed or ended by now.
     withdrawReattach();
+    // With reattach off, a shell outlives its runtime only in a previous
+    // run's detach window, with a reattach record unless writing it failed.
+    // Without a record there is nothing to wait for; the next start ends any
+    // such shell through native recovery.
+    if (database.terminalAuditScanPending && !reattachEnabledNow() && !reattachRecordsFound) return;
     if (database.terminalAuditScanPending) {
       let timer;
       await Promise.race([Promise.resolve(database.waitForTerminalAuditReconciliation?.()).catch(() => {}),
