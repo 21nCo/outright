@@ -4022,6 +4022,32 @@ async function diffRefreshAnchorRegression() {
   assert(viewport.textContent.includes("LINE 2500") && Math.abs(viewport.scrollTop - anchor) < 24, "Failed same-selection refresh erased the last valid diff");
 }
 
+// Windows CI lost a Find match to a late queued scroll only at some viewport
+// heights: where the aligned first row equals the Find anchor, the late
+// scroll changes no mounted row and nothing aligned the match again. With
+// classic scrollbars, as on that runner, rows 252-279px tall do that; these
+// heights cover that range with a margin for platform chrome.
+async function diffFindOwnershipRegression() {
+  root.render(null); await settle();
+  const style = document.createElement("style");
+  style.textContent = ".diff-view::-webkit-scrollbar { width: 17px; height: 17px; } .diff-view::-webkit-scrollbar-thumb { background: #888; }";
+  document.head.append(style);
+  const diff = Array.from({ length: 5_000 }, (_, index) => `-unstaged ${index}\n`).join("");
+  try {
+    for (const height of [287, 294, 301, 308]) {
+      root.render(null); await settle(); // NOSONAR S9382: each height starts from a fresh viewport
+      root.render(<div className="pane-body" style={{ width: 448, height }}><WindowedDiff diff={diff} label={`Diff at ${height}px`} /></div>);
+      await until(() => host.querySelector(".diff-view")?.textContent.includes("unstaged 0"), `diff at ${height}px`); // NOSONAR S9382: each height starts from a fresh viewport
+      const viewport = host.querySelector(".diff-view");
+      const find = host.querySelector('input[aria-label="Find in diff"]');
+      setControlValue(find, "unstaged 2500");
+      find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      await until(() => viewport.querySelector('[data-find-match="true"]'), `Find at ${height}px`); // NOSONAR S9382: each height starts from a fresh viewport
+      await assertFindKeepsOwnership(viewport, "unstaged 2500", `Find at ${height}px (${viewport.clientHeight}px rows)`); // NOSONAR S9382: each height starts from a fresh viewport
+    }
+  } finally { style.remove(); }
+}
+
 async function diffScrollbarFeedbackRegression() {
   root.render(null); await settle();
   // Classic scrollbars (CI on macOS and Windows) take layout space. A long row
@@ -4249,6 +4275,7 @@ async function productionDiffViewportRegression() {
   catch (error) { throw new Error(`${error.message}; status=${host.querySelector('.window-find [aria-hidden="true"]')?.textContent}; scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}; rows=${[...viewport.querySelectorAll('[data-find-match], span')].slice(0, 3).map((row) => row.textContent.slice(0, 30)).join('|')}; marked=${viewport.querySelector('[data-find-match="true"]')?.textContent.slice(0, 80)}`); }
   assert(viewport.querySelector('[data-find-match="true"]')?.textContent.includes("unstaged 25000"), "Found diff line was not marked");
   assert(viewport.querySelectorAll("span").length < 200, "Finding a diff match mounted all lines");
+  await assertFindKeepsOwnership(viewport, "unstaged 25000", "448px pane Find");
   viewport.focus();
   if (window.__fixtureSendKey) await window.__fixtureSendKey("End");
   else { viewport.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true, cancelable: true })); viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); }
@@ -4259,6 +4286,7 @@ async function productionDiffViewportRegression() {
   await settle();
   assert(host.querySelector('.diff-view').clientHeight > 0 && host.querySelector('.diff-view').clientHeight < 480, "Narrow pane lost its bounded diff viewport");
   assert(host.querySelector('.diff-view').querySelectorAll("span").length < 200, "Narrow pane mounted all diff lines");
+  await assertFindKeepsOwnership(host.querySelector('.diff-view'), "unstaged 25000", "320px pane Find");
 }
 
 async function longTranscriptWindowRegression() {
@@ -4452,6 +4480,45 @@ async function largeDiffWindowRegression() {
   window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), diff: { elapsedMs, mountedAtEnd: viewport.querySelectorAll("span").length, heapBytes: performance.memory?.usedJSHeapSize ?? null } };
 }
 
+// Find owns the diff viewport until a user gesture or a new query. A scroll
+// queued long after the seek settled, as a native End can be on a slow host,
+// must bring the match back and keep it there, with bounded commits a frame.
+async function assertFindKeepsOwnership(viewport, text, label) {
+  const matchShown = () => {
+    const mark = viewport.querySelector('[data-find-match="true"]');
+    if (!mark?.textContent.includes(text)) return false;
+    const row = mark.getBoundingClientRect();
+    const view = viewport.getBoundingClientRect();
+    return row.bottom > view.top && row.top < view.bottom;
+  };
+  const describe = () => `scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}; first=${viewport.dataset.firstLine}; mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}; marked=${viewport.querySelector('[data-find-match="true"]')?.textContent.slice(0, 40)}`;
+  for (let tick = 0; tick < 16; tick += 1) await frame(); // NOSONAR S9382: outlasts the old 12-frame settling budget
+  assert(matchShown(), `${label}: the match was not shown before the late scroll; ${describe()}`);
+  let commits = 0;
+  let peak = 0;
+  const observer = new MutationObserver((records) => { commits += records.filter((record) => record.attributeName === "data-first-line").length; });
+  observer.observe(viewport, { attributes: true, attributeFilter: ["data-first-line"] });
+  try {
+    viewport.scrollTop = viewport.scrollHeight;
+    viewport.dispatchEvent(new Event("scroll"));
+    let realigned = false;
+    for (let tick = 0; tick < 60 && !realigned; tick += 1) { // NOSONAR S9382: one sample per frame
+      await frame();
+      await Promise.resolve();
+      peak = Math.max(peak, commits); commits = 0;
+      realigned = matchShown();
+    }
+    assert(realigned, `${label}: a late queued scroll took the match out of view; ${describe()}`);
+    for (let tick = 0; tick < 10; tick += 1) { // NOSONAR S9382: one sample per frame
+      await frame();
+      await Promise.resolve();
+      peak = Math.max(peak, commits); commits = 0;
+      assert(matchShown(), `${label}: the match left the view ${tick + 1} frames after realigning; ${describe()}`);
+    }
+  } finally { observer.disconnect(); }
+  assert(peak <= 9, `${label}: ${peak} window commits in one frame`);
+}
+
 async function awaitPhysicalCompressedMatch(viewport, text, label) {
   try {
     await until(() => {
@@ -4521,6 +4588,7 @@ async function extremeDiffHeightRegression() {
   await awaitPhysicalCompressedMatch(viewport, "MIDDLE MATCH", "middle compressed diff alignment");
   let middleBounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
   assert(middleBounds.top < viewport.getBoundingClientRect().bottom && middleBounds.bottom > viewport.getBoundingClientRect().top, "Middle compressed diff match was mounted outside the viewport");
+  await assertFindKeepsOwnership(viewport, "MIDDLE MATCH", "compressed Find");
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={"+\n".repeat(10_000) + diff} label="Tall diff" /></div>);
   await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("MIDDLE MATCH") && host.querySelector('.window-find [role="status"]')?.textContent === "Line 610001", "Refresh realigns a moved middle match");
   await awaitPhysicalCompressedMatch(viewport, "MIDDLE MATCH", "refreshed compressed diff alignment");
@@ -6477,6 +6545,26 @@ function assertReachableInPane(element, view, label) {
   const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
   assert(element.contains(hit), `${label} is covered by ${hit?.outerHTML.slice(0, 120)}`);
 }
+// Split panes tile the stage: no two overlap and none leaves it, on the
+// settled commit and on each of the next frames.
+async function assertPanesTile(label) {
+  await settle();
+  const describe = () => JSON.stringify({ visibility: document.visibilityState,
+    stage: host.querySelector(".pane-stage")?.getBoundingClientRect().toJSON(),
+    panes: [...host.querySelectorAll(".pane-stage > .pane")].map((pane) => ({ view: pane.dataset.paneView, style: pane.getAttribute("style"), rect: pane.getBoundingClientRect().toJSON() })) });
+  for (let tick = 0; tick < 4; tick += 1) { // NOSONAR S9382: one sample per frame
+    const stage = host.querySelector(".pane-stage").getBoundingClientRect();
+    const rects = [...host.querySelectorAll(".pane-stage > .pane")].map((pane) => pane.getBoundingClientRect());
+    for (const [index, rect] of rects.entries()) {
+      assert(rect.left >= stage.left - 1 && rect.top >= stage.top - 1 && rect.right <= stage.right + 1 && rect.bottom <= stage.bottom + 1, `${label}: a pane leaves the stage: ${describe()}`);
+      for (const other of rects.slice(index + 1)) {
+        const overlap = Math.min(rect.right, other.right) - Math.max(rect.left, other.left) > 1 && Math.min(rect.bottom, other.bottom) - Math.max(rect.top, other.top) > 1;
+        assert(!overlap, `${label}: panes overlap: ${describe()}`);
+      }
+    }
+    await frame();
+  }
+}
 function paneOrder() { return [...host.querySelectorAll(".pane-stage > .pane")].map((element) => element.dataset.paneView).join(","); }
 async function choosePaneMenuItem(view, label) {
   host.querySelector(`[aria-label="${view} pane options"]`).click();
@@ -6525,11 +6613,13 @@ async function splitPaneLayoutRegression() {
 
     host.querySelector('[aria-label="Terminal"]').click();
     await until(() => terminalReady("Terminal A") && document.activeElement === host.querySelector("#pane-terminal"), "terminal pane beside the conversation");
+    await assertPanesTile("Terminal beside the conversation");
     assert(paneRect("terminal").left >= paneRect("conversation").right && Math.abs(paneRect("terminal").top - paneRect("conversation").top) < 1,
       "The terminal did not open beside the conversation");
     // The focused terminal is taller than its split share is wide: Changes nests below it.
     host.querySelector('[aria-label="Changes"]').click();
     await until(() => host.querySelector("#pane-changes .changes-pane"), "changes pane");
+    await assertPanesTile("Changes below the terminal");
     assert(Math.abs(paneRect("terminal").left - paneRect("changes").left) < 1 && paneRect("changes").top >= paneRect("terminal").bottom,
       `Changes did not nest below the terminal: ${JSON.stringify([paneRect("terminal"), paneRect("changes")])}`);
     assert(paneOrder() === "conversation,terminal,changes", `Panes are not in reading order: ${paneOrder()}`);
@@ -7951,6 +8041,7 @@ try {
     ["changes refresh selection", changesSelectionRefreshRegression, "pending refreshes preserve current file and mode and retained events refresh once"],
     ["changes diff failure ownership", changesDiffFailureOwnershipRegression, "pending and failed file or mode requests never display a previous diff"],
     ["diff refresh anchor", diffRefreshAnchorRegression, "same-selection refresh keeps the visible diff line and find through success and failure"],
+    ["diff Find ownership", diffFindOwnershipRegression, "a late queued scroll at any viewport height cannot take a Find match out of view"],
     ["diff scrollbar feedback", diffScrollbarFeedbackRegression, "a horizontal scrollbar from a long row at the diff window edge settles Find instead of looping"],
     ["changes mutation owner success", () => changesMutationOwnerRegression(false), "late stage completion cannot refresh another worktree"],
     ["changes mutation owner failure", () => changesMutationOwnerRegression(true), "late stage failure cannot report in another worktree"],
@@ -8017,6 +8108,12 @@ try {
   for (const [index, [step, run, success, skipped]] of selectedSteps.entries()) {
     const stepStartedAt = performance.now();
     window.__fixtureProgress = { step, completed: index, total: selectedSteps.length, stepStartedAt };
+    // A browser page opened by an earlier step's native key hides this one
+    // until the harness restores it. No step starts without painted frames.
+    if (document.visibilityState === "hidden" && window.__requestFixtureForeground) {
+      window.__requestFixtureForeground(window.__fixtureForegroundReason());
+      await until(() => document.visibilityState === "visible", `foreground before ${step}`); // NOSONAR S9382: each step starts visible
+    }
     localStorage.removeItem(LAYOUT_KEY);
     const ran = await run();
     window.__fixtureTimings.push({ step, ms: Math.round(performance.now() - stepStartedAt) });

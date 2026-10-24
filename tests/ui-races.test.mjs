@@ -803,12 +803,22 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     await send("Runtime.addBinding", { name: "__requestFixtureForeground" });
     await send("Page.addScriptToEvaluateOnNewDocument", { source: `
       window.__fixtureWheelCap = ${Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) || 0};
-      // Headless Chrome on macOS can route an unconsumed fixture key to a
+      // Headless Chrome on macOS can route a fixture's native key to a
       // browser shortcut that opens chrome://settings/help over this tab.
-      // A hidden page paints no frames, so restore it. Fixtures that model a
-      // hidden page override document.hidden, not the real visibility state.
+      // A hidden page paints no frames, so restore it, naming the step and
+      // the last native key so the log identifies the key that caused it.
+      // Fixtures that model a hidden page override document.hidden, not the
+      // real visibility state.
+      const describeFocus = () => {
+        const active = document.activeElement;
+        if (!active || active === document.body) return "body";
+        return active.tagName.toLowerCase() + (active.id ? "#" + active.id : "") + (active.getAttribute("aria-label") ? "[" + active.getAttribute("aria-label") + "]" : "");
+      };
+      window.__fixtureForegroundReason = () => JSON.stringify({ step: window.__fixtureProgress?.step ?? "",
+        key: window.__fixtureLastKey ? { ...window.__fixtureLastKey, msAgo: Math.round(performance.now() - window.__fixtureLastKey.at) } : null,
+        focus: describeFocus() });
       document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "hidden") window.__requestFixtureForeground("");
+        if (document.visibilityState === "hidden") window.__requestFixtureForeground(window.__fixtureForegroundReason());
       });
       window.__fixtureSetViewport = (width) => new Promise((resolve) => {
         const ready = (event) => {
@@ -826,6 +836,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
           resolve();
         };
         window.addEventListener("fixture-key-ready", ready);
+        window.__fixtureLastKey = { key, step: window.__fixtureProgress?.step ?? "", focus: describeFocus(), at: performance.now() };
         window.__requestFixtureKey(key);
       });
       window.__fixtureWheel = (x, y, deltaY, deltaX = 0) => new Promise((resolve, reject) => {
@@ -870,8 +881,13 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       (async () => {
         if (event.params.name === "__requestFixtureForeground") {
           const pages = await (await fetch(`http://127.0.0.1:${debugPort}/json/list`, { signal: AbortSignal.timeout(Math.min(5000, remaining())) })).json();
+          let reason = "";
+          try {
+            const { step, key, focus } = JSON.parse(event.params.payload || "{}");
+            reason = ` (in step "${step}", focus ${focus}${key ? `, ${key.msAgo}ms after native ${key.key} on ${key.focus} in step "${key.step}"` : ", no native key sent yet"})`;
+          } catch { reason = ""; }
           for (const page of pages.filter((candidate) => candidate.type === "page" && candidate.url.startsWith("chrome://"))) {
-            foreignPages.push(page.url);
+            foreignPages.push(`${page.url}${reason}`);
             await fetch(`http://127.0.0.1:${debugPort}/json/close/${page.id}`, { signal: AbortSignal.timeout(Math.min(5000, remaining())) });
           }
           await send("Page.bringToFront");
@@ -914,7 +930,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       devtoolsReady: devtools?.socket.readyState, viteOutput: output.slice(-500) }));
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
     const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
-    const expectedCount = selectedCount ?? 148;
+    const expectedCount = selectedCount ?? 149;
     const completedCount = Number(state.text.match(/(\d+) interaction regressions passed/)?.[1]);
     assert.equal(completedCount, expectedCount,
       `browser fixture completed ${completedCount || 0} of ${expectedCount} expected interactions; last step: ${state.progress?.step ?? "unknown"}`);
