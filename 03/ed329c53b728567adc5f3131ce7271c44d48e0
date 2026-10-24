@@ -1,0 +1,21 @@
+src/components/WindowedDiff.jsx
+  s_1900bb15a7199a::t_75df3563e1fb09 29,163,170-171,195-203,227-231,246-249
+tests/ui-races.jsx
+  s_1900bb15a7199a::t_6ed0a8424a3031 9,15,3988-4023,4046,4049-4084,4095-4161,4182-4190,4196,4203-4216,4233,4238,4276-4277,4670-4672,6724-6748,6757-6760,7149-7163,7205,7783
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "03ed329c53b728567adc5f3131ce7271c44d48e0",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
