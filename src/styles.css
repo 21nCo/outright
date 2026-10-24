@@ -255,7 +255,7 @@ button, input, textarea, select { font: inherit; }
 .conversation-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
 .conversation-meta span { padding: 2px 7px; border-radius: 999px; color: var(--foreground); background: var(--muted); font-size: 9px; font-weight: 650; }
 .conversation-meta small { color: var(--muted-foreground); font-size: 9px; }
-.conversation-meta .conversation-account { max-width: min(260px, 38vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-meta .conversation-account { max-width: min(260px, 38cqw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .message-scroll { min-height: 0; height: 100%; overflow: hidden; }
 .message-scroll [data-slot="scroll-area-viewport"] { height: 100%; overflow-y: auto; }
@@ -297,7 +297,8 @@ button, input, textarea, select { font: inherit; }
 
 .composer { width: min(820px, calc(100% - 44px)); min-height: 116px; margin: 0 auto 18px; overflow: hidden; border: 1px solid color-mix(in oklab, var(--foreground) 24%, transparent); border-radius: 11px; background: var(--card); box-shadow: 0 12px 32px rgba(0,0,0,.07), inset 0 0 0 1px color-mix(in oklab, var(--background) 50%, transparent); }
 .composer:focus-within { border-color: color-mix(in oklab, var(--foreground) 42%, transparent); box-shadow: 0 12px 32px rgba(0,0,0,.08), 0 0 0 3px color-mix(in oklab, var(--ring) 13%, transparent); }
-.first-prompt-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 15px 0; color: var(--foreground); font-size: 11px; line-height: 1.4; }
+.first-prompt-notice { width: min(820px, calc(100% - 44px)); margin: 0 auto; padding: 8px 4px 6px; display: flex; flex-direction: column; gap: 6px; color: var(--foreground); font-size: 11px; line-height: 1.4; }
+.first-prompt-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .composer textarea { width: 100%; height: 66px; padding: 14px 15px 7px; resize: none; border: 0; outline: 0; color: var(--foreground); background: transparent; font-size: 12px; line-height: 1.5; }
 .composer textarea::placeholder { color: var(--muted-foreground); }
 .composer-actions { min-height: 48px; padding: 3px 7px 7px; display: grid; grid-template-columns: minmax(0,1fr) auto 36px; align-items: center; gap: 8px; }
@@ -319,8 +320,6 @@ button, input, textarea, select { font: inherit; }
 
 @media (max-width: 920px) {
   .app-shell { grid-template-columns: 292px minmax(0,1fr); min-width: 0; }
-  /* The settings button stays: it is the keyboard entry to the conversation's provider and model. */
-  .conversation-meta small:not(.conversation-account) { display: none; }
 }
 
 @media (max-width: 760px) {
@@ -328,23 +327,53 @@ button, input, textarea, select { font: inherit; }
   .sidebar { position: fixed; z-index: 50; inset: 0 auto 0 0; width: min(86vw, 320px); box-shadow: 18px 0 50px rgba(0,0,0,.18); }
   .workspace { width: 100%; }
   .workspace-tools .worktree-state { display: none; }
-  .message-column, .composer, .history-live-tail { width: calc(100% - 28px); }
 }
 
 /* Runtime workspace */
 .sidebar-actions kbd { margin-left: auto; color: var(--muted-foreground); font-size: 9px; font-weight: 500; }
 .workspace { grid-template-rows: 50px 45px minmax(0, 1fr); }
-.work-area { min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-columns: minmax(0, 1fr); overflow: hidden; }
-.workspace.has-inspector .work-area { grid-template-columns: minmax(480px, 1fr) minmax(360px, 420px); }
-.conversation-pane { min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-rows: 83px minmax(0, 1fr) auto; overflow: hidden; }
-.inspector { min-width: 0; min-height: 0; display: grid; grid-template-rows: 43px minmax(0, 1fr); border-left: 1px solid var(--line-soft); background: var(--subtle-canvas); }
-.inspector > header { padding: 0 7px 0 9px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line-soft); }
-.inspector > header nav { height: 100%; display: flex; }
-.inspector > header nav button { position: relative; height: 100%; padding: 0 9px; border: 0; display: flex; align-items: center; gap: 5px; color: var(--muted-foreground); background: transparent; cursor: pointer; font-size: 10px; }
-.inspector > header nav button svg { width: 14px; height: 14px; }
-.inspector > header nav button:hover, .inspector > header nav button.is-active { color: var(--foreground); }
-.inspector > header nav button.is-active::after { content: ""; position: absolute; inset: auto 8px 0; height: 2px; background: var(--foreground); }
-.inspector-body { min-height: 0; overflow: hidden; }
+.work-area { min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
+/* Header, transcript, notices and composer. The transcript keeps a minimum
+   share; the notices take what is left up to a bounded height and scroll, with
+   their actions pinned in view. */
+.conversation-pane { min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-rows: 83px minmax(72px, 1fr) minmax(0, auto) auto; overflow: hidden; }
+.conversation-notices { min-height: 0; max-height: 45cqh; overflow-y: auto; overscroll-behavior: contain; }
+.conversation-notices .recovery-actions { position: sticky; bottom: 0; background: var(--subtle-canvas); }
+.first-prompt-actions { position: sticky; bottom: 0; background: var(--canvas); }
+/* Split panes: every pane is absolutely placed in one stage so a moved view
+   keeps its mounted component; the layout model owns the geometry. */
+.pane-layout { position: relative; display: grid; grid-template-rows: minmax(0, 1fr); }
+.pane-layout.is-compact { grid-template-rows: auto minmax(0, 1fr); }
+.pane-stage { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+.pane { position: absolute; min-width: 0; min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr); overflow: hidden; background: var(--canvas); outline: none; }
+.pane.has-header { grid-template-rows: 30px minmax(0, 1fr); }
+.pane:focus-visible { box-shadow: inset 0 0 0 2px var(--ring); }
+.pane-layout.is-compact .pane { inset: 0; }
+.pane.is-concealed { visibility: hidden; }
+.pane-body { min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-rows: minmax(0, 1fr); container: pane / size; }
+.pane-header { min-width: 0; padding: 0 4px 0 4px; display: flex; align-items: center; justify-content: space-between; gap: 4px; border-bottom: 1px solid var(--line-soft); background: var(--subtle-canvas); color: var(--muted-foreground); font-size: 10px; font-weight: 550; }
+.pane.is-focused .pane-header { color: var(--foreground); }
+.pane.is-focused .pane-header::after { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: var(--foreground); }
+.pane-title { min-width: 0; height: 100%; display: flex; align-items: center; gap: 5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; cursor: grab; user-select: none; }
+.pane-title svg { flex: none; width: 13px; height: 13px; }
+.pane-title .pane-grip { color: var(--muted-foreground); opacity: .7; }
+.pane-separator { position: absolute; z-index: 2; background: var(--line-soft); touch-action: none; }
+.pane-separator[aria-orientation="vertical"] { cursor: col-resize; }
+.pane-separator[aria-orientation="horizontal"] { cursor: row-resize; }
+.pane-separator:hover, .pane-separator.is-dragging { background: color-mix(in oklab, var(--foreground) 28%, transparent); }
+.pane-separator:focus-visible { outline: 2px solid var(--ring); outline-offset: -1px; background: color-mix(in oklab, var(--foreground) 28%, transparent); }
+.pane-drop-indicator { position: absolute; z-index: 3; pointer-events: none; border: 2px solid var(--ring); background: color-mix(in oklab, var(--ring) 16%, transparent); }
+.pane-drop-indicator.is-left { inset: 0 50% 0 0; }
+.pane-drop-indicator.is-right { inset: 0 0 0 50%; }
+.pane-drop-indicator.is-up { inset: 0 0 50% 0; }
+.pane-drop-indicator.is-down { inset: 50% 0 0 0; }
+.pane-switcher { min-width: 0; padding-right: 6px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; border-bottom: 1px solid var(--line-soft); background: var(--subtle-canvas); }
+.pane-switcher [role="tablist"] { min-width: 0; display: flex; overflow-x: auto; }
+.pane-switcher [role="tab"] { position: relative; min-width: 86px; min-height: 42px; padding: 0 10px; border: 0; display: flex; align-items: center; justify-content: center; gap: 5px; color: var(--muted-foreground); background: transparent; cursor: pointer; font-size: 10px; white-space: nowrap; }
+.pane-switcher [role="tab"] svg { width: 14px; height: 14px; }
+.pane-switcher [role="tab"]:hover, .pane-switcher [role="tab"].is-active { color: var(--foreground); }
+.pane-switcher [role="tab"].is-active::after { content: ""; position: absolute; inset: auto 8px 0; height: 2px; background: var(--foreground); }
+.pane-layout-hint { margin: 0; padding: 6px 8px 4px; color: var(--muted-foreground); font-size: 11px; }
 .workspace-tools { white-space: nowrap; }
 .run-state { height: 25px; padding: 0 8px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line-soft); border-radius: 999px; color: var(--foreground); font-size: 9px; }
 .run-state small { color: inherit; }
@@ -529,22 +558,12 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
 .new-template { display: grid; grid-template-columns: 1fr 1.6fr auto; gap: 6px; }
 
 @media (max-width: 1180px) {
-  .workspace.has-inspector .work-area { grid-template-columns: minmax(420px, 1fr) 360px; }
   .workspace-tools .worktree-state { display: none; }
-}
-
-@media (max-width: 960px) {
-  .workspace.has-inspector .conversation-pane { display: none; }
-  .workspace.has-inspector .work-area { grid-template-columns: minmax(0,1fr); }
-  .inspector { border-left: 0; }
 }
 
 @media (max-width: 760px) {
   .app-shell { position: relative; display: block; min-width: 0; }
   .sidebar { position: fixed; z-index: 50; inset: 0 auto 0 0; width: min(88vw, 336px); max-width: calc(100vw - 44px); box-shadow: 18px 0 50px rgba(0,0,0,.22); }
-  .recovery-notice { flex-wrap: wrap; }
-  .recovery-actions { width: 100%; flex: 0 0 100%; align-items: stretch; }
-  .recovery-actions [data-slot="button"] { min-width: 0; white-space: normal; }
   .sidebar-is-closed .sidebar { transform: translateX(-100%); }
   .mobile-scrim { position: fixed; z-index: 49; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; display: block; background: rgba(0,0,0,.32); cursor: default; }
   .workspace { width: 100%; }
@@ -554,14 +573,7 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .workspace-tools { gap: 0; }
   .workspace-tools .worktree-state, .workspace-tools .run-state { display: none; }
   .chat-tab { min-width: 150px; max-width: 190px; }
-  .message-column, .composer, .history-live-tail { width: calc(100% - 16px); }
-  .message-column { padding-top: 18px; }
   .composer { margin-bottom: max(8px, env(safe-area-inset-bottom)); }
-  .conversation-header { padding: 0 16px; }
-  .inspector { min-width: 0; }
-  .inspector > header { padding-inline: 5px; }
-  .inspector > header nav { min-width: 0; overflow-x: auto; }
-  .inspector > header nav button { min-width: 86px; min-height: 42px; justify-content: center; }
   .settings-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); }
   [data-slot="dialog-content"] { max-height: calc(100dvh - 16px); padding: 18px; overflow-y: auto; }
   .command-dialog { inset: 8px; width: auto; max-width: none; max-height: calc(100dvh - 16px); padding: 0; display: block; overflow: hidden; translate: 0 0; }
@@ -580,11 +592,31 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .workspace-context { min-width: 48px; }
   .workspace-context strong { max-width: 78px; }
   .workspace-tools [data-slot="button"] { width: 34px; }
-  .conversation-pane { grid-template-rows: 68px minmax(0, 1fr) auto; }
+  .chat-tab { min-width: 138px; }
+  .manage-actions { align-items: stretch; flex-direction: column; gap: 7px; }
+  .manage-actions button { width: 100%; }
+}
+
+/* A pane's size, not the window's, compacts its view, so each view keeps its
+   primary content usable down to the pane minimums in src/lib/pane-layout.js.
+   Window media queries above only style the shell around the panes. */
+@container pane (max-width: 760px) {
+  .message-column, .composer, .history-live-tail, .first-prompt-notice { width: calc(100% - 16px); }
+  .message-column { padding-top: 18px; }
+  .conversation-header { padding: 0 16px; }
+  .recovery-notice { flex-wrap: wrap; }
+  .recovery-actions { width: 100%; flex: 0 0 100%; align-items: stretch; }
+  .recovery-actions [data-slot="button"] { min-width: 0; white-space: normal; }
+}
+@container pane (max-width: 640px) {
+  /* The settings button stays: it is the keyboard entry to the conversation's provider and model. */
+  .conversation-meta small:not(.conversation-account) { display: none; }
+}
+@container pane (max-width: 520px) {
+  .conversation-pane { grid-template-rows: 68px minmax(72px, 1fr) minmax(0, auto) auto; }
   .conversation-header { grid-template-columns: minmax(0,1fr) auto; padding: 0 12px; }
   .conversation-symbol { display: none; }
   .conversation-header h1 { font-size: 14px; }
-  .chat-tab { min-width: 138px; }
   .message { grid-template-columns: 28px minmax(0,1fr); gap: 9px; margin-bottom: 20px; }
   .avatar { width: 27px; height: 27px; }
   .composer { min-height: 106px; border-radius: 9px; }
@@ -593,14 +625,27 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .composer-actions > div { min-width: 0; overflow: hidden; }
   .model-button { min-width: 0; max-width: 150px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   .send-hint { display: none; }
-  .manage-actions { align-items: stretch; flex-direction: column; gap: 7px; }
-  .manage-actions button { width: 100%; }
+  .recovery-actions [data-slot="button"] { width: 100%; }
   .changes-layout { grid-template-rows: minmax(110px, 34%) minmax(0,1fr); }
   .commit-bar { grid-template-columns: minmax(0,1fr); }
   .commit-bar button { width: 100%; }
   .terminal-tab { min-width: 130px; }
   .terminal-loading { font-size: 0; }
-  .recovery-actions [data-slot="button"] { width: 100%; }
+}
+@container pane (max-height: 479px) {
+  .conversation-pane { grid-template-rows: 56px minmax(72px, 1fr) minmax(0, auto) auto; }
+  .conversation-header h1 { margin-bottom: 2px; font-size: 14px; }
+  .message-column { padding-block: 12px 8px; }
+  .composer { min-height: 96px; margin-bottom: 8px; }
+  .composer textarea { height: 48px; padding-block: 10px 4px; }
+  .composer-actions { min-height: 44px; }
+  .changes-pane { grid-template-rows: 40px minmax(0, 1fr) auto; }
+  .changes-layout { grid-template-rows: minmax(64px, 30%) minmax(0, 1fr); }
+  .commit-bar { padding-block: 5px; }
+  /* Short panes keep recovery actions compact on shared rows, so the pinned
+     actions leave the notices region room for the explanation. */
+  .recovery-actions { gap: 4px; }
+  .recovery-actions [data-slot="button"] { width: auto; flex: 1 1 auto; height: 28px; padding-inline: 6px; font-size: 12px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

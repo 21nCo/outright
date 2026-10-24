@@ -12,6 +12,7 @@ Outright is a local-first workspace for running coding agents across Git project
 - Git status, diffs, stage/unstage, commits, guarded worktree creation/removal, and editor launching
 - Project spaces, searchable conversations/messages, draggable/pinnable/renamable/archivable tabs, cross-worktree conversation moves, prompt templates, notifications, and keyboard shortcuts
 - Repository context for AGENTS/Claude/Copilot instructions, local skills, and the current GitHub pull request
+- Split panes: place the conversation beside the terminal, changes, and context views; resize, move, and close panes; each worktree restores its own arrangement
 - Light, dark, and system themes using DM Sans, Tailwind, shadcn/Base UI, and Phosphor icons
 
 ## Requirements
@@ -55,11 +56,20 @@ OUTRIGHT_SCAN_ROOTS="/path/one:/path/two" npm start
 
 Outright only accepts Git and terminal operations for worktrees found by this scanner. New worktrees must remain inside a configured scan root.
 
+## Split panes
+
+The main view is a pane layout for the selected worktree. The conversation, controlled by the chat tabs above it, is always present; the Changes, Terminal, and Context toolbar buttons open or close their panes, and each pane's options menu splits it right or down, moves it, or closes it. Drag a pane's title onto an edge of another pane to dock it there. Each view appears at most once, so a layout has at most four panes, and moving a pane keeps its view mounted: a terminal keeps its session and output, and the conversation keeps its draft. Closing a pane leaves its shell running; reopening the Terminal pane reattaches to it.
+
+Separators resize with the pointer or, when focused, with the arrow keys, `Home`, and `End`; every pane keeps a minimum usable size that fits its view's own controls plus several message, diff, or terminal lines, and each view compacts its chrome to the size of its pane rather than the window. A conversation's notices (a recovery decision, an unsent first prompt, history navigation, live output) share one bounded, scrollable region above the composer with their actions kept in view, so the transcript always keeps several lines. When the window is too small for every pane's minimum, or narrower than 760px, panes are shown one at a time with tabs, and their views stay mounted; focus on a separator, pane tab, pane options button, or open pane options menu that this switch removes moves to the shown pane, and keyboard selection scrolls a clipped pane tab into view within the tab strip. Layouts are saved under each worktree's path, so worktrees whose names collide keep their own.
+
+Layouts are saved in the browser's local storage per worktree, for the 64 most recently arranged worktrees. A saved layout with an unknown or duplicate view or an invalid size is repaired on restore, and an unreadable one falls back to the conversation alone; Outright names the repair it made, and says only once per session when the saved layouts cannot be read at all.
+
 ## Keyboard shortcuts
 
 - `Cmd/Ctrl K`: project, worktree, and conversation search
 - `Cmd/Ctrl N`: new conversation
-- `Cmd/Ctrl Shift T`: terminal drawer
+- `Cmd/Ctrl Shift T`: open or focus the terminal pane
+- `F6` / `Shift F6`: move focus to the next or previous pane
 - `Enter`: send a prompt
 - `Shift Enter`: newline in the prompt
 

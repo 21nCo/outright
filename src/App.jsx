@@ -3,9 +3,9 @@ import {
   Archive, ArrowsClockwise, At, Bell, CaretDown, CaretRight, ChatCircle,
   Check, CheckCircle, ClockCounterClockwise, Command, Desktop, DotsThree,
   FolderOpen, FolderPlus, Folders, GearSix, GitBranch, GitDiff, Info,
-  MagnifyingGlass, Moon, PaperPlaneTilt, PencilSimple, PushPin, Plus,
+  Layout, MagnifyingGlass, Moon, PaperPlaneTilt, PencilSimple, PushPin, Plus,
   ShieldCheck, SidebarSimple, Sparkle, Stop, Sun, TerminalWindow, Trash,
-  TreeStructure, WarningCircle, X,
+  WarningCircle, X,
 } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -24,6 +24,7 @@ import { CommandPalette } from "@/components/CommandPalette";
 import { ContextPane } from "@/components/ContextPane";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { TerminalPane } from "@/components/TerminalPane";
+import { PaneLayout, paneId } from "@/components/PaneLayout";
 import { domId, nextTabIndex } from "@/lib/accessibility";
 import { api, connectRuntime, query } from "@/lib/runtime-api";
 import { scheduleLayoutTick } from "@/lib/windowing";
@@ -32,7 +33,9 @@ import { modelMismatch, providerOptionLabel, providerReady, providerStatusText, 
 import { answerAccountText, runAccountText, withStartedRunAccount } from "@/lib/provider-accounts";
 import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, messagePrecedesPage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "@/recovery-policy";
 import { createTerminalCommandFence } from "@/lib/terminal-command-fence";
+import { PANE_LAYOUT_PRESETS, PANE_STORE_PROBLEMS, applyPreset, defaultPaneLayout, focusView, layoutViews, loadPaneLayout, paneRestoreMessage, savePaneLayout } from "@/lib/pane-layout";
 
+const CHAT_TAB_DRAG_TYPE = "application/x-outright-chat-tab";
 const MAX_RENDERED_MESSAGES = 1000;
 function moveMessageViewport(viewport, top) {
   if (!viewport) return;
@@ -96,7 +99,12 @@ export function App() {
   const [isScanning, setIsScanning] = useState(true);
   const [isNarrow, setIsNarrow] = useState(() => typeof window !== "undefined" && window.matchMedia("(max-width: 760px)").matches);
   const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === "undefined" || !window.matchMedia("(max-width: 760px)").matches);
-  const [inspector, setInspector] = useState(null);
+  // Each worktree restores its own pane arrangement; views keep the selected
+  // worktree, so a pane never shows another worktree's terminal or diff.
+  const [paneState, setPaneState] = useState(() => ({ owner: "", layout: defaultPaneLayout(), problems: [], dirty: false }));
+  const paneLayoutRef = useRef(null);
+  const paneSaveWarnedRef = useRef(false);
+  const paneStoreWarnedRef = useRef(false);
   const [theme, setTheme] = useState(() => knownTheme(localStorage.getItem("outright.theme")));
   const [toast, setToast] = useState("");
   const [error, setError] = useState("");
@@ -158,9 +166,6 @@ export function App() {
   const sidebarFocusOwnerRef = useRef(null);
   const sidebarFocusSourceRef = useRef(null);
   const sidebarFocusLastElementRef = useRef(null);
-  const inspectorRef = useRef(null);
-  const inspectorInvokerRef = useRef(null);
-  const inspectorReturnFocusRef = useRef(null);
   const submissionPendingRef = useRef(false);
   const checkpointCursorsRef = useRef(new Map());
   const pendingConversationLoadRef = useRef(null);
@@ -313,6 +318,42 @@ export function App() {
 
   const project = bootstrap?.projects.find((item) => item.id === selectedProjectId);
   const worktree = project?.worktrees.find((item) => item.id === selectedWorktreeId);
+  // A worktree id is a lossy slug of its path, so distinct worktrees can share
+  // one. Layouts belong to the path; entries saved under an id never match a
+  // path and age out of the bounded store.
+  if (worktree && paneState.owner !== worktree.path) {
+    const restored = loadPaneLayout(localStorage, worktree.path);
+    setPaneState({ owner: worktree.path, layout: restored.layout, problems: restored.problems, dirty: false });
+  }
+  const changePaneLayout = useCallback((next) => {
+    setPaneState((current) => current.layout === next ? current : { ...current, layout: next, problems: [], dirty: true });
+  }, []);
+  // Choosing a chat focuses its conversation pane, which brings it to the front
+  // when panes are shown one at a time.
+  const revealConversationPane = useCallback(() => {
+    setPaneState((current) => {
+      const next = focusView(current.layout, "conversation");
+      return next === current.layout ? current : { ...current, layout: next, problems: [], dirty: true };
+    });
+  }, []);
+  useEffect(() => {
+    if (!paneState.dirty || !paneState.owner) return;
+    if (!savePaneLayout(localStorage, paneState.owner, paneState.layout) && !paneSaveWarnedRef.current) {
+      paneSaveWarnedRef.current = true;
+      setError("Pane layout changes could not be saved in this browser; they will reset when Outright reloads.");
+    }
+  }, [paneState]);
+  // Saved layouts that cannot be read at all are announced once, not again
+  // for each worktree that falls back to the default.
+  useEffect(() => {
+    const message = paneRestoreMessage(paneState.problems);
+    if (!message) return;
+    if (paneState.problems.some((problem) => PANE_STORE_PROBLEMS.includes(problem))) {
+      if (paneStoreWarnedRef.current) return;
+      paneStoreWarnedRef.current = true;
+    }
+    setToast(message);
+  }, [paneState.problems]);
   const spaces = useMemo(() => spaceState(bootstrap?.spaces, bootstrap?.projectGroups), [bootstrap?.spaces, bootstrap?.projectGroups]);
   const spaceProjects = useMemo(() => buildSpaceProjects(bootstrap?.projects ?? [], spaces), [bootstrap?.projects, spaces]);
   const settings = bootstrap?.settings ?? defaultSettings();
@@ -342,11 +383,16 @@ export function App() {
       if (request !== conversationListRequestRef.current || selectedProjectRef.current !== forProjectId || selectedWorktreeRef.current !== forWorktreeId) return;
       const available = result.conversations.filter((item) => !item.archived);
       stageConversations(available);
-      const wanted = preferredId || pendingConversationRef.current || selectedConversationRef.current;
+      const requested = pendingConversationRef.current;
+      const wanted = preferredId || requested || selectedConversationRef.current;
       const selected = available.find((item) => item.id === wanted) ?? available[0];
       conversationListPendingRef.current = false;
       setConversationListPending(false);
       pendingConversationRef.current = "";
+      // A chat the user chose outside the tabs (new chat, command palette,
+      // recovery, a moved or created chat) is shown even when another pane is
+      // in front. Runtime list refreshes never take the front.
+      if (requested && selected?.id === requested) revealConversationPane();
       const changedSelection = selectedConversationRef.current !== (selected?.id ?? "");
       if (changedSelection) selectConversation(selected?.id ?? "");
       if (!changedSelection && selected && readyConversationRef.current?.id === selected.id) {
@@ -847,17 +893,14 @@ export function App() {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "n") { event.preventDefault(); setNewChatOpen(true); }
       if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "t") {
         event.preventDefault();
-        inspectorInvokerRef.current = document.querySelector('[aria-label="Terminal"]');
-        setInspector("terminal");
+        paneLayoutRef.current?.open("terminal");
       }
       if (event.key === "Escape" && !document.querySelector('[role="dialog"][data-open]:not(#project-sidebar)')) {
         if (isNarrow && sidebarOpen) closeSidebar();
-        else if (inspector && !event.target.closest?.(".terminal-host")
-          && (inspectorRef.current?.contains(event.target) || event.target.closest?.(".composer") || event.target === inspectorInvokerRef.current)) closeInspector();
       }
     };
     window.addEventListener("keydown", keyboard); return () => window.removeEventListener("keydown", keyboard);
-  }, [inspector, isNarrow, sidebarOpen]);
+  }, [isNarrow, sidebarOpen]);
   useEffect(() => {
     const narrow = window.matchMedia("(max-width: 760px)");
     let wasNarrow = narrow.matches;
@@ -1049,16 +1092,6 @@ export function App() {
     transfer();
     return () => { active = false; cancelRetry(); observer.disconnect(); document.removeEventListener("focusout", restoreAfterBlur, true); document.removeEventListener("pointerdown", releaseOnUserInput, true); document.removeEventListener("keydown", releaseOnUserInput, true); };
   }, [isNarrow, sidebarOpen]);
-  useLayoutEffect(() => {
-    if (!inspector) return;
-    inspectorRef.current?.querySelector('[role="tab"][aria-selected="true"]')?.focus({ preventScroll: true });
-  }, [inspector]);
-  useLayoutEffect(() => {
-    if (inspector || !inspectorReturnFocusRef.current) return;
-    const invoker = inspectorReturnFocusRef.current;
-    inspectorReturnFocusRef.current = null;
-    if (invoker.isConnected) invoker.focus({ preventScroll: true });
-  }, [inspector]);
   useLayoutEffect(() => {
     const intent = archiveFocusRef.current;
     if (!intent) return;
@@ -1400,6 +1433,7 @@ export function App() {
         await api(`/api/conversations/${recoveryConversation.id}`, { method: "PATCH", body: { archived: false } });
       }
       if (recoveryConversation.projectId === selectedProjectRef.current && recoveryConversation.worktreeId === selectedWorktreeRef.current) {
+        pendingConversationRef.current = recoveryConversation.id;
         await loadConversations(recoveryConversation.id);
         return;
       }
@@ -1435,18 +1469,6 @@ export function App() {
     sidebarFocusIntentRef.current = "sidebar";
     sidebarFocusSourceRef.current = document.activeElement;
     setSidebarOpen(true);
-  }
-
-  function toggleInspector(nextInspector, invoker) {
-    if (inspector === nextInspector) { closeInspector(); return; }
-    inspectorInvokerRef.current = invoker;
-    setInspector(nextInspector);
-  }
-
-  function closeInspector() {
-    inspectorReturnFocusRef.current = inspectorInvokerRef.current;
-    inspectorInvokerRef.current = null;
-    setInspector(null);
   }
 
   function navigateProjectButtons(event) {
@@ -1859,14 +1881,28 @@ export function App() {
     } catch (nextError) { setError(nextError.message); }
   }
 
+  // Only a chat tab dragged in this worktree's tab strip reorders chats; a
+  // pane title or anything else dropped on a tab is ignored.
+  function isChatTabDrag(event) {
+    return Boolean(dragConversationRef.current) && [...(event.dataTransfer?.types ?? [])].includes(CHAT_TAB_DRAG_TYPE);
+  }
+
   async function reorderConversation(targetId) {
     const sourceId = dragConversationRef.current;
-    if (!sourceId || sourceId === targetId) return;
+    dragConversationRef.current = "";
+    const sourceIndex = conversations.findIndex((item) => item.id === sourceId);
+    if (sourceIndex < 0 || sourceId === targetId || !conversations.some((item) => item.id === targetId)) return;
     const next = [...conversations];
-    const [source] = next.splice(next.findIndex((item) => item.id === sourceId), 1);
+    const [source] = next.splice(sourceIndex, 1);
     next.splice(next.findIndex((item) => item.id === targetId), 0, source);
     stageConversations(next);
-    await Promise.all(next.map((item, index) => api(`/api/conversations/${item.id}`, { method: "PATCH", body: { tabPosition: index } })));
+    // Each tab saves its own position, so a failed write can leave the order
+    // partly saved. Report it and show the order the server kept.
+    const writes = await Promise.allSettled(next.map((item, index) => api(`/api/conversations/${item.id}`, { method: "PATCH", body: { tabPosition: index } })));
+    const failed = writes.find((write) => write.status === "rejected");
+    if (!failed) return;
+    setError(failed.reason?.message || "Chat tab order could not be saved");
+    try { await loadConversations(); } catch (nextError) { setError(nextError.message); }
   }
 
   async function createWorktree(event) {
@@ -1926,6 +1962,34 @@ export function App() {
   if (outcomePending) composerAction = <Button size="icon" type="button" variant="destructive" disabled aria-label="Final run outcome pending"><Stop weight="fill" /></Button>;
   if (activeRun) composerAction = <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button>;
 
+  const paneViews = layoutViews(paneState.layout.root);
+  const paneToggle = (view, label, Icon, hint) => {
+    const shown = paneViews.includes(view);
+    return <Tooltip><TooltipTrigger render={<Button variant={shown ? "secondary" : "ghost"} size="icon-sm" onClick={() => paneLayoutRef.current?.toggle(view)} aria-label={label} aria-pressed={shown} aria-controls={shown ? paneId(view) : undefined} />}><Icon /></TooltipTrigger><TooltipContent>{hint}</TooltipContent></Tooltip>;
+  };
+  const conversationView = <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
+    <span className="sr-only run-announcement" role="status" aria-live="polite" aria-atomic="true">{runAnnouncement}</span>
+    <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} pendingRuns={pendingOutcomeRuns} onManage={openManageChat} />
+    <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversationContent}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} busy={activeRun?.status === "running"} />}{!conversation?.messagePage?.hasLater && (activeRun || pendingOutcomeRun) && !streamingText && <RunningMessage run={activeRun ?? pendingOutcomeRun} events={runEvents} outcomePending={!activeRun && outcomePending} busy={activeRun?.status === "running"} />}</div></ScrollArea>
+    {/* Notices share one bounded region between the transcript and the composer,
+        so together they never take the transcript's minimum share of the pane. */}
+    <div className="conversation-notices">
+      {readingLiveText && <section className="history-live-tail" aria-label={activeRun ? "Live output while reading history" : "Recent output while reading history"} tabIndex={0}><strong>{activeRun ? "Live output" : "Recent output"}</strong><p>{readingLiveText}</p></section>}
+      {conversation?.messagePage?.hasLater && <div className="history-forward"><button className="history-later" onClick={loadLaterMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading later messages…" : `Load later messages · ${conversation.messagePage.newerCount} remaining`}</button><button className="history-return" onClick={() => loadConversation({ returnToLatest: true })}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button></div>}
+      {outcomePending && <div className="recovery-notice"><WarningCircle weight="fill" /><span className="recovery-copy"><strong>Run outcome waiting for storage</strong><span>The agent process has exited. Outright is saving the final result for {pendingOutcomeRuns.length === 1 ? "run" : "runs"} {pendingOutcomeRuns.map((run, index) => <code key={run.id}>{run.id}{index < pendingOutcomeRuns.length - 1 ? ", " : ""}</code>)} and will update this chat when storage recovers.</span></span></div>}
+      {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}
+      {unsentCreatedChat && <div className="first-prompt-notice" role="status" aria-live="polite"><span>Chat created, but your message was not sent. {unsentHelp}</span><span className="first-prompt-actions">{unsentForOwner && firstPromptAwaitingSelection && conversations.some((item) => item.id === unsentForOwner.id) && <Button type="button" variant="outline" size="sm" onClick={() => { revealConversationPane(); selectConversation(unsentForOwner.id); }}>Open created chat</Button>}{!unsentForOwner && unsentProject && unsentWorktree && <Button type="button" variant="outline" size="sm" onClick={() => { pendingConversationRef.current = unsentCreatedChat.id; chooseProject(unsentProject, unsentWorktree); }}>Return to created chat</Button>}<Button type="button" variant="ghost" size="sm" onClick={() => { setUnsentCreatedChat(null); editDraft(""); }}>Discard unsent message</Button></span></div>}
+    </div>
+    <form className="composer" onSubmit={sendPrompt}><textarea aria-label="Message the agent" disabled={Boolean(interruptedRun) || submissionUnavailable} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={composerPlaceholder} value={draft} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={editDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{composerHint}{composerAction}</div></form>
+  </section>;
+  // Only views in the layout mount; the others are inert element objects.
+  const paneViewElements = {
+    conversation: conversationView,
+    changes: <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />,
+    terminal: <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} terminalsVersion={terminalsVersion} unverifiedTerminalIds={unverifiedTerminalIds} sendRuntime={sendRuntime} onError={handleError} />,
+    context: <ContextPane worktree={worktree} settings={settings} onError={handleError} />,
+  };
+
   return <div className={`app-shell ${sidebarOpen ? "sidebar-is-open" : "sidebar-is-closed"}`}>
     <aside className="sidebar" id="project-sidebar" role={isNarrow && sidebarOpen ? "dialog" : undefined} aria-modal={isNarrow && sidebarOpen ? true : undefined} aria-label="Projects and worktrees" aria-hidden={!sidebarOpen} tabIndex={isNarrow ? -1 : undefined} ref={sidebarRef}>
       <header className="sidebar-brand"><div className="brand-lockup"><span className="brand-glyph"><Sparkle weight="fill" /></span><strong>Outright</strong></div><Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon-sm" onClick={closeSidebar} aria-label="Close projects sidebar" />}><SidebarSimple /></TooltipTrigger><TooltipContent>Close sidebar</TooltipContent></Tooltip></header>
@@ -1936,22 +2000,10 @@ export function App() {
     </aside>
     {isNarrow && sidebarOpen && <div className="mobile-scrim" onClick={closeSidebar} aria-hidden="true" />}
 
-    <main id="main-workspace" className={`workspace ${inspector ? "has-inspector" : ""}`} inert={isNarrow && sidebarOpen ? true : undefined} aria-hidden={isNarrow && sidebarOpen ? true : undefined}>
-      <header className="workspace-bar">{!sidebarOpen && <Button variant="ghost" size="icon-sm" onClick={openSidebar} aria-label="Open projects sidebar" aria-controls="project-sidebar" aria-expanded={sidebarOpen}><SidebarSimple /></Button>}<div className="workspace-context"><span>{project.name}</span><CaretRight /><GitBranch /><strong>{worktree.name}</strong></div><div className="workspace-tools"><RunState run={pendingOutcomeRun ?? activeRun ?? latestRun} outcomePending={outcomePending} /><WorktreeState worktree={worktree} /><Tooltip><TooltipTrigger render={<Button variant={inspector === "changes" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("changes", event.currentTarget)} aria-label="Changes" aria-controls="workspace-inspector" aria-expanded={inspector === "changes"} />}><GitDiff /></TooltipTrigger><TooltipContent>Changes</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "terminal" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("terminal", event.currentTarget)} aria-label="Terminal" aria-controls="workspace-inspector" aria-expanded={inspector === "terminal"} />}><TerminalWindow /></TooltipTrigger><TooltipContent>Terminal ⌘⇧T</TooltipContent></Tooltip><Tooltip><TooltipTrigger render={<Button variant={inspector === "context" ? "secondary" : "ghost"} size="icon-sm" onClick={(event) => toggleInspector("context", event.currentTarget)} aria-label="Project context" aria-controls="workspace-inspector" aria-expanded={inspector === "context"} />}><Info /></TooltipTrigger><TooltipContent>Project context</TooltipContent></Tooltip><ThemeMenu theme={theme} onThemeChange={setTheme} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Worktree options" />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, editor: settings.editor } }).then(() => setToast(`Opened in ${settings.editor}`)).catch((nextError) => setError(nextError.message))}><PencilSimple />Open in {settings.editor}</DropdownMenuItem><DropdownMenuItem onClick={() => setWorktreeDialog(project)}><GitBranch />New worktree</DropdownMenuItem>{worktree.isLinked && <><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onClick={() => setRemoveWorktreeOpen(true)}><Trash />Remove worktree</DropdownMenuItem></>}</DropdownMenuContent></DropdownMenu></div></header>
-      <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll" role="tablist" aria-label="Open agent chats" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', selectConversation)}>{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={() => { dragConversationRef.current = item.id; }} onDragOver={(event) => event.preventDefault()} onDrop={() => reorderConversation(item.id)}><button className="tab-select" id={domId("chat-tab", item.id)} data-tab-id={item.id} role="tab" aria-selected={item.id === selectedConversationId} aria-controls="conversation-panel" tabIndex={item.id === selectedConversationId ? 0 : -1} onClick={() => selectConversation(item.id)} onDoubleClick={() => { selectConversation(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); archiveChat(item, event.currentTarget); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
-      <div className="work-area">
-        <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
-          <span className="sr-only run-announcement" role="status" aria-live="polite" aria-atomic="true">{runAnnouncement}</span>
-          <ConversationHeader conversation={conversation} worktree={worktree} latestRun={latestRun} pendingRuns={pendingOutcomeRuns} onManage={openManageChat} />
-          <ScrollArea className="message-scroll" viewportRef={messageViewportRef} viewportProps={{ tabIndex: 0, "aria-label": "Conversation messages", onKeyDown: handleMessageViewportKeyDown }}><div className="message-column">{conversationListFailed && <button className="history-loader" onClick={() => loadConversations()}>Retry chat list</button>}{conversationLoadFailed && <button className="history-loader" onClick={loadConversation}>Retry loading chat</button>}{conversation?.messagePage?.hasMore && <button className="history-loader" onClick={loadEarlierMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : `Load earlier messages · ${conversation.messagePage.olderCount} remaining`}</button>}{conversationContent}{!conversation?.messagePage?.hasLater && streamingText && <StreamingMessage text={streamingText} events={runEvents} busy={activeRun?.status === "running"} />}{!conversation?.messagePage?.hasLater && (activeRun || pendingOutcomeRun) && !streamingText && <RunningMessage run={activeRun ?? pendingOutcomeRun} events={runEvents} outcomePending={!activeRun && outcomePending} busy={activeRun?.status === "running"} />}</div></ScrollArea>
-          {readingLiveText && <section className="history-live-tail" aria-label={activeRun ? "Live output while reading history" : "Recent output while reading history"} tabIndex={0}><strong>{activeRun ? "Live output" : "Recent output"}</strong><p>{readingLiveText}</p></section>}
-          {conversation?.messagePage?.hasLater && <div className="history-forward"><button className="history-later" onClick={loadLaterMessages} disabled={loadingEarlier}>{loadingEarlier ? "Loading later messages…" : `Load later messages · ${conversation.messagePage.newerCount} remaining`}</button><button className="history-return" onClick={() => loadConversation({ returnToLatest: true })}>Return to latest{conversation.messagePage.newerCount ? ` · ${conversation.messagePage.newerCount} new` : ""}</button></div>}
-          {outcomePending && <div className="recovery-notice"><WarningCircle weight="fill" /><span className="recovery-copy"><strong>Run outcome waiting for storage</strong><span>The agent process has exited. Outright is saving the final result for {pendingOutcomeRuns.length === 1 ? "run" : "runs"} {pendingOutcomeRuns.map((run, index) => <code key={run.id}>{run.id}{index < pendingOutcomeRuns.length - 1 ? ", " : ""}</code>)} and will update this chat when storage recovers.</span></span></div>}
-          {interruptedRun && <RecoveryNotice run={interruptedRun} conversation={conversation} recoveryConversation={recoveryConversation} onOpenRecovery={openRecoveryConversation} onResolve={resolveRecovery} />}
-          <form className="composer" onSubmit={sendPrompt}>{unsentCreatedChat && <div className="first-prompt-notice" role="status" aria-live="polite">Chat created, but your message was not sent. {unsentHelp}{unsentForOwner && firstPromptAwaitingSelection && conversations.some((item) => item.id === unsentForOwner.id) && <Button type="button" variant="outline" size="sm" onClick={() => selectConversation(unsentForOwner.id)}>Open created chat</Button>}{!unsentForOwner && unsentProject && unsentWorktree && <Button type="button" variant="outline" size="sm" onClick={() => { pendingConversationRef.current = unsentCreatedChat.id; chooseProject(unsentProject, unsentWorktree); }}>Return to created chat</Button>}<Button type="button" variant="ghost" size="sm" onClick={() => { setUnsentCreatedChat(null); editDraft(""); }}>Discard unsent message</Button></div>}<textarea aria-label="Message the agent" disabled={Boolean(interruptedRun) || submissionUnavailable} aria-busy={waitingForConversation && !conversationLoadFailed} placeholder={composerPlaceholder} value={draft} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (isComposerSubmitKey(event)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><div><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Attach files (coming soon)"><Plus /></Button><Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Mention context (coming soon)"><At /></Button><TemplateMenu templates={templates} onSelect={editDraft} /><button type="button" className="model-button" onClick={() => setSettingsOpen(true)} aria-label="Agent provider and model settings"><span className="model-orb" aria-hidden="true" />{conversation?.provider ?? settings.provider}{conversation?.model ? ` · ${conversation.model}` : ""}<CaretDown /></button></div>{composerHint}{composerAction}</div></form>
-        </section>
-        {inspector && <aside className="inspector" id="workspace-inspector" aria-label="Workspace inspector" tabIndex={-1} ref={inspectorRef}><header><nav role="tablist" aria-label="Inspector panels" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', setInspector)}><button id="inspector-tab-changes" data-tab-id="changes" role="tab" className={inspector === "changes" ? "is-active" : ""} aria-selected={inspector === "changes"} aria-controls="inspector-content" tabIndex={inspector === "changes" ? 0 : -1} onClick={() => setInspector("changes")}><GitDiff />Changes</button><button id="inspector-tab-terminal" data-tab-id="terminal" role="tab" className={inspector === "terminal" ? "is-active" : ""} aria-selected={inspector === "terminal"} aria-controls="inspector-content" tabIndex={inspector === "terminal" ? 0 : -1} onClick={() => setInspector("terminal")}><TerminalWindow />Terminal</button><button id="inspector-tab-context" data-tab-id="context" role="tab" className={inspector === "context" ? "is-active" : ""} aria-selected={inspector === "context"} aria-controls="inspector-content" tabIndex={inspector === "context" ? 0 : -1} onClick={() => setInspector("context")}><TreeStructure />Context</button></nav><Button variant="ghost" size="icon-xs" onClick={closeInspector} aria-label="Close inspector"><X /></Button></header><div className="inspector-body" id="inspector-content" role="tabpanel" aria-labelledby={`inspector-tab-${inspector}`}>{inspector === "changes" && <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />}{inspector === "terminal" && <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} terminalsVersion={terminalsVersion} unverifiedTerminalIds={unverifiedTerminalIds} sendRuntime={sendRuntime} onError={handleError} />}{inspector === "context" && <ContextPane worktree={worktree} settings={settings} onError={handleError} />}</div></aside>}
-      </div>
+    <main id="main-workspace" className="workspace" inert={isNarrow && sidebarOpen ? true : undefined} aria-hidden={isNarrow && sidebarOpen ? true : undefined}>
+      <header className="workspace-bar">{!sidebarOpen && <Button variant="ghost" size="icon-sm" onClick={openSidebar} aria-label="Open projects sidebar" aria-controls="project-sidebar" aria-expanded={sidebarOpen}><SidebarSimple /></Button>}<div className="workspace-context"><span>{project.name}</span><CaretRight /><GitBranch /><strong>{worktree.name}</strong></div><div className="workspace-tools"><RunState run={pendingOutcomeRun ?? activeRun ?? latestRun} outcomePending={outcomePending} /><WorktreeState worktree={worktree} />{paneToggle("changes", "Changes", GitDiff, "Changes")}{paneToggle("terminal", "Terminal", TerminalWindow, "Terminal ⌘⇧T")}{paneToggle("context", "Project context", Info, "Project context")}<DropdownMenu><span id="pane-layout-hint" className="sr-only">F6 moves focus between panes</span><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Pane layout" aria-describedby="pane-layout-hint" />}><Layout /></DropdownMenuTrigger><DropdownMenuContent align="end" className="w-auto min-w-60" aria-describedby="pane-layout-hint"><DropdownMenuGroup><DropdownMenuLabel>Pane layout</DropdownMenuLabel>{PANE_LAYOUT_PRESETS.map((preset) => <DropdownMenuItem key={preset.id} onClick={() => changePaneLayout(applyPreset(paneState.layout, preset.id))}>{preset.label}</DropdownMenuItem>)}</DropdownMenuGroup><DropdownMenuSeparator /><p className="pane-layout-hint" aria-hidden="true">F6 moves focus between panes</p></DropdownMenuContent></DropdownMenu><ThemeMenu theme={theme} onThemeChange={setTheme} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Worktree options" />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, editor: settings.editor } }).then(() => setToast(`Opened in ${settings.editor}`)).catch((nextError) => setError(nextError.message))}><PencilSimple />Open in {settings.editor}</DropdownMenuItem><DropdownMenuItem onClick={() => setWorktreeDialog(project)}><GitBranch />New worktree</DropdownMenuItem>{worktree.isLinked && <><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onClick={() => setRemoveWorktreeOpen(true)}><Trash />Remove worktree</DropdownMenuItem></>}</DropdownMenuContent></DropdownMenu></div></header>
+      <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll" role="tablist" aria-label="Open agent chats" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', (id) => { revealConversationPane(); selectConversation(id); })}>{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={(event) => { dragConversationRef.current = item.id; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData(CHAT_TAB_DRAG_TYPE, item.id); }} onDragEnd={() => { dragConversationRef.current = ""; }} onDragOver={(event) => { if (isChatTabDrag(event)) event.preventDefault(); }} onDrop={(event) => { if (!isChatTabDrag(event)) return; event.preventDefault(); void reorderConversation(item.id); }}><button className="tab-select" id={domId("chat-tab", item.id)} data-tab-id={item.id} role="tab" aria-selected={item.id === selectedConversationId} aria-controls="conversation-panel" tabIndex={item.id === selectedConversationId ? 0 : -1} onClick={() => { revealConversationPane(); selectConversation(item.id); }} onDoubleClick={() => { selectConversation(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); void archiveChat(item, event.currentTarget); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
+      <PaneLayout ref={paneLayoutRef} className="work-area" layout={paneState.layout} onChange={changePaneLayout} compactPreferred={isNarrow} views={paneViewElements} />
     </main>
 
     <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} projects={bootstrap.projects} onSelectProject={chooseProject} onSelectConversation={(item) => { const nextProject = bootstrap.projects.find((entry) => entry.id === item.projectId); const nextWorktree = nextProject?.worktrees.find((entry) => entry.id === item.worktreeId); if (nextProject && nextWorktree) { pendingConversationRef.current = item.id; chooseProject(nextProject, nextWorktree); } }} />
