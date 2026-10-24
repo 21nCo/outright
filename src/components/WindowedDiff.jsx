@@ -6,13 +6,9 @@ const OVERSCAN = 40;
 // Chromium clamps a single element near 16.7 million CSS pixels. Keep the
 // virtual track below that limit even for the allowed 12 MiB diff output.
 const MAX_TRACK_HEIGHT = 8_000_000;
-// Position updates are synchronous layout work. A geometry feedback beyond
-// the scrollbar reserve below must defer to the next frame, not recurse.
+// Position updates are synchronous layout work. A geometry feedback that the
+// rows height below does not absorb must defer to the next frame, not recurse.
 const MAX_POSITION_UPDATES_PER_FRAME = 8;
-// Find alignment runs at most once a frame and stops when a pass moves
-// nothing. A pass that keeps moving stops after this many frames until the
-// viewport next scrolls or resizes on its own.
-const MAX_ALIGN_FRAMES = 30;
 
 function lineOffsets(diff) {
   let count = 1;
@@ -21,6 +17,18 @@ function lineOffsets(diff) {
   let next = 1;
   for (let index = 0; index + 1 < diff.length; index += 1) if (diff.charCodeAt(index) === 10) starts[next++] = index + 1;
   return starts;
+}
+
+// The rows height is the viewport's box, not clientHeight: a classic
+// horizontal scrollbar from a long mounted row must not change the rows, the
+// Find target or the mounted window in turn.
+export function diffRowsHeight(viewport) { return viewport.offsetHeight; }
+
+// One Find geometry for seeking, alignment and resizes: the match row sits a
+// third of the way down the rows, below the viewport's top padding.
+function findTop(viewport, line) {
+  const padding = Number.parseFloat(getComputedStyle(viewport).paddingTop) || 0;
+  return Math.max(0, padding + line * LINE_HEIGHT - diffRowsHeight(viewport) / 3);
 }
 
 export function WindowedDiff({ diff, label }) {
@@ -38,21 +46,11 @@ export function WindowedDiff({ diff, label }) {
   const programmaticTopRef = useRef(null);
   const layoutRef = useRef({ compressed: false, maxFirst: 0, maxScroll: 1 });
   const positionRef = useRef(null);
-  const scrollbarReserveRef = useRef(0);
   const burstRef = useRef({ count: 0, reset: 0, deferred: 0, top: 0, first: null });
-  const alignFrameRef = useRef(0);
   const alignRef = useRef(null);
-  // Mounted rows decide the horizontal overflow, and a classic horizontal
-  // scrollbar would change clientHeight, the rows and the Find anchor in turn.
-  // Reserve the largest scrollbar seen so the row height ignores whether one
-  // is shown at this moment.
-  const rowsHeight = (viewport) => {
-    scrollbarReserveRef.current = Math.max(scrollbarReserveRef.current, viewport.offsetHeight - viewport.clientHeight);
-    return Math.max(0, viewport.offsetHeight - scrollbarReserveRef.current);
-  };
   const updatePosition = (viewport, logicalFirst = null) => {
     const top = viewport.scrollTop;
-    const height = rowsHeight(viewport);
+    const height = diffRowsHeight(viewport);
     const { compressed, maxFirst, maxScroll } = layoutRef.current;
     // A compressed track has fewer physical pixels than logical lines. Keep
     // line moves exact, even when the browser rounds a programmatic scroll.
@@ -151,35 +149,29 @@ export function WindowedDiff({ diff, label }) {
     programmaticTopRef.current = viewport.scrollTop;
     updatePosition(viewport, next);
   }
+  // A seek lands on the Find target directly, so aligning again with the
+  // same geometry moves nothing and needs no corrective pass.
   function seekLine(line) {
     const viewport = viewportRef.current;
     if (!viewport) return;
     if (compressed) {
       const first = Math.max(0, Math.min(maxFirst, line - Math.floor(visibleRows / 3)));
-      moveFirst(first);
+      if (Math.abs(viewport.scrollTop - (maxFirst ? first / maxFirst * maxScroll : 0)) > 1) moveFirst(first);
+      else { programmaticTopRef.current = viewport.scrollTop; updatePosition(viewport, first); }
       return;
     }
-    viewport.scrollTop = Math.max(0, line * LINE_HEIGHT - rowsHeight(viewport) / 3);
+    const top = findTop(viewport, line);
+    if (Math.abs(viewport.scrollTop - top) > 1) viewport.scrollTop = top;
     updatePosition(viewport);
   }
   // Find owns the viewport from a seek until a wheel, pointer, touch or key
-  // gesture, or a new or cleared query. While it does, any scroll or resize
-  // the alignment did not cause, such as a late queued native End, aligns the
-  // match again on the next frame.
-  function scheduleAlign() {
-    const pending = pendingFindAlignmentRef.current;
-    if (!pending || alignFrameRef.current || pending.frames >= MAX_ALIGN_FRAMES) return;
-    alignFrameRef.current = window.requestAnimationFrame(() => { alignFrameRef.current = 0; alignRef.current?.(); });
-  }
-  function keepFindOwnership(viewport) {
-    const pending = pendingFindAlignmentRef.current;
-    if (!pending) return;
-    if (viewport.scrollTop !== pending.top || rowsHeight(viewport) !== pending.height) pending.frames = 0;
-    scheduleAlign();
-  }
+  // gesture, or a new or cleared query. While it does, a resize aligns the
+  // match before paint, and a scroll it did not cause, such as a late queued
+  // native End, aligns it in that scroll event.
   function claimFind(line) {
-    pendingFindAlignmentRef.current = { line, frames: 0, top: null, height: null };
+    pendingFindAlignmentRef.current = { line, top: null };
     seekLine(line);
+    pendingFindAlignmentRef.current.top = viewportRef.current?.scrollTop ?? null;
   }
   function find(direction = 1, value = needle) {
     const query = foldFindText(value.trim());
@@ -205,13 +197,14 @@ export function WindowedDiff({ diff, label }) {
     // ResizeObserver survives same-component diff refreshes. Read the latest
     // coordinate model, rather than retaining the layout from the first diff.
     updatePosition(viewport);
-    const resize = new ResizeObserver(() => { updatePosition(viewport); keepFindOwnership(viewport); });
+    // ResizeObserver delivers after layout and before paint.
+    const resize = new ResizeObserver(() => { updatePosition(viewport); alignRef.current?.(); });
     resize.observe(viewport);
     const burst = burstRef.current;
     return () => {
       resize.disconnect();
-      window.cancelAnimationFrame(burst.reset); window.cancelAnimationFrame(burst.deferred); window.cancelAnimationFrame(alignFrameRef.current);
-      burst.reset = 0; burst.deferred = 0; alignFrameRef.current = 0;
+      window.cancelAnimationFrame(burst.reset); window.cancelAnimationFrame(burst.deferred);
+      burst.reset = 0; burst.deferred = 0;
     };
   }, []);
   useLayoutEffect(() => {
@@ -220,7 +213,7 @@ export function WindowedDiff({ diff, label }) {
     // Scroll and resize callbacks can enqueue a position from an older frame.
     // Reconcile the committed row placement with the physical viewport before
     // paint, including while a compressed Find seek is still pending.
-    if (viewport.scrollTop !== position.top || rowsHeight(viewport) !== position.height) updatePosition(viewport);
+    if (viewport.scrollTop !== position.top || diffRowsHeight(viewport) !== position.height) updatePosition(viewport);
   });
   useLayoutEffect(() => {
     if (!needle.trim() || foundOffsetRef.current < 0) return;
@@ -254,36 +247,26 @@ export function WindowedDiff({ diff, label }) {
     const timer = window.setTimeout(() => setAnnouncedStatus(visibleStatus), 180);
     return () => window.clearTimeout(timer);
   }, [visibleStatus]);
+  // Each alignment is one seek to the current target. It changes no state
+  // when the viewport is already there, so it cannot recurse.
   const align = () => {
     const pending = pendingFindAlignmentRef.current;
-    const viewport = viewportRef.current;
-    if (!pending || !viewport) return;
-    const before = viewport.scrollTop;
-    const mark = viewport.querySelector('[data-find-match="true"]');
-    if (compressed || !mark) seekLine(pending.line);
-    else {
-      const viewportTop = viewport.getBoundingClientRect().top;
-      const rowTop = mark.getBoundingClientRect().top;
-      const desired = viewportTop + rowsHeight(viewport) / 3;
-      if (Math.abs(rowTop - desired) > 1) viewport.scrollTop += rowTop - desired;
-      updatePosition(viewport);
-    }
-    // The scroll event this pass causes is not a new geometry change.
-    pending.top = viewport.scrollTop;
-    pending.height = rowsHeight(viewport);
-    if (mark && viewport.scrollTop === before) pending.frames = 0;
-    else { pending.frames += 1; scheduleAlign(); }
+    if (!pending || !viewportRef.current) return;
+    seekLine(pending.line);
+    // The scroll event this seek causes is not an outside scroll.
+    pending.top = viewportRef.current.scrollTop;
   };
   // Only committed geometry may align, as with the scroll coordinate model.
+  // A committed height or mode change re-maps a compressed track.
   useLayoutEffect(() => { alignRef.current = align; });
-  useLayoutEffect(scheduleAlign, [foundLine, start, end, position.height, compressed]);
+  useLayoutEffect(() => { alignRef.current(); }, [position.height, compressed]);
   const lines = [];
   for (let index = start; index < end; index += 1) {
     const endOffset = index + 1 < count ? starts[index + 1] - 1 : content.length;
     const line = content.slice(starts[index], endOffset);
     lines.push(<span className={line.startsWith("+") && !line.startsWith("+++") ? "added" : line.startsWith("-") && !line.startsWith("---") ? "removed" : line.startsWith("@@") ? "hunk" : ""} data-find-match={index === foundLine ? "true" : undefined} key={index}><i aria-hidden="true">{index + 1}</i>{line}{"\n"}</span>);
   }
-  return <div className="windowed-diff"><div className="window-find" role="search" aria-label={`Find in ${label}`}><input aria-label="Find in diff" value={needle} onChange={(event) => { setNeedle(event.target.value); setFoundLine(-1); setSearched(false); foundOffsetRef.current = -1; pendingFindAlignmentRef.current = null; }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle} aria-label="Previous diff match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle} aria-label="Next diff match">↓</button><span aria-hidden="true">{visibleStatus}</span><span className="sr-only" role="status">{announcedStatus}</span></div><pre ref={viewportRef} className="diff-view" tabIndex={0} aria-label={label} data-first-line={firstVisible} data-mounted-start={start} data-mounted-end={end} onScroll={(event) => { updatePosition(event.currentTarget); keepFindOwnership(event.currentTarget); }} onPointerDown={() => { pendingFindAlignmentRef.current = null; }} onTouchStart={() => { pendingFindAlignmentRef.current = null; }} onWheelCapture={(event) => { if (event.deltaY && !event.ctrlKey && !event.metaKey && !event.shiftKey) pendingFindAlignmentRef.current = null; }} onKeyDown={(event) => {
+  return <div className="windowed-diff"><div className="window-find" role="search" aria-label={`Find in ${label}`}><input aria-label="Find in diff" value={needle} onChange={(event) => { setNeedle(event.target.value); setFoundLine(-1); setSearched(false); foundOffsetRef.current = -1; pendingFindAlignmentRef.current = null; }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); find(event.shiftKey ? -1 : 1); } }} /><button type="button" onClick={() => find(-1)} disabled={!needle} aria-label="Previous diff match">↑</button><button type="button" onClick={() => find(1)} disabled={!needle} aria-label="Next diff match">↓</button><span aria-hidden="true">{visibleStatus}</span><span className="sr-only" role="status">{announcedStatus}</span></div><pre ref={viewportRef} className="diff-view" tabIndex={0} aria-label={label} data-first-line={firstVisible} data-mounted-start={start} data-mounted-end={end} onScroll={(event) => { updatePosition(event.currentTarget); if (event.currentTarget.scrollTop !== pendingFindAlignmentRef.current?.top) alignRef.current?.(); }} onPointerDown={() => { pendingFindAlignmentRef.current = null; }} onTouchStart={() => { pendingFindAlignmentRef.current = null; }} onWheelCapture={(event) => { if (event.deltaY && !event.ctrlKey && !event.metaKey && !event.shiftKey) pendingFindAlignmentRef.current = null; }} onKeyDown={(event) => {
     pendingFindAlignmentRef.current = null;
     if (!compressed) return;
     const moves = { ArrowDown: 1, ArrowUp: -1, PageDown: visibleRows - 1, PageUp: 1 - visibleRows, Home: -maxFirst, End: maxFirst };

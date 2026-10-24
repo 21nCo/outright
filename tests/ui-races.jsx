@@ -6,7 +6,7 @@ import { createRoot } from "react-dom/client";
 import { App } from "../src/App.jsx";
 import { ChangesPane } from "../src/components/ChangesPane.jsx";
 import { WindowedMessages } from "../src/components/WindowedMessages.jsx";
-import { WindowedDiff } from "../src/components/WindowedDiff.jsx";
+import { WindowedDiff, diffRowsHeight } from "../src/components/WindowedDiff.jsx";
 import { CommandPalette } from "../src/components/CommandPalette.jsx";
 import { SettingsDialog } from "../src/components/SettingsDialog.jsx";
 import { ProviderAccounts } from "../src/components/ProviderAccounts.jsx";
@@ -3990,9 +3990,7 @@ async function diffRefreshAnchorRegression() {
   const foundRowIsAligned = () => {
     const row = viewport.querySelector('[data-find-match="true"]');
     if (!row?.textContent.includes("2500")) return false;
-    const bounds = row.getBoundingClientRect();
-    const frame = viewport.getBoundingClientRect();
-    return Math.abs(bounds.top - (frame.top + viewport.clientHeight / 3)) < 2;
+    return Math.abs(diffFindRowOffset(viewport)) < 2;
   };
   await until(() => foundRowIsAligned() && viewport.scrollTop > 20_000,
     "large diff find aligned at its committed reading position");
@@ -4048,13 +4046,21 @@ async function diffFindOwnershipRegression() {
   } finally { style.remove(); }
 }
 
+// The Find row's distance from a third of the way down the diff rows. The
+// rows height is WindowedDiff's own definition; the row comes from layout.
+function diffFindRowOffset(viewport) {
+  const row = viewport.querySelector('[data-find-match="true"]');
+  return row ? row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - diffRowsHeight(viewport) / 3 : Number.NaN;
+}
+
 async function diffScrollbarFeedbackRegression() {
   root.render(null); await settle();
   // Classic scrollbars (CI on macOS and Windows) take layout space. A long row
   // mounted at the window edge then shows a horizontal scrollbar that changes
-  // the viewport height, which changes the mounted rows in turn.
+  // the viewport height, which changes the mounted rows in turn. Windows CI
+  // also showed a Find that landed beside its target and was moved by a later
+  // corrective pass, so the first committed frame must already be final.
   const style = document.createElement("style");
-  style.textContent = ".diff-view::-webkit-scrollbar { width: 15px; height: 15px; } .diff-view::-webkit-scrollbar-thumb { background: #888; }";
   document.head.append(style);
   let diff = "";
   route = async (url) => {
@@ -4072,26 +4078,86 @@ async function diffScrollbarFeedbackRegression() {
     setControlValue(find, "line 2500");
     find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("line 2500"), `Find with a long row at ${long}`);
-    for (let index = 0; index < 14; index += 1) await frame();
     return viewport;
   };
   try {
-    const plain = await render(-1);
-    const start = Number(plain.dataset.mountedStart);
-    const end = Number(plain.dataset.mountedEnd);
-    for (const long of [start - 2, start - 1, start, start + 1, end - 2, end - 1, end, end + 1]) {
-      const viewport = await render(long);
-      const place = () => `${viewport.scrollTop}:${viewport.clientHeight}:${viewport.dataset.mountedStart}:${viewport.dataset.mountedEnd}`;
-      const settled = place();
-      for (let index = 0; index < 6; index += 1) {
-        await frame();
-        assert(place() === settled, `A long row at ${long} kept moving the diff window after Find: ${settled} -> ${place()}`);
+    for (const size of [15, 17]) {
+      style.textContent = `.diff-view::-webkit-scrollbar { width: ${size}px; height: ${size}px; } .diff-view::-webkit-scrollbar-thumb { background: #888; }`;
+      const plain = await render(-1); // NOSONAR S9382: each case starts from a fresh viewport
+      for (let index = 0; index < 4; index += 1) await frame(); // NOSONAR S9382: the plain window is the reference for the edge cases
+      const start = Number(plain.dataset.mountedStart);
+      const end = Number(plain.dataset.mountedEnd);
+      for (const long of [-1, start - 2, start - 1, start, start + 1, end - 2, end - 1, end, end + 1]) {
+        const viewport = await render(long); // NOSONAR S9382: each case starts from a fresh viewport
+        const label = `${size}px scrollbars, long row at ${long}`;
+        const place = () => `${viewport.scrollTop}:${viewport.clientHeight}:${viewport.dataset.mountedStart}:${viewport.dataset.mountedEnd}`;
+        const settled = place();
+        for (let index = 0; index <= 20; index += 1) {
+          assert(place() === settled, `${label}: the diff window moved ${index} frames after Find committed: ${settled} -> ${place()}`);
+          assert(Math.abs(diffFindRowOffset(viewport)) < 2, `${label}: the Find row was ${diffFindRowOffset(viewport)}px from its target ${index} frames after Find committed`);
+          if (index < 20) await frame(); // NOSONAR S9382: one sample per frame
+        }
+        const row = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+        const frameTop = viewport.getBoundingClientRect().top;
+        assert(row.top >= frameTop && row.bottom <= frameTop + viewport.clientHeight, `${label}: the Find match was outside the diff viewport`);
       }
-      const row = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
-      const frameTop = viewport.getBoundingClientRect().top;
-      assert(row.top >= frameTop && row.bottom <= frameTop + viewport.clientHeight, `A long row at ${long} left the Find match outside the diff viewport`);
     }
   } finally { style.remove(); }
+}
+
+// Find, Next and Previous land aligned in the seek itself, and a pane resize
+// while Find owns the diff aligns the match before that frame paints, without
+// waiting for an animation frame.
+async function diffFindResizeRegression() {
+  root.render(null); await settle();
+  const style = document.createElement("style");
+  style.textContent = ".diff-view::-webkit-scrollbar { width: 17px; height: 17px; } .diff-view::-webkit-scrollbar-thumb { background: #888; }";
+  document.head.append(style);
+  const diff = Array.from({ length: 5_000 }, (_, index) => `-unstaged ${index}\n`).join("");
+  const nativeFrame = window.requestAnimationFrame;
+  let probe;
+  try {
+    root.render(<div className="pane-body" style={{ width: 448, height: 600 }}><WindowedDiff diff={diff} label="Resized diff" /></div>);
+    await until(() => host.querySelector(".diff-view")?.textContent.includes("unstaged 0"), "resizable diff ready");
+    const viewport = host.querySelector(".diff-view");
+    const find = host.querySelector('input[aria-label="Find in diff"]');
+    setControlValue(find, "unstaged 31");
+    const steps = [
+      ["Find", "unstaged 31", () => find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }))],
+      ["Next", "unstaged 310", () => host.querySelector('[aria-label="Next diff match"]').click()],
+      ["Next", "unstaged 311", () => host.querySelector('[aria-label="Next diff match"]').click()],
+      ["Previous", "unstaged 310", () => host.querySelector('[aria-label="Previous diff match"]').click()],
+    ];
+    for (const [name, text, act] of steps) {
+      act();
+      await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.endsWith(`-${text}\n`), `${name} reaches ${text}`); // NOSONAR S9382: each navigation waits for its own match
+      const top = viewport.scrollTop;
+      for (let index = 0; index <= 10; index += 1) {
+        assert(Math.abs(diffFindRowOffset(viewport)) < 2 && viewport.scrollTop === top, `${name} to ${text}: the match was ${diffFindRowOffset(viewport)}px from its target, scroll ${top} -> ${viewport.scrollTop}, ${index} frames after it committed`);
+        if (index < 10) await frame(); // NOSONAR S9382: one sample per frame
+      }
+    }
+    // Observers deliver in creation order, so this one samples after the
+    // diff's own observer in the same delivery, before paint.
+    let sample = null;
+    probe = new ResizeObserver(() => { sample ??= { offset: diffFindRowOffset(viewport), height: viewport.offsetHeight }; });
+    probe.observe(viewport);
+    await settle();
+    // Animation frames are delayed, so only work done before paint counts.
+    window.requestAnimationFrame = (callback) => nativeFrame(() => nativeFrame(() => nativeFrame(callback)));
+    // Resize outside React, as a window, font or sibling layout change does.
+    const body = host.querySelector(".pane-body");
+    for (const [width, height] of [[448, 520], [448, 640], [320, 640]]) {
+      sample = null;
+      Object.assign(body.style, { width: `${width}px`, height: `${height}px` });
+      await until(() => sample, `diff resized to ${width}x${height}`); // NOSONAR S9382: each resize is observed on its own
+      assert(Math.abs(sample.offset) < 2, `A resize to ${width}x${height} (${sample.height}px rows) left the Find match ${sample.offset}px from its target in the resize frame`);
+      for (let index = 0; index < 10; index += 1) { // NOSONAR S9382: one sample per frame
+        await frame();
+        assert(Math.abs(diffFindRowOffset(viewport)) < 2, `A resize to ${width}x${height} moved the Find match ${diffFindRowOffset(viewport)}px from its target ${index + 1} frames later`);
+      }
+    }
+  } finally { window.requestAnimationFrame = nativeFrame; probe?.disconnect(); style.remove(); }
 }
 
 async function changesMutationOwnerRegression(reject = false, mode = "stage") {
@@ -8043,6 +8109,7 @@ try {
     ["diff refresh anchor", diffRefreshAnchorRegression, "same-selection refresh keeps the visible diff line and find through success and failure"],
     ["diff Find ownership", diffFindOwnershipRegression, "a late queued scroll at any viewport height cannot take a Find match out of view"],
     ["diff scrollbar feedback", diffScrollbarFeedbackRegression, "a horizontal scrollbar from a long row at the diff window edge settles Find instead of looping"],
+    ["diff Find resize", diffFindResizeRegression, "Find, Next and Previous land aligned and a resize realigns the match before paint"],
     ["changes mutation owner success", () => changesMutationOwnerRegression(false), "late stage completion cannot refresh another worktree"],
     ["changes mutation owner failure", () => changesMutationOwnerRegression(true), "late stage failure cannot report in another worktree"],
     ["changes unstage owner failure", () => changesMutationOwnerRegression(true, "unstage"), "late unstage failure cannot report in another worktree"],
