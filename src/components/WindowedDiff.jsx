@@ -26,7 +26,7 @@ export function diffRowsHeight(viewport) { return viewport.offsetHeight; }
 
 // One Find geometry for seeking, alignment and resizes: the match row sits a
 // third of the way down the rows, below the viewport's top padding.
-function findTop(viewport, line) {
+export function diffFindTop(viewport, line) {
   const padding = Number.parseFloat(getComputedStyle(viewport).paddingTop) || 0;
   return Math.max(0, padding + line * LINE_HEIGHT - diffRowsHeight(viewport) / 3);
 }
@@ -160,14 +160,15 @@ export function WindowedDiff({ diff, label }) {
       else { programmaticTopRef.current = viewport.scrollTop; updatePosition(viewport, first); }
       return;
     }
-    const top = findTop(viewport, line);
+    const top = diffFindTop(viewport, line);
     if (Math.abs(viewport.scrollTop - top) > 1) viewport.scrollTop = top;
     updatePosition(viewport);
   }
   // Find owns the viewport from a seek until a wheel, pointer, touch or key
   // gesture, or a new or cleared query. While it does, a resize aligns the
   // match before paint, and a scroll it did not cause, such as a late queued
-  // native End, aligns it in that scroll event.
+  // native End, aligns it in that scroll event or in the next commit,
+  // whichever comes first.
   function claimFind(line) {
     pendingFindAlignmentRef.current = { line, top: null };
     seekLine(line);
@@ -191,6 +192,15 @@ export function WindowedDiff({ diff, label }) {
     setFoundLine(line);
     claimFind(line);
   }
+  // Each alignment is one seek to the current target. It changes no state
+  // when the viewport is already there, so it cannot recurse.
+  const align = () => {
+    const pending = pendingFindAlignmentRef.current;
+    if (!pending || !viewportRef.current) return;
+    seekLine(pending.line);
+    // The scroll event this seek causes is not an outside scroll.
+    pending.top = viewportRef.current.scrollTop;
+  };
   useLayoutEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
@@ -214,6 +224,11 @@ export function WindowedDiff({ diff, label }) {
     // Reconcile the committed row placement with the physical viewport before
     // paint, including while a compressed Find seek is still pending.
     if (viewport.scrollTop !== position.top || diffRowsHeight(viewport) !== position.height) updatePosition(viewport);
+    // A commit can land between a scroll Find did not cause and that scroll's
+    // event, or after a seek the viewport could not take yet. Every commit
+    // aligns while Find owns the viewport, so none depends on an event's
+    // timing. An aligned viewport moves nothing, so this ends.
+    if (pendingFindAlignmentRef.current) align();
   });
   useLayoutEffect(() => {
     if (!needle.trim() || foundOffsetRef.current < 0) return;
@@ -228,15 +243,11 @@ export function WindowedDiff({ diff, label }) {
     setFoundLine(line);
     claimFind(line);
   }, [content]);
-  const scrollFirst = compressed ? Math.max(0, Math.min(maxFirst, position.first ?? Math.round(position.top / maxScroll * maxFirst)))
+  // The mounted rows always follow the observed viewport. Alignment needs no
+  // mounted row, so a pending Find never mounts its match where the viewport
+  // is not.
+  const firstVisible = compressed ? Math.max(0, Math.min(maxFirst, position.first ?? Math.round(position.top / maxScroll * maxFirst)))
     : Math.max(0, Math.min(maxFirst, Math.floor(position.top / LINE_HEIGHT)));
-  // A seek can race a queued native End/scroll event after a mode switch.
-  // Keep the target mounted while Find owns the viewport, so the next
-  // alignment finds its row.
-  const pendingLine = pendingFindAlignmentRef.current?.line;
-  const firstVisible = pendingLine != null
-    && (pendingLine < scrollFirst - OVERSCAN || pendingLine >= scrollFirst + visibleRows + OVERSCAN)
-    ? Math.max(0, Math.min(maxFirst, pendingLine - Math.floor(visibleRows / 3))) : scrollFirst;
   const start = compressed ? firstVisible : Math.max(0, firstVisible - OVERSCAN);
   const end = Math.min(count, firstVisible + visibleRows + OVERSCAN);
   // Keep the mounted window attached to the physical viewport. Large CSS top
@@ -247,15 +258,6 @@ export function WindowedDiff({ diff, label }) {
     const timer = window.setTimeout(() => setAnnouncedStatus(visibleStatus), 180);
     return () => window.clearTimeout(timer);
   }, [visibleStatus]);
-  // Each alignment is one seek to the current target. It changes no state
-  // when the viewport is already there, so it cannot recurse.
-  const align = () => {
-    const pending = pendingFindAlignmentRef.current;
-    if (!pending || !viewportRef.current) return;
-    seekLine(pending.line);
-    // The scroll event this seek causes is not an outside scroll.
-    pending.top = viewportRef.current.scrollTop;
-  };
   // Only committed geometry may align, as with the scroll coordinate model.
   // A committed height or mode change re-maps a compressed track.
   useLayoutEffect(() => { alignRef.current = align; });

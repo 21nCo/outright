@@ -6,12 +6,13 @@ import { createRoot } from "react-dom/client";
 import { App } from "../src/App.jsx";
 import { ChangesPane } from "../src/components/ChangesPane.jsx";
 import { WindowedMessages } from "../src/components/WindowedMessages.jsx";
-import { WindowedDiff, diffRowsHeight } from "../src/components/WindowedDiff.jsx";
+import { WindowedDiff, diffFindTop, diffRowsHeight } from "../src/components/WindowedDiff.jsx";
 import { CommandPalette } from "../src/components/CommandPalette.jsx";
 import { SettingsDialog } from "../src/components/SettingsDialog.jsx";
 import { ProviderAccounts } from "../src/components/ProviderAccounts.jsx";
 import { TerminalPane } from "../src/components/TerminalPane.jsx";
 import { PaneLayout } from "../src/components/PaneLayout.jsx";
+import { computePaneRects } from "../src/lib/pane-layout.js";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
 import { scheduleLayoutTick } from "../src/lib/windowing.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
@@ -3984,40 +3985,42 @@ async function diffRefreshAnchorRegression() {
   root.render(pane(null));
   await until(() => host.querySelector(".diff-view")?.textContent.includes("line 0"), "large diff ready");
   const viewport = host.querySelector(".diff-view");
-  const find = host.querySelector('input[aria-label="Find in diff"]');
-  setControlValue(find, "line 2500");
-  find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-  const foundRowIsAligned = () => {
-    const row = viewport.querySelector('[data-find-match="true"]');
-    if (!row?.textContent.includes("2500")) return false;
-    return Math.abs(diffFindRowOffset(viewport)) < 2;
-  };
-  await until(() => foundRowIsAligned() && viewport.scrollTop > 20_000,
-    "large diff find aligned at its committed reading position");
-  // The mark may mount before the queued Find alignment settles on slower
-  // hosts. Start the refresh comparison from the completed reading position.
-  await settle();
-  assert(foundRowIsAligned(), "Large diff Find lost its aligned row before refresh");
-  const anchor = viewport.scrollTop;
-  hold = true;
-  root.render(pane({ type: "projects.changed" }));
-  await until(() => pending.length === 1, "background diff refresh pending");
-  assert(viewport.textContent.includes("line 2500") && viewport.querySelector('[data-find-match="true"]'), "Background refresh erased the reader's diff or find");
-  assert(Math.abs(viewport.scrollTop - anchor) < 24 && foundRowIsAligned(),
-    `Background refresh moved the diff anchor before its response: ${anchor} -> ${viewport.scrollTop}, row=${viewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top}, viewport=${viewport.getBoundingClientRect().top}`);
-  pending.shift().resolve(response({ diff: original }));
-  await settle();
-  assert(Math.abs(viewport.scrollTop - anchor) < 24 && viewport.querySelector('[data-find-match="true"]'), "Identical diff refresh lost the anchor or find");
-  host.querySelector('[aria-label="Refresh changes"]').click();
-  await until(() => pending.length === 1, "changed diff refresh pending");
-  pending.shift().resolve(response({ diff: changed }));
-  await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("LINE 2500"), "changed diff find retained");
-  assert(Math.abs(viewport.scrollTop - anchor) < 24, "Changed diff refresh moved the reader's line");
-  host.querySelector('[aria-label="Refresh changes"]').click();
-  await until(() => pending.length === 1, "failed same-selection refresh pending");
-  pending.shift().reject(new Error("Diff offline"));
-  await until(() => errors.includes("Diff offline"), "same-selection failure reported");
-  assert(viewport.textContent.includes("LINE 2500") && Math.abs(viewport.scrollTop - anchor) < 24, "Failed same-selection refresh erased the last valid diff");
+  await withDiffTrace(viewport, async () => {
+    const find = host.querySelector('input[aria-label="Find in diff"]');
+    setControlValue(find, "line 2500");
+    find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    const foundRowIsAligned = () => {
+      const row = viewport.querySelector('[data-find-match="true"]');
+      if (!row?.textContent.includes("2500")) return false;
+      return Math.abs(diffFindRowOffset(viewport)) < 2;
+    };
+    await until(() => foundRowIsAligned() && viewport.scrollTop > 20_000,
+      "large diff find aligned at its committed reading position");
+    // The mark may mount before the queued Find alignment settles on slower
+    // hosts. Start the refresh comparison from the completed reading position.
+    await settle();
+    assert(foundRowIsAligned(), "Large diff Find lost its aligned row before refresh");
+    const anchor = viewport.scrollTop;
+    hold = true;
+    root.render(pane({ type: "projects.changed" }));
+    await until(() => pending.length === 1, "background diff refresh pending");
+    assert(viewport.textContent.includes("line 2500") && viewport.querySelector('[data-find-match="true"]'), "Background refresh erased the reader's diff or find");
+    assert(Math.abs(viewport.scrollTop - anchor) < 24 && foundRowIsAligned(),
+      `Background refresh moved the diff anchor before its response: ${anchor} -> ${viewport.scrollTop}, row=${viewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top}, viewport=${viewport.getBoundingClientRect().top}`);
+    pending.shift().resolve(response({ diff: original }));
+    await settle();
+    assert(Math.abs(viewport.scrollTop - anchor) < 24 && viewport.querySelector('[data-find-match="true"]'), "Identical diff refresh lost the anchor or find");
+    host.querySelector('[aria-label="Refresh changes"]').click();
+    await until(() => pending.length === 1, "changed diff refresh pending");
+    pending.shift().resolve(response({ diff: changed }));
+    await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("LINE 2500"), "changed diff find retained");
+    assert(Math.abs(viewport.scrollTop - anchor) < 24, "Changed diff refresh moved the reader's line");
+    host.querySelector('[aria-label="Refresh changes"]').click();
+    await until(() => pending.length === 1, "failed same-selection refresh pending");
+    pending.shift().reject(new Error("Diff offline"));
+    await until(() => errors.includes("Diff offline"), "same-selection failure reported");
+    assert(viewport.textContent.includes("LINE 2500") && Math.abs(viewport.scrollTop - anchor) < 24, "Failed same-selection refresh erased the last valid diff");
+  });
 }
 
 // Windows CI lost a Find match to a late queued scroll only at some viewport
@@ -4040,9 +4043,45 @@ async function diffFindOwnershipRegression() {
       const find = host.querySelector('input[aria-label="Find in diff"]');
       setControlValue(find, "unstaged 2500");
       find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-      await until(() => viewport.querySelector('[data-find-match="true"]'), `Find at ${height}px`); // NOSONAR S9382: each height starts from a fresh viewport
+      await until(() => diffFindLanded(viewport, "unstaged 2500", 2500), `Find at ${height}px`); // NOSONAR S9382: each height starts from a fresh viewport
       await assertFindKeepsOwnership(viewport, "unstaged 2500", `Find at ${height}px (${viewport.clientHeight}px rows)`); // NOSONAR S9382: each height starts from a fresh viewport
     }
+    // A commit can land after a scroll Find did not cause and before that
+    // scroll's event. The commit itself must show the match at its target,
+    // and while a seek has not moved the viewport yet, the window must not
+    // mount the match where the viewport is not.
+    const pane = (label) => <div className="pane-body" style={{ width: 448, height: 600 }}><WindowedDiff diff={diff} label={label} /></div>;
+    root.render(null); await settle();
+    root.render(pane("Diff before a commit"));
+    await until(() => host.querySelector(".diff-view")?.textContent.includes("unstaged 0"), "diff for a commit before a scroll event");
+    const viewport = host.querySelector(".diff-view");
+    const find = host.querySelector('input[aria-label="Find in diff"]');
+    const native = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop");
+    await withDiffTrace(viewport, async () => {
+      setControlValue(find, "unstaged 2500");
+      find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      await until(() => diffFindLanded(viewport, "unstaged 2500", 2500), "Find before a late scroll and commit");
+      native.set.call(viewport, viewport.scrollHeight);
+      flushSync(() => root.render(pane("Diff committed before its scroll event")));
+      assert(Math.abs(diffFindRowOffset(viewport)) < 2, `A commit before the late scroll's event left the Find match ${diffFindRowOffset(viewport)}px from its target; scroll=${viewport.scrollTop}; mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`);
+    });
+    root.render(null); await settle();
+    root.render(pane("Diff with a held seek"));
+    await until(() => host.querySelector(".diff-view")?.textContent.includes("unstaged 0"), "diff for a held seek");
+    const held = host.querySelector(".diff-view");
+    Object.defineProperty(held, "scrollTop", { configurable: true, get: () => native.get.call(held), set: () => {} });
+    try {
+      const input = host.querySelector('input[aria-label="Find in diff"]');
+      setControlValue(input, "unstaged 2500");
+      flushSync(() => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
+      await settle();
+      const mark = held.querySelector('[data-find-match="true"]')?.getBoundingClientRect();
+      const view = held.getBoundingClientRect();
+      assert(!mark || (mark.bottom > view.top && mark.top < view.bottom), `A held seek mounted the Find match outside the viewport: mark=${mark?.top}, viewport=${view.top}/${view.bottom}, scroll=${held.scrollTop}, mounted=${held.dataset.mountedStart}/${held.dataset.mountedEnd}`);
+    } finally { delete held.scrollTop; }
+    // Once the viewport can move, the next commit reclaims the match.
+    flushSync(() => root.render(pane("Diff after a held seek")));
+    assert(diffFindLanded(held, "unstaged 2500", 2500), `A commit after a held seek did not land Find: scroll=${held.scrollTop}; mounted=${held.dataset.mountedStart}/${held.dataset.mountedEnd}`);
   } finally { style.remove(); }
 }
 
@@ -4051,6 +4090,73 @@ async function diffFindOwnershipRegression() {
 function diffFindRowOffset(viewport) {
   const row = viewport.querySelector('[data-find-match="true"]');
   return row ? row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - diffRowsHeight(viewport) / 3 : Number.NaN;
+}
+
+// Records what moves a diff viewport, by animation frame: each script write to
+// scrollTop and its writer, each scroll event and whether a script write
+// explains it, each resize delivery, and each committed window or Find mark
+// with the Find row's offset. A failing diff assertion appends the record.
+const fixtureNativeFrame = window.requestAnimationFrame.bind(window);
+function traceDiffViewport(viewport) {
+  const entries = [];
+  const writes = [];
+  const unexplained = [];
+  let frameIndex = 0;
+  let firstMarked = null;
+  let frameRequest = fixtureNativeFrame(function tick() { frameIndex += 1; frameRequest = fixtureNativeFrame(tick); });
+  const native = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop");
+  const top = () => native.get.call(viewport);
+  const record = (kind, detail) => {
+    entries.push(`f${frameIndex} ${kind} ${detail}${document.visibilityState === "visible" ? "" : " [page hidden]"}`);
+    if (entries.length > 60) entries.shift();
+  };
+  const owned = !Object.hasOwn(viewport, "scrollTop");
+  if (owned) Object.defineProperty(viewport, "scrollTop", { configurable: true, get: top, set(value) {
+    const before = top();
+    native.set.call(viewport, value);
+    const writer = new Error("trace").stack.split("\n").slice(2).map((line) => line.trim().match(/^at (?:async )?([\w$.]+)/)?.[1]).find(Boolean) ?? "unknown";
+    writes.push(top());
+    record("write", `${writer} ${before}->${top()} (set ${value})`);
+  } });
+  const onScroll = (event) => {
+    const explained = !event.isTrusted || writes.includes(top());
+    if (!explained) unexplained.push(top());
+    record("scroll", `${top()}${event.isTrusted ? "" : " synthetic"}${explained ? "" : " WITHOUT A SCRIPT WRITE"}`);
+  };
+  viewport.addEventListener("scroll", onScroll, true);
+  const resize = new ResizeObserver(() => record("resize", `box=${viewport.offsetHeight} client=${viewport.clientHeight}`));
+  resize.observe(viewport);
+  const commits = new MutationObserver(() => {
+    const marked = Boolean(viewport.querySelector('[data-find-match="true"]'));
+    const offset = diffFindRowOffset(viewport);
+    if (marked && firstMarked == null) firstMarked = offset;
+    record("commit", `first=${viewport.dataset.firstLine} mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd} top=${top()} row=${marked ? offset.toFixed(2) : "unmounted"}`);
+  });
+  commits.observe(viewport, { attributes: true, childList: true, subtree: true, attributeFilter: ["data-first-line", "data-mounted-start", "data-mounted-end", "data-find-match"] });
+  return {
+    firstMarkedOffset: () => firstMarked,
+    unexplained: () => unexplained,
+    text: () => entries.join(" | "),
+    stop() {
+      window.cancelAnimationFrame(frameRequest);
+      viewport.removeEventListener("scroll", onScroll, true);
+      resize.disconnect();
+      commits.disconnect();
+      if (owned) delete viewport.scrollTop;
+    },
+  };
+}
+async function withDiffTrace(viewport, run) {
+  const trace = traceDiffViewport(viewport);
+  try { return await run(trace); }
+  catch (error) { throw new Error(`${error.message}; trace: ${trace.text()}`, { cause: error }); }
+  finally { trace.stop(); }
+}
+// Find is ready when the viewport itself is at the match's target, not
+// merely when the match row is mounted.
+function diffFindLanded(viewport, text, line) {
+  return viewport.querySelector('[data-find-match="true"]')?.textContent.includes(text)
+    && Math.abs(viewport.scrollTop - diffFindTop(viewport, line)) <= 1;
 }
 
 async function diffScrollbarFeedbackRegression() {
@@ -4073,33 +4179,41 @@ async function diffScrollbarFeedbackRegression() {
     root.render(null); await settle();
     root.render(<div className="pane-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>);
     await until(() => host.querySelector(".diff-view")?.textContent.includes("line 0"), `diff with a long row at ${long} ready`);
-    const viewport = host.querySelector(".diff-view");
-    const find = host.querySelector('input[aria-label="Find in diff"]');
-    setControlValue(find, "line 2500");
-    find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("line 2500"), `Find with a long row at ${long}`);
-    return viewport;
+    return host.querySelector(".diff-view");
+  };
+  const find = async (viewport, trace, label) => {
+    const input = host.querySelector('input[aria-label="Find in diff"]');
+    setControlValue(input, "line 2500");
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await until(() => diffFindLanded(viewport, "line 2500", 2500), `${label}: Find landed`);
+    assert(Math.abs(trace.firstMarkedOffset()) < 2, `${label}: the first commit that showed the Find row placed it ${trace.firstMarkedOffset()}px from its target`);
+    assert(!trace.unexplained().length, `${label}: the browser moved the diff to ${trace.unexplained().join(", ")} without a script write while Find owned it`);
   };
   try {
     for (const size of [15, 17]) {
       style.textContent = `.diff-view::-webkit-scrollbar { width: ${size}px; height: ${size}px; } .diff-view::-webkit-scrollbar-thumb { background: #888; }`;
       const plain = await render(-1); // NOSONAR S9382: each case starts from a fresh viewport
+      await withDiffTrace(plain, (trace) => find(plain, trace, `${size}px scrollbars, reference window`)); // NOSONAR S9382: each case starts from a fresh viewport
       for (let index = 0; index < 4; index += 1) await frame(); // NOSONAR S9382: the plain window is the reference for the edge cases
       const start = Number(plain.dataset.mountedStart);
       const end = Number(plain.dataset.mountedEnd);
       for (const long of [-1, start - 2, start - 1, start, start + 1, end - 2, end - 1, end, end + 1]) {
         const viewport = await render(long); // NOSONAR S9382: each case starts from a fresh viewport
         const label = `${size}px scrollbars, long row at ${long}`;
-        const place = () => `${viewport.scrollTop}:${viewport.clientHeight}:${viewport.dataset.mountedStart}:${viewport.dataset.mountedEnd}`;
-        const settled = place();
-        for (let index = 0; index <= 20; index += 1) {
-          assert(place() === settled, `${label}: the diff window moved ${index} frames after Find committed: ${settled} -> ${place()}`);
-          assert(Math.abs(diffFindRowOffset(viewport)) < 2, `${label}: the Find row was ${diffFindRowOffset(viewport)}px from its target ${index} frames after Find committed`);
-          if (index < 20) await frame(); // NOSONAR S9382: one sample per frame
-        }
-        const row = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
-        const frameTop = viewport.getBoundingClientRect().top;
-        assert(row.top >= frameTop && row.bottom <= frameTop + viewport.clientHeight, `${label}: the Find match was outside the diff viewport`);
+        await withDiffTrace(viewport, async (trace) => { // NOSONAR S9382: each case starts from a fresh viewport
+          await find(viewport, trace, label);
+          const place = () => `${viewport.scrollTop}:${viewport.clientHeight}:${viewport.dataset.mountedStart}:${viewport.dataset.mountedEnd}`;
+          const settled = place();
+          for (let index = 0; index <= 20; index += 1) {
+            assert(place() === settled, `${label}: the diff window moved ${index} frames after Find landed: ${settled} -> ${place()}`);
+            assert(Math.abs(diffFindRowOffset(viewport)) < 2, `${label}: the Find row was ${diffFindRowOffset(viewport)}px from its target ${index} frames after Find landed`);
+            if (index < 20) await frame(); // NOSONAR S9382: one sample per frame
+          }
+          assert(!trace.unexplained().length, `${label}: the browser moved the diff to ${trace.unexplained().join(", ")} without a script write while Find owned it`);
+          const row = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+          const frameTop = viewport.getBoundingClientRect().top;
+          assert(row.top >= frameTop && row.bottom <= frameTop + viewport.clientHeight, `${label}: the Find match was outside the diff viewport`);
+        });
       }
     }
   } finally { style.remove(); }
@@ -4116,10 +4230,12 @@ async function diffFindResizeRegression() {
   const diff = Array.from({ length: 5_000 }, (_, index) => `-unstaged ${index}\n`).join("");
   const nativeFrame = window.requestAnimationFrame;
   let probe;
+  let trace;
   try {
     root.render(<div className="pane-body" style={{ width: 448, height: 600 }}><WindowedDiff diff={diff} label="Resized diff" /></div>);
     await until(() => host.querySelector(".diff-view")?.textContent.includes("unstaged 0"), "resizable diff ready");
     const viewport = host.querySelector(".diff-view");
+    trace = traceDiffViewport(viewport);
     const find = host.querySelector('input[aria-label="Find in diff"]');
     setControlValue(find, "unstaged 31");
     const steps = [
@@ -4157,7 +4273,8 @@ async function diffFindResizeRegression() {
         assert(Math.abs(diffFindRowOffset(viewport)) < 2, `A resize to ${width}x${height} moved the Find match ${diffFindRowOffset(viewport)}px from its target ${index + 1} frames later`);
       }
     }
-  } finally { window.requestAnimationFrame = nativeFrame; probe?.disconnect(); style.remove(); }
+  } catch (error) { throw new Error(`${error.message}; trace: ${trace?.text()}`, { cause: error }); }
+  finally { window.requestAnimationFrame = nativeFrame; probe?.disconnect(); trace?.stop(); style.remove(); }
 }
 
 async function changesMutationOwnerRegression(reject = false, mode = "stage") {
@@ -4550,6 +4667,9 @@ async function largeDiffWindowRegression() {
 // queued long after the seek settled, as a native End can be on a slow host,
 // must bring the match back and keep it there, with bounded commits a frame.
 async function assertFindKeepsOwnership(viewport, text, label) {
+  await withDiffTrace(viewport, () => findKeepsOwnership(viewport, text, label));
+}
+async function findKeepsOwnership(viewport, text, label) {
   const matchShown = () => {
     const mark = viewport.querySelector('[data-find-match="true"]');
     if (!mark?.textContent.includes(text)) return false;
@@ -6601,6 +6721,31 @@ async function spaceSidebarRegression() {
 }
 
 function paneRect(view) { return host.querySelector(`#pane-${view}`)?.getBoundingClientRect(); }
+// What decides how many panes show, for a failing pane assertion: the
+// layout's own props and measured stage, each pane's concealment, the
+// viewport, focus and the page's visibility.
+function describePaneState() {
+  const element = host.querySelector(".pane-layout");
+  const fiberKey = element && Object.keys(element).find((key) => key.startsWith("__reactFiber$"));
+  // The node keeps the fiber that last updated it; its alternate may be the
+  // committed one. The committed host fiber's props match the DOM.
+  let fiber = fiberKey ? element[fiberKey] : null;
+  if (fiber?.alternate?.memoizedProps?.className === element.className) fiber = fiber.alternate;
+  while (fiber && fiber.type?.name !== "PaneLayout") fiber = fiber.return;
+  const props = fiber?.memoizedProps;
+  const stage = element?.getBoundingClientRect();
+  const active = document.activeElement;
+  return JSON.stringify({
+    compactPreferred: props?.compactPreferred, focused: props?.layout.focused, root: props?.layout.root,
+    stage: stage && [stage.width, stage.height], fits: props && stage ? computePaneRects(props.layout.root, Math.floor(stage.width), Math.floor(stage.height)).fits : null,
+    compactClass: element?.classList.contains("is-compact"), layouts: document.querySelectorAll(".pane-layout").length,
+    tabs: [...host.querySelectorAll('[role="tab"][data-pane-view]')].map((tab) => `${tab.dataset.paneView}:${tab.getAttribute("aria-selected")}`),
+    panes: [...host.querySelectorAll(".pane-stage > .pane")].map((pane) => ({ id: pane.id, inert: pane.inert, className: pane.className, visibility: getComputedStyle(pane).visibility, rect: pane.getBoundingClientRect().toJSON() })),
+    conversationPanes: document.querySelectorAll("#pane-conversation").length,
+    innerWidth: window.innerWidth, innerHeight: window.innerHeight, narrow: window.matchMedia("(max-width: 760px)").matches, page: document.visibilityState,
+    active: active === document.body ? "body" : `${active?.tagName.toLowerCase()}#${active?.id}.${active?.className}`,
+  });
+}
 // A control is usable when it lies inside its pane and is what a click at its centre reaches.
 function assertReachableInPane(element, view, label) {
   const rect = element?.getBoundingClientRect();
@@ -6609,7 +6754,10 @@ function assertReachableInPane(element, view, label) {
     `${label} is clipped by its ${view} pane: ${JSON.stringify([rect?.toJSON(), pane.toJSON()])}`);
   assert(element.scrollWidth <= element.clientWidth + 1, `${label} clips its text: ${element.scrollWidth} > ${element.clientWidth}`);
   const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-  assert(element.contains(hit), `${label} is covered by ${hit?.outerHTML.slice(0, 120)}`);
+  if (element.contains(hit)) return;
+  const style = getComputedStyle(element);
+  const stack = document.elementsFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2).slice(0, 4).map((item) => `${item.tagName.toLowerCase()}.${item.className}`);
+  throw new Error(`${label} is covered by ${hit?.outerHTML.slice(0, 120)}; at its centre: ${stack.join(" > ")}; rect=${JSON.stringify(rect.toJSON())}; visibility=${style.visibility}; pointer-events=${style.pointerEvents}; opacity=${style.opacity}; transform=${style.transform}; panes=${describePaneState()}`);
 }
 // Split panes tile the stage: no two overlap and none leaves it, on the
 // settled commit and on each of the next frames.
@@ -6998,7 +7146,21 @@ async function paneNoticeMinimumRegression() {
   const saveMinimumLayout = () => localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { "/fixture/A": { savedAt: 1, layout: { version: 1, focused: "conversation", root: {
     type: "split", axis: "row", ratio: 0.05, first: leaf("conversation"), second: { type: "split", axis: "row", ratio: 0.95, first: leaf("context"), second: leaf("changes") },
   } } } } }));
-  const reachable = assertReachableInPane;
+  // Each switch between split and one-at-a-time panes, with the stage size,
+  // so a failing reachability check shows whether a pane was concealed.
+  const modes = [];
+  const recordModes = new MutationObserver((records) => {
+    for (const { target } of records) {
+      if (!target.classList.contains("pane-layout")) continue;
+      const stage = target.getBoundingClientRect();
+      modes.push(`${target.classList.contains("is-compact") ? "compact" : "split"} ${stage.width}x${stage.height} at ${Math.round(performance.now())}ms`);
+    }
+  });
+  recordModes.observe(host, { attributes: true, subtree: true, attributeFilter: ["class"] });
+  const reachable = (element, view, label) => {
+    try { assertReachableInPane(element, view, label); }
+    catch (error) { throw new Error(`${error.message}; layout modes: ${modes.join(", ") || "none"}; now ${Math.round(performance.now())}ms`, { cause: error }); }
+  };
   try {
     await window.__fixtureSetViewport(1280);
     await until(() => window.innerWidth === 1280, "wide notice viewport");
@@ -7040,6 +7202,7 @@ async function paneNoticeMinimumRegression() {
     assert(notice.getBoundingClientRect().width >= 260, `The unsent prompt notice is ${notice.getBoundingClientRect().width}px wide`);
     for (const button of notice.querySelectorAll("button")) reachable(button, "conversation", button.textContent.trim());
   } finally {
+    recordModes.disconnect();
     root.render(null);
     await settle();
   }
@@ -7617,7 +7780,7 @@ async function responsiveFocusRegression() {
     await until(() => document.activeElement === host.querySelector("#pane-terminal"), "narrow terminal pane focus");
     const conversationPane = host.querySelector("#pane-conversation");
     const terminalPane = host.querySelector("#pane-terminal");
-    assert(conversationPane.inert && getComputedStyle(conversationPane).visibility === "hidden", "The narrow layout showed two panes at once");
+    assert(conversationPane.inert && getComputedStyle(conversationPane).visibility === "hidden", `The narrow layout showed two panes at once: ${describePaneState()}`);
     const terminalRect = terminalPane.getBoundingClientRect();
     assert(terminalRect.left >= -1 && terminalRect.right <= window.innerWidth + 1 && terminalRect.width >= window.innerWidth - 2,
       `The narrow terminal pane does not use the viewport width: ${JSON.stringify(terminalRect.toJSON())}`);
