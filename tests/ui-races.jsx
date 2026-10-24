@@ -11,6 +11,7 @@ import { CommandPalette } from "../src/components/CommandPalette.jsx";
 import { SettingsDialog } from "../src/components/SettingsDialog.jsx";
 import { ProviderAccounts } from "../src/components/ProviderAccounts.jsx";
 import { TerminalPane } from "../src/components/TerminalPane.jsx";
+import { PaneLayout } from "../src/components/PaneLayout.jsx";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
 import { scheduleLayoutTick } from "../src/lib/windowing.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
@@ -4021,6 +4022,52 @@ async function diffRefreshAnchorRegression() {
   assert(viewport.textContent.includes("LINE 2500") && Math.abs(viewport.scrollTop - anchor) < 24, "Failed same-selection refresh erased the last valid diff");
 }
 
+async function diffScrollbarFeedbackRegression() {
+  root.render(null); await settle();
+  // Classic scrollbars (CI on macOS and Windows) take layout space. A long row
+  // mounted at the window edge then shows a horizontal scrollbar that changes
+  // the viewport height, which changes the mounted rows in turn.
+  const style = document.createElement("style");
+  style.textContent = ".diff-view::-webkit-scrollbar { width: 15px; height: 15px; } .diff-view::-webkit-scrollbar-thumb { background: #888; }";
+  document.head.append(style);
+  let diff = "";
+  route = async (url) => {
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [{ path: "large.txt", status: "MM", index: "M", worktree: "M" }], stagedCount: 1 });
+    if (url.pathname === "/api/git/diff") return response({ diff });
+    return response({});
+  };
+  const render = async (long) => {
+    diff = Array.from({ length: 5_000 }, (_, index) => index === long ? `+${"x".repeat(400)}\n` : `+line ${index}\n`).join("");
+    root.render(null); await settle();
+    root.render(<div className="pane-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>);
+    await until(() => host.querySelector(".diff-view")?.textContent.includes("line 0"), `diff with a long row at ${long} ready`);
+    const viewport = host.querySelector(".diff-view");
+    const find = host.querySelector('input[aria-label="Find in diff"]');
+    setControlValue(find, "line 2500");
+    find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("line 2500"), `Find with a long row at ${long}`);
+    for (let index = 0; index < 14; index += 1) await frame();
+    return viewport;
+  };
+  try {
+    const plain = await render(-1);
+    const start = Number(plain.dataset.mountedStart);
+    const end = Number(plain.dataset.mountedEnd);
+    for (const long of [start - 2, start - 1, start, start + 1, end - 2, end - 1, end, end + 1]) {
+      const viewport = await render(long);
+      const place = () => `${viewport.scrollTop}:${viewport.clientHeight}:${viewport.dataset.mountedStart}:${viewport.dataset.mountedEnd}`;
+      const settled = place();
+      for (let index = 0; index < 6; index += 1) {
+        await frame();
+        assert(place() === settled, `A long row at ${long} kept moving the diff window after Find: ${settled} -> ${place()}`);
+      }
+      const row = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+      const frameTop = viewport.getBoundingClientRect().top;
+      assert(row.top >= frameTop && row.bottom <= frameTop + viewport.clientHeight, `A long row at ${long} left the Find match outside the diff viewport`);
+    }
+  } finally { style.remove(); }
+}
+
 async function changesMutationOwnerRegression(reject = false, mode = "stage") {
   root.render(null); await settle();
   const pending = deferred();
@@ -6632,7 +6679,7 @@ async function splitPaneLayoutRegression() {
     // A saved layout with an unknown view, a duplicate and a bad size is repaired.
     root.render(null);
     await settle();
-    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { A: { savedAt: 1, layout: { version: 1, focused: "browser", root: {
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { "/fixture/A": { savedAt: 1, layout: { version: 1, focused: "browser", root: {
       type: "split", axis: "row", ratio: "wide", first: { type: "pane", view: "terminal" },
       second: { type: "split", axis: "column", ratio: 0.5, first: { type: "pane", view: "browser" }, second: { type: "pane", view: "terminal" } },
     } } } } }));
@@ -6640,7 +6687,7 @@ async function splitPaneLayoutRegression() {
     await until(() => terminalReady("Terminal A"), "repaired layout");
     assert(paneOrder() === "conversation,terminal", `Repair kept invalid panes: ${paneOrder()}`);
     await until(() => host.querySelector(".toast")?.textContent.includes("panes that could not be restored were left out"), "repair notice");
-    assert(JSON.parse(localStorage.getItem(LAYOUT_KEY)).worktrees.A.layout.root.first.view === "terminal", "Restoring rewrote the saved layout before a change");
+    assert(JSON.parse(localStorage.getItem(LAYOUT_KEY)).worktrees["/fixture/A"].layout.root.first.view === "terminal", "Restoring rewrote the saved layout before a change");
 
     root.render(null);
     await settle();
@@ -6686,7 +6733,7 @@ async function paneMinimumContentRegression() {
     if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
     return response({});
   };
-  const saved = (focused, layout) => localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { A: { savedAt: 1, layout: { version: 1, focused, root: layout } } } }));
+  const saved = (focused, layout) => localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { "/fixture/A": { savedAt: 1, layout: { version: 1, focused, root: layout } } } }));
   const leaf = (view) => ({ type: "pane", view });
   const inside = (element, view, label) => {
     const rect = element?.getBoundingClientRect();
@@ -6792,7 +6839,7 @@ async function paneNoticeMinimumRegression() {
     return response({});
   };
   const leaf = (view) => ({ type: "pane", view });
-  const saveMinimumLayout = () => localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { A: { savedAt: 1, layout: { version: 1, focused: "conversation", root: {
+  const saveMinimumLayout = () => localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { "/fixture/A": { savedAt: 1, layout: { version: 1, focused: "conversation", root: {
     type: "split", axis: "row", ratio: 0.05, first: leaf("conversation"), second: { type: "split", axis: "row", ratio: 0.95, first: leaf("context"), second: leaf("changes") },
   } } } } }));
   const reachable = assertReachableInPane;
@@ -6877,7 +6924,7 @@ async function paneNoticeShortRegression() {
   const render = async () => {
     root.render(null);
     await settle();
-    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { A: { savedAt: 1, layout: { version: 1, focused: "conversation", root: {
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { "/fixture/A": { savedAt: 1, layout: { version: 1, focused: "conversation", root: {
       type: "split", axis: "row", ratio: 0.05, first: { type: "split", axis: "column", ratio: 0.05, first: leaf("conversation"), second: leaf("context") }, second: leaf("changes"),
     } } } } }));
     root.render(<TooltipProvider><App /></TooltipProvider>);
@@ -6973,6 +7020,108 @@ async function paneNoticeShortRegression() {
 // opening a pane while the pointer is down cancels it without saving. Focus
 // on a separator or pane tab that a responsive change removes moves to the
 // shown pane, and the layout menu's F6 hint is a description, not menu content.
+// Four pane tabs overflow a phone-width strip. Keyboard selection reveals the
+// chosen tab by scrolling the strip only, never the workspace around it.
+async function compactPaneTabVisibilityRegression() {
+  root.render(null);
+  await settle();
+  const pane = (view) => ({ type: "pane", view });
+  const four = { version: 1, focused: "conversation", root: { type: "split", axis: "row", ratio: 0.5, first: pane("conversation"),
+    second: { type: "split", axis: "row", ratio: 0.5, first: pane("changes"), second: { type: "split", axis: "row", ratio: 0.5, first: pane("terminal"), second: pane("context") } } } };
+  const views = Object.fromEntries(["conversation", "changes", "terminal", "context"].map((view) => [view, <div>{view}</div>]));
+  function Harness({ width }) {
+    const [layout, setLayout] = React.useState(four);
+    return <div className="fixture-workspace" style={{ width, height: 480, overflow: "hidden" }}><div style={{ width, height: 480, display: "grid" }}><PaneLayout layout={layout} onChange={setLayout} compactPreferred views={views} /></div></div>;
+  }
+  for (const width of [320, 360]) {
+    root.render(<Harness width={width} />);
+    await until(() => host.querySelectorAll('.pane-switcher [role="tab"]').length === 4, `four pane tabs at ${width}px`);
+    const workspace = host.querySelector(".fixture-workspace");
+    const list = host.querySelector('.pane-switcher [role="tablist"]');
+    assert(list.scrollWidth > list.clientWidth, `The pane tabs fit at ${width}px, so nothing is clipped`);
+    const expectShown = async (view, label) => {
+      const tab = host.querySelector(`#pane-tab-${view}`);
+      await until(() => document.activeElement === tab && tab.getAttribute("aria-selected") === "true", `${label} selects ${view} at ${width}px`);
+      await settle();
+      const strip = list.getBoundingClientRect();
+      const shown = tab.getBoundingClientRect();
+      assert(shown.left >= strip.left - 1 && shown.right <= strip.right + 1, `${label} left the ${view} tab clipped at ${width}px: ${shown.left}-${shown.right} in ${strip.left}-${strip.right}`);
+      assert(workspace.scrollLeft === 0 && workspace.scrollTop === 0 && window.scrollX === 0, `${label} scrolled the workspace at ${width}px`);
+    };
+    host.querySelector("#pane-tab-conversation").focus();
+    pressKey(document.activeElement, "End");
+    await expectShown("context", "End");
+    pressKey(document.activeElement, "Home");
+    await expectShown("conversation", "Home");
+    pressKey(document.activeElement, "ArrowLeft");
+    await expectShown("context", "ArrowLeft wrapping");
+    pressKey(document.activeElement, "ArrowRight");
+    await expectShown("conversation", "ArrowRight wrapping");
+    for (const view of ["changes", "terminal", "context"]) {
+      pressKey(document.activeElement, "ArrowRight");
+      await expectShown(view, "ArrowRight");
+    }
+    list.scrollLeft = 0;
+    pressKey(document.activeElement, "ArrowLeft");
+    await expectShown("terminal", "ArrowLeft from a scrolled strip");
+    list.scrollLeft = list.scrollWidth;
+    pressKey(document.activeElement, "Home");
+    await expectShown("conversation", "Home from a scrolled strip");
+  }
+  root.render(null);
+  await settle();
+}
+
+// Worktree ids are lossy slugs of their paths, so two worktrees can share
+// one. Each keeps its own pane layout, saved under its path.
+async function paneLayoutOwnerRegression() {
+  root.render(null);
+  await settle();
+  const shared = projects.map((project) => ({ ...project, worktrees: [{ ...project.worktrees[0], id: "shared" }] }));
+  const sharedChats = Object.fromEntries(Object.entries(chats).map(([id, chat]) => [id, { ...chat, worktreeId: "shared" }]));
+  keys.forEach((key, index) => localStorage.setItem(key, ["A", "shared", "chat-A"][index]));
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: shared, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [sharedChats[url.searchParams.get("projectId")] ?? sharedChats.A] });
+    const match = url.pathname.match(/^\/api\/conversations\/chat-([AB])$/);
+    if (match) return response(sharedChats[match[1]]);
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [], stagedCount: 0 });
+    if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    return response({});
+  };
+  const split = { version: 1, focused: "conversation", root: { type: "split", axis: "row", ratio: 0.5, first: { type: "pane", view: "conversation" }, second: { type: "pane", view: "changes" } } };
+  localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { "/fixture/A": { savedAt: 1, layout: split } } }));
+  const saved = () => JSON.parse(localStorage.getItem(LAYOUT_KEY)).worktrees;
+  const choose = async (name) => {
+    host.querySelector(`[aria-label="Expand Review ${name}"]`)?.click();
+    await until(() => [...host.querySelectorAll(".worktree-row")].some((row) => row.querySelector("strong")?.textContent === name), `worktree ${name} row`);
+    [...host.querySelectorAll(".worktree-row")].find((row) => row.querySelector("strong")?.textContent === name).click();
+    await until(() => host.querySelector(`textarea[placeholder*="in ${name}"]`), `worktree ${name} selected`);
+    await settle();
+  };
+  try {
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('textarea[placeholder*="in A"]') && host.querySelector("#pane-changes"), "worktree A restores its split");
+    await choose("B");
+    assert(!host.querySelector("#pane-changes") && !host.querySelector(".pane-header"), "Worktree B, which shares A's id, showed A's layout");
+    host.querySelector('[aria-label="Project context"]').click();
+    await until(() => host.querySelector("#pane-context") && saved()["/fixture/B"], "worktree B saves its own layout");
+    assert(JSON.stringify(saved()["/fixture/A"].layout) === JSON.stringify(split), "Saving B's layout overwrote A's");
+    assert(!saved().shared, "A layout was saved under the shared worktree id");
+    await choose("A");
+    await until(() => host.querySelector("#pane-changes") && !host.querySelector("#pane-context"), "worktree A keeps its own split after B changed");
+    root.render(null);
+    await settle();
+    localStorage.setItem(keys[0], "B");
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('textarea[placeholder*="in B"]') && host.querySelector("#pane-context"), "worktree B restores its own layout after a reload");
+    assert(!host.querySelector("#pane-changes"), "A reload gave worktree B the layout of A");
+  } finally {
+    root.render(null);
+    await settle();
+  }
+}
+
 async function paneLayoutReplacementRegression() {
   if (!window.__fixtureSetViewport) return false;
   root.render(null);
@@ -6988,8 +7137,8 @@ async function paneLayoutReplacementRegression() {
     return response({});
   };
   const split = (ratio) => ({ version: 1, focused: "conversation", root: { type: "split", axis: "row", ratio, first: { type: "pane", view: "conversation" }, second: { type: "pane", view: "changes" } } });
-  localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { A: { savedAt: 2, layout: split(0.5) }, B: { savedAt: 1, layout: split(0.6) } } }));
-  const savedLayout = (id) => JSON.parse(localStorage.getItem(LAYOUT_KEY)).worktrees[id].layout;
+  localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { "/fixture/A": { savedAt: 2, layout: split(0.5) }, "/fixture/B": { savedAt: 1, layout: split(0.6) } } }));
+  const savedLayout = (id) => JSON.parse(localStorage.getItem(LAYOUT_KEY)).worktrees[`/fixture/${id}`].layout;
   const setWidth = async (width) => {
     await window.__fixtureSetViewport(width);
     await until(() => window.innerWidth === width, `real ${width}px layout`);
@@ -7046,7 +7195,7 @@ async function paneLayoutReplacementRegression() {
     const rects = ["conversation", "context", "changes"].map((view) => JSON.stringify(paneRect(view).toJSON()));
     pointer(before.isConnected ? before : separator(), "pointerup", beforeX - 160);
     await settle();
-    assert(layoutWrites.length === 1 && JSON.stringify(savedLayout("B")) === JSON.stringify(JSON.parse(opened).worktrees.B.layout),
+    assert(layoutWrites.length === 1 && JSON.stringify(savedLayout("B")) === JSON.stringify(JSON.parse(opened).worktrees["/fixture/B"].layout),
       `Releasing a drag after a pane opened changed the new layout: ${layoutWrites.slice(1).join(" | ")}`);
     assert(["conversation", "context", "changes"].every((view, index) => JSON.stringify(paneRect(view).toJSON()) === rects[index]), "Releasing a drag after a pane opened resized the new layout");
 
@@ -7081,6 +7230,26 @@ async function paneLayoutReplacementRegression() {
     await setWidth(1280);
     await until(() => !host.querySelector(".pane-switcher") && separator(), "split panes again from an options button");
     await until(() => document.activeElement === host.querySelector(`#pane-${viewBefore}`), `focus on a removed pane tab options button moves to the ${viewBefore} pane instead of ${document.activeElement?.outerHTML.slice(0, 80)}`);
+    // An item in an open options menu is layout chrome too, though the menu
+    // is portaled outside the layout.
+    const focusMenuItem = async (trigger, label) => {
+      trigger.click();
+      const menuItem = () => document.querySelector('[role="menu"] [role="menuitem"]:not([data-disabled])');
+      await until(menuItem, `${label} menu open`);
+      const item = menuItem();
+      item.focus();
+      assert(document.activeElement === item, `The ${label} menu item did not take focus`);
+    };
+    await focusMenuItem(host.querySelector(`#pane-${viewBefore} .pane-header [aria-label$=" pane options"]`), "split options");
+    await setWidth(640);
+    await until(() => host.querySelector(".pane-switcher") && !document.querySelector('[role="menu"]'), "panes one at a time from an open menu");
+    await until(() => document.activeElement === host.querySelector(`#pane-${viewBefore}`), `focus in a removed split options menu moves to the ${viewBefore} pane instead of ${document.activeElement?.outerHTML.slice(0, 80)}`);
+    await focusMenuItem(host.querySelector('.pane-switcher [aria-label$=" pane options"]'), "pane tab options");
+    await setWidth(1280);
+    await until(() => !host.querySelector(".pane-switcher") && !document.querySelector('[role="menu"]'), "split panes again from an open menu");
+    await until(() => document.activeElement === host.querySelector(`#pane-${viewBefore}`), `focus in a removed pane tab options menu moves to the ${viewBefore} pane instead of ${document.activeElement?.outerHTML.slice(0, 80)}`);
+    for (let index = 0; index < 10; index += 1) await frame();
+    assert(document.activeElement === host.querySelector(`#pane-${viewBefore}`), `A closing options menu took focus back from the ${viewBefore} pane: ${document.activeElement?.outerHTML.slice(0, 80)}`);
   } finally {
     Storage.prototype.setItem = setItem;
     root.render(null);
@@ -7097,10 +7266,19 @@ async function paneDragChatTabRegression() {
   keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
   const second = { ...chats.A, id: "chat-A2", title: "Conversation A2" };
   const patches = [];
+  // The server keeps each tab's last saved position; listed chats follow it.
+  const positions = { "chat-A": 0, "chat-A2": 1 };
+  let failing = new Set();
   route = async (url, options = {}) => {
-    if (options.method === "PATCH") { patches.push(url.pathname); return response({}); }
+    if (options.method === "PATCH") {
+      patches.push(url.pathname);
+      const id = url.pathname.split("/").at(-1);
+      if (failing.has(id)) return response({ error: `Tab order for ${id} offline` }, 500);
+      positions[id] = JSON.parse(options.body).tabPosition;
+      return response({});
+    }
     if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
-    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A, second] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A, second].sort((a, b) => positions[a.id] - positions[b.id]).map((item) => ({ ...item, tabPosition: positions[item.id] })) });
     if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
     if (url.pathname === "/api/conversations/chat-A2") return response(second);
     if (url.pathname === "/api/git/status") return response({ branch: "main", files: [], stagedCount: 0 });
@@ -7139,6 +7317,35 @@ async function paneDragChatTabRegression() {
     await settle();
     assert(tabOrder() === "chat-A2,chat-A" && patches.length === 2, `A pane title drop reordered chats: ${tabOrder()} after ${JSON.stringify(patches)}`);
     assert(paneOrder() === "conversation,changes", `A pane title dropped on a chat tab moved panes: ${paneOrder()}`);
+
+    // A rejected reorder is reported and the tabs return to the saved order.
+    const reorder = async (source, target) => {
+      const transfer = new DataTransfer();
+      drag("dragstart", tab(source), transfer);
+      drag("dragover", tab(target), transfer);
+      drag("drop", tab(target), transfer);
+      drag("dragend", tab(source), transfer);
+    };
+    const rejected = [];
+    const recordRejection = (event) => rejected.push(String(event.reason?.message ?? event.reason));
+    window.addEventListener("unhandledrejection", recordRejection);
+    try {
+      failing = new Set(["chat-A", "chat-A2"]);
+      await reorder("chat-A", "chat-A2");
+      await until(() => host.querySelector(".error-toast")?.textContent.includes("offline"), "rejected chat reorder reported");
+      await until(() => tabOrder() === "chat-A2,chat-A", `rejected chat reorder returns to the saved order instead of ${tabOrder()}`);
+      host.querySelector('[aria-label="Dismiss error"]').click();
+      // One position saved and one refused: the tabs show what the server kept.
+      failing = new Set(["chat-A2"]);
+      await reorder("chat-A", "chat-A2");
+      await until(() => host.querySelector(".error-toast")?.textContent.includes("chat-A2 offline"), "partly saved chat reorder reported");
+      await until(() => positions["chat-A"] === 0 && tabOrder() === "chat-A,chat-A2", `partly saved chat reorder shows the server order instead of ${tabOrder()}`);
+      await settle();
+      assert(!rejected.length, `A chat reorder left an unhandled rejection: ${rejected.join("; ")}`);
+    } finally {
+      window.removeEventListener("unhandledrejection", recordRejection);
+      failing = new Set();
+    }
   } finally {
     root.render(null);
     await settle();
@@ -7744,6 +7951,7 @@ try {
     ["changes refresh selection", changesSelectionRefreshRegression, "pending refreshes preserve current file and mode and retained events refresh once"],
     ["changes diff failure ownership", changesDiffFailureOwnershipRegression, "pending and failed file or mode requests never display a previous diff"],
     ["diff refresh anchor", diffRefreshAnchorRegression, "same-selection refresh keeps the visible diff line and find through success and failure"],
+    ["diff scrollbar feedback", diffScrollbarFeedbackRegression, "a horizontal scrollbar from a long row at the diff window edge settles Find instead of looping"],
     ["changes mutation owner success", () => changesMutationOwnerRegression(false), "late stage completion cannot refresh another worktree"],
     ["changes mutation owner failure", () => changesMutationOwnerRegression(true), "late stage failure cannot report in another worktree"],
     ["changes unstage owner failure", () => changesMutationOwnerRegression(true, "unstage"), "late unstage failure cannot report in another worktree"],
@@ -7792,6 +8000,8 @@ try {
     ["pane minimum content", paneMinimumContentRegression, "every view keeps usable content at its minimum pane size, including restored layouts", "minimum pane geometry requires the CDP viewport bridge"],
     ["pane notices at minimum", paneNoticeMinimumRegression, "recovery, unsent-prompt and commit controls stay readable and clickable at the pane minimums on a wide window", "minimum pane geometry requires the CDP viewport bridge"],
     ["pane notices at minimum height", paneNoticeShortRegression, "at the conversation's minimum height the transcript keeps message lines while recovery, history, live and unsent-prompt notices stay readable and reachable", "minimum pane geometry requires the CDP viewport bridge"],
+    ["compact pane tab visibility", compactPaneTabVisibilityRegression, "keyboard selection reveals each of four pane tabs in a 320px and 360px strip without scrolling the workspace"],
+    ["pane layout owner", paneLayoutOwnerRegression, "worktrees whose ids collide keep their own pane layouts across switches and a reload"],
     ["pane layout replacement", paneLayoutReplacementRegression, "a separator drag on a replaced layout is discarded unsaved and focus on any removed pane chrome moves to the shown pane", "responsive transition requires the CDP viewport bridge"],
     ["pane drag isolation", paneDragChatTabRegression, "pane title drags never reorder chat tabs, even after an unfinished tab drag"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and one-at-a-time panes contain and restore focus", "responsive transition requires the CDP viewport bridge"],

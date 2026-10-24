@@ -101,7 +101,7 @@ export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === "undefined" || !window.matchMedia("(max-width: 760px)").matches);
   // Each worktree restores its own pane arrangement; views keep the selected
   // worktree, so a pane never shows another worktree's terminal or diff.
-  const [paneState, setPaneState] = useState(() => ({ worktreeId: "", layout: defaultPaneLayout(), problems: [], dirty: false }));
+  const [paneState, setPaneState] = useState(() => ({ owner: "", layout: defaultPaneLayout(), problems: [], dirty: false }));
   const paneLayoutRef = useRef(null);
   const paneSaveWarnedRef = useRef(false);
   const paneStoreWarnedRef = useRef(false);
@@ -318,9 +318,12 @@ export function App() {
 
   const project = bootstrap?.projects.find((item) => item.id === selectedProjectId);
   const worktree = project?.worktrees.find((item) => item.id === selectedWorktreeId);
-  if (worktree && paneState.worktreeId !== worktree.id) {
-    const restored = loadPaneLayout(localStorage, worktree.id);
-    setPaneState({ worktreeId: worktree.id, layout: restored.layout, problems: restored.problems, dirty: false });
+  // A worktree id is a lossy slug of its path, so distinct worktrees can share
+  // one. Layouts belong to the path; entries saved under an id never match a
+  // path and age out of the bounded store.
+  if (worktree && paneState.owner !== worktree.path) {
+    const restored = loadPaneLayout(localStorage, worktree.path);
+    setPaneState({ owner: worktree.path, layout: restored.layout, problems: restored.problems, dirty: false });
   }
   const changePaneLayout = useCallback((next) => {
     setPaneState((current) => current.layout === next ? current : { ...current, layout: next, problems: [], dirty: true });
@@ -334,8 +337,8 @@ export function App() {
     });
   }, []);
   useEffect(() => {
-    if (!paneState.dirty || !paneState.worktreeId) return;
-    if (!savePaneLayout(localStorage, paneState.worktreeId, paneState.layout) && !paneSaveWarnedRef.current) {
+    if (!paneState.dirty || !paneState.owner) return;
+    if (!savePaneLayout(localStorage, paneState.owner, paneState.layout) && !paneSaveWarnedRef.current) {
       paneSaveWarnedRef.current = true;
       setError("Pane layout changes could not be saved in this browser; they will reset when Outright reloads.");
     }
@@ -1893,7 +1896,13 @@ export function App() {
     const [source] = next.splice(sourceIndex, 1);
     next.splice(next.findIndex((item) => item.id === targetId), 0, source);
     stageConversations(next);
-    await Promise.all(next.map((item, index) => api(`/api/conversations/${item.id}`, { method: "PATCH", body: { tabPosition: index } })));
+    // Each tab saves its own position, so a failed write can leave the order
+    // partly saved. Report it and show the order the server kept.
+    const writes = await Promise.allSettled(next.map((item, index) => api(`/api/conversations/${item.id}`, { method: "PATCH", body: { tabPosition: index } })));
+    const failed = writes.find((write) => write.status === "rejected");
+    if (!failed) return;
+    setError(failed.reason?.message || "Chat tab order could not be saved");
+    try { await loadConversations(); } catch (nextError) { setError(nextError.message); }
   }
 
   async function createWorktree(event) {
@@ -1993,7 +2002,7 @@ export function App() {
 
     <main id="main-workspace" className="workspace" inert={isNarrow && sidebarOpen ? true : undefined} aria-hidden={isNarrow && sidebarOpen ? true : undefined}>
       <header className="workspace-bar">{!sidebarOpen && <Button variant="ghost" size="icon-sm" onClick={openSidebar} aria-label="Open projects sidebar" aria-controls="project-sidebar" aria-expanded={sidebarOpen}><SidebarSimple /></Button>}<div className="workspace-context"><span>{project.name}</span><CaretRight /><GitBranch /><strong>{worktree.name}</strong></div><div className="workspace-tools"><RunState run={pendingOutcomeRun ?? activeRun ?? latestRun} outcomePending={outcomePending} /><WorktreeState worktree={worktree} />{paneToggle("changes", "Changes", GitDiff, "Changes")}{paneToggle("terminal", "Terminal", TerminalWindow, "Terminal ⌘⇧T")}{paneToggle("context", "Project context", Info, "Project context")}<DropdownMenu><span id="pane-layout-hint" className="sr-only">F6 moves focus between panes</span><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Pane layout" aria-describedby="pane-layout-hint" />}><Layout /></DropdownMenuTrigger><DropdownMenuContent align="end" className="w-auto min-w-60" aria-describedby="pane-layout-hint"><DropdownMenuGroup><DropdownMenuLabel>Pane layout</DropdownMenuLabel>{PANE_LAYOUT_PRESETS.map((preset) => <DropdownMenuItem key={preset.id} onClick={() => changePaneLayout(applyPreset(paneState.layout, preset.id))}>{preset.label}</DropdownMenuItem>)}</DropdownMenuGroup><DropdownMenuSeparator /><p className="pane-layout-hint" aria-hidden="true">F6 moves focus between panes</p></DropdownMenuContent></DropdownMenu><ThemeMenu theme={theme} onThemeChange={setTheme} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Worktree options" />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, editor: settings.editor } }).then(() => setToast(`Opened in ${settings.editor}`)).catch((nextError) => setError(nextError.message))}><PencilSimple />Open in {settings.editor}</DropdownMenuItem><DropdownMenuItem onClick={() => setWorktreeDialog(project)}><GitBranch />New worktree</DropdownMenuItem>{worktree.isLinked && <><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onClick={() => setRemoveWorktreeOpen(true)}><Trash />Remove worktree</DropdownMenuItem></>}</DropdownMenuContent></DropdownMenu></div></header>
-      <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll" role="tablist" aria-label="Open agent chats" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', (id) => { revealConversationPane(); selectConversation(id); })}>{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={(event) => { dragConversationRef.current = item.id; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData(CHAT_TAB_DRAG_TYPE, item.id); }} onDragEnd={() => { dragConversationRef.current = ""; }} onDragOver={(event) => { if (isChatTabDrag(event)) event.preventDefault(); }} onDrop={(event) => { if (!isChatTabDrag(event)) return; event.preventDefault(); reorderConversation(item.id); }}><button className="tab-select" id={domId("chat-tab", item.id)} data-tab-id={item.id} role="tab" aria-selected={item.id === selectedConversationId} aria-controls="conversation-panel" tabIndex={item.id === selectedConversationId ? 0 : -1} onClick={() => { revealConversationPane(); selectConversation(item.id); }} onDoubleClick={() => { selectConversation(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); archiveChat(item, event.currentTarget); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
+      <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll" role="tablist" aria-label="Open agent chats" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', (id) => { revealConversationPane(); selectConversation(id); })}>{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={(event) => { dragConversationRef.current = item.id; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData(CHAT_TAB_DRAG_TYPE, item.id); }} onDragEnd={() => { dragConversationRef.current = ""; }} onDragOver={(event) => { if (isChatTabDrag(event)) event.preventDefault(); }} onDrop={(event) => { if (!isChatTabDrag(event)) return; event.preventDefault(); void reorderConversation(item.id); }}><button className="tab-select" id={domId("chat-tab", item.id)} data-tab-id={item.id} role="tab" aria-selected={item.id === selectedConversationId} aria-controls="conversation-panel" tabIndex={item.id === selectedConversationId ? 0 : -1} onClick={() => { revealConversationPane(); selectConversation(item.id); }} onDoubleClick={() => { selectConversation(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); void archiveChat(item, event.currentTarget); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
       <PaneLayout ref={paneLayoutRef} className="work-area" layout={paneState.layout} onChange={changePaneLayout} compactPreferred={isNarrow} views={paneViewElements} />
     </main>
 

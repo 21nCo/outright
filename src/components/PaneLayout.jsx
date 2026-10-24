@@ -1,4 +1,4 @@
-import { Component, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
+import { Component, useCallback, useEffect, useId, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChatCircle, Columns, DotsSixVertical, DotsThree, GitDiff, Rows, TerminalWindow, TreeStructure, X } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -45,13 +45,17 @@ class PreserveMovedState extends Component {
 }
 
 // Switching between split and one-at-a-time panes replaces the layout's own
-// chrome: separators, pane headers, the pane tabs and their options buttons.
-// Focus on any of it that the switch drops moves to the shown pane, not the
-// page. Focus inside a view's body is left to the view.
+// chrome: separators, pane headers, the pane tabs, their options buttons and
+// the options menus portaled out of the layout. Focus on any of it that the
+// switch drops moves to the shown pane, not the page. Focus inside a view's
+// body is left to the view.
 class KeepFocusAcrossModes extends Component {
   getSnapshotBeforeUpdate(previous) {
     if (previous.compact === this.props.compact) return null;
     const active = document.activeElement;
+    if (!active) return false;
+    const portaled = active.closest("[data-pane-layout-owner]");
+    if (portaled) return portaled.dataset.paneLayoutOwner === this.props.ownerId;
     return Boolean(this.props.containerRef.current?.contains(active) && !active.closest(".pane-body"));
   }
   componentDidUpdate(_previous, _state, lost) {
@@ -93,6 +97,7 @@ function placement(rect, size) {
 // re-render for each pointer move.
 export function PaneLayout({ ref, layout, onChange, compactPreferred = false, views: viewElements, className = "" }) {
   const containerRef = useRef(null);
+  const ownerId = useId();
   const stageRef = useRef(null);
   const layoutRef = useRef(layout);
   layoutRef.current = layout;
@@ -137,6 +142,19 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
   const geometryRef = useRef(geometry);
   geometryRef.current = geometry;
   const focused = views.includes(layout.focused) ? layout.focused : views[0];
+
+  // The selected pane tab stays in view in a narrow tab strip, however it was
+  // selected. Only the strip scrolls; scrollIntoView could move the workspace.
+  const tablistRef = useRef(null);
+  useLayoutEffect(() => {
+    const list = tablistRef.current;
+    const tab = compact && list?.querySelector(`[data-pane-view="${focused}"]`);
+    if (!tab) return;
+    const strip = list.getBoundingClientRect();
+    const shown = tab.getBoundingClientRect();
+    if (shown.left < strip.left) list.scrollLeft -= strip.left - shown.left;
+    else if (shown.right > strip.right) list.scrollLeft += shown.right - strip.right;
+  }, [compact, focused, size.width]);
 
   // Focus waits for the commit that shows its pane. A pane no longer in the
   // layout drops the request rather than taking focus later.
@@ -318,7 +336,7 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
     const act = (action) => () => { menuMovedFocusRef.current = true; action(); };
     return <DropdownMenu onOpenChange={(open) => { if (open) menuMovedFocusRef.current = false; }}>
       <DropdownMenuTrigger render={<Button variant="ghost" size="icon-xs" aria-label={`${label} pane options`} />}><DotsThree weight="bold" /></DropdownMenuTrigger>
-      <DropdownMenuContent align="end" finalFocus={finalFocus} className="w-auto min-w-48">
+      <DropdownMenuContent align="end" finalFocus={finalFocus} data-pane-layout-owner={ownerId} className="w-auto min-w-48">
         {closed.length > 0 && <>
           <DropdownMenuGroup><DropdownMenuLabel>Split right</DropdownMenuLabel>{closed.map((item) => <DropdownMenuItem key={item} aria-label={`Open ${PANE_VIEW_LABELS[item]} to the right of ${label}`} onClick={act(() => open(item, { target: view, side: "right" }))}><Columns />{PANE_VIEW_LABELS[item]}</DropdownMenuItem>)}</DropdownMenuGroup>
           <DropdownMenuGroup><DropdownMenuLabel>Split down</DropdownMenuLabel>{closed.map((item) => <DropdownMenuItem key={item} aria-label={`Open ${PANE_VIEW_LABELS[item]} below ${label}`} onClick={act(() => open(item, { target: view, side: "down" }))}><Rows />{PANE_VIEW_LABELS[item]}</DropdownMenuItem>)}</DropdownMenuGroup>
@@ -332,9 +350,9 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
     </DropdownMenu>;
   }
 
-  return <div ref={containerRef} className={`pane-layout ${compact ? "is-compact" : ""} ${className}`}><KeepFocusAcrossModes compact={compact} containerRef={containerRef} onFocusLost={() => focusPane(focused)}>
+  return <div ref={containerRef} className={`pane-layout ${compact ? "is-compact" : ""} ${className}`}><KeepFocusAcrossModes compact={compact} containerRef={containerRef} ownerId={ownerId} onFocusLost={() => focusPane(focused)}>
     {compact && <div className="pane-switcher">
-      <div role="tablist" aria-label="Panes" aria-orientation="horizontal" onKeyDown={compactTabKeyDown}>
+      <div ref={tablistRef} role="tablist" aria-label="Panes" aria-orientation="horizontal" onKeyDown={compactTabKeyDown}>
         {views.map((view) => { const Icon = VIEW_ICONS[view]; return <button key={view} type="button" role="tab" id={`pane-tab-${view}`} data-pane-view={view} aria-selected={view === focused} aria-controls={paneId(view)} tabIndex={view === focused ? 0 : -1} className={view === focused ? "is-active" : ""} onClick={() => selectCompactTab(view)}><Icon />{PANE_VIEW_LABELS[view]}</button>; })}
       </div>
       {menu(focused)}

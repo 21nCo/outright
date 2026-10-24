@@ -6,6 +6,9 @@ const OVERSCAN = 40;
 // Chromium clamps a single element near 16.7 million CSS pixels. Keep the
 // virtual track below that limit even for the allowed 12 MiB diff output.
 const MAX_TRACK_HEIGHT = 8_000_000;
+// Position updates are synchronous layout work. A geometry feedback beyond
+// the scrollbar reserve below must defer to the next frame, not recurse.
+const MAX_POSITION_UPDATES_PER_FRAME = 8;
 
 function lineOffsets(diff) {
   let count = 1;
@@ -30,9 +33,20 @@ export function WindowedDiff({ diff, label }) {
   const logicalFirstRef = useRef(0);
   const programmaticTopRef = useRef(null);
   const layoutRef = useRef({ compressed: false, maxFirst: 0, maxScroll: 1 });
+  const positionRef = useRef(null);
+  const scrollbarReserveRef = useRef(0);
+  const burstRef = useRef({ count: 0, reset: 0, deferred: 0 });
+  // Mounted rows decide the horizontal overflow, and a classic horizontal
+  // scrollbar would change clientHeight, the rows and the Find anchor in turn.
+  // Reserve the largest scrollbar seen so the row height ignores whether one
+  // is shown at this moment.
+  const rowsHeight = (viewport) => {
+    scrollbarReserveRef.current = Math.max(scrollbarReserveRef.current, viewport.offsetHeight - viewport.clientHeight);
+    return Math.max(0, viewport.offsetHeight - scrollbarReserveRef.current);
+  };
   const updatePosition = (viewport, logicalFirst = null) => {
     const top = viewport.scrollTop;
-    const height = viewport.clientHeight;
+    const height = rowsHeight(viewport);
     const { compressed, maxFirst, maxScroll } = layoutRef.current;
     // A compressed track has fewer physical pixels than logical lines. Keep
     // line moves exact, even when the browser rounds a programmatic scroll.
@@ -43,8 +57,16 @@ export function WindowedDiff({ diff, label }) {
       logicalFirstRef.current = compressed ? Math.max(0, Math.min(maxFirst, Math.round(top / maxScroll * maxFirst)))
         : Math.max(0, Math.min(maxFirst, Math.floor(top / LINE_HEIGHT)));
     } else logicalFirstRef.current = first;
-    setPosition((current) => current.top === top && current.height === height && current.first === first
-      ? current : { top, height, first });
+    const current = positionRef.current;
+    if (current && current.top === top && current.height === height && current.first === first) return;
+    const burst = burstRef.current;
+    if (++burst.count > MAX_POSITION_UPDATES_PER_FRAME) {
+      if (!burst.deferred) burst.deferred = window.requestAnimationFrame(() => { burst.deferred = 0; if (viewport.isConnected) updatePosition(viewport); });
+      return;
+    }
+    if (!burst.reset) burst.reset = window.requestAnimationFrame(() => { burst.reset = 0; burst.count = 0; });
+    positionRef.current = { top, height, first };
+    setPosition(positionRef.current);
   };
   const starts = useMemo(() => content ? lineOffsets(content) : [], [content]);
   const searchable = useMemo(() => foldFindText(content), [content]);
@@ -123,7 +145,7 @@ export function WindowedDiff({ diff, label }) {
       moveFirst(first);
       return;
     }
-    viewport.scrollTop = Math.max(0, line * LINE_HEIGHT - viewport.clientHeight / 3);
+    viewport.scrollTop = Math.max(0, line * LINE_HEIGHT - rowsHeight(viewport) / 3);
     updatePosition(viewport);
   }
   function find(direction = 1, value = needle) {
@@ -154,7 +176,8 @@ export function WindowedDiff({ diff, label }) {
     update();
     const resize = new ResizeObserver(update);
     resize.observe(viewport);
-    return () => resize.disconnect();
+    const burst = burstRef.current;
+    return () => { resize.disconnect(); window.cancelAnimationFrame(burst.reset); window.cancelAnimationFrame(burst.deferred); burst.reset = 0; burst.deferred = 0; };
   }, []);
   useLayoutEffect(() => {
     const viewport = viewportRef.current;
@@ -162,7 +185,7 @@ export function WindowedDiff({ diff, label }) {
     // Scroll and resize callbacks can enqueue a position from an older frame.
     // Reconcile the committed row placement with the physical viewport before
     // paint, including while a compressed Find seek is still pending.
-    if (viewport.scrollTop !== position.top || viewport.clientHeight !== position.height) updatePosition(viewport);
+    if (viewport.scrollTop !== position.top || rowsHeight(viewport) !== position.height) updatePosition(viewport);
   });
   useLayoutEffect(() => {
     if (!needle.trim() || foundOffsetRef.current < 0) return;
@@ -214,7 +237,7 @@ export function WindowedDiff({ diff, label }) {
       else {
         const viewportTop = viewport.getBoundingClientRect().top;
         const rowTop = mark.getBoundingClientRect().top;
-        const desired = viewportTop + viewport.clientHeight / 3;
+        const desired = viewportTop + rowsHeight(viewport) / 3;
         if (Math.abs(rowTop - desired) > 1) viewport.scrollTop += rowTop - desired;
         updatePosition(viewport);
       }
