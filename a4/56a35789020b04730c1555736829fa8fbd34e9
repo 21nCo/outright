@@ -1,0 +1,29 @@
+README.md
+  s_1900bb15a7199a::t_c2f38c530b4ae7 63
+src/App.jsx
+  s_1900bb15a7199a::t_98f9287bf08622 104,321-326,340-341,1899-1905,2005
+src/components/PaneLayout.jsx
+  s_1900bb15a7199a::t_f498b575b9234f 1,48-51,56-58,100,146-158,339,353,355
+src/components/WindowedDiff.jsx
+  s_1900bb15a7199a::t_7192ad4e9600a4 9-11,36-46,49,60-69,148,179-180,188,240
+tests/ui-races.jsx
+  s_1900bb15a7199a::t_b6031c0fd2d9e7 14,4025-4070,6682,6690,6736,6842,6927,7023-7124,7140-7141,7198,7233-7252,7269-7271,7273-7279,7281,7320-7348,7954,8003-8004
+tests/ui-races.test.mjs
+  s_1900bb15a7199a::t_df8eb517b65f2f 917
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a456a35789020b04730c1555736829fa8fbd34e9",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
