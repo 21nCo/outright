@@ -24,6 +24,14 @@ function lineOffsets(diff) {
 // Find target or the mounted window in turn.
 export function diffRowsHeight(viewport) { return viewport.offsetHeight; }
 
+// Rows shown whole below the top padding. Where scrollbars take layout space
+// a horizontal one is always reserved, at the vertical one's width, so the
+// last row stays reachable and a long mounted row cannot change the rows.
+function diffShownRows(viewport, height) {
+  const padding = Number.parseFloat(getComputedStyle(viewport).paddingTop) || 0;
+  return Math.max(1, Math.floor((height - padding - (viewport.offsetWidth - viewport.clientWidth)) / LINE_HEIGHT));
+}
+
 // One Find geometry for seeking, alignment and resizes: the match row sits a
 // third of the way down the rows, below the viewport's top padding.
 export function diffFindTop(viewport, line) {
@@ -34,7 +42,7 @@ export function diffFindTop(viewport, line) {
 export function WindowedDiff({ diff, label }) {
   const content = typeof diff === "string" ? diff : "";
   const viewportRef = useRef(null);
-  const [position, setPosition] = useState({ top: 0, height: 600 });
+  const [position, setPosition] = useState({ top: 0, height: 600, rows: 42 });
   const [needle, setNeedle] = useState("");
   const [foundLine, setFoundLine] = useState(-1);
   const [searched, setSearched] = useState(false);
@@ -51,6 +59,7 @@ export function WindowedDiff({ diff, label }) {
   const updatePosition = (viewport, logicalFirst = null) => {
     const top = viewport.scrollTop;
     const height = diffRowsHeight(viewport);
+    const rows = diffShownRows(viewport, height);
     const { compressed, maxFirst, maxScroll } = layoutRef.current;
     // A compressed track has fewer physical pixels than logical lines. Keep
     // line moves exact, even when the browser rounds a programmatic scroll.
@@ -62,7 +71,7 @@ export function WindowedDiff({ diff, label }) {
         : Math.max(0, Math.min(maxFirst, Math.floor(top / LINE_HEIGHT)));
     } else logicalFirstRef.current = first;
     const current = positionRef.current;
-    if (current && current.top === top && current.height === height && current.first === first) return;
+    if (current && current.top === top && current.height === height && current.rows === rows && current.first === first) return;
     const burst = burstRef.current;
     if (++burst.count > MAX_POSITION_UPDATES_PER_FRAME) {
       // Defer the commit, not the update: the logical cursor above is already
@@ -77,7 +86,7 @@ export function WindowedDiff({ diff, label }) {
       return;
     }
     if (!burst.reset) burst.reset = window.requestAnimationFrame(() => { burst.reset = 0; burst.count = 0; });
-    positionRef.current = { top, height, first };
+    positionRef.current = { top, height, rows, first };
     setPosition(positionRef.current);
   };
   const starts = useMemo(() => content ? lineOffsets(content) : [], [content]);
@@ -88,7 +97,7 @@ export function WindowedDiff({ diff, label }) {
   const count = starts.length;
   const compressed = count * LINE_HEIGHT > MAX_TRACK_HEIGHT;
   const trackHeight = compressed ? MAX_TRACK_HEIGHT : count * LINE_HEIGHT;
-  const visibleRows = Math.max(1, Math.floor(position.height / LINE_HEIGHT));
+  const visibleRows = position.rows;
   const maxFirst = Math.max(0, count - visibleRows);
   const maxScroll = Math.max(1, trackHeight - position.height);
   useLayoutEffect(() => {
@@ -253,6 +262,8 @@ export function WindowedDiff({ diff, label }) {
   // Keep the mounted window attached to the physical viewport. Large CSS top
   // coordinates lose precision across engines at multi-million-pixel scroll
   // positions; a sticky zero-height anchor avoids that coordinate conversion.
+  // An ordinary track places its rows in flow below a spacer, so they move
+  // with the committed window in the same layout on every engine.
   const visibleStatus = needle && foundLine >= 0 ? `Line ${foundLine + 1}` : needle && searched ? "No match" : needle ? "Press Enter to find" : "";
   useEffect(() => {
     const timer = window.setTimeout(() => setAnnouncedStatus(visibleStatus), 180);
@@ -278,7 +289,7 @@ export function WindowedDiff({ diff, label }) {
   }}>
     {content ? compressed
       ? <div style={{ height: trackHeight }}><div style={{ position: "sticky", top: 0, height: 0 }}>{lines}</div></div>
-      : <div style={{ height: trackHeight, position: "relative" }}><div style={{ position: "absolute", top: start * LINE_HEIGHT, left: 0, right: 0 }}>{lines}</div></div>
+      : <div style={{ height: trackHeight }}><div className="diff-spacer" style={{ height: start * LINE_HEIGHT }} />{lines}</div>
       : <span className="diff-empty">Select a changed file to inspect its diff.</span>}
   </pre></div>;
 }

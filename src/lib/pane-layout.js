@@ -317,8 +317,10 @@ export function savePaneLayout(storage, worktreeId, layout, now = Date.now()) {
   try {
     const { entries } = readStore(storage);
     entries.delete(worktreeId);
-    entries.set(worktreeId, { layout: { version: layout.version, root: layout.root, focused: layout.focused }, savedAt: now });
-    const kept = [...entries].sort((a, b) => b[1].savedAt - a[1].savedAt).slice(0, MAX_SAVED_LAYOUTS);
+    // The layout being saved is never evicted: other worktrees' layouts are
+    // ranked by age, which a tied or stepped-back clock cannot order against it.
+    const others = [...entries].sort((a, b) => b[1].savedAt - a[1].savedAt).slice(0, MAX_SAVED_LAYOUTS - 1);
+    const kept = [[worktreeId, { layout: { version: layout.version, root: layout.root, focused: layout.focused }, savedAt: now }], ...others];
     let text = JSON.stringify({ version: PANE_LAYOUT_VERSION, worktrees: Object.fromEntries(kept) });
     while (text.length > MAX_STORED_CHARACTERS && kept.length > 1) {
       kept.pop();

@@ -785,7 +785,9 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     // Chrome binds it, especially in the nested Windows cleanup fixture.
     const devToolsDeadline = Math.min(Date.now() + 45_000, deadline);
     const debugPort = await waitForDevToolsPort(profile, browser, logs, diagnostic, devToolsDeadline);
-    await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, logs, diagnostic, devToolsDeadline);
+    const version = await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, logs, diagnostic, devToolsDeadline);
+    // Layout differs across Chrome releases; name the one each run used.
+    console.log(`UI fixture browser: ${version.Browser}`);
     snapshotWindowsTree(browser);
     phase = "create DevTools target";
     const targetResponse = await fetch(`http://127.0.0.1:${debugPort}/json/new?${encodeURIComponent("about:blank")}`, { method: "PUT", signal: AbortSignal.timeout(Math.min(10_000, remaining())) });

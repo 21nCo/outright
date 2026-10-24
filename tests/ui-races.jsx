@@ -4092,6 +4092,19 @@ function diffFindRowOffset(viewport) {
   return row ? row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - diffRowsHeight(viewport) / 3 : Number.NaN;
 }
 
+// Where layout put the marked row, split in two: its place in the track
+// against its line's position, and the track against the scroll position.
+// Both are 0 when the window placed the row where its line belongs.
+function diffRowPlacement(viewport) {
+  const row = viewport.querySelector('[data-find-match="true"]');
+  const track = viewport.firstElementChild;
+  if (!row || !track) return null;
+  const line = Number(row.querySelector("i")?.textContent) - 1;
+  const padding = Number.parseFloat(getComputedStyle(viewport).paddingTop) || 0;
+  const trackTop = track.getBoundingClientRect().top;
+  return { place: row.getBoundingClientRect().top - trackTop - line * 14, track: trackTop - (viewport.getBoundingClientRect().top + padding - viewport.scrollTop) };
+}
+
 // Records what moves a diff viewport, by animation frame: each script write to
 // scrollTop and its writer, each scroll event and whether a script write
 // explains it, each resize delivery, and each committed window or Find mark
@@ -4130,7 +4143,14 @@ function traceDiffViewport(viewport) {
     const marked = Boolean(viewport.querySelector('[data-find-match="true"]'));
     const offset = diffFindRowOffset(viewport);
     if (marked && firstMarked == null) firstMarked = offset;
-    record("commit", `first=${viewport.dataset.firstLine} mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd} top=${top()} row=${marked ? offset.toFixed(2) : "unmounted"}`);
+    // The same row after one and two frames tells stale synchronous geometry
+    // from a frame that really showed the row elsewhere.
+    const placed = (kind) => {
+      const placement = diffRowPlacement(viewport);
+      record(kind, `first=${viewport.dataset.firstLine} mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd} top=${top()} row=${placement ? diffFindRowOffset(viewport).toFixed(2) : "unmounted"}${placement ? ` place=${placement.place.toFixed(2)} track=${placement.track.toFixed(2)}` : ""}`);
+    };
+    placed("commit");
+    if (marked) fixtureNativeFrame(() => { placed("commit+1f"); fixtureNativeFrame(() => placed("commit+2f")); });
   });
   commits.observe(viewport, { attributes: true, childList: true, subtree: true, attributeFilter: ["data-first-line", "data-mounted-start", "data-mounted-end", "data-find-match"] });
   return {
@@ -4149,14 +4169,15 @@ function traceDiffViewport(viewport) {
 async function withDiffTrace(viewport, run) {
   const trace = traceDiffViewport(viewport);
   try { return await run(trace); }
-  catch (error) { throw new Error(`${error.message}; trace: ${trace.text()}`, { cause: error }); }
+  catch (error) { throw new Error(`${error.message}; ${navigator.userAgent}; trace: ${trace.text()}`, { cause: error }); }
   finally { trace.stop(); }
 }
-// Find is ready when the viewport itself is at the match's target, not
-// merely when the match row is mounted.
+// Find is ready when the viewport is at the match's target and layout shows
+// the match row there, not merely when the row is mounted.
 function diffFindLanded(viewport, text, line) {
   return viewport.querySelector('[data-find-match="true"]')?.textContent.includes(text)
-    && Math.abs(viewport.scrollTop - diffFindTop(viewport, line)) <= 1;
+    && Math.abs(viewport.scrollTop - diffFindTop(viewport, line)) <= 1
+    && Math.abs(diffFindRowOffset(viewport)) < 2;
 }
 
 async function diffScrollbarFeedbackRegression() {
@@ -4273,7 +4294,7 @@ async function diffFindResizeRegression() {
         assert(Math.abs(diffFindRowOffset(viewport)) < 2, `A resize to ${width}x${height} moved the Find match ${diffFindRowOffset(viewport)}px from its target ${index + 1} frames later`);
       }
     }
-  } catch (error) { throw new Error(`${error.message}; trace: ${trace?.text()}`, { cause: error }); }
+  } catch (error) { throw new Error(`${error.message}; ${navigator.userAgent}; trace: ${trace?.text()}`, { cause: error }); }
   finally { window.requestAnimationFrame = nativeFrame; probe?.disconnect(); trace?.stop(); style.remove(); }
 }
 
@@ -4812,7 +4833,47 @@ async function extremeDiffHeightRegression() {
   await until(() => Number(viewport.dataset.firstLine) < 100, "removed match releases the old virtual window");
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={null} label="Empty diff" /></div>);
   await until(() => host.querySelector(".diff-empty"), "nullable diff shows its empty state");
+  await compressedDiffTailRegression();
   await nearLimitCompressedDiffRegression();
+}
+
+// Classic scrollbars take layout space. Long rows at the end of a compressed
+// diff show a horizontal one there, and End, a wheel and Find must still show
+// the final row whole above it.
+async function compressedDiffTailRegression() {
+  const style = document.createElement("style");
+  style.textContent = ".diff-view::-webkit-scrollbar { width: 17px; height: 17px; } .diff-view::-webkit-scrollbar-thumb { background: #888; }";
+  document.head.append(style);
+  const diff = "+\n".repeat(600_000) + `+${"x".repeat(400)}\n`.repeat(60) + "+FINAL LINE\n";
+  try {
+    root.render(null); await settle();
+    root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 280 }}><WindowedDiff diff={diff} label="Tall diff with long tail rows" /></div>);
+    await until(() => host.querySelector(".diff-view")?.scrollHeight > 1_000_000, "compressed diff with long tail rows");
+    const viewport = host.querySelector(".diff-view");
+    const finalShown = (label) => {
+      const row = [...viewport.querySelectorAll("span")].find((item) => item.textContent.includes("FINAL LINE"))?.getBoundingClientRect();
+      const view = viewport.getBoundingClientRect();
+      assert(viewport.clientHeight < viewport.offsetHeight, `${label}: no horizontal scrollbar showed at the tail (${viewport.clientHeight}/${viewport.offsetHeight})`);
+      assert(row && row.top >= view.top && row.bottom <= view.top + viewport.clientHeight + 0.5,
+        `${label}: the final row was not shown whole: row=${row?.top}/${row?.bottom}, viewport=${view.top}/${view.top + viewport.clientHeight}, first=${viewport.dataset.firstLine}, mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`);
+    };
+    const reachTail = async (act, label) => {
+      pressKey(viewport, "Home");
+      await until(() => Number(viewport.dataset.firstLine) === 0, `${label}: back at the start`); // NOSONAR S9382: each route starts at the top
+      act();
+      await until(() => viewport.textContent.includes("FINAL LINE"), `${label}: reaches the final line`); // NOSONAR S9382: each route is observed on its own
+      await settle(); // NOSONAR S9382: the horizontal scrollbar shows after the tail rows mount
+      finalShown(label);
+    };
+    viewport.focus();
+    await reachTail(() => pressKey(viewport, "End"), "End");
+    await reachTail(() => viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 14 * 1_000_000, bubbles: true, cancelable: true })), "A wheel to the end");
+    const input = host.querySelector('input[aria-label="Find in diff"]');
+    await reachTail(() => {
+      setControlValue(input, "FINAL LINE");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    }, "Find of the final line");
+  } finally { style.remove(); }
 }
 
 async function nearLimitCompressedDiffRegression() {
@@ -6924,7 +6985,39 @@ async function splitPaneLayoutRegression() {
       assert(rect.width >= width - 1 && rect.height >= height - 1, `${view} is below its minimum size: ${JSON.stringify(rect.toJSON())}`);
     }
 
+    // A title drag belongs to the tree it started in. When another action
+    // replaces that tree before dragend, the abandoned drag cannot dock.
+    const abandonedDrag = async (replace, label) => {
+      const transfer = new DataTransfer();
+      const edge = () => { const rect = host.querySelector("#pane-terminal").getBoundingClientRect(); return { clientX: rect.left + 6, clientY: rect.top + rect.height / 2 }; };
+      const send = (type) => { const event = new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: transfer, ...edge() }); host.querySelector("#pane-terminal").dispatchEvent(event); return event; };
+      host.querySelector("#pane-changes .pane-title").dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: transfer }));
+      send("dragover");
+      await until(() => host.querySelector("#pane-terminal .pane-drop-indicator"), `${label}: drop indicator before the tree changes`);
+      await replace();
+      await until(() => !host.querySelector(".pane-drop-indicator"), `${label}: the abandoned drag's drop indicator was cleared`);
+      const before = paneOrder();
+      assert(!send("dragover").defaultPrevented, `${label}: the replaced tree accepted the abandoned drag`);
+      send("drop");
+      await settle();
+      assert(paneOrder() === before && !host.querySelector(".pane-drop-indicator"), `${label}: the abandoned drag moved panes: ${before} -> ${paneOrder()}`);
+    };
+    await abandonedDrag(() => choosePaneMenuItem("Terminal", "Move right"), "a pane move during a title drag");
+    await choosePaneMenuItem("Terminal", "Move left");
+    await until(() => paneOrder() === "changes,terminal,conversation", `moving the terminal back restores the arrangement, not ${paneOrder()}`);
+
     if (window.__fixtureSetViewport) {
+      // A title drag does not survive one-at-a-time panes either.
+      await abandonedDrag(async () => {
+        await window.__fixtureSetViewport(900);
+        await until(() => window.innerWidth === 900, "900px viewport during a title drag");
+        window.dispatchEvent(new Event("resize"));
+        await until(() => host.querySelector('[role="tablist"][aria-label="Panes"]'), "one-at-a-time panes during a title drag");
+        await window.__fixtureSetViewport(1280);
+        await until(() => window.innerWidth === 1280, "wide viewport after a title drag");
+        window.dispatchEvent(new Event("resize"));
+        await until(() => host.querySelectorAll('.pane-separator[role="separator"]').length === 2, "split panes after a title drag");
+      }, "a compact transition during a title drag");
       // Too narrow for every minimum: one pane at a time, same mounted views.
       await window.__fixtureSetViewport(900);
       await until(() => window.innerWidth === 900, "900px viewport");
@@ -7182,7 +7275,13 @@ async function paneNoticeMinimumRegression() {
     reachable(commitMessage, "changes", "The commit message");
     setControlValue(commitMessage, "Commit from a narrow pane");
     await until(() => [...host.querySelectorAll("#pane-changes .commit-bar button")].some((button) => button.textContent.includes("Commit") && !button.disabled), "commit enabled");
-    reachable([...host.querySelectorAll("#pane-changes .commit-bar button")].find((button) => button.textContent.includes("Commit")), "changes", "The commit button");
+    const commitButton = [...host.querySelectorAll("#pane-changes .commit-bar button")].find((button) => button.textContent.includes("Commit"));
+    // The layout's first commit shows one pane at a time until it measures
+    // its stage, so the button's transitions start from its concealed and
+    // disabled style. Before an animation frame they still report that start,
+    // hidden, so hit testing waits for them to finish.
+    await until(() => commitButton.getAnimations().every((animation) => animation.playState === "finished"), "commit button transitions finished");
+    reachable(commitButton, "changes", "The commit button");
 
     // A first prompt whose chat was created but not sent, in the same pane.
     root.render(null);

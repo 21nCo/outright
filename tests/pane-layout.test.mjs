@@ -156,6 +156,22 @@ test("saved layouts are bounded to the most recently arranged worktrees", () => 
   assert.deepEqual(loadPaneLayout(storage, `wt-${MAX_SAVED_LAYOUTS}`).layout, review());
 });
 
+test("the layout just saved survives eviction when the clock ties or steps back", () => {
+  for (const now of [5, 1]) {
+    const storage = memoryStorage();
+    for (let index = 0; index < MAX_SAVED_LAYOUTS; index += 1) savePaneLayout(storage, `wt-${index}`, review(), 5);
+    assert.equal(savePaneLayout(storage, "wt-new", openView(defaultPaneLayout(), "context"), now), true);
+    const saved = JSON.parse(storage.getItem(PANE_LAYOUT_STORAGE_KEY));
+    assert.equal(Object.keys(saved.worktrees).length, MAX_SAVED_LAYOUTS);
+    assert.deepEqual(loadPaneLayout(storage, "wt-new"), { layout: openView(defaultPaneLayout(), "context"), problems: [] }, `A save at ${now} was evicted`);
+  }
+  // Trimming to the size bound also keeps the layout being saved.
+  const large = memoryStorage({ [PANE_LAYOUT_STORAGE_KEY]: JSON.stringify({ version: 1, worktrees: Object.fromEntries(
+    Array.from({ length: 8 }, (_, index) => [`wt-${index}-${"x".repeat(40_000)}`, { layout: review(), savedAt: 5 }])) }) });
+  assert.equal(savePaneLayout(large, "wt-new", review(), 1), true);
+  assert.deepEqual(loadPaneLayout(large, "wt-new").layout, review());
+});
+
 test("unreadable or unavailable storage falls back to the default layout and says so", () => {
   const damaged = memoryStorage({ [PANE_LAYOUT_STORAGE_KEY]: "{not json" });
   assert.deepEqual(loadPaneLayout(damaged, "wt-a"), { layout: defaultPaneLayout(), problems: ["store"] });

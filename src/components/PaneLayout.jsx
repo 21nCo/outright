@@ -143,6 +143,15 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
   geometryRef.current = geometry;
   const focused = views.includes(layout.focused) ? layout.focused : views[0];
 
+  // A pane title drag also belongs to its tree, in split mode. Replacing the
+  // tree or showing one pane at a time abandons it, even when the browser
+  // cannot deliver dragend to a title that has unmounted.
+  useLayoutEffect(() => {
+    if (!draggedViewRef.current || (draggedViewRef.current.root === layout.root && !compact)) return;
+    draggedViewRef.current = null;
+    setDropTarget(null);
+  }, [layout.root, compact]);
+
   // The selected pane tab stays in view in a narrow tab strip, however it was
   // selected. Only the strip scrolls; scrollIntoView could move the workspace.
   const tablistRef = useRef(null);
@@ -286,7 +295,7 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
   // Only a pane title dragged in this layout docks; chat tabs and files do not.
   function paneDragged(event) {
     const dragged = draggedViewRef.current;
-    return dragged && [...(event.dataTransfer?.types ?? [])].includes(PANE_DRAG_TYPE) ? dragged : null;
+    return dragged?.root === layoutRef.current.root && [...(event.dataTransfer?.types ?? [])].includes(PANE_DRAG_TYPE) ? dragged.view : null;
   }
 
   function dragOver(event, view) {
@@ -372,7 +381,7 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
             onDragOverCapture={(event) => dragOver(event, view)} onDropCapture={(event) => drop(event, view)}
             onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDropTarget((current) => current?.view === view ? null : current); }}>
             {multiple && !compact && <header className="pane-header">
-              <span className="pane-title" draggable onDragStart={(event) => { draggedViewRef.current = view; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData(PANE_DRAG_TYPE, view); }} onDragEnd={() => { draggedViewRef.current = null; setDropTarget(null); }} title="Drag to move this pane"><DotsSixVertical className="pane-grip" aria-hidden="true" /><Icon aria-hidden="true" />{PANE_VIEW_LABELS[view]}</span>
+              <span className="pane-title" draggable onDragStart={(event) => { draggedViewRef.current = { view, root: layout.root }; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData(PANE_DRAG_TYPE, view); }} onDragEnd={() => { draggedViewRef.current = null; setDropTarget(null); }} title="Drag to move this pane"><DotsSixVertical className="pane-grip" aria-hidden="true" /><Icon aria-hidden="true" />{PANE_VIEW_LABELS[view]}</span>
               {menu(view)}
             </header>}
             <div className="pane-body">{viewElements[view]}</div>
