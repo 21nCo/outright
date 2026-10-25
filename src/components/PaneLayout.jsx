@@ -84,6 +84,37 @@ function dropSide(event, element) {
 
 const SIDE_WORDS = { left: "to the left of", right: "to the right of", up: "above", down: "below" };
 
+// A pane's size, not the window's, compacts its view. The body measures its
+// own box before paint and marks the size tiers styles.css uses, rather than
+// being a CSS size container: Chrome on macOS and Windows CI laid out a style
+// change inside one only at the next frame, so a view's synchronous layout
+// reads, such as the diff's Find placement, saw the previous layout.
+const PANE_MAX_WIDTHS = [760, 640, 520];
+const PANE_MAX_HEIGHTS = [479];
+function markPaneSize(body) {
+  const { width, height } = body.getBoundingClientRect();
+  const marks = {
+    maxWidth: PANE_MAX_WIDTHS.filter((limit) => width <= limit).join(" "),
+    maxHeight: PANE_MAX_HEIGHTS.filter((limit) => height <= limit).join(" "),
+  };
+  for (const [key, value] of Object.entries(marks)) if (body.dataset[key] !== value) body.dataset[key] = value;
+  for (const [name, value] of [["--pane-width", `${width}px`], ["--pane-height", `${height}px`]]) {
+    if (body.style.getPropertyValue(name) !== value) body.style.setProperty(name, value);
+  }
+}
+export function PaneBody({ children, style }) {
+  const ref = useRef(null);
+  // A layout commit marks its panes at once; any other resize, before paint.
+  useLayoutEffect(() => markPaneSize(ref.current));
+  useLayoutEffect(() => {
+    const body = ref.current;
+    const observer = new ResizeObserver(() => markPaneSize(body));
+    observer.observe(body);
+    return () => observer.disconnect();
+  }, []);
+  return <div ref={ref} className="pane-body" style={style}>{children}</div>;
+}
+
 // Pane geometry is computed in pixels for minimum sizes, then placed as
 // fractions of the stage so a resize between measurements never overflows it.
 function placement(rect, size) {
@@ -384,7 +415,7 @@ export function PaneLayout({ ref, layout, onChange, compactPreferred = false, vi
               <span className="pane-title" draggable onDragStart={(event) => { draggedViewRef.current = { view, root: layout.root }; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData(PANE_DRAG_TYPE, view); }} onDragEnd={() => { draggedViewRef.current = null; setDropTarget(null); }} title="Drag to move this pane"><DotsSixVertical className="pane-grip" aria-hidden="true" /><Icon aria-hidden="true" />{PANE_VIEW_LABELS[view]}</span>
               {menu(view)}
             </header>}
-            <div className="pane-body">{viewElements[view]}</div>
+            <PaneBody>{viewElements[view]}</PaneBody>
             {dropTarget?.view === view && <div className={`pane-drop-indicator is-${dropTarget.side}`} aria-hidden="true" />}
           </section>;
         })}

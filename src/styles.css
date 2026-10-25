@@ -255,7 +255,7 @@ button, input, textarea, select { font: inherit; }
 .conversation-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
 .conversation-meta span { padding: 2px 7px; border-radius: 999px; color: var(--foreground); background: var(--muted); font-size: 9px; font-weight: 650; }
 .conversation-meta small { color: var(--muted-foreground); font-size: 9px; }
-.conversation-meta .conversation-account { max-width: min(260px, 38cqw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-meta .conversation-account { max-width: min(260px, calc(var(--pane-width, 100svw) * .38)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .message-scroll { min-height: 0; height: 100%; overflow: hidden; }
 .message-scroll [data-slot="scroll-area-viewport"] { height: 100%; overflow-y: auto; }
@@ -337,7 +337,7 @@ button, input, textarea, select { font: inherit; }
    share; the notices take what is left up to a bounded height and scroll, with
    their actions pinned in view. */
 .conversation-pane { min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-rows: 83px minmax(72px, 1fr) minmax(0, auto) auto; overflow: hidden; }
-.conversation-notices { min-height: 0; max-height: 45cqh; overflow-y: auto; overscroll-behavior: contain; }
+.conversation-notices { min-height: 0; max-height: calc(var(--pane-height, 100svh) * .45); overflow-y: auto; overscroll-behavior: contain; }
 .conversation-notices .recovery-actions { position: sticky; bottom: 0; background: var(--subtle-canvas); }
 .first-prompt-actions { position: sticky; bottom: 0; background: var(--canvas); }
 /* Split panes: every pane is absolutely placed in one stage so a moved view
@@ -350,7 +350,7 @@ button, input, textarea, select { font: inherit; }
 .pane:focus-visible { box-shadow: inset 0 0 0 2px var(--ring); }
 .pane-layout.is-compact .pane { inset: 0; }
 .pane.is-concealed { visibility: hidden; }
-.pane-body { min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-rows: minmax(0, 1fr); container: pane / size; }
+.pane-body { min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-rows: minmax(0, 1fr); }
 .pane-header { min-width: 0; padding: 0 4px 0 4px; display: flex; align-items: center; justify-content: space-between; gap: 4px; border-bottom: 1px solid var(--line-soft); background: var(--subtle-canvas); color: var(--muted-foreground); font-size: 10px; font-weight: 550; }
 .pane.is-focused .pane-header { color: var(--foreground); }
 .pane.is-focused .pane-header::after { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: var(--foreground); }
@@ -599,8 +599,10 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
 
 /* A pane's size, not the window's, compacts its view, so each view keeps its
    primary content usable down to the pane minimums in src/lib/pane-layout.js.
+   PaneBody marks each tier its box is at most; :where keeps the specificity
+   of the rules inside.
    Window media queries above only style the shell around the panes. */
-@container pane (max-width: 760px) {
+:where(.pane-body[data-max-width~="760"]) {
   .message-column, .composer, .history-live-tail, .first-prompt-notice { width: calc(100% - 16px); }
   .message-column { padding-top: 18px; }
   .conversation-header { padding: 0 16px; }
@@ -608,11 +610,11 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .recovery-actions { width: 100%; flex: 0 0 100%; align-items: stretch; }
   .recovery-actions [data-slot="button"] { min-width: 0; white-space: normal; }
 }
-@container pane (max-width: 640px) {
+:where(.pane-body[data-max-width~="640"]) {
   /* The settings button stays: it is the keyboard entry to the conversation's provider and model. */
   .conversation-meta small:not(.conversation-account) { display: none; }
 }
-@container pane (max-width: 520px) {
+:where(.pane-body[data-max-width~="520"]) {
   .conversation-pane { grid-template-rows: 68px minmax(72px, 1fr) minmax(0, auto) auto; }
   .conversation-header { grid-template-columns: minmax(0,1fr) auto; padding: 0 12px; }
   .conversation-symbol { display: none; }
@@ -632,7 +634,7 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .terminal-tab { min-width: 130px; }
   .terminal-loading { font-size: 0; }
 }
-@container pane (max-height: 479px) {
+:where(.pane-body[data-max-height~="479"]) {
   .conversation-pane { grid-template-rows: 56px minmax(72px, 1fr) minmax(0, auto) auto; }
   .conversation-header h1 { margin-bottom: 2px; font-size: 14px; }
   .message-column { padding-block: 12px 8px; }

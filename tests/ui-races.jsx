@@ -11,7 +11,7 @@ import { CommandPalette } from "../src/components/CommandPalette.jsx";
 import { SettingsDialog } from "../src/components/SettingsDialog.jsx";
 import { ProviderAccounts } from "../src/components/ProviderAccounts.jsx";
 import { TerminalPane } from "../src/components/TerminalPane.jsx";
-import { PaneLayout } from "../src/components/PaneLayout.jsx";
+import { PaneBody, PaneLayout } from "../src/components/PaneLayout.jsx";
 import { computePaneRects } from "../src/lib/pane-layout.js";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
 import { scheduleLayoutTick } from "../src/lib/windowing.js";
@@ -3897,7 +3897,7 @@ async function changesSelectionRefreshRegression() {
     return response({});
   };
   const tree = projects[0].worktrees[0];
-  const pane = (event) => <div className="pane-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>;
+  const pane = (event) => <PaneBody style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></PaneBody>;
   root.render(pane(null));
   await until(() => host.querySelectorAll('.change-file-select').length === 2, "change selection ready");
   holdStatus = true;
@@ -3950,7 +3950,7 @@ async function changesDiffFailureOwnershipRegression() {
     }
     return response({});
   };
-  root.render(<div className="pane-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>);
+  root.render(<PaneBody style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></PaneBody>);
   await until(() => host.querySelector('.diff-view')?.textContent.includes("A content"), "initial A diff");
   [...host.querySelectorAll('.change-file-select')].find((button) => button.textContent.includes("b.txt")).click();
   await settle();
@@ -3981,7 +3981,7 @@ async function diffRefreshAnchorRegression() {
     return response({});
   };
   const tree = projects[0].worktrees[0];
-  const pane = (event) => <div className="pane-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>;
+  const pane = (event) => <PaneBody style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></PaneBody>;
   root.render(pane(null));
   await until(() => host.querySelector(".diff-view")?.textContent.includes("line 0"), "large diff ready");
   const viewport = host.querySelector(".diff-view");
@@ -4037,7 +4037,7 @@ async function diffFindOwnershipRegression() {
   try {
     for (const height of [287, 294, 301, 308]) {
       root.render(null); await settle(); // NOSONAR S9382: each height starts from a fresh viewport
-      root.render(<div className="pane-body" style={{ width: 448, height }}><WindowedDiff diff={diff} label={`Diff at ${height}px`} /></div>);
+      root.render(<PaneBody style={{ width: 448, height }}><WindowedDiff diff={diff} label={`Diff at ${height}px`} /></PaneBody>);
       await until(() => host.querySelector(".diff-view")?.textContent.includes("unstaged 0"), `diff at ${height}px`); // NOSONAR S9382: each height starts from a fresh viewport
       const viewport = host.querySelector(".diff-view");
       const find = host.querySelector('input[aria-label="Find in diff"]');
@@ -4050,7 +4050,7 @@ async function diffFindOwnershipRegression() {
     // scroll's event. The commit itself must show the match at its target,
     // and while a seek has not moved the viewport yet, the window must not
     // mount the match where the viewport is not.
-    const pane = (label) => <div className="pane-body" style={{ width: 448, height: 600 }}><WindowedDiff diff={diff} label={label} /></div>;
+    const pane = (label) => <PaneBody style={{ width: 448, height: 600 }}><WindowedDiff diff={diff} label={label} /></PaneBody>;
     root.render(null); await settle();
     root.render(pane("Diff before a commit"));
     await until(() => host.querySelector(".diff-view")?.textContent.includes("unstaged 0"), "diff for a commit before a scroll event");
@@ -4065,36 +4065,91 @@ async function diffFindOwnershipRegression() {
       flushSync(() => root.render(pane("Diff committed before its scroll event")));
       assert(Math.abs(diffFindRowOffset(viewport)) < 2, `A commit before the late scroll's event left the Find match ${diffFindRowOffset(viewport)}px from its target; ${diffFindState(viewport, 2500)}`);
     });
-    root.render(null); await settle();
-    root.render(pane("Diff with a held seek"));
-    await until(() => host.querySelector(".diff-view")?.textContent.includes("unstaged 0"), "diff for a held seek");
-    const held = host.querySelector(".diff-view");
-    await withDiffTrace(held, async () => {
-      // Hold the seek over the trace's own scrollTop recorder, then give it back.
-      const traced = Object.getOwnPropertyDescriptor(held, "scrollTop");
-      Object.defineProperty(held, "scrollTop", { configurable: true, get: () => native.get.call(held), set: () => {} });
-      try {
-        const input = host.querySelector('input[aria-label="Find in diff"]');
-        setControlValue(input, "unstaged 2500");
-        flushSync(() => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
-        await settle();
-        const mark = held.querySelector('[data-find-match="true"]')?.getBoundingClientRect();
-        const view = held.getBoundingClientRect();
-        assert(!mark || (mark.bottom > view.top && mark.top < view.bottom), `A held seek mounted the Find match outside the viewport: mark=${mark?.top}, viewport=${view.top}/${view.bottom}, scroll=${held.scrollTop}, mounted=${held.dataset.mountedStart}/${held.dataset.mountedEnd}`);
-      } finally { Object.defineProperty(held, "scrollTop", traced); }
-      // Once the viewport can move, the next commit reclaims the match. The
-      // state right after that commit, and one and two frames later, tells a
-      // stale synchronous read from a frame that showed the row elsewhere.
-      flushSync(() => root.render(pane("Diff after a held seek")));
-      if (!diffFindLanded(held, "unstaged 2500", 2500)) {
-        const committed = diffFindState(held, 2500);
-        await frame();
-        const oneFrame = diffFindState(held, 2500);
-        await frame();
-        throw new Error(`A commit after a held seek did not land Find: ${committed}; +1f ${oneFrame}; +2f ${diffFindState(held, 2500)}`);
-      }
-    });
+    // macOS and Windows CI laid the committed spacer out only a frame after a
+    // held seek's commit while the pane body was a CSS size container. The
+    // same run records that case, and a scroll write with a spacer change
+    // outside React, inside such a container and outside one, and asserts
+    // only the product's pane body.
+    const sized = (label) => <PaneBody style={{ width: 448, height: 600, containerType: "size" }}><WindowedDiff diff={diff} label={label} /></PaneBody>;
+    const probe = { spacer: { sized: await spacerLayoutProbe(true), control: await spacerLayoutProbe(false) } };
+    const container = await heldSeekCommit(sized);
+    probe.heldSeek = { sized: `${container.landed ? "landed" : "NOT LANDED"} ${container.states}` };
+    results.textContent += `Container probe: ${JSON.stringify(probe)}\n`;
+    const held = await heldSeekCommit(pane);
+    results.textContent += `Container probe control: ${held.landed ? "landed" : "NOT LANDED"} ${held.states}\n`;
+    assert(!held.outside, `A held seek mounted the Find match outside the viewport: ${held.outside}`);
+    assert(held.landed, `A commit after a held seek did not land Find: ${held.states}; ${navigator.userAgent}; trace: ${held.trace}`);
   } finally { style.remove(); }
+}
+
+// Holds a Find seek, then commits once the viewport can move. That commit
+// reclaims the match. The state right after it, and one and two frames later,
+// tells a stale synchronous read from a frame that showed the row elsewhere.
+async function heldSeekCommit(pane) {
+  root.render(null); await settle();
+  root.render(pane("Diff with a held seek"));
+  await until(() => host.querySelector(".diff-view")?.textContent.includes("unstaged 0"), "diff for a held seek");
+  const held = host.querySelector(".diff-view");
+  const native = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop");
+  return withDiffTrace(held, async (trace) => {
+    // Hold the seek over the trace's own scrollTop recorder, then give it back.
+    const traced = Object.getOwnPropertyDescriptor(held, "scrollTop");
+    Object.defineProperty(held, "scrollTop", { configurable: true, get: () => native.get.call(held), set: () => {} });
+    let outside = null;
+    try {
+      const input = host.querySelector('input[aria-label="Find in diff"]');
+      setControlValue(input, "unstaged 2500");
+      flushSync(() => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
+      await settle();
+      const mark = held.querySelector('[data-find-match="true"]')?.getBoundingClientRect();
+      const view = held.getBoundingClientRect();
+      if (mark && (mark.bottom <= view.top || mark.top >= view.bottom)) outside = `mark=${mark.top}, viewport=${view.top}/${view.bottom}, scroll=${held.scrollTop}, mounted=${held.dataset.mountedStart}/${held.dataset.mountedEnd}`;
+    } finally { Object.defineProperty(held, "scrollTop", traced); }
+    flushSync(() => root.render(pane("Diff after a held seek")));
+    const landed = diffFindLanded(held, "unstaged 2500", 2500);
+    const committed = diffFindState(held, 2500);
+    await frame();
+    const oneFrame = diffFindState(held, 2500);
+    await frame();
+    return { outside, landed, states: `${committed}; +1f ${oneFrame}; +2f ${diffFindState(held, 2500)}`, trace: trace.text() };
+  });
+}
+
+// Outside React, one task writes scrollTop and grows the spacer above a diff's
+// rows, as a Find commit does. Reports the spacer's laid-out height and row
+// 40's distance from its place, right away and one and two frames later.
+async function spacerLayoutProbe(sized) {
+  const box = document.createElement("div");
+  Object.assign(box.style, { width: "448px", height: "600px", display: "grid", gridTemplateRows: "minmax(0, 1fr)", overflow: "hidden", containerType: sized ? "size" : "normal" });
+  const viewport = document.createElement("pre");
+  viewport.className = "diff-view";
+  const track = document.createElement("div");
+  track.style.height = "70000px";
+  const spacer = document.createElement("div");
+  spacer.style.height = "0px";
+  track.append(spacer);
+  for (let index = 0; index < 120; index += 1) {
+    const row = document.createElement("span");
+    row.textContent = `row ${index}`;
+    track.append(row);
+  }
+  viewport.append(track);
+  box.append(viewport);
+  document.body.append(box);
+  try {
+    const box0 = viewport.offsetHeight;
+    await frame();
+    await frame();
+    viewport.scrollTop = 34820;
+    spacer.style.height = "34258px";
+    const row = track.children[41];
+    const read = () => `${spacer.offsetHeight}/${row.offsetTop - track.offsetTop - 34258 - 40 * 14}`;
+    const committed = read();
+    await frame();
+    const oneFrame = read();
+    await frame();
+    return `box=${box0} spacer/offsetPlace commit=${committed} +1f=${oneFrame} +2f=${read()} scroll=${viewport.scrollTop}`;
+  } finally { box.remove(); }
 }
 
 // The Find row's distance from a third of the way down the diff rows. The
@@ -4232,7 +4287,7 @@ async function diffScrollbarFeedbackRegression() {
   const render = async (long) => {
     diff = Array.from({ length: 5_000 }, (_, index) => index === long ? `+${"x".repeat(400)}\n` : `+line ${index}\n`).join("");
     root.render(null); await settle();
-    root.render(<div className="pane-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>);
+    root.render(<PaneBody style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></PaneBody>);
     await until(() => host.querySelector(".diff-view")?.textContent.includes("line 0"), `diff with a long row at ${long} ready`);
     return host.querySelector(".diff-view");
   };
@@ -4287,7 +4342,7 @@ async function diffFindResizeRegression() {
   let probe;
   let trace;
   try {
-    root.render(<div className="pane-body" style={{ width: 448, height: 600 }}><WindowedDiff diff={diff} label="Resized diff" /></div>);
+    root.render(<PaneBody style={{ width: 448, height: 600 }}><WindowedDiff diff={diff} label="Resized diff" /></PaneBody>);
     await until(() => host.querySelector(".diff-view")?.textContent.includes("unstaged 0"), "resizable diff ready");
     const viewport = host.querySelector(".diff-view");
     trace = traceDiffViewport(viewport);
@@ -4344,7 +4399,7 @@ async function changesMutationOwnerRegression(reject = false, mode = "stage") {
     if (url.pathname === `/api/git/${mode}`) return pending.promise;
     return response({});
   };
-  const pane = (tree) => <div className="pane-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>;
+  const pane = (tree) => <PaneBody style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></PaneBody>;
   root.render(pane(projects[0].worktrees[0]));
   await until(() => host.querySelector('.pane-toolbar strong')?.textContent === "A branch", "A changes ready");
   host.querySelector(`[aria-label="${mode === "unstage" ? "Unstage" : "Stage"} file.txt"]`).click();
@@ -4372,7 +4427,7 @@ async function changesCommitOwnerRegression(reject = false) {
     if (url.pathname === "/api/git/commit") return pending.promise;
     return response({});
   };
-  const pane = (tree) => <div className="pane-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={(message) => toasts.push(message)} /></div>;
+  const pane = (tree) => <PaneBody style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={(message) => toasts.push(message)} /></PaneBody>;
   root.render(pane(projects[0].worktrees[0]));
   await until(() => host.querySelector('.pane-toolbar strong')?.textContent === "A branch", "A commit pane ready");
   setControlValue(host.querySelector('[aria-label="Commit message"]'), "Commit A");
@@ -4399,7 +4454,7 @@ async function productionDiffViewportRegression() {
     if (url.pathname === "/api/git/diff") return response({ diff: url.searchParams.get("staged") === "true" ? staged : unstaged });
     return response({});
   };
-  root.render(<div className="pane-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>);
+  root.render(<PaneBody style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></PaneBody>);
   await until(() => host.querySelector('.diff-view')?.textContent.includes("-unstaged 0"), "initial production diff");
   host.querySelector('[aria-label="Diff view"] button[aria-pressed="false"]').click();
   await until(() => host.querySelector('.diff-view')?.textContent.includes("+staged 0"), "staged production diff");
@@ -4520,7 +4575,7 @@ async function productionDiffViewportRegression() {
   await until(() => viewport.textContent.includes("unstaged 49999"), "real End takes ownership after Find");
   host.querySelector('[aria-label="Next diff match"]').click();
   await until(matchIsVisible, "Find realigns after a real End key");
-  root.render(<div className="pane-body" style={{ width: 320, height: 480 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>);
+  root.render(<PaneBody style={{ width: 320, height: 480 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></PaneBody>);
   await settle();
   assert(host.querySelector('.diff-view').clientHeight > 0 && host.querySelector('.diff-view').clientHeight < 480, "Narrow pane lost its bounded diff viewport");
   assert(host.querySelector('.diff-view').querySelectorAll("span").length < 200, "Narrow pane mounted all diff lines");
@@ -5958,7 +6013,8 @@ async function queuedRunAccountRegression() {
       await until(() => window.innerWidth === 900, "real 900px layout");
       window.dispatchEvent(new Event("resize"));
       await settle();
-      assert(!host.querySelector(".conversation-header .conversation-meta small:not(.conversation-account)")?.checkVisibility(), "the header run summary is hidden at 900px");
+      // A pane marks its size tiers at a rendering update, as a user sees it.
+      await until(() => !host.querySelector(".conversation-header .conversation-meta small:not(.conversation-account)")?.checkVisibility(), "the header run summary is hidden at 900px");
       visible("while it runs");
       const earlier = { id: "earlier-1", role: "assistant", kind: "text", body: "Earlier answer", payload: {}, createdAt: new Date(0).toISOString() };
       detail = { ...chats.A, runs: [{ ...launched, status: "running" }], messages: [earlier],

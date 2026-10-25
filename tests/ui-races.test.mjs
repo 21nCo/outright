@@ -939,6 +939,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     const performanceFixture = state.text.match(/Performance fixture: (\{[^\n]+\})/);
     if (!process.env.OUTRIGHT_UI_STEP) assert.ok(performanceFixture, "large fixture measurements were not recorded");
     if (performanceFixture) console.log(`UI performance: ${performanceFixture[1]}`);
+    for (const probe of state.text.match(/Container probe[^\n]*/g) ?? []) console.log(`UI ${probe}`);
     if (!process.env.OUTRIGHT_UI_STEP) console.log(`UI fixture timings: ${fixtureProgress(state)}`);
     if (foreignPages.length) console.log(`UI fixture restored its tab after the browser opened: ${foreignPages.join(", ")}`);
     if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
