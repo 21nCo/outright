@@ -35,9 +35,16 @@ let timedOut = false;
 let escalation;
 let currentFile = null;
 let currentFileStartedAt = 0;
+const fileTimings = [];
+const suiteStartedAt = Date.now();
+// Windows CI ran the serial files ahead of the browser fixture in 870-1142s,
+// and the full fixture takes at least 143s. The 30-minute job also spends
+// about 160s before npm test and 40s after it, so 1440s covers that suite
+// with headroom and leaves at least 120s of the job timeout.
+const maxSuiteTimeoutMs = 1_440_000;
 const requestedTimeout = Number(process.env.OUTRIGHT_TEST_SUITE_TIMEOUT_MS);
 const suiteTimeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
-  ? Math.min(1_200_000, Math.max(1000, requestedTimeout)) : 1_200_000;
+  ? Math.min(maxSuiteTimeoutMs, Math.max(1000, requestedTimeout)) : maxSuiteTimeoutMs;
 // The suite owns each file serially. Windows' native and SQLite files consume
 // most of the old 10-minute global budget before the browser file begins;
 // retain a bounded per-file deadline and allow the browser its full turn.
@@ -132,7 +139,9 @@ async function runFile(file) {
     try { console.error(`CI failed test runner group: runner=${runner.pid} members=${JSON.stringify(liveGroupMembers(runner.pid).slice(0, 32))}`); }
     catch (error) { console.error(error.message); }
   }
-  if (process.env.CI) console.error(`CI test runner closed: file=${path.basename(file)} runner=${runner.pid} status=${closed.status} signal=${closed.signal ?? "none"} launcher=${process.pid} parent=${process.ppid}`);
+  const elapsedMs = Date.now() - currentFileStartedAt;
+  fileTimings.push(`${path.basename(file)}=${Math.round(elapsedMs / 1000)}s`);
+  if (process.env.CI) console.error(`CI test runner closed: file=${path.basename(file)} runner=${runner.pid} status=${closed.status} signal=${closed.signal ?? "none"} elapsedMs=${elapsedMs} launcher=${process.pid} parent=${process.ppid}`);
   if (process.platform !== "win32") signalRunner("SIGKILL");
   const groupGone = runner.pid ? await reapGroup(runner.pid) : true;
   child = null;
@@ -159,6 +168,8 @@ try {
   passed = false;
 } finally {
   clearTimeout(deadline);
+  const totalMs = Date.now() - suiteStartedAt;
+  if (process.env.CI) console.error(`CI test suite timings: totalMs=${totalMs} budgetMs=${suiteTimeoutMs} remainingMs=${suiteTimeoutMs - totalMs} files=${fileTimings.join(" ")}`);
   clearTimeout(escalation);
   for (const [signal, handler] of signalHandlers) process.off(signal, handler);
 }

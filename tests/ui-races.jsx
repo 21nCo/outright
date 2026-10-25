@@ -4065,26 +4065,31 @@ async function diffFindOwnershipRegression() {
       flushSync(() => root.render(pane("Diff committed before its scroll event")));
       assert(Math.abs(diffFindRowOffset(viewport)) < 2, `A commit before the late scroll's event left the Find match ${diffFindRowOffset(viewport)}px from its target; ${diffFindState(viewport, 2500)}`);
     });
-    // macOS and Windows CI laid the committed spacer out only a frame after a
-    // held seek's commit while the pane body was a CSS size container. The
-    // same run records that case, and a scroll write with a spacer change
-    // outside React, inside such a container and outside one, and asserts
-    // only the product's pane body.
+    // On macOS and Windows CI, layout forced in the task that writes scrollTop
+    // and then grows the spacer still shows the old spacer, even outside React
+    // and outside a size container; the first frame shows the new one. A held
+    // seek's commit is therefore judged at its first animation frame, before
+    // paint. A CSS size container delayed that frame's layout too, so the
+    // same run records the held seek in one, and the probe's write orders.
     const sized = (label) => <PaneBody style={{ width: 448, height: 600, containerType: "size" }}><WindowedDiff diff={diff} label={label} /></PaneBody>;
     const probe = { spacer: { sized: await spacerLayoutProbe(true), control: await spacerLayoutProbe(false) } };
     const container = await heldSeekCommit(sized);
-    probe.heldSeek = { sized: `${container.landed ? "landed" : "NOT LANDED"} ${container.states}` };
+    probe.heldSeek = { sized: `${container.landed ? "landed" : "NOT LANDED"} at its first frame; ${container.states}` };
     results.textContent += `Container probe: ${JSON.stringify(probe)}\n`;
+    const matrix = {};
+    for (const order of ["scroll>spacer", "spacer>scroll", "spacer", "scroll>spacer>style"]) matrix[order] = await spacerLayoutProbe(false, order); // NOSONAR S9382: each order needs its own fresh layout
+    results.textContent += `Container probe matrix: ${JSON.stringify(matrix)}\n`;
     const held = await heldSeekCommit(pane);
-    results.textContent += `Container probe control: ${held.landed ? "landed" : "NOT LANDED"} ${held.states}\n`;
+    results.textContent += `Container probe control: ${held.landed ? "landed" : "NOT LANDED"} at its first frame; ${held.states}\n`;
     assert(!held.outside, `A held seek mounted the Find match outside the viewport: ${held.outside}`);
-    assert(held.landed, `A commit after a held seek did not land Find: ${held.states}; ${navigator.userAgent}; trace: ${held.trace}`);
+    assert(held.landed, `A commit after a held seek did not land Find by its first frame${held.reason}: ${held.states}; ${navigator.userAgent}; trace: ${held.trace}`);
   } finally { style.remove(); }
 }
 
 // Holds a Find seek, then commits once the viewport can move. That commit
-// reclaims the match. The state right after it, and one and two frames later,
-// tells a stale synchronous read from a frame that showed the row elsewhere.
+// reclaims the match, and its first animation frame must show the match row
+// at its target, before paint, with no scroll write since the commit. The
+// commit's own state is recorded beside it, and one tick later.
 async function heldSeekCommit(pane) {
   root.render(null); await settle();
   root.render(pane("Diff with a held seek"));
@@ -4106,19 +4111,49 @@ async function heldSeekCommit(pane) {
       if (mark && (mark.bottom <= view.top || mark.top >= view.bottom)) outside = `mark=${mark.top}, viewport=${view.top}/${view.bottom}, scroll=${held.scrollTop}, mounted=${held.dataset.mountedStart}/${held.dataset.mountedEnd}`;
     } finally { Object.defineProperty(held, "scrollTop", traced); }
     flushSync(() => root.render(pane("Diff after a held seek")));
-    const landed = diffFindLanded(held, "unstaged 2500", 2500);
-    const committed = diffFindState(held, 2500);
-    await frame();
-    const oneFrame = diffFindState(held, 2500);
-    await frame();
-    return { outside, landed, states: `${committed}; +1f ${oneFrame}; +2f ${diffFindState(held, 2500)}`, trace: trace.text() };
+    const writes = trace.writeCount();
+    const landedNow = () => diffFindLanded(held, "unstaged 2500", 2500);
+    const committed = `commit ${landedNow() ? "landed" : "not landed"} ${diffFindState(held, 2500)}`;
+    const painted = await paintFrame(() => ({ landed: landedNow(), state: diffFindState(held, 2500), writes: trace.writeCount() - writes }));
+    const source = await namedTick();
+    const later = { landed: landedNow(), writes: trace.writeCount() - writes };
+    const reason = [!painted && " (no animation frame within 1s)", painted?.writes && " (a scroll write landed before it)",
+      painted?.landed && !later.landed && " (it moved one tick later)", later.writes && " (a scroll write landed one tick later)"].find(Boolean) || "";
+    return {
+      outside,
+      landed: Boolean(painted?.landed) && later.landed && later.writes === 0,
+      reason,
+      states: `${committed}; first frame ${painted ? `${painted.landed ? "landed" : "not landed"} ${painted.state}` : "none"}; +1 ${source} tick ${diffFindState(held, 2500)}`,
+      trace: trace.text(),
+    };
+  });
+}
+
+// Reads layout in the next real animation frame, after the frame's earlier
+// callbacks and before it paints; null when none comes, as on a hidden page.
+function paintFrame(read) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => { window.cancelAnimationFrame(request); resolve(null); }, 1000);
+    const request = fixtureNativeFrame(() => { clearTimeout(timer); resolve(read()); });
+  });
+}
+
+// One fixture tick, as frame() takes it, named by what ended it: a real
+// animation frame or the 32ms timer fallback.
+function namedTick() {
+  return new Promise((resolve) => {
+    const finish = (source) => { window.cancelAnimationFrame(request); clearTimeout(timer); resolve(source); };
+    const request = fixtureNativeFrame(() => finish("raf"));
+    const timer = setTimeout(() => finish("timer"), 32);
   });
 }
 
 // Outside React, one task writes scrollTop and grows the spacer above a diff's
-// rows, as a Find commit does. Reports the spacer's laid-out height and row
-// 40's distance from its place, right away and one and two frames later.
-async function spacerLayoutProbe(sized) {
+// rows, as a Find commit does, in the given order; "style" reads the spacer's
+// computed height before its layout. Reports the spacer's laid-out height and
+// row 40's distance from its place, right away, after two named ticks and in
+// the next real animation frame.
+async function spacerLayoutProbe(sized, order = "scroll>spacer") {
   const box = document.createElement("div");
   Object.assign(box.style, { width: "448px", height: "600px", display: "grid", gridTemplateRows: "minmax(0, 1fr)", overflow: "hidden", containerType: sized ? "size" : "normal" });
   const viewport = document.createElement("pre");
@@ -4140,15 +4175,16 @@ async function spacerLayoutProbe(sized) {
     const box0 = viewport.offsetHeight;
     await frame();
     await frame();
-    viewport.scrollTop = 34820;
-    spacer.style.height = "34258px";
+    const steps = { scroll: () => { viewport.scrollTop = 34820; }, spacer: () => { spacer.style.height = "34258px"; }, style: () => getComputedStyle(spacer).height };
+    for (const step of order.split(">")) steps[step]();
     const row = track.children[41];
     const read = () => `${spacer.offsetHeight}/${row.offsetTop - track.offsetTop - 34258 - 40 * 14}`;
     const committed = read();
-    await frame();
+    const first = await namedTick();
     const oneFrame = read();
-    await frame();
-    return `box=${box0} spacer/offsetPlace commit=${committed} +1f=${oneFrame} +2f=${read()} scroll=${viewport.scrollTop}`;
+    const second = await namedTick();
+    const twoFrames = read();
+    return `box=${box0} spacer/offsetPlace commit=${committed} +1f(${first})=${oneFrame} +2f(${second})=${twoFrames} raf=${await paintFrame(read) ?? "none"} scroll=${viewport.scrollTop}`;
   } finally { box.remove(); }
 }
 
@@ -4245,6 +4281,7 @@ function traceDiffViewport(viewport) {
   return {
     firstMarkedOffset: () => firstMarked,
     unexplained: () => unexplained,
+    writeCount: () => writes.length,
     text: () => entries.join(" | "),
     stop() {
       window.cancelAnimationFrame(frameRequest);
