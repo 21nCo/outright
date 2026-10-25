@@ -1,0 +1,25 @@
+src/components/PaneLayout.jsx
+  s_92427ff18a8304::t_69694e47980818 87-117,418
+src/styles.css
+  s_92427ff18a8304::t_8226094d8e45db 258,340,353,602-603,605,613,617,637
+tests/ui-races.jsx
+  s_92427ff18a8304::t_793719ae6d16f2 14,3900,3953,3984,4040,4053,4068-4081,4085-4154,4290,4345,4402,4430,4457,4578,6016-6017
+tests/ui-races.test.mjs
+  s_92427ff18a8304::t_e5b844c335540f 942
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f2bed89a088840395566b1127c4d225e9a33c748",
+  "prompts": {},
+  "sessions": {
+    "s_92427ff18a8304": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26336501-b0e6-4534-a7c2-345f5528a4ba",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
