@@ -1,0 +1,21 @@
+scripts/run-tests.mjs
+  s_fa2f447dc1245d::t_6cb291334b33f1 38-44,47,142-144,171-172
+tests/ui-races.jsx
+  s_fa2f447dc1245d::t_756f33dce9b3a6 4068-4073,4077,4079-4081,4083,4085,4090-4092,4114-4147,4152-4156,4178-4179,4183,4185-4187,4284
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d33562d869e1cfbc9dccfde2526850d32208f4c5",
+  "prompts": {},
+  "sessions": {
+    "s_fa2f447dc1245d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_fa2f447dc1245d",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
