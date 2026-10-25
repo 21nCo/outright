@@ -4063,25 +4063,37 @@ async function diffFindOwnershipRegression() {
       await until(() => diffFindLanded(viewport, "unstaged 2500", 2500), "Find before a late scroll and commit");
       native.set.call(viewport, viewport.scrollHeight);
       flushSync(() => root.render(pane("Diff committed before its scroll event")));
-      assert(Math.abs(diffFindRowOffset(viewport)) < 2, `A commit before the late scroll's event left the Find match ${diffFindRowOffset(viewport)}px from its target; scroll=${viewport.scrollTop}; mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`);
+      assert(Math.abs(diffFindRowOffset(viewport)) < 2, `A commit before the late scroll's event left the Find match ${diffFindRowOffset(viewport)}px from its target; ${diffFindState(viewport, 2500)}`);
     });
     root.render(null); await settle();
     root.render(pane("Diff with a held seek"));
     await until(() => host.querySelector(".diff-view")?.textContent.includes("unstaged 0"), "diff for a held seek");
     const held = host.querySelector(".diff-view");
-    Object.defineProperty(held, "scrollTop", { configurable: true, get: () => native.get.call(held), set: () => {} });
-    try {
-      const input = host.querySelector('input[aria-label="Find in diff"]');
-      setControlValue(input, "unstaged 2500");
-      flushSync(() => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
-      await settle();
-      const mark = held.querySelector('[data-find-match="true"]')?.getBoundingClientRect();
-      const view = held.getBoundingClientRect();
-      assert(!mark || (mark.bottom > view.top && mark.top < view.bottom), `A held seek mounted the Find match outside the viewport: mark=${mark?.top}, viewport=${view.top}/${view.bottom}, scroll=${held.scrollTop}, mounted=${held.dataset.mountedStart}/${held.dataset.mountedEnd}`);
-    } finally { delete held.scrollTop; }
-    // Once the viewport can move, the next commit reclaims the match.
-    flushSync(() => root.render(pane("Diff after a held seek")));
-    assert(diffFindLanded(held, "unstaged 2500", 2500), `A commit after a held seek did not land Find: scroll=${held.scrollTop}; mounted=${held.dataset.mountedStart}/${held.dataset.mountedEnd}`);
+    await withDiffTrace(held, async () => {
+      // Hold the seek over the trace's own scrollTop recorder, then give it back.
+      const traced = Object.getOwnPropertyDescriptor(held, "scrollTop");
+      Object.defineProperty(held, "scrollTop", { configurable: true, get: () => native.get.call(held), set: () => {} });
+      try {
+        const input = host.querySelector('input[aria-label="Find in diff"]');
+        setControlValue(input, "unstaged 2500");
+        flushSync(() => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
+        await settle();
+        const mark = held.querySelector('[data-find-match="true"]')?.getBoundingClientRect();
+        const view = held.getBoundingClientRect();
+        assert(!mark || (mark.bottom > view.top && mark.top < view.bottom), `A held seek mounted the Find match outside the viewport: mark=${mark?.top}, viewport=${view.top}/${view.bottom}, scroll=${held.scrollTop}, mounted=${held.dataset.mountedStart}/${held.dataset.mountedEnd}`);
+      } finally { Object.defineProperty(held, "scrollTop", traced); }
+      // Once the viewport can move, the next commit reclaims the match. The
+      // state right after that commit, and one and two frames later, tells a
+      // stale synchronous read from a frame that showed the row elsewhere.
+      flushSync(() => root.render(pane("Diff after a held seek")));
+      if (!diffFindLanded(held, "unstaged 2500", 2500)) {
+        const committed = diffFindState(held, 2500);
+        await frame();
+        const oneFrame = diffFindState(held, 2500);
+        await frame();
+        throw new Error(`A commit after a held seek did not land Find: ${committed}; +1f ${oneFrame}; +2f ${diffFindState(held, 2500)}`);
+      }
+    });
   } finally { style.remove(); }
 }
 
@@ -4103,6 +4115,28 @@ function diffRowPlacement(viewport) {
   const padding = Number.parseFloat(getComputedStyle(viewport).paddingTop) || 0;
   const trackTop = track.getBoundingClientRect().top;
   return { place: row.getBoundingClientRect().top - trackTop - line * 14, track: trackTop - (viewport.getBoundingClientRect().top + padding - viewport.scrollTop) };
+}
+
+// Everything that decides whether Find landed, for a failure message: the
+// scroll position against its target, the committed window, the mark, and the
+// row's place from layout offsets, which involve no scrolling, beside its
+// place from rects, which do.
+function diffFindState(viewport, line) {
+  const row = viewport.querySelector('[data-find-match="true"]');
+  const track = viewport.firstElementChild;
+  const spacer = track?.querySelector(".diff-spacer");
+  const spacerSize = spacer ? `${spacer.style.height}/${spacer.offsetHeight}` : "none";
+  const placement = diffRowPlacement(viewport);
+  const fixed = (value) => Number.isFinite(value) ? value.toFixed(2) : String(value);
+  return [
+    `scroll=${viewport.scrollTop} findTop=${fixed(diffFindTop(viewport, line))}`,
+    `box=${viewport.offsetHeight} client=${viewport.clientHeight} scrollHeight=${viewport.scrollHeight}`,
+    `first=${viewport.dataset.firstLine} mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`,
+    `mark=${row ? JSON.stringify(row.textContent.trim()) : "none"} row=${fixed(diffFindRowOffset(viewport))}`,
+    placement ? `place=${fixed(placement.place)} track=${fixed(placement.track)}` : "place=unmounted",
+    `offsetPlace=${row && track ? row.offsetTop - track.offsetTop - line * 14 : "unmounted"}`,
+    `spacer=${spacerSize} page=${document.visibilityState}`,
+  ].join(" ");
 }
 
 // Records what moves a diff viewport, by animation frame: each script write to
