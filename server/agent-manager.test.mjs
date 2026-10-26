@@ -114,6 +114,8 @@ test("builds sandboxed provider commands with model and reasoning settings", () 
   const codex = buildProviderCommand(conversation, { provider: "codex", model: "gpt-5.4", reasoningEffort: "high", approvalPolicy: "read-only", prompt: "Review" });
   assert.deepEqual(codex.args.slice(0, 6), ["exec", "--json", "-C", "/tmp/project", "--sandbox", "read-only"]);
   assert.ok(codex.args.includes("model_reasoning_effort=\"high\""));
+  assert.ok(codex.args.some((arg) => arg.startsWith('mcp_servers.subset_usage.command=')));
+  assert.ok(codex.args.some((arg) => arg.includes('subset-usage-mcp.mjs')));
 
   const claude = buildProviderCommand(conversation, { provider: "claude", model: "sonnet", reasoningEffort: "xhigh", approvalPolicy: "workspace-write", prompt: "Implement" });
   assert.ok(claude.args.includes("acceptEdits"));
@@ -124,6 +126,7 @@ test("keeps the selected sandbox policy when resuming Codex sessions", () => {
   const resumedConversation = { ...conversation, providerSessionId: "session-1" };
   const readOnly = buildProviderCommand(resumedConversation, { provider: "codex", reasoningEffort: "medium", approvalPolicy: "read-only", prompt: "Review" });
   assert.ok(readOnly.args.includes('sandbox_mode="read-only"'));
+  assert.ok(readOnly.args.some((arg) => arg.includes('subset-usage-mcp.mjs')));
   assert.equal(readOnly.args.includes("--dangerously-bypass-approvals-and-sandbox"), false);
 
   const workspaceWrite = buildProviderCommand(resumedConversation, { provider: "codex", reasoningEffort: "medium", approvalPolicy: "workspace-write", prompt: "Implement" });

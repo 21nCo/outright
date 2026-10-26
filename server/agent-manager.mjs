@@ -5,6 +5,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const MAX_PROVIDER_LINE_BYTES = 1024 * 1024;
+const SUBSET_USAGE_MCP_PATH = fileURLToPath(new URL('./subset-usage-mcp.mjs', import.meta.url));
+const SUBSET_USAGE_MCP_CONFIG = [
+  '-c', `mcp_servers.subset_usage.command=${JSON.stringify(process.execPath)}`,
+  '-c', `mcp_servers.subset_usage.args=${JSON.stringify([SUBSET_USAGE_MCP_PATH])}`,
+];
 const MAX_ASSISTANT_BYTES = 1024 * 1024;
 const MAX_PROCESS_EVENT_BYTES = 64 * 1024;
 const MAX_ASSISTANT_EVENT_BYTES = 255 * 1024;
@@ -1016,6 +1021,7 @@ export function buildProviderCommand(conversation, run) {
 
   if (conversation.providerSessionId) {
     const args = ["exec", "resume", "--json"];
+    args.push(...SUBSET_USAGE_MCP_CONFIG);
     if (run.model) args.push("--model", run.model);
     if (validReasoningEffort(run.reasoningEffort)) args.push("-c", `model_reasoning_effort=${JSON.stringify(run.reasoningEffort)}`);
     if (run.approvalPolicy === "danger-full-access") args.push("--dangerously-bypass-approvals-and-sandbox");
@@ -1025,6 +1031,7 @@ export function buildProviderCommand(conversation, run) {
   }
   const sandbox = ["read-only", "workspace-write", "danger-full-access"].includes(run.approvalPolicy) ? run.approvalPolicy : "workspace-write";
   const args = ["exec", "--json", "-C", conversation.worktreePath, "--sandbox", sandbox];
+  args.push(...SUBSET_USAGE_MCP_CONFIG);
   if (run.model) args.push("--model", run.model);
   if (validReasoningEffort(run.reasoningEffort)) args.push("-c", `model_reasoning_effort=${JSON.stringify(run.reasoningEffort)}`);
   args.push(run.prompt);

@@ -11,6 +11,7 @@ import { createTerminalManager } from "./terminal-manager.mjs";
 import { createGitService } from "./git-service.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
+import { readSubsetUsage } from "./subset-usage.mjs";
 
 export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000 }) {
   // The database-backed lease is acquired before reconciliation so another
@@ -121,6 +122,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     try {
       assertRuntimeRequest(request, allowedHosts);
       if (shuttingDown) throw apiError(503, "Runtime is shutting down");
+      if (url.pathname === "/api/subset/usage" && request.method === "GET") return json(response, 200, await readSubsetUsage());
       if (url.pathname === "/api/bootstrap" && request.method === "GET") {
         const scan = await projects();
         return json(response, 200, {

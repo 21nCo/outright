@@ -338,6 +338,14 @@ button, input, textarea, select { font: inherit; }
 .inspector > header nav button:hover, .inspector > header nav button.is-active { color: var(--foreground); }
 .inspector > header nav button.is-active::after { content: ""; position: absolute; inset: auto 8px 0; height: 2px; background: var(--foreground); }
 .inspector-body { min-height: 0; overflow: hidden; }
+.subset-usage-pane { height: 100%; min-height: 0; display: flex; flex-direction: column; gap: 10px; padding: 12px; }
+.subset-usage-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.subset-usage-toolbar h2 { font-size: 13px; font-weight: 650; }
+.subset-usage-toolbar button { border: 1px solid var(--line-soft); border-radius: 7px; background: var(--background); color: var(--foreground); padding: 5px 9px; cursor: pointer; }
+.subset-usage-toolbar button:focus-visible { outline: 2px solid var(--foreground); outline-offset: 2px; }
+.subset-usage-fallback { font-size: 11px; color: var(--muted-foreground); }
+.subset-usage-fallback pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 8px 0; font: inherit; }
+.subset-usage-pane iframe { flex: 1; min-height: 0; width: 100%; border: 1px solid var(--line-soft); border-radius: 8px; background: #f4f3ef; }
 .workspace-tools { white-space: nowrap; }
 .run-state { height: 25px; padding: 0 8px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line-soft); border-radius: 999px; color: var(--foreground); font-size: 9px; }
 .run-state small { color: inherit; }

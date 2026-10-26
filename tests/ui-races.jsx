@@ -172,9 +172,9 @@ async function chatTabControlRegression() {
   const inspectorTab = host.querySelector("#inspector-tab-changes");
   await assertVerticalKeysIgnored(inspectorTab, inspectorTab, "Inspector");
   inspectorTab.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true, cancelable: true }));
-  await until(() => host.querySelector('#inspector-tab-context[aria-selected="true"]'), "End selects final inspector tab");
-  host.querySelector("#inspector-tab-context").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
-  await until(() => host.querySelector('#inspector-tab-terminal[aria-selected="true"]'), "left arrow selects terminal inspector tab");
+  await until(() => host.querySelector('#inspector-tab-usage[aria-selected="true"]'), "End selects final inspector tab");
+  host.querySelector("#inspector-tab-usage").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
+  await until(() => host.querySelector('#inspector-tab-context[aria-selected="true"]'), "left arrow selects context inspector tab");
 }
 
 async function chatSettingsArchiveRegression() {

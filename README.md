@@ -45,6 +45,14 @@ npm start
 
 The production server binds to `127.0.0.1:4173` by default. Use `PORT` or `HOST` to change that behavior.
 
+## Subset Codex usage preview (SET-1)
+
+The Usage inspector reads Subset's local read-only status service and renders its versioned `subset.usage.dashboard@1` view in an iframe. Start Subset's `@subset/usage-web` host on `127.0.0.1:4174` with explicitly configured Codex homes before opening this panel; see the [Subset usage README](/Users/serro/Documents/dev/n/subset/packages/usage/README.md) for setup. Each Codex home must be signed in to the intended ChatGPT account. Outright receives only normalized account status, never Codex credentials. If the service is unavailable or its contract differs, the inspector shows an error; the text status remains available when the view loads.
+
+Outright configures a read-only `subset_usage_status` MCP tool for Codex agent runs through a per-run CLI override. The tool returns structured status and a text fallback, including the registered view ID. The Usage inspector renders that view; users can open it alongside the agent transcript. Outright uses `@mcpfn/core@0.0.5` for the MCP protocol and has no package or runtime path dependency on Subset.
+
+The tool passed a direct MCP protocol check, and an isolated Outright run called it. That run could not settle: Outright's macOS `launchctl submit` supervisor relaunched Codex after it exited. The run was stopped, and this integration must remain a preview until the supervisor's one-shot lifecycle is repaired and a clean agent run is verified. Hosted agent rendering and a released Subset surface are also unverified.
+
 ## Configure discovery
 
 Edit `outright.config.json`, or provide scan roots as a platform-delimited environment variable:
