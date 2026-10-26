@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  authorizeRecovery,
   createLedger,
   evaluateLedger,
   ledgerPath,
@@ -16,6 +17,18 @@ import {
 } from "./pr-remediation-ledger.mjs";
 
 const skill = { identity: "21n/pr-refetch-fix@1.3.0", digest: "sha256:test" };
+
+test("recovery authorization requires a stalled exact head and the next round", () => {
+  const state = createLedger({ prNumber: 3, prUrl: "url", head: "head", skill });
+  state.rounds = [{ round: 11 }];
+  state.convergenceEvaluations = [{ head: "head", gate: { mode: "stalled" } }];
+  const decision = { head: "head", round: 12, authorizedBy: "user", reason: "stalled progress", scope: "bounded fixture repair", verificationCriteria: "three OS CI" };
+  assert.throws(() => authorizeRecovery(state, { ...decision, head: "other" }), /current head/);
+  assert.throws(() => authorizeRecovery(state, { ...decision, round: 13 }), /next round/);
+  authorizeRecovery(state, decision);
+  assert.equal(state.recoveryAuthorizations[0].round, 12);
+  assert.throws(() => authorizeRecovery(state, decision), /already authorized/);
+});
 
 test("round-trips the machine-readable state through the persistent Markdown ledger", () => {
   const state = createLedger({ prNumber: 2, prUrl: "https://github.com/21nCo/outright/pull/2", head: "abc", skill });
@@ -39,6 +52,7 @@ test("a complete architecture assessment opens the reset implementation gate", (
   const state = createLedger({ prNumber: 2, prUrl: "url", head: "abc", skill });
   recordFailure(state, { familyId: "tree-reaping", title: "Reap", round: 2, head: "a", evidence: "one" });
   recordFailure(state, { familyId: "tree-reaping", title: "Reap", round: 3, head: "b", evidence: "two" });
+  state.rounds = [{ round: 2 }, { round: 3 }];
   recordAssessment(state, {
     familyId: "tree-reaping",
     invariant: "No provider process-group members remain after stop",
@@ -46,6 +60,8 @@ test("a complete architecture assessment opens the reset implementation gate", (
     coordinatedPlan: "Use an outside-group child subreaper guardian",
     verificationCriteria: "Old head fails and new head leaves zero /proc members"
   });
+  assert.equal(state.families["tree-reaping"].assessment.head, "b");
+  assert.equal(state.families["tree-reaping"].assessment.round, 4);
   assert.deepEqual(evaluateLedger(state), {
     ok: true,
     mode: "architecture_reset",

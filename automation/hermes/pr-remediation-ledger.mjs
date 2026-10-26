@@ -74,8 +74,31 @@ export function recordAssessment(state, { familyId, invariant, failingEvidence, 
   for (const [field, value] of Object.entries(assessment)) {
     if (!String(value ?? "").trim()) throw new Error(`Architecture assessment requires ${field}`);
   }
-  family.assessment = assessment;
+  family.assessment = {
+    ...assessment,
+    head: state.currentHead,
+    round: Math.max(0, ...(state.rounds ?? []).map((entry) => Number(entry.round))) + 1
+  };
   family.state = "architecture_assessed";
+  return state;
+}
+
+export function authorizeRecovery(state, { head, round, authorizedBy, reason, scope, verificationCriteria }) {
+  const nextRound = Math.max(0, ...(state.rounds ?? []).map((entry) => Number(entry.round))) + 1;
+  if (head !== state.currentHead || Number(round) !== nextRound) {
+    throw new Error(`Recovery must target current head ${state.currentHead} and next round ${nextRound}`);
+  }
+  const evaluated = (state.convergenceEvaluations ?? []).find((entry) => entry.head === head);
+  if (evaluated?.gate?.mode !== "stalled") throw new Error(`No stalled convergence evaluation for ${head}`);
+  const decision = { head, round: nextRound, authorizedBy, reason, scope, verificationCriteria };
+  for (const [field, value] of Object.entries(decision)) {
+    if (!String(value ?? "").trim()) throw new Error(`Recovery authorization requires ${field}`);
+  }
+  state.recoveryAuthorizations ??= [];
+  if (state.recoveryAuthorizations.some((entry) => entry.head === head && entry.round === nextRound)) {
+    throw new Error(`Recovery already authorized for ${head} round ${nextRound}`);
+  }
+  state.recoveryAuthorizations.push({ ...decision, recordedAt: new Date().toISOString() });
   return state;
 }
 
@@ -148,6 +171,18 @@ export function runCli(args, root = process.cwd()) {
     writeLedger(path, state);
     return { path, state, gate: evaluateLedger(state) };
   }
+  if (command === "authorize-recovery") {
+    authorizeRecovery(state, {
+      head: value(args, "--head"),
+      round: value(args, "--round"),
+      authorizedBy: value(args, "--authorized-by"),
+      reason: value(args, "--reason"),
+      scope: value(args, "--scope"),
+      verificationCriteria: value(args, "--verification")
+    });
+    writeLedger(path, state);
+    return { path, recovery: state.recoveryAuthorizations.at(-1), gate: evaluateLedger(state) };
+  }
   if (command === "resolve-family") {
     const familyId = value(args, "--family");
     const family = state.families[familyId];
@@ -173,6 +208,8 @@ export function runCli(args, root = process.cwd()) {
     state.rounds = (state.rounds ?? []).filter((item) => item.round !== round);
     state.rounds.push(entry);
     state.rounds.sort((a, b) => a.round - b.round);
+    const recovery = (state.recoveryAuthorizations ?? []).find((item) => item.round === round && item.head === entry.snapshotHead);
+    if (recovery) recovery.completedAt = new Date().toISOString();
     state.currentHead = entry.pushedHead || entry.snapshotHead;
     writeLedger(path, state);
     return { path, state, gate: evaluateLedger(state) };

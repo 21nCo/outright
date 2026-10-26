@@ -2,13 +2,18 @@
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { evaluateLedger, ledgerPath, readLedger } from "./pr-remediation-ledger.mjs";
+import { evaluateLedger, ledgerPath, readLedger, writeLedger } from "./pr-remediation-ledger.mjs";
+import { runPrConvergenceEvaluation } from "./pr-convergence-evaluator.mjs";
+import { selectPinnedSkill } from "./skill-pin.mjs";
+import { runRepairCheckpoint } from "/Users/serro/Documents/dev/n/agent/automation/linear-loop/repair-checkpoint.mjs";
 
 const configPath = fileURLToPath(new URL("./workflow.json", import.meta.url));
 const config = JSON.parse(readFileSync(configPath, "utf8"));
-const pinned = config.skillplane;
+const worktreeConfigPath = resolve(process.cwd(), "automation/hermes/workflow.json");
+const worktreeConfig = existsSync(worktreeConfigPath) ? JSON.parse(readFileSync(worktreeConfigPath, "utf8")) : null;
 const taskId = process.env.HERMES_KANBAN_TASK || "manual";
 const runId = process.env.HERMES_KANBAN_RUN || `${taskId}-${Date.now()}`;
 const pr = JSON.parse(execFileSync(
@@ -25,13 +30,24 @@ if (!existsSync(path)) {
   throw new Error(`Missing persistent PR remediation ledger: ${path}. Initialize it before retrieving the hosted skill.`);
 }
 const ledger = readLedger(path);
-const expectedIdentity = `${pinned.workspaceSlug}/${pinned.skillSlug}@${pinned.semanticVersion}`;
-if (ledger.skill?.identity !== expectedIdentity || ledger.skill?.digest !== pinned.digest) {
-  throw new Error(`Ledger skill pin drift: expected ${expectedIdentity} (${pinned.digest})`);
+const pinned = selectPinnedSkill(ledger.skill, worktreeConfig?.skillplane, config.skillplane);
+if (!pinned) {
+  throw new Error(`Ledger skill pin is not in the assigned worktree or coordinator workflow config: ${ledger.skill?.identity} (${ledger.skill?.digest})`);
 }
+const expectedIdentity = `${pinned.workspaceSlug}/${pinned.skillSlug}@${pinned.semanticVersion}`;
 const gate = evaluateLedger(ledger);
 if (!gate.ok) {
   throw new Error(`ARCHITECTURE_RESET_REQUIRED: ${gate.resetRequired.join(", ")}. Record a complete architecture assessment in ${path} before another hosted mutation pass.`);
+}
+const convergence = await runPrConvergenceEvaluation({ number: pr.number });
+const sharedConfig = JSON.parse(readFileSync("/Users/serro/Documents/dev/n/agent/automation/linear-loop/projects/outright.json", "utf8"));
+const checkpoint = await runRepairCheckpoint({ config: sharedConfig, number: pr.number, evaluation: convergence,
+  ledgerFile: path, read: readLedger, write: writeLedger });
+if (!checkpoint.gate.ok) {
+  throw new Error(`PR_REPAIR_${checkpoint.gate.mode.toUpperCase()}: ${checkpoint.gate.reason}. Checkpoint evidence: ${path}`);
+}
+if (!convergence.gate.ok) {
+  throw new Error(`PR_CONVERGENCE_${convergence.gate.mode.toUpperCase()}: ${convergence.gate.reason}. Evaluator evidence: ${path}`);
 }
 
 const payload = {
@@ -77,4 +93,4 @@ if (data.version.digest !== pinned.digest) {
   throw new Error(`Hosted skill digest drift: expected ${pinned.digest}, received ${data.version.digest}`);
 }
 
-process.stdout.write(`Hosted skill: ${identity}\nDigest: ${data.version.digest}\nLedger: ${path}\nConvergence mode: ${gate.mode}\nPR snapshot candidate: ${pr.headRefOid}\n\n${data.instructions}\n`);
+process.stdout.write(`Hosted skill: ${identity}\nDigest: ${data.version.digest}\nLedger: ${path}\nConvergence mode: ${gate.mode}\nConvergence evaluator: ${convergence.gate.mode} (${convergence.gate.reason})\nFive-round repair checkpoint: ${checkpoint.gate.mode}${checkpoint.report ? ` (${checkpoint.report.trend}: ${checkpoint.report.evidence})` : ""}\nPR snapshot candidate: ${pr.headRefOid}\n\n${data.instructions}\n`);

@@ -20,7 +20,7 @@ function executeJson(command, args) {
 }
 
 function composio(slug, data) {
-  const result = executeJson("composio", ["execute", slug, "-d", JSON.stringify(data)]);
+  const result = executeJson("composio", ["execute", slug, "--account", config.linear.account, "-d", JSON.stringify(data)]);
   if (!result.successful) {
     throw new Error(`${slug} failed: ${result.error ?? "unknown Composio error"}`);
   }
@@ -32,12 +32,22 @@ function issueNumber(issue) {
   return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
 }
 
-export function selectNextIssue(issues, backlogState = "Backlog", issueOrder = []) {
+export function selectNextIssue(issues, backlogState = "Backlog", issueOrder = [], {
+  issueDependencies = {}, completedStates = ["Done"],
+} = {}) {
   const order = new Map(issueOrder.map((identifier, index) => [identifier, index]));
+  const byIdentifier = new Map(issues.map((issue) => [issue.identifier, issue]));
   return issues
     .filter((issue) => {
       const state = typeof issue.state === "string" ? issue.state : issue.state?.name;
-      return state === backlogState;
+      if (state !== backlogState || (order.size && !order.has(issue.identifier))) return false;
+      return (issueDependencies[issue.identifier] ?? []).every((identifier) => {
+        const prerequisite = byIdentifier.get(identifier);
+        if (!prerequisite) return false;
+        if (prerequisite.state?.type) return prerequisite.state.type === "completed";
+        const name = typeof prerequisite.state === "string" ? prerequisite.state : prerequisite.state?.name;
+        return completedStates.includes(name);
+      });
     })
     .sort((left, right) => {
       const leftOrder = order.get(left.identifier) ?? Number.MAX_SAFE_INTEGER;
@@ -75,15 +85,17 @@ ${description}
 
 ## Required delivery loop
 
+The user authorized this ordered implementation automation after the backlog was captured. Any older "backlog planning only" sentence in the issue is capture history, not a fresh veto on this assigned implementation. The separate human merge and Linear Done gate still applies.
+
 1. Read AGENTS.md and inspect the existing implementation before editing.
 2. Implement the whole issue in the assigned worktree. Keep the change scoped to this issue.
    Treat OUT-31 accessibility and OUT-32 performance as cross-cutting acceptance criteria and do not regress them.
 3. Run the relevant focused checks plus npm test, npm run build, and npm run test:sites.
 4. Commit locally without pushing or opening a pull request, then call kanban_request_review with phase=local and reviewer=${config.profiles.reviewer}.
-5. Address every local-review finding and repeat until the reviewer emits the LOCAL_GATE_PASSED transition.
+5. The reviewer runs independent ${config.profiles.localGptReviewer} and ${config.profiles.localGlmReviewer} reviews in parallel on isolated snapshots of the same committed head, consolidates root-cause families, and returns verified findings. Address them until the reviewer emits LOCAL_GATE_PASSED.
 6. After that transition, push the branch and open a pull request against main in ${config.repository}. Move ${issue.identifier} to In Review through Composio CLI and comment with the PR URL.
-7. Initialize the persistent PR convergence ledger, then hand the card to ${config.profiles.prFixer}. That GPT Sol High profile owns every hosted Skillplane remediation round and any architecture reset triggered by a recurring defect family.
-8. ${config.profiles.prFixer} waits for the current PR head's checks and automatic review agents to settle, retrieves the pinned hosted Skillplane PR remediation skill through Composio, executes exactly one bounded pass, and hands the exact head to ${config.profiles.reviewer}. Repeat through the same PR-fixer profile until clean or a reset/round limit blocks the loop.
+7. Initialize the persistent PR convergence ledger, then hand the card to ${config.profiles.prFixer}. That GPT-6 Sol High profile owns every hosted Skillplane remediation round and any architecture reset triggered by a recurring defect family.
+8. ${config.profiles.prFixer} waits for the current PR head's checks and automatic review agents to settle. Before each hosted skill retrieval, ${config.profiles.convergenceEvaluator} evaluates the complete exact-head PR snapshot read-only. A stalled, incomplete, or architecture-reset verdict blocks routine fixes. Otherwise the fixer executes exactly one pinned hosted Skillplane pass and hands the exact head to ${config.profiles.reviewer}. Repeat until clean or a gate blocks the loop.
 
 The local loop is capped at ${config.localReviewCycleLimit} review rounds and the PR loop at ${config.pullRequestReviewCycleLimit} hosted remediation rounds. A clean PR must wait at the human merge gate with Linear still In Review. Do not merge the PR without the user's explicit go.`;
 }
@@ -127,10 +139,22 @@ function main() {
     first: 250,
     include_archived: false
   });
+  if (issueData.page_info?.has_next_page || issueData.page_info?.hasNextPage || issueData.pageInfo?.hasNextPage) {
+    throw new Error("Linear issue inventory is incomplete; do not dispatch from a partial backlog");
+  }
+  const issues = extractIssues(issueData);
+  const known = new Set(issues.map((issue) => issue.identifier));
+  const prerequisites = new Set(Object.values(config.linear.issueDependencies ?? {}).flat());
+  for (const identifier of prerequisites) {
+    if (known.has(identifier)) continue;
+    const data = composio("LINEAR_GET_LINEAR_ISSUE", { issue_id: identifier });
+    if (data.issue?.identifier === identifier) issues.push(data.issue);
+  }
   const issue = selectNextIssue(
-    extractIssues(issueData),
+    issues,
     config.linear.backlogState,
-    config.linear.issueOrder
+    config.linear.issueOrder,
+    config.linear
   );
   if (!issue) return;
 
