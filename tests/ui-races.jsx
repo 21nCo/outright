@@ -2343,6 +2343,94 @@ function savedTerminal(id, name, endReason, exitCode, endedAt) {
 }
 function terminalStatusText() { return [...host.querySelectorAll('.terminal-pane [role="status"]')].map((node) => node.textContent).join(" "); }
 
+// Find reads the retained scrollback without taking keys from the process:
+// its shortcut and query never reach the terminal, Escape inside the
+// terminal still does, and closing Find gives the keyboard back.
+async function terminalScrollbackFindRegression() {
+  root.render(null);
+  await settle();
+  const sent = [];
+  const errors = [];
+  const lines = Array.from({ length: 4900 }, (_, index) => index % 700 === 350 ? `step ${index} FAIL build` : `row ${index} ok`);
+  lines.splice(2000, 0, "Straße 日本語 ✓ done");
+  route = async (url) => {
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A")] });
+    return response({ ...terminal("A"), buffer: `${lines.join("\r\n")}\r\n$ `, outputCursor: 1 });
+  };
+  const sendRuntime = (message) => sent.push(message);
+  const show = (event = null) => root.render(<div className="fixture-terminal-frame" style={{ width: 640, height: 420 }}><TerminalPane worktree={projects[0].worktrees[0]}
+    runtimeEvent={event} onError={(error) => errors.push(error)} sendRuntime={sendRuntime} /></div>);
+  const rows = () => host.querySelector(".terminal-host .xterm-rows")?.textContent ?? "";
+  const find = () => host.querySelector('input[aria-label="Find in terminal output"]');
+  const status = () => host.querySelector(".terminal-find > span[aria-hidden]")?.textContent ?? "";
+  const inputs = () => sent.filter((message) => message.type === "terminal.input").map((message) => message.data);
+  const textarea = () => host.querySelector(".terminal-host .xterm-helper-textarea");
+  const key = (target, init) => target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init }));
+  show();
+  await until(() => terminalReady("Terminal A") && rows().includes("row 4899 ok") && sent.some((message) => message.type === "terminal.resize"), "large retained output ready for input");
+
+  textarea().focus();
+  key(textarea(), { key: "Escape", code: "Escape", keyCode: 27 });
+  assert(inputs().join("") === "\x1b" && !find(), "Escape in the terminal did not reach the process");
+  const resizes = () => sent.filter((message) => message.type === "terminal.resize").length;
+  const resizesBeforeFind = resizes();
+  const mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+  const shortcut = mac ? { metaKey: true } : { ctrlKey: true, shiftKey: true };
+  key(textarea(), { key: mac ? "f" : "F", code: "KeyF", keyCode: 70, ...shortcut });
+  await until(() => find() && document.activeElement === find(), "Find shortcut focuses the query");
+  const opener = host.querySelector('[aria-label="Find in terminal"]');
+  assert(opener.getAttribute("aria-expanded") === "true" && opener.getAttribute("aria-keyshortcuts") === (mac ? "Meta+F" : "Control+Shift+F"), "Find toggle state or shortcut is not exposed");
+
+  const startedAt = performance.now();
+  setControlValue(find(), "fail");
+  const searchMs = performance.now() - startedAt;
+  window.__performanceEvidence = { ...window.__performanceEvidence, terminalFindMs: Math.round(searchMs) };
+  await until(() => status() === "7 of 7", "a new query selects the newest match");
+  assert(searchMs < 500, `Searching 4,900 retained lines took ${Math.round(searchMs)}ms`);
+  await until(() => rows().includes("step 4550 FAIL build"), "newest match shown");
+  key(find(), { key: "Enter", shiftKey: true });
+  await until(() => status() === "6 of 7" && rows().includes("step 3850 FAIL build"), "Shift+Enter moves to the previous match");
+  key(find(), { key: "Enter" });
+  key(find(), { key: "Enter" });
+  await until(() => status() === "1 of 7" && rows().includes("step 350 FAIL build"), "Enter wraps to the earliest match");
+  host.querySelector('[aria-label="Previous terminal match"]').click();
+  await until(() => status() === "7 of 7", "Previous wraps to the newest match");
+  await until(() => host.querySelector(".terminal-find [role=status]").textContent === "Match 7 of 7", "match state announced");
+  assert(host.querySelector(".terminal-host .xterm-selection")?.childElementCount > 0, "The current match is not highlighted");
+
+  setControlValue(find(), "STRASSE 日本");
+  await until(() => status() === "1 of 1" && rows().includes("Straße 日本語"), "Unicode case folding finds a wide-character line");
+  setControlValue(find(), "r.w 1");
+  await until(() => status() === "No matches", "a regex-looking query is literal");
+  assert(!inputs().slice(1).length, `Find sent keys to the process: ${JSON.stringify(inputs())}`);
+  await settle();
+  assert(resizes() === resizesBeforeFind, "Opening Find resized the process's terminal");
+
+  // A new query starts from the view, still at the Unicode line. New output
+  // recounts without moving the current match; a full reset drops it, and
+  // the next step starts in the new buffer.
+  setControlValue(find(), "fail");
+  await until(() => status() === "3 of 7" && rows().includes("step 1750 FAIL build"), "a query selects the newest match above the view's bottom");
+  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 2, data: "\r\nstep new FAIL again\r\n$ " } });
+  await until(() => status() === "3 of 8", "new output counted while the current match stays");
+  assert(rows().includes("step 1750 FAIL build"), "New output moved the view away from the current match");
+  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 3, data: "\x1bcfresh FAIL only\r\n$ " } });
+  await until(() => status() === "1 match", "a terminal reset recounts and drops the earlier match");
+  key(find(), { key: "Enter" });
+  await until(() => status() === "1 of 1", "Enter selects in the reset buffer");
+
+  key(find(), { key: "Escape" });
+  await until(() => !find() && document.activeElement === textarea(), "Escape closes Find and returns focus to the terminal");
+  assert(!host.querySelector(".terminal-host .xterm-selection")?.childElementCount, "Closing Find left its match selected");
+  key(textarea(), { key: "Escape", code: "Escape", keyCode: 27 });
+  assert(inputs().join("") === "\x1b\x1b", "Input did not return to the process after Find closed");
+  opener.click();
+  await until(() => find()?.value === "fail" && document.activeElement === find() && status() === "1 of 1", "reopened Find searches its query again");
+  host.querySelector('[aria-label="Close terminal find"]').click();
+  await until(() => !find() && document.activeElement === textarea(), "Close returns focus to the terminal");
+  assert(!errors.length, `Unexpected terminal errors: ${errors.map((error) => error.message).join("; ")}`);
+}
+
 async function terminalSavedSessionRegression() {
   root.render(null);
   await settle();
@@ -8371,6 +8459,7 @@ try {
     ["terminal keyboard", terminalKeyboardRegression, "terminal keyboard switching retains focus and ignores non-tab controls"],
     ["terminal unknown", terminalUnknownRegression, "unverified terminal ownership blocks interaction and survives restart"],
     ["terminal unknown during activation", terminalUnknownDuringActivationRegression, "a newer unknown event wins over an in-flight running detail"],
+    ["terminal scrollback find", terminalScrollbackFindRegression, "Find counts and steps through large, Unicode and reset scrollback by keyboard without taking the process's keys"],
     ["terminal saved session", terminalSavedSessionRegression, "saved output stays read-only, relaunches as a marked new shell and dismisses"],
     ["terminal reservation restored", terminalReservationRestoredRegression, "a reservation that becomes saved output updates in place and storage warnings announce once"],
     ["terminal saved session sync", terminalSavedSessionSyncRegression, "coalesced restores, eviction, expiry and dismissing an expired session converge with the server"],
