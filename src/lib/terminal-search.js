@@ -14,12 +14,26 @@ export function terminalFindQuery(value) {
 
 // Logical lines join the rows a long line wrapped onto, so a match can span
 // rows. A row continued on the next keeps its trailing blank cells, as
-// translateToString does; the last row of a line is trimmed. Folding is per
-// code point, so folding each row and joining equals folding the line.
-function logicalLineRows(buffer, start, end) {
+// translateToString does; the last row of a line is trimmed. A wide
+// character that did not fit in the last column wrapped to the next row and
+// left an empty cell behind: that cell is padding, not a space, and is left
+// out as xterm's search addon does. Folding is per code point, so folding
+// each row and joining equals folding the line.
+function logicalLineRows(buffer, start, end, cell) {
   const folded = [];
-  for (let row = start; row <= end; row += 1) folded.push(foldFindText(buffer.getLine(row)?.translateToString(row === end) ?? ""));
+  for (let row = start; row <= end; row += 1) {
+    const line = buffer.getLine(row);
+    let text = line?.translateToString(row === end) ?? "";
+    if (row < end && text.endsWith(" ") && isWidePadding(line.getCell(line.length - 1, cell)) && buffer.getLine(row + 1)?.getCell(0, cell)?.getWidth() === 2) {
+      text = text.slice(0, -1);
+    }
+    folded.push(foldFindText(text));
+  }
   return folded;
+}
+
+function isWidePadding(cell) {
+  return Boolean(cell) && !cell.getChars() && cell.getWidth() === 1;
 }
 
 // Maps each folded code unit of one row to the cell that drew it. A wide
@@ -82,7 +96,7 @@ export function findTerminalMatches(buffer, query, cols, limit = TERMINAL_MATCH_
   while (end >= 0) {
     let start = end;
     while (start > 0 && buffer.getLine(start)?.isWrapped) start -= 1;
-    const rows = logicalLineRows(buffer, start, end);
+    const rows = logicalLineRows(buffer, start, end, cell);
     const text = rows.join("");
     if (text.includes(query)) {
       const budget = limit - newestFirst.length;
@@ -108,7 +122,9 @@ function sameMatch(left, right) {
 // A match in the top coveredRows of the view, under the Find bar, is
 // scrolled into the open like one outside the view. Near the top of the
 // buffer the view cannot scroll that far, so covered says the current match
-// is still under the bar, which then moves out of its way.
+// is still under the bar, which then moves out of its way. xterm clears the
+// selection when the view's height changes; a current match Find had
+// selected is selected again in place, unless the user selected since.
 export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_LIMIT, recountMs = RECOUNT_MS, coveredRows = 0 } = {}) {
   let query = "";
   let matches = [];
@@ -116,6 +132,7 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
   let current = null;
   let ownSelection = false;
   let selecting = false;
+  let reselect = false;
   let timer = 0;
 
   const isCovered = () => {
@@ -138,7 +155,14 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
   function drop() {
     current?.marker?.dispose();
     current = null;
+    reselect = false;
     releaseSelection();
+  }
+
+  function highlight(match) {
+    selecting = true;
+    try { xterm.select(match.col, match.row, match.length); } finally { selecting = false; }
+    ownSelection = true;
   }
 
   function select(index) {
@@ -149,9 +173,8 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
     // A marker follows its line as older lines are trimmed off the top.
     const marker = xterm.registerMarker(match.row - (buffer.baseY + buffer.cursorY));
     current = { match, marker };
-    selecting = true;
-    try { xterm.select(match.col, match.row, match.length); } finally { selecting = false; }
-    ownSelection = true;
+    reselect = false;
+    highlight(match);
     if (match.row < buffer.viewportY + coveredRows || match.row >= buffer.viewportY + xterm.rows) {
       xterm.scrollToLine(Math.max(0, match.row - Math.floor(xterm.rows / 2)));
     }
@@ -166,8 +189,11 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
       const { marker } = kept;
       const moved = marker && !marker.isDisposed && marker.line >= 0 ? { ...kept.match, row: marker.line } : null;
       const match = moved && matches.find((candidate) => sameMatch(candidate, moved));
-      if (match) current = { match, marker };
-      else drop();
+      if (match) {
+        current = { match, marker };
+        if (reselect && !xterm.hasSelection()) highlight(match);
+        reselect = false;
+      } else drop();
     }
     publish();
   }
@@ -179,11 +205,17 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
 
   const subscriptions = [
     xterm.onWriteParsed(schedule),
-    xterm.onResize(schedule),
+    // The resize clears the selection after this runs, so the recount puts
+    // it back.
+    xterm.onResize(() => { if (current && ownSelection) reselect = true; schedule(); }),
     // A full reset (RIS) or a switch to or from the alternate screen gives
     // the view another buffer: no earlier match is current in it.
     xterm.buffer.onBufferChange(() => { drop(); schedule(); }),
-    xterm.onSelectionChange(() => { if (!selecting) ownSelection = false; }),
+    xterm.onSelectionChange(() => {
+      if (selecting) return;
+      ownSelection = false;
+      if (xterm.hasSelection()) reselect = false;
+    }),
     xterm.onScroll(() => { if (isCovered() !== covered) publish(); }),
   ];
 

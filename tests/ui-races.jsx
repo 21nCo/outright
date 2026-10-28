@@ -2437,7 +2437,7 @@ async function terminalScrollbackFindRegression() {
   next.focus();
   key(next, { key: "Escape" });
   await until(() => !find() && document.activeElement === textarea(), "Escape from a Find button closes Find and returns focus to the terminal");
-  assert(!host.querySelector(".terminal-host .xterm-selection")?.childElementCount, "Closing Find left its match selected");
+  await until(() => !host.querySelector(".terminal-host .xterm-selection")?.childElementCount, "closing Find clears its match selection");
   key(textarea(), { key: "Escape", code: "Escape", keyCode: 27 });
   assert(inputs().join("") === "\x1b\x1b", "Input did not return to the process after Find closed");
   opener.click();
@@ -2445,6 +2445,58 @@ async function terminalScrollbackFindRegression() {
   key(find(), { key: "Escape", isComposing: true });
   await settle();
   assert(find(), "Escape that cancels an IME composition closed Find");
+
+  // A wide character that does not fit in the last column wraps and leaves
+  // an empty cell behind, which Find does not read as a space.
+  const size = () => sent.filter((message) => message.type === "terminal.resize").at(-1);
+  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 4, data: `\r\n${"a".repeat(size().cols - 2)}d日 end\r\n$ ` } });
+  await until(() => rows().includes("日 end"), "a wide character wrapped past the last column");
+  setControlValue(find(), "d日");
+  await until(() => status() === "1 of 1", "a wide character wrapped to the next row is found");
+  setControlValue(find(), "d 日");
+  await until(() => status() === "No matches", "the cell a wide character wrapped past is not a space");
+
+  // xterm clears the selection when the view's height changes; Find selects
+  // its current match again, but never in place of the user's selection.
+  const highlighted = () => host.querySelector(".terminal-host .xterm-selection")?.childElementCount > 0;
+  const terminalFrame = host.querySelector(".fixture-terminal-frame");
+  const settledResize = async (height, label) => {
+    const count = sent.filter((message) => message.type === "terminal.resize").length;
+    terminalFrame.style.height = height;
+    await until(() => sent.filter((message) => message.type === "terminal.resize").length > count, label);
+    // Past the recount, so xterm has painted the selection it cleared.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await settle();
+  };
+  // xterm measures cells in the terminal font once it has loaded and applies
+  // them at a later fit. Fit until the width holds, so the resizes below
+  // change only the height.
+  await document.fonts.load('12px "DM Sans Variable"');
+  await settledResize("400px", "the terminal measures its loaded font");
+  for (let attempt = 0, cols = 0; attempt < 4 && size().cols !== cols; attempt += 1) {
+    cols = size().cols;
+    await settledResize(attempt % 2 ? "400px" : "390px", "the terminal fits its loaded font");
+  }
+  setControlValue(find(), "日 end");
+  await until(() => status() === "1 of 1" && highlighted(), "the wrapped wide-character match is current and highlighted");
+  const before = size();
+  await settledResize("340px", "the terminal is resized to fewer rows");
+  assert(size().cols === before.cols && size().rows < before.rows, `The resize changed more than the height: ${JSON.stringify([before, size()])}`);
+  assert(status() === "1 of 1" && highlighted(), "A resize left the current match without its highlight");
+  assert(rows().includes("日 end"), "The resize moved the view");
+  const screen = host.querySelector(".terminal-host .xterm-screen").getBoundingClientRect();
+  const rowHeight = screen.height / size().rows;
+  const selectedRows = () => [...host.querySelectorAll(".terminal-host .xterm-selection > *")].map((node) => Math.round((node.getBoundingClientRect().top - screen.top) / rowHeight));
+  // The user double-clicks the word that wraps onto the match's row, from
+  // the row above it, which Find's selection does not cover.
+  const userRow = Math.min(...selectedRows()) - 1;
+  const point = { bubbles: true, cancelable: true, button: 0, clientX: screen.left + 4, clientY: screen.top + rowHeight * (userRow + 0.5) };
+  host.querySelector(".terminal-host .xterm-screen").dispatchEvent(new MouseEvent("mousedown", { ...point, detail: 2 }));
+  document.dispatchEvent(new MouseEvent("mouseup", { ...point, detail: 2 }));
+  await until(() => selectedRows().includes(userRow), "the user's double-click replaces Find's selection");
+  await settledResize("420px", "the terminal is resized back");
+  assert(size().cols === before.cols && status() === "1 of 1", `The resize back dropped the current match: ${status()}`);
+  assert(!highlighted(), "A resize put Find's match back in place of the user's selection");
   key(find(), { key: "Escape" });
   await until(() => !find() && document.activeElement === textarea(), "Escape in the query closes Find");
   opener.click();

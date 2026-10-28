@@ -97,3 +97,16 @@ test("a scrollback-long dense wrapped line maps only the cells of the kept match
   assert.ok(cellReads <= 3 * cols, `mapped ${cellReads} cells for 1,000 matches`);
   assert.ok(elapsed < 500, `dense line search took ${Math.round(elapsed)}ms`);
 });
+
+test("the empty cell a wide character wrapped past is padding, not a space", () => {
+  // At 4 columns "abd日" leaves the last cell of the first row empty and
+  // draws 日 at the start of the next. A space the program wrote stays.
+  const wide = [["日", 2], ["", 0], ...ascii("x")];
+  const padded = buffer(4, [{ cells: ascii("abd") }, { cells: wide, wrapped: true }]);
+  assert.deepEqual(findTerminalMatches(padded, terminalFindQuery("d日"), 4).matches, [{ row: 0, col: 2, length: 4 }]);
+  assert.deepEqual(findTerminalMatches(padded, terminalFindQuery("d 日"), 4).matches, []);
+  assert.deepEqual(findTerminalMatches(padded, terminalFindQuery("日x"), 4).matches, [{ row: 1, col: 0, length: 3 }]);
+  const spaced = buffer(4, [{ cells: ascii("abd ") }, { cells: wide, wrapped: true }]);
+  assert.deepEqual(findTerminalMatches(spaced, terminalFindQuery("d 日"), 4).matches, [{ row: 0, col: 2, length: 4 }]);
+  assert.deepEqual(findTerminalMatches(spaced, terminalFindQuery("d日"), 4).matches, []);
+});
