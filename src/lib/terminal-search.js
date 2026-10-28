@@ -114,25 +114,29 @@ function sameMatch(left, right) {
 }
 
 // Owns Find for one xterm view. It reads only the buffer the view shows,
-// never writes to the terminal, and reports { total, capped, index, covered }
-// where index is -1 when no match is current. A new query selects the newest match
+// never writes to the terminal, and reports { total, capped, index, covered,
+// selected } where index is -1 when no match is current and selected says
+// xterm's selection is Find's highlight. A new query selects the newest match
 // at or above the bottom of the view. Later output recounts without moving
 // the view: a current match keeps its place by a buffer marker, and is
-// dropped when its line leaves the buffer or the buffer is reset or switched.
+// dropped when its line leaves the buffer or the newest `limit` matches, a
+// reflow moves it within its own line, or the buffer is reset or switched.
 // A match in the top coveredRows of the view, under the Find bar, is
 // scrolled into the open like one outside the view. Near the top of the
 // buffer the view cannot scroll that far, so covered says the current match
-// is still under the bar, which then moves out of its way. xterm clears the
-// selection when the view's height changes; a current match Find had
-// selected is selected again in place, unless the user selected since.
+// is still under the bar, which then moves out of its way.
 export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_LIMIT, recountMs = RECOUNT_MS, coveredRows = 0 } = {}) {
   let query = "";
   let matches = [];
   let capped = false;
   let current = null;
-  let ownSelection = false;
+  // Who holds xterm's selection: "find" while it is the highlight Find drew
+  // at `shown`, "cleared" after xterm cleared that highlight for a change of
+  // height, and null once the user selected, typed or cleared it.
+  let selection = null;
+  let shown = null;
   let selecting = false;
-  let reselect = false;
+  let resizing = false;
   let timer = 0;
 
   const isCovered = () => {
@@ -143,26 +147,28 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
   let covered = false;
   const publish = () => {
     covered = isCovered();
-    onChange({ total: matches.length, capped, index: current ? matches.indexOf(current.match) : -1, covered });
+    onChange({ total: matches.length, capped, index: current ? matches.indexOf(current.match) : -1, covered, selected: selection !== null });
   };
   const scan = () => ({ matches, capped } = findTerminalMatches(xterm.buffer.active, query, xterm.cols, limit));
 
   function releaseSelection() {
-    if (ownSelection && xterm.hasSelection()) xterm.clearSelection();
-    ownSelection = false;
+    const own = selection === "find";
+    selection = null;
+    shown = null;
+    if (own && xterm.hasSelection()) xterm.clearSelection();
   }
 
   function drop() {
     current?.marker?.dispose();
     current = null;
-    reselect = false;
     releaseSelection();
   }
 
   function highlight(match) {
     selecting = true;
     try { xterm.select(match.col, match.row, match.length); } finally { selecting = false; }
-    ownSelection = true;
+    selection = "find";
+    shown = match;
   }
 
   function select(index) {
@@ -170,16 +176,21 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
     if (!match) return;
     current?.marker?.dispose();
     const buffer = xterm.buffer.active;
-    // A marker follows its line as older lines are trimmed off the top.
+    // A marker follows its line as older lines are trimmed off the top,
+    // lines are inserted or deleted above it, or the buffer reflows.
     const marker = xterm.registerMarker(match.row - (buffer.baseY + buffer.cursorY));
     current = { match, marker };
-    reselect = false;
     highlight(match);
     if (match.row < buffer.viewportY + coveredRows || match.row >= buffer.viewportY + xterm.rows) {
       xterm.scrollToLine(Math.max(0, match.row - Math.floor(xterm.rows / 2)));
     }
   }
 
+  // xterm keeps a selection at its buffer cells when lines are inserted or
+  // deleted above it or a width change reflows earlier lines, and clears it
+  // when the height changes. Whichever moved the current match, a highlight
+  // Find still holds is drawn again on the match's cells, without moving
+  // the view; a user's selection is left alone.
   function recount() {
     timer = 0;
     if (!query) return;
@@ -189,11 +200,11 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
       const { marker } = kept;
       const moved = marker && !marker.isDisposed && marker.line >= 0 ? { ...kept.match, row: marker.line } : null;
       const match = moved && matches.find((candidate) => sameMatch(candidate, moved));
-      if (match) {
+      if (!match) drop();
+      else {
         current = { match, marker };
-        if (reselect && !xterm.hasSelection()) highlight(match);
-        reselect = false;
-      } else drop();
+        if ((selection === "find" && !sameMatch(shown, match)) || selection === "cleared") highlight(match);
+      }
     }
     publish();
   }
@@ -205,16 +216,21 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
 
   const subscriptions = [
     xterm.onWriteParsed(schedule),
-    // The resize clears the selection after this runs, so the recount puts
-    // it back.
-    xterm.onResize(() => { if (current && ownSelection) reselect = true; schedule(); }),
+    // xterm clears the selection for a change of height right after this.
+    xterm.onResize(() => {
+      resizing = true;
+      queueMicrotask(() => { resizing = false; });
+      schedule();
+    }),
     // A full reset (RIS) or a switch to or from the alternate screen gives
     // the view another buffer: no earlier match is current in it.
     xterm.buffer.onBufferChange(() => { drop(); schedule(); }),
     xterm.onSelectionChange(() => {
       if (selecting) return;
-      ownSelection = false;
-      if (xterm.hasSelection()) reselect = false;
+      const next = selection === "find" && resizing && !xterm.hasSelection() ? "cleared" : null;
+      if (next === selection) return;
+      selection = next;
+      if (!next) { shown = null; publish(); }
     }),
     xterm.onScroll(() => { if (isCovered() !== covered) publish(); }),
   ];

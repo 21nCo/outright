@@ -2506,6 +2506,138 @@ async function terminalScrollbackFindRegression() {
   assert(!errors.length, `Unexpected terminal errors: ${errors.map((error) => error.message).join("; ")}`);
 }
 
+// Find's highlight stays on its current match's text wherever output or a
+// resize moves the match, only that highlight is drawn as the match, a
+// selection the user made is left alone, and streaming output does not keep
+// re-announcing the count.
+async function terminalFindHighlightRegression() {
+  root.render(null);
+  await settle();
+  const sent = [];
+  const errors = [];
+  let cursor = 1;
+  route = async (url) => {
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A")] });
+    return response({ ...terminal("A"), buffer: "alpha\r\nfirst\r\nTARGET one\r\nlast\r\n$ ", outputCursor: 1 });
+  };
+  const sendRuntime = (message) => sent.push(message);
+  const show = (data = null) => root.render(<div className="fixture-terminal-frame" style={{ width: 640, height: 420 }}><TerminalPane worktree={projects[0].worktrees[0]}
+    runtimeEvent={data === null ? null : { type: "terminal.output", terminalId: "term-A", payload: { cursor: ++cursor, data } }}
+    onError={(error) => errors.push(error)} sendRuntime={sendRuntime} /></div>);
+  const write = async (data) => { show(data); await new Promise((resolve) => setTimeout(resolve, 500)); await settle(); };
+  const find = () => host.querySelector('input[aria-label="Find in terminal output"]');
+  const status = () => host.querySelector(".terminal-find > span[aria-hidden]")?.textContent ?? "";
+  const announced = () => host.querySelector(".terminal-find [role=status]")?.textContent ?? "";
+  const size = () => sent.filter((message) => message.type === "terminal.resize").at(-1);
+  const textarea = () => host.querySelector(".terminal-host .xterm-helper-textarea");
+  const key = (target, init) => target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init }));
+  // xterm copies its own selection, so the copied text is what it selected.
+  const selectedText = () => {
+    const clipboardData = new DataTransfer();
+    textarea().dispatchEvent(new ClipboardEvent("copy", { bubbles: true, cancelable: true, clipboardData }));
+    return clipboardData.getData("text/plain");
+  };
+  const amber = ["rgb(196, 132, 12)", "rgb(232, 176, 74)"];
+  const selectionColor = () => { const node = host.querySelector(".terminal-host .xterm-selection > *"); return node ? getComputedStyle(node).backgroundColor : ""; };
+  const screenRows = () => [...host.querySelectorAll(".terminal-host .xterm-rows > div")].map((row) => row.textContent);
+  const doubleClick = (text) => {
+    const screen = host.querySelector(".terminal-host .xterm-screen");
+    const box = screen.getBoundingClientRect();
+    const rowHeight = box.height / size().rows;
+    const row = screenRows().findIndex((line) => line.startsWith(text));
+    assert(row >= 0, `No row starts with ${text}`);
+    const point = { bubbles: true, cancelable: true, button: 0, clientX: box.left + 4, clientY: box.top + rowHeight * (row + 0.5) };
+    screen.dispatchEvent(new MouseEvent("mousedown", { ...point, detail: 2 }));
+    document.dispatchEvent(new MouseEvent("mouseup", { ...point, detail: 2 }));
+  };
+  const frameElement = () => host.querySelector(".fixture-terminal-frame");
+  const settledResize = async (property, value, label) => {
+    const count = sent.filter((message) => message.type === "terminal.resize").length;
+    frameElement().style[property] = value;
+    await until(() => sent.filter((message) => message.type === "terminal.resize").length > count, label);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await settle();
+  };
+  show();
+  await until(() => terminalReady("Terminal A") && screenRows().some((line) => line.startsWith("TARGET one")) && size(), "terminal ready");
+  // The terminal font's late load changes its cells at a later fit; fit until
+  // the size holds, so the resizes below change only what they mean to.
+  await document.fonts.load('12px "DM Sans Variable"');
+  await settledResize("height", "390px", "the terminal measures its loaded font");
+  for (let attempt = 0, cols = 0; attempt < 4 && size().cols !== cols; attempt += 1) {
+    cols = size().cols;
+    await settledResize("height", attempt % 2 ? "390px" : "360px", "the terminal fits its loaded font");
+  }
+
+  host.querySelector('[aria-label="Find in terminal"]').click();
+  await until(() => document.activeElement === find(), "Find opens");
+  setControlValue(find(), "target one");
+  await until(() => status() === "1 of 1" && selectedText() === "TARGET one", "the query selects its match");
+  await until(() => amber.includes(selectionColor()), "Find's match is drawn in the match color");
+
+  // A line inserted (CSI L) or deleted (CSI M) above the match moves it, while
+  // xterm keeps the selection on the same cells.
+  await write("\x1b7\x1b[1;1H\x1b[L\x1b8");
+  assert(status() === "1 of 1" && selectedText() === "TARGET one", `A line inserted above left Find's highlight on ${JSON.stringify(selectedText())}`);
+  await write("\x1b7\x1b[1;1H\x1b[M\x1b8");
+  assert(status() === "1 of 1" && selectedText() === "TARGET one", `A line deleted above left Find's highlight on ${JSON.stringify(selectedText())}`);
+
+  // The user's selection is theirs: drawn in the normal color and not moved
+  // or replaced as output moves the match.
+  doubleClick("first");
+  await until(() => selectedText() === "first" && selectionColor() && !amber.includes(selectionColor()), "the user's selection keeps the normal selection color");
+  await write("\x1b7\x1b[1;1H\x1b[L\x1b8");
+  assert(selectedText() === "alpha" && status() === "1 of 1", `Find moved the user's selection after a line was inserted: ${JSON.stringify(selectedText())}`);
+  await write("\x1b7\x1b[1;1H\x1b[M\x1b8");
+  assert(selectedText() === "first", `Find moved the user's selection after a line was deleted: ${JSON.stringify(selectedText())}`);
+  key(find(), { key: "Enter" });
+  await until(() => selectedText() === "TARGET one" && amber.includes(selectionColor()), "Next highlights the match in the match color again");
+
+  // A width change reflows a long line above the match onto more rows.
+  await write(`\r\n${"x".repeat(size().cols - 4)}\r\nTARGET two\r\n$ `);
+  setControlValue(find(), "target two");
+  await until(() => status() === "1 of 1" && selectedText() === "TARGET two", "the match below a long line is selected");
+  const wide = size();
+  await settledResize("width", "420px", "the terminal is narrowed");
+  assert(size().rows === wide.rows && size().cols < wide.cols - 4, `The resize changed more than the width: ${JSON.stringify([wide, size()])}`);
+  assert(status() === "1 of 1" && selectedText() === "TARGET two", `A reflow above left Find's highlight on ${JSON.stringify(selectedText())}`);
+  doubleClick("first");
+  await until(() => selectedText() === "first", "the user selects other text");
+  await settledResize("width", "640px", "the terminal is widened");
+  assert(size().cols === wide.cols && status() === "1 of 1" && selectedText() === "first", `Find took over the user's selection on a reflow: ${JSON.stringify(selectedText())}`);
+
+  // Output alone announces the count at most every few seconds; the visible
+  // count still follows it.
+  await write("\r\ntick 0\r\n$ ");
+  setControlValue(find(), "tick");
+  await until(() => announced() === "Match 1 of 1", "a new query is announced");
+  const announcements = [];
+  const observer = new MutationObserver(() => announcements.push(announced()));
+  observer.observe(host.querySelector(".terminal-find [role=status]"), { childList: true, characterData: true, subtree: true });
+  for (let index = 1; index <= 12; index += 1) {
+    show(`\r\ntick ${index}\r\n$ `);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  await until(() => status() === "1 of 13", "streamed output is counted");
+  observer.disconnect();
+  assert(announcements.length <= 1, `Streaming output re-announced the count: ${JSON.stringify(announcements)}`);
+  key(find(), { key: "Enter" });
+  await until(() => announced() === "Match 2 of 13", "a step is announced at once");
+
+  // A current match that newer output pushes out of the newest 1,000 matches
+  // is no longer current.
+  await write(Array.from({ length: 1100 }, (_, index) => `\r\nhit ${index}`).join("") + "\r\n$ ");
+  setControlValue(find(), "hit");
+  await until(() => /^(1|1000) of 1000\+$/.test(status()), "one of many matches is current");
+  if (status() !== "1 of 1000+") key(find(), { key: "Enter" });
+  await until(() => status() === "1 of 1000+" && selectedText() === "hit", "the oldest counted match is current");
+  await write("\r\nhit again\r\n$ ");
+  await until(() => status() === "1000+ matches" && !selectedText(), "a match pushed out of the newest 1,000 is dropped with its highlight");
+  key(find(), { key: "Escape" });
+  await until(() => !find() && document.activeElement === textarea(), "Escape closes Find");
+  assert(!errors.length, `Unexpected terminal errors: ${errors.map((error) => error.message).join("; ")}`);
+}
+
 async function terminalSavedSessionRegression() {
   root.render(null);
   await settle();
@@ -8535,6 +8667,7 @@ try {
     ["terminal unknown", terminalUnknownRegression, "unverified terminal ownership blocks interaction and survives restart"],
     ["terminal unknown during activation", terminalUnknownDuringActivationRegression, "a newer unknown event wins over an in-flight running detail"],
     ["terminal scrollback find", terminalScrollbackFindRegression, "Find counts and steps through large, Unicode and reset scrollback by keyboard without taking the process's keys"],
+    ["terminal find highlight", terminalFindHighlightRegression, "Find keeps its highlight on the current match as output and reflow move it, leaves user selections alone and paces output announcements"],
     ["terminal saved session", terminalSavedSessionRegression, "saved output stays read-only, relaunches as a marked new shell and dismisses"],
     ["terminal reservation restored", terminalReservationRestoredRegression, "a reservation that becomes saved output updates in place and storage warnings announce once"],
     ["terminal saved session sync", terminalSavedSessionSyncRegression, "coalesced restores, eviction, expiry and dismissing an expired session converge with the server"],

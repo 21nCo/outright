@@ -24,7 +24,10 @@ const RESERVATION_LABEL = "its prior-run owner is unverified and not attached";
 const EARLIER_NOT_SHOWN = "\x1b[90m[earlier saved output not shown]\x1b[0m\r\n";
 // One announcement per distinct storage condition for this page session.
 let announcedHistoryWarning = "";
-const NO_FIND_RESULT = { total: 0, capped: false, index: -1, covered: false };
+const NO_FIND_RESULT = { total: 0, capped: false, index: -1, covered: false, selected: false };
+// A count that only output changed is announced at most this often; what the
+// user's own Find actions change is announced as it settles.
+const FIND_OUTPUT_ANNOUNCE_MS = 5000;
 // The Find bar overlays about the first two 15px rows of the output.
 const FIND_COVERED_ROWS = 2;
 // Ctrl+F is a shell key, so outside macOS Find takes Ctrl+Shift+F. Either
@@ -104,6 +107,11 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
   const [findValue, setFindValue] = useState("");
   const [findResult, setFindResult] = useState(NO_FIND_RESULT);
   const [announcedFind, setAnnouncedFind] = useState("");
+  const [findAction, setFindAction] = useState(0);
+  const findActionSeenRef = useRef(0);
+  const findActionPendingRef = useRef(false);
+  const findAnnouncedAtRef = useRef(0);
+  const findHighlightRef = useRef(false);
   findOpenRef.current = findOpen;
   findValueRef.current = findValue;
 
@@ -116,7 +124,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       lineHeight: 1.25,
       screenReaderMode: true,
       scrollback: LIVE_SCROLLBACK,
-      theme: findOpenRef.current ? findTheme() : terminalTheme(),
+      theme: findHighlightRef.current ? findTheme() : terminalTheme(),
     });
     const fit = new FitAddon();
     xterm.loadAddon(fit);
@@ -671,6 +679,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
   // Opening Find moves focus to its query, selected so typing replaces it.
   // A reopened query searches the view again.
   function openFind() {
+    setFindAction((count) => count + 1);
     if (findOpenRef.current) { findInputRef.current?.focus(); findInputRef.current?.select(); return; }
     focusFindRef.current = true;
     findOpenRef.current = true;
@@ -694,12 +703,17 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     if (event.nativeEvent.isComposing || event.keyCode === 229) return;
     if (event.key === "Enter" && event.target === findInputRef.current) {
       event.preventDefault();
-      searchRef.current?.step(event.shiftKey ? -1 : 1);
+      stepFind(event.shiftKey ? -1 : 1);
     } else if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
       closeFind();
     }
+  }
+
+  function stepFind(direction) {
+    setFindAction((count) => count + 1);
+    searchRef.current?.step(direction);
   }
 
   function paneKey(event) {
@@ -709,8 +723,15 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     openFind();
   }
 
+  // Only Find's own highlight is drawn as the current match; a selection the
+  // user makes while Find is open keeps the normal selection color.
+  const findHighlight = findOpen && findResult.selected;
+  findHighlightRef.current = findHighlight;
   useLayoutEffect(() => {
-    if (xtermRef.current) xtermRef.current.options.theme = findOpen ? findTheme() : terminalTheme();
+    if (xtermRef.current) xtermRef.current.options.theme = findHighlight ? findTheme() : terminalTheme();
+  }, [findHighlight]);
+
+  useLayoutEffect(() => {
     if (!findOpen || !focusFindRef.current) return;
     focusFindRef.current = false;
     findInputRef.current?.focus();
@@ -734,10 +755,18 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     findStatus = findResult.index >= 0 ? `${findResult.index + 1} of ${total}` : matches;
     findAnnouncement = (findResult.index >= 0 ? `Match ${findResult.index + 1} of ${findResult.total}` : matches) + findScope + more;
   }
+  // Streaming output recounts every 200 ms; announcing each count would talk
+  // over the user, so output-only changes wait for the slower cadence.
   useEffect(() => {
-    const timer = window.setTimeout(() => setAnnouncedFind(findAnnouncement), 180);
+    if (findActionSeenRef.current !== findAction) { findActionSeenRef.current = findAction; findActionPendingRef.current = true; }
+    const delay = findActionPendingRef.current ? 180 : Math.max(180, findAnnouncedAtRef.current + FIND_OUTPUT_ANNOUNCE_MS - Date.now());
+    const timer = window.setTimeout(() => {
+      findActionPendingRef.current = false;
+      findAnnouncedAtRef.current = Date.now();
+      setAnnouncedFind(findAnnouncement);
+    }, delay);
     return () => window.clearTimeout(timer);
-  }, [findAnnouncement]);
+  }, [findAnnouncement, findAction]);
 
   return <section className="terminal-pane" aria-label="Worktree terminals" onKeyDown={paneKey}>
     <p className="sr-only" id="terminal-help">Terminal input and output. Use the left and right arrow keys on a terminal tab to switch sessions.</p>
@@ -761,10 +790,10 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       {/* It moves to the bottom while the current match is under it. */}
       {findOpen && <div className={`window-find terminal-find${findResult.covered ? " is-lowered" : ""}`} id="terminal-find" role="search" aria-label={`Find in ${activeTerminal?.name ?? "terminal"} output`} onKeyDown={findKey}>
         <input ref={findInputRef} type="text" aria-label="Find in terminal output" aria-keyshortcuts={FIND_SHORTCUT} aria-describedby="terminal-find-help" spellCheck={false} autoComplete="off" value={findValue}
-          onChange={(event) => { setFindValue(event.target.value); searchRef.current?.setQuery(event.target.value); }} />
+          onChange={(event) => { setFindAction((count) => count + 1); setFindValue(event.target.value); searchRef.current?.setQuery(event.target.value); }} />
         <span aria-hidden="true">{findStatus}</span>
-        <button type="button" onClick={() => searchRef.current?.step(-1)} disabled={!findQuery} aria-label="Previous terminal match"><ArrowUp /></button>
-        <button type="button" onClick={() => searchRef.current?.step(1)} disabled={!findQuery} aria-label="Next terminal match"><ArrowDown /></button>
+        <button type="button" onClick={() => stepFind(-1)} disabled={!findQuery} aria-label="Previous terminal match"><ArrowUp /></button>
+        <button type="button" onClick={() => stepFind(1)} disabled={!findQuery} aria-label="Next terminal match"><ArrowDown /></button>
         <button type="button" onClick={closeFind} aria-label="Close terminal find"><X /></button>
         <span className="sr-only" id="terminal-find-help">Enter finds the next match, Shift+Enter the previous, and Escape closes Find and returns to the terminal.</span>
         <span className="sr-only" role="status">{announcedFind}</span>
@@ -775,7 +804,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
   </section>;
 }
 
-// While Find is open its current match is the selection, drawn opaque amber
+// While Find holds the selection it is the current match, drawn opaque amber
 // with dark text whatever color the program used: at least 3:1 against the
 // terminal background and 4.5:1 for the text, focused or not.
 function findTheme() {
