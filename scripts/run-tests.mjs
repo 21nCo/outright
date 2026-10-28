@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { uiFixtureBudget } from "../tests/ui-fixture-budget.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const windowsSupervisor = process.platform === "win32"
@@ -48,10 +49,9 @@ const suiteTimeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
 // The suite owns each file serially. Windows' native and SQLite files consume
 // most of the old 10-minute global budget before the browser file begins;
 // retain a bounded per-file deadline and allow the browser its full turn.
-// The focused 1000px wheel fixture has a 330-second interaction phase and a
-// separate cleanup allowance. Its per-file runner must outlive both.
-const smallWheelCap = Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP);
-const testFileTimeoutMs = smallWheelCap > 0 && smallWheelCap <= 1000 ? 390_000 : 300_000;
+// The browser fixture file's runner must outlive the fixture's interaction
+// phase, its cleanup and the file's earlier tests.
+const testFileTimeoutMs = uiFixtureBudget().fileMs;
 const deadline = setTimeout(() => {
   timedOut = true;
   console.error(`Test suite timed out after ${suiteTimeoutMs}ms: file=${currentFile ?? "between-files"} fileElapsedMs=${currentFile ? Date.now() - currentFileStartedAt : 0} runner=${child?.pid ?? "none"}`);

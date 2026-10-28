@@ -7,6 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import WebSocket, { WebSocketServer } from "ws";
+import { uiFixtureBudget } from "./ui-fixture-budget.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -370,10 +371,22 @@ async function waitForFixture(send, deadline, diagnostics = () => "") {
   throw new Error(`Interaction phase exceeded its pre-cleanup deadline: ${fixtureProgress(state)}; ${diagnostics()}; page=${state?.title ?? "unavailable"}; output=${state?.text?.slice(-1000) ?? "unavailable"}`);
 }
 
+// Each MOTION_STEPS rerun pairs with its reduced-motion run, so a platform's
+// frame cadence is attributable step by step.
+const motionStepSuffix = " without reduced motion";
+function motionTimings(timings) {
+  return timings.filter(({ step }) => step.endsWith(motionStepSuffix)).map(({ step, ms }) => {
+    const base = step.slice(0, -motionStepSuffix.length);
+    return { step: base, reduceMs: timings.find((timing) => timing.step === base)?.ms, noPreferenceMs: ms };
+  });
+}
+
 function fixtureProgress(state) {
   const progress = state?.progress;
+  const motion = state?.timings?.length ? motionTimings(state.timings) : [];
   const timing = state?.timings?.length
-    ? `, recent=${JSON.stringify(state.timings.slice(-5))}, slowest=${JSON.stringify([...state.timings].sort((a, b) => b.ms - a.ms).slice(0, 5))}` : "";
+    ? `, recent=${JSON.stringify(state.timings.slice(-5))}, slowest=${JSON.stringify([...state.timings].sort((a, b) => b.ms - a.ms).slice(0, 5))}`
+      + (motion.length ? `, motion=${JSON.stringify(motion)}` : "") : "";
   return progress
     ? `${progress.completed}/${progress.total} complete, current step=${progress.step}, elapsed=${progress.elapsedMs}ms, step=${progress.stepElapsedMs}ms${timing}`
     : "fixture has not reported a step";
@@ -381,11 +394,12 @@ function fixtureProgress(state) {
 
 test("browser fixture polling reports its last step and preserves the phase deadline", { timeout: 5_000 }, async () => {
   const progress = { step: "terminal activation", completed: 7, total: 21, elapsedMs: 1234, stepElapsedMs: 250 };
-  const timings = [{ step: "slow", ms: 900 }, { step: "fast", ms: 10 }];
+  const timings = [{ step: "slow", ms: 900 }, { step: "fast", ms: 10 }, { step: "slow without reduced motion", ms: 1800 }];
   const send = async () => ({ result: { value: { title: "Running", text: "Running interaction regressions", progress, timings } } });
   await assert.rejects(waitForFixture(send, Date.now() + 30, () => "owner=responsive drawer"), (error) =>
     /7\/21 complete, current step=terminal activation, elapsed=1234ms/.test(error.message)
-    && /recent=.*fast.*slowest=.*slow.*owner=responsive drawer/.test(error.message));
+    && /recent=.*fast.*slowest=.*slow.*owner=responsive drawer/.test(error.message)
+    && error.message.includes('motion=[{"step":"slow","reduceMs":900,"noPreferenceMs":1800}]'));
   let polls = 0;
   const completed = await waitForFixture(async () => {
     polls += 1;
@@ -636,23 +650,26 @@ test("a vanished Windows launcher preserves verified descendants without adoptin
 // without it; ui-races.jsx names them in MOTION_STEPS.
 const motionStepCount = 6;
 
-// A measured full local run took 133.5 seconds; macOS CI reached 103/108 at
-// 148.4 seconds. Keep a finite phase with room for the final responsive and
-// recovery steps, while preserving their separate performance assertions.
-// The normal child has 235 seconds including its 210-second interaction phase
-// and cleanup. A focused 1000px full-span wheel fixture gets a larger finite
-// phase bound. The parent must outlive either child contract and reserve its
-// own tree/profile cleanup time.
-const smallWheelCap = Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) > 0
-  && Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) <= 1000;
-const browserPhaseTimeout = smallWheelCap ? 330_000 : 210_000;
-const browserFixtureTimeout = browserPhaseTimeout + 25_000;
+// tests/ui-fixture-budget.mjs sizes the interaction phase from measured CI
+// runs and gives scripts/run-tests.mjs the per-file deadline that outlives
+// it. The parent must outlive either child contract and reserve its own
+// tree/profile cleanup time.
+const { phaseMs: browserPhaseTimeout, fixtureMs: browserFixtureTimeout, fileMs: testFileTimeout } = uiFixtureBudget();
 const nestedStartupAllowance = 15_000;
 const nestedRunnerBudget = (childBudget, startupAllowance) => childBudget + startupAllowance;
 const nestedExitTimeout = nestedRunnerBudget(browserFixtureTimeout, nestedStartupAllowance);
 test("nested runner deadline exceeds its child's full browser budget", () => {
   assert(nestedExitTimeout > browserFixtureTimeout);
   assert(nestedExitTimeout > browserPhaseTimeout + 25_000);
+});
+
+test("the per-file deadline outlives the browser fixture and the file's earlier tests", () => {
+  // macOS CI spent 17 seconds on this file's earlier tests and needs about
+  // 232 seconds for the 156-step interaction phase.
+  assert(testFileTimeout >= browserFixtureTimeout + 30_000);
+  assert(browserPhaseTimeout >= 232_000 + 30_000);
+  const wheel = uiFixtureBudget(1000);
+  assert(wheel.phaseMs > browserPhaseTimeout && wheel.fileMs >= wheel.fixtureMs + 30_000);
 });
 
 test("parent permits a slow child beyond the old shorter watchdog", { timeout: 5_000 }, async () => {
