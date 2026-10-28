@@ -6,11 +6,13 @@ import { createRoot } from "react-dom/client";
 import { App } from "../src/App.jsx";
 import { ChangesPane } from "../src/components/ChangesPane.jsx";
 import { WindowedMessages } from "../src/components/WindowedMessages.jsx";
-import { WindowedDiff } from "../src/components/WindowedDiff.jsx";
+import { WindowedDiff, diffFindTop, diffRowsHeight } from "../src/components/WindowedDiff.jsx";
 import { CommandPalette } from "../src/components/CommandPalette.jsx";
 import { SettingsDialog } from "../src/components/SettingsDialog.jsx";
 import { ProviderAccounts } from "../src/components/ProviderAccounts.jsx";
 import { TerminalPane } from "../src/components/TerminalPane.jsx";
+import { PaneBody, PaneLayout } from "../src/components/PaneLayout.jsx";
+import { computePaneRects } from "../src/lib/pane-layout.js";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
 import { scheduleLayoutTick } from "../src/lib/windowing.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
@@ -25,6 +27,9 @@ const originalFetch = window.fetch;
 const OriginalSocket = window.WebSocket;
 const keys = ["outright.selected-project", "outright.selected-worktree", "outright.selected-conversation"];
 const saved = keys.map((key) => localStorage.getItem(key));
+// Pane layouts persist per worktree; each step starts from the default.
+const LAYOUT_KEY = "outright.pane-layouts";
+const savedLayouts = localStorage.getItem(LAYOUT_KEY);
 const projects = ["A", "B"].map((id) => ({ id, name: `Review ${id}`, path: `/fixture/${id}`, worktrees: [{ id, name: id, path: `/fixture/${id}`, branch: "main", changedCount: 0 }] }));
 const chats = Object.fromEntries(projects.map(({ id }) => [id, { id: `chat-${id}`, title: `Conversation ${id}`, projectId: id, worktreeId: id, worktreePath: `/fixture/${id}`, provider: "codex", messages: [], runs: [] }]));
 const terminal = (id) => ({ id: `term-${id}`, name: `Terminal ${id}`, cwd: `/fixture/${id[0]}`, status: "running" });
@@ -181,18 +186,18 @@ async function chatTabControlRegression() {
   nextChat.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true }));
   await until(() => selected.getAttribute("aria-selected") === "true", "Home returns to first chat");
   const changes = host.querySelector('[aria-label="Changes"]');
-  assert(!host.querySelector("#workspace-inspector"), "Inspector was already open before Changes click");
+  assert(!host.querySelector("#pane-changes") && changes.getAttribute("aria-pressed") === "false", "Changes pane was already open before Changes click");
+  changes.focus();
   changes.click();
-  await settle();
-  assert(host.querySelector('#workspace-inspector'), `Inspector did not open: changes=${changes.outerHTML.slice(0, 400)}, connected=${changes.isConnected}, active=${document.activeElement?.outerHTML.slice(0, 250)}`);
-  assert(host.querySelector('#inspector-tab-changes[aria-selected="true"]'),
-    `Changes did not select the inspector tab: ${host.querySelector('#workspace-inspector')?.outerHTML.slice(0, 600)}`);
-  const inspectorTab = host.querySelector("#inspector-tab-changes");
-  await assertVerticalKeysIgnored(inspectorTab, inspectorTab, "Inspector");
-  inspectorTab.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true, cancelable: true }));
-  await until(() => host.querySelector('#inspector-tab-context[aria-selected="true"]'), "End selects final inspector tab");
-  host.querySelector("#inspector-tab-context").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
-  await until(() => host.querySelector('#inspector-tab-terminal[aria-selected="true"]'), "left arrow selects terminal inspector tab");
+  await until(() => document.activeElement === host.querySelector("#pane-changes"), "Changes pane opened with focus");
+  assert(changes.getAttribute("aria-pressed") === "true" && changes.getAttribute("aria-controls") === "pane-changes",
+    `Changes toggle does not report its pane: ${changes.outerHTML.slice(0, 300)}`);
+  assert(host.querySelector('[role="tab"][aria-selected="true"]') === selected, "Opening a pane changed the selected chat");
+  changes.focus();
+  changes.click();
+  await until(() => !host.querySelector("#pane-changes"), "Changes toggle closes its pane");
+  assert(changes.getAttribute("aria-pressed") === "false" && !changes.hasAttribute("aria-controls"), "Closed Changes pane is still reported open");
+  assert(document.activeElement === changes, "Closing from the toolbar moved focus away from the toggle");
 }
 
 async function sameWorktreeChatSelectionRegression() {
@@ -3892,7 +3897,7 @@ async function changesSelectionRefreshRegression() {
     return response({});
   };
   const tree = projects[0].worktrees[0];
-  const pane = (event) => <div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>;
+  const pane = (event) => <PaneBody style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></PaneBody>;
   root.render(pane(null));
   await until(() => host.querySelectorAll('.change-file-select').length === 2, "change selection ready");
   holdStatus = true;
@@ -3945,7 +3950,7 @@ async function changesDiffFailureOwnershipRegression() {
     }
     return response({});
   };
-  root.render(<div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>);
+  root.render(<PaneBody style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></PaneBody>);
   await until(() => host.querySelector('.diff-view')?.textContent.includes("A content"), "initial A diff");
   [...host.querySelectorAll('.change-file-select')].find((button) => button.textContent.includes("b.txt")).click();
   await settle();
@@ -3976,46 +3981,355 @@ async function diffRefreshAnchorRegression() {
     return response({});
   };
   const tree = projects[0].worktrees[0];
-  const pane = (event) => <div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>;
+  const pane = (event) => <PaneBody style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={event} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></PaneBody>;
   root.render(pane(null));
   await until(() => host.querySelector(".diff-view")?.textContent.includes("line 0"), "large diff ready");
   const viewport = host.querySelector(".diff-view");
-  const find = host.querySelector('input[aria-label="Find in diff"]');
-  setControlValue(find, "line 2500");
-  find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-  const foundRowIsAligned = () => {
-    const row = viewport.querySelector('[data-find-match="true"]');
-    if (!row?.textContent.includes("2500")) return false;
-    const bounds = row.getBoundingClientRect();
-    const frame = viewport.getBoundingClientRect();
-    return Math.abs(bounds.top - (frame.top + viewport.clientHeight / 3)) < 2;
+  await withDiffTrace(viewport, async () => {
+    const find = host.querySelector('input[aria-label="Find in diff"]');
+    setControlValue(find, "line 2500");
+    find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    const foundRowIsAligned = () => {
+      const row = viewport.querySelector('[data-find-match="true"]');
+      if (!row?.textContent.includes("2500")) return false;
+      return Math.abs(diffFindRowOffset(viewport)) < 2;
+    };
+    await until(() => foundRowIsAligned() && viewport.scrollTop > 20_000,
+      "large diff find aligned at its committed reading position");
+    // The mark may mount before the queued Find alignment settles on slower
+    // hosts. Start the refresh comparison from the completed reading position.
+    await settle();
+    assert(foundRowIsAligned(), "Large diff Find lost its aligned row before refresh");
+    const anchor = viewport.scrollTop;
+    hold = true;
+    root.render(pane({ type: "projects.changed" }));
+    await until(() => pending.length === 1, "background diff refresh pending");
+    assert(viewport.textContent.includes("line 2500") && viewport.querySelector('[data-find-match="true"]'), "Background refresh erased the reader's diff or find");
+    assert(Math.abs(viewport.scrollTop - anchor) < 24 && foundRowIsAligned(),
+      `Background refresh moved the diff anchor before its response: ${anchor} -> ${viewport.scrollTop}, row=${viewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top}, viewport=${viewport.getBoundingClientRect().top}`);
+    pending.shift().resolve(response({ diff: original }));
+    await settle();
+    assert(Math.abs(viewport.scrollTop - anchor) < 24 && viewport.querySelector('[data-find-match="true"]'), "Identical diff refresh lost the anchor or find");
+    host.querySelector('[aria-label="Refresh changes"]').click();
+    await until(() => pending.length === 1, "changed diff refresh pending");
+    pending.shift().resolve(response({ diff: changed }));
+    await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("LINE 2500"), "changed diff find retained");
+    assert(Math.abs(viewport.scrollTop - anchor) < 24, "Changed diff refresh moved the reader's line");
+    host.querySelector('[aria-label="Refresh changes"]').click();
+    await until(() => pending.length === 1, "failed same-selection refresh pending");
+    pending.shift().reject(new Error("Diff offline"));
+    await until(() => errors.includes("Diff offline"), "same-selection failure reported");
+    assert(viewport.textContent.includes("LINE 2500") && Math.abs(viewport.scrollTop - anchor) < 24, "Failed same-selection refresh erased the last valid diff");
+  });
+}
+
+// Windows CI lost a Find match to a late queued scroll only at some viewport
+// heights: where the aligned first row equals the Find anchor, the late
+// scroll changes no mounted row and nothing aligned the match again. With
+// classic scrollbars, as on that runner, rows 252-279px tall do that; these
+// heights cover that range with a margin for platform chrome.
+async function diffFindOwnershipRegression() {
+  root.render(null); await settle();
+  const style = document.createElement("style");
+  style.textContent = ".diff-view::-webkit-scrollbar { width: 17px; height: 17px; } .diff-view::-webkit-scrollbar-thumb { background: #888; }";
+  document.head.append(style);
+  const diff = Array.from({ length: 5_000 }, (_, index) => `-unstaged ${index}\n`).join("");
+  try {
+    for (const height of [287, 294, 301, 308]) {
+      root.render(null); await settle(); // NOSONAR S9382: each height starts from a fresh viewport
+      root.render(<PaneBody style={{ width: 448, height }}><WindowedDiff diff={diff} label={`Diff at ${height}px`} /></PaneBody>);
+      await until(() => host.querySelector(".diff-view")?.textContent.includes("unstaged 0"), `diff at ${height}px`); // NOSONAR S9382: each height starts from a fresh viewport
+      const viewport = host.querySelector(".diff-view");
+      const find = host.querySelector('input[aria-label="Find in diff"]');
+      setControlValue(find, "unstaged 2500");
+      find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      await until(() => diffFindLanded(viewport, "unstaged 2500", 2500), `Find at ${height}px`); // NOSONAR S9382: each height starts from a fresh viewport
+      await assertFindKeepsOwnership(viewport, "unstaged 2500", `Find at ${height}px (${viewport.clientHeight}px rows)`); // NOSONAR S9382: each height starts from a fresh viewport
+    }
+    // A commit can land after a scroll Find did not cause and before that
+    // scroll's event. The commit itself must show the match at its target,
+    // and while a seek has not moved the viewport yet, the window must not
+    // mount the match where the viewport is not.
+    const pane = (label) => <PaneBody style={{ width: 448, height: 600 }}><WindowedDiff diff={diff} label={label} /></PaneBody>;
+    root.render(null); await settle();
+    root.render(pane("Diff before a commit"));
+    await until(() => host.querySelector(".diff-view")?.textContent.includes("unstaged 0"), "diff for a commit before a scroll event");
+    const viewport = host.querySelector(".diff-view");
+    const find = host.querySelector('input[aria-label="Find in diff"]');
+    const native = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop");
+    await withDiffTrace(viewport, async () => {
+      setControlValue(find, "unstaged 2500");
+      find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      await until(() => diffFindLanded(viewport, "unstaged 2500", 2500), "Find before a late scroll and commit");
+      native.set.call(viewport, viewport.scrollHeight);
+      flushSync(() => root.render(pane("Diff committed before its scroll event")));
+      assert(Math.abs(diffFindRowOffset(viewport)) < 2, `A commit before the late scroll's event left the Find match ${diffFindRowOffset(viewport)}px from its target; ${diffFindState(viewport, 2500)}`);
+    });
+    root.render(null); await settle();
+    root.render(pane("Diff with a held seek"));
+    await until(() => host.querySelector(".diff-view")?.textContent.includes("unstaged 0"), "diff for a held seek");
+    const held = host.querySelector(".diff-view");
+    await withDiffTrace(held, async () => {
+      // Hold the seek over the trace's own scrollTop recorder, then give it back.
+      const traced = Object.getOwnPropertyDescriptor(held, "scrollTop");
+      Object.defineProperty(held, "scrollTop", { configurable: true, get: () => native.get.call(held), set: () => {} });
+      try {
+        const input = host.querySelector('input[aria-label="Find in diff"]');
+        setControlValue(input, "unstaged 2500");
+        flushSync(() => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
+        await settle();
+        const mark = held.querySelector('[data-find-match="true"]')?.getBoundingClientRect();
+        const view = held.getBoundingClientRect();
+        assert(!mark || (mark.bottom > view.top && mark.top < view.bottom), `A held seek mounted the Find match outside the viewport: mark=${mark?.top}, viewport=${view.top}/${view.bottom}, scroll=${held.scrollTop}, mounted=${held.dataset.mountedStart}/${held.dataset.mountedEnd}`);
+      } finally { Object.defineProperty(held, "scrollTop", traced); }
+      // Once the viewport can move, the next commit reclaims the match, and
+      // that commit's layout must show it at its target. On failure, the
+      // states one and two frames later tell a late layout from a wrong one.
+      flushSync(() => root.render(pane("Diff after a held seek")));
+      if (!diffFindLanded(held, "unstaged 2500", 2500)) {
+        const committed = diffFindState(held, 2500);
+        await frame();
+        const oneFrame = diffFindState(held, 2500);
+        await frame();
+        throw new Error(`A commit after a held seek did not land Find: ${committed}; +1f ${oneFrame}; +2f ${diffFindState(held, 2500)}`);
+      }
+    });
+  } finally { style.remove(); }
+}
+
+// The Find row's distance from a third of the way down the diff rows. The
+// rows height is WindowedDiff's own definition; the row comes from layout.
+function diffFindRowOffset(viewport) {
+  const row = viewport.querySelector('[data-find-match="true"]');
+  return row ? row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - diffRowsHeight(viewport) / 3 : Number.NaN;
+}
+
+// Where layout put the marked row, split in two: its place in the track
+// against its line's position, and the track against the scroll position.
+// Both are 0 when the window placed the row where its line belongs.
+function diffRowPlacement(viewport) {
+  const row = viewport.querySelector('[data-find-match="true"]');
+  const track = viewport.firstElementChild;
+  if (!row || !track) return null;
+  const line = Number(row.querySelector("i")?.textContent) - 1;
+  const padding = Number.parseFloat(getComputedStyle(viewport).paddingTop) || 0;
+  const trackTop = track.getBoundingClientRect().top;
+  return { place: row.getBoundingClientRect().top - trackTop - line * 14, track: trackTop - (viewport.getBoundingClientRect().top + padding - viewport.scrollTop) };
+}
+
+// Everything that decides whether Find landed, for a failure message: the
+// scroll position against its target, the committed window, the mark, and the
+// row's place from layout offsets, which involve no scrolling, beside its
+// place from rects, which do.
+function diffFindState(viewport, line) {
+  const row = viewport.querySelector('[data-find-match="true"]');
+  const track = viewport.firstElementChild;
+  const spacer = track?.querySelector(".diff-spacer");
+  const spacerSize = spacer ? `${spacer.style.height}/${spacer.offsetHeight}` : "none";
+  const placement = diffRowPlacement(viewport);
+  const fixed = (value) => Number.isFinite(value) ? value.toFixed(2) : String(value);
+  return [
+    `scroll=${viewport.scrollTop} findTop=${fixed(diffFindTop(viewport, line))}`,
+    `box=${viewport.offsetHeight} client=${viewport.clientHeight} scrollHeight=${viewport.scrollHeight}`,
+    `first=${viewport.dataset.firstLine} mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`,
+    `mark=${row ? JSON.stringify(row.textContent.trim()) : "none"} row=${fixed(diffFindRowOffset(viewport))}`,
+    placement ? `place=${fixed(placement.place)} track=${fixed(placement.track)}` : "place=unmounted",
+    `offsetPlace=${row && track ? row.offsetTop - track.offsetTop - line * 14 : "unmounted"}`,
+    `spacer=${spacerSize} page=${document.visibilityState}`,
+  ].join(" ");
+}
+
+// Records what moves a diff viewport, by animation frame: each script write to
+// scrollTop and its writer, each scroll event and whether a script write
+// explains it, each resize delivery, and each committed window or Find mark
+// with the Find row's offset. A failing diff assertion appends the record.
+const fixtureNativeFrame = window.requestAnimationFrame.bind(window);
+function traceDiffViewport(viewport) {
+  const entries = [];
+  const writes = [];
+  const unexplained = [];
+  let frameIndex = 0;
+  let firstMarked = null;
+  let frameRequest = fixtureNativeFrame(function tick() { frameIndex += 1; frameRequest = fixtureNativeFrame(tick); });
+  const native = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop");
+  const top = () => native.get.call(viewport);
+  const record = (kind, detail) => {
+    entries.push(`f${frameIndex} ${kind} ${detail}${document.visibilityState === "visible" ? "" : " [page hidden]"}`);
+    if (entries.length > 60) entries.shift();
   };
-  await until(() => foundRowIsAligned() && viewport.scrollTop > 20_000,
-    "large diff find aligned at its committed reading position");
-  // The mark may mount before the queued Find alignment settles on slower
-  // hosts. Start the refresh comparison from the completed reading position.
-  await settle();
-  assert(foundRowIsAligned(), "Large diff Find lost its aligned row before refresh");
-  const anchor = viewport.scrollTop;
-  hold = true;
-  root.render(pane({ type: "projects.changed" }));
-  await until(() => pending.length === 1, "background diff refresh pending");
-  assert(viewport.textContent.includes("line 2500") && viewport.querySelector('[data-find-match="true"]'), "Background refresh erased the reader's diff or find");
-  assert(Math.abs(viewport.scrollTop - anchor) < 24 && foundRowIsAligned(),
-    `Background refresh moved the diff anchor before its response: ${anchor} -> ${viewport.scrollTop}, row=${viewport.querySelector('[data-find-match="true"]')?.getBoundingClientRect().top}, viewport=${viewport.getBoundingClientRect().top}`);
-  pending.shift().resolve(response({ diff: original }));
-  await settle();
-  assert(Math.abs(viewport.scrollTop - anchor) < 24 && viewport.querySelector('[data-find-match="true"]'), "Identical diff refresh lost the anchor or find");
-  host.querySelector('[aria-label="Refresh changes"]').click();
-  await until(() => pending.length === 1, "changed diff refresh pending");
-  pending.shift().resolve(response({ diff: changed }));
-  await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("LINE 2500"), "changed diff find retained");
-  assert(Math.abs(viewport.scrollTop - anchor) < 24, "Changed diff refresh moved the reader's line");
-  host.querySelector('[aria-label="Refresh changes"]').click();
-  await until(() => pending.length === 1, "failed same-selection refresh pending");
-  pending.shift().reject(new Error("Diff offline"));
-  await until(() => errors.includes("Diff offline"), "same-selection failure reported");
-  assert(viewport.textContent.includes("LINE 2500") && Math.abs(viewport.scrollTop - anchor) < 24, "Failed same-selection refresh erased the last valid diff");
+  const owned = !Object.hasOwn(viewport, "scrollTop");
+  if (owned) Object.defineProperty(viewport, "scrollTop", { configurable: true, get: top, set(value) {
+    const before = top();
+    native.set.call(viewport, value);
+    const writer = new Error("trace").stack.split("\n").slice(2).map((line) => line.trim().match(/^at (?:async )?([\w$.]+)/)?.[1]).find(Boolean) ?? "unknown";
+    writes.push(top());
+    record("write", `${writer} ${before}->${top()} (set ${value})`);
+  } });
+  const onScroll = (event) => {
+    const explained = !event.isTrusted || writes.includes(top());
+    if (!explained) unexplained.push(top());
+    record("scroll", `${top()}${event.isTrusted ? "" : " synthetic"}${explained ? "" : " WITHOUT A SCRIPT WRITE"}`);
+  };
+  viewport.addEventListener("scroll", onScroll, true);
+  const resize = new ResizeObserver(() => record("resize", `box=${viewport.offsetHeight} client=${viewport.clientHeight}`));
+  resize.observe(viewport);
+  const commits = new MutationObserver(() => {
+    const marked = Boolean(viewport.querySelector('[data-find-match="true"]'));
+    const offset = diffFindRowOffset(viewport);
+    if (marked && firstMarked == null) firstMarked = offset;
+    // The same row after one and two frames tells stale synchronous geometry
+    // from a frame that really showed the row elsewhere.
+    const placed = (kind) => {
+      const placement = diffRowPlacement(viewport);
+      record(kind, `first=${viewport.dataset.firstLine} mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd} top=${top()} row=${placement ? diffFindRowOffset(viewport).toFixed(2) : "unmounted"}${placement ? ` place=${placement.place.toFixed(2)} track=${placement.track.toFixed(2)}` : ""}`);
+    };
+    placed("commit");
+    if (marked) fixtureNativeFrame(() => { placed("commit+1f"); fixtureNativeFrame(() => placed("commit+2f")); });
+  });
+  commits.observe(viewport, { attributes: true, childList: true, subtree: true, attributeFilter: ["data-first-line", "data-mounted-start", "data-mounted-end", "data-find-match"] });
+  return {
+    firstMarkedOffset: () => firstMarked,
+    unexplained: () => unexplained,
+    text: () => entries.join(" | "),
+    stop() {
+      window.cancelAnimationFrame(frameRequest);
+      viewport.removeEventListener("scroll", onScroll, true);
+      resize.disconnect();
+      commits.disconnect();
+      if (owned) delete viewport.scrollTop;
+    },
+  };
+}
+async function withDiffTrace(viewport, run) {
+  const trace = traceDiffViewport(viewport);
+  try { return await run(trace); }
+  catch (error) { throw new Error(`${error.message}; ${navigator.userAgent}; trace: ${trace.text()}`, { cause: error }); }
+  finally { trace.stop(); }
+}
+// Find is ready when the viewport is at the match's target and layout shows
+// the match row there, not merely when the row is mounted.
+function diffFindLanded(viewport, text, line) {
+  return viewport.querySelector('[data-find-match="true"]')?.textContent.includes(text)
+    && Math.abs(viewport.scrollTop - diffFindTop(viewport, line)) <= 1
+    && Math.abs(diffFindRowOffset(viewport)) < 2;
+}
+
+async function diffScrollbarFeedbackRegression() {
+  root.render(null); await settle();
+  // Classic scrollbars (CI on macOS and Windows) take layout space. A long row
+  // mounted at the window edge then shows a horizontal scrollbar that changes
+  // the viewport height, which changes the mounted rows in turn. Windows CI
+  // also showed a Find that landed beside its target and was moved by a later
+  // corrective pass, so the first committed frame must already be final.
+  const style = document.createElement("style");
+  document.head.append(style);
+  let diff = "";
+  route = async (url) => {
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [{ path: "large.txt", status: "MM", index: "M", worktree: "M" }], stagedCount: 1 });
+    if (url.pathname === "/api/git/diff") return response({ diff });
+    return response({});
+  };
+  const render = async (long) => {
+    diff = Array.from({ length: 5_000 }, (_, index) => index === long ? `+${"x".repeat(400)}\n` : `+line ${index}\n`).join("");
+    root.render(null); await settle();
+    root.render(<PaneBody style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></PaneBody>);
+    await until(() => host.querySelector(".diff-view")?.textContent.includes("line 0"), `diff with a long row at ${long} ready`);
+    return host.querySelector(".diff-view");
+  };
+  const find = async (viewport, trace, label) => {
+    const input = host.querySelector('input[aria-label="Find in diff"]');
+    setControlValue(input, "line 2500");
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await until(() => diffFindLanded(viewport, "line 2500", 2500), `${label}: Find landed`);
+    assert(Math.abs(trace.firstMarkedOffset()) < 2, `${label}: the first commit that showed the Find row placed it ${trace.firstMarkedOffset()}px from its target`);
+    assert(!trace.unexplained().length, `${label}: the browser moved the diff to ${trace.unexplained().join(", ")} without a script write while Find owned it`);
+  };
+  try {
+    for (const size of [15, 17]) {
+      style.textContent = `.diff-view::-webkit-scrollbar { width: ${size}px; height: ${size}px; } .diff-view::-webkit-scrollbar-thumb { background: #888; }`;
+      const plain = await render(-1); // NOSONAR S9382: each case starts from a fresh viewport
+      await withDiffTrace(plain, (trace) => find(plain, trace, `${size}px scrollbars, reference window`)); // NOSONAR S9382: each case starts from a fresh viewport
+      for (let index = 0; index < 4; index += 1) await frame(); // NOSONAR S9382: the plain window is the reference for the edge cases
+      const start = Number(plain.dataset.mountedStart);
+      const end = Number(plain.dataset.mountedEnd);
+      for (const long of [-1, start - 2, start - 1, start, start + 1, end - 2, end - 1, end, end + 1]) {
+        const viewport = await render(long); // NOSONAR S9382: each case starts from a fresh viewport
+        const label = `${size}px scrollbars, long row at ${long}`;
+        await withDiffTrace(viewport, async (trace) => { // NOSONAR S9382: each case starts from a fresh viewport
+          await find(viewport, trace, label);
+          const place = () => `${viewport.scrollTop}:${viewport.clientHeight}:${viewport.dataset.mountedStart}:${viewport.dataset.mountedEnd}`;
+          const settled = place();
+          for (let index = 0; index <= 20; index += 1) {
+            assert(place() === settled, `${label}: the diff window moved ${index} frames after Find landed: ${settled} -> ${place()}`);
+            assert(Math.abs(diffFindRowOffset(viewport)) < 2, `${label}: the Find row was ${diffFindRowOffset(viewport)}px from its target ${index} frames after Find landed`);
+            if (index < 20) await frame(); // NOSONAR S9382: one sample per frame
+          }
+          assert(!trace.unexplained().length, `${label}: the browser moved the diff to ${trace.unexplained().join(", ")} without a script write while Find owned it`);
+          const row = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
+          const frameTop = viewport.getBoundingClientRect().top;
+          assert(row.top >= frameTop && row.bottom <= frameTop + viewport.clientHeight, `${label}: the Find match was outside the diff viewport`);
+        });
+      }
+    }
+  } finally { style.remove(); }
+}
+
+// Find, Next and Previous land aligned in the seek itself, and a pane resize
+// while Find owns the diff aligns the match before that frame paints, without
+// waiting for an animation frame.
+async function diffFindResizeRegression() {
+  root.render(null); await settle();
+  const style = document.createElement("style");
+  style.textContent = ".diff-view::-webkit-scrollbar { width: 17px; height: 17px; } .diff-view::-webkit-scrollbar-thumb { background: #888; }";
+  document.head.append(style);
+  const diff = Array.from({ length: 5_000 }, (_, index) => `-unstaged ${index}\n`).join("");
+  const nativeFrame = window.requestAnimationFrame;
+  let probe;
+  let trace;
+  try {
+    root.render(<PaneBody style={{ width: 448, height: 600 }}><WindowedDiff diff={diff} label="Resized diff" /></PaneBody>);
+    await until(() => host.querySelector(".diff-view")?.textContent.includes("unstaged 0"), "resizable diff ready");
+    const viewport = host.querySelector(".diff-view");
+    trace = traceDiffViewport(viewport);
+    const find = host.querySelector('input[aria-label="Find in diff"]');
+    setControlValue(find, "unstaged 31");
+    const steps = [
+      ["Find", "unstaged 31", () => find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }))],
+      ["Next", "unstaged 310", () => host.querySelector('[aria-label="Next diff match"]').click()],
+      ["Next", "unstaged 311", () => host.querySelector('[aria-label="Next diff match"]').click()],
+      ["Previous", "unstaged 310", () => host.querySelector('[aria-label="Previous diff match"]').click()],
+    ];
+    for (const [name, text, act] of steps) {
+      act();
+      await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.endsWith(`-${text}\n`), `${name} reaches ${text}`); // NOSONAR S9382: each navigation waits for its own match
+      const top = viewport.scrollTop;
+      for (let index = 0; index <= 10; index += 1) {
+        assert(Math.abs(diffFindRowOffset(viewport)) < 2 && viewport.scrollTop === top, `${name} to ${text}: the match was ${diffFindRowOffset(viewport)}px from its target, scroll ${top} -> ${viewport.scrollTop}, ${index} frames after it committed`);
+        if (index < 10) await frame(); // NOSONAR S9382: one sample per frame
+      }
+    }
+    // Observers deliver in creation order, so this one samples after the
+    // diff's own observer in the same delivery, before paint.
+    let sample = null;
+    probe = new ResizeObserver(() => { sample ??= { offset: diffFindRowOffset(viewport), height: viewport.offsetHeight }; });
+    probe.observe(viewport);
+    await settle();
+    // Animation frames are delayed, so only work done before paint counts.
+    window.requestAnimationFrame = (callback) => nativeFrame(() => nativeFrame(() => nativeFrame(callback)));
+    // Resize outside React, as a window, font or sibling layout change does.
+    const body = host.querySelector(".pane-body");
+    for (const [width, height] of [[448, 520], [448, 640], [320, 640]]) {
+      sample = null;
+      Object.assign(body.style, { width: `${width}px`, height: `${height}px` });
+      await until(() => sample, `diff resized to ${width}x${height}`); // NOSONAR S9382: each resize is observed on its own
+      assert(Math.abs(sample.offset) < 2, `A resize to ${width}x${height} (${sample.height}px rows) left the Find match ${sample.offset}px from its target in the resize frame`);
+      for (let index = 0; index < 10; index += 1) { // NOSONAR S9382: one sample per frame
+        await frame();
+        assert(Math.abs(diffFindRowOffset(viewport)) < 2, `A resize to ${width}x${height} moved the Find match ${diffFindRowOffset(viewport)}px from its target ${index + 1} frames later`);
+      }
+    }
+  } catch (error) { throw new Error(`${error.message}; ${navigator.userAgent}; trace: ${trace?.text()}`, { cause: error }); }
+  finally { window.requestAnimationFrame = nativeFrame; probe?.disconnect(); trace?.stop(); style.remove(); }
 }
 
 async function changesMutationOwnerRegression(reject = false, mode = "stage") {
@@ -4030,7 +4344,7 @@ async function changesMutationOwnerRegression(reject = false, mode = "stage") {
     if (url.pathname === `/api/git/${mode}`) return pending.promise;
     return response({});
   };
-  const pane = (tree) => <div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></div>;
+  const pane = (tree) => <PaneBody style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={() => {}} /></PaneBody>;
   root.render(pane(projects[0].worktrees[0]));
   await until(() => host.querySelector('.pane-toolbar strong')?.textContent === "A branch", "A changes ready");
   host.querySelector(`[aria-label="${mode === "unstage" ? "Unstage" : "Stage"} file.txt"]`).click();
@@ -4058,7 +4372,7 @@ async function changesCommitOwnerRegression(reject = false) {
     if (url.pathname === "/api/git/commit") return pending.promise;
     return response({});
   };
-  const pane = (tree) => <div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={(message) => toasts.push(message)} /></div>;
+  const pane = (tree) => <PaneBody style={{ width: 448, height: 600 }}><ChangesPane worktree={tree} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => errors.push(error.message)} onToast={(message) => toasts.push(message)} /></PaneBody>;
   root.render(pane(projects[0].worktrees[0]));
   await until(() => host.querySelector('.pane-toolbar strong')?.textContent === "A branch", "A commit pane ready");
   setControlValue(host.querySelector('[aria-label="Commit message"]'), "Commit A");
@@ -4085,7 +4399,7 @@ async function productionDiffViewportRegression() {
     if (url.pathname === "/api/git/diff") return response({ diff: url.searchParams.get("staged") === "true" ? staged : unstaged });
     return response({});
   };
-  root.render(<div className="inspector-body" style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>);
+  root.render(<PaneBody style={{ width: 448, height: 600 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></PaneBody>);
   await until(() => host.querySelector('.diff-view')?.textContent.includes("-unstaged 0"), "initial production diff");
   host.querySelector('[aria-label="Diff view"] button[aria-pressed="false"]').click();
   await until(() => host.querySelector('.diff-view')?.textContent.includes("+staged 0"), "staged production diff");
@@ -4199,16 +4513,18 @@ async function productionDiffViewportRegression() {
   catch (error) { throw new Error(`${error.message}; status=${host.querySelector('.window-find [aria-hidden="true"]')?.textContent}; scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}; rows=${[...viewport.querySelectorAll('[data-find-match], span')].slice(0, 3).map((row) => row.textContent.slice(0, 30)).join('|')}; marked=${viewport.querySelector('[data-find-match="true"]')?.textContent.slice(0, 80)}`); }
   assert(viewport.querySelector('[data-find-match="true"]')?.textContent.includes("unstaged 25000"), "Found diff line was not marked");
   assert(viewport.querySelectorAll("span").length < 200, "Finding a diff match mounted all lines");
+  await assertFindKeepsOwnership(viewport, "unstaged 25000", "448px pane Find");
   viewport.focus();
   if (window.__fixtureSendKey) await window.__fixtureSendKey("End");
   else { viewport.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true, cancelable: true })); viewport.scrollTop = viewport.scrollHeight; viewport.dispatchEvent(new Event("scroll")); }
   await until(() => viewport.textContent.includes("unstaged 49999"), "real End takes ownership after Find");
   host.querySelector('[aria-label="Next diff match"]').click();
   await until(matchIsVisible, "Find realigns after a real End key");
-  root.render(<div className="inspector-body" style={{ width: 320, height: 480 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></div>);
+  root.render(<PaneBody style={{ width: 320, height: 480 }}><ChangesPane worktree={projects[0].worktrees[0]} runtimeEvent={null} settings={{ editor: "code" }} onError={(error) => { throw error; }} onToast={() => {}} /></PaneBody>);
   await settle();
-  assert(host.querySelector('.diff-view').clientHeight > 0 && host.querySelector('.diff-view').clientHeight < 480, "Narrow inspector lost its bounded diff viewport");
-  assert(host.querySelector('.diff-view').querySelectorAll("span").length < 200, "Narrow inspector mounted all diff lines");
+  assert(host.querySelector('.diff-view').clientHeight > 0 && host.querySelector('.diff-view').clientHeight < 480, "Narrow pane lost its bounded diff viewport");
+  assert(host.querySelector('.diff-view').querySelectorAll("span").length < 200, "Narrow pane mounted all diff lines");
+  await assertFindKeepsOwnership(host.querySelector('.diff-view'), "unstaged 25000", "320px pane Find");
 }
 
 async function longTranscriptWindowRegression() {
@@ -4402,6 +4718,48 @@ async function largeDiffWindowRegression() {
   window.__performanceEvidence = { ...(window.__performanceEvidence ?? {}), diff: { elapsedMs, mountedAtEnd: viewport.querySelectorAll("span").length, heapBytes: performance.memory?.usedJSHeapSize ?? null } };
 }
 
+// Find owns the diff viewport until a user gesture or a new query. A scroll
+// queued long after the seek settled, as a native End can be on a slow host,
+// must bring the match back and keep it there, with bounded commits a frame.
+async function assertFindKeepsOwnership(viewport, text, label) {
+  await withDiffTrace(viewport, () => findKeepsOwnership(viewport, text, label));
+}
+async function findKeepsOwnership(viewport, text, label) {
+  const matchShown = () => {
+    const mark = viewport.querySelector('[data-find-match="true"]');
+    if (!mark?.textContent.includes(text)) return false;
+    const row = mark.getBoundingClientRect();
+    const view = viewport.getBoundingClientRect();
+    return row.bottom > view.top && row.top < view.bottom;
+  };
+  const describe = () => `scroll=${viewport.scrollTop}/${viewport.scrollHeight - viewport.clientHeight}; first=${viewport.dataset.firstLine}; mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}; marked=${viewport.querySelector('[data-find-match="true"]')?.textContent.slice(0, 40)}`;
+  for (let tick = 0; tick < 16; tick += 1) await frame(); // NOSONAR S9382: outlasts the old 12-frame settling budget
+  assert(matchShown(), `${label}: the match was not shown before the late scroll; ${describe()}`);
+  let commits = 0;
+  let peak = 0;
+  const observer = new MutationObserver((records) => { commits += records.filter((record) => record.attributeName === "data-first-line").length; });
+  observer.observe(viewport, { attributes: true, attributeFilter: ["data-first-line"] });
+  try {
+    viewport.scrollTop = viewport.scrollHeight;
+    viewport.dispatchEvent(new Event("scroll"));
+    let realigned = false;
+    for (let tick = 0; tick < 60 && !realigned; tick += 1) { // NOSONAR S9382: one sample per frame
+      await frame();
+      await Promise.resolve();
+      peak = Math.max(peak, commits); commits = 0;
+      realigned = matchShown();
+    }
+    assert(realigned, `${label}: a late queued scroll took the match out of view; ${describe()}`);
+    for (let tick = 0; tick < 10; tick += 1) { // NOSONAR S9382: one sample per frame
+      await frame();
+      await Promise.resolve();
+      peak = Math.max(peak, commits); commits = 0;
+      assert(matchShown(), `${label}: the match left the view ${tick + 1} frames after realigning; ${describe()}`);
+    }
+  } finally { observer.disconnect(); }
+  assert(peak <= 9, `${label}: ${peak} window commits in one frame`);
+}
+
 async function awaitPhysicalCompressedMatch(viewport, text, label) {
   try {
     await until(() => {
@@ -4471,6 +4829,7 @@ async function extremeDiffHeightRegression() {
   await awaitPhysicalCompressedMatch(viewport, "MIDDLE MATCH", "middle compressed diff alignment");
   let middleBounds = viewport.querySelector('[data-find-match="true"]').getBoundingClientRect();
   assert(middleBounds.top < viewport.getBoundingClientRect().bottom && middleBounds.bottom > viewport.getBoundingClientRect().top, "Middle compressed diff match was mounted outside the viewport");
+  await assertFindKeepsOwnership(viewport, "MIDDLE MATCH", "compressed Find");
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={"+\n".repeat(10_000) + diff} label="Tall diff" /></div>);
   await until(() => viewport.querySelector('[data-find-match="true"]')?.textContent.includes("MIDDLE MATCH") && host.querySelector('.window-find [role="status"]')?.textContent === "Line 610001", "Refresh realigns a moved middle match");
   await awaitPhysicalCompressedMatch(viewport, "MIDDLE MATCH", "refreshed compressed diff alignment");
@@ -4508,7 +4867,47 @@ async function extremeDiffHeightRegression() {
   await until(() => Number(viewport.dataset.firstLine) < 100, "removed match releases the old virtual window");
   root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 420 }}><WindowedDiff diff={null} label="Empty diff" /></div>);
   await until(() => host.querySelector(".diff-empty"), "nullable diff shows its empty state");
+  await compressedDiffTailRegression();
   await nearLimitCompressedDiffRegression();
+}
+
+// Classic scrollbars take layout space. Long rows at the end of a compressed
+// diff show a horizontal one there, and End, a wheel and Find must still show
+// the final row whole above it.
+async function compressedDiffTailRegression() {
+  const style = document.createElement("style");
+  style.textContent = ".diff-view::-webkit-scrollbar { width: 17px; height: 17px; } .diff-view::-webkit-scrollbar-thumb { background: #888; }";
+  document.head.append(style);
+  const diff = "+\n".repeat(600_000) + `+${"x".repeat(400)}\n`.repeat(60) + "+FINAL LINE\n";
+  try {
+    root.render(null); await settle();
+    root.render(<div style={{ display: "grid", gridTemplateRows: "minmax(0, 1fr)", height: 280 }}><WindowedDiff diff={diff} label="Tall diff with long tail rows" /></div>);
+    await until(() => host.querySelector(".diff-view")?.scrollHeight > 1_000_000, "compressed diff with long tail rows");
+    const viewport = host.querySelector(".diff-view");
+    const finalShown = (label) => {
+      const row = [...viewport.querySelectorAll("span")].find((item) => item.textContent.includes("FINAL LINE"))?.getBoundingClientRect();
+      const view = viewport.getBoundingClientRect();
+      assert(viewport.clientHeight < viewport.offsetHeight, `${label}: no horizontal scrollbar showed at the tail (${viewport.clientHeight}/${viewport.offsetHeight})`);
+      assert(row && row.top >= view.top && row.bottom <= view.top + viewport.clientHeight + 0.5,
+        `${label}: the final row was not shown whole: row=${row?.top}/${row?.bottom}, viewport=${view.top}/${view.top + viewport.clientHeight}, first=${viewport.dataset.firstLine}, mounted=${viewport.dataset.mountedStart}/${viewport.dataset.mountedEnd}`);
+    };
+    const reachTail = async (act, label) => {
+      pressKey(viewport, "Home");
+      await until(() => Number(viewport.dataset.firstLine) === 0, `${label}: back at the start`); // NOSONAR S9382: each route starts at the top
+      act();
+      await until(() => viewport.textContent.includes("FINAL LINE"), `${label}: reaches the final line`); // NOSONAR S9382: each route is observed on its own
+      await settle(); // NOSONAR S9382: the horizontal scrollbar shows after the tail rows mount
+      finalShown(label);
+    };
+    viewport.focus();
+    await reachTail(() => pressKey(viewport, "End"), "End");
+    await reachTail(() => viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 14 * 1_000_000, bubbles: true, cancelable: true })), "A wheel to the end");
+    const input = host.querySelector('input[aria-label="Find in diff"]');
+    await reachTail(() => {
+      setControlValue(input, "FINAL LINE");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    }, "Find of the final line");
+  } finally { style.remove(); }
 }
 
 async function nearLimitCompressedDiffRegression() {
@@ -5559,7 +5958,8 @@ async function queuedRunAccountRegression() {
       await until(() => window.innerWidth === 900, "real 900px layout");
       window.dispatchEvent(new Event("resize"));
       await settle();
-      assert(!host.querySelector(".conversation-header .conversation-meta small:not(.conversation-account)")?.checkVisibility(), "the header run summary is hidden at 900px");
+      // A pane marks its size tiers at a rendering update, as a user sees it.
+      await until(() => !host.querySelector(".conversation-header .conversation-meta small:not(.conversation-account)")?.checkVisibility(), "the header run summary is hidden at 900px");
       visible("while it runs");
       const earlier = { id: "earlier-1", role: "assistant", kind: "text", body: "Earlier answer", payload: {}, createdAt: new Date(0).toISOString() };
       detail = { ...chats.A, runs: [{ ...launched, status: "running" }], messages: [earlier],
@@ -6416,6 +6816,996 @@ async function spaceSidebarRegression() {
   assertNoGroupCopy(sidebarCopy(), "Updated sidebar");
 }
 
+function paneRect(view) { return host.querySelector(`#pane-${view}`)?.getBoundingClientRect(); }
+// What decides how many panes show, for a failing pane assertion: the
+// layout's own props and measured stage, each pane's concealment, the
+// viewport, focus and the page's visibility.
+function describePaneState() {
+  const element = host.querySelector(".pane-layout");
+  const fiberKey = element && Object.keys(element).find((key) => key.startsWith("__reactFiber$"));
+  // The node keeps the fiber that last updated it; its alternate may be the
+  // committed one. The committed host fiber's props match the DOM.
+  let fiber = fiberKey ? element[fiberKey] : null;
+  if (fiber?.alternate?.memoizedProps?.className === element.className) fiber = fiber.alternate;
+  while (fiber && fiber.type?.name !== "PaneLayout") fiber = fiber.return;
+  const props = fiber?.memoizedProps;
+  const stage = element?.getBoundingClientRect();
+  const active = document.activeElement;
+  return JSON.stringify({
+    compactPreferred: props?.compactPreferred, focused: props?.layout.focused, root: props?.layout.root,
+    stage: stage && [stage.width, stage.height], fits: props && stage ? computePaneRects(props.layout.root, Math.floor(stage.width), Math.floor(stage.height)).fits : null,
+    compactClass: element?.classList.contains("is-compact"), layouts: document.querySelectorAll(".pane-layout").length,
+    tabs: [...host.querySelectorAll('[role="tab"][data-pane-view]')].map((tab) => `${tab.dataset.paneView}:${tab.getAttribute("aria-selected")}`),
+    panes: [...host.querySelectorAll(".pane-stage > .pane")].map((pane) => ({ id: pane.id, inert: pane.inert, className: pane.className, visibility: getComputedStyle(pane).visibility, rect: pane.getBoundingClientRect().toJSON() })),
+    conversationPanes: document.querySelectorAll("#pane-conversation").length,
+    innerWidth: window.innerWidth, innerHeight: window.innerHeight, narrow: window.matchMedia("(max-width: 760px)").matches, page: document.visibilityState,
+    active: active === document.body ? "body" : `${active?.tagName.toLowerCase()}#${active?.id}.${active?.className}`,
+  });
+}
+// A control is usable when it lies inside its pane and is what a click at its centre reaches.
+function assertReachableInPane(element, view, label) {
+  const rect = element?.getBoundingClientRect();
+  const pane = paneRect(view);
+  assert(rect && rect.width > 0 && rect.height > 0 && rect.left >= pane.left - 1 && rect.right <= pane.right + 1 && rect.top >= pane.top - 1 && rect.bottom <= pane.bottom + 1,
+    `${label} is clipped by its ${view} pane: ${JSON.stringify([rect?.toJSON(), pane.toJSON()])}`);
+  assert(element.scrollWidth <= element.clientWidth + 1, `${label} clips its text: ${element.scrollWidth} > ${element.clientWidth}`);
+  const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+  if (element.contains(hit)) return;
+  const style = getComputedStyle(element);
+  const stack = document.elementsFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2).slice(0, 4).map((item) => `${item.tagName.toLowerCase()}.${item.className}`);
+  throw new Error(`${label} is covered by ${hit?.outerHTML.slice(0, 120)}; at its centre: ${stack.join(" > ")}; rect=${JSON.stringify(rect.toJSON())}; visibility=${style.visibility}; pointer-events=${style.pointerEvents}; opacity=${style.opacity}; transform=${style.transform}; panes=${describePaneState()}`);
+}
+// Split panes tile the stage: no two overlap and none leaves it, on the
+// settled commit and on each of the next frames.
+async function assertPanesTile(label) {
+  await settle();
+  const describe = () => JSON.stringify({ visibility: document.visibilityState,
+    stage: host.querySelector(".pane-stage")?.getBoundingClientRect().toJSON(),
+    panes: [...host.querySelectorAll(".pane-stage > .pane")].map((pane) => ({ view: pane.dataset.paneView, style: pane.getAttribute("style"), rect: pane.getBoundingClientRect().toJSON() })) });
+  for (let tick = 0; tick < 4; tick += 1) { // NOSONAR S9382: one sample per frame
+    const stage = host.querySelector(".pane-stage").getBoundingClientRect();
+    const rects = [...host.querySelectorAll(".pane-stage > .pane")].map((pane) => pane.getBoundingClientRect());
+    for (const [index, rect] of rects.entries()) {
+      assert(rect.left >= stage.left - 1 && rect.top >= stage.top - 1 && rect.right <= stage.right + 1 && rect.bottom <= stage.bottom + 1, `${label}: a pane leaves the stage: ${describe()}`);
+      for (const other of rects.slice(index + 1)) {
+        const overlap = Math.min(rect.right, other.right) - Math.max(rect.left, other.left) > 1 && Math.min(rect.bottom, other.bottom) - Math.max(rect.top, other.top) > 1;
+        assert(!overlap, `${label}: panes overlap: ${describe()}`);
+      }
+    }
+    await frame();
+  }
+}
+function paneOrder() { return [...host.querySelectorAll(".pane-stage > .pane")].map((element) => element.dataset.paneView).join(","); }
+async function choosePaneMenuItem(view, label) {
+  host.querySelector(`[aria-label="${view} pane options"]`).click();
+  let item;
+  await until(() => (item = [...document.querySelectorAll('[role="menuitem"]')].find((entry) => entry.textContent === label || entry.getAttribute("aria-label") === label)), `${view} pane menu item ${label}`);
+  item.click();
+}
+function pressKey(target, key, options = {}) {
+  const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...options });
+  target.dispatchEvent(event);
+  return event;
+}
+
+// A conversation beside a terminal and a diff: nested splits with minimum
+// sizes, keyboard resizing, moves that keep each view's mounted session,
+// F6 focus cycling, restore after reload, and repair of a damaged layout.
+async function splitPaneLayoutRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const requests = [];
+  route = async (url, options = {}) => {
+    requests.push(`${options.method ?? "GET"} ${url.pathname}`);
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats[url.searchParams.get("projectId")] ?? chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/conversations/chat-B") return response(chats.B);
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A"), terminal("B")] });
+    if (url.pathname.startsWith("/api/terminals/")) return response({ buffer: "Split pane fixture\r\n" });
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [], stagedCount: 0 });
+    if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    return response({});
+  };
+  const terminalRequests = () => requests.filter((request) => request.includes("/api/terminals")).length;
+  try {
+    if (window.__fixtureSetViewport) {
+      await window.__fixtureSetViewport(1280);
+      await until(() => window.innerWidth === 1280, "wide split viewport");
+      window.dispatchEvent(new Event("resize"));
+    }
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('textarea[aria-label="Message the agent"]'), "split fixture");
+    assert(!host.querySelector(".pane-header") && !host.querySelector('.pane-separator'), "A lone conversation showed split chrome");
+    const composer = host.querySelector('textarea[aria-label="Message the agent"]');
+    setControlValue(composer, "Draft kept across pane moves");
+
+    host.querySelector('[aria-label="Terminal"]').click();
+    await until(() => terminalReady("Terminal A") && document.activeElement === host.querySelector("#pane-terminal"), "terminal pane beside the conversation");
+    await assertPanesTile("Terminal beside the conversation");
+    assert(paneRect("terminal").left >= paneRect("conversation").right && Math.abs(paneRect("terminal").top - paneRect("conversation").top) < 1,
+      "The terminal did not open beside the conversation");
+    // The focused terminal is taller than its split share is wide: Changes nests below it.
+    host.querySelector('[aria-label="Changes"]').click();
+    await until(() => host.querySelector("#pane-changes .changes-pane"), "changes pane");
+    await assertPanesTile("Changes below the terminal");
+    assert(Math.abs(paneRect("terminal").left - paneRect("changes").left) < 1 && paneRect("changes").top >= paneRect("terminal").bottom,
+      `Changes did not nest below the terminal: ${JSON.stringify([paneRect("terminal"), paneRect("changes")])}`);
+    assert(paneOrder() === "conversation,terminal,changes", `Panes are not in reading order: ${paneOrder()}`);
+    const xterm = host.querySelector(".terminal-host .xterm");
+    const listedTerminals = terminalRequests();
+
+    const outer = host.querySelector('.pane-separator[role="separator"][aria-label="Resize Conversation and Terminal and Changes"]');
+    assert(outer?.getAttribute("aria-orientation") === "vertical" && outer.getAttribute("aria-controls") === "pane-conversation pane-terminal pane-changes", "The outer split has no labelled vertical separator");
+    const before = paneRect("conversation").width;
+    const valueBefore = Number(outer.getAttribute("aria-valuenow"));
+    outer.focus();
+    assert(pressKey(outer, "ArrowRight").defaultPrevented, "ArrowRight on a separator was not handled");
+    await until(() => paneRect("conversation").width > before, "ArrowRight widens the conversation");
+    assert(Number(outer.getAttribute("aria-valuenow")) > valueBefore, "The separator value did not follow the resize");
+    pressKey(outer, "End");
+    await until(() => Math.abs(paneRect("changes").width - 280) <= 1, "End stops at the right column's minimum width");
+    pressKey(outer, "Home");
+    await until(() => Math.abs(paneRect("conversation").width - 320) <= 1, "Home stops at the conversation's minimum width");
+    assert(pressKey(outer, "ArrowUp").defaultPrevented === false, "A vertical separator handled ArrowUp");
+    // A pointer drag follows the pointer and saves the layout once, on release.
+    const layoutWrites = [];
+    const setItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function recordLayoutWrite(key, value) {
+      if (key === LAYOUT_KEY) layoutWrites.push(value);
+      return setItem.call(this, key, value);
+    };
+    try {
+      const start = outer.getBoundingClientRect();
+      const pointer = (type, dx) => outer.dispatchEvent(new PointerEvent(type, { pointerId: 7, button: 0, clientX: start.left + start.width / 2 + dx, clientY: start.top + 100, bubbles: true, cancelable: true }));
+      pointer("pointerdown", 0);
+      for (const dx of [20, 40, 60]) { pointer("pointermove", dx); await frame(); }
+      await until(() => Math.abs(paneRect("conversation").width - 380) <= 1, "the conversation follows the dragged separator");
+      assert(layoutWrites.length === 0, `A separator drag saved the layout ${layoutWrites.length} times before release`);
+      pointer("pointerup", 60);
+      await until(() => layoutWrites.length === 1, "releasing the separator saves the layout");
+      await settle();
+      assert(layoutWrites.length === 1 && Math.abs(paneRect("conversation").width - 380) <= 1, `Release saved ${layoutWrites.length} times or moved the separator`);
+    } finally {
+      Storage.prototype.setItem = setItem;
+    }
+    const inner = host.querySelector('.pane-separator[role="separator"][aria-label="Resize Terminal and Changes"]');
+    inner.focus();
+    pressKey(inner, "End");
+    await until(() => Math.abs(paneRect("changes").height - 340) <= 1, "End stops at the diff's minimum height");
+    pressKey(inner, "Home");
+    await until(() => Math.abs(paneRect("terminal").height - 200) <= 1, "Home stops at the terminal's minimum height");
+    pressKey(inner, "ArrowDown");
+    await until(() => paneRect("terminal").height > 201, "ArrowDown grows the terminal");
+
+    await choosePaneMenuItem("Terminal", "Move left");
+    await until(() => paneRect("terminal").right <= paneRect("conversation").left + 1, "Move left swaps the terminal with the conversation");
+    await until(() => document.activeElement === host.querySelector("#pane-terminal"), "the moved pane keeps focus");
+    assert(paneOrder() === "terminal,conversation,changes", `Moved panes are not in reading order: ${paneOrder()}`);
+    assert(host.querySelector(".terminal-host .xterm") === xterm && xterm.isConnected, "Moving the terminal remounted its view");
+    assert(host.querySelector('textarea[aria-label="Message the agent"]') === composer && composer.value === "Draft kept across pane moves", "Moving panes lost the conversation draft");
+    assert(terminalRequests() === listedTerminals, `Moving the terminal reloaded its session: ${requests.slice(-4).join(", ")}`);
+
+    // F6 and Shift+F6 cycle panes in reading order, even from terminal input.
+    pressKey(document.activeElement, "F6");
+    await until(() => document.activeElement === host.querySelector("#pane-conversation"), "F6 reaches the conversation pane");
+    pressKey(document.activeElement, "F6");
+    await until(() => document.activeElement === host.querySelector("#pane-changes"), "F6 reaches the changes pane");
+    pressKey(document.activeElement, "F6");
+    await until(() => document.activeElement === host.querySelector("#pane-terminal"), "F6 wraps to the first pane");
+    pressKey(document.activeElement, "F6", { shiftKey: true });
+    await until(() => document.activeElement === host.querySelector("#pane-changes"), "Shift+F6 moves backwards");
+    const terminalInput = host.querySelector(".terminal-host .xterm-helper-textarea");
+    terminalInput.focus();
+    assert(pressKey(terminalInput, "F6").defaultPrevented, "F6 from terminal input was not handled");
+    await until(() => document.activeElement === host.querySelector("#pane-conversation"), "F6 leaves terminal input for the next pane");
+
+    // Dragging a pane header onto another pane's edge docks it there.
+    const dataTransfer = new DataTransfer();
+    const handle = host.querySelector("#pane-changes .pane-title");
+    handle.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer }));
+    const target = host.querySelector("#pane-terminal");
+    const targetRect = target.getBoundingClientRect();
+    const point = { clientX: targetRect.left + 6, clientY: targetRect.top + targetRect.height / 2 };
+    target.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer, ...point }));
+    await until(() => host.querySelector("#pane-terminal .pane-drop-indicator.is-left"), "left-edge drop indicator");
+    target.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer, ...point }));
+    handle.dispatchEvent(new DragEvent("dragend", { bubbles: true, dataTransfer }));
+    await until(() => paneOrder() === "changes,terminal,conversation" && paneRect("changes").right <= paneRect("terminal").left + 1, "drop docks Changes left of the terminal");
+    assert(!host.querySelector(".pane-drop-indicator"), "The drop indicator remained after the drop");
+    assert(host.querySelector(".terminal-host .xterm") === xterm && terminalRequests() === listedTerminals, "Docking another pane restarted the terminal view");
+    for (const [view, width, height] of [["changes", 280, 340], ["terminal", 260, 200], ["conversation", 320, 300]]) {
+      const rect = paneRect(view);
+      assert(rect.width >= width - 1 && rect.height >= height - 1, `${view} is below its minimum size: ${JSON.stringify(rect.toJSON())}`);
+    }
+
+    // A title drag belongs to the tree it started in. When another action
+    // replaces that tree before dragend, the abandoned drag cannot dock.
+    const abandonedDrag = async (replace, label) => {
+      const transfer = new DataTransfer();
+      const edge = () => { const rect = host.querySelector("#pane-terminal").getBoundingClientRect(); return { clientX: rect.left + 6, clientY: rect.top + rect.height / 2 }; };
+      const send = (type) => { const event = new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: transfer, ...edge() }); host.querySelector("#pane-terminal").dispatchEvent(event); return event; };
+      host.querySelector("#pane-changes .pane-title").dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: transfer }));
+      send("dragover");
+      await until(() => host.querySelector("#pane-terminal .pane-drop-indicator"), `${label}: drop indicator before the tree changes`);
+      await replace();
+      await until(() => !host.querySelector(".pane-drop-indicator"), `${label}: the abandoned drag's drop indicator was cleared`);
+      const before = paneOrder();
+      assert(!send("dragover").defaultPrevented, `${label}: the replaced tree accepted the abandoned drag`);
+      send("drop");
+      await settle();
+      assert(paneOrder() === before && !host.querySelector(".pane-drop-indicator"), `${label}: the abandoned drag moved panes: ${before} -> ${paneOrder()}`);
+    };
+    await abandonedDrag(() => choosePaneMenuItem("Terminal", "Move right"), "a pane move during a title drag");
+    await choosePaneMenuItem("Terminal", "Move left");
+    await until(() => paneOrder() === "changes,terminal,conversation", `moving the terminal back restores the arrangement, not ${paneOrder()}`);
+
+    if (window.__fixtureSetViewport) {
+      // A title drag does not survive one-at-a-time panes either.
+      await abandonedDrag(async () => {
+        await window.__fixtureSetViewport(900);
+        await until(() => window.innerWidth === 900, "900px viewport during a title drag");
+        window.dispatchEvent(new Event("resize"));
+        await until(() => host.querySelector('[role="tablist"][aria-label="Panes"]'), "one-at-a-time panes during a title drag");
+        await window.__fixtureSetViewport(1280);
+        await until(() => window.innerWidth === 1280, "wide viewport after a title drag");
+        window.dispatchEvent(new Event("resize"));
+        await until(() => host.querySelectorAll('.pane-separator[role="separator"]').length === 2, "split panes after a title drag");
+      }, "a compact transition during a title drag");
+      // Too narrow for every minimum: one pane at a time, same mounted views.
+      await window.__fixtureSetViewport(900);
+      await until(() => window.innerWidth === 900, "900px viewport");
+      window.dispatchEvent(new Event("resize"));
+      await until(() => host.querySelector('[role="tablist"][aria-label="Panes"]'), "panes that no longer fit are shown one at a time");
+      assert(host.querySelectorAll(".pane-stage > .pane:not([inert])").length === 1 && !host.querySelector('.pane-separator'), "A layout below its minimum stayed split");
+      assert(host.querySelector(".terminal-host .xterm") === xterm, "Entering one-at-a-time panes remounted the terminal");
+      await window.__fixtureSetViewport(1280);
+      await until(() => window.innerWidth === 1280, "wide viewport again");
+      window.dispatchEvent(new Event("resize"));
+      await until(() => !host.querySelector('[role="tablist"][aria-label="Panes"]') && host.querySelectorAll('.pane-separator[role="separator"]').length === 2, "a wide window splits panes again");
+      assert(host.querySelector(".terminal-host .xterm") === xterm, "Leaving one-at-a-time panes remounted the terminal");
+    }
+
+    // A reload restores the worktree's arrangement and sizes.
+    // The sidebar's width transition and the layout's next measurement settle
+    // before sizes are compared: the same pane sizes across several frames.
+    let previousSizes = "";
+    let stableFrames = 0;
+    await until(() => {
+      const sizes = JSON.stringify(["changes", "terminal", "conversation"].map((view) => paneRect(view).toJSON()));
+      stableFrames = sizes === previousSizes && !document.getAnimations().some((animation) => animation.playState === "running") ? stableFrames + 1 : 0;
+      previousSizes = sizes;
+      return stableFrames >= 3;
+    }, "settled pane sizes");
+    const arranged = Object.fromEntries(["changes", "terminal", "conversation"].map((view) => [view, paneRect(view).toJSON()]));
+    root.render(null);
+    await settle();
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => terminalReady("Terminal A") && host.querySelector("#pane-changes .changes-pane"), "restored split layout");
+    assert(paneOrder() === "changes,terminal,conversation", `Reload restored another arrangement: ${paneOrder()}`);
+    for (const [view, rect] of Object.entries(arranged)) {
+      const restored = paneRect(view);
+      assert(Math.abs(restored.left - rect.left) <= 1 && Math.abs(restored.width - rect.width) <= 1 && Math.abs(restored.height - rect.height) <= 1,
+        `Reload restored ${view} at another size: ${JSON.stringify([rect, restored.toJSON()])}`);
+    }
+
+    // Another worktree keeps its own layout; returning restores this one.
+    const restoredXterm = host.querySelector(".terminal-host .xterm");
+    host.querySelector('[aria-label="Expand Review B"]')?.click();
+    await until(() => [...host.querySelectorAll(".worktree-row")].some((row) => row.textContent.includes("B")), "worktree B row");
+    [...host.querySelectorAll(".worktree-row")].find((row) => row.querySelector("strong")?.textContent === "B").click();
+    await until(() => host.querySelector('textarea[placeholder*="in B"]') && !host.querySelector("#pane-terminal") && !host.querySelector(".pane-header"), "worktree B opens its own default layout");
+    [...host.querySelectorAll(".worktree-row")].find((row) => row.querySelector("strong")?.textContent === "A").click();
+    await until(() => terminalReady("Terminal A") && paneOrder() === "changes,terminal,conversation", "worktree A's layout returns");
+    assert(restoredXterm !== host.querySelector(".terminal-host .xterm"), "The worktree switch reused another worktree's terminal view");
+
+    // Closing a pane unmounts its view but leaves the shell running.
+    const closeFrom = terminalRequests();
+    host.querySelector("#pane-terminal").focus();
+    await choosePaneMenuItem("Terminal", "Close Terminal pane");
+    await until(() => !host.querySelector("#pane-terminal"), "terminal pane closed");
+    await until(() => document.activeElement === host.querySelector("#pane-changes") || document.activeElement === host.querySelector("#pane-conversation"), "focus moves to the pane that took the closed pane's place");
+    assert(!host.querySelector(".terminal-host") && !requests.slice(closeFrom).some((request) => request.startsWith("DELETE")), `Closing the pane ended the shell: ${requests.slice(closeFrom).join(", ")}`);
+
+    // A saved layout with an unknown view, a duplicate and a bad size is repaired.
+    root.render(null);
+    await settle();
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { "/fixture/A": { savedAt: 1, layout: { version: 1, focused: "browser", root: {
+      type: "split", axis: "row", ratio: "wide", first: { type: "pane", view: "terminal" },
+      second: { type: "split", axis: "column", ratio: 0.5, first: { type: "pane", view: "browser" }, second: { type: "pane", view: "terminal" } },
+    } } } } }));
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => terminalReady("Terminal A"), "repaired layout");
+    assert(paneOrder() === "conversation,terminal", `Repair kept invalid panes: ${paneOrder()}`);
+    await until(() => host.querySelector(".toast")?.textContent.includes("panes that could not be restored were left out"), "repair notice");
+    assert(JSON.parse(localStorage.getItem(LAYOUT_KEY)).worktrees["/fixture/A"].layout.root.first.view === "terminal", "Restoring rewrote the saved layout before a change");
+
+    root.render(null);
+    await settle();
+    localStorage.setItem(LAYOUT_KEY, "{unreadable");
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector(".toast")?.textContent.includes("could not be read; showing the default layout"), "unreadable layout notice");
+    assert(paneOrder() === "conversation" && !host.querySelector(".pane-header"), "An unreadable layout did not fall back to the default");
+    // The damaged store is announced once, not again for each worktree.
+    await until(() => !host.querySelector(".toast"), "unreadable layout notice dismissed");
+    host.querySelector('[aria-label="Expand Review B"]')?.click();
+    await until(() => [...host.querySelectorAll(".worktree-row")].some((row) => row.textContent.includes("B")), "worktree B row after unreadable store");
+    [...host.querySelectorAll(".worktree-row")].find((row) => row.querySelector("strong")?.textContent === "B").click();
+    await until(() => host.querySelector('textarea[placeholder*="in B"]'), "worktree B after unreadable store");
+    for (let index = 0; index < 4; index += 1) await frame(); // NOSONAR S9382: a repeated notice would render within these frames
+    assert(!host.querySelector(".toast")?.textContent.includes("could not be read"), "The unreadable layout store was announced again for another worktree");
+  } finally {
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
+// Every view stays usable at its minimum pane size: message lines beside the
+// composer, changed files and diff lines with the commit bar, terminal rows
+// and context content, also when a saved layout restores those minimums.
+async function paneMinimumContentRegression() {
+  if (!window.__fixtureSetViewport) return false;
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const messages = Array.from({ length: 8 }, (_, index) => ({ id: `minimum-${index}`, role: index % 2 ? "assistant" : "user", kind: "text", body: `Minimum size message ${index}`, createdAt: "2026-10-24T00:00:00Z" }));
+  const chat = { ...chats.A, messages };
+  const files = Array.from({ length: 6 }, (_, index) => ({ path: `src/file-${index}.js`, status: "M" }));
+  const diff = Array.from({ length: 60 }, (_, index) => `${index % 3 ? "+" : "-"}minimum diff line ${index}`).join("\n");
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chat] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chat);
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A")] });
+    if (url.pathname.startsWith("/api/terminals/")) return response({ buffer: "Minimum pane fixture\r\n" });
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files, stagedCount: 0 });
+    if (url.pathname === "/api/git/diff") return response({ diff });
+    if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    return response({});
+  };
+  const saved = (focused, layout) => localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { "/fixture/A": { savedAt: 1, layout: { version: 1, focused, root: layout } } } }));
+  const leaf = (view) => ({ type: "pane", view });
+  const inside = (element, view, label) => {
+    const rect = element?.getBoundingClientRect();
+    const pane = paneRect(view);
+    assert(rect && rect.width > 0 && rect.height > 0 && rect.left >= pane.left - 1 && rect.right <= pane.right + 1 && rect.top >= pane.top - 1 && rect.bottom <= pane.bottom + 1,
+      `${label} is clipped by its ${view} pane: ${JSON.stringify([rect?.toJSON(), pane.toJSON()])}`);
+  };
+  const usable = {
+    conversation: () => {
+      const viewport = host.querySelector('#pane-conversation [aria-label="Conversation messages"]');
+      assert(viewport.clientHeight >= 90, `The conversation at ${JSON.stringify(paneRect("conversation").toJSON())} shows ${viewport.clientHeight}px of messages`);
+      inside(viewport, "conversation", "The message list");
+      inside(host.querySelector('#pane-conversation textarea[aria-label="Message the agent"]'), "conversation", "The composer");
+      inside(host.querySelector('#pane-conversation [aria-label="Send message"]'), "conversation", "The send button");
+    },
+    changes: () => {
+      const list = host.querySelector("#pane-changes .changed-files");
+      const lines = host.querySelector("#pane-changes .diff-view");
+      assert(list.clientHeight >= 60, `The changed file list is ${list.clientHeight}px high`);
+      assert(lines.clientHeight >= 70, `The diff at ${JSON.stringify(paneRect("changes").toJSON())} shows ${lines.clientHeight}px of lines`);
+      inside(lines, "changes", "The diff");
+      inside(host.querySelector('#pane-changes [aria-label="Commit message"]'), "changes", "The commit message");
+      inside([...host.querySelectorAll("#pane-changes .commit-bar button")].find((button) => button.textContent.includes("Commit")), "changes", "The commit button");
+    },
+    terminal: () => {
+      const screen = host.querySelector("#pane-terminal .xterm-screen");
+      assert(screen.getBoundingClientRect().height >= 60, `The terminal shows ${screen.getBoundingClientRect().height}px of rows`);
+      inside(host.querySelector("#pane-terminal .terminal-host"), "terminal", "The terminal");
+    },
+    context: () => {
+      const content = host.querySelector("#pane-context .context-pane-content");
+      assert(content.clientHeight >= 100 && content.clientWidth >= 200, `The context content is ${content.clientWidth}x${content.clientHeight}`);
+    },
+  };
+  const near = (value, expected, label) => assert(Math.abs(value - expected) <= 1, `${label}: ${value} instead of ${expected}`);
+  try {
+    await window.__fixtureSetViewport(1280);
+    await until(() => window.innerWidth === 1280, "wide minimum viewport");
+    window.dispatchEvent(new Event("resize"));
+
+    // Restored at the narrowest conversation and the shortest diff.
+    saved("conversation", { type: "split", axis: "row", ratio: 0.05, first: leaf("conversation"),
+      second: { type: "split", axis: "column", ratio: 0.95, first: leaf("terminal"), second: leaf("changes") } });
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => terminalReady("Terminal A") && host.querySelector("#pane-changes .diff-view span:not(.diff-empty)")
+      && host.querySelector("#pane-conversation .message-text"), "restored minimum layout");
+    await settle();
+    near(paneRect("conversation").width, 320, "The restored conversation width");
+    near(paneRect("changes").height, 340, "The restored changes height");
+    usable.conversation();
+    usable.changes();
+    const inner = host.querySelector('.pane-separator[role="separator"][aria-label="Resize Terminal and Changes"]');
+    inner.focus();
+    pressKey(inner, "Home");
+    await until(() => Math.abs(paneRect("terminal").height - 200) <= 1, "terminal at its minimum height");
+    await settle();
+    usable.terminal();
+
+    // Restored at the shortest conversation and the narrowest context.
+    root.render(null);
+    await settle();
+    saved("conversation", { type: "split", axis: "column", ratio: 0.05, first: leaf("conversation"),
+      second: { type: "split", axis: "row", ratio: 0.95, first: leaf("changes"), second: leaf("context") } });
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector("#pane-context .context-pane-content") && host.querySelector("#pane-changes .diff-view span:not(.diff-empty)")
+      && host.querySelector("#pane-conversation .message-text"), "restored short conversation layout");
+    await settle();
+    near(paneRect("conversation").height, 400, "The restored conversation height");
+    near(paneRect("context").width, 240, "The restored context width");
+    usable.conversation();
+    usable.context();
+    usable.changes();
+  } finally {
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
+// Notices and controls inside a pane follow the pane's width, not the
+// window's: on a wide window a conversation at its minimum width keeps the
+// recovery explanation and every decision readable and clickable, the unsent
+// first-prompt notice keeps its buttons, and the commit bar fits Changes at
+// its minimum width.
+async function paneNoticeMinimumRegression() {
+  if (!window.__fixtureSetViewport) return false;
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const interrupted = { id: "run-interrupted", conversationId: "chat-A", status: "interrupted", recoveryClass: "exited", provider: "codex", providerSessionId: "session-A" };
+  const recoveryChat = { ...chats.A, providerSessionId: "session-A", runs: [interrupted] };
+  const created = { ...chats.A, id: "chat-unsent", title: "Unsent first prompt" };
+  let conversations = [recoveryChat];
+  route = async (url, options = {}) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations" && options.method === "POST") { conversations = [created]; return response(created, 201); }
+    if (url.pathname === "/api/conversations") return response({ conversations });
+    if (url.pathname === "/api/conversations/chat-A") return response(recoveryChat);
+    if (url.pathname === "/api/conversations/chat-unsent") return response({ error: "Chat details unavailable" }, 503);
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [{ path: "src/notice.js", status: "M" }], stagedCount: 12 });
+    if (url.pathname === "/api/git/diff") return response({ diff: "+notice line" });
+    if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    return response({});
+  };
+  const leaf = (view) => ({ type: "pane", view });
+  const saveMinimumLayout = () => localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { "/fixture/A": { savedAt: 1, layout: { version: 1, focused: "conversation", root: {
+    type: "split", axis: "row", ratio: 0.05, first: leaf("conversation"), second: { type: "split", axis: "row", ratio: 0.95, first: leaf("context"), second: leaf("changes") },
+  } } } } }));
+  // Each switch between split and one-at-a-time panes, with the stage size,
+  // so a failing reachability check shows whether a pane was concealed.
+  const modes = [];
+  const recordModes = new MutationObserver((records) => {
+    for (const { target } of records) {
+      if (!target.classList.contains("pane-layout")) continue;
+      const stage = target.getBoundingClientRect();
+      modes.push(`${target.classList.contains("is-compact") ? "compact" : "split"} ${stage.width}x${stage.height} at ${Math.round(performance.now())}ms`);
+    }
+  });
+  recordModes.observe(host, { attributes: true, subtree: true, attributeFilter: ["class"] });
+  const reachable = (element, view, label) => {
+    try { assertReachableInPane(element, view, label); }
+    catch (error) { throw new Error(`${error.message}; layout modes: ${modes.join(", ") || "none"}; now ${Math.round(performance.now())}ms`, { cause: error }); }
+  };
+  try {
+    await window.__fixtureSetViewport(1280);
+    await until(() => window.innerWidth === 1280, "wide notice viewport");
+    window.dispatchEvent(new Event("resize"));
+
+    saveMinimumLayout();
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelectorAll("#pane-conversation .recovery-actions button").length === 3
+      && host.querySelector('#pane-changes .commit-bar [aria-label="Commit message"]'), "recovery notice beside Changes at their minimum widths");
+    await settle();
+    assert(Math.abs(paneRect("conversation").width - 320) <= 1 && Math.abs(paneRect("changes").width - 280) <= 1,
+      `The panes are not at their minimum widths: ${JSON.stringify([paneRect("conversation").toJSON(), paneRect("changes").toJSON()])}`);
+    const copy = host.querySelector("#pane-conversation .recovery-copy");
+    assert(copy.getBoundingClientRect().width >= 200, `The recovery explanation is ${copy.getBoundingClientRect().width}px wide in a 320px conversation pane`);
+    reachable(copy, "conversation", "The recovery explanation");
+    for (const button of host.querySelectorAll("#pane-conversation .recovery-actions button")) reachable(button, "conversation", button.textContent.trim());
+    const commitMessage = host.querySelector('#pane-changes .commit-bar [aria-label="Commit message"]');
+    assert(commitMessage.getBoundingClientRect().width >= 200, `The commit message field is ${commitMessage.getBoundingClientRect().width}px wide in a 280px Changes pane`);
+    reachable(commitMessage, "changes", "The commit message");
+    setControlValue(commitMessage, "Commit from a narrow pane");
+    await until(() => [...host.querySelectorAll("#pane-changes .commit-bar button")].some((button) => button.textContent.includes("Commit") && !button.disabled), "commit enabled");
+    const commitButton = [...host.querySelectorAll("#pane-changes .commit-bar button")].find((button) => button.textContent.includes("Commit"));
+    // The layout's first commit shows one pane at a time until it measures
+    // its stage, so the button's transitions start from its concealed and
+    // disabled style. Before an animation frame they still report that start,
+    // hidden, so hit testing waits for them to finish.
+    await until(() => commitButton.getAnimations().every((animation) => animation.playState === "finished"), "commit button transitions finished");
+    reachable(commitButton, "changes", "The commit button");
+
+    // A first prompt whose chat was created but not sent, in the same pane.
+    root.render(null);
+    await settle();
+    conversations = [];
+    localStorage.removeItem(keys[2]);
+    saveMinimumLayout();
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('#pane-conversation textarea[aria-label="Message the agent"]:not(:disabled)'), "empty worktree composer");
+    setControlValue(host.querySelector('textarea[aria-label="Message the agent"]'), "First prompt in a narrow pane");
+    await until(() => host.querySelector('[aria-label="Send message"]:not(:disabled)'), "first prompt enabled");
+    host.querySelector('[aria-label="Send message"]').click();
+    await until(() => host.querySelector("#pane-conversation .first-prompt-notice button"), "unsent first-prompt notice");
+    await until(() => !host.querySelector(".toast"), "notices settle");
+    await settle();
+    const notice = host.querySelector("#pane-conversation .first-prompt-notice");
+    assert(notice.getBoundingClientRect().width >= 260, `The unsent prompt notice is ${notice.getBoundingClientRect().width}px wide`);
+    for (const button of notice.querySelectorAll("button")) reachable(button, "conversation", button.textContent.trim());
+  } finally {
+    recordModes.disconnect();
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
+// At the conversation's minimum height its notices share one bounded region
+// between the transcript and the composer: the transcript keeps several
+// message lines, recovery and first-prompt actions stay pinned in view, and
+// every other notice control is reachable by scrolling that region alone.
+async function paneNoticeShortRegression() {
+  if (!window.__fixtureSetViewport) return false;
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const messages = Array.from({ length: 8 }, (_, index) => ({ id: `short-${index}`, role: index % 2 ? "assistant" : "user", kind: "text", body: `Short pane message ${index}`, createdAt: "2026-10-24T00:00:00Z" }));
+  const interrupted = { id: "run-interrupted", conversationId: "chat-A", status: "interrupted", recoveryClass: "exited", provider: "codex", providerSessionId: "session-A" };
+  const pendingRun = { id: "run-pending", conversationId: "chat-A", status: "running", outcomePending: true, provider: "codex" };
+  const checkpoint = { id: "short-checkpoint", role: "assistant", kind: "text", body: Array.from({ length: 12 }, (_, index) => `Live checkpoint line ${index}`).join("\n"), payload: { runId: "run-pending", checkpointEventSeq: 1 }, createdAt: "2026-10-24T00:00:01Z" };
+  const details = {
+    interrupted: { ...chats.A, providerSessionId: "session-A", runs: [interrupted], messages },
+    pending: { ...chats.A, runs: [pendingRun], messages: [...messages, checkpoint], messagePage: { hasMore: false, olderCount: 0, hasLater: true, newerCount: 4, total: 13, beforeId: "short-0" } },
+  };
+  const created = { ...chats.A, id: "chat-unsent", title: "Unsent first prompt" };
+  let mode = "interrupted";
+  let conversations = [details.interrupted];
+  route = async (url, options = {}) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations" && options.method === "POST") { conversations = [created]; return response(created, 201); }
+    if (url.pathname === "/api/conversations") return response({ conversations });
+    if (url.pathname === "/api/conversations/chat-A") return response(details[mode]);
+    if (url.pathname === "/api/conversations/chat-unsent") return response({ error: "Chat details unavailable" }, 503);
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [], stagedCount: 0 });
+    if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    return response({});
+  };
+  const leaf = (view) => ({ type: "pane", view });
+  const render = async () => {
+    root.render(null);
+    await settle();
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { "/fixture/A": { savedAt: 1, layout: { version: 1, focused: "conversation", root: {
+      type: "split", axis: "row", ratio: 0.05, first: { type: "split", axis: "column", ratio: 0.05, first: leaf("conversation"), second: leaf("context") }, second: leaf("changes"),
+    } } } } }));
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+  };
+  const query = (selector) => host.querySelector(`#pane-conversation ${selector}`);
+  const notices = () => query(".conversation-notices");
+  const transcriptKept = (label) => {
+    const viewport = query('[aria-label="Conversation messages"]');
+    assert(viewport.clientHeight >= 60, `${label}: the transcript of a ${JSON.stringify(paneRect("conversation").toJSON())} conversation shows ${viewport.clientHeight}px`);
+    assertReachableInPane(viewport, "conversation", `${label}: the message list`);
+    assertReachableInPane(query('textarea[aria-label="Message the agent"]'), "conversation", `${label}: the composer`);
+  };
+  // Shows a control by scrolling the notices region, never the pane around it.
+  const reveal = (element) => {
+    element.scrollIntoView({ block: "nearest", inline: "nearest" });
+    for (const outer of [host.querySelector("#pane-conversation"), query(".pane-body") ?? host.querySelector("#pane-conversation .pane-body"), query(".conversation-pane")]) {
+      assert(!outer?.scrollTop, `Revealing ${element.textContent.trim().slice(0, 40)} scrolled ${outer?.className} instead of the notices`);
+    }
+    return element;
+  };
+  // How much of an element shows in the notices region, above any actions pinned over it.
+  const visibleHeight = (element, pinned = null) => {
+    const rect = element.getBoundingClientRect();
+    const region = notices().getBoundingClientRect();
+    const bottom = Math.min(rect.bottom, region.bottom, pinned ? pinned.getBoundingClientRect().top : Infinity);
+    return Math.max(0, bottom - Math.max(rect.top, region.top));
+  };
+  try {
+    await window.__fixtureSetViewport(1280);
+    await until(() => window.innerWidth === 1280, "wide short-pane viewport");
+    window.dispatchEvent(new Event("resize"));
+
+    // An interrupted run: the explanation and every decision beside the transcript.
+    await render();
+    await until(() => query(".recovery-actions button") && query('[data-message-id="short-7"]'), "interrupted run at the minimum height");
+    await settle();
+    const minimum = paneRect("conversation");
+    assert(Math.abs(minimum.width - 320) <= 1 && !host.querySelector(".pane-switcher"), `The conversation is not a split pane at its minimum width: ${JSON.stringify(minimum.toJSON())}`);
+    assert(Math.abs(paneRect("context").top - minimum.bottom - 6) <= 1, "The conversation is not at its minimum height above Context");
+    transcriptKept("Interrupted run");
+    const copy = query(".recovery-copy");
+    assert(copy.getBoundingClientRect().width >= 200 && visibleHeight(copy, query(".recovery-actions")) >= 48,
+      `Only ${visibleHeight(copy, query(".recovery-actions"))}px of the recovery explanation shows above its actions in ${notices().clientHeight}px of notices`);
+    const actions = [...host.querySelectorAll("#pane-conversation .recovery-actions button")];
+    assert(actions.length === 3, "The recovery decisions are missing");
+    for (const button of actions) assertReachableInPane(button, "conversation", button.textContent.trim());
+    notices().scrollTop = notices().scrollHeight;
+    await settle();
+    for (const button of actions) assertReachableInPane(button, "conversation", `${button.textContent.trim()} after scrolling the notices`);
+    assert(reveal(copy.querySelector("p")).getBoundingClientRect().top >= notices().getBoundingClientRect().top - 1, "The start of the recovery explanation cannot be scrolled into view");
+
+    // A pending outcome while reading history with a live tail: three notices at once.
+    mode = "pending";
+    conversations = [details.pending];
+    await render();
+    await until(() => query(".history-live-tail")?.textContent.includes("Live checkpoint line 11") && query(".history-forward .history-return")
+      && query(".recovery-notice")?.textContent.includes("Run outcome waiting for storage"), "pending outcome, history and live tail together");
+    await settle();
+    transcriptKept("Pending outcome");
+    for (const control of [query(".history-live-tail"), query(".history-later"), query(".history-return")]) {
+      assertReachableInPane(reveal(control), "conversation", control.getAttribute("aria-label") ?? control.textContent.trim());
+    }
+    const pending = query(".recovery-notice .recovery-copy");
+    reveal(pending);
+    assert(visibleHeight(pending) >= Math.min(60, pending.getBoundingClientRect().height - 1), `Only ${visibleHeight(pending)}px of the pending outcome notice shows`);
+    transcriptKept("Pending outcome after scrolling the notices");
+
+    // A first prompt whose chat was created but not sent.
+    mode = "interrupted";
+    conversations = [];
+    localStorage.removeItem(keys[2]);
+    await render();
+    await until(() => query('textarea[aria-label="Message the agent"]:not(:disabled)'), "empty worktree composer at the minimum height");
+    setControlValue(query('textarea[aria-label="Message the agent"]'), "First prompt in a short pane");
+    await until(() => query('[aria-label="Send message"]:not(:disabled)'), "first prompt enabled");
+    query('[aria-label="Send message"]').click();
+    await until(() => query(".first-prompt-notice button"), "unsent first-prompt notice at the minimum height");
+    await until(() => !host.querySelector(".toast"), "short notices settle");
+    await settle();
+    transcriptKept("Unsent first prompt");
+    const unsent = query(".first-prompt-notice");
+    const unsentActions = unsent.querySelector(".first-prompt-actions");
+    assert(visibleHeight(unsent.firstElementChild, unsentActions) >= 30, `Only ${visibleHeight(unsent.firstElementChild, unsentActions)}px of the unsent prompt explanation shows above its actions`);
+    for (const button of unsent.querySelectorAll("button")) assertReachableInPane(button, "conversation", button.textContent.trim());
+  } finally {
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
+// A separator drag belongs to the layout it started on. Switching worktree or
+// opening a pane while the pointer is down cancels it without saving. Focus
+// on a separator or pane tab that a responsive change removes moves to the
+// shown pane, and the layout menu's F6 hint is a description, not menu content.
+// Four pane tabs overflow a phone-width strip. Keyboard selection reveals the
+// chosen tab by scrolling the strip only, never the workspace around it.
+async function compactPaneTabVisibilityRegression() {
+  root.render(null);
+  await settle();
+  const pane = (view) => ({ type: "pane", view });
+  const four = { version: 1, focused: "conversation", root: { type: "split", axis: "row", ratio: 0.5, first: pane("conversation"),
+    second: { type: "split", axis: "row", ratio: 0.5, first: pane("changes"), second: { type: "split", axis: "row", ratio: 0.5, first: pane("terminal"), second: pane("context") } } } };
+  const views = Object.fromEntries(["conversation", "changes", "terminal", "context"].map((view) => [view, <div>{view}</div>]));
+  function Harness({ width }) {
+    const [layout, setLayout] = React.useState(four);
+    return <div className="fixture-workspace" style={{ width, height: 480, overflow: "hidden" }}><div style={{ width, height: 480, display: "grid" }}><PaneLayout layout={layout} onChange={setLayout} compactPreferred views={views} /></div></div>;
+  }
+  for (const width of [320, 360]) {
+    root.render(<Harness width={width} />);
+    await until(() => host.querySelectorAll('.pane-switcher [role="tab"]').length === 4, `four pane tabs at ${width}px`);
+    const workspace = host.querySelector(".fixture-workspace");
+    const list = host.querySelector('.pane-switcher [role="tablist"]');
+    assert(list.scrollWidth > list.clientWidth, `The pane tabs fit at ${width}px, so nothing is clipped`);
+    const expectShown = async (view, label) => {
+      const tab = host.querySelector(`#pane-tab-${view}`);
+      await until(() => document.activeElement === tab && tab.getAttribute("aria-selected") === "true", `${label} selects ${view} at ${width}px`);
+      await settle();
+      const strip = list.getBoundingClientRect();
+      const shown = tab.getBoundingClientRect();
+      assert(shown.left >= strip.left - 1 && shown.right <= strip.right + 1, `${label} left the ${view} tab clipped at ${width}px: ${shown.left}-${shown.right} in ${strip.left}-${strip.right}`);
+      assert(workspace.scrollLeft === 0 && workspace.scrollTop === 0 && window.scrollX === 0, `${label} scrolled the workspace at ${width}px`);
+    };
+    host.querySelector("#pane-tab-conversation").focus();
+    pressKey(document.activeElement, "End");
+    await expectShown("context", "End");
+    pressKey(document.activeElement, "Home");
+    await expectShown("conversation", "Home");
+    pressKey(document.activeElement, "ArrowLeft");
+    await expectShown("context", "ArrowLeft wrapping");
+    pressKey(document.activeElement, "ArrowRight");
+    await expectShown("conversation", "ArrowRight wrapping");
+    for (const view of ["changes", "terminal", "context"]) {
+      pressKey(document.activeElement, "ArrowRight");
+      await expectShown(view, "ArrowRight");
+    }
+    list.scrollLeft = 0;
+    pressKey(document.activeElement, "ArrowLeft");
+    await expectShown("terminal", "ArrowLeft from a scrolled strip");
+    list.scrollLeft = list.scrollWidth;
+    pressKey(document.activeElement, "Home");
+    await expectShown("conversation", "Home from a scrolled strip");
+  }
+  root.render(null);
+  await settle();
+}
+
+// Worktree ids are lossy slugs of their paths, so two worktrees can share
+// one. Each keeps its own pane layout, saved under its path.
+async function paneLayoutOwnerRegression() {
+  root.render(null);
+  await settle();
+  const shared = projects.map((project) => ({ ...project, worktrees: [{ ...project.worktrees[0], id: "shared" }] }));
+  const sharedChats = Object.fromEntries(Object.entries(chats).map(([id, chat]) => [id, { ...chat, worktreeId: "shared" }]));
+  keys.forEach((key, index) => localStorage.setItem(key, ["A", "shared", "chat-A"][index]));
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: shared, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [sharedChats[url.searchParams.get("projectId")] ?? sharedChats.A] });
+    const match = url.pathname.match(/^\/api\/conversations\/chat-([AB])$/);
+    if (match) return response(sharedChats[match[1]]);
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [], stagedCount: 0 });
+    if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    return response({});
+  };
+  const split = { version: 1, focused: "conversation", root: { type: "split", axis: "row", ratio: 0.5, first: { type: "pane", view: "conversation" }, second: { type: "pane", view: "changes" } } };
+  localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { "/fixture/A": { savedAt: 1, layout: split } } }));
+  const saved = () => JSON.parse(localStorage.getItem(LAYOUT_KEY)).worktrees;
+  const choose = async (name) => {
+    host.querySelector(`[aria-label="Expand Review ${name}"]`)?.click();
+    await until(() => [...host.querySelectorAll(".worktree-row")].some((row) => row.querySelector("strong")?.textContent === name), `worktree ${name} row`);
+    [...host.querySelectorAll(".worktree-row")].find((row) => row.querySelector("strong")?.textContent === name).click();
+    await until(() => host.querySelector(`textarea[placeholder*="in ${name}"]`), `worktree ${name} selected`);
+    await settle();
+  };
+  try {
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('textarea[placeholder*="in A"]') && host.querySelector("#pane-changes"), "worktree A restores its split");
+    await choose("B");
+    assert(!host.querySelector("#pane-changes") && !host.querySelector(".pane-header"), "Worktree B, which shares A's id, showed A's layout");
+    host.querySelector('[aria-label="Project context"]').click();
+    await until(() => host.querySelector("#pane-context") && saved()["/fixture/B"], "worktree B saves its own layout");
+    assert(JSON.stringify(saved()["/fixture/A"].layout) === JSON.stringify(split), "Saving B's layout overwrote A's");
+    assert(!saved().shared, "A layout was saved under the shared worktree id");
+    await choose("A");
+    await until(() => host.querySelector("#pane-changes") && !host.querySelector("#pane-context"), "worktree A keeps its own split after B changed");
+    root.render(null);
+    await settle();
+    localStorage.setItem(keys[0], "B");
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('textarea[placeholder*="in B"]') && host.querySelector("#pane-context"), "worktree B restores its own layout after a reload");
+    assert(!host.querySelector("#pane-changes"), "A reload gave worktree B the layout of A");
+  } finally {
+    root.render(null);
+    await settle();
+  }
+}
+
+async function paneLayoutReplacementRegression() {
+  if (!window.__fixtureSetViewport) return false;
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats[url.searchParams.get("projectId")] ?? chats.A] });
+    const match = url.pathname.match(/^\/api\/conversations\/chat-([AB])$/);
+    if (match) return response(chats[match[1]]);
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [], stagedCount: 0 });
+    if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    return response({});
+  };
+  const split = (ratio) => ({ version: 1, focused: "conversation", root: { type: "split", axis: "row", ratio, first: { type: "pane", view: "conversation" }, second: { type: "pane", view: "changes" } } });
+  localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { "/fixture/A": { savedAt: 2, layout: split(0.5) }, "/fixture/B": { savedAt: 1, layout: split(0.6) } } }));
+  const savedLayout = (id) => JSON.parse(localStorage.getItem(LAYOUT_KEY)).worktrees[`/fixture/${id}`].layout;
+  const setWidth = async (width) => {
+    await window.__fixtureSetViewport(width);
+    await until(() => window.innerWidth === width, `real ${width}px layout`);
+    window.dispatchEvent(new Event("resize"));
+    await settle();
+  };
+  const separator = () => host.querySelector('.pane-separator[role="separator"]');
+  const pointer = (target, type, x) => target.dispatchEvent(new PointerEvent(type, { pointerId: 9, button: 0, clientX: x, clientY: target.getBoundingClientRect().top + 100, bubbles: true, cancelable: true }));
+  const layoutWrites = [];
+  const setItem = Storage.prototype.setItem;
+  Storage.prototype.setItem = function recordLayoutWrite(key, value) {
+    if (key === LAYOUT_KEY) layoutWrites.push(value);
+    return setItem.call(this, key, value);
+  };
+  try {
+    await setWidth(1280);
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('textarea[placeholder*="in A"]') && host.querySelector("#pane-changes .changes-pane"), "worktree A split");
+    const savedA = JSON.stringify(savedLayout("A"));
+    const savedB = JSON.stringify(savedLayout("B"));
+
+    // Drag in A, switch to B mid-drag, release: B keeps its own split.
+    const dragged = separator();
+    const startX = dragged.getBoundingClientRect().left + 3;
+    const widthA = paneRect("conversation").width;
+    pointer(dragged, "pointerdown", startX);
+    pointer(dragged, "pointermove", startX + 80);
+    await until(() => paneRect("conversation").width > widthA + 40, "the drag widens A's conversation");
+    host.querySelector('[aria-label="Expand Review B"]')?.click();
+    await until(() => [...host.querySelectorAll(".worktree-row")].some((row) => row.textContent.includes("B")), "worktree B row");
+    [...host.querySelectorAll(".worktree-row")].find((row) => row.querySelector("strong")?.textContent === "B").click();
+    await until(() => host.querySelector('textarea[placeholder*="in B"]') && host.querySelector("#pane-changes .changes-pane"), "worktree B split");
+    await settle();
+    const widthB = paneRect("conversation").width;
+    pointer(dragged.isConnected ? dragged : separator(), "pointermove", startX + 160);
+    await settle();
+    assert(Math.abs(paneRect("conversation").width - widthB) <= 1, "A drag started in worktree A resized worktree B");
+    pointer(dragged.isConnected ? dragged : separator(), "pointerup", startX + 160);
+    await settle();
+    assert(layoutWrites.length === 0, `Releasing a drag from another worktree saved ${layoutWrites.length} layouts`);
+    assert(Math.abs(paneRect("conversation").width - widthB) <= 1, "Releasing a drag from another worktree resized worktree B");
+    assert(JSON.stringify(savedLayout("A")) === savedA && JSON.stringify(savedLayout("B")) === savedB, "A cancelled drag changed a saved layout");
+
+    // Drag in B, open a pane mid-drag, release: only the open is saved.
+    const before = separator();
+    const beforeX = before.getBoundingClientRect().left + 3;
+    pointer(before, "pointerdown", beforeX);
+    pointer(before, "pointermove", beforeX - 80);
+    await until(() => paneRect("conversation").width < widthB - 40, "the drag narrows B's conversation");
+    host.querySelector('[aria-label="Project context"]').click();
+    await until(() => host.querySelector("#pane-context") && layoutWrites.length === 1, "context opened and saved during the drag");
+    await settle();
+    const opened = layoutWrites[0];
+    const rects = ["conversation", "context", "changes"].map((view) => JSON.stringify(paneRect(view).toJSON()));
+    pointer(before.isConnected ? before : separator(), "pointerup", beforeX - 160);
+    await settle();
+    assert(layoutWrites.length === 1 && JSON.stringify(savedLayout("B")) === JSON.stringify(JSON.parse(opened).worktrees["/fixture/B"].layout),
+      `Releasing a drag after a pane opened changed the new layout: ${layoutWrites.slice(1).join(" | ")}`);
+    assert(["conversation", "context", "changes"].every((view, index) => JSON.stringify(paneRect(view).toJSON()) === rects[index]), "Releasing a drag after a pane opened resized the new layout");
+
+    // The F6 hint describes the layout menu instead of sitting in it.
+    const layoutMenu = host.querySelector('[aria-label="Pane layout"]');
+    assert(document.getElementById(layoutMenu.getAttribute("aria-describedby"))?.textContent === "F6 moves focus between panes", "The pane layout button does not describe F6");
+    layoutMenu.click();
+    let menu;
+    await until(() => (menu = document.querySelector('[role="menu"]')) && menu.querySelector('[role="menuitem"]'), "pane layout menu");
+    const exposed = [...menu.querySelectorAll("p, span")].filter((node) => node.textContent.includes("F6") && !node.closest('[aria-hidden="true"]'));
+    assert(!exposed.length && menu.getAttribute("aria-describedby") === "pane-layout-hint", "The F6 hint is exposed as content inside the menu");
+    pressKey(document.activeElement, "Escape");
+    await until(() => !document.querySelector('[role="menu"]'), "pane layout menu closed");
+
+    // Focus on chrome removed by a responsive change moves to the shown pane.
+    const focusedView = () => host.querySelector(".pane.is-focused")?.dataset.paneView;
+    separator().focus();
+    const viewBefore = focusedView();
+    await setWidth(640);
+    await until(() => host.querySelector(".pane-switcher"), "panes one at a time");
+    await until(() => document.activeElement === host.querySelector(`#pane-${viewBefore}`), `focus on a removed separator moves to the ${viewBefore} pane instead of ${document.activeElement?.outerHTML.slice(0, 80)}`);
+    host.querySelector(`#pane-tab-${viewBefore}`).focus();
+    await setWidth(1280);
+    await until(() => !host.querySelector(".pane-switcher") && separator(), "split panes again");
+    await until(() => document.activeElement === host.querySelector(`#pane-${viewBefore}`), `focus on a removed pane tab moves to the ${viewBefore} pane instead of ${document.activeElement?.outerHTML.slice(0, 80)}`);
+    // Pane options buttons in split headers and in the pane tab strip as well.
+    host.querySelector(`#pane-${viewBefore} .pane-header [aria-label$=" pane options"]`).focus();
+    await setWidth(640);
+    await until(() => host.querySelector(".pane-switcher"), "panes one at a time from an options button");
+    await until(() => document.activeElement === host.querySelector(`#pane-${viewBefore}`), `focus on a removed split options button moves to the ${viewBefore} pane instead of ${document.activeElement?.outerHTML.slice(0, 80)}`);
+    host.querySelector('.pane-switcher [aria-label$=" pane options"]').focus();
+    await setWidth(1280);
+    await until(() => !host.querySelector(".pane-switcher") && separator(), "split panes again from an options button");
+    await until(() => document.activeElement === host.querySelector(`#pane-${viewBefore}`), `focus on a removed pane tab options button moves to the ${viewBefore} pane instead of ${document.activeElement?.outerHTML.slice(0, 80)}`);
+    // An item in an open options menu is layout chrome too, though the menu
+    // is portaled outside the layout.
+    const focusMenuItem = async (trigger, label) => {
+      trigger.click();
+      const menuItem = () => document.querySelector('[role="menu"] [role="menuitem"]:not([data-disabled])');
+      await until(menuItem, `${label} menu open`);
+      const item = menuItem();
+      item.focus();
+      assert(document.activeElement === item, `The ${label} menu item did not take focus`);
+    };
+    await focusMenuItem(host.querySelector(`#pane-${viewBefore} .pane-header [aria-label$=" pane options"]`), "split options");
+    await setWidth(640);
+    await until(() => host.querySelector(".pane-switcher") && !document.querySelector('[role="menu"]'), "panes one at a time from an open menu");
+    await until(() => document.activeElement === host.querySelector(`#pane-${viewBefore}`), `focus in a removed split options menu moves to the ${viewBefore} pane instead of ${document.activeElement?.outerHTML.slice(0, 80)}`);
+    await focusMenuItem(host.querySelector('.pane-switcher [aria-label$=" pane options"]'), "pane tab options");
+    await setWidth(1280);
+    await until(() => !host.querySelector(".pane-switcher") && !document.querySelector('[role="menu"]'), "split panes again from an open menu");
+    await until(() => document.activeElement === host.querySelector(`#pane-${viewBefore}`), `focus in a removed pane tab options menu moves to the ${viewBefore} pane instead of ${document.activeElement?.outerHTML.slice(0, 80)}`);
+    for (let index = 0; index < 10; index += 1) await frame();
+    assert(document.activeElement === host.querySelector(`#pane-${viewBefore}`), `A closing options menu took focus back from the ${viewBefore} pane: ${document.activeElement?.outerHTML.slice(0, 80)}`);
+  } finally {
+    Storage.prototype.setItem = setItem;
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
+// Pane titles and chat tabs are both draggable and sit next to each other:
+// only a chat tab dragged in the tab strip reorders chats.
+async function paneDragChatTabRegression() {
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const second = { ...chats.A, id: "chat-A2", title: "Conversation A2" };
+  const patches = [];
+  // The server keeps each tab's last saved position; listed chats follow it.
+  const positions = { "chat-A": 0, "chat-A2": 1 };
+  let failing = new Set();
+  route = async (url, options = {}) => {
+    if (options.method === "PATCH") {
+      patches.push(url.pathname);
+      const id = url.pathname.split("/").at(-1);
+      if (failing.has(id)) return response({ error: `Tab order for ${id} offline` }, 500);
+      positions[id] = JSON.parse(options.body).tabPosition;
+      return response({});
+    }
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A, second].sort((a, b) => positions[a.id] - positions[b.id]).map((item) => ({ ...item, tabPosition: positions[item.id] })) });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/conversations/chat-A2") return response(second);
+    if (url.pathname === "/api/git/status") return response({ branch: "main", files: [], stagedCount: 0 });
+    return response({});
+  };
+  const tab = (id) => host.querySelector(`#chat-tab-${id}`).closest(".chat-tab");
+  const tabOrder = () => [...host.querySelectorAll('[role="tab"][id^="chat-tab-"]')].map((item) => item.dataset.tabId).join(",");
+  const drag = (type, target, dataTransfer) => {
+    const event = new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer });
+    target.dispatchEvent(event);
+    return event;
+  };
+  try {
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => tabOrder() === "chat-A,chat-A2", "two chat tabs");
+    host.querySelector('[aria-label="Changes"]').click();
+    await until(() => host.querySelector("#pane-changes .pane-title"), "pane title beside the chat tabs");
+
+    // A chat tab dragged onto another tab still reorders and saves the order.
+    const tabTransfer = new DataTransfer();
+    drag("dragstart", tab("chat-A2"), tabTransfer);
+    assert(drag("dragover", tab("chat-A"), tabTransfer).defaultPrevented, "A chat tab did not accept a chat tab drag");
+    drag("drop", tab("chat-A"), tabTransfer);
+    drag("dragend", tab("chat-A2"), tabTransfer);
+    await until(() => tabOrder() === "chat-A2,chat-A" && patches.length === 2, "chat tab drag reorders chats");
+
+    // A tab drag that never ends here (its source left mid-drag) is followed
+    // by a pane title dropped on a tab: chats keep their order and no request.
+    drag("dragstart", tab("chat-A"), new DataTransfer());
+    const paneTransfer = new DataTransfer();
+    const title = host.querySelector("#pane-changes .pane-title");
+    drag("dragstart", title, paneTransfer);
+    assert(!drag("dragover", tab("chat-A2"), paneTransfer).defaultPrevented, "A chat tab accepted a pane title drag");
+    drag("drop", tab("chat-A2"), paneTransfer);
+    drag("dragend", title, paneTransfer);
+    await settle();
+    assert(tabOrder() === "chat-A2,chat-A" && patches.length === 2, `A pane title drop reordered chats: ${tabOrder()} after ${JSON.stringify(patches)}`);
+    assert(paneOrder() === "conversation,changes", `A pane title dropped on a chat tab moved panes: ${paneOrder()}`);
+
+    // A rejected reorder is reported and the tabs return to the saved order.
+    const reorder = async (source, target) => {
+      const transfer = new DataTransfer();
+      drag("dragstart", tab(source), transfer);
+      drag("dragover", tab(target), transfer);
+      drag("drop", tab(target), transfer);
+      drag("dragend", tab(source), transfer);
+    };
+    const rejected = [];
+    const recordRejection = (event) => rejected.push(String(event.reason?.message ?? event.reason));
+    window.addEventListener("unhandledrejection", recordRejection);
+    try {
+      failing = new Set(["chat-A", "chat-A2"]);
+      await reorder("chat-A", "chat-A2");
+      await until(() => host.querySelector(".error-toast")?.textContent.includes("offline"), "rejected chat reorder reported");
+      await until(() => tabOrder() === "chat-A2,chat-A", `rejected chat reorder returns to the saved order instead of ${tabOrder()}`);
+      host.querySelector('[aria-label="Dismiss error"]').click();
+      // One position saved and one refused: the tabs show what the server kept.
+      failing = new Set(["chat-A2"]);
+      await reorder("chat-A", "chat-A2");
+      await until(() => host.querySelector(".error-toast")?.textContent.includes("chat-A2 offline"), "partly saved chat reorder reported");
+      await until(() => positions["chat-A"] === 0 && tabOrder() === "chat-A,chat-A2", `partly saved chat reorder shows the server order instead of ${tabOrder()}`);
+      await settle();
+      assert(!rejected.length, `A chat reorder left an unhandled rejection: ${rejected.join("; ")}`);
+    } finally {
+      window.removeEventListener("unhandledrejection", recordRejection);
+      failing = new Set();
+    }
+  } finally {
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
 async function responsiveFocusRegression() {
   root.render(null);
   await settle();
@@ -6432,9 +7822,19 @@ async function responsiveFocusRegression() {
   };
   if (!window.__fixtureSetViewport) return false; // Manual preview still runs width-independent cases.
   await setWidth(1280);
-  route = async (url) => {
+  let createdChat = null;
+  route = async (url, options = {}) => {
     if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
-    if (url.pathname === "/api/conversations") return response({ conversations: [chats[url.searchParams.get("projectId")]] });
+    if (url.pathname === "/api/conversations" && options.method === "POST") {
+      const body = JSON.parse(options.body);
+      createdChat = { ...chats.A, id: "chat-narrow", title: body.title, projectId: body.projectId, worktreeId: body.worktreeId, worktreePath: body.worktreePath };
+      return response(createdChat, 201);
+    }
+    if (url.pathname === "/api/conversations") {
+      const owner = url.searchParams.get("projectId");
+      return response({ conversations: [chats[owner], ...(createdChat?.projectId === owner ? [createdChat] : [])] });
+    }
+    if (url.pathname === "/api/conversations/chat-narrow") return response(createdChat);
     if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A")] });
     if (url.pathname.startsWith("/api/terminals/")) return response({ buffer: "Responsive focus fixture\r\n" });
     const match = url.pathname.match(/^\/api\/conversations\/chat-([AB])$/);
@@ -6510,8 +7910,14 @@ async function responsiveFocusRegression() {
 
     const terminalTrigger = host.querySelector('[aria-label="Terminal"]');
     terminalTrigger.click();
-    await until(() => host.querySelector("#workspace-inspector"), "narrow inspector");
-    await until(() => document.activeElement?.id === "inspector-tab-terminal", "inspector tab focus");
+    await until(() => host.querySelector('#pane-tab-terminal[aria-selected="true"]'), "narrow terminal pane tab");
+    await until(() => document.activeElement === host.querySelector("#pane-terminal"), "narrow terminal pane focus");
+    const conversationPane = host.querySelector("#pane-conversation");
+    const terminalPane = host.querySelector("#pane-terminal");
+    assert(conversationPane.inert && getComputedStyle(conversationPane).visibility === "hidden", `The narrow layout showed two panes at once: ${describePaneState()}`);
+    const terminalRect = terminalPane.getBoundingClientRect();
+    assert(terminalRect.left >= -1 && terminalRect.right <= window.innerWidth + 1 && terminalRect.width >= window.innerWidth - 2,
+      `The narrow terminal pane does not use the viewport width: ${JSON.stringify(terminalRect.toJSON())}`);
     const terminalInput = host.querySelector(".terminal-host .xterm-helper-textarea");
     assert(terminalInput, "Terminal input did not mount");
     await until(() => host.querySelector('.terminal-tabs [role="tab"][aria-selected="true"]'), "active terminal for Escape input");
@@ -6522,26 +7928,37 @@ async function responsiveFocusRegression() {
     await window.__fixtureSendKey("Escape");
     await settle();
     document.removeEventListener("keydown", observeKey, true);
-    assert(host.querySelector("#workspace-inspector"), "Escape from terminal input dismissed the inspector");
+    assert(host.querySelector("#pane-terminal") && !terminalPane.inert, "Escape from terminal input changed the pane layout");
     assert(keyEvents.some((event) => event.key === "Escape" && event.target === terminalInput && event.trusted), "Trusted Escape did not reach the terminal input");
-    const terminalTab = host.querySelector("#inspector-tab-terminal");
-    terminalTab.focus();
-    terminalTab.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
-    await until(() => !host.querySelector("#workspace-inspector"), "inspector escape close");
-    assert(document.activeElement === terminalTrigger, "Escape did not restore focus to the inspector invoker");
+    const xterm = host.querySelector(".terminal-host .xterm");
+    const paneTab = host.querySelector("#pane-tab-terminal");
+    paneTab.focus();
+    paneTab.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
+    await until(() => host.querySelector('#pane-tab-conversation[aria-selected="true"]') && document.activeElement?.id === "pane-tab-conversation", "arrow key selects the conversation pane");
+    assert(!conversationPane.inert && terminalPane.inert && getComputedStyle(terminalPane).visibility === "hidden", "Pane tabs did not switch the visible pane");
+    assert(host.querySelector(".terminal-host .xterm") === xterm && xterm.isConnected, "Switching narrow panes remounted the terminal");
+    document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true, cancelable: true }));
+    await until(() => host.querySelector('#pane-tab-terminal[aria-selected="true"]') && document.activeElement?.id === "pane-tab-terminal", "End selects the last pane");
+    host.querySelector('[role="tab"][id^="chat-tab-"][aria-selected="true"]').click();
+    await until(() => host.querySelector('#pane-tab-conversation[aria-selected="true"]') && !conversationPane.inert, "choosing a chat shows its conversation pane");
+    host.querySelector("#pane-tab-terminal").click();
+    await until(() => !terminalPane.inert && conversationPane.inert, "pane tab click shows the terminal again");
+    // A chat created from the + tab takes the front from the terminal.
+    host.querySelector('[aria-label="New chat tab"]').click();
+    await until(() => document.querySelector('[role="dialog"] input#chat-title'), "narrow new chat dialog");
+    setControlValue(document.querySelector("input#chat-title"), "Narrow chat");
+    [...document.querySelectorAll('[role="dialog"] button')].find((button) => button.textContent === "Create chat").click();
+    await until(() => host.querySelector('#chat-tab-chat-narrow[aria-selected="true"]') && host.querySelector('#pane-tab-conversation[aria-selected="true"]')
+      && !conversationPane.inert && terminalPane.inert, "a new chat shows its conversation pane");
+    assert(host.querySelector(".terminal-host .xterm") === xterm && xterm.isConnected, "Creating a chat remounted the terminal");
+    host.querySelector("#pane-tab-terminal").click();
+    await until(() => !terminalPane.inert && conversationPane.inert, "pane tab click shows the terminal after the new chat");
 
+    terminalTrigger.focus();
     terminalTrigger.click();
-    await until(() => host.querySelector("#workspace-inspector"), "inspector reopened for composer Escape");
-    host.querySelector('textarea[aria-label="Message the agent"]').focus();
-    host.querySelector('textarea[aria-label="Message the agent"]').dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
-    await until(() => !host.querySelector("#workspace-inspector"), "composer Escape closes inspector");
-    assert(document.activeElement === terminalTrigger, "Composer Escape did not restore inspector invoker focus");
-
-    terminalTrigger.click();
-    await until(() => host.querySelector('[aria-label="Close inspector"]'), "inspector close control");
-    host.querySelector('[aria-label="Close inspector"]').click();
-    await until(() => !host.querySelector("#workspace-inspector"), "inspector button close");
-    assert(document.activeElement === terminalTrigger, "Inspector close control did not restore invoker focus");
+    await until(() => !host.querySelector("#pane-terminal") && !host.querySelector('[role="tablist"][aria-label="Panes"]'), "toolbar closes the narrow terminal pane");
+    assert(document.activeElement === terminalTrigger, "Closing from the toolbar moved focus away from its toggle");
+    assert(!host.querySelector("#pane-conversation").inert, "The remaining conversation pane stayed inert");
   } finally {
     root.render(null);
     await settle();
@@ -6892,6 +8309,8 @@ async function pendingRunWithQueuedSiblingRegression() {
   await until(() => !host.querySelector(".recovery-notice") && host.querySelector(".run-state")?.textContent.includes("queued"), "durable snapshot clears only the older pending result");
 }
 
+const MOTION_STEPS = ["diff Find ownership", "diff scrollbar feedback", "diff Find resize", "split pane layout", "pane notices at minimum", "responsive focus"];
+
 try {
   const steps = [
     ["current conversation send", () => chatRace(false, false), "sending in the current conversation shows its run"],
@@ -6987,6 +8406,9 @@ try {
     ["changes refresh selection", changesSelectionRefreshRegression, "pending refreshes preserve current file and mode and retained events refresh once"],
     ["changes diff failure ownership", changesDiffFailureOwnershipRegression, "pending and failed file or mode requests never display a previous diff"],
     ["diff refresh anchor", diffRefreshAnchorRegression, "same-selection refresh keeps the visible diff line and find through success and failure"],
+    ["diff Find ownership", diffFindOwnershipRegression, "a late queued scroll at any viewport height cannot take a Find match out of view"],
+    ["diff scrollbar feedback", diffScrollbarFeedbackRegression, "a horizontal scrollbar from a long row at the diff window edge settles Find instead of looping"],
+    ["diff Find resize", diffFindResizeRegression, "Find, Next and Previous land aligned and a resize realigns the match before paint"],
     ["changes mutation owner success", () => changesMutationOwnerRegression(false), "late stage completion cannot refresh another worktree"],
     ["changes mutation owner failure", () => changesMutationOwnerRegression(true), "late stage failure cannot report in another worktree"],
     ["changes unstage owner failure", () => changesMutationOwnerRegression(true, "unstage"), "late unstage failure cannot report in another worktree"],
@@ -7001,7 +8423,7 @@ try {
     ["extreme diff height", extremeDiffHeightRegression, "a clamped-height diff still reaches its final line with End and Find"],
     ["Unicode diff find", unicodeDiffFindRegression, "length-changing case folding keeps the correct diff line"],
     ["reverse diff Find wrap", reverseDiffFindWrapRegression, "Previous wraps left of offset zero and continues through earlier matches"],
-    ["production diff viewport", productionDiffViewportRegression, "staged and unstaged large diffs stay bounded in the inspector"],
+    ["production diff viewport", productionDiffViewportRegression, "staged and unstaged large diffs stay bounded in a pane"],
     ["paged transcript anchor", pagedTranscriptAnchorRegression, "loading earlier history preserves its visible reading anchor"],
     ["stale page measured follow", () => pagedTranscriptFindRegression({ measuredOnly: true }), "a newly measured row cannot erase latest-page bottom intent before a live append"],
     ["paged transcript find", pagedTranscriptFindRegression, "find navigates older persisted messages with bounded mounted rows"],
@@ -7031,9 +8453,27 @@ try {
     ["bootstrap hard failures", bootstrapHardFailureRegression, "authorization, server, and network failures surface once"],
     ["provider checking rate", providerCheckingRateRegression, "repeated checking snapshots keep a bounded poll cadence"],
     ["conversation settings keyboard", conversationSettingsKeyboardRegression, "conversation settings stay keyboard reachable at 360, 760 and 900px", "keyboard and width checks require the CDP bridges"],
-    ["responsive focus", responsiveFocusRegression, "narrow drawer and inspector contain and restore focus", "responsive transition requires the CDP viewport bridge"],
+    ["split pane layout", splitPaneLayoutRegression, "nested panes resize, move, cycle focus, restore and repair without restarting their views"],
+    ["pane minimum content", paneMinimumContentRegression, "every view keeps usable content at its minimum pane size, including restored layouts", "minimum pane geometry requires the CDP viewport bridge"],
+    ["pane notices at minimum", paneNoticeMinimumRegression, "recovery, unsent-prompt and commit controls stay readable and clickable at the pane minimums on a wide window", "minimum pane geometry requires the CDP viewport bridge"],
+    ["pane notices at minimum height", paneNoticeShortRegression, "at the conversation's minimum height the transcript keeps message lines while recovery, history, live and unsent-prompt notices stay readable and reachable", "minimum pane geometry requires the CDP viewport bridge"],
+    ["compact pane tab visibility", compactPaneTabVisibilityRegression, "keyboard selection reveals each of four pane tabs in a 320px and 360px strip without scrolling the workspace"],
+    ["pane layout owner", paneLayoutOwnerRegression, "worktrees whose ids collide keep their own pane layouts across switches and a reload"],
+    ["pane layout replacement", paneLayoutReplacementRegression, "a separator drag on a replaced layout is discarded unsaved and focus on any removed pane chrome moves to the shown pane", "responsive transition requires the CDP viewport bridge"],
+    ["pane drag isolation", paneDragChatTabRegression, "pane title drags never reorder chat tabs, even after an unfinished tab drag"],
+    ["responsive focus", responsiveFocusRegression, "narrow drawer and one-at-a-time panes contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],
   ];
+  // The harness runs every step with reduced motion, as hosted macOS and
+  // Windows runners report it. Pane and diff geometry must be final at commit
+  // in either mode, so those steps run again without it.
+  for (const [step, run, success, skipped] of steps.filter(([name]) => MOTION_STEPS.includes(name))) {
+    steps.push([`${step} without reduced motion`, async () => {
+      if (!window.__fixtureSetMotion) return false;
+      await window.__fixtureSetMotion("no-preference");
+      try { return await run(); } finally { await window.__fixtureSetMotion("reduce"); }
+    }, `${success}, without reduced motion`, skipped ?? "reduced-motion emulation requires the CDP motion bridge"]);
+  }
   const selectedStep = new URLSearchParams(location.search).get("only");
   const selectedSteps = selectedStep ? steps.filter(([name]) => selectedStep.split(",").includes(name)) : steps;
   if (!selectedSteps.length) throw new Error(`Unknown interaction fixture: ${selectedStep}`);
@@ -7044,6 +8484,13 @@ try {
   for (const [index, [step, run, success, skipped]] of selectedSteps.entries()) {
     const stepStartedAt = performance.now();
     window.__fixtureProgress = { step, completed: index, total: selectedSteps.length, stepStartedAt };
+    // A browser page opened by an earlier step's native key hides this one
+    // until the harness restores it. No step starts without painted frames.
+    if (document.visibilityState === "hidden" && window.__requestFixtureForeground) {
+      window.__requestFixtureForeground(window.__fixtureForegroundReason());
+      await until(() => document.visibilityState === "visible", `foreground before ${step}`); // NOSONAR S9382: each step starts visible
+    }
+    localStorage.removeItem(LAYOUT_KEY);
     const ran = await run();
     window.__fixtureTimings.push({ step, ms: Math.round(performance.now() - stepStartedAt) });
     results.textContent += `${ran === false && skipped ? `SKIP: ${skipped}` : `PASS: ${success}`}\n`;
@@ -7061,4 +8508,6 @@ try {
   window.fetch = originalFetch;
   window.WebSocket = OriginalSocket;
   keys.forEach((key, index) => saved[index] === null ? localStorage.removeItem(key) : localStorage.setItem(key, saved[index]));
+  if (savedLayouts === null) localStorage.removeItem(LAYOUT_KEY);
+  else localStorage.setItem(LAYOUT_KEY, savedLayouts);
 }

@@ -7,6 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import WebSocket, { WebSocketServer } from "ws";
+import { uiFixtureBudget } from "./ui-fixture-budget.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -370,10 +371,22 @@ async function waitForFixture(send, deadline, diagnostics = () => "") {
   throw new Error(`Interaction phase exceeded its pre-cleanup deadline: ${fixtureProgress(state)}; ${diagnostics()}; page=${state?.title ?? "unavailable"}; output=${state?.text?.slice(-1000) ?? "unavailable"}`);
 }
 
+// Each MOTION_STEPS rerun pairs with its reduced-motion run, so a platform's
+// frame cadence is attributable step by step.
+const motionStepSuffix = " without reduced motion";
+function motionTimings(timings) {
+  return timings.filter(({ step }) => step.endsWith(motionStepSuffix)).map(({ step, ms }) => {
+    const base = step.slice(0, -motionStepSuffix.length);
+    return { step: base, reduceMs: timings.find((timing) => timing.step === base)?.ms, noPreferenceMs: ms };
+  });
+}
+
 function fixtureProgress(state) {
   const progress = state?.progress;
+  const motion = state?.timings?.length ? motionTimings(state.timings) : [];
   const timing = state?.timings?.length
-    ? `, recent=${JSON.stringify(state.timings.slice(-5))}, slowest=${JSON.stringify([...state.timings].sort((a, b) => b.ms - a.ms).slice(0, 5))}` : "";
+    ? `, recent=${JSON.stringify(state.timings.slice(-5))}, slowest=${JSON.stringify([...state.timings].sort((a, b) => b.ms - a.ms).slice(0, 5))}`
+      + (motion.length ? `, motion=${JSON.stringify(motion)}` : "") : "";
   return progress
     ? `${progress.completed}/${progress.total} complete, current step=${progress.step}, elapsed=${progress.elapsedMs}ms, step=${progress.stepElapsedMs}ms${timing}`
     : "fixture has not reported a step";
@@ -381,11 +394,12 @@ function fixtureProgress(state) {
 
 test("browser fixture polling reports its last step and preserves the phase deadline", { timeout: 5_000 }, async () => {
   const progress = { step: "terminal activation", completed: 7, total: 21, elapsedMs: 1234, stepElapsedMs: 250 };
-  const timings = [{ step: "slow", ms: 900 }, { step: "fast", ms: 10 }];
+  const timings = [{ step: "slow", ms: 900 }, { step: "fast", ms: 10 }, { step: "slow without reduced motion", ms: 1800 }];
   const send = async () => ({ result: { value: { title: "Running", text: "Running interaction regressions", progress, timings } } });
   await assert.rejects(waitForFixture(send, Date.now() + 30, () => "owner=responsive drawer"), (error) =>
     /7\/21 complete, current step=terminal activation, elapsed=1234ms/.test(error.message)
-    && /recent=.*fast.*slowest=.*slow.*owner=responsive drawer/.test(error.message));
+    && /recent=.*fast.*slowest=.*slow.*owner=responsive drawer/.test(error.message)
+    && error.message.includes('motion=[{"step":"slow","reduceMs":900,"noPreferenceMs":1800}]'));
   let polls = 0;
   const completed = await waitForFixture(async () => {
     polls += 1;
@@ -632,23 +646,45 @@ test("a vanished Windows launcher preserves verified descendants without adoptin
   assert.equal(launcher.ownedWindows.has(4103), false);
 });
 
-// A measured full local run took 133.5 seconds; macOS CI reached 103/108 at
-// 148.4 seconds. Keep a finite phase with room for the final responsive and
-// recovery steps, while preserving their separate performance assertions.
-// The normal child has 235 seconds including its 210-second interaction phase
-// and cleanup. A focused 1000px full-span wheel fixture gets a larger finite
-// phase bound. The parent must outlive either child contract and reserve its
-// own tree/profile cleanup time.
-const smallWheelCap = Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) > 0
-  && Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) <= 1000;
-const browserPhaseTimeout = smallWheelCap ? 330_000 : 210_000;
-const browserFixtureTimeout = browserPhaseTimeout + 25_000;
+// The diff and pane geometry steps run once with reduced motion and once
+// without it; ui-races.jsx names them in MOTION_STEPS.
+const motionStepCount = 6;
+
+// tests/ui-fixture-budget.mjs sizes the interaction phase from measured CI
+// runs and gives scripts/run-tests.mjs the per-file deadline that outlives
+// it. The parent must outlive either child contract and reserve its own
+// tree/profile cleanup time.
+const { phaseMs: browserPhaseTimeout, fixtureMs: browserFixtureTimeout, fileMs: testFileTimeout } = uiFixtureBudget();
 const nestedStartupAllowance = 15_000;
 const nestedRunnerBudget = (childBudget, startupAllowance) => childBudget + startupAllowance;
 const nestedExitTimeout = nestedRunnerBudget(browserFixtureTimeout, nestedStartupAllowance);
+// The deadline relations must hold for both tuples, whichever one this run's
+// OUTRIGHT_TEST_WHEEL_DELTA_CAP selects.
+const ordinaryBudget = uiFixtureBudget(0);
+const wheelBudget = uiFixtureBudget(1000);
 test("nested runner deadline exceeds its child's full browser budget", () => {
-  assert(nestedExitTimeout > browserFixtureTimeout);
-  assert(nestedExitTimeout > browserPhaseTimeout + 25_000);
+  for (const budget of [ordinaryBudget, wheelBudget]) {
+    const exitTimeout = nestedRunnerBudget(budget.fixtureMs, nestedStartupAllowance);
+    assert(exitTimeout > budget.fixtureMs);
+    assert(exitTimeout > budget.phaseMs + 25_000);
+  }
+});
+
+test("the per-file deadline outlives the browser fixture and the file's earlier tests", () => {
+  // macOS CI spent 17 seconds on this file's earlier tests and needs about
+  // 232 seconds for the 156-step interaction phase.
+  for (const budget of [ordinaryBudget, wheelBudget]) {
+    assert(budget.fixtureMs >= budget.phaseMs + 25_000);
+    assert(budget.fileMs >= budget.fixtureMs + 30_000);
+  }
+  assert(ordinaryBudget.phaseMs >= 232_000 + 30_000);
+  assert(wheelBudget.phaseMs > ordinaryBudget.phaseMs);
+  for (const cap of [Number.NaN, -1, 0, 1001, 5000]) assert.deepEqual(uiFixtureBudget(cap), ordinaryBudget, `cap=${cap}`);
+  for (const cap of [1, 120, 1000]) assert.deepEqual(uiFixtureBudget(cap), wheelBudget, `cap=${cap}`);
+  // This file's deadlines and scripts/run-tests.mjs follow the configured cap.
+  const configured = uiFixtureBudget(Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP));
+  assert.deepEqual(uiFixtureBudget(), configured);
+  assert.deepEqual([browserPhaseTimeout, browserFixtureTimeout, testFileTimeout], [configured.phaseMs, configured.fixtureMs, configured.fileMs]);
 });
 
 test("parent permits a slow child beyond the old shorter watchdog", { timeout: 5_000 }, async () => {
@@ -785,7 +821,9 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     // Chrome binds it, especially in the nested Windows cleanup fixture.
     const devToolsDeadline = Math.min(Date.now() + 45_000, deadline);
     const debugPort = await waitForDevToolsPort(profile, browser, logs, diagnostic, devToolsDeadline);
-    await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, logs, diagnostic, devToolsDeadline);
+    const version = await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, logs, diagnostic, devToolsDeadline);
+    // Layout differs across Chrome releases; name the one each run used.
+    console.log(`UI fixture browser: ${version.Browser}`);
     snapshotWindowsTree(browser);
     phase = "create DevTools target";
     const targetResponse = await fetch(`http://127.0.0.1:${debugPort}/json/new?${encodeURIComponent("about:blank")}`, { method: "PUT", signal: AbortSignal.timeout(Math.min(10_000, remaining())) });
@@ -801,14 +839,25 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     await send("Runtime.addBinding", { name: "__requestFixtureKey" });
     await send("Runtime.addBinding", { name: "__requestFixtureWheel" });
     await send("Runtime.addBinding", { name: "__requestFixtureForeground" });
+    await send("Runtime.addBinding", { name: "__requestFixtureMotion" });
     await send("Page.addScriptToEvaluateOnNewDocument", { source: `
       window.__fixtureWheelCap = ${Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) || 0};
-      // Headless Chrome on macOS can route an unconsumed fixture key to a
+      // Headless Chrome on macOS can route a fixture's native key to a
       // browser shortcut that opens chrome://settings/help over this tab.
-      // A hidden page paints no frames, so restore it. Fixtures that model a
-      // hidden page override document.hidden, not the real visibility state.
+      // A hidden page paints no frames, so restore it, naming the step and
+      // the last native key so the log identifies the key that caused it.
+      // Fixtures that model a hidden page override document.hidden, not the
+      // real visibility state.
+      const describeFocus = () => {
+        const active = document.activeElement;
+        if (!active || active === document.body) return "body";
+        return active.tagName.toLowerCase() + (active.id ? "#" + active.id : "") + (active.getAttribute("aria-label") ? "[" + active.getAttribute("aria-label") + "]" : "");
+      };
+      window.__fixtureForegroundReason = () => JSON.stringify({ step: window.__fixtureProgress?.step ?? "",
+        key: window.__fixtureLastKey ? { ...window.__fixtureLastKey, msAgo: Math.round(performance.now() - window.__fixtureLastKey.at) } : null,
+        focus: describeFocus() });
       document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "hidden") window.__requestFixtureForeground("");
+        if (document.visibilityState === "hidden") window.__requestFixtureForeground(window.__fixtureForegroundReason());
       });
       window.__fixtureSetViewport = (width) => new Promise((resolve) => {
         const ready = (event) => {
@@ -819,6 +868,15 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
         window.addEventListener("fixture-viewport-ready", ready);
         window.__requestFixtureViewport(String(width));
       });
+      window.__fixtureSetMotion = (motion) => new Promise((resolve) => {
+        const ready = (event) => {
+          if (event.detail !== motion) return;
+          window.removeEventListener("fixture-motion-ready", ready);
+          resolve();
+        };
+        window.addEventListener("fixture-motion-ready", ready);
+        window.__requestFixtureMotion(motion);
+      });
       window.__fixtureSendKey = (key) => new Promise((resolve) => {
         const ready = (event) => {
           if (event.detail !== key) return;
@@ -826,6 +884,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
           resolve();
         };
         window.addEventListener("fixture-key-ready", ready);
+        window.__fixtureLastKey = { key, step: window.__fixtureProgress?.step ?? "", focus: describeFocus(), at: performance.now() };
         window.__requestFixtureKey(key);
       });
       window.__fixtureWheel = (x, y, deltaY, deltaX = 0) => new Promise((resolve, reject) => {
@@ -870,8 +929,13 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       (async () => {
         if (event.params.name === "__requestFixtureForeground") {
           const pages = await (await fetch(`http://127.0.0.1:${debugPort}/json/list`, { signal: AbortSignal.timeout(Math.min(5000, remaining())) })).json();
+          let reason = "";
+          try {
+            const { step, key, focus } = JSON.parse(event.params.payload || "{}");
+            reason = ` (in step "${step}", focus ${focus}${key ? `, ${key.msAgo}ms after native ${key.key} on ${key.focus} in step "${key.step}"` : ", no native key sent yet"})`;
+          } catch { reason = ""; }
           for (const page of pages.filter((candidate) => candidate.type === "page" && candidate.url.startsWith("chrome://"))) {
-            foreignPages.push(page.url);
+            foreignPages.push(`${page.url}${reason}`);
             await fetch(`http://127.0.0.1:${debugPort}/json/close/${page.id}`, { signal: AbortSignal.timeout(Math.min(5000, remaining())) });
           }
           await send("Page.bringToFront");
@@ -895,6 +959,12 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
           await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-key-ready", { detail: ${JSON.stringify(event.params.payload)} }))` });
           return;
         }
+        if (event.params.name === "__requestFixtureMotion") {
+          if (!["reduce", "no-preference"].includes(event.params.payload)) throw new Error(`Unexpected fixture motion: ${event.params.payload}`);
+          await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: event.params.payload }] });
+          await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-motion-ready", { detail: ${JSON.stringify(event.params.payload)} }))` });
+          return;
+        }
         if (event.params.name !== "__requestFixtureViewport") return;
         const width = Number(event.params.payload);
         if (![1280, 1200, 900, 760, 640, 620, 390, 360].includes(width)) throw new Error(`Unexpected fixture viewport: ${width}`);
@@ -903,6 +973,10 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       })().catch((error) => { viewportError = error; });
     });
     await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 844, deviceScaleFactor: 1, mobile: false });
+    // Hosted macOS and Windows runners report reduced motion and Ubuntu does
+    // not, so every platform runs the fixture with it; the geometry steps
+    // repeat without it.
+    await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
     await send("Page.navigate", { url });
     phase = "run browser interaction fixtures";
     const state = await waitForFixture(async (method, params) => {
@@ -914,7 +988,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       devtoolsReady: devtools?.socket.readyState, viteOutput: output.slice(-500) }));
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
     const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
-    const expectedCount = selectedCount ?? 139;
+    const expectedCount = selectedCount ?? 150 + motionStepCount;
     const completedCount = Number(state.text.match(/(\d+) interaction regressions passed/)?.[1]);
     assert.equal(completedCount, expectedCount,
       `browser fixture completed ${completedCount || 0} of ${expectedCount} expected interactions; last step: ${state.progress?.step ?? "unknown"}`);

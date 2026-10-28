@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { uiFixtureBudget } from "../tests/ui-fixture-budget.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const windowsSupervisor = process.platform === "win32"
@@ -20,6 +21,7 @@ tests.push(
   path.join(root, "tests", "run-tests.test.mjs"),
   path.join(root, "tests", "ui-accessibility.test.mjs"),
   path.join(root, "tests", "terminal-exit-state.test.mjs"),
+  path.join(root, "tests", "pane-layout.test.mjs"),
   path.join(root, "tests", "ui-races.test.mjs"),
 );
 
@@ -34,16 +36,22 @@ let timedOut = false;
 let escalation;
 let currentFile = null;
 let currentFileStartedAt = 0;
+const fileTimings = [];
+const suiteStartedAt = Date.now();
+// Windows CI ran the serial files ahead of the browser fixture in 870-1142s,
+// and the full fixture takes at least 143s. The 30-minute job also spends
+// about 160s before npm test and 40s after it, so 1440s covers that suite
+// with headroom and leaves at least 120s of the job timeout.
+const maxSuiteTimeoutMs = 1_440_000;
 const requestedTimeout = Number(process.env.OUTRIGHT_TEST_SUITE_TIMEOUT_MS);
 const suiteTimeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
-  ? Math.min(1_200_000, Math.max(1000, requestedTimeout)) : 1_200_000;
+  ? Math.min(maxSuiteTimeoutMs, Math.max(1000, requestedTimeout)) : maxSuiteTimeoutMs;
 // The suite owns each file serially. Windows' native and SQLite files consume
 // most of the old 10-minute global budget before the browser file begins;
 // retain a bounded per-file deadline and allow the browser its full turn.
-// The focused 1000px wheel fixture has a 330-second interaction phase and a
-// separate cleanup allowance. Its per-file runner must outlive both.
-const smallWheelCap = Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP);
-const testFileTimeoutMs = smallWheelCap > 0 && smallWheelCap <= 1000 ? 390_000 : 300_000;
+// The browser fixture file's runner must outlive the fixture's interaction
+// phase, its cleanup and the file's earlier tests.
+const testFileTimeoutMs = uiFixtureBudget().fileMs;
 const deadline = setTimeout(() => {
   timedOut = true;
   console.error(`Test suite timed out after ${suiteTimeoutMs}ms: file=${currentFile ?? "between-files"} fileElapsedMs=${currentFile ? Date.now() - currentFileStartedAt : 0} runner=${child?.pid ?? "none"}`);
@@ -131,7 +139,9 @@ async function runFile(file) {
     try { console.error(`CI failed test runner group: runner=${runner.pid} members=${JSON.stringify(liveGroupMembers(runner.pid).slice(0, 32))}`); }
     catch (error) { console.error(error.message); }
   }
-  if (process.env.CI) console.error(`CI test runner closed: file=${path.basename(file)} runner=${runner.pid} status=${closed.status} signal=${closed.signal ?? "none"} launcher=${process.pid} parent=${process.ppid}`);
+  const elapsedMs = Date.now() - currentFileStartedAt;
+  fileTimings.push(`${path.basename(file)}=${Math.round(elapsedMs / 1000)}s`);
+  if (process.env.CI) console.error(`CI test runner closed: file=${path.basename(file)} runner=${runner.pid} status=${closed.status} signal=${closed.signal ?? "none"} elapsedMs=${elapsedMs} launcher=${process.pid} parent=${process.ppid}`);
   if (process.platform !== "win32") signalRunner("SIGKILL");
   const groupGone = runner.pid ? await reapGroup(runner.pid) : true;
   child = null;
@@ -158,6 +168,8 @@ try {
   passed = false;
 } finally {
   clearTimeout(deadline);
+  const totalMs = Date.now() - suiteStartedAt;
+  if (process.env.CI) console.error(`CI test suite timings: totalMs=${totalMs} budgetMs=${suiteTimeoutMs} remainingMs=${suiteTimeoutMs - totalMs} files=${fileTimings.join(" ")}`);
   clearTimeout(escalation);
   for (const [signal, handler] of signalHandlers) process.off(signal, handler);
 }
