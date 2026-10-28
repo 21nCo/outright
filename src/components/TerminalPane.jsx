@@ -24,7 +24,7 @@ const RESERVATION_LABEL = "its prior-run owner is unverified and not attached";
 const EARLIER_NOT_SHOWN = "\x1b[90m[earlier saved output not shown]\x1b[0m\r\n";
 // One announcement per distinct storage condition for this page session.
 let announcedHistoryWarning = "";
-const NO_FIND_RESULT = { total: 0, capped: false, index: -1 };
+const NO_FIND_RESULT = { total: 0, capped: false, index: -1, covered: false };
 // The Find bar overlays about the first two 15px rows of the output.
 const FIND_COVERED_ROWS = 2;
 // Ctrl+F is a shell key, so outside macOS Find takes Ctrl+Shift+F. Either
@@ -688,8 +688,11 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     xtermRef.current?.focus();
   }
 
+  // Enter in the query steps; Escape anywhere in the bar closes it. Keys
+  // that confirm or cancel an IME composition stay with the composition.
   function findKey(event) {
-    if (event.key === "Enter") {
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+    if (event.key === "Enter" && event.target === findInputRef.current) {
       event.preventDefault();
       searchRef.current?.step(event.shiftKey ? -1 : 1);
     } else if (event.key === "Escape") {
@@ -755,9 +758,10 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     </div>}
     {/* Find overlays the output, so opening it never resizes the process. */}
     <div className="terminal-stage">
-      {findOpen && <div className="window-find terminal-find" id="terminal-find" role="search" aria-label={`Find in ${activeTerminal?.name ?? "terminal"} output`}>
+      {/* It moves to the bottom while the current match is under it. */}
+      {findOpen && <div className={`window-find terminal-find${findResult.covered ? " is-lowered" : ""}`} id="terminal-find" role="search" aria-label={`Find in ${activeTerminal?.name ?? "terminal"} output`} onKeyDown={findKey}>
         <input ref={findInputRef} type="text" aria-label="Find in terminal output" aria-keyshortcuts={FIND_SHORTCUT} aria-describedby="terminal-find-help" spellCheck={false} autoComplete="off" value={findValue}
-          onChange={(event) => { setFindValue(event.target.value); searchRef.current?.setQuery(event.target.value); }} onKeyDown={findKey} />
+          onChange={(event) => { setFindValue(event.target.value); searchRef.current?.setQuery(event.target.value); }} />
         <span aria-hidden="true">{findStatus}</span>
         <button type="button" onClick={() => searchRef.current?.step(-1)} disabled={!findQuery} aria-label="Previous terminal match"><ArrowUp /></button>
         <button type="button" onClick={() => searchRef.current?.step(1)} disabled={!findQuery} aria-label="Next terminal match"><ArrowDown /></button>

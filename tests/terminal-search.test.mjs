@@ -64,3 +64,36 @@ test("only the newest matches are kept and the count says when there are more", 
   assert.equal(exact.capped, false);
   assert.equal(exact.matches.length, 12);
 });
+
+test("a match inside one expanded character counts that character once", () => {
+  // "ß" folds to "ss": both units of the expansion select the same cell.
+  const view = buffer(16, [row("Straße")]);
+  assert.deepEqual(findTerminalMatches(view, "s", 16).matches, [{ row: 0, col: 0, length: 1 }, { row: 0, col: 4, length: 1 }]);
+  assert.deepEqual(findTerminalMatches(view, "s", 16, 1), { matches: [{ row: 0, col: 4, length: 1 }], capped: true });
+  assert.deepEqual(findTerminalMatches(buffer(4, [row("ßß")]), "ss", 4).matches, [{ row: 0, col: 0, length: 1 }, { row: 0, col: 1, length: 1 }]);
+});
+
+test("overlapping occurrences are counted without overlap from the newest", () => {
+  assert.deepEqual(findTerminalMatches(buffer(8, [row("-----")]), "--", 8).matches, [{ row: 0, col: 1, length: 2 }, { row: 0, col: 3, length: 2 }]);
+});
+
+test("a scrollback-long dense wrapped line maps only the cells of the kept matches", () => {
+  // One logical line wrapped over 5,000 rows of 400 "x" cells holds
+  // 2,000,000 matches. Only the newest 1,000, and the one that shows there
+  // are more, may be mapped to cells.
+  const cols = 400;
+  let cellReads = 0;
+  const shared = { getChars: () => "x", getWidth: () => 1 };
+  const line = (wrapped) => ({ isWrapped: wrapped, length: cols, translateToString: () => "x".repeat(cols), getCell: () => { cellReads += 1; return shared; } });
+  const lines = Array.from({ length: 5000 }, (_, index) => line(index > 0));
+  const view = { length: lines.length, getLine: (index) => lines[index] };
+  const startedAt = performance.now();
+  const { matches, capped } = findTerminalMatches(view, "x", cols);
+  const elapsed = performance.now() - startedAt;
+  assert.equal(capped, true);
+  assert.equal(matches.length, 1000);
+  assert.deepEqual(matches[0], { row: 4997, col: 200, length: 1 });
+  assert.deepEqual(matches.at(-1), { row: 4999, col: 399, length: 1 });
+  assert.ok(cellReads <= 3 * cols, `mapped ${cellReads} cells for 1,000 matches`);
+  assert.ok(elapsed < 500, `dense line search took ${Math.round(elapsed)}ms`);
+});

@@ -14,67 +14,66 @@ export function terminalFindQuery(value) {
 
 // Logical lines join the rows a long line wrapped onto, so a match can span
 // rows. A row continued on the next keeps its trailing blank cells, as
-// translateToString does; the last row of a line is trimmed.
-function logicalLineText(buffer, start, end) {
-  let text = "";
-  for (let row = start; row <= end; row += 1) text += buffer.getLine(row)?.translateToString(row === end) ?? "";
-  return text;
+// translateToString does; the last row of a line is trimmed. Folding is per
+// code point, so folding each row and joining equals folding the line.
+function logicalLineRows(buffer, start, end) {
+  const folded = [];
+  for (let row = start; row <= end; row += 1) folded.push(foldFindText(buffer.getLine(row)?.translateToString(row === end) ?? ""));
+  return folded;
 }
 
-// Each source code unit maps to the cell that drew it. A wide character's
-// second cell has width 0 and draws nothing, as in translateToString.
-function lineCells(buffer, start, end, cell) {
-  let text = "";
-  const cells = [];
-  for (let row = start; row <= end; row += 1) {
-    const line = buffer.getLine(row);
-    if (!line) continue;
-    const kept = row === end ? line.translateToString(true).length : Infinity;
-    let rowText = "";
-    for (let col = 0; col < line.length && rowText.length < kept; col += 1) {
-      const current = line.getCell(col, cell);
-      const width = current?.getWidth() ?? 1;
-      if (width === 0) continue;
-      const chars = current?.getChars() || " ";
-      for (let unit = 0; unit < chars.length; unit += 1) cells.push({ row, col, width });
-      rowText += chars;
-    }
-    text += rowText;
+// Maps each folded code unit of one row to the cell that drew it. A wide
+// character's second cell has width 0 and draws nothing, as in
+// translateToString. Folding can expand one character into several units
+// (ß -> ss); every unit of the expansion maps to that character's cell.
+function rowCells(buffer, row, length, cell) {
+  const line = buffer.getLine(row);
+  const cols = [];
+  const widths = [];
+  for (let col = 0; line && col < line.length && cols.length < length; col += 1) {
+    const current = line.getCell(col, cell);
+    const width = current?.getWidth() ?? 1;
+    if (width === 0) continue;
+    const units = foldFindText(current?.getChars() || " ").length;
+    for (let unit = 0; unit < units; unit += 1) { cols.push(col); widths.push(width); }
   }
-  return { text, cells };
+  return { cols, widths };
 }
 
-// Folding can expand one character into several (ß -> ss), so each folded
-// code unit records the source code unit its character started at.
-function foldWithOffsets(text) {
-  let folded = "";
-  const sources = [];
-  let offset = 0;
-  for (const point of text) {
-    const foldedPoint = foldFindText(point);
-    for (let unit = 0; unit < foldedPoint.length; unit += 1) sources.push(offset);
-    folded += foldedPoint;
-    offset += point.length;
-  }
-  return { folded, sources };
-}
-
-function lineMatches(buffer, start, end, query, cols, cell) {
-  const { text, cells } = lineCells(buffer, start, end, cell);
-  const { folded, sources } = foldWithOffsets(text);
+// Finds a logical line's matches from its end backwards, the rightmost
+// non-overlapping occurrence first, and stops once more than `budget`
+// distinct matches are found. Only rows holding a returned match are mapped
+// to cells, so a long, dense wrapped line costs no more than the matches
+// kept. Matches inside one expanded character (s in ß) select the same
+// cells and count once. Returns them newest first.
+function lineMatches(buffer, start, rows, text, query, cols, cell, budget) {
+  const starts = [];
+  for (let offset = 0, index = 0; index < rows.length; index += 1) { starts.push(offset); offset += rows[index].length; }
+  const mapped = new Map();
+  const locate = (unit) => {
+    let low = 0;
+    let high = starts.length - 1;
+    while (low < high) { const middle = (low + high + 1) >>> 1; if (starts[middle] <= unit) low = middle; else high = middle - 1; }
+    if (!mapped.has(low)) mapped.set(low, rowCells(buffer, start + low, rows[low].length, cell));
+    const { cols: cellCols, widths } = mapped.get(low);
+    const offset = unit - starts[low];
+    return cellCols[offset] === undefined ? null : { row: start + low, col: cellCols[offset], width: widths[offset] };
+  };
   const found = [];
-  for (let index = folded.indexOf(query); index >= 0; index = folded.indexOf(query, index + query.length)) {
-    const first = cells[sources[index]];
-    const last = cells[sources[index + query.length - 1]];
+  for (let index = text.lastIndexOf(query); index >= 0 && found.length <= budget; index = index < query.length ? -1 : text.lastIndexOf(query, index - query.length)) {
+    const first = locate(index);
+    const last = locate(index + query.length - 1);
     if (!first || !last) continue;
-    found.push({ row: first.row, col: first.col, length: (last.row - first.row) * cols + last.col + last.width - first.col });
+    const match = { row: first.row, col: first.col, length: (last.row - first.row) * cols + last.col + last.width - first.col };
+    const previous = found.at(-1);
+    if (!previous || !sameMatch(previous, match)) found.push(match);
   }
   return found;
 }
 
 // Scans the buffer from its newest line upwards and returns matches in
 // buffer order: { row, col, length } in cells, the shape xterm's select()
-// takes. A line is mapped to cells only when its text contains the query.
+// takes. Work stops once `limit` matches are kept and one more is seen.
 export function findTerminalMatches(buffer, query, cols, limit = TERMINAL_MATCH_LIMIT) {
   const newestFirst = [];
   if (!query || !buffer || !(cols > 0)) return { matches: [], capped: false };
@@ -83,12 +82,13 @@ export function findTerminalMatches(buffer, query, cols, limit = TERMINAL_MATCH_
   while (end >= 0) {
     let start = end;
     while (start > 0 && buffer.getLine(start)?.isWrapped) start -= 1;
-    if (foldFindText(logicalLineText(buffer, start, end)).includes(query)) {
-      const found = lineMatches(buffer, start, end, query, cols, cell);
-      for (let index = found.length - 1; index >= 0; index -= 1) {
-        if (newestFirst.length === limit) return { matches: newestFirst.reverse(), capped: true };
-        newestFirst.push(found[index]);
-      }
+    const rows = logicalLineRows(buffer, start, end);
+    const text = rows.join("");
+    if (text.includes(query)) {
+      const budget = limit - newestFirst.length;
+      const found = lineMatches(buffer, start, rows, text, query, cols, cell, budget);
+      if (found.length > budget) return { matches: [...newestFirst, ...found.slice(0, budget)].reverse(), capped: true };
+      newestFirst.push(...found);
     }
     end = start - 1;
   }
@@ -100,13 +100,15 @@ function sameMatch(left, right) {
 }
 
 // Owns Find for one xterm view. It reads only the buffer the view shows,
-// never writes to the terminal, and reports { total, capped, index } where
-// index is -1 when no match is current. A new query selects the newest match
+// never writes to the terminal, and reports { total, capped, index, covered }
+// where index is -1 when no match is current. A new query selects the newest match
 // at or above the bottom of the view. Later output recounts without moving
 // the view: a current match keeps its place by a buffer marker, and is
 // dropped when its line leaves the buffer or the buffer is reset or switched.
 // A match in the top coveredRows of the view, under the Find bar, is
-// scrolled into the open like one outside the view.
+// scrolled into the open like one outside the view. Near the top of the
+// buffer the view cannot scroll that far, so covered says the current match
+// is still under the bar, which then moves out of its way.
 export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_LIMIT, recountMs = RECOUNT_MS, coveredRows = 0 } = {}) {
   let query = "";
   let matches = [];
@@ -116,7 +118,16 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
   let selecting = false;
   let timer = 0;
 
-  const publish = () => onChange({ total: matches.length, capped, index: current ? matches.indexOf(current.match) : -1 });
+  const isCovered = () => {
+    if (!current) return false;
+    const row = current.match.row - xterm.buffer.active.viewportY;
+    return row >= 0 && row < coveredRows;
+  };
+  let covered = false;
+  const publish = () => {
+    covered = isCovered();
+    onChange({ total: matches.length, capped, index: current ? matches.indexOf(current.match) : -1, covered });
+  };
   const scan = () => ({ matches, capped } = findTerminalMatches(xterm.buffer.active, query, xterm.cols, limit));
 
   function releaseSelection() {
@@ -173,6 +184,7 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
     // the view another buffer: no earlier match is current in it.
     xterm.buffer.onBufferChange(() => { drop(); schedule(); }),
     xterm.onSelectionChange(() => { if (!selecting) ownSelection = false; }),
+    xterm.onScroll(() => { if (isCovered() !== covered) publish(); }),
   ];
 
   return {

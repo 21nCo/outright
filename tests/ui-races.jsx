@@ -2388,6 +2388,11 @@ async function terminalScrollbackFindRegression() {
   await until(() => status() === "7 of 7", "a new query selects the newest match");
   assert(searchMs < 500, `Searching 4,900 retained lines took ${Math.round(searchMs)}ms`);
   await until(() => rows().includes("step 4550 FAIL build"), "newest match shown");
+  // Enter that confirms an IME composition stays with the composition.
+  key(find(), { key: "Enter", isComposing: true });
+  key(find(), { key: "Enter", keyCode: 229 });
+  await settle();
+  assert(status() === "7 of 7", "Enter during IME composition moved the match");
   key(find(), { key: "Enter", shiftKey: true });
   await until(() => status() === "6 of 7" && rows().includes("step 3850 FAIL build"), "Shift+Enter moves to the previous match");
   key(find(), { key: "Enter" });
@@ -2414,18 +2419,36 @@ async function terminalScrollbackFindRegression() {
   show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 2, data: "\r\nstep new FAIL again\r\n$ " } });
   await until(() => status() === "3 of 8", "new output counted while the current match stays");
   assert(rows().includes("step 1750 FAIL build"), "New output moved the view away from the current match");
-  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 3, data: "\x1bcfresh FAIL only\r\n$ " } });
+  // The reset buffer's only match is on its first row, on the right, where
+  // the view cannot scroll it out from under the bar.
+  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 3, data: "\x1bc\x1b[1;50Hfresh FAIL only\r\n$ " } });
   await until(() => status() === "1 match", "a terminal reset recounts and drops the earlier match");
   key(find(), { key: "Enter" });
   await until(() => status() === "1 of 1", "Enter selects in the reset buffer");
+  await until(() => host.querySelector(".terminal-find.is-lowered"), "the bar moves off a match it covers");
+  await settle();
+  const bar = host.querySelector(".terminal-find").getBoundingClientRect();
+  const selected = [...host.querySelectorAll(".terminal-host .xterm-selection > *")].map((node) => node.getBoundingClientRect());
+  assert(selected.length && selected.every((rect) => rect.right <= bar.left || rect.left >= bar.right || rect.bottom <= bar.top || rect.top >= bar.bottom),
+    "The Find bar covers the current match on the first row");
+  assert(resizes() === resizesBeforeFind, "Moving the Find bar resized the process's terminal");
 
-  key(find(), { key: "Escape" });
-  await until(() => !find() && document.activeElement === textarea(), "Escape closes Find and returns focus to the terminal");
+  const next = host.querySelector('[aria-label="Next terminal match"]');
+  next.focus();
+  key(next, { key: "Escape" });
+  await until(() => !find() && document.activeElement === textarea(), "Escape from a Find button closes Find and returns focus to the terminal");
   assert(!host.querySelector(".terminal-host .xterm-selection")?.childElementCount, "Closing Find left its match selected");
   key(textarea(), { key: "Escape", code: "Escape", keyCode: 27 });
   assert(inputs().join("") === "\x1b\x1b", "Input did not return to the process after Find closed");
   opener.click();
   await until(() => find()?.value === "fail" && document.activeElement === find() && status() === "1 of 1", "reopened Find searches its query again");
+  key(find(), { key: "Escape", isComposing: true });
+  await settle();
+  assert(find(), "Escape that cancels an IME composition closed Find");
+  key(find(), { key: "Escape" });
+  await until(() => !find() && document.activeElement === textarea(), "Escape in the query closes Find");
+  opener.click();
+  await until(() => find() && document.activeElement === find(), "Find reopens from its button");
   host.querySelector('[aria-label="Close terminal find"]').click();
   await until(() => !find() && document.activeElement === textarea(), "Close returns focus to the terminal");
   assert(!errors.length, `Unexpected terminal errors: ${errors.map((error) => error.message).join("; ")}`);

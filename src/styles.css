@@ -478,6 +478,7 @@ select { height: 34px; padding: 0 28px 0 10px; border: 1px solid var(--input); b
 .terminal-saved-bar { grid-row: 2; padding: 5px 9px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; border-bottom: 1px solid var(--line-soft); color: var(--muted-foreground); font-size: 10px; }
 .terminal-stage { grid-row: 3; position: relative; min-width: 0; min-height: 0; display: grid; grid-template: minmax(0, 1fr) / minmax(0, 1fr); }
 .terminal-find { position: absolute; z-index: 20; top: 4px; right: 12px; width: min(340px, calc(100% - 24px)); border: 1px solid var(--line-soft); border-radius: 6px; background: var(--canvas); box-shadow: 0 4px 14px rgb(0 0 0 / .12); }
+.terminal-find.is-lowered { top: auto; bottom: 4px; }
 .terminal-find button { display: inline-flex; align-items: center; justify-content: center; }
 .terminal-find button svg { width: 13px; height: 13px; }
 .terminal-host { min-width: 0; min-height: 0; padding: 8px 3px 3px 9px; overflow: hidden; }
