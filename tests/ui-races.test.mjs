@@ -658,18 +658,33 @@ const { phaseMs: browserPhaseTimeout, fixtureMs: browserFixtureTimeout, fileMs: 
 const nestedStartupAllowance = 15_000;
 const nestedRunnerBudget = (childBudget, startupAllowance) => childBudget + startupAllowance;
 const nestedExitTimeout = nestedRunnerBudget(browserFixtureTimeout, nestedStartupAllowance);
+// The deadline relations must hold for both tuples, whichever one this run's
+// OUTRIGHT_TEST_WHEEL_DELTA_CAP selects.
+const ordinaryBudget = uiFixtureBudget(0);
+const wheelBudget = uiFixtureBudget(1000);
 test("nested runner deadline exceeds its child's full browser budget", () => {
-  assert(nestedExitTimeout > browserFixtureTimeout);
-  assert(nestedExitTimeout > browserPhaseTimeout + 25_000);
+  for (const budget of [ordinaryBudget, wheelBudget]) {
+    const exitTimeout = nestedRunnerBudget(budget.fixtureMs, nestedStartupAllowance);
+    assert(exitTimeout > budget.fixtureMs);
+    assert(exitTimeout > budget.phaseMs + 25_000);
+  }
 });
 
 test("the per-file deadline outlives the browser fixture and the file's earlier tests", () => {
   // macOS CI spent 17 seconds on this file's earlier tests and needs about
   // 232 seconds for the 156-step interaction phase.
-  assert(testFileTimeout >= browserFixtureTimeout + 30_000);
-  assert(browserPhaseTimeout >= 232_000 + 30_000);
-  const wheel = uiFixtureBudget(1000);
-  assert(wheel.phaseMs > browserPhaseTimeout && wheel.fileMs >= wheel.fixtureMs + 30_000);
+  for (const budget of [ordinaryBudget, wheelBudget]) {
+    assert(budget.fixtureMs >= budget.phaseMs + 25_000);
+    assert(budget.fileMs >= budget.fixtureMs + 30_000);
+  }
+  assert(ordinaryBudget.phaseMs >= 232_000 + 30_000);
+  assert(wheelBudget.phaseMs > ordinaryBudget.phaseMs);
+  for (const cap of [Number.NaN, -1, 0, 1001, 5000]) assert.deepEqual(uiFixtureBudget(cap), ordinaryBudget, `cap=${cap}`);
+  for (const cap of [1, 120, 1000]) assert.deepEqual(uiFixtureBudget(cap), wheelBudget, `cap=${cap}`);
+  // This file's deadlines and scripts/run-tests.mjs follow the configured cap.
+  const configured = uiFixtureBudget(Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP));
+  assert.deepEqual(uiFixtureBudget(), configured);
+  assert.deepEqual([browserPhaseTimeout, browserFixtureTimeout, testFileTimeout], [configured.phaseMs, configured.fixtureMs, configured.fileMs]);
 });
 
 test("parent permits a slow child beyond the old shorter watchdog", { timeout: 5_000 }, async () => {
