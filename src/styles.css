@@ -650,8 +650,12 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .recovery-actions [data-slot="button"] { width: auto; flex: 1 1 auto; height: 28px; padding-inline: 6px; font-size: 12px; }
 }
 
+/* A nonzero duration would make every property transition, since
+   transition-property defaults to all: inline pane geometry, pane visibility
+   and the diff spacer would then show their old values at commit and in the
+   next painted frame. */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: 0s !important; transition-delay: 0s !important; }
 }
 
 .conversation-loading-status { display: block; }

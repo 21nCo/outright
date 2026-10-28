@@ -85,10 +85,7 @@ function dropSide(event, element) {
 const SIDE_WORDS = { left: "to the left of", right: "to the right of", up: "above", down: "below" };
 
 // A pane's size, not the window's, compacts its view. The body measures its
-// own box before paint and marks the size tiers styles.css uses, rather than
-// being a CSS size container: Chrome on macOS and Windows CI laid out a style
-// change inside one only at the next frame, so a view's synchronous layout
-// reads, such as the diff's Find placement, saw the previous layout.
+// own box before paint and marks the size tiers styles.css uses.
 const PANE_MAX_WIDTHS = [760, 640, 520];
 const PANE_MAX_HEIGHTS = [479];
 function markPaneSize(body) {

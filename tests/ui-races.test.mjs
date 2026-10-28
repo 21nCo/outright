@@ -632,6 +632,10 @@ test("a vanished Windows launcher preserves verified descendants without adoptin
   assert.equal(launcher.ownedWindows.has(4103), false);
 });
 
+// The diff and pane geometry steps run once with reduced motion and once
+// without it; ui-races.jsx names them in MOTION_STEPS.
+const motionStepCount = 6;
+
 // A measured full local run took 133.5 seconds; macOS CI reached 103/108 at
 // 148.4 seconds. Keep a finite phase with room for the final responsive and
 // recovery steps, while preserving their separate performance assertions.
@@ -803,6 +807,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     await send("Runtime.addBinding", { name: "__requestFixtureKey" });
     await send("Runtime.addBinding", { name: "__requestFixtureWheel" });
     await send("Runtime.addBinding", { name: "__requestFixtureForeground" });
+    await send("Runtime.addBinding", { name: "__requestFixtureMotion" });
     await send("Page.addScriptToEvaluateOnNewDocument", { source: `
       window.__fixtureWheelCap = ${Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) || 0};
       // Headless Chrome on macOS can route a fixture's native key to a
@@ -830,6 +835,15 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
         };
         window.addEventListener("fixture-viewport-ready", ready);
         window.__requestFixtureViewport(String(width));
+      });
+      window.__fixtureSetMotion = (motion) => new Promise((resolve) => {
+        const ready = (event) => {
+          if (event.detail !== motion) return;
+          window.removeEventListener("fixture-motion-ready", ready);
+          resolve();
+        };
+        window.addEventListener("fixture-motion-ready", ready);
+        window.__requestFixtureMotion(motion);
       });
       window.__fixtureSendKey = (key) => new Promise((resolve) => {
         const ready = (event) => {
@@ -913,6 +927,12 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
           await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-key-ready", { detail: ${JSON.stringify(event.params.payload)} }))` });
           return;
         }
+        if (event.params.name === "__requestFixtureMotion") {
+          if (!["reduce", "no-preference"].includes(event.params.payload)) throw new Error(`Unexpected fixture motion: ${event.params.payload}`);
+          await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: event.params.payload }] });
+          await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-motion-ready", { detail: ${JSON.stringify(event.params.payload)} }))` });
+          return;
+        }
         if (event.params.name !== "__requestFixtureViewport") return;
         const width = Number(event.params.payload);
         if (![1280, 1200, 900, 760, 640, 620, 390, 360].includes(width)) throw new Error(`Unexpected fixture viewport: ${width}`);
@@ -921,6 +941,10 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       })().catch((error) => { viewportError = error; });
     });
     await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 844, deviceScaleFactor: 1, mobile: false });
+    // Hosted macOS and Windows runners report reduced motion and Ubuntu does
+    // not, so every platform runs the fixture with it; the geometry steps
+    // repeat without it.
+    await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
     await send("Page.navigate", { url });
     phase = "run browser interaction fixtures";
     const state = await waitForFixture(async (method, params) => {
@@ -932,14 +956,13 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       devtoolsReady: devtools?.socket.readyState, viteOutput: output.slice(-500) }));
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
     const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
-    const expectedCount = selectedCount ?? 150;
+    const expectedCount = selectedCount ?? 150 + motionStepCount;
     const completedCount = Number(state.text.match(/(\d+) interaction regressions passed/)?.[1]);
     assert.equal(completedCount, expectedCount,
       `browser fixture completed ${completedCount || 0} of ${expectedCount} expected interactions; last step: ${state.progress?.step ?? "unknown"}`);
     const performanceFixture = state.text.match(/Performance fixture: (\{[^\n]+\})/);
     if (!process.env.OUTRIGHT_UI_STEP) assert.ok(performanceFixture, "large fixture measurements were not recorded");
     if (performanceFixture) console.log(`UI performance: ${performanceFixture[1]}`);
-    for (const probe of state.text.match(/Container probe[^\n]*/g) ?? []) console.log(`UI ${probe}`);
     if (!process.env.OUTRIGHT_UI_STEP) console.log(`UI fixture timings: ${fixtureProgress(state)}`);
     if (foreignPages.length) console.log(`UI fixture restored its tab after the browser opened: ${foreignPages.join(", ")}`);
     if (process.env.OUTRIGHT_TEST_UI_ASSERTION_FAILURE === "1") throw new Error("Injected UI assertion failure after fixture pass");
