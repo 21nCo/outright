@@ -87,11 +87,13 @@ const MAX_ACCOUNTS_PER_PROVIDER = 16;
 const MAX_TRUSTED_LIFECYCLE_CONFIGS = 16;
 const MAX_WORKTREE_LIFECYCLE_STATES = 512;
 // A running state is what archive maintenance waits for and what restore
-// turns into an unconfirmed interruption; a state with unconfirmed processes
-// holds its worktree. Both are bounded by live claims and unacknowledged
-// attempts, so retention keeps them however many newer states are saved.
+// turns into an unconfirmed interruption. Retention keeps it, and every state
+// the lifecycle service keeps (lifecycleStateKept), however many newer states
+// are saved; the service forgets those whose worktree is gone.
 const LIFECYCLE_STATE_RUNNING = "COALESCE(json_extract(state, '$.status'), '') = 'running'";
-const LIFECYCLE_STATE_PINNED = `${LIFECYCLE_STATE_RUNNING} OR COALESCE(json_extract(state, '$.outcomeUnknown'), 0) <> 0`;
+const LIFECYCLE_STATE_KEPT = `${LIFECYCLE_STATE_RUNNING} OR COALESCE(json_extract(state, '$.outcomeUnknown'), 0) <> 0
+  OR COALESCE(json_extract(state, '$.status'), '') IN ('failed', 'cancelled', 'interrupted')
+  OR COALESCE(json_extract(state, '$.checkpoints'), '{}') <> '{}'`;
 const MAX_LIMIT_WINDOWS_PER_HOME = 8;
 
 const SETTING_RULES = {
@@ -2145,7 +2147,8 @@ export function createOutrightDatabase(options = {}) {
       return row?.project_path === projectPath;
     },
     listWorktreeLifecycle() {
-      return db.prepare("SELECT state FROM worktree_lifecycle ORDER BY updated_at DESC").all()
+      // Oldest first, so the service's retention gives way in the same order.
+      return db.prepare("SELECT state FROM worktree_lifecycle ORDER BY updated_at, worktree_path DESC").all()
         .map((row) => parseJson(row.state, null)).filter(Boolean);
     },
     // Lifecycle state is the durable record of a setup or teardown outcome.
@@ -2159,7 +2162,7 @@ export function createOutrightDatabase(options = {}) {
           ON CONFLICT(worktree_path) DO UPDATE SET project_id = excluded.project_id, state = excluded.state, updated_at = excluded.updated_at`)
           .run(state.worktreePath, state.projectId, JSON.stringify(state), state.updatedAt ?? now());
         // Retention never drops a state something still depends on.
-        db.prepare(`DELETE FROM worktree_lifecycle WHERE NOT (${LIFECYCLE_STATE_PINNED}) AND worktree_path NOT IN (
+        db.prepare(`DELETE FROM worktree_lifecycle WHERE NOT (${LIFECYCLE_STATE_KEPT}) AND worktree_path NOT IN (
           SELECT worktree_path FROM worktree_lifecycle ORDER BY updated_at DESC, worktree_path LIMIT ?)`).run(MAX_WORKTREE_LIFECYCLE_STATES);
         reserveRecoveryHeadroom(db);
       }).immediate();

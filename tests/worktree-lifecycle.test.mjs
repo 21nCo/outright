@@ -72,8 +72,11 @@ test("an older event or snapshot never replaces a newer state or removal", () =>
   assert.equal(lifecycleFor(mergeLifecycleSnapshot(states, [state("running", 3)], 6), project, worktree), null);
   assert.equal(lifecycleFor(upsertLifecycleState(states, state("running", 6)), project, worktree), null);
   assert.equal(lifecycleFor(upsertLifecycleState(states, state("running", 8)), project, worktree).status, "running");
-  // A trusted refusal no longer asks for review.
-  assert.equal(lifecycleSummary(state("trusted", 9)).quiet, true);
+  // A trusted refusal no longer asks for review, but setup that has not run
+  // is still a visible prompt; a trusted teardown needs nothing until removal.
+  const trusted = lifecycleSummary(state("trusted", 9));
+  assert.deepEqual([trusted.quiet, trusted.tone, trusted.short], [undefined, "trust", "Run setup"]);
+  assert.equal(lifecycleSummary({ ...state("trusted", 9), phase: "teardown" }).quiet, true);
 });
 
 test("a teardown acknowledgement or skip is explicit, and applies only to the worktree whose problem was shown", () => {

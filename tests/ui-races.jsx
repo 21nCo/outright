@@ -1180,6 +1180,10 @@ async function lifecycleStatusOrder() {
     held.resolve(snapshot([state("failed", base + 2)], base + 2));
     await remainsTrue(() => !chip() && !mark(), 150, `${order}: a snapshot read before the removal brought the state back`);
   }
+  // Trusting the file from a sibling worktree runs nothing here, so this
+  // worktree's setup is still a visible prompt.
+  send({ type: "worktree.lifecycle", payload: { ...state("trusted", 40), stepIndex: 0 } });
+  await until(() => chip() === "Run setup" && /setup has not run/.test(mark()), `a trusted setup that has not run looked ready (chip "${chip()}", mark "${mark()}")`);
   root.render(null); await settle();
 }
 

@@ -32,7 +32,11 @@ function statusSummary(state) {
     }
     case "ready": return { tone: "ready", quiet: true, short: "Ready", label: "Setup finished; the worktree is ready" };
     case "complete": return { tone: "ready", quiet: true, short: "Torn down", label: "Teardown finished" };
-    case "trusted": return { tone: "ready", quiet: true, short: "Trusted", label: `${phase} commands trusted; they have not run yet` };
+    // Trusting a file from one worktree runs nothing in its siblings: their
+    // setup still has to run before they are ready.
+    case "trusted": return state.phase === "teardown"
+      ? { tone: "ready", quiet: true, short: "Trusted", label: "Teardown commands trusted; they run when the worktree is removed" }
+      : { tone: "trust", short: "Run setup", label: "Setup commands trusted; setup has not run in this worktree yet" };
     case "needs-trust": return { tone: "trust", short: `Review ${state.phase}`, label: `${phase} commands need your review before they run` };
     case "invalid": return { tone: "attention", short: `${phase} invalid`, label: `${phase} configuration is invalid` };
     case "failed":

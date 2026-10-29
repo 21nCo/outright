@@ -7,6 +7,7 @@ import path from "node:path";
 import { createOutrightDatabase } from "./database.mjs";
 import { createGitService } from "./git-service.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
+import { lifecycleSummary } from "../src/lib/worktree-lifecycle.js";
 import { LIFECYCLE_CONFIG_FILE, LIFECYCLE_LIMITS, createWorktreeLifecycle, parseLifecycleConfig, readLifecycleConfig, sanitizeOutput } from "./worktree-lifecycle.mjs";
 
 // Disposable repositories must not be attached to a host Git Trace2 consumer.
@@ -802,4 +803,101 @@ test("status surfaces see the newest state of the worktree now at each path: rev
   await lifecycle.setup(target);
   const removal = published().at(-1);
   assert.deepEqual([removal.removed, removal.revision > Math.max(...revisions)], [true, true]);
+}));
+
+// Steps that record where they ran, against configurations and worktree
+// identities the test controls, so retention runs at its real bound fast.
+function scriptedLifecycle(create, database, project, { fail = () => null, digest = "sha256:trusted", ...options } = {}) {
+  const ran = [];
+  const alive = new Map();
+  const config = (worktreePath) => (worktreePath.startsWith("/other/")
+    ? { digest: "sha256:unreviewed", version: 1, setup: [{ name: "Install", command: ["install"], timeoutSeconds: 1 }], teardown: [] }
+    : { digest, version: 1, teardown: [{ name: "Down", command: ["down"], timeoutSeconds: 1 }],
+      setup: ["one", "two", "three"].map((name) => ({ name, command: [name], timeoutSeconds: 1 })) });
+  const subprocesses = { capacity: () => ({ active: 0, limit: 4, unknown: 0 }),
+    run: async (command, _args, { cwd }) => {
+      ran.push(`${cwd}:${command}`);
+      const error = fail(cwd, command);
+      if (error) throw error;
+    } };
+  let clock = Date.parse("2026-01-01T00:00:00Z");
+  const now = () => new Date(clock += 1000).toISOString();
+  const target = (worktreePath) => ({ project, worktree: { id: worktreePath, path: worktreePath }, worktreePath });
+  const start = (extra = {}) => create({ subprocesses, readConfig: async (worktreePath) => config(worktreePath),
+    identify: async (worktreePath) => (alive.has(worktreePath) ? alive.get(worktreePath) : `live:${worktreePath}`), now, ...options, ...extra });
+  database.trustLifecycleConfig(project.id, project.path, digest);
+  return { ran, alive, target, start };
+}
+
+test("retention never loses a checkpoint, an outcome to act on or a teardown awaiting removal while its worktree exists, and stays bounded", { timeout: 60_000 }, withLifecycle(async ({ database, project, create }) => {
+  let failSecond = true;
+  const { ran, target, start } = scriptedLifecycle(create, database, project, {
+    fail: (cwd, command) => (cwd === "/w/a" && command === "two" && failSecond ? Object.assign(new Error("exited"), { code: 2 }) : null) });
+  const lifecycle = start();
+  const [a, b] = [target("/w/a"), target("/w/b")];
+  await lifecycle.setup(a);
+  assert.deepEqual([(await settled(lifecycle, a)).state.status, (await lifecycle.describe(a)).state.stepIndex], ["failed", 1]);
+  // Teardown finishes, then Git keeps the worktree.
+  await assert.rejects(lifecycle.removeWorktree(b, { remove: async (prepareRemoval) => { await prepareRemoval(); throw new Error("git kept it"); } }), /git kept it/);
+  const awaiting = (await lifecycle.describe(b)).state;
+  assert.deepEqual([awaiting.phase, awaiting.status, awaiting.checkpoints.teardown.stepIndex], ["teardown", "failed", 1]);
+  // Settled states of other worktrees fill memory and the database to the bound.
+  for (let index = 1; index <= LIFECYCLE_LIMITS.states; index += 1) await lifecycle.setup(target(`/other/${index}`), { automatic: true });
+  for (const [worktree, status] of [[a, "failed"], [b, "failed"]]) assert.equal((await lifecycle.describe(worktree)).state?.status, status, "memory evicted a state its worktree depends on");
+  const listed = (await lifecycle.list()).states.map((state) => state.worktreePath);
+  assert.ok(listed.includes("/w/a") && listed.includes("/w/b"), "status surfaces lost a failure");
+  const durable = database.listWorktreeLifecycle().map((state) => state.worktreePath);
+  assert.ok(durable.includes("/w/a") && durable.includes("/w/b"), "the database pruned a state its worktree depends on");
+
+  // After a restart at the bound, the next state evicts the oldest settled
+  // state, never the newest, and each retry resumes at its checkpoint.
+  await lifecycle.shutdown();
+  const successor = start();
+  await successor.setup(target("/other/next"), { automatic: true });
+  const kept = (await successor.list()).states.map((state) => state.worktreePath);
+  assert.ok(kept.includes(`/other/${LIFECYCLE_LIMITS.states}`) && kept.includes("/other/next"), "a restart evicted the newest states first");
+  assert.equal(kept.includes("/other/1"), false, "the oldest settled state was not the one evicted");
+  failSecond = false;
+  assert.equal((await successor.setup(a)).stepIndex, 1, "the retry did not resume at the failed step");
+  assert.equal((await settled(successor, a)).state.status, "ready");
+  assert.deepEqual(ran.filter((entry) => entry.startsWith("/w/a:")), ["/w/a:one", "/w/a:two", "/w/a:two", "/w/a:three"]);
+  let removed = false;
+  await successor.removeWorktree(b, { remove: async (prepareRemoval) => { await prepareRemoval(); removed = true; } });
+  assert.equal(removed, true);
+  assert.deepEqual(ran.filter((entry) => entry.startsWith("/w/b:")), ["/w/b:down"], "a finished teardown ran again");
+}));
+
+test("kept states of worktrees that no longer exist are forgotten once they pass the bound, but unconfirmed processes stay held", { timeout: 30_000 }, withLifecycle(async ({ database, project, create }) => {
+  const { alive, target, start } = scriptedLifecycle(create, database, project, {
+    fail: (cwd) => (cwd === "/w/unconfirmed" ? Object.assign(new Error("not confirmed"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN" })
+      : Object.assign(new Error("exited"), { code: 1 })) });
+  const lifecycle = start({ limits: { ...LIFECYCLE_LIMITS, states: 4 } });
+  const paths = ["/w/live", "/w/unconfirmed", "/w/gone/1", "/w/gone/2", "/w/gone/3", "/w/replaced"];
+  for (const worktreePath of paths) {
+    await lifecycle.setup(target(worktreePath));
+    await settled(lifecycle, target(worktreePath));
+    if (worktreePath === "/w/unconfirmed") alive.set(worktreePath, null);
+  }
+  // Six kept states over a bound of four: none are dropped while their worktrees exist.
+  assert.deepEqual((await lifecycle.list()).states.map((state) => state.worktreePath).sort(), [...paths].sort());
+  for (const worktreePath of paths.slice(2)) alive.set(worktreePath, worktreePath === "/w/replaced" ? "another" : null);
+  await lifecycle.setup(target("/other/1"), { automatic: true });
+  await waitFor(() => database.listWorktreeLifecycle().length === 3, 5000, "states of vanished worktrees were not forgotten");
+  assert.deepEqual(database.listWorktreeLifecycle().map((state) => state.worktreePath).sort(), ["/other/1", "/w/live", "/w/unconfirmed"]);
+  assert.equal(lifecycle.hold("/w/unconfirmed"), "WORKTREE_LIFECYCLE_UNCONFIRMED");
+  assert.equal((await lifecycle.describe(target("/w/live"))).state.status, "failed");
+}));
+
+test("trusting a configuration from one worktree leaves a sibling's unrun setup visible, not ready", withLifecycle(async ({ database, project, create, events }) => {
+  const { ran, target, start } = scriptedLifecycle(create, database, project, { digest: "sha256:reviewed" });
+  database.untrustProject(project.id);
+  const lifecycle = start();
+  const [a, c] = [target("/w/a"), target("/w/c")];
+  for (const worktree of [a, c]) assert.equal((await lifecycle.setup(worktree, { automatic: true })).status, "needs-trust");
+  await lifecycle.trust(a, "sha256:reviewed");
+  const sibling = events.filter((event) => event.type === "worktree.lifecycle" && event.payload.worktreePath === "/w/c").at(-1).payload;
+  assert.equal(sibling.status, "trusted");
+  const summary = lifecycleSummary(sibling);
+  assert.deepEqual([summary.quiet, summary.tone, summary.short], [undefined, "trust", "Run setup"], "a sibling whose setup never ran looked ready");
+  assert.deepEqual(ran, [], "trust ran nothing");
 }));

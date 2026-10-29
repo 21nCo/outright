@@ -194,6 +194,15 @@ function storedState(value) {
     && PHASES.has(value.phase) && STATUSES.has(value.status);
 }
 
+// Retention never drops a state its worktree depends on while it exists: a
+// running step, unconfirmed processes, an outcome the user must act on, or a
+// checkpoint, including a finished teardown waiting for Git removal. The
+// database keeps the same states (LIFECYCLE_STATE_KEPT in database.mjs).
+export function lifecycleStateKept(state) {
+  return state.status === "running" || Boolean(state.outcomeUnknown) || RESUMABLE.has(state.status)
+    || Object.keys(state.checkpoints ?? {}).length > 0;
+}
+
 function publicState(state) {
   if (!state) return null;
   const { output: _output, ...rest } = state;
@@ -288,14 +297,29 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
       error: `${state.error ? `${state.error} ` : ""}The ${state.phase} ${finished ? "finished" : "stopped"}, but Outright could not save that outcome (${String(failure?.message ?? failure).slice(0, 200)}). Run it again to record it.` }, { memoryOnly: true });
   }
 
-  // A state with unconfirmed processes is never evicted: it holds its worktree.
+  // Memory holds every state the database keeps, so a lookup never misses a
+  // durable one. Only settled states give way to newer ones, oldest first;
+  // when kept states alone pass the bound, those of worktrees that are gone
+  // or replaced are forgotten.
   function remember(state) {
     states.delete(state.worktreePath);
     states.set(state.worktreePath, state);
     for (const [key, value] of states) {
       if (states.size <= limits.states) break;
-      if (!active.has(key) && !value.outcomeUnknown) states.delete(key);
+      if (value !== state && !active.has(key) && !lifecycleStateKept(value)) states.delete(key);
     }
+    if (states.size > limits.states) pruneVanished();
+  }
+
+  let pruning = null;
+  function pruneVanished() {
+    pruning ??= (async () => {
+      for (const [key, state] of [...states]) {
+        if (state.outcomeUnknown || holding(key)) continue;
+        const instance = await identify(key);
+        if (instance !== state.instance && states.get(key) === state && !holding(key)) forget(key);
+      }
+    })().catch(onPersistError).finally(() => { pruning = null; });
   }
 
   function commit(value, { strict = false, memoryOnly = false } = {}) {
