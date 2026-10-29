@@ -113,6 +113,20 @@ function sameMatch(left, right) {
   return left.row === right.row && left.col === right.col && left.length === right.length;
 }
 
+// Whether xterm's selection is exactly a match's cells at the current width.
+// select(col, row, length) ends where xterm's SelectionModel puts it: a
+// selection that ends on the right edge keeps that row's last column.
+function selectionCovers(xterm, match) {
+  const range = xterm.getSelectionPosition();
+  if (!range) return false;
+  const { cols } = xterm;
+  const end = match.col + match.length;
+  const last = end <= cols ? { x: end, y: match.row }
+    : end % cols === 0 ? { x: cols, y: match.row + end / cols - 1 }
+      : { x: end % cols, y: match.row + Math.floor(end / cols) };
+  return range.start.x === match.col && range.start.y === match.row && range.end.x === last.x && range.end.y === last.y;
+}
+
 // Owns Find for one xterm view. It reads only the buffer the view shows,
 // never writes to the terminal, and reports { total, capped, index, covered,
 // selected } where index is -1 when no match is current and selected says
@@ -130,11 +144,11 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
   let matches = [];
   let capped = false;
   let current = null;
-  // Who holds xterm's selection: "find" while it is the highlight Find drew
-  // at `shown`, "cleared" after xterm cleared that highlight for a change of
-  // height, and null once the user selected, typed or cleared it.
+  // Who holds xterm's selection: "find" while it is the highlight Find drew,
+  // "cleared" after xterm cleared that highlight for a change of height, and
+  // null once the user pressed a mouse button in the terminal, selected,
+  // typed or cleared it.
   let selection = null;
-  let shown = null;
   let selecting = false;
   let resizing = false;
   let timer = 0;
@@ -154,7 +168,6 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
   function releaseSelection() {
     const own = selection === "find";
     selection = null;
-    shown = null;
     if (own && xterm.hasSelection()) xterm.clearSelection();
   }
 
@@ -168,7 +181,6 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
     selecting = true;
     try { xterm.select(match.col, match.row, match.length); } finally { selecting = false; }
     selection = "find";
-    shown = match;
   }
 
   function select(index) {
@@ -187,10 +199,11 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
   }
 
   // xterm keeps a selection at its buffer cells when lines are inserted or
-  // deleted above it or a width change reflows earlier lines, and clears it
-  // when the height changes. Whichever moved the current match, a highlight
-  // Find still holds is drawn again on the match's cells, without moving
-  // the view; a user's selection is left alone.
+  // deleted above it or a width change reflows earlier lines, moves it with
+  // its text when older lines are trimmed, and clears it when the height
+  // changes. Whenever a highlight Find still holds is no longer on the
+  // current match's cells, it is drawn there again, without moving the
+  // view; a user's selection is left alone.
   function recount() {
     timer = 0;
     if (!query) return;
@@ -203,7 +216,7 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
       if (!match) drop();
       else {
         current = { match, marker };
-        if ((selection === "find" && !sameMatch(shown, match)) || selection === "cleared") highlight(match);
+        if (selection && !selectionCovers(xterm, match)) highlight(match);
       }
     }
     publish();
@@ -214,7 +227,19 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
     timer = setTimeout(recount, recountMs);
   }
 
+  // xterm reports a selection the user makes only when the mouse button is
+  // released. Pressing it in the terminal already makes the selection the
+  // user's, so a recount during a drag does not replace it.
+  const release = (event) => {
+    if (event.button !== 0 && event.button !== 2) return;
+    if (!selection) return;
+    selection = null;
+    publish();
+  };
+  xterm.element?.addEventListener("mousedown", release, true);
+
   const subscriptions = [
+    { dispose: () => xterm.element?.removeEventListener("mousedown", release, true) },
     xterm.onWriteParsed(schedule),
     // xterm clears the selection for a change of height right after this.
     xterm.onResize(() => {
@@ -230,7 +255,7 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
       const next = selection === "find" && resizing && !xterm.hasSelection() ? "cleared" : null;
       if (next === selection) return;
       selection = next;
-      if (!next) { shown = null; publish(); }
+      if (!next) publish();
     }),
     xterm.onScroll(() => { if (isCovered() !== covered) publish(); }),
   ];

@@ -2508,7 +2508,7 @@ async function terminalScrollbackFindRegression() {
 
 // Find's highlight stays on its current match's text wherever output or a
 // resize moves the match, only that highlight is drawn as the match, a
-// selection the user made is left alone, and streaming output does not keep
+// selection the user made or is dragging is left alone, and streaming output does not keep
 // re-announcing the count.
 async function terminalFindHighlightRegression() {
   root.render(null);
@@ -2665,6 +2665,58 @@ async function terminalFindHighlightRegression() {
   await until(() => status() === "1 of 1000+" && selectedText() === "hit", "the oldest counted match is current");
   await write("\r\nhit again\r\n$ ");
   await until(() => status() === "1000+ matches" && !selectedText(), "a match pushed out of the newest 1,000 is dropped with its highlight");
+
+  // Once the scrollback is full, output trims the oldest lines and xterm
+  // moves the selection with its text, so Find's highlight stays on its match
+  // without being drawn again.
+  const fill = Array.from({ length: 5100 }, (_, index) => `\r\nfill ${index}`).join("");
+  await write(`${fill}\r\nNEEDLE row${Array.from({ length: 5 }, (_, index) => `\r\nafter ${index}`).join("")}\r\n$ `);
+  setControlValue(find(), "needle row");
+  await until(() => status() === "1 of 1" && selectedText() === "NEEDLE row" && amber.includes(selectionColor()), "the match in a full scrollback is highlighted");
+  const select = Terminal.prototype.select;
+  let selects = 0;
+  Terminal.prototype.select = function countSelect(...args) { selects += 1; return select.apply(this, args); };
+  const stream = async (label, count = 3) => {
+    for (let index = 0; index < count; index += 1) {
+      show(`\r\n${label} ${index}`);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    await settle();
+  };
+  try {
+    await stream("more");
+    assert(selects === 0, `Streaming into a full scrollback drew Find's highlight again ${selects} times`);
+  } finally {
+    Terminal.prototype.select = select;
+  }
+  assert(status() === "1 of 1" && selectedText() === "NEEDLE row" && amber.includes(selectionColor()), `Streaming into a full scrollback moved Find's highlight to ${JSON.stringify(selectedText())}`);
+
+  // A drag the user starts is theirs before xterm reports it on release, so a
+  // recount during the drag, after output trims the scrollback or inserts a
+  // line above the match, neither replaces nor ends it.
+  const drag = async (text, during) => {
+    const screen = host.querySelector(".terminal-host .xterm-screen");
+    const box = screen.getBoundingClientRect();
+    const rowHeight = box.height / size().rows;
+    const row = screenRows().findIndex((line) => line.startsWith(text));
+    assert(row >= 0, `No row starts with ${text}`);
+    const clientY = box.top + rowHeight * (row + 0.5);
+    const point = { bubbles: true, cancelable: true, button: 0, clientY };
+    screen.dispatchEvent(new MouseEvent("mousedown", { ...point, buttons: 1, detail: 1, clientX: box.left + 1 }));
+    document.dispatchEvent(new MouseEvent("mousemove", { ...point, buttons: 1, clientX: box.right - 2 }));
+    await during();
+    document.dispatchEvent(new MouseEvent("mouseup", { ...point, clientX: box.right - 2 }));
+    await settle();
+  };
+  await drag("after 1", () => stream("drag"));
+  assert(selectedText() === "after 1" && status() === "1 of 1", `A recount during the user's drag in a full scrollback replaced it with ${JSON.stringify(selectedText())}`);
+  assert(selectionColor() && !amber.includes(selectionColor()), "The user's drag is drawn as Find's match");
+  key(find(), { key: "Enter" });
+  await until(() => selectedText() === "NEEDLE row" && amber.includes(selectionColor()), "Next highlights the match again");
+  // The inserted line moves the text under the user's cells down one row.
+  await drag("after 3", () => write("\x1b7\x1b[1;1H\x1b[L\x1b8"));
+  assert(selectedText() === "after 2" && status() === "1 of 1", `A recount during the user's drag after a line was inserted replaced it with ${JSON.stringify(selectedText())}`);
+  assert(selectionColor() && !amber.includes(selectionColor()), "The user's drag is drawn as Find's match after a line was inserted");
   key(find(), { key: "Escape" });
   await until(() => !find() && document.activeElement === textarea(), "Escape closes Find");
   assert(!errors.length, `Unexpected terminal errors: ${errors.map((error) => error.message).join("; ")}`);
