@@ -2534,9 +2534,24 @@ async function terminalScrollbackFindRegression() {
   const marked = [...host.querySelectorAll(".terminal-host .xterm-selection > *")].map((node) => node.getBoundingClientRect());
   assert(marked.length && marked.every((rect) => rect.bottom <= barRect.top || rect.top >= barRect.bottom), "The Find bar covers the current match at the top right");
   assert(!host.querySelector(".terminal-find.is-lowered"), "The Find bar lowered for a match scrolled out from under it");
+  // A match that starts on the last row of the view and wraps below it is
+  // scrolled until it is shown whole.
+  const middle = size().rows - 1 - Math.floor(size().rows / 2);
+  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 6, data: `\r\n${filler(40)}ANCHOR mark\r\n${filler(middle - 1)}${" ".repeat(size().cols - 4)}WRAP mark\r\n${filler(size().rows)}$ ` } });
+  // Output is parsed by the second frame.
+  await settle();
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  await settle();
+  setControlValue(find(), "anchor mark");
+  await until(() => status() === "1 of 1" && viewRows().at(-1)?.trimEnd().endsWith("WRAP"), "the view ends on the first row of a wrapped match");
+  setControlValue(find(), "wrap mark");
+  await until(() => status() === "1 of 1" && highlighted(), "the wrapped match is current");
+  await settle();
+  const wrapRow = viewRows().findIndex((row) => row.trimEnd().endsWith("WRAP"));
+  assert(wrapRow >= 0 && viewRows()[wrapRow + 1]?.trim() === "mark", `Find left the wrapped part of its match below the view: ${JSON.stringify(viewRows().slice(-2))}`);
   // At the top of the buffer the view cannot scroll, so only the bar's
   // real left edge keeps it up for a top-left match.
-  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 6, data: "\x1bcTOP mark\r\n$ " } });
+  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 7, data: "\x1bcTOP mark\r\n$ " } });
   await until(() => viewRows()[0]?.startsWith("TOP mark") && status() === "No matches", "a reset buffer starts with a top-left match");
   setControlValue(find(), "top mark");
   await until(() => status() === "1 of 1" && highlighted(), "the match at the top of the buffer is current");
@@ -2760,20 +2775,43 @@ async function terminalFindHighlightRegression() {
   await drag("after 3", () => write("\x1b7\x1b[1;1H\x1b[L\x1b8"));
   assert(selectedText() === "after 2" && status() === "1 of 1", `A recount during the user's drag after a line was inserted replaced it with ${JSON.stringify(selectedText())}`);
   assert(selectionColor() && !amber.includes(selectionColor()), "The user's drag is drawn as Find's match after a line was inserted");
-  // A click starts with an empty selection, so a drag that begins after a
-  // change of height cleared Find's highlight, before the recount draws it
-  // again, changes no visible selection; it is still the user's.
-  key(find(), { key: "Enter" });
-  await until(() => selectedText() === "NEEDLE row" && amber.includes(selectionColor()), "Find highlights its match before the height changes");
+  // xterm clears the selection for a change of height; Find draws its
+  // highlight again at once, before the recount. A drag, typing or a paste
+  // that comes after the change and before the recount is the user's, so the
+  // recount leaves it alone and the input still reaches the process.
   const tall = size();
   const tallHeight = frameElement().style.height;
-  frameElement().style.height = "300px";
-  await until(() => size() !== tall && !selectedText() && host.querySelectorAll(".terminal-host .xterm-rows > div").length === size().rows,
-    "xterm clears Find's highlight for a change of height");
-  assert(size().cols === tall.cols && size().rows < tall.rows, `The resize changed more than the height: ${JSON.stringify([tall, size()])}`);
+  const heightChanged = async (height, label) => {
+    key(find(), { key: "Enter" });
+    await until(() => selectedText() === "NEEDLE row" && amber.includes(selectionColor()), `Find highlights its match before ${label}`);
+    const before = size();
+    frameElement().style.height = height;
+    await until(() => size() !== before && host.querySelectorAll(".terminal-host .xterm-rows > div").length === size().rows, `the height changes before ${label}`);
+    assert(size().cols === tall.cols && size().rows !== before.rows, `The resize changed more than the height: ${JSON.stringify([before, size()])}`);
+    assert(selectedText() === "NEEDLE row" && amber.includes(selectionColor()), `A change of height left Find's highlight on ${JSON.stringify(selectedText())} before ${label}`);
+  };
+  await heightChanged("300px", "a drag");
   await drag("after 1", () => new Promise((resolve) => setTimeout(resolve, 300)));
   assert(selectedText() === "after 1" && status() === "1 of 1", `A recount after a change of height replaced the user's drag with ${JSON.stringify(selectedText())}`);
   assert(selectionColor() && !amber.includes(selectionColor()), "The user's drag after a change of height is drawn as Find's match");
+  const sends = (data) => sent.filter((message) => message.type === "terminal.input" && message.data === data).length;
+  for (const [label, height, data, input] of [
+    ["typing", tallHeight, "x", () => key(textarea(), { key: "x", code: "KeyX", keyCode: 88, which: 88 })],
+    ["a paste", "300px", "pasted", () => {
+      const clipboardData = new DataTransfer();
+      clipboardData.setData("text/plain", "pasted");
+      textarea().dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData }));
+    }],
+  ]) {
+    await heightChanged(height, label);
+    const count = sends(data);
+    input();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await settle();
+    assert(sends(data) === count + 1, `${label} after a change of height did not reach the process`);
+    assert(!selectedText() && !amber.includes(selectionColor()) && status() === "1 of 1",
+      `A recount after ${label} drew Find's highlight again on ${JSON.stringify(selectedText())}`);
+  }
   await settledResize("height", tallHeight, "the terminal is resized back");
 
   // A press xterm does not select with leaves Find's highlight Find's: one on
