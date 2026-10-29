@@ -2527,10 +2527,27 @@ async function terminalFindHighlightRegression() {
   const write = async (data) => { show(data); await new Promise((resolve) => setTimeout(resolve, 500)); await settle(); };
   const find = () => host.querySelector('input[aria-label="Find in terminal output"]');
   const status = () => host.querySelector(".terminal-find > span[aria-hidden]")?.textContent ?? "";
-  const announced = () => host.querySelector(".terminal-find [role=status]")?.textContent ?? "";
+  // An unchanged announcement toggles a trailing no-break space, which trim drops.
+  const announced = () => host.querySelector(".terminal-find [role=status]")?.textContent.trim() ?? "";
   const size = () => sent.filter((message) => message.type === "terminal.resize").at(-1);
   const textarea = () => host.querySelector(".terminal-host .xterm-helper-textarea");
   const key = (target, init) => target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init }));
+  // Records the live region's text each time it is mounted or changes.
+  const watchAnnouncements = () => {
+    const seen = [];
+    let last = host.querySelector(".terminal-find [role=status]");
+    let lastText = last?.textContent;
+    const record = () => {
+      const region = host.querySelector(".terminal-find [role=status]");
+      if (!region || (region === last && region.textContent === lastText)) return;
+      last = region;
+      lastText = region.textContent;
+      seen.push(lastText.trim());
+    };
+    const observer = new MutationObserver(record);
+    observer.observe(host, { childList: true, characterData: true, subtree: true });
+    return { seen, stop: () => observer.disconnect() };
+  };
   // xterm copies its own selection, so the copied text is what it selected.
   const selectedText = () => {
     const clipboardData = new DataTransfer();
@@ -2611,6 +2628,21 @@ async function terminalFindHighlightRegression() {
   await write("\r\ntick 0\r\n$ ");
   setControlValue(find(), "tick");
   await until(() => announced() === "Match 1 of 1", "a new query is announced");
+
+  // A user action is announced even when its text does not change: Next on
+  // the only match, and Find reopened within the output pacing interval.
+  let watch = watchAnnouncements();
+  key(find(), { key: "Enter" });
+  await until(() => watch.seen.length && announced() === "Match 1 of 1", "Next on the only match is announced again");
+  watch.stop();
+  key(find(), { key: "Escape" });
+  await until(() => !find(), "Escape closes Find");
+  watch = watchAnnouncements();
+  host.querySelector('[aria-label="Find in terminal"]').click();
+  await until(() => find() && announced() === "Match 1 of 1", "the reopened query is announced");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  watch.stop();
+  assert(watch.seen[0] === "" && watch.seen.at(-1) === "Match 1 of 1", `Reopening Find did not change its live region: ${JSON.stringify(watch.seen)}`);
   const announcements = [];
   const observer = new MutationObserver(() => announcements.push(announced()));
   observer.observe(host.querySelector(".terminal-find [role=status]"), { childList: true, characterData: true, subtree: true });

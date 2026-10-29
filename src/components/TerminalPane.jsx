@@ -694,6 +694,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     findOpenRef.current = false;
     setFindOpen(false);
     setFindResult(NO_FIND_RESULT);
+    setAnnouncedFind("");
     xtermRef.current?.focus();
   }
 
@@ -756,14 +757,17 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     findAnnouncement = (findResult.index >= 0 ? `Match ${findResult.index + 1} of ${findResult.total}` : matches) + findScope + more;
   }
   // Streaming output recounts every 200 ms; announcing each count would talk
-  // over the user, so output-only changes wait for the slower cadence.
+  // over the user, so output-only changes wait for the slower cadence. A user
+  // action is always announced: when its text is unchanged (one match, or a
+  // reopen), a trailing no-break space toggles so the live region still changes.
   useEffect(() => {
     if (findActionSeenRef.current !== findAction) { findActionSeenRef.current = findAction; findActionPendingRef.current = true; }
-    const delay = findActionPendingRef.current ? 180 : Math.max(180, findAnnouncedAtRef.current + FIND_OUTPUT_ANNOUNCE_MS - Date.now());
+    const action = findActionPendingRef.current;
+    const delay = action ? 180 : Math.max(180, findAnnouncedAtRef.current + FIND_OUTPUT_ANNOUNCE_MS - Date.now());
     const timer = window.setTimeout(() => {
       findActionPendingRef.current = false;
       findAnnouncedAtRef.current = Date.now();
-      setAnnouncedFind(findAnnouncement);
+      setAnnouncedFind((shown) => action && findAnnouncement && shown === findAnnouncement ? `${findAnnouncement}\u00a0` : findAnnouncement);
     }, delay);
     return () => window.clearTimeout(timer);
   }, [findAnnouncement, findAction]);
