@@ -1066,18 +1066,26 @@ async function worktreeLifecycleRegression() {
   const acknowledge = [...dialog().querySelectorAll("button")].find((button) => button.textContent === "Acknowledge");
   assert(acknowledge.disabled, "acknowledgement did not wait for the user's confirmation");
   assert(/agent runs here wait/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? ""), "the hold on agent runs was not stated");
-  const confirm = dialog().querySelector('.lifecycle-acknowledge input[type="checkbox"]');
-  confirm.click();
+  const confirm = () => dialog().querySelector('.lifecycle-acknowledge input[type="checkbox"]');
+  confirm().click();
+  await until(() => !acknowledge.disabled, "the acknowledgement stayed disabled");
+  // A newer attempt that also left processes unconfirmed is never shown as
+  // already checked: each attempt needs its own acknowledgement.
+  detail = { ...interrupted, state: { ...interrupted.state, runId: "run-3", outcomeUnknown: true } };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => !confirm().checked && acknowledge.disabled, "a newer unconfirmed attempt kept the earlier acknowledgement");
+  confirm().click();
   await until(() => !acknowledge.disabled, "the acknowledgement stayed disabled");
   detail = interrupted;
   acknowledge.click();
   await until(() => posts.some((post) => post.path === "/api/worktrees/lifecycle/acknowledge"), "the acknowledgement was not sent");
   const sentAcknowledgement = posts.find((post) => post.path === "/api/worktrees/lifecycle/acknowledge");
   assert(sentAcknowledgement.body.worktreePath === worktree.path && sentAcknowledgement.body.projectId === project.id, "the acknowledgement named another worktree");
+  assert(sentAcknowledgement.body.acknowledgeUnconfirmed === "run-3", "the acknowledgement did not name the attempt shown");
   await until(() => !buttons().includes("Acknowledge"), "the acknowledged state was not reloaded");
   assert(errors.length === 0, `unexpected lifecycle errors: ${errors.map((error) => error.message).join("; ")}`);
 
-  const failure = Object.assign(new Error("Teardown did not finish"), { payload: { code: "LIFECYCLE_OUTCOME_UNKNOWN" } });
+  const failure = Object.assign(new Error("Teardown did not finish"), { payload: { code: "LIFECYCLE_OUTCOME_UNKNOWN", runId: "run-3" } });
   let problem = teardownProblem(failure, worktree.path);
   const sent = [];
   function Choices() {
@@ -1095,12 +1103,23 @@ async function worktreeLifecycleRegression() {
   radios[0].click();
   await until(() => problem.choice === "acknowledge", "the acknowledgement was not chosen");
   host.querySelector("button").click();
-  assert(sent.at(-1)?.acknowledgeUnconfirmed === true && sent.at(-1).skipTeardown === undefined, "the acknowledgement was not sent with the removal");
+  assert(sent.at(-1)?.acknowledgeUnconfirmed === "run-3" && sent.at(-1).skipTeardown === undefined, "the acknowledgement was not sent with the removal");
   radios[1].click();
   await until(() => problem.choice === "skip", "skip was not chosen");
   host.querySelector("button").click();
-  assert(sent.at(-1)?.skipTeardown === true && sent.at(-1).acknowledgeUnconfirmed === true, "skipping beside unconfirmed processes did not acknowledge them");
+  assert(sent.at(-1)?.skipTeardown === true && sent.at(-1).acknowledgeUnconfirmed === "run-3", "skipping beside unconfirmed processes did not acknowledge them");
   assert(/confirmed stopped/.test(radios[1].closest("label").textContent), "the skip choice did not say it acknowledges the processes");
+  // Without teardown steps the only choice is an acknowledged removal.
+  root.render(null); await settle();
+  problem = teardownProblem(Object.assign(new Error("Unconfirmed"), { payload: { code: "LIFECYCLE_OUTCOME_UNKNOWN", runId: "run-4", teardown: false } }), worktree.path);
+  root.render(<Choices />);
+  await until(() => host.querySelectorAll('.lifecycle-choices input[type="radio"]').length === 1, "a removal without teardown offered teardown choices");
+  const only = host.querySelector('.lifecycle-choices input[type="radio"]');
+  assert(/I checked them; remove the worktree/.test(only.closest("label").textContent) && !only.checked, "the removal acknowledgement was not explicit");
+  only.click();
+  await until(() => problem.choice === "acknowledge", "the removal acknowledgement was not chosen");
+  host.querySelector("button").click();
+  assert(sent.at(-1)?.acknowledgeUnconfirmed === "run-4" && sent.at(-1).skipTeardown === undefined, "the removal did not name the attempt shown");
   root.render(null); await settle();
 }
 

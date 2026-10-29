@@ -79,25 +79,33 @@ export function lifecycleFor(states, project, worktree) {
 
 // Removal refusals that keep the worktree and leave the user a choice.
 export const TEARDOWN_PROBLEMS = ["WORKTREE_TEARDOWN_FAILED", "LIFECYCLE_TRUST_REQUIRED", "LIFECYCLE_CONFIG_INVALID",
-  "LIFECYCLE_OUTCOME_UNKNOWN", "WORKTREE_AGENT_ACTIVE"];
+  "LIFECYCLE_OUTCOME_UNKNOWN", "LIFECYCLE_ACKNOWLEDGEMENT_STALE", "WORKTREE_AGENT_ACTIVE"];
 
 // What the user may do next about a teardown problem. Processes that could
-// not be confirmed stopped must be acknowledged before teardown runs again.
+// not be confirmed stopped must be acknowledged, for the attempt (`runId`)
+// shown, before teardown runs again or the worktree is removed. Without
+// teardown steps (`teardown: false`), acknowledging only removes.
 export function teardownProblem(error, worktreePath) {
-  const code = error?.payload?.code;
+  const payload = error?.payload;
+  const code = payload?.code;
   if (!TEARDOWN_PROBLEMS.includes(code)) return null;
-  const outcomeUnknown = code === "LIFECYCLE_OUTCOME_UNKNOWN" || Boolean(error.payload?.lifecycle?.outcomeUnknown);
-  const choices = code === "WORKTREE_AGENT_ACTIVE" ? [] : [outcomeUnknown ? "acknowledge" : "retry", "skip"];
-  return { code, message: error.message, worktreePath, choices, outcomeUnknown, choice: outcomeUnknown ? "" : choices[0] ?? "" };
+  const outcomeUnknown = ["LIFECYCLE_OUTCOME_UNKNOWN", "LIFECYCLE_ACKNOWLEDGEMENT_STALE"].includes(code) || Boolean(payload.lifecycle?.outcomeUnknown);
+  const runId = outcomeUnknown ? payload.runId ?? payload.lifecycle?.runId ?? null : null;
+  const teardown = payload.teardown !== false;
+  let choices = [outcomeUnknown ? "acknowledge" : "retry", "skip"];
+  if (code === "WORKTREE_AGENT_ACTIVE" || (outcomeUnknown && !runId)) choices = [];
+  else if (outcomeUnknown && !teardown) choices = ["acknowledge"];
+  return { code, message: error.message, worktreePath, choices, outcomeUnknown, runId, teardown, choice: outcomeUnknown ? "" : choices[0] ?? "" };
 }
 
 // The removal request. A skip or an acknowledgement applies only to the
 // worktree whose problem the user saw, and only as one of its choices. Where
-// processes are unconfirmed, skipping teardown acknowledges them too.
+// processes are unconfirmed, skipping teardown acknowledges them too, and an
+// acknowledgement names the attempt shown.
 export function removalRequest({ projectId, worktreePath, confirmation }, problem) {
   const body = { projectId, worktreePath, confirmation };
   if (problem?.worktreePath !== worktreePath || !problem.choices.includes(problem.choice)) return body;
   if (problem.choice === "skip") body.skipTeardown = true;
-  if (problem.choice === "acknowledge" || (problem.choice === "skip" && problem.outcomeUnknown)) body.acknowledgeUnconfirmed = true;
+  if (problem.outcomeUnknown && ["acknowledge", "skip"].includes(problem.choice)) body.acknowledgeUnconfirmed = problem.runId;
   return body;
 }

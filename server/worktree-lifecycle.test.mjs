@@ -386,7 +386,12 @@ test("a refused retry keeps the resume checkpoint and the unconfirmed-processes 
   await assert.rejects(restarted.setup(target), (error) => error.details?.code === "LIFECYCLE_OUTCOME_UNKNOWN", "the acknowledgement was skipped");
   failMigrate = false;
   ran.length = 0;
-  assert.equal((await restarted.setup(target, { acknowledgeUnconfirmed: true })).stepIndex, 1);
+  await assert.rejects(restarted.setup(target, { acknowledgeUnconfirmed: "an-earlier-run" }), (error) => error.details?.code === "LIFECYCLE_ACKNOWLEDGEMENT_STALE");
+  assert.equal(refused.runId, failed.runId, "the refusal lost the attempt to acknowledge");
+  assert.equal((await restarted.setup(target, { acknowledgeUnconfirmed: failed.runId })).stepIndex, 1);
+  // Admission past unconfirmed processes is audited like an explicit acknowledgement.
+  assert.ok(database.listAudit(20).some((entry) => entry.action === "worktree.lifecycle.unconfirmed.acknowledged"
+    && entry.details?.action === "setup" && entry.details.operationId === failed.runId), "the acknowledged retry left no audit");
   assert.equal((await settled(restarted, target)).state.status, "ready");
   assert.deepEqual(ran, ["migrate", "seed"], "the finished first step ran again");
   assert.equal(restarted.hold(repository), null);
@@ -409,7 +414,11 @@ test("an explicit acknowledgement releases agent work held by unconfirmed proces
   assert.equal(lifecycle.hold(repository), "WORKTREE_LIFECYCLE_UNCONFIRMED");
   // The hold is durable.
   assert.equal(create({ subprocesses }).hold(repository), "WORKTREE_LIFECYCLE_UNCONFIRMED");
-  const acknowledged = lifecycle.acknowledge(target);
+  const { runId } = (await lifecycle.describe(target)).state;
+  assert.throws(() => lifecycle.acknowledge(target), (error) => error.details?.code === "LIFECYCLE_OUTCOME_UNKNOWN");
+  assert.throws(() => lifecycle.acknowledge(target, "an-earlier-run"), (error) => error.details?.code === "LIFECYCLE_ACKNOWLEDGEMENT_STALE");
+  assert.equal(lifecycle.hold(repository), "WORKTREE_LIFECYCLE_UNCONFIRMED", "a stale acknowledgement released the hold");
+  const acknowledged = lifecycle.acknowledge(target, runId);
   assert.deepEqual([acknowledged.outcomeUnknown, acknowledged.status, acknowledged.checkpoints.setup.stepIndex], [false, "failed", 1]);
   assert.equal(lifecycle.hold(repository), null);
   assert.deepEqual(released, [repository]);
@@ -575,4 +584,133 @@ test("a teardown that finished before a crash is not run again: the next removal
   await restarted.removeWorktree(target, { remove: (prepare) => service.removeWorktree({ projectId: project.id, worktreePath, confirmation: worktreePath, prepare }) });
   assert.equal(existsSync(worktreePath), false);
   assert.equal(readFileSync(teardownRuns, "utf8"), "r", "teardown ran again after a restart");
+}));
+
+test("every removal refuses beside unconfirmed processes until that attempt is acknowledged, whatever the configuration", { timeout: 30_000 }, withLifecycle(async ({ root, repository, database, project, create }) => {
+  // Setup only: no teardown steps would run before removal.
+  writeConfig(repository, { setup: [{ name: "Serve", command: ["serve"] }] });
+  git(repository, ["add", LIFECYCLE_CONFIG_FILE]);
+  git(repository, ["commit", "-m", "lifecycle"]);
+  database.trustLifecycleConfig(project.id, project.path, (await readLifecycleConfig(repository)).digest);
+  let worktrees = [{ id: "main", path: repository, isLinked: false, changedCount: 0 }];
+  const service = createGitService({ database, getProjects: () => [{ ...project, worktrees }], getConfig: async () => ({ scanRoots: [root] }) });
+  const subprocesses = { capacity: () => ({ active: 1, limit: 4, unknown: 1 }), reconcileUnknown: async () => 0,
+    run: async () => { throw Object.assign(new Error("ownership unknown"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN", cause: new Error("lost") }); } };
+  const lifecycle = create({ subprocesses });
+  const unconfirmedWorktree = async (name, edit = () => {}) => {
+    const created = await service.createWorktree({ projectId: project.id, branch: name, name });
+    worktrees = [...worktrees, { id: name, path: created.path, isLinked: true, changedCount: 0 }];
+    const target = { project, worktree: { id: name, path: created.path }, worktreePath: created.path };
+    await lifecycle.setup(target);
+    const { state } = await settled(lifecycle, target);
+    assert.equal(state.outcomeUnknown, true);
+    edit(created.path);
+    const remove = (prepare) => service.removeWorktree({ projectId: project.id, worktreePath: created.path, confirmation: created.path, prepare });
+    return { target, path: created.path, runId: state.runId, attempt: (options = {}) => lifecycle.removeWorktree(target, { remove, ...options }) };
+  };
+
+  for (const [name, edit] of [["setup-only", () => {}], ["missing", (worktreePath) => { git(worktreePath, ["rm", "-q", "--", LIFECYCLE_CONFIG_FILE]); git(worktreePath, ["commit", "-qm", "no lifecycle"]); }]]) {
+    const worktree = await unconfirmedWorktree(name, edit);
+    await assert.rejects(worktree.attempt(), (error) => error.details?.code === "LIFECYCLE_OUTCOME_UNKNOWN"
+      && error.details.runId === worktree.runId && error.details.teardown === false, `${name}: removal went ahead beside unconfirmed processes`);
+    await assert.rejects(worktree.attempt({ acknowledgeUnconfirmed: "an-earlier-run" }), (error) => error.details?.code === "LIFECYCLE_ACKNOWLEDGEMENT_STALE");
+    assert.equal(existsSync(worktree.path), true, `${name}: a refused removal removed the worktree`);
+    assert.equal(lifecycle.hold(worktree.path), "WORKTREE_LIFECYCLE_UNCONFIRMED", `${name}: a refused removal dropped the hold`);
+    assert.ok(database.listWorktreeLifecycle().some((state) => state.worktreePath === worktree.path && state.outcomeUnknown), `${name}: the durable hold was lost`);
+    await worktree.attempt({ acknowledgeUnconfirmed: worktree.runId });
+    assert.equal(existsSync(worktree.path), false);
+    assert.ok(database.listAudit(40).some((entry) => entry.action === "worktree.lifecycle.unconfirmed.acknowledged"
+      && entry.details?.action === "removal" && entry.details.operationId === worktree.runId), `${name}: the acknowledged removal was not audited`);
+  }
+  // Skipping teardown is the same decision.
+  const skipped = await unconfirmedWorktree("skipped");
+  await assert.rejects(skipped.attempt({ skipTeardown: true }), (error) => error.details?.code === "LIFECYCLE_OUTCOME_UNKNOWN");
+  assert.equal(existsSync(skipped.path), true);
+  await skipped.attempt({ skipTeardown: true, acknowledgeUnconfirmed: skipped.runId });
+  assert.equal(existsSync(skipped.path), false);
+}));
+
+test("a step starts only after earlier progress is saved, and an unsaved outcome is never ready", { timeout: 30_000 }, withLifecycle(async ({ repository, database, project, target, create }) => {
+  writeConfig(repository, { setup: [{ name: "Install", command: ["install"] }, { name: "Migrate", command: ["migrate"] }] });
+  database.trustLifecycleConfig(project.id, project.path, (await readLifecycleConfig(repository)).digest);
+  const ran = [];
+  const subprocesses = { capacity: () => ({ active: 0, limit: 4, unknown: 0 }), run: async (file) => { ran.push(file); return { stdout: "", stderr: "" }; } };
+  // The save recording that step 1 finished fails once, as while the
+  // database is briefly unavailable.
+  const save = database.saveWorktreeLifecycle;
+  let failed = false;
+  database.saveWorktreeLifecycle = (state) => {
+    if (!failed && state.status === "running" && ran.includes("install")) {
+      failed = true;
+      throw new Error("database unavailable");
+    }
+    return save.call(database, state);
+  };
+  const errors = [];
+  const limits = { ...LIFECYCLE_LIMITS, persistRetryDelaysMs: [0, 0] };
+  const lifecycle = create({ subprocesses, limits, onPersistError: (error) => errors.push(error) });
+  try {
+    await lifecycle.setup(target);
+    const stopped = (await settled(lifecycle, target)).state;
+    assert.deepEqual(ran, ["install"], "step 2 started before step 1's checkpoint was saved");
+    assert.deepEqual([stopped.status, stopped.stepIndex, stopped.checkpoints.setup?.stepIndex], ["failed", 1, 1]);
+    assert.match(stopped.error, /could not save progress before "Migrate"/);
+    // The stop is durable: a successor runtime resumes at step 2.
+    database.saveWorktreeLifecycle = save;
+    ran.length = 0;
+    const successor = create({ subprocesses, limits, onPersistError: (error) => errors.push(error) });
+    assert.equal((await successor.setup(target)).stepIndex, 1);
+    assert.equal((await settled(successor, target)).state.status, "ready");
+    assert.deepEqual(ran, ["migrate"], "the finished first step ran again");
+
+    // Every step finished, but the outcome cannot be saved: failed, not ready.
+    database.saveWorktreeLifecycle = (state) => {
+      if (state.status !== "running") throw new Error("database unavailable");
+      return save.call(database, state);
+    };
+    ran.length = 0;
+    await successor.setup(target);
+    const unsaved = (await settled(successor, target)).state;
+    assert.deepEqual(ran, ["install", "migrate"]);
+    assert.deepEqual([unsaved.status, unsaved.unsaved, unsaved.checkpoints.setup?.stepIndex], ["failed", true, 2]);
+    assert.match(unsaved.error, /setup finished, but Outright could not save that outcome/);
+    assert.notEqual(database.listWorktreeLifecycle().find((state) => state.worktreePath === repository).status, "ready");
+    // A retry records the outcome without running a step again.
+    database.saveWorktreeLifecycle = save;
+    ran.length = 0;
+    await successor.setup(target);
+    assert.equal((await settled(successor, target)).state.status, "ready");
+    assert.deepEqual(ran, []);
+    assert.equal(database.listWorktreeLifecycle().find((state) => state.worktreePath === repository).status, "ready");
+  } finally { database.saveWorktreeLifecycle = save; }
+}));
+
+test("a timeout stays the reason when the timed-out step's processes cannot be confirmed stopped", withLifecycle(async ({ repository, database, project, target, create }) => {
+  writeConfig(repository, { setup: [{ name: "Hang", command: ["hang"], timeoutSeconds: 1 }] });
+  database.trustLifecycleConfig(project.id, project.path, (await readLifecycleConfig(repository)).digest);
+  const timeout = Object.assign(new Error("Utility process timed out after 1000ms"), { killed: true, signal: "SIGTERM" });
+  const unsettled = Object.assign(new Error("Utility owner did not settle after stop", { cause: timeout }), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN" });
+  const subprocesses = { capacity: () => ({ active: 1, limit: 4, unknown: 1 }), run: async () => {
+    throw Object.assign(new Error("Utility descendant ownership is unknown", { cause: unsettled }), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN" });
+  } };
+  const lifecycle = create({ subprocesses });
+  await lifecycle.setup(target);
+  const { state } = await settled(lifecycle, target);
+  assert.deepEqual([state.status, state.outcomeUnknown], ["failed", true]);
+  assert.match(state.error, /"Hang" timed out after 1 seconds\. Its processes could not be confirmed stopped/);
+}));
+
+test("archive maintenance, which closes the database, waits while setup or teardown is running", { timeout: 30_000 }, withLifecycle(async ({ repository, database, project }) => {
+  const archived = database.createConversation({ projectId: project.id, worktreeId: "main", worktreePath: repository, title: "Archived", provider: "codex" });
+  database.addMessage({ conversationId: archived.id, role: "assistant", body: `large ${"x".repeat(300 * 1024)}` });
+  for (let index = 0; index < 300; index += 1) database.addMessage({ conversationId: archived.id, role: "assistant", body: `filler ${index}` });
+  database.updateConversation(archived.id, { archived: true });
+  const state = { worktreePath: repository, projectId: project.id, phase: "setup", status: "running", stepIndex: 0, steps: ["Install"], updatedAt: new Date().toISOString() };
+  database.saveWorktreeLifecycle(state);
+  const deferred = await database.deleteArchivedConversation(archived.id, archived.id);
+  assert.equal(deferred.deferred, true, "maintenance went offline during a running step");
+  assert.equal(database.maintenanceActive, false);
+  database.saveWorktreeLifecycle({ ...state, status: "ready" });
+  const deletion = await database.deleteArchivedConversation(archived.id, archived.id);
+  assert.notEqual(deletion.deferred, true, "maintenance stayed deferred after the step finished");
 }));

@@ -276,7 +276,7 @@ export function createOutrightDatabase(options = {}) {
     },
     onWorkerReady: (snapshot) => {
       if (activeMessageFinds || terminalAuditScan || runReconciliationPending || deletionsInFlight.size !== 1
-        || db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
+        || maintenanceMustWait(db)) {
         const error = databaseError(503, "Archive maintenance must wait for other work");
         error.code = "ARCHIVE_DEFERRED";
         throw error;
@@ -2650,13 +2650,20 @@ function deleteArchivedInBatches(db, id, inFlight, { automatic = false, cutoff, 
   return run();
 }
 
+// The offline archive phase closes the database, so it waits for agent runs
+// and for worktree setup or teardown, whose steps save progress as they go.
+function maintenanceMustWait(db) {
+  return Boolean(db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()
+    || db.prepare("SELECT 1 FROM worktree_lifecycle WHERE json_extract(state, '$.status') = 'running' LIMIT 1").get());
+}
+
 async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, cutoverStatGate, cutoverCloseGate, cutoverPromoteGate, copyGate, copyStepGate, copyPhase, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing }) {
   const step = db.transaction(() => deleteArchivedBatch(db, id, filename)).immediate();
   if (step.done) { onWorkerExit(); return { deleted: 1, id }; }
   if (!step.oversized) return null;
   // The durable marker lets an active run or another cleanup finish before
   // this exclusive offline phase starts.
-  if (workers.size || !canMaintain() || db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
+  if (workers.size || !canMaintain() || maintenanceMustWait(db)) {
     return { deleted: 0, deferred: true, id };
   }
   // Only a committed cutover changes a task. Before the rebuild, task reads

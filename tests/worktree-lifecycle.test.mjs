@@ -65,16 +65,27 @@ test("a teardown acknowledgement or skip is explicit, and applies only to the wo
   assert.deepEqual(removalRequest(base, { ...failed, choice: "skip" }), { ...base, skipTeardown: true });
   assert.deepEqual(removalRequest(base, { ...failed, choice: "acknowledge" }), base, "acknowledgement is not offered here");
 
-  // Unconfirmed processes: nothing is chosen until the user acknowledges or skips.
-  for (const unknown of [failure("LIFECYCLE_OUTCOME_UNKNOWN"), failure("WORKTREE_TEARDOWN_FAILED", { lifecycle: { outcomeUnknown: true } })]) {
+  // Unconfirmed processes: nothing is chosen until the user acknowledges or
+  // skips, and either names the attempt that was shown.
+  for (const unknown of [failure("LIFECYCLE_OUTCOME_UNKNOWN", { runId: "run-1" }), failure("LIFECYCLE_ACKNOWLEDGEMENT_STALE", { runId: "run-1" }),
+    failure("WORKTREE_TEARDOWN_FAILED", { lifecycle: { outcomeUnknown: true, runId: "run-1" } }),
+    failure("LIFECYCLE_TRUST_REQUIRED", { lifecycle: { outcomeUnknown: true, runId: "run-1" } })]) {
     const problem = teardownProblem(unknown, "/w/a");
     assert.deepEqual([problem.choices, problem.choice], [["acknowledge", "skip"], ""]);
     assert.deepEqual(removalRequest(base, problem), base);
-    assert.deepEqual(removalRequest(base, { ...problem, choice: "acknowledge" }), { ...base, acknowledgeUnconfirmed: true });
+    assert.deepEqual(removalRequest(base, { ...problem, choice: "acknowledge" }), { ...base, acknowledgeUnconfirmed: "run-1" });
     // Skipping teardown beside unconfirmed processes acknowledges them too.
-    assert.deepEqual(removalRequest(base, { ...problem, choice: "skip" }), { ...base, skipTeardown: true, acknowledgeUnconfirmed: true });
+    assert.deepEqual(removalRequest(base, { ...problem, choice: "skip" }), { ...base, skipTeardown: true, acknowledgeUnconfirmed: "run-1" });
   }
-  const acknowledged = { ...teardownProblem(failure("LIFECYCLE_OUTCOME_UNKNOWN"), "/w/a"), choice: "acknowledge" };
+  // Without teardown steps, acknowledging only removes; a later attempt is a
+  // new problem with nothing chosen.
+  const removalOnly = teardownProblem(failure("LIFECYCLE_OUTCOME_UNKNOWN", { runId: "run-1", teardown: false }), "/w/a");
+  assert.deepEqual([removalOnly.choices, removalOnly.choice, removalOnly.teardown], [["acknowledge"], "", false]);
+  const later = teardownProblem(failure("LIFECYCLE_ACKNOWLEDGEMENT_STALE", { runId: "run-2", teardown: false }), "/w/a");
+  assert.deepEqual([later.choice, removalRequest(base, { ...later, choice: "acknowledge" }).acknowledgeUnconfirmed], ["", "run-2"]);
+  // An unconfirmed problem that names no attempt cannot be acknowledged.
+  assert.deepEqual(teardownProblem(failure("LIFECYCLE_OUTCOME_UNKNOWN"), "/w/a").choices, []);
+  const acknowledged = { ...teardownProblem(failure("LIFECYCLE_OUTCOME_UNKNOWN", { runId: "run-1" }), "/w/a"), choice: "acknowledge" };
   assert.deepEqual(removalRequest({ ...base, worktreePath: "/w/b", confirmation: "/w/b" }, acknowledged),
     { projectId: "p", worktreePath: "/w/b", confirmation: "/w/b" }, "a choice never carries over to another worktree");
   assert.deepEqual(teardownProblem(failure("WORKTREE_AGENT_ACTIVE"), "/w/a").choices, []);

@@ -3762,7 +3762,11 @@ test("unconfirmed setup processes hold agent work until acknowledged, and setup 
   assert.equal(beside.body.code, "WORKTREE_LIFECYCLE_UNCONFIRMED", beside.raw);
   assert.deepEqual(runtime.database.listRuns(conversation.id), []);
 
-  const acknowledged = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/acknowledge", target);
+  // An acknowledgement names the attempt the user was shown.
+  const stale = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/acknowledge", { ...target, acknowledgeUnconfirmed: "an-earlier-run" });
+  assert.deepEqual([stale.statusCode, stale.body.code, stale.body.runId], [409, "LIFECYCLE_ACKNOWLEDGEMENT_STALE", state.runId], stale.raw);
+  assert.equal(unconfirmedAgentOptions.worktreeHeld(worktree.path), true, "a stale acknowledgement released the hold");
+  const acknowledged = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/acknowledge", { ...target, acknowledgeUnconfirmed: state.runId });
   assert.equal(acknowledged.statusCode, 200, acknowledged.raw);
   assert.equal(acknowledged.body.state.outcomeUnknown, false);
   assert.equal(unconfirmedAgentOptions.worktreeHeld(worktree.path), false);

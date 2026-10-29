@@ -39,7 +39,9 @@ export function LifecycleMark({ state }) {
 export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree, events, onError }) {
   const [detail, setDetail] = useState(null);
   const [busy, setBusy] = useState(false);
-  const [acknowledged, setAcknowledged] = useState(false);
+  // The attempt whose unconfirmed processes the user checked, by run id: a
+  // newer attempt is never shown as already checked.
+  const [acknowledgedRunId, setAcknowledgedRunId] = useState(null);
   const outputRef = useRef(null);
   const pinnedRef = useRef(true);
   // The runtime's canonical form of this worktree's path, once loaded.
@@ -64,7 +66,7 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
   }, [project.id, worktree.path, onError]);
 
   useEffect(() => {
-    if (!open) { setDetail(null); setAcknowledged(false); return undefined; }
+    if (!open) { setDetail(null); setAcknowledgedRunId(null); return undefined; }
     void load();
     const onState = (event) => {
       const payload = event.detail;
@@ -120,6 +122,7 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
   if (checkpoint && checkpoint.configDigest === config?.digest) runLabel = `Retry from step ${checkpoint.stepIndex + 1}`;
   else if (state?.phase === "setup" && state.status === "ready") runLabel = "Run setup again";
   const needsAcknowledgement = Boolean(state?.outcomeUnknown) && !running;
+  const acknowledged = needsAcknowledgement && Boolean(state.runId) && acknowledgedRunId === state.runId;
 
   return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent className="lifecycle-dialog">
     <DialogHeader><DialogTitle>Worktree setup</DialogTitle><DialogDescription>{project.name} / {worktree.name}</DialogDescription></DialogHeader>
@@ -138,13 +141,13 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
       onScroll={(event) => { const element = event.currentTarget; pinnedRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 24; }}>
       {state.outputTruncated ? "… earlier output was not kept\n" : ""}{state.output}</pre> : null}
     {needsAcknowledgement && <p className="lifecycle-note">Agent runs in this worktree wait until these processes are confirmed stopped or you acknowledge them.{state.phase === "teardown" ? " To run teardown again, remove the worktree again and acknowledge there." : ""}</p>}
-    {needsAcknowledgement && <label className="lifecycle-acknowledge"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} />The last {state.phase}'s processes could not be confirmed stopped. I checked them.</label>}
+    {needsAcknowledgement && <label className="lifecycle-acknowledge"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledgedRunId(event.target.checked ? state.runId : null)} />The last {state.phase}'s processes could not be confirmed stopped. I checked them.</label>}
     <DialogFooter>
       <Button variant="outline" onClick={() => onOpenChange(false)}>Close</Button>
       {running && <Button variant="destructive" disabled={busy} onClick={() => act("/api/worktrees/lifecycle/cancel")}>Cancel {detail.running}</Button>}
-      {needsAcknowledgement && <Button variant="outline" disabled={busy || !acknowledged} onClick={() => act("/api/worktrees/lifecycle/acknowledge")}>Acknowledge</Button>}
+      {needsAcknowledgement && <Button variant="outline" disabled={busy || !acknowledged} onClick={() => act("/api/worktrees/lifecycle/acknowledge", { acknowledgeUnconfirmed: state.runId })}>Acknowledge</Button>}
       {!running && canTrust && <Button disabled={busy} onClick={trustAndRun}>{config.setup.length ? "Trust and run setup" : "Trust teardown"}</Button>}
-      {canRun && <Button disabled={busy || (needsAcknowledgement && !acknowledged)} onClick={() => act("/api/worktrees/lifecycle/setup", { acknowledgeUnconfirmed: acknowledged })}>{runLabel}</Button>}
+      {canRun && <Button disabled={busy || (needsAcknowledgement && !acknowledged)} onClick={() => act("/api/worktrees/lifecycle/setup", acknowledged ? { acknowledgeUnconfirmed: state.runId } : {})}>{runLabel}</Button>}
     </DialogFooter>
   </DialogContent></Dialog>;
 }
@@ -152,16 +155,23 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
 const TEARDOWN_CHOICE_LABELS = {
   retry: "Run teardown again from the step that did not finish",
   acknowledge: "The last attempt's processes could not be confirmed stopped. I checked them; run teardown again from the step that did not finish",
+  remove: "The last attempt's processes could not be confirmed stopped. I checked them; remove the worktree",
   skip: "Remove without running teardown; its cleanup will not happen",
 };
 const UNCONFIRMED_SKIP_LABEL = "The last attempt's processes could not be confirmed stopped. I checked them; remove without running teardown, so its cleanup will not happen";
+
+function choiceLabel(problem, choice) {
+  if (choice === "skip" && problem.outcomeUnknown) return UNCONFIRMED_SKIP_LABEL;
+  if (choice === "acknowledge" && !problem.teardown) return TEARDOWN_CHOICE_LABELS.remove;
+  return TEARDOWN_CHOICE_LABELS[choice];
+}
 
 // The explicit next step after a teardown problem kept a worktree.
 export function TeardownChoices({ problem, onChoose }) {
   if (!problem?.choices.length) return null;
   return <fieldset className="lifecycle-choices"><legend>Next attempt</legend>{problem.choices.map((choice) => <label key={choice} className="lifecycle-acknowledge">
     <input type="radio" name="teardown-choice" value={choice} checked={problem.choice === choice} onChange={() => onChoose(choice)} />
-    {choice === "skip" && problem.outcomeUnknown ? UNCONFIRMED_SKIP_LABEL : TEARDOWN_CHOICE_LABELS[choice]}
+    {choiceLabel(problem, choice)}
   </label>)}</fieldset>;
 }
 

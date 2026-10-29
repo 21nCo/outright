@@ -353,6 +353,12 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     }
   }
 
+  // An acknowledgement of unconfirmed processes names the attempt the user
+  // was shown, by its run id.
+  function acknowledgedRunId(body) {
+    return typeof body.acknowledgeUnconfirmed === "string" ? body.acknowledgeUnconfirmed : undefined;
+  }
+
   async function removeWorktreeAfterTeardown(body) {
     if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.worktreePath !== "string") throw apiError(400, "Worktree target is required");
     const remove = (prepare) => git.removeWorktree({ projectId: body.projectId, worktreePath: body.worktreePath, confirmation: body.confirmation, prepare });
@@ -362,7 +368,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     if (!project || !worktree) return remove();
     const worktreePath = await git.requireWorktree(worktree.path);
     return lifecycle.removeWorktree({ project, worktree, worktreePath }, { remove,
-      skipTeardown: body.skipTeardown === true, acknowledgeUnconfirmed: body.acknowledgeUnconfirmed === true });
+      skipTeardown: body.skipTeardown === true, acknowledgeUnconfirmed: acknowledgedRunId(body) });
   }
 
   async function refreshProjectsAfterMutation(result) {
@@ -1052,8 +1058,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const target = await resolveLifecycleTarget(body);
         if (lifecycleMatch[1] === "trust") return json(response, 200, await lifecycle.trust(target, body.digest));
         if (lifecycleMatch[1] === "cancel") return json(response, 200, { state: lifecycle.cancel(target) });
-        if (lifecycleMatch[1] === "acknowledge") return json(response, 200, { state: lifecycle.acknowledge(target) });
-        return json(response, 202, { state: await lifecycle.setup(target, { acknowledgeUnconfirmed: body.acknowledgeUnconfirmed === true }) });
+        if (lifecycleMatch[1] === "acknowledge") return json(response, 200, { state: lifecycle.acknowledge(target, acknowledgedRunId(body)) });
+        return json(response, 202, { state: await lifecycle.setup(target, { acknowledgeUnconfirmed: acknowledgedRunId(body) }) });
       }
 
       if (url.pathname === "/api/templates" && request.method === "GET") return json(response, 200, { templates: database.listTemplates() });

@@ -30,6 +30,8 @@ export const LIFECYCLE_LIMITS = Object.freeze({
   // Finished runs whose live output stays in memory.
   retainedLogs: 32,
   states: 512,
+  // Waits before each attempt to save a run's outcome.
+  persistRetryDelaysMs: Object.freeze([0, 250, 1000]),
 });
 const PHASES = new Set(["setup", "teardown"]);
 const STATUSES = new Set(["needs-trust", "invalid", "running", "ready", "complete", "failed", "cancelled", "interrupted"]);
@@ -220,7 +222,9 @@ function finishedCheckpoints(checkpoints, phase, configDigest, outcome, stepCoun
 
 function stepFailure(error, step, signal, capacity) {
   const unknown = error?.code === "SUBPROCESS_OWNERSHIP_UNKNOWN";
-  const cause = unknown && error.cause ? error.cause : error;
+  // Unconfirmed ownership wraps what stopped the step, such as its timeout.
+  let cause = error;
+  while (cause?.code === "SUBPROCESS_OWNERSHIP_UNKNOWN" && cause.cause) cause = cause.cause;
   const suffix = unknown ? " Its processes could not be confirmed stopped; Outright keeps their capacity reserved until they are." : "";
   if (signal.aborted) {
     const shutdown = signal.reason === "shutdown";
@@ -260,6 +264,24 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     }
   }
 
+  // A run's outcome is saved before it is reported: a few attempts while the
+  // run still holds its worktree. When none succeeds the run is reported as
+  // failed with what it reached, never as ready, and a retry in this runtime
+  // records it; after a restart the durable running state is interrupted.
+  async function commitOutcome(state) {
+    let failure;
+    for (const delay of limits.persistRetryDelaysMs ?? LIFECYCLE_LIMITS.persistRetryDelaysMs) {
+      if (delay) await new Promise((resolve) => { setTimeout(resolve, delay); });
+      try { return commit(state, { strict: true }); }
+      catch (error) { failure = error; }
+    }
+    onPersistError(failure);
+    const finished = state.status === "ready" || state.status === "complete";
+    return commit({ ...state, status: finished ? "failed" : state.status, unsaved: true,
+      checkpoints: { ...state.checkpoints, [state.phase]: { configDigest: state.configDigest, stepIndex: state.stepIndex } },
+      error: `${state.error ? `${state.error} ` : ""}The ${state.phase} ${finished ? "finished" : "stopped"}, but Outright could not save that outcome (${String(failure?.message ?? failure).slice(0, 200)}). Run it again to record it.` }, { memoryOnly: true });
+  }
+
   // A state with unconfirmed processes is never evicted: it holds its worktree.
   function remember(state) {
     states.delete(state.worktreePath);
@@ -270,8 +292,8 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     }
   }
 
-  function commit(state, { strict = false } = {}) {
-    persist(state, strict);
+  function commit(state, { strict = false, memoryOnly = false } = {}) {
+    if (!memoryOnly) persist(state, strict);
     remember(state);
     publish({ type: "worktree.lifecycle", payload: publicState(state) });
     return state;
@@ -399,33 +421,52 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
       checkpoints: previous?.checkpoints ?? {}, runId: null, error: null, outcomeUnknown: false, updatedAt: now() };
   }
 
-  function requireAcknowledged(worktreePath, acknowledgeUnconfirmed) {
-    const pending = unconfirmed(worktreePath);
-    if (pending && !acknowledgeUnconfirmed) {
-      throw apiError(409, "Processes from the last attempt could not be confirmed stopped; acknowledge that before running again",
-        { code: "LIFECYCLE_OUTCOME_UNKNOWN", phase: pending.phase });
+  function unconfirmedAt(target) {
+    return [target.worktreePath, target.worktree?.path].filter(Boolean).map(unconfirmed).find(Boolean) ?? null;
+  }
+
+  // Anything that proceeds beside processes that could not be confirmed
+  // stopped needs the user's acknowledgement of that attempt: `acknowledged`
+  // is the run id they were shown, so a stale one never covers a newer
+  // attempt. Every acknowledgement is audited before anything proceeds.
+  function requireAcknowledged(target, acknowledged, action, details = {}) {
+    const pending = unconfirmedAt(target);
+    if (!pending) return null;
+    if (acknowledged === undefined || acknowledged === null || acknowledged === false) {
+      throw apiError(409, "Processes from the last attempt could not be confirmed stopped; acknowledge that before going on",
+        { code: "LIFECYCLE_OUTCOME_UNKNOWN", phase: pending.phase, runId: pending.runId, ...details });
     }
+    if (acknowledged !== pending.runId) {
+      throw apiError(409, "That acknowledgement was for an earlier attempt; check the latest attempt's processes and acknowledge again",
+        { code: "LIFECYCLE_ACKNOWLEDGEMENT_STALE", phase: pending.phase, runId: pending.runId, ...details });
+    }
+    database.auditCritical("worktree.lifecycle.unconfirmed.acknowledged", { target: pending.worktreePath, phase: pending.phase,
+      operationId: pending.runId, stepIndex: pending.stepIndex, action });
+    return pending;
   }
 
   // Decides what a phase would run. Null means nothing to run; a state that
   // needs the user (an invalid or untrusted configuration) is recorded and
-  // refused, keeping both checkpoints and any unconfirmed processes for the
-  // retry that follows.
-  function prepare(target, phase, config, { previous, instance, acknowledgeUnconfirmed = false }) {
+  // refused, keeping both checkpoints and any unconfirmed processes, with the
+  // run id to acknowledge, for the retry that follows.
+  function prepare(target, phase, config, { previous, instance }) {
     if (!config) return null;
-    const refusal = { outcomeUnknown: Boolean(unconfirmed(target.worktreePath)) };
+    const pending = unconfirmedAt(target);
+    const refusal = pending ? { outcomeUnknown: true, runId: pending.runId } : {};
+    const refused = (state, statusCode, message, code) => {
+      const recorded = commit(state);
+      throw apiError(statusCode, message, { code, lifecycle: publicState(recorded) });
+    };
     if (config.error) {
-      commit({ ...baseState(target, phase, null, instance, previous), ...refusal, status: "invalid", configDigest: config.digest,
-        error: `${LIFECYCLE_CONFIG_FILE} ${config.error}` });
-      throw apiError(422, `${LIFECYCLE_CONFIG_FILE} ${config.error}`, { code: "LIFECYCLE_CONFIG_INVALID" });
+      refused({ ...baseState(target, phase, null, instance, previous), ...refusal, status: "invalid", configDigest: config.digest,
+        error: `${LIFECYCLE_CONFIG_FILE} ${config.error}` }, 422, `${LIFECYCLE_CONFIG_FILE} ${config.error}`, "LIFECYCLE_CONFIG_INVALID");
     }
     const steps = config[phase];
     if (!steps.length) return null;
     if (!database.isLifecycleConfigTrusted(target.project.id, target.project.path, config.digest)) {
-      commit({ ...baseState(target, phase, config, instance, previous), ...refusal, status: "needs-trust" });
-      throw apiError(409, `Review and trust ${LIFECYCLE_CONFIG_FILE} before its ${phase} commands run`, { code: "LIFECYCLE_TRUST_REQUIRED" });
+      refused({ ...baseState(target, phase, config, instance, previous), ...refusal, status: "needs-trust" }, 409,
+        `Review and trust ${LIFECYCLE_CONFIG_FILE} before its ${phase} commands run`, "LIFECYCLE_TRUST_REQUIRED");
     }
-    requireAcknowledged(target.worktreePath, acknowledgeUnconfirmed);
     const checkpoint = previous?.checkpoints?.[phase];
     const resumeAt = checkpoint?.configDigest === config.digest ? Math.min(checkpoint.stepIndex, steps.length) : 0;
     return { config, steps, resumeAt, instance, previous };
@@ -462,7 +503,14 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
         break;
       }
       append(worktreePath, log, `\n▸ Step ${index + 1} of ${steps.length}: ${step.name}\n$ ${displayCommand(step.command)}\n`);
-      state = commit({ ...state, stepIndex: index, output: log.text, outputTruncated: log.truncated, updatedAt: now() });
+      // A step starts only once the checkpoint saying earlier steps finished
+      // is durable, so a retry after a restart never repeats them.
+      try { state = commit({ ...state, stepIndex: index, output: log.text, outputTruncated: log.truncated, updatedAt: now() }, { strict: true }); }
+      catch (error) {
+        outcome = { status: "failed", stepIndex: index, outcomeUnknown: false,
+          error: `Outright could not save progress before "${step.name}", so it did not run: ${String(error?.message ?? error).slice(0, 512)}` };
+        break;
+      }
       const decoders = { stdout: createOutputDecoder(), stderr: createOutputDecoder() };
       try {
         await subprocesses.run(step.command[0], step.command.slice(1), { // NOSONAR S9382: steps run in their declared order
@@ -483,7 +531,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     // output stays only in memory.
     const keepOutput = RESUMABLE.has(outcome.status);
     const checkpoints = finishedCheckpoints(state.checkpoints, phase, state.configDigest, outcome, steps.length);
-    state = commit({ ...state, error: null, outcomeUnknown: false, ...outcome, checkpoints, output: keepOutput ? log.text : undefined,
+    state = await commitOutcome({ ...state, error: null, outcomeUnknown: false, ...outcome, checkpoints, output: keepOutput ? log.text : undefined,
       outputTruncated: keepOutput ? log.truncated : undefined, finishedAt: now(), updatedAt: now() });
     try { database.auditCritical(`worktree.lifecycle.${phase}.${outcome.status}`, { target: worktreePath, operationId: runId, stepIndex: state.stepIndex, outcomeUnknown: state.outcomeUnknown }); }
     catch (error) { onPersistError(error); }
@@ -492,13 +540,13 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
 
   // `created` marks a worktree Outright just created: whatever was recorded
   // at its path before describes another worktree.
-  async function setup(target, { acknowledgeUnconfirmed = false, automatic = false, created = false } = {}) {
+  async function setup(target, { acknowledgeUnconfirmed, automatic = false, created = false } = {}) {
     const entry = claim(target, "setup");
     let run;
     try {
       const instance = await identify(target.worktreePath);
       const previous = created ? null : current(target.worktreePath, instance);
-      const prepared = prepare(target, "setup", await readConfig(target.worktreePath), { previous, instance, acknowledgeUnconfirmed });
+      const prepared = prepare(target, "setup", await readConfig(target.worktreePath), { previous, instance });
       if (!prepared) {
         // Nothing to set up: no earlier setup state can describe this worktree.
         const stale = states.get(target.worktreePath);
@@ -506,6 +554,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
         entry.release();
         return null;
       }
+      requireAcknowledged(target, acknowledgeUnconfirmed, "setup");
       run = begin(entry, target, "setup", prepared);
     } catch (error) {
       entry.release();
@@ -520,22 +569,26 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
 
   // Removes a worktree after its teardown. `remove(prepareRemoval)` performs
   // the guarded removal and calls `prepareRemoval` after its own checks and
-  // before Git removes anything; a failed teardown keeps the worktree.
-  async function removeWorktree(target, { remove, skipTeardown = false, acknowledgeUnconfirmed = false }) {
+  // before Git removes anything; a failed teardown keeps the worktree. Every
+  // removal, with or without teardown commands, refuses beside unconfirmed
+  // processes until the user acknowledges them, and keeps their state.
+  async function removeWorktree(target, { remove, skipTeardown = false, acknowledgeUnconfirmed }) {
     const entry = claim(target, "teardown");
     let finished = null;
     try {
       const result = await remove(async () => {
+        const instance = await identify(target.worktreePath);
+        const prepared = skipTeardown ? null : prepare(target, "teardown", await readConfig(target.worktreePath),
+          { previous: current(target.worktreePath, instance), instance });
+        // `teardown` tells the removal dialog whether acknowledging would run
+        // teardown steps or only remove.
+        const acknowledged = requireAcknowledged(target, acknowledgeUnconfirmed, skipTeardown ? "teardown-skipped" : "removal",
+          skipTeardown ? {} : { teardown: Boolean(prepared) });
         if (skipTeardown) {
-          // Removal beside unconfirmed processes is a decision the user makes.
-          requireAcknowledged(target.worktreePath, acknowledgeUnconfirmed);
           database.auditAdmission("worktree.lifecycle.teardown.skipped", { target: target.worktreePath, projectId: target.project.id,
-            acknowledgedUnconfirmed: Boolean(unconfirmed(target.worktreePath)) });
+            acknowledgedUnconfirmed: Boolean(acknowledged) });
           return;
         }
-        const instance = await identify(target.worktreePath);
-        const prepared = prepare(target, "teardown", await readConfig(target.worktreePath),
-          { previous: current(target.worktreePath, instance), instance, acknowledgeUnconfirmed });
         if (!prepared) return;
         if (prepared.resumeAt >= prepared.steps.length) {
           // Teardown already finished, here or before a restart: only Git
@@ -565,13 +618,11 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
 
   // The user checked processes that could not be confirmed stopped. Agent
   // work may start again, and a retry resumes at its checkpoint.
-  function acknowledge(target) {
+  function acknowledge(target, runId) {
     const paths = [target.worktreePath, target.worktree?.path].filter(Boolean);
     if (paths.some(holding)) throw apiError(409, "Worktree setup or teardown is running", { code: "WORKTREE_LIFECYCLE_BUSY" });
-    const pending = paths.map(unconfirmed).find(Boolean);
-    if (!pending) return publicState(states.get(target.worktreePath) ?? null);
-    database.auditCritical("worktree.lifecycle.unconfirmed.acknowledged", { target: pending.worktreePath, phase: pending.phase,
-      operationId: pending.runId, stepIndex: pending.stepIndex });
+    if (!unconfirmedAt(target)) return publicState(states.get(target.worktreePath) ?? null);
+    const pending = requireAcknowledged(target, runId, "acknowledge");
     const state = commit({ ...pending, outcomeUnknown: false, acknowledgedAt: now(), updatedAt: now() });
     releaseHold(pending.worktreePath);
     return publicState(state);
