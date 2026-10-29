@@ -2509,6 +2509,24 @@ async function terminalScrollbackFindRegression() {
   await settle();
   assert(viewRows()[0]?.startsWith("LEFT mark"), `Find scrolled a match the bar does not cover: ${JSON.stringify(viewRows()[0])}`);
   assert(!host.querySelector(".terminal-find.is-lowered"), "The Find bar lowered over the prompt for a match it does not cover");
+  // Reopened with its query, from the shortcut or the button, Find decides
+  // from the mounted bar too: the bar is never drawn lowered for it.
+  const lowered = [];
+  const watchLowered = new MutationObserver(() => { if (host.querySelector(".terminal-find.is-lowered")) lowered.push(status()); });
+  const reopensLeftOfBar = async (text, query) => {
+    for (const [label, open] of [["the shortcut", () => key(textarea(), { key: mac ? "f" : "F", code: "KeyF", keyCode: 70, ...shortcut })], ["the button", () => opener.click()]]) {
+      key(find(), { key: "Escape" });
+      await until(() => !find() && document.activeElement === textarea(), `Escape closes Find before it reopens from ${label}`);
+      watchLowered.observe(host, { attributes: true, attributeFilter: ["class"], childList: true, subtree: true });
+      open();
+      await until(() => find()?.value === query && document.activeElement === find() && status() === "1 of 1" && highlighted(), `Find reopens from ${label} on ${text}`);
+      await settle();
+      watchLowered.disconnect();
+      assert(viewRows()[0]?.startsWith(text), `Reopening Find from ${label} scrolled a match the bar does not cover: ${JSON.stringify(viewRows()[0])}`);
+      assert(!lowered.length, `Reopening Find from ${label} lowered the bar for a match it does not cover`);
+    }
+  };
+  await reopensLeftOfBar("LEFT mark", "left mark");
   setControlValue(find(), "right mark");
   await until(() => status() === "1 of 1" && !viewRows()[1]?.includes("RIGHT mark"), "Find scrolls a match the bar covers out from under it");
   await settle();
@@ -2516,10 +2534,13 @@ async function terminalScrollbackFindRegression() {
   const marked = [...host.querySelectorAll(".terminal-host .xterm-selection > *")].map((node) => node.getBoundingClientRect());
   assert(marked.length && marked.every((rect) => rect.bottom <= barRect.top || rect.top >= barRect.bottom), "The Find bar covers the current match at the top right");
   assert(!host.querySelector(".terminal-find.is-lowered"), "The Find bar lowered for a match scrolled out from under it");
-  key(find(), { key: "Escape" });
-  await until(() => !find() && document.activeElement === textarea(), "Escape in the query closes Find");
-  opener.click();
-  await until(() => find() && document.activeElement === find(), "Find reopens from its button");
+  // At the top of the buffer the view cannot scroll, so only the bar's
+  // real left edge keeps it up for a top-left match.
+  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 6, data: "\x1bcTOP mark\r\n$ " } });
+  await until(() => viewRows()[0]?.startsWith("TOP mark") && status() === "No matches", "a reset buffer starts with a top-left match");
+  setControlValue(find(), "top mark");
+  await until(() => status() === "1 of 1" && highlighted(), "the match at the top of the buffer is current");
+  await reopensLeftOfBar("TOP mark", "top mark");
   host.querySelector('[aria-label="Close terminal find"]').click();
   await until(() => !find() && document.activeElement === textarea(), "Close returns focus to the terminal");
   assert(!errors.length, `Unexpected terminal errors: ${errors.map((error) => error.message).join("; ")}`);
@@ -2543,7 +2564,8 @@ async function terminalFindHighlightRegression() {
   const show = (data = null) => root.render(<div className="fixture-terminal-frame" style={{ width: 640, height: 420 }}><TerminalPane worktree={projects[0].worktrees[0]}
     runtimeEvent={data === null ? null : { type: "terminal.output", terminalId: "term-A", payload: { cursor: ++cursor, data } }}
     onError={(error) => errors.push(error)} sendRuntime={sendRuntime} /></div>);
-  const write = async (data) => { show(data); await new Promise((resolve) => setTimeout(resolve, 500)); await settle(); };
+  // Output is parsed by the second frame, and its recount follows 200ms later.
+  const write = async (data) => { show(data); await settle(); await new Promise((resolve) => setTimeout(resolve, 300)); await settle(); };
   const find = () => host.querySelector('input[aria-label="Find in terminal output"]');
   const status = () => host.querySelector(".terminal-find > span[aria-hidden]")?.textContent ?? "";
   // An unchanged announcement toggles a trailing no-break space, which trim drops.
@@ -2591,7 +2613,8 @@ async function terminalFindHighlightRegression() {
     const count = sent.filter((message) => message.type === "terminal.resize").length;
     frameElement().style[property] = value;
     await until(() => sent.filter((message) => message.type === "terminal.resize").length > count, label);
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    // The recount follows xterm's resize, which is sent before this.
+    await new Promise((resolve) => setTimeout(resolve, 300));
     await settle();
   };
   show();
@@ -2748,7 +2771,7 @@ async function terminalFindHighlightRegression() {
   await until(() => size() !== tall && !selectedText() && host.querySelectorAll(".terminal-host .xterm-rows > div").length === size().rows,
     "xterm clears Find's highlight for a change of height");
   assert(size().cols === tall.cols && size().rows < tall.rows, `The resize changed more than the height: ${JSON.stringify([tall, size()])}`);
-  await drag("after 1", () => new Promise((resolve) => setTimeout(resolve, 500)));
+  await drag("after 1", () => new Promise((resolve) => setTimeout(resolve, 300)));
   assert(selectedText() === "after 1" && status() === "1 of 1", `A recount after a change of height replaced the user's drag with ${JSON.stringify(selectedText())}`);
   assert(selectionColor() && !amber.includes(selectionColor()), "The user's drag after a change of height is drawn as Find's match");
   await settledResize("height", tallHeight, "the terminal is resized back");

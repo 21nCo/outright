@@ -687,14 +687,12 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
   }
 
   // Opening Find moves focus to its query, selected so typing replaces it.
-  // A reopened query searches the view again.
   function openFind() {
     setFindAction((count) => count + 1);
     if (findOpenRef.current) { findInputRef.current?.focus(); findInputRef.current?.select(); return; }
     focusFindRef.current = true;
     findOpenRef.current = true;
     setFindOpen(true);
-    searchRef.current?.setQuery(findValueRef.current);
   }
 
   // Closing Find removes its selection and returns focus to the terminal,
@@ -741,6 +739,13 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
   useLayoutEffect(() => {
     if (xtermRef.current) xtermRef.current.options.theme = findHighlight ? findTheme() : terminalTheme();
   }, [findHighlight]);
+
+  // A reopened query searches the view again once the bar is mounted, so
+  // whether to scroll its match and lower the bar is decided from where the
+  // bar really is, before it is painted.
+  useLayoutEffect(() => {
+    if (findOpen) searchRef.current?.setQuery(findValueRef.current);
+  }, [findOpen]);
 
   useLayoutEffect(() => {
     if (!findOpen || !focusFindRef.current) return;
