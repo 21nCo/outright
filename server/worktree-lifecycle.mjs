@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open } from "node:fs/promises";
+import { lstat, open, stat } from "node:fs/promises";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
@@ -9,6 +9,8 @@ import { StringDecoder } from "node:string_decoder";
 // the user trusts the exact bytes for that project. Each step runs as a
 // utility process, so the native owner terminates its whole descendant tree
 // on cancel, timeout or shutdown, and only the newest output is retained.
+// Steps draw on their own process budget, so long setups never take the
+// capacity Git, project scans and removal need.
 export const LIFECYCLE_CONFIG_FILE = "outright.worktree.json";
 export const LIFECYCLE_LIMITS = Object.freeze({
   configBytes: 64 * 1024,
@@ -187,7 +189,25 @@ function publicState(state) {
   return rest;
 }
 
-function stepFailure(error, step, signal) {
+// Identifies one worktree instance at a path: a worktree removed outside
+// Outright and created again at the same path is a different instance, and
+// none of the earlier one's progress applies to it.
+export async function worktreeInstance(worktreePath) {
+  try {
+    const info = await stat(worktreePath, { bigint: true });
+    return `${info.dev}:${info.ino}:${info.birthtimeNs}`;
+  } catch { return null; }
+}
+
+// Where a retry of a phase would resume. A refusal (untrusted or invalid
+// configuration) keeps the checkpoint of the run before it.
+function checkpointOf(state) {
+  if (!state) return null;
+  if (RESUMABLE.has(state.status)) return { phase: state.phase, configDigest: state.configDigest, stepIndex: state.stepIndex };
+  return state.checkpoint ?? null;
+}
+
+function stepFailure(error, step, signal, capacity) {
   const unknown = error?.code === "SUBPROCESS_OWNERSHIP_UNKNOWN";
   const cause = unknown && error.cause ? error.cause : error;
   const suffix = unknown ? " Its processes could not be confirmed stopped; Outright keeps their capacity reserved until they are." : "";
@@ -197,14 +217,20 @@ function stepFailure(error, step, signal) {
       error: `${shutdown ? "Outright stopped during" : "Cancelled during"} "${step.name}"; its effects may be partial.${suffix}` };
   }
   let message = `"${step.name}" could not run: ${String(cause?.message ?? cause).slice(0, 512)}`;
-  if (cause?.code === "SUBPROCESS_CAPACITY") message = "Utility process capacity is full; retry when a process finishes.";
+  if (cause?.code === "SUBPROCESS_CAPACITY") {
+    message = `Setup and teardown capacity is full${capacity ? ` (${capacity.active} of ${capacity.limit} steps running or unconfirmed)` : ""}; retry when one finishes.`;
+  }
   else if (cause?.killed && /timed out/i.test(cause.message ?? "")) message = `"${step.name}" timed out after ${step.timeoutSeconds} seconds.`;
   else if (Number.isInteger(cause?.code)) message = `"${step.name}" exited with status ${cause.code}.`;
   else if (cause?.signal) message = `"${step.name}" was stopped by ${cause.signal}.`;
   return { status: "failed", outcomeUnknown: unknown, error: `${message}${suffix}` };
 }
 
+// `agentWork(paths)` reports whether an agent run is queued, launching or
+// running in a worktree; `onRelease` is called when a worktree is no longer
+// held, so runs that waited for it can launch.
 export function createWorktreeLifecycle({ database, subprocesses, publish = () => {}, readConfig = readLifecycleConfig,
+  identify = worktreeInstance, agentWork = () => false, onRelease = () => {},
   now = () => new Date().toISOString(), limits = LIFECYCLE_LIMITS, onPersistError = () => {} }) {
   // worktree path -> latest state; path -> claim of the running operation;
   // path -> live output of the latest run.
@@ -251,19 +277,40 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     states.set(state.worktreePath, state);
   }
 
-  function claim(worktreePath, phase) {
+  function holding(worktreePath) {
+    return active.get(worktreePath) ?? [...active.values()].find((entry) => entry.paths.has(worktreePath)) ?? null;
+  }
+
+  // One operation per worktree, never beside agent work there. The check
+  // and the claim are synchronous, as the agent manager's launch fence is,
+  // so neither side can start between them.
+  function claim(target, phase) {
+    const { worktreePath } = target;
     if (stopping) throw apiError(503, "Runtime is shutting down");
-    const current = active.get(worktreePath);
+    const paths = new Set([worktreePath, target.worktree?.path].filter(Boolean));
+    const current = [...paths].map(holding).find(Boolean);
     if (current) throw apiError(409, `Worktree ${current.phase} is already running`, { code: "WORKTREE_LIFECYCLE_BUSY", phase: current.phase });
+    if (agentWork([...paths])) {
+      throw apiError(409, `An agent run is queued or running in this worktree; ${phase} waits until it finishes`, { code: "WORKTREE_AGENT_ACTIVE", phase });
+    }
     let resolveDone;
-    const entry = { phase, controller: new AbortController(), done: new Promise((resolve) => { resolveDone = resolve; }) };
+    const entry = { phase, paths, controller: new AbortController(), done: new Promise((resolve) => { resolveDone = resolve; }) };
     entry.release = () => {
       if (active.get(worktreePath) !== entry) return;
       active.delete(worktreePath);
       resolveDone();
+      try { onRelease(worktreePath); }
+      catch (error) { onPersistError(error); }
     };
     active.set(worktreePath, entry);
     return entry;
+  }
+
+  // The latest state of this worktree instance, or null when the state
+  // belongs to an earlier worktree at the same path.
+  function current(worktreePath, instance) {
+    const state = states.get(worktreePath);
+    return state && state.instance === instance ? state : null;
   }
 
   function openLog(worktreePath, runId) {
@@ -308,46 +355,52 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     return { ...publicState(state), output, outputEnd: output.length, outputTruncated: Boolean(state.outputTruncated) };
   }
 
-  function baseState(target, phase, config) {
-    return { worktreePath: target.worktreePath, worktreeId: target.worktree?.id ?? null, projectId: target.project.id, phase,
+  // `discoveredPath` is the path the project scan reports, which clients
+  // match; `worktreePath` is its canonical form.
+  function baseState(target, phase, config, instance) {
+    return { worktreePath: target.worktreePath, discoveredPath: target.worktree?.path ?? target.worktreePath,
+      worktreeId: target.worktree?.id ?? null, projectId: target.project.id, instance, phase,
       configDigest: config?.digest ?? null, steps: (config?.[phase] ?? []).map((step) => step.name), stepIndex: 0,
       runId: null, error: null, outcomeUnknown: false, updatedAt: now() };
   }
 
   // Decides what a phase would run. Null means nothing to run; a state that
   // needs the user (an invalid or untrusted configuration) is recorded and
-  // refused.
-  function prepare(target, phase, config, { acknowledgeUnconfirmed = false } = {}) {
+  // refused, keeping the previous run's checkpoint and any unconfirmed
+  // processes for the retry that follows.
+  function prepare(target, phase, config, { previous, instance, acknowledgeUnconfirmed = false }) {
     if (!config) return null;
+    const refusal = { checkpoint: checkpointOf(previous), outcomeUnknown: Boolean(previous?.outcomeUnknown) };
     if (config.error) {
-      commit({ ...baseState(target, phase, null), status: "invalid", configDigest: config.digest, error: `${LIFECYCLE_CONFIG_FILE} ${config.error}` });
+      commit({ ...baseState(target, phase, null, instance), ...refusal, status: "invalid", configDigest: config.digest,
+        error: `${LIFECYCLE_CONFIG_FILE} ${config.error}` });
       throw apiError(422, `${LIFECYCLE_CONFIG_FILE} ${config.error}`, { code: "LIFECYCLE_CONFIG_INVALID" });
     }
     const steps = config[phase];
     if (!steps.length) return null;
     if (!database.isLifecycleConfigTrusted(target.project.id, target.project.path, config.digest)) {
-      commit({ ...baseState(target, phase, config), status: "needs-trust" });
+      commit({ ...baseState(target, phase, config, instance), ...refusal, status: "needs-trust" });
       throw apiError(409, `Review and trust ${LIFECYCLE_CONFIG_FILE} before its ${phase} commands run`, { code: "LIFECYCLE_TRUST_REQUIRED" });
     }
-    const previous = states.get(target.worktreePath);
     if (previous?.outcomeUnknown && !acknowledgeUnconfirmed) {
       throw apiError(409, "Processes from the last attempt could not be confirmed stopped; acknowledge that before running again",
-        { code: "LIFECYCLE_OUTCOME_UNKNOWN" });
+        { code: "LIFECYCLE_OUTCOME_UNKNOWN", phase: previous.phase });
     }
-    const resumeAt = previous?.phase === phase && previous.configDigest === config.digest && RESUMABLE.has(previous.status)
-      ? Math.min(previous.stepIndex, steps.length) : 0;
-    return { config, steps, resumeAt };
+    const checkpoint = refusal.checkpoint;
+    const resumeAt = checkpoint?.phase === phase && checkpoint.configDigest === config.digest
+      ? Math.min(checkpoint.stepIndex, steps.length) : 0;
+    return { config, steps, resumeAt, instance };
   }
 
   // Admits one phase run under the caller's claim. The admission audit and
   // the running state commit before any command starts; a refusal throws
   // and leaves nothing running.
-  function begin(entry, target, phase, { config, steps, resumeAt }) {
+  function begin(entry, target, phase, { config, steps, resumeAt, instance }) {
     const { worktreePath } = target;
     const runId = randomUUID();
     database.auditAdmission(`worktree.lifecycle.${phase}.requested`, { target: worktreePath, projectId: target.project.id,
       operationId: runId, digest: config.digest, steps: steps.map((step) => step.name), resumeAt });
-    const state = commit({ ...baseState(target, phase, config), status: "running", runId, stepIndex: resumeAt, startedAt: now() }, { strict: true });
+    const state = commit({ ...baseState(target, phase, config, instance), status: "running", runId, stepIndex: resumeAt, startedAt: now() }, { strict: true });
     const log = openLog(worktreePath, runId);
     if (resumeAt) append(worktreePath, log, `Resuming at step ${resumeAt + 1}; earlier steps already finished.\n`);
     return { entry, target, phase, steps, resumeAt, runId, log, state };
@@ -362,7 +415,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     for (let index = resumeAt; index < steps.length; index += 1) {
       const step = steps[index];
       if (signal.aborted) {
-        outcome = { ...stepFailure(null, step, signal), stepIndex: index };
+        outcome = { ...stepFailure(null, step, signal, null), stepIndex: index };
         break;
       }
       append(worktreePath, log, `\n▸ Step ${index + 1} of ${steps.length}: ${step.name}\n$ ${displayCommand(step.command)}\n`);
@@ -375,7 +428,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
           onOutput: (stream, chunk) => append(worktreePath, log, decoders[stream].write(chunk)),
         });
       } catch (error) {
-        outcome = { ...stepFailure(error, step, signal), stepIndex: index };
+        outcome = { ...stepFailure(error, step, signal, subprocesses.capacity?.()), stepIndex: index };
         break;
       } finally {
         append(worktreePath, log, decoders.stdout.end() + decoders.stderr.end());
@@ -393,14 +446,19 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     return state;
   }
 
-  async function setup(target, { acknowledgeUnconfirmed = false, automatic = false } = {}) {
-    const entry = claim(target.worktreePath, "setup");
+  // `created` marks a worktree Outright just created: whatever was recorded
+  // at its path before describes another worktree.
+  async function setup(target, { acknowledgeUnconfirmed = false, automatic = false, created = false } = {}) {
+    const entry = claim(target, "setup");
     let run;
     try {
-      const prepared = prepare(target, "setup", await readConfig(target.worktreePath), { acknowledgeUnconfirmed });
+      const instance = await identify(target.worktreePath);
+      const previous = created ? null : current(target.worktreePath, instance);
+      const prepared = prepare(target, "setup", await readConfig(target.worktreePath), { previous, instance, acknowledgeUnconfirmed });
       if (!prepared) {
         // Nothing to set up: no earlier setup state can describe this worktree.
-        if (states.get(target.worktreePath)?.phase === "setup") forget(target.worktreePath);
+        const stale = states.get(target.worktreePath);
+        if (stale && (stale.phase === "setup" || stale !== previous)) forget(target.worktreePath);
         entry.release();
         return null;
       }
@@ -420,7 +478,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
   // the guarded removal and calls `prepareRemoval` after its own checks and
   // before Git removes anything; a failed teardown keeps the worktree.
   async function removeWorktree(target, { remove, skipTeardown = false, acknowledgeUnconfirmed = false }) {
-    const entry = claim(target.worktreePath, "teardown");
+    const entry = claim(target, "teardown");
     let finished = null;
     try {
       const result = await remove(async () => {
@@ -428,7 +486,9 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
           database.auditAdmission("worktree.lifecycle.teardown.skipped", { target: target.worktreePath, projectId: target.project.id });
           return;
         }
-        const prepared = prepare(target, "teardown", await readConfig(target.worktreePath), { acknowledgeUnconfirmed });
+        const instance = await identify(target.worktreePath);
+        const prepared = prepare(target, "teardown", await readConfig(target.worktreePath),
+          { previous: current(target.worktreePath, instance), instance, acknowledgeUnconfirmed });
         if (!prepared) return;
         finished = await runSteps(begin(entry, target, "teardown", prepared));
         if (finished.status !== "complete") {
@@ -450,7 +510,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
   }
 
   function cancel(target) {
-    const entry = active.get(target.worktreePath);
+    const entry = holding(target.worktreePath);
     if (!entry) throw apiError(409, "No setup or teardown is running in this worktree", { code: "WORKTREE_LIFECYCLE_IDLE" });
     entry.controller.abort("cancel");
     return publicState(states.get(target.worktreePath));
@@ -473,10 +533,14 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     const config = await readConfig(target.worktreePath);
     const trusted = Boolean(config?.digest && !config.error
       && database.isLifecycleConfigTrusted(target.project.id, target.project.path, config.digest));
+    const running = holding(target.worktreePath)?.phase ?? null;
+    // A running state is this instance's by construction.
+    const state = running ? states.get(target.worktreePath) : current(target.worktreePath, await identify(target.worktreePath));
     return {
       file: LIFECYCLE_CONFIG_FILE,
-      state: withOutput(states.get(target.worktreePath) ?? null),
-      running: active.get(target.worktreePath)?.phase ?? null,
+      worktreePath: target.worktreePath,
+      state: withOutput(state ?? null),
+      running,
       config: config && { digest: config.digest, error: config.error ? `${LIFECYCLE_CONFIG_FILE} ${config.error}` : null, trusted,
         setup: config.setup ?? [], teardown: config.teardown ?? [] },
     };
@@ -502,7 +566,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
 
   return {
     setup, removeWorktree, cancel, trust, describe, shutdown,
-    busy: (worktreePath) => active.has(worktreePath),
+    busy: (worktreePath) => Boolean(holding(worktreePath)),
     list: () => [...states.values()].map(publicState),
   };
 }

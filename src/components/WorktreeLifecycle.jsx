@@ -42,19 +42,25 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
   const [acknowledged, setAcknowledged] = useState(false);
   const outputRef = useRef(null);
   const pinnedRef = useRef(true);
-  const target = { projectId: project.id, worktreeId: worktree.id, worktreePath: worktree.path };
+  // The runtime's canonical form of this worktree's path, once loaded.
+  const canonicalRef = useRef(null);
+  const target = { projectId: project.id, worktreePath: worktree.path };
   const load = useCallback(async () => {
-    try { setDetail(await api(query("/api/worktrees/lifecycle", { projectId: project.id, worktreeId: worktree.id, path: worktree.path }))); }
-    catch (error) { onError(error); }
-  }, [project.id, worktree.id, worktree.path, onError]);
+    try {
+      const next = await api(query("/api/worktrees/lifecycle", { projectId: project.id, path: worktree.path }));
+      canonicalRef.current = next.worktreePath ?? null;
+      setDetail(next);
+    } catch (error) { onError(error); }
+  }, [project.id, worktree.path, onError]);
 
   useEffect(() => {
     if (!open) { setDetail(null); setAcknowledged(false); return undefined; }
     void load();
     const onState = (event) => {
       const payload = event.detail;
-      if (payload.worktreeId === worktree.id || payload.worktreePath === worktree.path) void load();
+      if ([payload.worktreePath, payload.discoveredPath].some((value) => value && (value === worktree.path || value === canonicalRef.current))) void load();
     };
+    const onReconnect = () => void load();
     const onOutput = (event) => setDetail((current) => {
       const next = lifecycleOutputUpdate(current?.state, event.detail);
       if (next === "reload") { void load(); return current; }
@@ -62,8 +68,13 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
     });
     events.addEventListener("state", onState);
     events.addEventListener("output", onOutput);
-    return () => { events.removeEventListener("state", onState); events.removeEventListener("output", onOutput); };
-  }, [open, load, events, worktree.id, worktree.path]);
+    events.addEventListener("reconnect", onReconnect);
+    return () => {
+      events.removeEventListener("state", onState);
+      events.removeEventListener("output", onOutput);
+      events.removeEventListener("reconnect", onReconnect);
+    };
+  }, [open, load, events, worktree.path]);
 
   // Follow new output unless the user scrolled up to read.
   useLayoutEffect(() => {
@@ -92,9 +103,9 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
   const running = Boolean(detail?.running);
   const canTrust = Boolean(config && !config.error && !config.trusted && (config.setup.length || config.teardown.length));
   const canRun = Boolean(config && !config.error && config.trusted && config.setup.length && !running);
-  const resumable = state?.phase === "setup" && ["failed", "cancelled", "interrupted"].includes(state.status) && state.configDigest === config?.digest;
+  const checkpoint = setupCheckpoint(state);
   let runLabel = "Run setup";
-  if (resumable) runLabel = `Retry from step ${state.stepIndex + 1}`;
+  if (checkpoint && checkpoint.configDigest === config?.digest) runLabel = `Retry from step ${checkpoint.stepIndex + 1}`;
   else if (state?.phase === "setup" && state.status === "ready") runLabel = "Run setup again";
   const needsAcknowledgement = Boolean(state?.outcomeUnknown);
 
@@ -114,7 +125,8 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
     {state?.output ? <pre ref={outputRef} className="lifecycle-output" tabIndex={0} aria-label={`${state.phase === "teardown" ? "Teardown" : "Setup"} output`}
       onScroll={(event) => { const element = event.currentTarget; pinnedRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 24; }}>
       {state.outputTruncated ? "… earlier output was not kept\n" : ""}{state.output}</pre> : null}
-    {needsAcknowledgement && !running && <label className="lifecycle-acknowledge"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} />The last attempt's processes could not be confirmed stopped. I checked them; run again anyway.</label>}
+    {needsAcknowledgement && !running && state.phase === "teardown" && <p className="lifecycle-note">To run teardown again, remove the worktree again and acknowledge there.</p>}
+    {needsAcknowledgement && !running && canRun && <label className="lifecycle-acknowledge"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} />The last {state.phase}'s processes could not be confirmed stopped. I checked them; run setup anyway.</label>}
     <DialogFooter>
       <Button variant="outline" onClick={() => onOpenChange(false)}>Close</Button>
       {running && <Button variant="destructive" disabled={busy} onClick={() => act("/api/worktrees/lifecycle/cancel")}>Cancel {detail.running}</Button>}
@@ -122,6 +134,27 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
       {canRun && <Button disabled={busy || (needsAcknowledgement && !acknowledged)} onClick={() => act("/api/worktrees/lifecycle/setup", { acknowledgeUnconfirmed: acknowledged })}>{runLabel}</Button>}
     </DialogFooter>
   </DialogContent></Dialog>;
+}
+
+// Where a setup retry resumes: a failed, cancelled or interrupted setup, or
+// the checkpoint a later refusal kept.
+function setupCheckpoint(state) {
+  if (state?.phase === "setup" && ["failed", "cancelled", "interrupted"].includes(state.status)) return state;
+  return state?.checkpoint?.phase === "setup" ? state.checkpoint : null;
+}
+
+const TEARDOWN_CHOICE_LABELS = {
+  retry: "Run teardown again from the step that did not finish",
+  acknowledge: "The last attempt's processes could not be confirmed stopped. I checked them; run teardown again from the step that did not finish",
+  skip: "Remove without running teardown; its cleanup will not happen",
+};
+
+// The explicit next step after a teardown problem kept a worktree.
+export function TeardownChoices({ problem, onChoose }) {
+  if (!problem?.choices.length) return null;
+  return <fieldset className="lifecycle-choices"><legend>Next attempt</legend>{problem.choices.map((choice) => <label key={choice} className="lifecycle-acknowledge">
+    <input type="radio" name="teardown-choice" value={choice} checked={problem.choice === choice} onChange={() => onChoose(choice)} />{TEARDOWN_CHOICE_LABELS[choice]}
+  </label>)}</fieldset>;
 }
 
 function StepList({ title, steps, current }) {

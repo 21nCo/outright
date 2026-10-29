@@ -159,6 +159,36 @@ test("audit quota refusal defers an authorized queued run before spawning", asyn
   } finally { await manager.shutdown(); }
 });
 
+test("a queued, recovered or resumed run waits while its worktree's setup or teardown holds it, then launches", async () => {
+  const database = fakeDatabase();
+  const run = database.createRun({ ...codexRun("held-by-setup"), status: "queued" });
+  const children = [];
+  let held = true;
+  const manager = createAgentManager({ database, publish: () => {},
+    worktreeHeld: (worktreePath) => held && worktreePath === "/tmp/project",
+    validateConversation: async () => () => {},
+    launchCommand: () => ({ executable: process.execPath, args: [], display: "fixture" }),
+    spawnProcess: () => { const child = fakeChild(); children.push(child); return child; } });
+  try {
+    // schedule() is how submission, recovery retry and resume all launch.
+    await manager.schedule({ conversation: database.getConversation("conv-1"), run });
+    assert.equal(children.length, 0, "a run launched into a worktree that setup holds");
+    assert.equal(database.getRun(run.id).status, "queued");
+    // Setup admission sees the waiting run.
+    assert.equal(manager.hasWorktreeWork(["/tmp/project"]), true);
+    assert.equal(manager.hasWorktreeWork(["/tmp/other"]), false);
+    held = false;
+    manager.resumeQueued();
+    const deadline = Date.now() + 1500;
+    while (!children.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(children.length, 1, "the run did not launch when the hold ended");
+    assert.equal(manager.hasWorktreeWork(["/tmp/project"]), true, "a running run is worktree work");
+    children[0].emit("close", 0, null);
+    assert.equal(database.getRun(run.id).status, "completed");
+    assert.equal(manager.hasWorktreeWork(["/tmp/project"]), false);
+  } finally { await manager.shutdown(); }
+});
+
 test("transient admission audit faults keep runs queued and revalidate before sibling launch", async () => {
   const database = fakeDatabase();
   database.getSettings = () => ({ maxConcurrentRuns: 1 });

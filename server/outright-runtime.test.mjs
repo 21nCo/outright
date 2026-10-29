@@ -3664,6 +3664,7 @@ test("bootstrap omits saved terminal sessions, which clients list over /api/term
   } finally { rmSync(historyRoot, { recursive: true, force: true }); }
 });
 
+let lifecycleAgentOptions;
 test("a created worktree waits for trusted setup, refuses agent work until ready, and tears down before removal", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
   const root = path.dirname(worktree.path);
   const gate = path.join(root, "setup-gate");
@@ -3680,8 +3681,9 @@ test("a created worktree waits for trusted setup, refuses agent work until ready
   assert.equal(created.body.lifecycle.state.status, "needs-trust", "untrusted repository commands ran on creation");
   const scanned = (await runtime.projects(true)).projects.find((item) => item.id === project.id);
   const added = scanned.worktrees.find((item) => realpathSync.native(item.path) === realpathSync.native(created.body.path));
-  const target = { projectId: project.id, worktreeId: added.id, worktreePath: added.path };
-  const query = `/api/worktrees/lifecycle?projectId=${encodeURIComponent(project.id)}&worktreeId=${encodeURIComponent(added.id)}&path=${encodeURIComponent(added.path)}`;
+  // Lifecycle targets are named by path alone.
+  const target = { projectId: project.id, worktreePath: added.path };
+  const query = `/api/worktrees/lifecycle?projectId=${encodeURIComponent(project.id)}&path=${encodeURIComponent(added.path)}`;
   const described = await callRuntime(runtime, "GET", query);
   assert.equal(described.statusCode, 200, described.raw);
   assert.equal(described.body.config.trusted, false);
@@ -3692,15 +3694,23 @@ test("a created worktree waits for trusted setup, refuses agent work until ready
   const stale = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/trust", { ...target, digest: "sha256:stale" });
   assert.equal(stale.body.code, "LIFECYCLE_CONFIG_CHANGED");
   assert.equal((await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/trust", { ...target, digest: described.body.config.digest })).body.config.trusted, true);
+  // Setup is refused while an agent run is queued or running in the worktree.
+  const hasWorktreeWork = runtime.agents.hasWorktreeWork;
+  runtime.agents.hasWorktreeWork = (paths) => paths.includes(added.path);
+  const beside = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/setup", target);
+  assert.equal(beside.body.code, "WORKTREE_AGENT_ACTIVE", beside.raw);
+  runtime.agents.hasWorktreeWork = hasWorktreeWork;
   const started = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/setup", target);
   assert.equal(started.statusCode, 202, started.raw);
   assert.equal(started.body.state.status, "running");
 
-  const conversation = runtime.database.createConversation({ ...target, title: "Too early", provider: "codex" });
+  const conversation = runtime.database.createConversation({ ...target, worktreeId: added.id, title: "Too early", provider: "codex" });
   const early = await callRuntime(runtime, "POST", `/api/conversations/${conversation.id}/runs`, { prompt: "start before setup" });
   assert.equal(early.statusCode, 409, early.raw);
   assert.equal(early.body.code, "WORKTREE_LIFECYCLE_BUSY");
   assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+  // Queued, recovered and resumed runs reach the same hold at launch.
+  assert.equal(lifecycleAgentOptions.worktreeHeld(added.path), true);
   const removeEarly = await callRuntime(runtime, "DELETE", "/api/worktrees", { projectId: project.id, worktreePath: added.path, confirmation: added.path });
   assert.equal(removeEarly.body.code, "WORKTREE_LIFECYCLE_BUSY");
 
@@ -3711,6 +3721,7 @@ test("a created worktree waits for trusted setup, refuses agent work until ready
     ready = (await callRuntime(runtime, "GET", query)).body;
   }
   assert.match(ready.state.output, /services up/);
+  assert.equal(lifecycleAgentOptions.worktreeHeld(added.path), false);
 
   runtime.database.updateConversation(conversation.id, { archived: true });
   const removed = await callRuntime(runtime, "DELETE", "/api/worktrees", { projectId: project.id, worktreePath: added.path, confirmation: added.path });
@@ -3718,4 +3729,4 @@ test("a created worktree waits for trusted setup, refuses agent work until ready
   assert.equal(readFileSync(tornDown, "utf8"), "down", "removal skipped the trusted teardown");
   assert.equal(existsSync(added.path), false);
   assert.equal((await callRuntime(runtime, "GET", "/api/bootstrap")).body.worktreeLifecycle.some((state) => state.worktreeId === added.id), false);
-}));
+}, { agentManagerFactory: (options) => createAgentManager(lifecycleAgentOptions = options) }));

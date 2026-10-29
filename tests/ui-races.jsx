@@ -9,6 +9,7 @@ import { WindowedMessages } from "../src/components/WindowedMessages.jsx";
 import { WindowedDiff, diffFindTop, diffRowsHeight } from "../src/components/WindowedDiff.jsx";
 import { CommandPalette } from "../src/components/CommandPalette.jsx";
 import { SettingsDialog } from "../src/components/SettingsDialog.jsx";
+import { TeardownChoices, WorktreeLifecycleDialog } from "../src/components/WorktreeLifecycle.jsx";
 import { ProviderAccounts } from "../src/components/ProviderAccounts.jsx";
 import { TerminalPane } from "../src/components/TerminalPane.jsx";
 import { PaneBody, PaneLayout } from "../src/components/PaneLayout.jsx";
@@ -16,6 +17,7 @@ import { computePaneRects } from "../src/lib/pane-layout.js";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
 import { scheduleLayoutTick } from "../src/lib/windowing.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
+import { removalRequest, teardownProblem } from "../src/lib/worktree-lifecycle.js";
 import { savedOutputRows, savedPageText, savedRowPages } from "../src/lib/terminal-exit-state.js";
 import { Terminal } from "@xterm/xterm";
 import "../src/styles.css";
@@ -984,6 +986,65 @@ async function settingsMigrationCompletionRegression() {
   signalCompletion();
   await until(() => document.querySelector(".capacity-status")?.textContent.includes("available for new work"), "migration warning cleared while Settings stayed open");
   assert(reads >= 2, "capacity completion did not read authoritative state");
+}
+
+// An open setup dialog reloads on reconnect: a restarted runtime reports an
+// interrupted run without any event. Teardown choices are a labelled radio
+// group, and the acknowledgement it sends is bound to its worktree.
+async function worktreeLifecycleRegression() {
+  root.render(null); await settle();
+  const project = projects[0];
+  const worktree = project.worktrees[0];
+  const config = { digest: "sha256:abc", error: null, trusted: true, teardown: [],
+    setup: [{ name: "Install", command: ["npm", "ci"], timeoutSeconds: 600 }, { name: "Seed", command: ["npm", "run", "seed"], timeoutSeconds: 600 }] };
+  const state = { worktreePath: worktree.path, discoveredPath: worktree.path, projectId: project.id, phase: "setup", configDigest: "sha256:abc", steps: ["Install", "Seed"],
+    stepIndex: 1, runId: "run-1", output: "installed\n", outputEnd: 10, outputTruncated: false, outcomeUnknown: false };
+  let detail = { file: "outright.worktree.json", worktreePath: worktree.path, config, running: "setup", state: { ...state, status: "running" } };
+  const reads = [];
+  route = async (url) => {
+    if (url.pathname === "/api/worktrees/lifecycle") { reads.push(url.searchParams.get("path")); return response(detail); }
+    return response({});
+  };
+  const events = new EventTarget();
+  const errors = [];
+  root.render(<TooltipProvider><WorktreeLifecycleDialog open onOpenChange={() => {}} project={project} worktree={worktree} events={events} onError={(error) => errors.push(error)} /></TooltipProvider>);
+  const dialog = () => document.querySelector(".lifecycle-dialog");
+  const buttons = () => [...(dialog()?.querySelectorAll("button") ?? [])].map((button) => button.textContent);
+  await until(() => buttons().includes("Cancel setup"), "running setup offers cancel");
+  assert(reads.every((path) => path === worktree.path), "the dialog named its worktree by something other than its path");
+  // The runtime restarted while the client was away.
+  detail = { ...detail, running: null, state: { ...state, status: "interrupted", error: "Outright stopped during step 2; its effects may be partial." } };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => buttons().includes("Retry from step 2"), "reconnect did not reconcile the interrupted run");
+  assert(!buttons().includes("Cancel setup"), "an interrupted run still offered cancel");
+  const summary = dialog().querySelector('.lifecycle-summary[role="status"]');
+  assert(/Setup interrupted at step 2 of 2, Seed/.test(summary?.textContent ?? ""), "the interrupted state was not announced");
+  assert(errors.length === 0, `unexpected lifecycle errors: ${errors.map((error) => error.message).join("; ")}`);
+
+  const failure = Object.assign(new Error("Teardown did not finish"), { payload: { code: "LIFECYCLE_OUTCOME_UNKNOWN" } });
+  let problem = teardownProblem(failure, worktree.path);
+  const sent = [];
+  function Choices() {
+    const [current, setCurrent] = React.useState(problem);
+    problem = current;
+    return <div><TeardownChoices problem={current} onChoose={(choice) => setCurrent({ ...current, choice })} />
+      <button type="button" onClick={() => sent.push(removalRequest({ projectId: project.id, worktreePath: worktree.path, confirmation: worktree.path }, current))}>Remove fixture</button></div>;
+  }
+  root.render(<Choices />);
+  await until(() => host.querySelector(".lifecycle-choices legend")?.textContent === "Next attempt", "teardown choices render as a labelled group");
+  const radios = [...host.querySelectorAll('.lifecycle-choices input[type="radio"]')];
+  assert(radios.length === 2 && radios.every((radio) => !radio.checked), "unconfirmed processes preselected a choice");
+  assert(radios.every((radio) => radio.closest("label")?.textContent.length > 20), "a teardown choice has no visible label");
+  radios[0].focus();
+  radios[0].click();
+  await until(() => problem.choice === "acknowledge", "the acknowledgement was not chosen");
+  host.querySelector("button").click();
+  assert(sent.at(-1)?.acknowledgeUnconfirmed === true && sent.at(-1).skipTeardown === undefined, "the acknowledgement was not sent with the removal");
+  radios[1].click();
+  await until(() => problem.choice === "skip", "skip was not chosen");
+  host.querySelector("button").click();
+  assert(sent.at(-1)?.skipTeardown === true && sent.at(-1).acknowledgeUnconfirmed === undefined, "skip carried the acknowledgement");
+  root.render(null); await settle();
 }
 
 async function settingsCapacityWithoutEventRegression() {
@@ -8860,6 +8921,7 @@ try {
     ["settings shared refresh order", settingsSharedRefreshOrderRegression, "a settings save preserves an in-flight template refresh without reverting the new quota"],
     ["bootstrap error ownership", bootstrapRefreshErrorOwnershipRegression, "a background bootstrap cannot dismiss an unrelated operation error"],
     ["settings migration completion", settingsMigrationCompletionRegression, "an open Settings dialog refreshes capacity when migration finishes"],
+    ["worktree lifecycle", worktreeLifecycleRegression, "an open setup dialog reconciles an interrupted run on reconnect, and teardown choices are explicit and bound to their worktree"],
     ["settings live capacity", settingsCapacityWithoutEventRegression, "an open Settings dialog reads another client's quota changes without a capacity event"],
     ["provider accounts window aging", providerAccountsWindowAgingRegression, "an open account list drops a run that leaves the 5-hour window without any event"],
     ["provider accounts failed reload", providerAccountsFailedReloadRegression, "a failed reload marks an expired measured total out of date, and account changes reload without the runtime event"],

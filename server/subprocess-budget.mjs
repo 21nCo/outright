@@ -759,3 +759,10 @@ export function createSubprocessBudget({ limit = 8, execute = runOwned, launch =
 export const utilityProcesses = createSubprocessBudget({
   unknownDirectory: path.join(process.env.OUTRIGHT_DATA_DIR ?? path.join(os.homedir(), ".outright"), "utility-unknown"),
 });
+
+// Worktree setup and teardown steps may run for an hour each. They have their
+// own budget, so they never hold the permits Git, scans and removal use.
+export const lifecycleProcesses = createSubprocessBudget({
+  limit: 4,
+  unknownDirectory: path.join(process.env.OUTRIGHT_DATA_DIR ?? path.join(os.homedir(), ".outright"), "lifecycle-unknown"),
+});

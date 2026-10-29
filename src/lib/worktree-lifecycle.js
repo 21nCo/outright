@@ -61,6 +61,34 @@ export function upsertLifecycleState(states, payload) {
   return payload.removed ? others : [payload, ...others];
 }
 
+// States are matched by path: scanner ids are path slugs that two worktrees
+// can share.
 export function lifecycleFor(states, project, worktree) {
-  return (states ?? []).find((state) => state.projectId === project?.id && state.worktreeId === worktree?.id) ?? null;
+  if (!project || !worktree?.path) return null;
+  return (states ?? []).find((state) => state.projectId === project.id
+    && (state.discoveredPath ?? state.worktreePath) === worktree.path) ?? null;
+}
+
+// Removal refusals that keep the worktree and leave the user a choice.
+export const TEARDOWN_PROBLEMS = ["WORKTREE_TEARDOWN_FAILED", "LIFECYCLE_TRUST_REQUIRED", "LIFECYCLE_CONFIG_INVALID",
+  "LIFECYCLE_OUTCOME_UNKNOWN", "WORKTREE_AGENT_ACTIVE"];
+
+// What the user may do next about a teardown problem. Processes that could
+// not be confirmed stopped must be acknowledged before teardown runs again.
+export function teardownProblem(error, worktreePath) {
+  const code = error?.payload?.code;
+  if (!TEARDOWN_PROBLEMS.includes(code)) return null;
+  const outcomeUnknown = code === "LIFECYCLE_OUTCOME_UNKNOWN" || Boolean(error.payload?.lifecycle?.outcomeUnknown);
+  const choices = code === "WORKTREE_AGENT_ACTIVE" ? [] : [outcomeUnknown ? "acknowledge" : "retry", "skip"];
+  return { code, message: error.message, worktreePath, choices, choice: outcomeUnknown ? "" : choices[0] ?? "" };
+}
+
+// The removal request. A skip or an acknowledgement applies only to the
+// worktree whose problem the user saw, and only as one of its choices.
+export function removalRequest({ projectId, worktreePath, confirmation }, problem) {
+  const body = { projectId, worktreePath, confirmation };
+  if (problem?.worktreePath !== worktreePath || !problem.choices.includes(problem.choice)) return body;
+  if (problem.choice === "skip") body.skipTeardown = true;
+  if (problem.choice === "acknowledge") body.acknowledgeUnconfirmed = true;
+  return body;
 }
