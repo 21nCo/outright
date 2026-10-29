@@ -1083,6 +1083,29 @@ async function worktreeLifecycleRegression() {
   assert(sentAcknowledgement.body.worktreePath === worktree.path && sentAcknowledgement.body.projectId === project.id, "the acknowledgement named another worktree");
   assert(sentAcknowledgement.body.acknowledgeUnconfirmed === "run-3", "the acknowledgement did not name the attempt shown");
   await until(() => !buttons().includes("Acknowledge"), "the acknowledged state was not reloaded");
+  // Progress belongs to the file version that ran: after the file changes,
+  // none of its steps is marked, and the outcome says it was for the earlier file.
+  const changed = { ...config, digest: "sha256:def", setup: [...config.setup, { name: "Migrate", command: ["npm", "run", "migrate"], timeoutSeconds: 600 }] };
+  for (const status of ["ready", "failed"]) {
+    detail = { ...interrupted, config: changed, state: { ...interrupted.state, status, checkpoints: {} } };
+    events.dispatchEvent(new CustomEvent("reconnect"));
+    await until(() => dialog().querySelectorAll(".lifecycle-steps li").length === 3, `${status}: the changed file was not shown`);
+    const marked = [...dialog().querySelectorAll(".lifecycle-steps li")].filter((step) => step.className);
+    assert(marked.length === 0, `${status}: steps of the changed file were marked ${marked.map((step) => step.className).join(", ")}`);
+    assert(/earlier version of outright\.worktree\.json/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? ""), `${status}: the outcome was not tied to the earlier file`);
+  }
+  assert(buttons().includes("Run setup"), "a changed file offered to run setup again or retry");
+  // Trusting a file can leave setup unrun, so a teardown that a removal
+  // refused for review runs from its checkpoint before setup provisions.
+  detail = { ...interrupted, config: { ...config, trusted: false, teardown: [{ name: "Down", command: ["docker", "compose", "down"], timeoutSeconds: 600 }] },
+    state: { ...state, phase: "teardown", status: "needs-trust", steps: ["Down"], stepIndex: 0, checkpoints: { teardown: { configDigest: "sha256:abc", stepIndex: 0 } } } };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => buttons().includes("Trust without running setup") && buttons().includes("Trust and run setup"), "trusting offered no choice to leave setup unrun");
+  posts.length = 0;
+  [...dialog().querySelectorAll("button")].find((button) => button.textContent === "Trust without running setup").click();
+  await until(() => posts.some((post) => post.path === "/api/worktrees/lifecycle/trust"), "trust was not sent");
+  await remainsTrue(() => !posts.some((post) => post.path === "/api/worktrees/lifecycle/setup"), 150, "trusting started setup");
+  assert(posts[0].body.digest === "sha256:abc", "trust did not name the reviewed file");
   assert(errors.length === 0, `unexpected lifecycle errors: ${errors.map((error) => error.message).join("; ")}`);
 
   const failure = Object.assign(new Error("Teardown did not finish"), { payload: { code: "LIFECYCLE_OUTCOME_UNKNOWN", runId: "run-3" } });
@@ -1184,6 +1207,48 @@ async function lifecycleStatusOrder() {
   // worktree's setup is still a visible prompt.
   send({ type: "worktree.lifecycle", payload: { ...state("trusted", 40), stepIndex: 0 } });
   await until(() => chip() === "Run setup" && /setup has not run/.test(mark()), `a trusted setup that has not run looked ready (chip "${chip()}", mark "${mark()}")`);
+  // A refresh that no longer lists the worktree decides it as of its read:
+  // a late replayed event from before then stays out, and a newer one shows.
+  held = deferred();
+  send({ type: "runtime.connected", payload: { replay: { missed: true } } });
+  held.resolve(snapshot([], 50));
+  await until(() => !chip() && !mark(), "a snapshot without the state did not clear it");
+  send({ type: "worktree.lifecycle", payload: state("failed", 48) });
+  await remainsTrue(() => !chip() && !mark(), 150, `an event older than the applied snapshot came back (chip "${chip()}")`);
+  send({ type: "worktree.lifecycle", payload: state("failed", 51) });
+  await until(() => chip() === "Setup failed", "an event newer than the snapshot was not shown");
+  root.render(null); await settle();
+  await lifecycleDialogAfterRemoval();
+}
+
+// Watching teardown progress during a removal never leaves the setup dialog
+// open for whichever worktree is selected after the removal.
+async function lifecycleDialogAfterRemoval() {
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const linkedProjects = projects.map((item) => item.id === "A" ? { ...item, worktrees: [{ ...item.worktrees[0], isLinked: true }] } : item);
+  const removal = deferred();
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: linkedProjects, projectGroups: { groups: [], memberships: {} },
+      settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/worktrees" && options.method === "DELETE") return removal.promise;
+    if (url.pathname === "/api/worktrees/lifecycle") return response({ file: "outright.worktree.json", worktreePath: url.searchParams.get("path"), config: null, state: null, running: null });
+    if (url.pathname === "/api/conversations") return response({ conversations: [] });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[aria-label="Worktree options"]'), "linked worktree options");
+  host.querySelector('[aria-label="Worktree options"]').click();
+  await until(() => [...document.querySelectorAll('[role="menuitem"]')].some((item) => item.textContent.includes("Remove worktree")), "remove worktree menu item");
+  [...document.querySelectorAll('[role="menuitem"]')].find((item) => item.textContent.includes("Remove worktree")).click();
+  await until(() => document.querySelector("#remove-worktree-confirmation"), "remove worktree confirmation");
+  setControlValue(document.querySelector("#remove-worktree-confirmation"), "/fixture/A");
+  [...document.querySelectorAll('[role="dialog"] button')].find((item) => item.textContent === "Remove worktree").click();
+  await until(() => [...document.querySelectorAll("button")].some((item) => item.textContent === "Show teardown progress"), "teardown progress was not offered");
+  [...document.querySelectorAll("button")].find((item) => item.textContent === "Show teardown progress").click();
+  await until(() => document.querySelector(".lifecycle-dialog"), "teardown progress did not open");
+  removal.resolve(response({ removed: true }));
+  await until(() => document.querySelector(".toast")?.textContent.includes("Worktree removed"), "the removal did not finish");
+  await remainsTrue(() => !document.querySelector(".lifecycle-dialog"), 150, "the setup dialog stayed open after the removal");
   root.render(null); await settle();
 }
 

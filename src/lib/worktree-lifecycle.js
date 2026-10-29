@@ -70,11 +70,12 @@ export function lifecycleOutputUpdate(state, payload) {
 }
 
 // States and removals carry the runtime's revision, which only grows. An
-// event replaces what the client has for its path unless that is newer; a
-// removal is kept as a marker so an older state cannot return.
-export function upsertLifecycleState(states, payload) {
+// event replaces what the client has for its path unless that is newer, or
+// the applied snapshot (read at `watermark`) already decided it, absence
+// included; a removal is kept as a marker so an older state cannot return.
+export function upsertLifecycleState(states, payload, watermark = -Infinity) {
   const current = (states ?? []).find((state) => state.worktreePath === payload.worktreePath);
-  if (current?.revision > payload.revision) return states;
+  if (current?.revision > payload.revision || payload.revision <= watermark) return states;
   return [payload, ...(states ?? []).filter((state) => state !== current)];
 }
 

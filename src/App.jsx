@@ -757,7 +757,7 @@ export function App() {
     }
     if (event.type === "providers.changed") setBootstrap((current) => current ? { ...current, providers: event.payload.providers } : current);
     if (event.type === "worktree.lifecycle" && event.payload?.worktreePath) {
-      setLifecycleStates((current) => upsertLifecycleState(current, event.payload));
+      setLifecycleStates((current) => upsertLifecycleState(current, event.payload, lifecycleSnapshotRef.current));
       lifecycleEvents.dispatchEvent(new CustomEvent("state", { detail: event.payload }));
     }
     if (event.type === "worktree.lifecycle.output" && event.payload) lifecycleEvents.dispatchEvent(new CustomEvent("output", { detail: event.payload }));
@@ -1967,7 +1967,7 @@ export function App() {
   }
   async function removeWorktree() {
     setRemoveState((current) => ({ ...current, pending: true, problem: null }));
-    try { const result = await api("/api/worktrees", { method: "DELETE", body: removalRequest({ projectId: project.id, worktreePath: worktree.path, confirmation: removeConfirmation }, removeState.problem) }); setRemoveWorktreeOpen(false); setRemoveConfirmation(""); setRemoveState({ pending: false, problem: null }); setSelectedWorktreeId(""); const refreshed = await bootstrapLoadRef.current?.(result.refreshDeferred ? 3 : 1); setToast(refreshed === true ? "Worktree removed" : "Worktree removed; project refresh delayed"); }
+    try { const result = await api("/api/worktrees", { method: "DELETE", body: removalRequest({ projectId: project.id, worktreePath: worktree.path, confirmation: removeConfirmation }, removeState.problem) }); setRemoveWorktreeOpen(false); setLifecycleOpen(false); setRemoveConfirmation(""); setRemoveState({ pending: false, problem: null }); setSelectedWorktreeId(""); const refreshed = await bootstrapLoadRef.current?.(result.refreshDeferred ? 3 : 1); setToast(refreshed === true ? "Worktree removed" : "Worktree removed; project refresh delayed"); }
     catch (nextError) {
       // Teardown problems keep the worktree; say why in the dialog and offer
       // the explicit choices.

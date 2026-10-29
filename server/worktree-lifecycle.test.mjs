@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createOutrightDatabase } from "./database.mjs";
 import { createGitService } from "./git-service.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { lifecycleSummary } from "../src/lib/worktree-lifecycle.js";
-import { LIFECYCLE_CONFIG_FILE, LIFECYCLE_LIMITS, createWorktreeLifecycle, parseLifecycleConfig, readLifecycleConfig, sanitizeOutput } from "./worktree-lifecycle.mjs";
+import { LIFECYCLE_CONFIG_FILE, LIFECYCLE_LIMITS, createWorktreeLifecycle, parseLifecycleConfig, readLifecycleConfig, sanitizeOutput, worktreeInstance } from "./worktree-lifecycle.mjs";
 
 // Disposable repositories must not be attached to a host Git Trace2 consumer.
 process.env.GIT_TRACE2_EVENT = "0";
@@ -824,7 +824,11 @@ function scriptedLifecycle(create, database, project, { fail = () => null, diges
   const now = () => new Date(clock += 1000).toISOString();
   const target = (worktreePath) => ({ project, worktree: { id: worktreePath, path: worktreePath }, worktreePath });
   const start = (extra = {}) => create({ subprocesses, readConfig: async (worktreePath) => config(worktreePath),
-    identify: async (worktreePath) => (alive.has(worktreePath) ? alive.get(worktreePath) : `live:${worktreePath}`), now, ...options, ...extra });
+    identify: async (worktreePath) => {
+      const instance = alive.has(worktreePath) ? alive.get(worktreePath) : `live:${worktreePath}`;
+      if (instance instanceof Error) throw instance;
+      return instance;
+    }, now, ...options, ...extra });
   database.trustLifecycleConfig(project.id, project.path, digest);
   return { ran, alive, target, start };
 }
@@ -881,11 +885,65 @@ test("kept states of worktrees that no longer exist are forgotten once they pass
   // Six kept states over a bound of four: none are dropped while their worktrees exist.
   assert.deepEqual((await lifecycle.list()).states.map((state) => state.worktreePath).sort(), [...paths].sort());
   for (const worktreePath of paths.slice(2)) alive.set(worktreePath, worktreePath === "/w/replaced" ? "another" : null);
+  // A worktree that cannot be checked just now is not proven gone.
+  alive.set("/w/live", Object.assign(new Error("permission denied"), { code: "EACCES" }));
   await lifecycle.setup(target("/other/1"), { automatic: true });
   await waitFor(() => database.listWorktreeLifecycle().length === 3, 5000, "states of vanished worktrees were not forgotten");
   assert.deepEqual(database.listWorktreeLifecycle().map((state) => state.worktreePath).sort(), ["/other/1", "/w/live", "/w/unconfirmed"]);
   assert.equal(lifecycle.hold("/w/unconfirmed"), "WORKTREE_LIFECYCLE_UNCONFIRMED");
+  assert.ok((await lifecycle.list()).states.some((state) => state.worktreePath === "/w/live"), "an unreadable worktree's failure was hidden");
+  alive.delete("/w/live");
   assert.equal((await lifecycle.describe(target("/w/live"))).state.status, "failed");
+}));
+
+test("a worktree instance is null only when nothing is at its path; any other failure to tell is reported", { skip: process.platform === "win32" || process.getuid?.() === 0 }, async () => {
+  const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-instance-")));
+  const worktreePath = path.join(root, "parent", "worktree");
+  mkdirSync(worktreePath, { recursive: true });
+  try {
+    assert.equal(typeof await worktreeInstance(worktreePath), "string");
+    assert.equal(await worktreeInstance(path.join(root, "missing")), null);
+    chmodSync(path.join(root, "parent"), 0o000);
+    await assert.rejects(worktreeInstance(worktreePath), { code: "EACCES" });
+  } finally {
+    chmodSync(path.join(root, "parent"), 0o755);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a cancel accepted before Git starts keeps the worktree and its finished teardown; once Git starts, cancel is refused", withLifecycle(async ({ database, project, create }) => {
+  const { ran, target, start } = scriptedLifecycle(create, database, project);
+  const b = target("/w/b");
+  // The finished teardown's outcome save fails once, and the cancel lands
+  // while it waits to retry: after every step, before Git.
+  const save = database.saveWorktreeLifecycle;
+  let cancelled = null;
+  const lifecycle = start({ limits: { ...LIFECYCLE_LIMITS, persistRetryDelaysMs: [0, 100] } });
+  database.saveWorktreeLifecycle = (state) => {
+    if (state.status === "complete" && !cancelled) {
+      cancelled = new Promise((resolve) => { setImmediate(() => resolve(lifecycle.cancel(b))); });
+      throw new Error("database busy");
+    }
+    return save.call(database, state);
+  };
+  let removed = false;
+  try {
+    await assert.rejects(lifecycle.removeWorktree(b, { remove: async (prepareRemoval) => { await prepareRemoval(); removed = true; } }),
+      (error) => error.details?.code === "WORKTREE_TEARDOWN_FAILED");
+  } finally { database.saveWorktreeLifecycle = save; }
+  assert.equal((await cancelled).status, "running", "the cancel was not accepted while the run held the worktree");
+  assert.equal(removed, false, "Git removed the worktree after the cancel was accepted");
+  const kept = (await lifecycle.describe(b)).state;
+  assert.deepEqual([kept.status, kept.checkpoints.teardown?.stepIndex], ["cancelled", 1]);
+  assert.equal(database.listWorktreeLifecycle().find((state) => state.worktreePath === "/w/b").status, "cancelled");
+  // The retry only removes, and a cancel once Git has started is refused.
+  await lifecycle.removeWorktree(b, { remove: async (prepareRemoval) => {
+    await prepareRemoval();
+    assert.throws(() => lifecycle.cancel(b), (error) => error.details?.code === "WORKTREE_REMOVAL_STARTED");
+    removed = true;
+  } });
+  assert.equal(removed, true);
+  assert.deepEqual(ran.filter((entry) => entry.startsWith("/w/b:")), ["/w/b:down"], "the finished teardown ran again");
 }));
 
 test("trusting a configuration from one worktree leaves a sibling's unrun setup visible, not ready", withLifecycle(async ({ database, project, create, events }) => {

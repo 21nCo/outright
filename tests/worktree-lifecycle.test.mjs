@@ -72,6 +72,11 @@ test("an older event or snapshot never replaces a newer state or removal", () =>
   assert.equal(lifecycleFor(mergeLifecycleSnapshot(states, [state("running", 3)], 6), project, worktree), null);
   assert.equal(lifecycleFor(upsertLifecycleState(states, state("running", 6)), project, worktree), null);
   assert.equal(lifecycleFor(upsertLifecycleState(states, state("running", 8)), project, worktree).status, "running");
+  // A snapshot's absence decides a path as well: an event at or below the
+  // snapshot it applied stays out, and a newer one shows.
+  const cleared = mergeLifecycleSnapshot([{ worktreePath: "/w/a", removed: true, revision: 95 }], [], 100);
+  assert.equal(lifecycleFor(upsertLifecycleState(cleared, state("failed", 90), 100), project, worktree), null);
+  assert.equal(lifecycleFor(upsertLifecycleState(cleared, state("failed", 101), 100), project, worktree).status, "failed");
   // A trusted refusal no longer asks for review, but setup that has not run
   // is still a visible prompt; a trusted teardown needs nothing until removal.
   const trusted = lifecycleSummary(state("trusted", 9));

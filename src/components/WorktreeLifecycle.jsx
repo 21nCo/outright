@@ -102,11 +102,13 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
     catch (error) { onError(error); }
     finally { setBusy(false); await load(); }
   }
-  async function trustAndRun() {
+  // Trusting runs nothing unless the user also asks for setup, so a teardown
+  // the removal refused can run from its checkpoint before setup provisions.
+  async function trust(runSetup) {
     setBusy(true);
     try {
       await api("/api/worktrees/lifecycle/trust", { method: "POST", body: { ...target, digest: detail.config.digest } });
-      if (detail.config.setup.length) await api("/api/worktrees/lifecycle/setup", { method: "POST", body: target });
+      if (runSetup) await api("/api/worktrees/lifecycle/setup", { method: "POST", body: target });
     } catch (error) { onError(error); }
     finally { setBusy(false); await load(); }
   }
@@ -115,12 +117,14 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
   const state = detail?.state;
   const summary = lifecycleSummary(state);
   const running = Boolean(detail?.running);
+  // Progress belongs to the file version it ran; steps of a changed file have not run.
+  const matching = Boolean(state && config && state.configDigest === config.digest);
   const canTrust = Boolean(config && !config.error && !config.trusted && (config.setup.length || config.teardown.length));
   const canRun = Boolean(config && !config.error && config.trusted && config.setup.length && !running);
   const checkpoint = state?.checkpoints?.setup;
   let runLabel = "Run setup";
   if (checkpoint && checkpoint.configDigest === config?.digest) runLabel = `Retry from step ${checkpoint.stepIndex + 1}`;
-  else if (state?.phase === "setup" && state.status === "ready") runLabel = "Run setup again";
+  else if (matching && state.phase === "setup" && state.status === "ready") runLabel = "Run setup again";
   const needsAcknowledgement = Boolean(state?.outcomeUnknown) && !running;
   const acknowledged = needsAcknowledgement && Boolean(state.runId) && acknowledgedRunId === state.runId;
 
@@ -133,10 +137,10 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
       <p className={`lifecycle-trust ${config.trusted ? "trusted" : ""}`}>{config.trusted
         ? <><CheckCircle aria-hidden="true" />You trusted this exact version of <code>{detail.file}</code>.</>
         : <><ShieldWarning aria-hidden="true" />Review these commands. Once trusted, they run as you, in this worktree, with your environment. Trust covers only the command lines in this exact file, and any change to it needs a new review. Scripts and package hooks those commands run are not reviewed and can change without one.</>}</p>
-      <StepList title="Setup" steps={config.setup} current={state?.phase === "setup" ? state : null} />
-      <StepList title="Teardown" steps={config.teardown} current={state?.phase === "teardown" ? state : null} />
+      <StepList title="Setup" steps={config.setup} current={matching && state.phase === "setup" ? state : null} />
+      <StepList title="Teardown" steps={config.teardown} current={matching && state.phase === "teardown" ? state : null} />
     </>}
-    {summary && <p className={`lifecycle-summary ${summary.tone}`} role="status" aria-live="polite">{summary.label}{state.error ? ` ${state.error}` : ""}</p>}
+    {summary && <p className={`lifecycle-summary ${summary.tone}`} role="status" aria-live="polite">{config && !matching ? `For an earlier version of ${detail.file}: ` : ""}{summary.label}{state.error ? ` ${state.error}` : ""}</p>}
     {state?.output ? <pre ref={outputRef} className="lifecycle-output" tabIndex={0} aria-label={`${state.phase === "teardown" ? "Teardown" : "Setup"} output`}
       onScroll={(event) => { const element = event.currentTarget; pinnedRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 24; }}>
       {state.outputTruncated ? "… earlier output was not kept\n" : ""}{state.output}</pre> : null}
@@ -146,7 +150,8 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
       <Button variant="outline" onClick={() => onOpenChange(false)}>Close</Button>
       {running && <Button variant="destructive" disabled={busy} onClick={() => act("/api/worktrees/lifecycle/cancel")}>Cancel {detail.running}</Button>}
       {needsAcknowledgement && <Button variant="outline" disabled={busy || !acknowledged} onClick={() => act("/api/worktrees/lifecycle/acknowledge", { acknowledgeUnconfirmed: state.runId })}>Acknowledge</Button>}
-      {!running && canTrust && <Button disabled={busy} onClick={trustAndRun}>{config.setup.length ? "Trust and run setup" : "Trust teardown"}</Button>}
+      {!running && canTrust && config.setup.length > 0 && <Button variant="outline" disabled={busy} onClick={() => trust(false)}>Trust without running setup</Button>}
+      {!running && canTrust && <Button disabled={busy} onClick={() => trust(config.setup.length > 0)}>{config.setup.length ? "Trust and run setup" : "Trust teardown"}</Button>}
       {canRun && <Button disabled={busy || (needsAcknowledgement && !acknowledged)} onClick={() => act("/api/worktrees/lifecycle/setup", acknowledged ? { acknowledgeUnconfirmed: state.runId } : {})}>{runLabel}</Button>}
     </DialogFooter>
   </DialogContent></Dialog>;

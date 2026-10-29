@@ -118,7 +118,8 @@ export async function readLifecycleConfig(worktreePath) {
   }
   if (!info.isFile()) return { digest: null, error: "must be a regular file, not a link or directory" };
   let handle;
-  try { handle = await open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)); }
+  // Non-blocking, so a FIFO swapped in after the check cannot hang the open.
+  try { handle = await open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)); }
   catch (error) {
     if (error.code === "ENOENT") return null;
     if (["ELOOP", "EISDIR", "EMLINK"].includes(error.code)) return { digest: null, error: "must be a regular file, not a link or directory" };
@@ -211,12 +212,16 @@ function publicState(state) {
 
 // Identifies one worktree instance at a path: a worktree removed outside
 // Outright and created again at the same path is a different instance, and
-// none of the earlier one's progress applies to it.
+// none of the earlier one's progress applies to it. Null means no worktree
+// is there; any other failure to tell is thrown.
 export async function worktreeInstance(worktreePath) {
   try {
     const info = await stat(worktreePath, { bigint: true });
     return `${info.dev}:${info.ino}:${info.birthtimeNs}`;
-  } catch { return null; }
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes(error.code)) return null;
+    throw error;
+  }
 }
 
 // Each phase keeps its own checkpoint, `checkpoints[phase]`: the steps of
@@ -316,7 +321,8 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     pruning ??= (async () => {
       for (const [key, state] of [...states]) {
         if (state.outcomeUnknown || holding(key)) continue;
-        const instance = await identify(key);
+        // Only proof that the worktree is gone or replaced forgets its state.
+        const instance = await identify(key).catch(() => state.instance);
         if (instance !== state.instance && states.get(key) === state && !holding(key)) forget(key);
       }
     })().catch(onPersistError).finally(() => { pruning = null; });
@@ -606,6 +612,23 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
   async function removeWorktree(target, { remove, skipTeardown = false, acknowledgeUnconfirmed }) {
     const entry = claim(target, "teardown");
     let finished = null;
+    // A cancel accepted before Git starts keeps the worktree; a finished
+    // teardown keeps its checkpoint, so a retry only removes. Once Git
+    // starts, cancel is refused.
+    const proceed = () => {
+      const { signal } = entry.controller;
+      if (signal.aborted) {
+        const status = signal.reason === "shutdown" ? "interrupted" : "cancelled";
+        const reason = status === "cancelled" ? "Cancelled" : "Outright stopped";
+        if (finished?.status === "complete") {
+          finished = commit({ ...finished, status, stepIndex: finished.steps.length, updatedAt: now(),
+            error: `${reason} before the worktree was removed; teardown had finished, so a retry only removes it.` });
+        }
+        throw apiError(409, `${reason} before Git removed anything, so the worktree was kept.`,
+          { code: "WORKTREE_TEARDOWN_FAILED", lifecycle: publicState(finished) });
+      }
+      entry.removing = true;
+    };
     try {
       const result = await remove(async () => {
         const instance = await identify(target.worktreePath);
@@ -616,23 +639,25 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
         const acknowledged = requireAcknowledged(target, acknowledgeUnconfirmed, skipTeardown ? "teardown-skipped" : "removal",
           skipTeardown ? {} : { teardown: Boolean(prepared) });
         if (skipTeardown) {
+          proceed();
           database.auditAdmission("worktree.lifecycle.teardown.skipped", { target: target.worktreePath, projectId: target.project.id,
             acknowledgedUnconfirmed: Boolean(acknowledged) });
           return;
         }
-        if (!prepared) return;
+        if (!prepared) return proceed();
         if (prepared.resumeAt >= prepared.steps.length) {
           // Teardown already finished, here or before a restart: only Git
           // removal is left.
           finished = { ...baseState(target, "teardown", prepared.config, instance, prepared.previous), status: "complete",
             stepIndex: prepared.steps.length };
-          return;
+          return proceed();
         }
         finished = await runSteps(begin(entry, target, "teardown", prepared));
         if (finished.status !== "complete") {
           throw apiError(409, `Teardown did not finish, so the worktree was kept. ${finished.error ?? ""}`.trim(),
             { code: "WORKTREE_TEARDOWN_FAILED", lifecycle: publicState(finished) });
         }
+        proceed();
       });
       forget(target.worktreePath);
       return result;
@@ -684,6 +709,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
   function cancel(target) {
     const entry = holding(target.worktreePath);
     if (!entry) throw apiError(409, "No setup or teardown is running in this worktree", { code: "WORKTREE_LIFECYCLE_IDLE" });
+    if (entry.removing) throw apiError(409, "Git is already removing this worktree; that can no longer be cancelled", { code: "WORKTREE_REMOVAL_STARTED" });
     entry.controller.abort("cancel");
     return publicState(states.get(target.worktreePath));
   }
@@ -747,7 +773,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     const at = revision;
     const listed = [...states.values()];
     const instances = await Promise.all(listed.map((state) => (state.outcomeUnknown || holding(state.worktreePath)
-      ? state.instance : identify(state.worktreePath))));
+      ? state.instance : identify(state.worktreePath).catch(() => state.instance))));
     return { revision: at, states: listed.filter((state, index) => instances[index] === state.instance).map(publicState) };
   }
 
