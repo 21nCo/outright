@@ -146,8 +146,7 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
   let current = null;
   // Who holds xterm's selection: "find" while it is the highlight Find drew,
   // "cleared" after xterm cleared that highlight for a change of height, and
-  // null once the user pressed a mouse button in the terminal, selected,
-  // typed or cleared it.
+  // null once the user selected, typed or cleared it.
   let selection = null;
   let selecting = false;
   let resizing = false;
@@ -227,19 +226,35 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
     timer = setTimeout(recount, recountMs);
   }
 
-  // xterm reports a selection the user makes only when the mouse button is
-  // released. Pressing it in the terminal already makes the selection the
-  // user's, so a recount during a drag does not replace it.
-  const release = (event) => {
-    if (event.button !== 0 && event.button !== 2) return;
-    if (!selection) return;
+  // xterm starts the user's selection when a mouse button goes down but
+  // reports it only on release, so the selection becomes the user's as soon
+  // as a press changes it; a recount during the drag then leaves it alone.
+  // A press xterm does not select with (a right-click on the selection, a
+  // click a program tracking the mouse receives) leaves Find's highlight
+  // Find's. xterm handles the press on its element before this does.
+  const selectionKey = () => {
+    const range = xterm.getSelectionPosition();
+    return range ? `${range.start.x},${range.start.y},${range.end.x},${range.end.y}` : "";
+  };
+  let pressedOn = null;
+  const pressStart = () => { pressedOn = selectionKey(); };
+  const pressEnd = () => {
+    const before = pressedOn;
+    pressedOn = null;
+    if (!selection || selectionKey() === before) return;
     selection = null;
     publish();
   };
-  xterm.element?.addEventListener("mousedown", release, true);
+  xterm.element?.addEventListener("mousedown", pressStart, true);
+  xterm.element?.addEventListener("mousedown", pressEnd);
 
   const subscriptions = [
-    { dispose: () => xterm.element?.removeEventListener("mousedown", release, true) },
+    {
+      dispose: () => {
+        xterm.element?.removeEventListener("mousedown", pressStart, true);
+        xterm.element?.removeEventListener("mousedown", pressEnd);
+      },
+    },
     xterm.onWriteParsed(schedule),
     // xterm clears the selection for a change of height right after this.
     xterm.onResize(() => {

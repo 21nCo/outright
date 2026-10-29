@@ -840,6 +840,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     await send("Runtime.addBinding", { name: "__requestFixtureWheel" });
     await send("Runtime.addBinding", { name: "__requestFixtureForeground" });
     await send("Runtime.addBinding", { name: "__requestFixtureMotion" });
+    await send("Runtime.addBinding", { name: "__requestFixtureMouse" });
     await send("Page.addScriptToEvaluateOnNewDocument", { source: `
       window.__fixtureWheelCap = ${Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP) || 0};
       // Headless Chrome on macOS can route a fixture's native key to a
@@ -886,6 +887,18 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
         window.addEventListener("fixture-key-ready", ready);
         window.__fixtureLastKey = { key, step: window.__fixtureProgress?.step ?? "", focus: describeFocus(), at: performance.now() };
         window.__requestFixtureKey(key);
+      });
+      // A native mouse event, so the browser decides, as for a person, which
+      // compatibility mouse events a press delivers and where.
+      window.__fixtureMouse = (type, x, y, button = "left") => new Promise((resolve) => {
+        const id = Math.random().toString(36).slice(2);
+        const ready = (event) => {
+          if (event.detail !== id) return;
+          window.removeEventListener("fixture-mouse-ready", ready);
+          resolve();
+        };
+        window.addEventListener("fixture-mouse-ready", ready);
+        window.__requestFixtureMouse(JSON.stringify({ id, type, x, y, button }));
       });
       window.__fixtureWheel = (x, y, deltaY, deltaX = 0) => new Promise((resolve, reject) => {
         const id = Math.random().toString(36).slice(2);
@@ -948,6 +961,14 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
             ? Math.sign(wheel.deltaY) * Math.min(Math.abs(wheel.deltaY), configuredCap) : wheel.deltaY;
           await send("Input.dispatchMouseEvent", { type: "mouseWheel", x: wheel.x, y: wheel.y, deltaX: wheel.deltaX ?? 0, deltaY: deliveredDelta });
           await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-wheel-ready", { detail: ${JSON.stringify(wheel.id)} }))` });
+          return;
+        }
+        if (event.params.name === "__requestFixtureMouse") {
+          const mouse = JSON.parse(event.params.payload);
+          if (!["mousePressed", "mouseReleased", "mouseMoved"].includes(mouse.type) || !["left", "right"].includes(mouse.button)) throw new Error("Unexpected fixture mouse event");
+          const pressed = mouse.type === "mouseMoved" ? "none" : mouse.button;
+          await send("Input.dispatchMouseEvent", { type: mouse.type, x: mouse.x, y: mouse.y, button: pressed, buttons: mouse.type === "mousePressed" ? (mouse.button === "left" ? 1 : 2) : 0, clickCount: mouse.type === "mouseMoved" ? 0 : 1 });
+          await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-mouse-ready", { detail: ${JSON.stringify(mouse.id)} }))` });
           return;
         }
         if (event.params.name === "__requestFixtureKey") {

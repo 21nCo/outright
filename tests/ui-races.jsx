@@ -2705,6 +2705,7 @@ async function terminalFindHighlightRegression() {
     screen.dispatchEvent(new MouseEvent("mousedown", { ...point, buttons: 1, detail: 1, clientX: box.left + 1 }));
     document.dispatchEvent(new MouseEvent("mousemove", { ...point, buttons: 1, clientX: box.right - 2 }));
     await during();
+    assert(selectionColor() && !amber.includes(selectionColor()), "The user's drag is drawn as Find's match before release");
     document.dispatchEvent(new MouseEvent("mouseup", { ...point, clientX: box.right - 2 }));
     await settle();
   };
@@ -2717,6 +2718,62 @@ async function terminalFindHighlightRegression() {
   await drag("after 3", () => write("\x1b7\x1b[1;1H\x1b[L\x1b8"));
   assert(selectedText() === "after 2" && status() === "1 of 1", `A recount during the user's drag after a line was inserted replaced it with ${JSON.stringify(selectedText())}`);
   assert(selectionColor() && !amber.includes(selectionColor()), "The user's drag is drawn as Find's match after a line was inserted");
+
+  // A press xterm does not select with leaves Find's highlight Find's: one on
+  // the scrollbar, a right-click on the highlight, and a click while a
+  // program tracks the mouse. These are native presses, so the browser
+  // decides which mouse events reach the page. Afterwards a line inserted
+  // above still moves the highlight with its match, and closing Find
+  // removes it.
+  assert(window.__fixtureMouse, "Native mouse input is unavailable");
+  const press = async (x, y, button = "left") => {
+    await window.__fixtureMouse("mousePressed", x, y, button);
+    await window.__fixtureMouse("mouseReleased", x, y, button);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await settle();
+  };
+  const rowPoint = (text) => {
+    const box = host.querySelector(".terminal-host .xterm-screen").getBoundingClientRect();
+    const rowHeight = box.height / size().rows;
+    const row = screenRows().findIndex((line) => line.startsWith(text));
+    assert(row >= 0, `No row starts with ${text}`);
+    return { x: box.left + 4, y: box.top + rowHeight * (row + 0.5) };
+  };
+  const keepsHighlight = async (label, pressed) => {
+    key(find(), { key: "Enter" });
+    await until(() => selectedText() === "NEEDLE row" && amber.includes(selectionColor()), `Find highlights its match before ${label}`);
+    await pressed();
+    assert(status() === "1 of 1" && selectedText() === "NEEDLE row" && amber.includes(selectionColor()), `${label} took Find's highlight from it (${JSON.stringify(selectedText())}, ${selectionColor()})`);
+    await write("\x1b7\x1b[1;1H\x1b[L\x1b8");
+    assert(status() === "1 of 1" && selectedText() === "NEEDLE row" && amber.includes(selectionColor()), `After ${label}, a line inserted above left Find's highlight on ${JSON.stringify(selectedText())}`);
+    key(find(), { key: "Escape" });
+    await until(() => !find(), `Escape closes Find after ${label}`);
+    assert(!selectedText(), `Closing Find after ${label} left ${JSON.stringify(selectedText())} selected`);
+    host.querySelector('[aria-label="Find in terminal"]').click();
+    await until(() => document.activeElement === find() && status() === "1 of 1", `Find reopens after ${label}`);
+  };
+  await keepsHighlight("a press on the scrollbar", async () => {
+    const slider = host.querySelector(".terminal-host .xterm-scrollable-element > .scrollbar.vertical > .slider");
+    assert(slider, "The terminal has no scrollbar slider");
+    const box = slider.getBoundingClientRect();
+    const shown = screenRows().join("\n");
+    // The scrollbar takes presses once the pointer over the terminal shows it.
+    await window.__fixtureMouse("mouseMoved", box.left + box.width / 2, box.top + box.height / 2);
+    await until(() => document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2) === slider, "the scrollbar shows under the pointer");
+    await press(box.left + box.width / 2, box.top + box.height / 2);
+    assert(screenRows().join("\n") === shown, "Pressing the scrollbar slider scrolled the terminal");
+  });
+  await keepsHighlight("a right-click on the highlight", async () => {
+    const { x, y } = rowPoint("NEEDLE row");
+    await press(x, y, "right");
+  });
+  await write("\x1b[?1000h");
+  await keepsHighlight("a click while the program tracks the mouse", async () => {
+    assert(host.querySelector(".terminal-host .xterm.enable-mouse-events"), "The terminal does not track the mouse");
+    const { x, y } = rowPoint("after 4");
+    await press(x, y);
+  });
+  await write("\x1b[?1000l");
   key(find(), { key: "Escape" });
   await until(() => !find() && document.activeElement === textarea(), "Escape closes Find");
   assert(!errors.length, `Unexpected terminal errors: ${errors.map((error) => error.message).join("; ")}`);
