@@ -86,6 +86,12 @@ const PROVIDER_ACCOUNT_FIELDS = "id, provider, label, home_path AS homePath, cre
 const MAX_ACCOUNTS_PER_PROVIDER = 16;
 const MAX_TRUSTED_LIFECYCLE_CONFIGS = 16;
 const MAX_WORKTREE_LIFECYCLE_STATES = 512;
+// A running state is what archive maintenance waits for and what restore
+// turns into an unconfirmed interruption; a state with unconfirmed processes
+// holds its worktree. Both are bounded by live claims and unacknowledged
+// attempts, so retention keeps them however many newer states are saved.
+const LIFECYCLE_STATE_RUNNING = "COALESCE(json_extract(state, '$.status'), '') = 'running'";
+const LIFECYCLE_STATE_PINNED = `${LIFECYCLE_STATE_RUNNING} OR COALESCE(json_extract(state, '$.outcomeUnknown'), 0) <> 0`;
 const MAX_LIMIT_WINDOWS_PER_HOME = 8;
 
 const SETTING_RULES = {
@@ -2145,15 +2151,15 @@ export function createOutrightDatabase(options = {}) {
     // Lifecycle state is the durable record of a setup or teardown outcome.
     // Like a critical audit it may spend the recovery reserve: a state the
     // user must act on cannot be dropped at the quota edge. Each state is
-    // bounded by the lifecycle service, and only the newest states are kept.
+    // bounded by the lifecycle service, and only the newest settled states are kept.
     saveWorktreeLifecycle(state) {
       db.transaction(() => {
         reserveRecoveryHeadroom(db, undefined, true);
         db.prepare(`INSERT INTO worktree_lifecycle (worktree_path, project_id, state, updated_at) VALUES (?, ?, ?, ?)
           ON CONFLICT(worktree_path) DO UPDATE SET project_id = excluded.project_id, state = excluded.state, updated_at = excluded.updated_at`)
           .run(state.worktreePath, state.projectId, JSON.stringify(state), state.updatedAt ?? now());
-        // A state with unconfirmed processes holds its worktree and is kept.
-        db.prepare(`DELETE FROM worktree_lifecycle WHERE COALESCE(json_extract(state, '$.outcomeUnknown'), 0) = 0 AND worktree_path NOT IN (
+        // Retention never drops a state something still depends on.
+        db.prepare(`DELETE FROM worktree_lifecycle WHERE NOT (${LIFECYCLE_STATE_PINNED}) AND worktree_path NOT IN (
           SELECT worktree_path FROM worktree_lifecycle ORDER BY updated_at DESC, worktree_path LIMIT ?)`).run(MAX_WORKTREE_LIFECYCLE_STATES);
         reserveRecoveryHeadroom(db);
       }).immediate();
@@ -2654,7 +2660,7 @@ function deleteArchivedInBatches(db, id, inFlight, { automatic = false, cutoff, 
 // and for worktree setup or teardown, whose steps save progress as they go.
 function maintenanceMustWait(db) {
   return Boolean(db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()
-    || db.prepare("SELECT 1 FROM worktree_lifecycle WHERE json_extract(state, '$.status') = 'running' LIMIT 1").get());
+    || db.prepare(`SELECT 1 FROM worktree_lifecycle WHERE ${LIFECYCLE_STATE_RUNNING} LIMIT 1`).get());
 }
 
 async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, cutoverStatGate, cutoverCloseGate, cutoverPromoteGate, copyGate, copyStepGate, copyPhase, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing }) {

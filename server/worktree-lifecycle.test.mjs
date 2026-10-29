@@ -714,3 +714,42 @@ test("archive maintenance, which closes the database, waits while setup or teard
   const deletion = await database.deleteArchivedConversation(archived.id, archived.id);
   assert.notEqual(deletion.deferred, true, "maintenance stayed deferred after the step finished");
 }));
+
+test("a running step's state survives retention however many newer states are saved, so maintenance waits and a crash is still held", { timeout: 30_000 }, withLifecycle(async ({ repository, database, project, target, create }) => {
+  writeConfig(repository, { setup: [{ name: "Wait", command: node("setInterval(() => {}, 1000)") }] });
+  const lifecycle = create();
+  database.trustLifecycleConfig(project.id, project.path, (await readLifecycleConfig(repository)).digest);
+  await lifecycle.setup(target);
+  const running = database.listWorktreeLifecycle().find((state) => state.worktreePath === repository);
+  assert.equal(running?.status, "running");
+  // Other worktrees' states written during one long step, at the retention edge.
+  const newer = Date.parse(running.updatedAt);
+  for (let index = 1; index <= 512; index += 1) {
+    database.saveWorktreeLifecycle({ worktreePath: `/elsewhere/${index}`, projectId: project.id, phase: "setup", status: "needs-trust",
+      stepIndex: 0, steps: ["Install"], updatedAt: new Date(newer + index * 1000).toISOString() });
+  }
+  const kept = database.listWorktreeLifecycle();
+  assert.equal(kept.length, 513);
+  assert.equal(kept.find((state) => state.worktreePath === repository)?.status, "running", "retention deleted a live run's state");
+  database.saveWorktreeLifecycle({ worktreePath: "/elsewhere/513", projectId: project.id, phase: "setup", status: "needs-trust",
+    stepIndex: 0, steps: ["Install"], updatedAt: new Date(newer + 513 * 1000).toISOString() });
+  assert.equal(database.listWorktreeLifecycle().some((state) => state.worktreePath === "/elsewhere/1"), false, "settled states are still bounded");
+
+  const archived = database.createConversation({ projectId: project.id, worktreeId: "main", worktreePath: repository, title: "Archived", provider: "codex" });
+  database.addMessage({ conversationId: archived.id, role: "assistant", body: `large ${"x".repeat(300 * 1024)}` });
+  for (let index = 0; index < 300; index += 1) database.addMessage({ conversationId: archived.id, role: "assistant", body: `filler ${index}` });
+  database.updateConversation(archived.id, { archived: true });
+  assert.equal((await database.deleteArchivedConversation(archived.id, archived.id)).deferred, true, "maintenance went offline during a running step");
+
+  // A runtime that starts after a crash still finds the step and holds the worktree.
+  const recovering = { capacity: () => ({ active: 1, limit: 4, unknown: 1 }), reconcileUnknown: async () => 0,
+    run: async () => { throw new Error("no step may run"); } };
+  const successor = create({ subprocesses: recovering });
+  const recovered = (await successor.describe(target)).state;
+  assert.deepEqual([recovered?.status, recovered?.outcomeUnknown], ["interrupted", true]);
+  assert.equal(successor.hold(repository), "WORKTREE_LIFECYCLE_UNCONFIRMED");
+  // The unconfirmed state is pinned in turn.
+  database.saveWorktreeLifecycle({ worktreePath: "/elsewhere/514", projectId: project.id, phase: "setup", status: "needs-trust",
+    stepIndex: 0, steps: ["Install"], updatedAt: new Date(newer + 514 * 1000).toISOString() });
+  assert.equal(database.listWorktreeLifecycle().find((state) => state.worktreePath === repository)?.outcomeUnknown, true);
+}));
