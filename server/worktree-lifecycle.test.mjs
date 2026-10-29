@@ -88,6 +88,14 @@ test("repository configuration is strict, bounded and read only from a regular f
     [JSON.stringify({ version: 1, setup: [{ name: "x", command: ["a\0b"] }] }), /command must be an array/],
     [JSON.stringify({ version: 1, setup: [{ name: "", command: ["true"] }] }), /name must be/],
     [JSON.stringify({ version: 1, setup: [{ name: "a\u001b[31m", command: ["true"] }] }), /name must be/],
+    // A reviewed command must look like the one that runs (Trojan Source).
+    [JSON.stringify({ version: 1, setup: [{ name: "Install", command: ["sh", "-c", "echo safe \u202e; rm -rf ~ \u202c"] }] }), /command\[2\] contains an invisible, reordering/],
+    [JSON.stringify({ version: 1, setup: [{ name: "Install", command: ["np\u200bm", "ci"] }] }), /command\[0\] contains/],
+    [JSON.stringify({ version: 1, setup: [{ name: "Install", command: ["npm\u00a0ci"] }] }), /command\[0\] contains/],
+    [JSON.stringify({ version: 1, setup: [{ name: "Install", command: ["echo", "\u2066x\u2069"] }] }), /command\[1\] contains/],
+    ['{"version":1,"setup":[{"name":"Install","command":["echo","\\ud800"]}]}', /command\[1\] contains/],
+    [JSON.stringify({ version: 1, setup: [{ name: "Inst\u202eall", command: ["true"] }] }), /name must be/],
+    [JSON.stringify({ version: 1, setup: [{ name: "Ins\ufefftall", command: ["true"] }] }), /name must be/],
     [JSON.stringify({ version: 1, setup: [{ name: "x", command: ["true"], timeoutSeconds: 0 }] }), /timeoutSeconds/],
     [JSON.stringify({ version: 1, setup: [{ name: "x", command: ["true"], shell: true }] }), /unknown field "shell"/],
     [JSON.stringify({ version: 1, teardown: Array.from({ length: LIFECYCLE_LIMITS.steps + 1 }, () => ({ name: "x", command: ["true"] })) }), /at most/],
@@ -112,6 +120,9 @@ test("repository configuration is strict, bounded and read only from a regular f
       assert.match((await readLifecycleConfig(root)).error, /regular file/);
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
+  // Tabs and line breaks are visible in the review, as are non-Latin scripts.
+  assert.deepEqual(parseLifecycleConfig(JSON.stringify({ version: 1, setup: [{ name: "Préparer 日本", command: ["sh", "-c", "a\tb\nc"] }] })).setup[0].command,
+    ["sh", "-c", "a\tb\nc"]);
   assert.equal(sanitizeOutput("\u001b[32mok\u001b[0m\r\nbar\rbaz\u0007\u001b]0;title\u0007"), "ok\nbar\nbaz");
 });
 
@@ -262,20 +273,39 @@ test("a failed teardown keeps the worktree; a retry or an explicit skip removes 
   assert.ok(database.listAudit(20).some((entry) => entry.action === "worktree.lifecycle.teardown.skipped"));
 }));
 
-test("a run going when the runtime stopped is interrupted, not ready, after restart", withLifecycle(async ({ repository, database, project, target, create }) => {
+test("a run going when the runtime stopped is interrupted, not ready, and holds its worktree until its processes are proven gone", withLifecycle(async ({ repository, database, project, target, create }) => {
   writeConfig(repository, { setup: [{ name: "Wait", command: node("setInterval(() => {}, 1000)") }] });
   const lifecycle = create();
   database.trustLifecycleConfig(project.id, project.path, (await readLifecycleConfig(repository)).digest);
   await lifecycle.setup(target);
   await lifecycle.shutdown();
-  assert.equal((await lifecycle.describe(target)).state.status, "interrupted");
+  const stopped = (await lifecycle.describe(target)).state;
+  assert.deepEqual([stopped.status, stopped.outcomeUnknown], ["interrupted", false], "a proven shutdown is not unconfirmed");
   await assert.rejects(lifecycle.setup(target), (error) => error.statusCode === 503);
-  // A crash leaves the durable state running; the next runtime reports it.
-  database.saveWorktreeLifecycle({ ...(await lifecycle.describe(target)).state, status: "running", output: undefined });
-  const successor = create();
-  const recovered = await successor.describe(target);
-  assert.equal(recovered.state.status, "interrupted");
-  assert.match(recovered.state.error, /Outright stopped during step 1/);
+  // A crash leaves the durable state running; the next runtime reports it,
+  // and the step's processes are unconfirmed until recovery proves them gone.
+  database.saveWorktreeLifecycle({ ...stopped, status: "running", output: undefined, checkpoints: {} });
+  let unknownOwners = 1;
+  const released = [];
+  const recovering = { capacity: () => ({ active: unknownOwners, limit: 4, unknown: unknownOwners }), reconcileUnknown: async () => 0,
+    run: async () => { throw new Error("no step may run"); } };
+  const successor = create({ subprocesses: recovering, onRelease: (worktreePath) => released.push(worktreePath) });
+  const recovered = (await successor.describe(target)).state;
+  assert.deepEqual([recovered.status, recovered.outcomeUnknown, recovered.checkpoints.setup?.stepIndex], ["interrupted", true, 0]);
+  assert.match(recovered.error, /Outright stopped during step 1/);
+  assert.equal(successor.hold(repository), "WORKTREE_LIFECYCLE_UNCONFIRMED", "agent work may start beside the crashed step's tree");
+  await assert.rejects(successor.setup(target), (error) => error.details?.code === "LIFECYCLE_OUTCOME_UNKNOWN", "a retry ran without acknowledgement");
+  released.length = 0;
+  // Recovery that leaves the tree unproven keeps the hold.
+  assert.equal(await successor.reconcile(), 0);
+  assert.equal(successor.hold(repository), "WORKTREE_LIFECYCLE_UNCONFIRMED");
+  assert.deepEqual(released, []);
+  unknownOwners = 0;
+  await successor.reconcile();
+  assert.equal(successor.hold(repository), null);
+  assert.deepEqual(released, [repository], "waiting agent runs were not woken");
+  assert.equal((await successor.describe(target)).state.outcomeUnknown, false);
+  assert.ok(database.listAudit(20).some((entry) => entry.action === "worktree.lifecycle.unconfirmed.proven"));
 }));
 
 test("setup and teardown are refused beside agent work, before any command runs, and release wakes waiting runs", withLifecycle(async ({ root, repository, database, project, target, create }) => {
@@ -284,9 +314,11 @@ test("setup and teardown are refused beside agent work, before any command runs,
     teardown: [{ name: "Mark", command: node("require('fs').appendFileSync(process.argv[1], 't')", marker) }] });
   database.trustLifecycleConfig(project.id, project.path, (await readLifecycleConfig(repository)).digest);
   let agentRunning = true;
+  let interrupted = null;
   const asked = [];
   const released = [];
-  const lifecycle = create({ agentWork: (paths) => { asked.push(paths); return agentRunning; }, onRelease: (worktreePath) => released.push(worktreePath) });
+  const lifecycle = create({ agentWork: (paths) => { asked.push(paths); return agentRunning; }, interruptedRun: () => interrupted,
+    onRelease: (worktreePath) => released.push(worktreePath) });
   // The scan may report a path that is not canonical.
   const alias = path.join(root, "alias");
   symlinkSync(repository, alias, "junction");
@@ -297,10 +329,17 @@ test("setup and teardown are refused beside agent work, before any command runs,
   await assert.rejects(lifecycle.removeWorktree(target, { remove: async (prepare) => { await prepare(); removed = true; } }),
     (error) => error.details?.code === "WORKTREE_AGENT_ACTIVE");
   assert.equal(removed, false);
+  agentRunning = false;
+  // An interrupted run whose processes the user has not resolved.
+  interrupted = { id: "run-interrupted" };
+  await assert.rejects(lifecycle.setup(discovered), (error) => error.details?.code === "RUN_RECOVERY_REQUIRED" && error.details.runId === "run-interrupted");
+  await assert.rejects(lifecycle.removeWorktree(target, { remove: async (prepare) => { await prepare(); removed = true; } }),
+    (error) => error.details?.code === "RUN_RECOVERY_REQUIRED");
+  assert.equal(removed, false);
+  interrupted = null;
   assert.equal(existsSync(marker), false, "a refused phase ran a command");
   assert.equal((await lifecycle.describe(target)).state, null, "a refusal beside agent work recorded a state");
 
-  agentRunning = false;
   await lifecycle.setup(discovered);
   // Agent launches consult the hold by either path.
   assert.equal(lifecycle.busy(discovered.worktree.path), true);
@@ -323,10 +362,14 @@ test("a refused retry keeps the resume checkpoint and the unconfirmed-processes 
     if (file === "migrate" && failMigrate) throw Object.assign(new Error("ownership unknown"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN", cause: Object.assign(new Error("exit"), { code: 2 }) });
     return { stdout: "", stderr: "" };
   } };
-  const lifecycle = create({ subprocesses });
+  const released = [];
+  const lifecycle = create({ subprocesses, onRelease: (worktreePath) => released.push(worktreePath) });
   await lifecycle.setup(target);
   const failed = (await settled(lifecycle, target)).state;
   assert.deepEqual([failed.status, failed.stepIndex, failed.outcomeUnknown], ["failed", 1, true]);
+  // The run ended, but its processes did not provably: agent work stays held.
+  assert.equal(lifecycle.busy(repository), false);
+  assert.equal(lifecycle.hold(repository), "WORKTREE_LIFECYCLE_UNCONFIRMED");
 
   // Trust revoked, then an invalid edit: both refusals keep the checkpoint.
   database.untrustProject(project.id);
@@ -335,7 +378,7 @@ test("a refused retry keeps the resume checkpoint and the unconfirmed-processes 
   await assert.rejects(lifecycle.setup(target), (error) => error.details?.code === "LIFECYCLE_CONFIG_INVALID");
   const refused = (await create({ subprocesses }).describe(target)).state;
   assert.equal(refused.status, "invalid");
-  assert.deepEqual([refused.checkpoint, refused.outcomeUnknown], [{ phase: "setup", configDigest: digest, stepIndex: 1 }, true], "the durable refusal lost the checkpoint");
+  assert.deepEqual([refused.checkpoints, refused.outcomeUnknown], [{ setup: { configDigest: digest, stepIndex: 1 } }, true], "the durable refusal lost the checkpoint");
 
   writeFileSync(path.join(repository, LIFECYCLE_CONFIG_FILE), original);
   database.trustLifecycleConfig(project.id, project.path, digest);
@@ -346,6 +389,58 @@ test("a refused retry keeps the resume checkpoint and the unconfirmed-processes 
   assert.equal((await restarted.setup(target, { acknowledgeUnconfirmed: true })).stepIndex, 1);
   assert.equal((await settled(restarted, target)).state.status, "ready");
   assert.deepEqual(ran, ["migrate", "seed"], "the finished first step ran again");
+  assert.equal(restarted.hold(repository), null);
+}));
+
+test("an explicit acknowledgement releases agent work held by unconfirmed processes, and keeps the checkpoint", withLifecycle(async ({ repository, database, project, target, create }) => {
+  writeConfig(repository, { setup: [{ name: "Install", command: ["install"] }, { name: "Serve", command: ["serve"] }] });
+  database.trustLifecycleConfig(project.id, project.path, (await readLifecycleConfig(repository)).digest);
+  // The unknown owner stays charged, so recovery cannot prove it gone.
+  const subprocesses = { capacity: () => ({ active: 1, limit: 4, unknown: 1 }), reconcileUnknown: async () => 0, run: async (file) => {
+    if (file === "serve") throw Object.assign(new Error("ownership unknown"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN", cause: new Error("lost") });
+    return { stdout: "", stderr: "" };
+  } };
+  const released = [];
+  const lifecycle = create({ subprocesses, onRelease: (worktreePath) => released.push(worktreePath) });
+  await lifecycle.setup(target);
+  await settled(lifecycle, target);
+  released.length = 0;
+  await lifecycle.reconcile();
+  assert.equal(lifecycle.hold(repository), "WORKTREE_LIFECYCLE_UNCONFIRMED");
+  // The hold is durable.
+  assert.equal(create({ subprocesses }).hold(repository), "WORKTREE_LIFECYCLE_UNCONFIRMED");
+  const acknowledged = lifecycle.acknowledge(target);
+  assert.deepEqual([acknowledged.outcomeUnknown, acknowledged.status, acknowledged.checkpoints.setup.stepIndex], [false, "failed", 1]);
+  assert.equal(lifecycle.hold(repository), null);
+  assert.deepEqual(released, [repository]);
+  assert.ok(database.listAudit(20).some((entry) => entry.action === "worktree.lifecycle.unconfirmed.acknowledged"));
+  assert.equal(create({ subprocesses }).hold(repository), null, "the acknowledgement was not durable");
+}));
+
+test("each phase keeps its own checkpoint: a teardown attempt never resets setup progress", withLifecycle(async ({ repository, database, project, target, create }) => {
+  writeConfig(repository, { setup: [{ name: "Install", command: ["install"] }, { name: "Migrate", command: ["migrate"] }],
+    teardown: [{ name: "Stop", command: ["stop"] }] });
+  database.trustLifecycleConfig(project.id, project.path, (await readLifecycleConfig(repository)).digest);
+  const ran = [];
+  const failing = new Set(["migrate", "stop"]);
+  const subprocesses = { capacity: () => ({ active: 0, limit: 4, unknown: 0 }), run: async (file) => {
+    ran.push(file);
+    if (failing.has(file)) throw Object.assign(new Error("exit"), { code: 1 });
+    return { stdout: "", stderr: "" };
+  } };
+  const lifecycle = create({ subprocesses });
+  await lifecycle.setup(target);
+  assert.deepEqual([(await settled(lifecycle, target)).state.stepIndex, ran], [1, ["install", "migrate"]]);
+  let removed = false;
+  await assert.rejects(lifecycle.removeWorktree(target, { remove: async (prepare) => { await prepare(); removed = true; } }),
+    (error) => error.details?.code === "WORKTREE_TEARDOWN_FAILED");
+  assert.equal(removed, false);
+  failing.clear();
+  ran.length = 0;
+  assert.equal((await create({ subprocesses }).describe(target)).state.checkpoints.setup.stepIndex, 1, "teardown erased the setup checkpoint");
+  assert.equal((await lifecycle.setup(target)).stepIndex, 1);
+  assert.equal((await settled(lifecycle, target)).state.status, "ready");
+  assert.deepEqual(ran, ["migrate"], "setup did not resume at its failed step after a teardown attempt");
 }));
 
 test("a worktree created again at the same path starts setup at step 1, never at the old checkpoint", { timeout: 30_000 }, withLifecycle(async ({ root, repository, database, project, create }) => {
@@ -450,4 +545,34 @@ test("teardown refuses an untrusted or invalid configuration and resumes at remo
   await lifecycle.removeWorktree(target, { remove });
   assert.equal(existsSync(worktreePath), false);
   assert.equal(readFileSync(teardownRuns, "utf8"), "r", "the retry ran the finished teardown again");
+}));
+
+test("a teardown that finished before a crash is not run again: the next removal only removes", { timeout: 30_000 }, withLifecycle(async ({ root, repository, database, project, create }) => {
+  const teardownRuns = path.join(root, "teardown-runs");
+  writeConfig(repository, { teardown: [{ name: "Record", command: node("require('fs').appendFileSync(process.argv[1], 'r')", teardownRuns) }] });
+  git(repository, ["add", LIFECYCLE_CONFIG_FILE]);
+  git(repository, ["commit", "-m", "lifecycle"]);
+  database.trustLifecycleConfig(project.id, project.path, (await readLifecycleConfig(repository)).digest);
+  const worktreePath = path.join(root, "feature");
+  git(repository, ["worktree", "add", "-b", "feature", worktreePath]);
+  const worktrees = [{ id: "main", path: repository, isLinked: false, changedCount: 0 }, { id: "feature", path: worktreePath, isLinked: true, changedCount: 0 }];
+  const service = createGitService({ database, getProjects: () => [{ ...project, worktrees }], getConfig: async () => ({ scanRoots: [root] }) });
+  const target = { project, worktree: { id: "feature", path: worktreePath }, worktreePath };
+
+  // The runtime stops after teardown commits its outcome, before Git runs.
+  let durable;
+  const crashed = create();
+  await assert.rejects(crashed.removeWorktree(target, { remove: async (prepare) => {
+    await prepare();
+    durable = database.listWorktreeLifecycle().find((state) => state.worktreePath === worktreePath);
+    throw new Error("runtime stopped");
+  } }));
+  assert.equal(durable.status, "complete");
+  database.saveWorktreeLifecycle(durable);
+  assert.equal(readFileSync(teardownRuns, "utf8"), "r");
+
+  const restarted = create();
+  await restarted.removeWorktree(target, { remove: (prepare) => service.removeWorktree({ projectId: project.id, worktreePath, confirmation: worktreePath, prepare }) });
+  assert.equal(existsSync(worktreePath), false);
+  assert.equal(readFileSync(teardownRuns, "utf8"), "r", "teardown ran again after a restart");
 }));

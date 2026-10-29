@@ -989,8 +989,10 @@ async function settingsMigrationCompletionRegression() {
 }
 
 // An open setup dialog reloads on reconnect: a restarted runtime reports an
-// interrupted run without any event. Teardown choices are a labelled radio
-// group, and the acknowledgement it sends is bound to its worktree.
+// interrupted run without any event. An older read that answers late never
+// replaces a newer state, also across closing and reopening. Unconfirmed
+// processes are acknowledged explicitly. Teardown choices are a labelled
+// radio group, and the acknowledgement it sends is bound to its worktree.
 async function worktreeLifecycleRegression() {
   root.render(null); await settle();
   const project = projects[0];
@@ -1001,24 +1003,78 @@ async function worktreeLifecycleRegression() {
     stepIndex: 1, runId: "run-1", output: "installed\n", outputEnd: 10, outputTruncated: false, outcomeUnknown: false };
   let detail = { file: "outright.worktree.json", worktreePath: worktree.path, config, running: "setup", state: { ...state, status: "running" } };
   const reads = [];
-  route = async (url) => {
-    if (url.pathname === "/api/worktrees/lifecycle") { reads.push(url.searchParams.get("path")); return response(detail); }
+  const posts = [];
+  // A read answered by the test, in any order, instead of at once.
+  let held = null;
+  route = async (url, options) => {
+    if (url.pathname === "/api/worktrees/lifecycle") {
+      reads.push(url.searchParams.get("path"));
+      if (held) { const answer = deferred(); held.push(answer); return answer.promise; }
+      return response(detail);
+    }
+    if (options.method === "POST") posts.push({ path: url.pathname, body: JSON.parse(options.body) });
     return response({});
   };
   const events = new EventTarget();
   const errors = [];
-  root.render(<TooltipProvider><WorktreeLifecycleDialog open onOpenChange={() => {}} project={project} worktree={worktree} events={events} onError={(error) => errors.push(error)} /></TooltipProvider>);
+  const render = (open) => root.render(<TooltipProvider><WorktreeLifecycleDialog open={open} onOpenChange={() => {}} project={project} worktree={worktree} events={events} onError={(error) => errors.push(error)} /></TooltipProvider>);
+  render(true);
   const dialog = () => document.querySelector(".lifecycle-dialog");
   const buttons = () => [...(dialog()?.querySelectorAll("button") ?? [])].map((button) => button.textContent);
   await until(() => buttons().includes("Cancel setup"), "running setup offers cancel");
   assert(reads.every((path) => path === worktree.path), "the dialog named its worktree by something other than its path");
   // The runtime restarted while the client was away.
-  detail = { ...detail, running: null, state: { ...state, status: "interrupted", error: "Outright stopped during step 2; its effects may be partial." } };
+  const checkpoints = { setup: { configDigest: "sha256:abc", stepIndex: 1 } };
+  const running = detail;
+  const interrupted = { ...detail, running: null, state: { ...state, status: "interrupted", checkpoints, error: "Outright stopped during step 2; its effects may be partial." } };
+  detail = interrupted;
   events.dispatchEvent(new CustomEvent("reconnect"));
   await until(() => buttons().includes("Retry from step 2"), "reconnect did not reconcile the interrupted run");
   assert(!buttons().includes("Cancel setup"), "an interrupted run still offered cancel");
   const summary = dialog().querySelector('.lifecycle-summary[role="status"]');
   assert(/Setup interrupted at step 2 of 2, Seed/.test(summary?.textContent ?? ""), "the interrupted state was not announced");
+
+  // Two reads overlap and the older one, from while setup ran, answers last.
+  const failedDetail = { ...interrupted, state: { ...interrupted.state, status: "failed", runId: "run-2", error: "\"Seed\" exited with status 1." } };
+  held = [];
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => held.length === 2, "both reads were not issued");
+  held[1].resolve(response(failedDetail));
+  await until(() => /Setup failed/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? ""), "the newer failure was not shown");
+  held[0].resolve(response(running));
+  await remainsTrue(() => /Setup failed/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? "") && !buttons().includes("Cancel setup"),
+    150, "a late older read replaced the newer failure");
+  assert(buttons().includes("Retry from step 2"), "the failure lost its retry control");
+  // A read from before the dialog closed never lands in the reopened one.
+  held = [];
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => held.length === 1, "the read before closing was not issued");
+  render(false); await settle();
+  render(true);
+  await until(() => held.length === 2, "reopening did not read again");
+  held[1].resolve(response(failedDetail));
+  await until(() => buttons().includes("Retry from step 2"), "the reopened dialog did not load");
+  held[0].resolve(response(running));
+  await remainsTrue(() => !buttons().includes("Cancel setup"), 150, "a read from before closing replaced the reopened dialog's state");
+  held = null;
+
+  // Unconfirmed processes hold agent work until the user acknowledges them.
+  detail = { ...interrupted, state: { ...interrupted.state, outcomeUnknown: true } };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => buttons().includes("Acknowledge"), "unconfirmed processes offered no acknowledgement");
+  const acknowledge = [...dialog().querySelectorAll("button")].find((button) => button.textContent === "Acknowledge");
+  assert(acknowledge.disabled, "acknowledgement did not wait for the user's confirmation");
+  assert(/agent runs here wait/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? ""), "the hold on agent runs was not stated");
+  const confirm = dialog().querySelector('.lifecycle-acknowledge input[type="checkbox"]');
+  confirm.click();
+  await until(() => !acknowledge.disabled, "the acknowledgement stayed disabled");
+  detail = interrupted;
+  acknowledge.click();
+  await until(() => posts.some((post) => post.path === "/api/worktrees/lifecycle/acknowledge"), "the acknowledgement was not sent");
+  const sentAcknowledgement = posts.find((post) => post.path === "/api/worktrees/lifecycle/acknowledge");
+  assert(sentAcknowledgement.body.worktreePath === worktree.path && sentAcknowledgement.body.projectId === project.id, "the acknowledgement named another worktree");
+  await until(() => !buttons().includes("Acknowledge"), "the acknowledged state was not reloaded");
   assert(errors.length === 0, `unexpected lifecycle errors: ${errors.map((error) => error.message).join("; ")}`);
 
   const failure = Object.assign(new Error("Teardown did not finish"), { payload: { code: "LIFECYCLE_OUTCOME_UNKNOWN" } });
@@ -1043,7 +1099,8 @@ async function worktreeLifecycleRegression() {
   radios[1].click();
   await until(() => problem.choice === "skip", "skip was not chosen");
   host.querySelector("button").click();
-  assert(sent.at(-1)?.skipTeardown === true && sent.at(-1).acknowledgeUnconfirmed === undefined, "skip carried the acknowledgement");
+  assert(sent.at(-1)?.skipTeardown === true && sent.at(-1).acknowledgeUnconfirmed === true, "skipping beside unconfirmed processes did not acknowledge them");
+  assert(/confirmed stopped/.test(radios[1].closest("label").textContent), "the skip choice did not say it acknowledges the processes");
   root.render(null); await settle();
 }
 

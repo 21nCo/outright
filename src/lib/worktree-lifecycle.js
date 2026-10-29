@@ -11,8 +11,16 @@ function stepText(state) {
 }
 
 // What the toolbar and sidebar say about a state. `quiet` states need no
-// attention and show no chip, but their change is still announced.
+// attention and show no chip, but their change is still announced. Processes
+// that could not be confirmed stopped hold agent work, which the label says.
 export function lifecycleSummary(state) {
+  const summary = statusSummary(state);
+  if (!summary || !state.outcomeUnknown || state.status === "running") return summary;
+  return { ...summary, tone: "attention", quiet: undefined,
+    label: `${summary.label}; its processes are not confirmed stopped, so agent runs here wait` };
+}
+
+function statusSummary(state) {
   if (!state?.status) return null;
   const phase = PHASE_NAMES[state.phase] ?? "Setup";
   const count = state.steps?.length ?? 0;
@@ -80,15 +88,16 @@ export function teardownProblem(error, worktreePath) {
   if (!TEARDOWN_PROBLEMS.includes(code)) return null;
   const outcomeUnknown = code === "LIFECYCLE_OUTCOME_UNKNOWN" || Boolean(error.payload?.lifecycle?.outcomeUnknown);
   const choices = code === "WORKTREE_AGENT_ACTIVE" ? [] : [outcomeUnknown ? "acknowledge" : "retry", "skip"];
-  return { code, message: error.message, worktreePath, choices, choice: outcomeUnknown ? "" : choices[0] ?? "" };
+  return { code, message: error.message, worktreePath, choices, outcomeUnknown, choice: outcomeUnknown ? "" : choices[0] ?? "" };
 }
 
 // The removal request. A skip or an acknowledgement applies only to the
-// worktree whose problem the user saw, and only as one of its choices.
+// worktree whose problem the user saw, and only as one of its choices. Where
+// processes are unconfirmed, skipping teardown acknowledges them too.
 export function removalRequest({ projectId, worktreePath, confirmation }, problem) {
   const body = { projectId, worktreePath, confirmation };
   if (problem?.worktreePath !== worktreePath || !problem.choices.includes(problem.choice)) return body;
   if (problem.choice === "skip") body.skipTeardown = true;
-  if (problem.choice === "acknowledge") body.acknowledgeUnconfirmed = true;
+  if (problem.choice === "acknowledge" || (problem.choice === "skip" && problem.outcomeUnknown)) body.acknowledgeUnconfirmed = true;
   return body;
 }

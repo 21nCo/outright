@@ -140,10 +140,12 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   } });
   const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl), subprocesses });
   // Setup and teardown never run beside agent work in the same worktree: the
-  // agent manager holds queued runs while a worktree is held, and a run that
-  // waited launches when the hold ends.
+  // agent manager holds queued runs while a worktree is held, including while
+  // a step's processes are unconfirmed, and a run that waited launches when
+  // the hold ends. Neither starts beside an unresolved interrupted run.
   const lifecycle = createWorktreeLifecycle({ database, subprocesses: lifecycleSubprocesses, publish: (event) => publish(event),
     agentWork: (paths) => agents?.hasWorktreeWork(paths) ?? false,
+    interruptedRun: (paths) => paths.map((worktreePath) => database.findUnresolvedInterruptedRunForWorktree(worktreePath)).find(Boolean) ?? null,
     onRelease: () => { if (!shuttingDown) agents?.resumeQueued(); },
     onPersistError: (error) => {
       if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:worktree-lifecycle]", error);
@@ -176,7 +178,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       }
     },
     onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }),
-    worktreeHeld: (worktreePath) => lifecycle.busy(worktreePath), validateConversation: async (conversation) => {
+    worktreeHeld: (worktreePath) => Boolean(lifecycle.hold(worktreePath)), validateConversation: async (conversation) => {
     const target = await resolveWorktreeTarget(conversation);
     return () => {
       if (database.getConversation(conversation.id)?.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
@@ -285,9 +287,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (resolved && !shuttingDown) await terminals.reconcileUnknown();
       }).catch(() => {});
     }
-    if (lifecycleSubprocesses !== subprocesses && typeof lifecycleSubprocesses.reconcileUnknown === "function") {
-      void Promise.resolve().then(() => lifecycleSubprocesses.reconcileUnknown()).then(onRecovered).catch(() => {});
-    }
+    // Proving the previous runtime's setup and teardown steps gone releases
+    // the worktrees they held.
+    void Promise.resolve().then(() => lifecycle.reconcile()).then(onRecovered).catch(() => {});
   }
   startOwnershipRecovery();
 
@@ -433,6 +435,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
     // A terminal proof may have waited only for this helper slot.
     if (!shuttingDown) void terminals.reconcileUnknown().catch(() => {});
+    // The last unconfirmed step may now be proven gone.
+    if (!shuttingDown && budget === lifecycleSubprocesses) void lifecycle.reconcile().catch(() => {});
     return { released, capacity: runtimeCapacity() };
   }
 
@@ -772,7 +776,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (currentInterrupted) throw apiError(409, "Resolve the interrupted run before starting more agent work", { code: "RUN_RECOVERY_REQUIRED", runId: currentInterrupted.id });
         // An agent would race setup commands that are still changing the
         // worktree, or work in one being torn down.
-        if (lifecycle.busy(target.worktreePath)) throw apiError(409, "Worktree setup or teardown is running; start work when it finishes", { code: "WORKTREE_LIFECYCLE_BUSY" });
+        const lifecycleHold = lifecycle.hold(target.worktreePath) ?? lifecycle.hold(conversation.worktreePath);
+        if (lifecycleHold === "WORKTREE_LIFECYCLE_BUSY") throw apiError(409, "Worktree setup or teardown is running; start work when it finishes", { code: lifecycleHold });
+        if (lifecycleHold) throw apiError(409, "Setup or teardown processes in this worktree are not confirmed stopped; acknowledge them in Worktree setup first", { code: lifecycleHold });
         const { run, message: userMessage } = database.submitRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, ...runConfig, prompt }, prompt);
         publish({ type: "message.created", conversationId: conversation.id, payload: userMessage });
         return json(response, 202, await agents.schedule({ conversation: database.getConversation(conversation.id), run }));
@@ -1039,13 +1045,14 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const target = await resolveLifecycleTarget({ projectId: url.searchParams.get("projectId"), worktreePath: requiredQuery(url, "path") });
         return json(response, 200, await lifecycle.describe(target));
       }
-      const lifecycleMatch = url.pathname.match(/^\/api\/worktrees\/lifecycle\/(trust|setup|cancel)$/);
+      const lifecycleMatch = url.pathname.match(/^\/api\/worktrees\/lifecycle\/(trust|setup|cancel|acknowledge)$/);
       if (lifecycleMatch && request.method === "POST") {
         const body = await readJson(request);
         if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Worktree target is required");
         const target = await resolveLifecycleTarget(body);
         if (lifecycleMatch[1] === "trust") return json(response, 200, await lifecycle.trust(target, body.digest));
         if (lifecycleMatch[1] === "cancel") return json(response, 200, { state: lifecycle.cancel(target) });
+        if (lifecycleMatch[1] === "acknowledge") return json(response, 200, { state: lifecycle.acknowledge(target) });
         return json(response, 202, { state: await lifecycle.setup(target, { acknowledgeUnconfirmed: body.acknowledgeUnconfirmed === true }) });
       }
 

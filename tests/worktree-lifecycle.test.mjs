@@ -22,6 +22,10 @@ test("summaries say which step a run is on and never call an unfinished worktree
     assert.equal(summary.quiet, undefined, `${status} must stay visible`);
   }
   assert.equal(lifecycleSummary({ phase: "setup", status: "ready", steps, stepIndex: 3 }).quiet, true);
+  // Unconfirmed processes hold agent work, and the summary says so.
+  const unconfirmed = lifecycleSummary({ phase: "setup", status: "interrupted", steps, stepIndex: 1, outcomeUnknown: true });
+  assert.equal(unconfirmed.tone, "attention");
+  assert.match(unconfirmed.label, /^Setup interrupted at step 2 of 3, Migrate; its processes are not confirmed stopped, so agent runs here wait$/);
 });
 
 test("streamed output appends once, in order, and asks for a reload across a gap or a new run", () => {
@@ -67,6 +71,8 @@ test("a teardown acknowledgement or skip is explicit, and applies only to the wo
     assert.deepEqual([problem.choices, problem.choice], [["acknowledge", "skip"], ""]);
     assert.deepEqual(removalRequest(base, problem), base);
     assert.deepEqual(removalRequest(base, { ...problem, choice: "acknowledge" }), { ...base, acknowledgeUnconfirmed: true });
+    // Skipping teardown beside unconfirmed processes acknowledges them too.
+    assert.deepEqual(removalRequest(base, { ...problem, choice: "skip" }), { ...base, skipTeardown: true, acknowledgeUnconfirmed: true });
   }
   const acknowledged = { ...teardownProblem(failure("LIFECYCLE_OUTCOME_UNKNOWN"), "/w/a"), choice: "acknowledge" };
   assert.deepEqual(removalRequest({ ...base, worktreePath: "/w/b", confirmation: "/w/b" }, acknowledged),

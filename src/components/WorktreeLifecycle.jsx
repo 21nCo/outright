@@ -44,13 +44,23 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
   const pinnedRef = useRef(true);
   // The runtime's canonical form of this worktree's path, once loaded.
   const canonicalRef = useRef(null);
+  // Reads overlap (open, events, reconnect, actions). Only a response to a
+  // read issued after the one shown may replace it, so a slow older read
+  // never hides a newer state; closing or retargeting discards all reads.
+  const issuedRef = useRef(0);
+  const shownRef = useRef(0);
   const target = { projectId: project.id, worktreePath: worktree.path };
   const load = useCallback(async () => {
+    const generation = ++issuedRef.current;
     try {
       const next = await api(query("/api/worktrees/lifecycle", { projectId: project.id, path: worktree.path }));
+      if (generation <= shownRef.current) return;
+      shownRef.current = generation;
       canonicalRef.current = next.worktreePath ?? null;
       setDetail(next);
-    } catch (error) { onError(error); }
+    } catch (error) {
+      if (generation > shownRef.current) onError(error);
+    }
   }, [project.id, worktree.path, onError]);
 
   useEffect(() => {
@@ -73,6 +83,8 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
       events.removeEventListener("state", onState);
       events.removeEventListener("output", onOutput);
       events.removeEventListener("reconnect", onReconnect);
+      shownRef.current = issuedRef.current;
+      canonicalRef.current = null;
     };
   }, [open, load, events, worktree.path]);
 
@@ -103,11 +115,11 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
   const running = Boolean(detail?.running);
   const canTrust = Boolean(config && !config.error && !config.trusted && (config.setup.length || config.teardown.length));
   const canRun = Boolean(config && !config.error && config.trusted && config.setup.length && !running);
-  const checkpoint = setupCheckpoint(state);
+  const checkpoint = state?.checkpoints?.setup;
   let runLabel = "Run setup";
   if (checkpoint && checkpoint.configDigest === config?.digest) runLabel = `Retry from step ${checkpoint.stepIndex + 1}`;
   else if (state?.phase === "setup" && state.status === "ready") runLabel = "Run setup again";
-  const needsAcknowledgement = Boolean(state?.outcomeUnknown);
+  const needsAcknowledgement = Boolean(state?.outcomeUnknown) && !running;
 
   return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent className="lifecycle-dialog">
     <DialogHeader><DialogTitle>Worktree setup</DialogTitle><DialogDescription>{project.name} / {worktree.name}</DialogDescription></DialogHeader>
@@ -117,7 +129,7 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
     {config && !config.error && <>
       <p className={`lifecycle-trust ${config.trusted ? "trusted" : ""}`}>{config.trusted
         ? <><CheckCircle aria-hidden="true" />You trusted this exact version of <code>{detail.file}</code>.</>
-        : <><ShieldWarning aria-hidden="true" />Review these commands. Once trusted, they run as you, in this worktree, with your environment. Trust covers only this exact file; any change needs a new review.</>}</p>
+        : <><ShieldWarning aria-hidden="true" />Review these commands. Once trusted, they run as you, in this worktree, with your environment. Trust covers only the command lines in this exact file, and any change to it needs a new review. Scripts and package hooks those commands run are not reviewed and can change without one.</>}</p>
       <StepList title="Setup" steps={config.setup} current={state?.phase === "setup" ? state : null} />
       <StepList title="Teardown" steps={config.teardown} current={state?.phase === "teardown" ? state : null} />
     </>}
@@ -125,22 +137,16 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
     {state?.output ? <pre ref={outputRef} className="lifecycle-output" tabIndex={0} aria-label={`${state.phase === "teardown" ? "Teardown" : "Setup"} output`}
       onScroll={(event) => { const element = event.currentTarget; pinnedRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 24; }}>
       {state.outputTruncated ? "… earlier output was not kept\n" : ""}{state.output}</pre> : null}
-    {needsAcknowledgement && !running && state.phase === "teardown" && <p className="lifecycle-note">To run teardown again, remove the worktree again and acknowledge there.</p>}
-    {needsAcknowledgement && !running && canRun && <label className="lifecycle-acknowledge"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} />The last {state.phase}'s processes could not be confirmed stopped. I checked them; run setup anyway.</label>}
+    {needsAcknowledgement && <p className="lifecycle-note">Agent runs in this worktree wait until these processes are confirmed stopped or you acknowledge them.{state.phase === "teardown" ? " To run teardown again, remove the worktree again and acknowledge there." : ""}</p>}
+    {needsAcknowledgement && <label className="lifecycle-acknowledge"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} />The last {state.phase}'s processes could not be confirmed stopped. I checked them.</label>}
     <DialogFooter>
       <Button variant="outline" onClick={() => onOpenChange(false)}>Close</Button>
       {running && <Button variant="destructive" disabled={busy} onClick={() => act("/api/worktrees/lifecycle/cancel")}>Cancel {detail.running}</Button>}
+      {needsAcknowledgement && <Button variant="outline" disabled={busy || !acknowledged} onClick={() => act("/api/worktrees/lifecycle/acknowledge")}>Acknowledge</Button>}
       {!running && canTrust && <Button disabled={busy} onClick={trustAndRun}>{config.setup.length ? "Trust and run setup" : "Trust teardown"}</Button>}
       {canRun && <Button disabled={busy || (needsAcknowledgement && !acknowledged)} onClick={() => act("/api/worktrees/lifecycle/setup", { acknowledgeUnconfirmed: acknowledged })}>{runLabel}</Button>}
     </DialogFooter>
   </DialogContent></Dialog>;
-}
-
-// Where a setup retry resumes: a failed, cancelled or interrupted setup, or
-// the checkpoint a later refusal kept.
-function setupCheckpoint(state) {
-  if (state?.phase === "setup" && ["failed", "cancelled", "interrupted"].includes(state.status)) return state;
-  return state?.checkpoint?.phase === "setup" ? state.checkpoint : null;
 }
 
 const TEARDOWN_CHOICE_LABELS = {
@@ -148,12 +154,14 @@ const TEARDOWN_CHOICE_LABELS = {
   acknowledge: "The last attempt's processes could not be confirmed stopped. I checked them; run teardown again from the step that did not finish",
   skip: "Remove without running teardown; its cleanup will not happen",
 };
+const UNCONFIRMED_SKIP_LABEL = "The last attempt's processes could not be confirmed stopped. I checked them; remove without running teardown, so its cleanup will not happen";
 
 // The explicit next step after a teardown problem kept a worktree.
 export function TeardownChoices({ problem, onChoose }) {
   if (!problem?.choices.length) return null;
   return <fieldset className="lifecycle-choices"><legend>Next attempt</legend>{problem.choices.map((choice) => <label key={choice} className="lifecycle-acknowledge">
-    <input type="radio" name="teardown-choice" value={choice} checked={problem.choice === choice} onChange={() => onChoose(choice)} />{TEARDOWN_CHOICE_LABELS[choice]}
+    <input type="radio" name="teardown-choice" value={choice} checked={problem.choice === choice} onChange={() => onChoose(choice)} />
+    {choice === "skip" && problem.outcomeUnknown ? UNCONFIRMED_SKIP_LABEL : TEARDOWN_CHOICE_LABELS[choice]}
   </label>)}</fieldset>;
 }
 

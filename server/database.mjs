@@ -2152,7 +2152,8 @@ export function createOutrightDatabase(options = {}) {
         db.prepare(`INSERT INTO worktree_lifecycle (worktree_path, project_id, state, updated_at) VALUES (?, ?, ?, ?)
           ON CONFLICT(worktree_path) DO UPDATE SET project_id = excluded.project_id, state = excluded.state, updated_at = excluded.updated_at`)
           .run(state.worktreePath, state.projectId, JSON.stringify(state), state.updatedAt ?? now());
-        db.prepare(`DELETE FROM worktree_lifecycle WHERE worktree_path NOT IN (
+        // A state with unconfirmed processes holds its worktree and is kept.
+        db.prepare(`DELETE FROM worktree_lifecycle WHERE COALESCE(json_extract(state, '$.outcomeUnknown'), 0) = 0 AND worktree_path NOT IN (
           SELECT worktree_path FROM worktree_lifecycle ORDER BY updated_at DESC, worktree_path LIMIT ?)`).run(MAX_WORKTREE_LIFECYCLE_STATES);
         reserveRecoveryHeadroom(db);
       }).immediate();

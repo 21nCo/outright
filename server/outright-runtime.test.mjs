@@ -3730,3 +3730,42 @@ test("a created worktree waits for trusted setup, refuses agent work until ready
   assert.equal(existsSync(added.path), false);
   assert.equal((await callRuntime(runtime, "GET", "/api/bootstrap")).body.worktreeLifecycle.some((state) => state.worktreeId === added.id), false);
 }, { agentManagerFactory: (options) => createAgentManager(lifecycleAgentOptions = options) }));
+
+let unconfirmedAgentOptions;
+test("unconfirmed setup processes hold agent work until acknowledged, and setup waits for an interrupted run", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  writeFileSync(path.join(worktree.path, "outright.worktree.json"), JSON.stringify({ version: 1,
+    setup: [{ name: "Serve", command: [process.execPath, "-e", "0"] }] }));
+  const target = { projectId: project.id, worktreePath: worktree.path };
+  const query = `/api/worktrees/lifecycle?projectId=${encodeURIComponent(project.id)}&path=${encodeURIComponent(worktree.path)}`;
+  const digest = (await callRuntime(runtime, "GET", query)).body.config.digest;
+  assert.equal((await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/trust", { ...target, digest })).statusCode, 200);
+
+  // Setup and teardown wait for an interrupted agent run the user has not resolved.
+  const findInterrupted = runtime.database.findUnresolvedInterruptedRunForWorktree;
+  runtime.database.findUnresolvedInterruptedRunForWorktree = () => ({ id: "run-interrupted" });
+  const refused = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/setup", target);
+  runtime.database.findUnresolvedInterruptedRunForWorktree = findInterrupted;
+  assert.equal(refused.body.code, "RUN_RECOVERY_REQUIRED", refused.raw);
+  assert.equal((await callRuntime(runtime, "GET", query)).body.state, null, "a step ran beside the interrupted run");
+
+  assert.equal((await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/setup", target)).statusCode, 202);
+  let state;
+  for (const deadline = Date.now() + 15_000; !state || state.status === "running"; await new Promise((resolve) => setTimeout(resolve, 20))) {
+    if (Date.now() > deadline) assert.fail("setup did not settle");
+    state = (await callRuntime(runtime, "GET", query)).body.state;
+  }
+  assert.deepEqual([state.status, state.outcomeUnknown], ["failed", true]);
+  // The run ended, but its processes did not provably: agent work waits.
+  assert.equal(unconfirmedAgentOptions.worktreeHeld(worktree.path), true);
+  const conversation = runtime.database.createConversation({ ...target, worktreeId: worktree.id, title: "Beside", provider: "codex" });
+  const beside = await callRuntime(runtime, "POST", `/api/conversations/${conversation.id}/runs`, { prompt: "start beside unconfirmed processes" });
+  assert.equal(beside.body.code, "WORKTREE_LIFECYCLE_UNCONFIRMED", beside.raw);
+  assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+
+  const acknowledged = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/acknowledge", target);
+  assert.equal(acknowledged.statusCode, 200, acknowledged.raw);
+  assert.equal(acknowledged.body.state.outcomeUnknown, false);
+  assert.equal(unconfirmedAgentOptions.worktreeHeld(worktree.path), false);
+}, { agentManagerFactory: (options) => createAgentManager(unconfirmedAgentOptions = options),
+  lifecycleSubprocesses: { capacity: () => ({ active: 1, limit: 4, unknown: 1 }), reconcileUnknown: async () => 0, unknownOwnerStatus: () => [],
+    run: async () => { throw Object.assign(new Error("ownership unknown"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN", cause: new Error("lost") }); } } }));
