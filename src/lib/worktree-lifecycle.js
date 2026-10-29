@@ -32,6 +32,7 @@ function statusSummary(state) {
     }
     case "ready": return { tone: "ready", quiet: true, short: "Ready", label: "Setup finished; the worktree is ready" };
     case "complete": return { tone: "ready", quiet: true, short: "Torn down", label: "Teardown finished" };
+    case "trusted": return { tone: "ready", quiet: true, short: "Trusted", label: `${phase} commands trusted; they have not run yet` };
     case "needs-trust": return { tone: "trust", short: `Review ${state.phase}`, label: `${phase} commands need your review before they run` };
     case "invalid": return { tone: "attention", short: `${phase} invalid`, label: `${phase} configuration is invalid` };
     case "failed":
@@ -64,16 +65,28 @@ export function lifecycleOutputUpdate(state, payload) {
   return { ...state, output, outputEnd: stop, outputTruncated };
 }
 
+// States and removals carry the runtime's revision, which only grows. An
+// event replaces what the client has for its path unless that is newer; a
+// removal is kept as a marker so an older state cannot return.
 export function upsertLifecycleState(states, payload) {
-  const others = (states ?? []).filter((state) => state.worktreePath !== payload.worktreePath);
-  return payload.removed ? others : [payload, ...others];
+  const current = (states ?? []).find((state) => state.worktreePath === payload.worktreePath);
+  if (current?.revision > payload.revision) return states;
+  return [payload, ...(states ?? []).filter((state) => state !== current)];
+}
+
+// A bootstrap snapshot, read at `revision`, replaces what the client has,
+// except states and removals published after it was read.
+export function mergeLifecycleSnapshot(states, snapshot, revision) {
+  const newer = (states ?? []).filter((state) => state.revision > revision);
+  const paths = new Set(newer.map((state) => state.worktreePath));
+  return [...newer, ...(snapshot ?? []).filter((state) => !paths.has(state.worktreePath))];
 }
 
 // States are matched by path: scanner ids are path slugs that two worktrees
 // can share.
 export function lifecycleFor(states, project, worktree) {
   if (!project || !worktree?.path) return null;
-  return (states ?? []).find((state) => state.projectId === project.id
+  return (states ?? []).find((state) => !state.removed && state.projectId === project.id
     && (state.discoveredPath ?? state.worktreePath) === worktree.path) ?? null;
 }
 

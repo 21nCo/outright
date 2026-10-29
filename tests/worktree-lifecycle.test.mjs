@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LIFECYCLE_OUTPUT_CHARACTERS, lifecycleFor, lifecycleOutputUpdate, lifecycleSummary, removalRequest, teardownProblem, upsertLifecycleState } from "../src/lib/worktree-lifecycle.js";
+import { LIFECYCLE_OUTPUT_CHARACTERS, lifecycleFor, lifecycleOutputUpdate, lifecycleSummary, mergeLifecycleSnapshot, removalRequest, teardownProblem, upsertLifecycleState } from "../src/lib/worktree-lifecycle.js";
 import { LIFECYCLE_LIMITS } from "../server/worktree-lifecycle.mjs";
 
 const steps = ["Install", "Migrate", "Seed"];
@@ -52,6 +52,28 @@ test("state events replace or remove a worktree's state by path, and lookup neve
   assert.equal(lifecycleFor(updated, { id: "q" }, { id: "foo-bar", path: "/w/foo_bar" }), null);
   assert.equal(updated.length, 2);
   assert.equal(lifecycleFor(upsertLifecycleState(updated, { worktreePath: "/real/foo-bar", removed: true }), { id: "p" }, { path: "/w/foo-bar" }), null);
+});
+
+test("an older event or snapshot never replaces a newer state or removal", () => {
+  const project = { id: "p" };
+  const worktree = { path: "/w/a" };
+  const state = (status, revision) => ({ worktreePath: "/w/a", projectId: "p", phase: "setup", status, steps: ["Install"], stepIndex: 0, revision });
+  // Events out of order: the older running state does not replace the failure.
+  let states = upsertLifecycleState(upsertLifecycleState([], state("failed", 5)), state("running", 4));
+  assert.equal(lifecycleFor(states, project, worktree).status, "failed");
+  // A snapshot read before the failure keeps it; one read after replaces it.
+  assert.equal(lifecycleFor(mergeLifecycleSnapshot(states, [state("running", 3)], 4), project, worktree).status, "failed");
+  assert.equal(lifecycleFor(mergeLifecycleSnapshot(states, [state("ready", 6)], 6), project, worktree).status, "ready");
+  // A snapshot read after the failure that no longer lists it was evicted or forgotten.
+  assert.equal(lifecycleFor(mergeLifecycleSnapshot(states, [], 5), project, worktree), null);
+  // A removal after the snapshot was read hides the snapshot's state, and an
+  // older state event cannot bring it back.
+  states = upsertLifecycleState(states, { worktreePath: "/w/a", removed: true, revision: 7 });
+  assert.equal(lifecycleFor(mergeLifecycleSnapshot(states, [state("running", 3)], 6), project, worktree), null);
+  assert.equal(lifecycleFor(upsertLifecycleState(states, state("running", 6)), project, worktree), null);
+  assert.equal(lifecycleFor(upsertLifecycleState(states, state("running", 8)), project, worktree).status, "running");
+  // A trusted refusal no longer asks for review.
+  assert.equal(lifecycleSummary(state("trusted", 9)).quiet, true);
 });
 
 test("a teardown acknowledgement or skip is explicit, and applies only to the worktree whose problem was shown", () => {

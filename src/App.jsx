@@ -34,7 +34,7 @@ import { modelMismatch, providerOptionLabel, providerReady, providerStatusText, 
 import { answerAccountText, runAccountText, withStartedRunAccount } from "@/lib/provider-accounts";
 import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, messagePrecedesPage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "@/recovery-policy";
 import { createTerminalCommandFence } from "@/lib/terminal-command-fence";
-import { lifecycleFor, removalRequest, teardownProblem, upsertLifecycleState } from "@/lib/worktree-lifecycle";
+import { lifecycleFor, mergeLifecycleSnapshot, removalRequest, teardownProblem, upsertLifecycleState } from "@/lib/worktree-lifecycle";
 import { PANE_LAYOUT_PRESETS, PANE_STORE_PROBLEMS, applyPreset, defaultPaneLayout, focusView, layoutViews, loadPaneLayout, paneRestoreMessage, savePaneLayout } from "@/lib/pane-layout";
 
 const CHAT_TAB_DRAG_TYPE = "application/x-outright-chat-tab";
@@ -66,6 +66,16 @@ function bootstrapFailureOutcome(error, manual) {
 
 export function App() {
   const [bootstrap, setBootstrap] = useState(null);
+  // Worktree setup and teardown states, merged from bootstrap snapshots and
+  // events by revision, so neither hides a newer one; a snapshot older than
+  // one already applied is ignored.
+  const [lifecycleStates, setLifecycleStates] = useState([]);
+  const lifecycleSnapshotRef = useRef(-Infinity);
+  const applyLifecycleSnapshot = useCallback((next) => {
+    if (!Array.isArray(next?.worktreeLifecycle) || next.worktreeLifecycleRevision < lifecycleSnapshotRef.current) return;
+    lifecycleSnapshotRef.current = next.worktreeLifecycleRevision ?? -Infinity;
+    setLifecycleStates((current) => mergeLifecycleSnapshot(current, next.worktreeLifecycle, next.worktreeLifecycleRevision));
+  }, []);
   const [bootstrapError, setBootstrapError] = useState("");
   const bootstrapLoadRef = useRef(null);
   const [selectedProjectId, setSelectedProjectId] = useState(() => localStorage.getItem("outright.selected-project") || "");
@@ -262,6 +272,7 @@ export function App() {
       if (!isCurrent()) return false;
       if (manual) setBootstrap((current) => ({ ...current, ...next }));
       else setBootstrap(next);
+      applyLifecycleSnapshot(next);
       if (!manual) setBootstrapError("");
       if (manual) setToast(`Found ${next.projects.length} Git projects`);
       return true;
@@ -273,7 +284,7 @@ export function App() {
       return outcome;
     }
     finally { if (isCurrent()) setIsScanning(false); }
-  }, []);
+  }, [applyLifecycleSnapshot]);
 
   useEffect(() => {
     let stopped = false;
@@ -326,7 +337,7 @@ export function App() {
 
   const project = bootstrap?.projects.find((item) => item.id === selectedProjectId);
   const worktree = project?.worktrees.find((item) => item.id === selectedWorktreeId);
-  const worktreeLifecycle = lifecycleFor(bootstrap?.worktreeLifecycle, project, worktree);
+  const worktreeLifecycle = lifecycleFor(lifecycleStates, project, worktree);
   useEffect(() => {
     const pending = pendingWorktreeRef.current;
     const createdProject = pending && bootstrap?.projects.find((item) => item.id === pending.projectId);
@@ -746,13 +757,18 @@ export function App() {
     }
     if (event.type === "providers.changed") setBootstrap((current) => current ? { ...current, providers: event.payload.providers } : current);
     if (event.type === "worktree.lifecycle" && event.payload?.worktreePath) {
-      setBootstrap((current) => current ? { ...current, worktreeLifecycle: upsertLifecycleState(current.worktreeLifecycle, event.payload) } : current);
+      setLifecycleStates((current) => upsertLifecycleState(current, event.payload));
       lifecycleEvents.dispatchEvent(new CustomEvent("state", { detail: event.payload }));
     }
     if (event.type === "worktree.lifecycle.output" && event.payload) lifecycleEvents.dispatchEvent(new CustomEvent("output", { detail: event.payload }));
     // Output is never replayed, and a restarted runtime reports an
     // interrupted run without an event: an open setup dialog reloads.
     if (event.type === "runtime.connected") lifecycleEvents.dispatchEvent(new CustomEvent("reconnect"));
+    if (event.type === "runtime.connected" && event.payload?.restarted) {
+      // Another runtime's states and revisions do not compare with this one's.
+      lifecycleSnapshotRef.current = -Infinity;
+      setLifecycleStates([]);
+    }
     if (event.type === "runtime.connected" && (event.payload?.replay?.missed || event.payload?.restarted)) {
       loadBootstrap();
       loadConversation({ preservePage: true });
@@ -1971,6 +1987,7 @@ export function App() {
       const next = await api("/api/bootstrap");
       if (request !== settingsRefreshRef.current) return;
       setBootstrap((current) => ({ ...next, settings: settingsVersion === settingsVersionRef.current ? next.settings : current.settings }));
+      applyLifecycleSnapshot(next);
       if (includeTemplates) setToast("Templates updated");
     } catch (nextError) { if (request === settingsRefreshRef.current) setError(nextError.message); }
   }
@@ -2045,7 +2062,7 @@ export function App() {
       <header className="sidebar-brand"><div className="brand-lockup"><span className="brand-glyph"><Sparkle weight="fill" /></span><strong>Outright</strong></div><Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon-sm" onClick={closeSidebar} aria-label="Close projects sidebar" />}><SidebarSimple /></TooltipTrigger><TooltipContent>Close sidebar</TooltipContent></Tooltip></header>
       <div className="sidebar-actions"><Button className="new-chat-action" onClick={() => setNewChatOpen(true)}><Plus weight="bold" /> New chat <kbd>⌘N</kbd></Button><Button variant="ghost" className="sidebar-action" onClick={() => setCommandOpen(true)}><MagnifyingGlass /> Search <kbd>⌘K</kbd></Button><Button variant="ghost" className="sidebar-action" onClick={() => loadBootstrap(true)}><ArrowsClockwise className={isScanning ? "spin" : ""} /> Scan projects</Button></div>
       <Separator /><div className="project-section-heading"><span>Projects</span><Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon-xs" onClick={() => setNewSpaceOpen(true)} aria-label="New space" />}><FolderPlus /></TooltipTrigger><TooltipContent>New space</TooltipContent></Tooltip></div>
-      <ScrollArea className="project-scroll" viewportProps={{ tabIndex: 0, "aria-label": "Spaces, projects, and worktrees", onKeyDown: navigateProjectButtons }}><div className="space-list">{spaceProjects.map((space) => { const isOpen = expandedSpaces[space.id] ?? true; return <section className="project-space" key={space.id}><button className="space-heading" aria-expanded={isOpen} onClick={() => setExpandedSpaces((current) => ({ ...current, [space.id]: !isOpen }))}>{isOpen ? <CaretDown /> : <CaretRight />}<Folders weight="duotone" /><span>{space.name}</span><small>{space.projects.length}</small></button>{isOpen && space.projects.map((item) => <ProjectTree key={item.id} project={item} activeProjectId={project.id} activeWorktreeId={worktree.id} expanded={expandedProjects[item.id] ?? item.id === project.id} spaces={spaces.spaces} onToggle={() => setExpandedProjects((current) => ({ ...current, [item.id]: !(current[item.id] ?? item.id === project.id) }))} onSelectProject={() => chooseProject(item)} onSelectWorktree={(nextWorktree) => chooseProject(item, nextWorktree)} onMove={(spaceId) => moveProject(item.id, spaceId)} onCreateWorktree={() => setWorktreeDialog(item)} lifecycle={bootstrap.worktreeLifecycle} />)}</section>; })}</div></ScrollArea>
+      <ScrollArea className="project-scroll" viewportProps={{ tabIndex: 0, "aria-label": "Spaces, projects, and worktrees", onKeyDown: navigateProjectButtons }}><div className="space-list">{spaceProjects.map((space) => { const isOpen = expandedSpaces[space.id] ?? true; return <section className="project-space" key={space.id}><button className="space-heading" aria-expanded={isOpen} onClick={() => setExpandedSpaces((current) => ({ ...current, [space.id]: !isOpen }))}>{isOpen ? <CaretDown /> : <CaretRight />}<Folders weight="duotone" /><span>{space.name}</span><small>{space.projects.length}</small></button>{isOpen && space.projects.map((item) => <ProjectTree key={item.id} project={item} activeProjectId={project.id} activeWorktreeId={worktree.id} expanded={expandedProjects[item.id] ?? item.id === project.id} spaces={spaces.spaces} onToggle={() => setExpandedProjects((current) => ({ ...current, [item.id]: !(current[item.id] ?? item.id === project.id) }))} onSelectProject={() => chooseProject(item)} onSelectWorktree={(nextWorktree) => chooseProject(item, nextWorktree)} onMove={(spaceId) => moveProject(item.id, spaceId)} onCreateWorktree={() => setWorktreeDialog(item)} lifecycle={lifecycleStates} />)}</section>; })}</div></ScrollArea>
       <footer className="sidebar-footer"><span className={`status-dot ${connection === "connected" ? "live" : "demo"}`} aria-hidden="true" /><span role="status" aria-live="polite">{connection === "connected" ? "Runtime connected" : connection}</span>{bootstrap.truncated ? <small className="scan-limit" title={`Showing ${bootstrap.projects.length} of ${bootstrap.repositoryCount} discovered repositories. Increase maxProjects in outright.config.json to show more.`}><WarningCircle />{bootstrap.projects.length}/{bootstrap.repositoryCount}</small> : <small>{bootstrap.scanDurationMs ? `${Math.round(bootstrap.scanDurationMs)}ms` : ""}</small>}<Button variant="ghost" size="icon-xs" onClick={() => setSettingsOpen(true)} aria-label="Settings"><GearSix /></Button></footer>
     </aside>
     {isNarrow && sidebarOpen && <div className="mobile-scrim" onClick={closeSidebar} aria-hidden="true" />}

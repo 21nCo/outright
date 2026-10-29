@@ -1121,6 +1121,66 @@ async function worktreeLifecycleRegression() {
   host.querySelector("button").click();
   assert(sent.at(-1)?.acknowledgeUnconfirmed === "run-4" && sent.at(-1).skipTeardown === undefined, "the removal did not name the attempt shown");
   root.render(null); await settle();
+  await lifecycleStatusOrder();
+}
+
+// The toolbar chip, sidebar mark and announcement show the newest state:
+// a bootstrap snapshot read before an event never replaces it, whichever
+// arrives first, and events before the first bootstrap are kept.
+async function lifecycleStatusOrder() {
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const worktree = projects[0].worktrees[0];
+  const state = (status, revision) => ({ worktreePath: worktree.path, discoveredPath: worktree.path, projectId: "A", phase: "setup",
+    status, steps: ["Install", "Seed"], stepIndex: 1, runId: "run-1", revision });
+  let held = deferred();
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return held.promise;
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    return response({});
+  };
+  const snapshot = (states, revision) => response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" },
+    providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [], worktreeLifecycle: states, worktreeLifecycleRevision: revision });
+  const send = (event) => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
+  const chip = () => host.querySelector(".workspace-tools .lifecycle-state")?.textContent ?? "";
+  const mark = () => host.querySelector(".worktree-row.is-active .lifecycle-mark")?.textContent ?? "";
+  const announced = () => [...host.querySelectorAll('.workspace-tools [role="status"]')].map((node) => node.textContent).join(" ");
+  const sockets = fixtureSockets.length;
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => fixtureSockets.length > sockets, "the runtime socket did not open");
+  // An event before the first bootstrap answers is newer than its snapshot.
+  send({ type: "worktree.lifecycle", payload: state("failed", 12) });
+  held.resolve(snapshot([state("running", 10)], 11));
+  await until(() => chip() === "Setup failed", "the bootstrap snapshot replaced an earlier-delivered newer failure");
+  await remainsTrue(() => chip() === "Setup failed" && /Setup failed at step 2 of 2/.test(mark()), 150, "the sidebar did not show the newer failure");
+  // A reload is held while a newer state and then a removal arrive.
+  for (const [order, base] of [["event first", 20], ["snapshot first", 30]]) {
+    send({ type: "worktree.lifecycle", payload: state("running", base) });
+    await until(() => chip() === "Setup 2/2", `${order}: the running state was not shown`);
+    held = deferred();
+    send({ type: "runtime.connected", payload: { replay: { missed: true } } });
+    if (order === "event first") {
+      send({ type: "worktree.lifecycle", payload: state("failed", base + 2) });
+      await until(() => chip() === "Setup failed" && /Setup failed/.test(announced()), `${order}: the failure was not shown`);
+      held.resolve(snapshot([state("running", base)], base + 1));
+      await remainsTrue(() => chip() === "Setup failed" && /Setup failed/.test(mark()) && /Setup failed/.test(announced()), 150,
+        `${order}: an older snapshot replaced the newer failure (chip "${chip()}", mark "${mark()}", announced "${announced()}")`);
+      send({ type: "worktree.lifecycle", payload: { worktreePath: worktree.path, removed: true, revision: base + 3 } });
+    } else {
+      held.resolve(snapshot([state("running", base)], base + 1));
+      await settle();
+      send({ type: "worktree.lifecycle", payload: state("failed", base + 2) });
+      send({ type: "worktree.lifecycle", payload: { worktreePath: worktree.path, removed: true, revision: base + 3 } });
+      // A late copy of the failure never brings a removed state back.
+      send({ type: "worktree.lifecycle", payload: state("failed", base + 2) });
+    }
+    await until(() => !chip() && !mark(), `${order}: the removal was not shown`);
+    held = deferred();
+    send({ type: "runtime.connected", payload: { replay: { missed: true } } });
+    held.resolve(snapshot([state("failed", base + 2)], base + 2));
+    await remainsTrue(() => !chip() && !mark(), 150, `${order}: a snapshot read before the removal brought the state back`);
+  }
+  root.render(null); await settle();
 }
 
 async function settingsCapacityWithoutEventRegression() {

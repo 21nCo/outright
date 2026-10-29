@@ -465,6 +465,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/bootstrap" && request.method === "GET") {
         const scan = await projects();
         const spaces = database.listSpaces();
+        const lifecycleStates = await lifecycle.list();
         return json(response, 200, {
           ...scan,
           spaces,
@@ -473,7 +474,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           settings: database.getSettings(),
           providers: agents.providers(),
           trustedProjects: database.listTrustedProjects(),
-          worktreeLifecycle: lifecycle.list(),
+          // Clients keep lifecycle events published after this revision.
+          worktreeLifecycle: lifecycleStates.states,
+          worktreeLifecycleRevision: lifecycleStates.revision,
           templates: database.listTemplates(),
           // Clients list saved sessions over /api/terminals; bootstrap
           // stays independent of the history population.

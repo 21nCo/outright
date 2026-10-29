@@ -753,3 +753,53 @@ test("a running step's state survives retention however many newer states are sa
     stepIndex: 0, steps: ["Install"], updatedAt: new Date(newer + 514 * 1000).toISOString() });
   assert.equal(database.listWorktreeLifecycle().find((state) => state.worktreePath === repository)?.outcomeUnknown, true);
 }));
+
+test("status surfaces see the newest state of the worktree now at each path: revisions grow, trust settles a review refusal, and an earlier worktree's state is not listed", withLifecycle(async ({ repository, database, project, target, create, events }) => {
+  writeConfig(repository, { setup: [{ name: "Fail", command: node("process.exit(4)") }] });
+  let instance = "first";
+  const identify = async () => instance;
+  const exits = { capacity: () => ({ active: 0, limit: 4, unknown: 0 }), run: async () => { throw Object.assign(new Error("exited"), { code: 4 }); } };
+  const lifecycle = create({ identify, subprocesses: exits });
+  const published = () => events.filter((event) => event.type === "worktree.lifecycle").map((event) => event.payload);
+  // A refusal for review is listed, and trusting the file settles it,
+  // keeping its run id, so no status surface still asks for review.
+  const waiting = await lifecycle.setup(target, { automatic: true });
+  assert.equal(waiting.status, "needs-trust");
+  let listed = await lifecycle.list();
+  assert.deepEqual(listed.states.map((state) => state.status), ["needs-trust"]);
+  assert.ok(listed.revision >= waiting.revision);
+  await lifecycle.trust(target, (await readLifecycleConfig(repository)).digest);
+  const trusted = published().at(-1);
+  assert.deepEqual([trusted.status, trusted.runId, trusted.revision > waiting.revision], ["trusted", waiting.runId, true]);
+  listed = await lifecycle.list();
+  assert.deepEqual(listed.states.map((state) => state.status), ["trusted"]);
+  assert.ok(listed.revision >= trusted.revision);
+
+  await lifecycle.setup(target);
+  assert.equal((await settled(lifecycle, target)).state.status, "failed");
+  const revisions = published().map((state) => state.revision);
+  assert.deepEqual(revisions, [...revisions].sort((a, b) => a - b), "revisions did not grow with each state");
+  assert.equal(new Set(revisions).size, revisions.length);
+  assert.deepEqual((await lifecycle.list()).states.map((state) => state.status), ["failed"]);
+  // A worktree created again at the path, outside Outright, has no setup
+  // state yet: the list agrees with describe().
+  instance = "second";
+  assert.equal((await lifecycle.describe(target)).state, null);
+  assert.deepEqual((await lifecycle.list()).states, []);
+
+  // Unconfirmed processes belong to the path, whatever worktree is there.
+  instance = "first";
+  const failed = (await lifecycle.describe(target)).state;
+  database.saveWorktreeLifecycle({ ...failed, status: "running", output: undefined });
+  const successor = create({ identify, subprocesses: { capacity: () => ({ active: 1, limit: 4, unknown: 1 }), run: async () => { throw new Error("no step may run"); } } });
+  instance = "second";
+  const recovered = await successor.list();
+  assert.deepEqual(recovered.states.map((state) => [state.status, state.outcomeUnknown]), [["interrupted", true]]);
+  assert.ok(recovered.states[0].revision > Math.max(...revisions), "a restarted runtime's revisions went back");
+  // A removal is published with its own, newer revision.
+  instance = "first";
+  rmSync(path.join(repository, LIFECYCLE_CONFIG_FILE));
+  await lifecycle.setup(target);
+  const removal = published().at(-1);
+  assert.deepEqual([removal.removed, removal.revision > Math.max(...revisions)], [true, true]);
+}));

@@ -34,7 +34,8 @@ export const LIFECYCLE_LIMITS = Object.freeze({
   persistRetryDelaysMs: Object.freeze([0, 250, 1000]),
 });
 const PHASES = new Set(["setup", "teardown"]);
-const STATUSES = new Set(["needs-trust", "invalid", "running", "ready", "complete", "failed", "cancelled", "interrupted"]);
+// `trusted` is a refusal for review that the user has since resolved.
+const STATUSES = new Set(["needs-trust", "trusted", "invalid", "running", "ready", "complete", "failed", "cancelled", "interrupted"]);
 // States the user must act on keep their output.
 const RESUMABLE = new Set(["failed", "cancelled", "interrupted"]);
 const CONFIG_KEYS = new Set(["version", "setup", "teardown"]);
@@ -254,6 +255,11 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
   const active = new Map();
   const logs = new Map();
   let stopping = false;
+  const stored = (database.listWorktreeLifecycle?.() ?? []).filter(storedState);
+  // Every published state and removal carries a revision that only grows,
+  // also across restarts, so a client that merges a snapshot with events
+  // keeps the newer of each.
+  let revision = Math.max(Date.now() * 1000, ...stored.map((state) => Number(state.revision) || 0));
 
   function persist(state, strict = false) {
     try { database.saveWorktreeLifecycle({ ...state, output: state.output ? tail(state.output, limits.outputCharacters) : undefined }); }
@@ -292,7 +298,9 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     }
   }
 
-  function commit(state, { strict = false, memoryOnly = false } = {}) {
+  function commit(value, { strict = false, memoryOnly = false } = {}) {
+    revision += 1;
+    const state = { ...value, revision };
     if (!memoryOnly) persist(state, strict);
     remember(state);
     publish({ type: "worktree.lifecycle", payload: publicState(state) });
@@ -302,11 +310,10 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
   // A run that was going when the previous runtime stopped did not finish,
   // and its processes are unconfirmed until lifecycle ownership recovery
   // proves them gone or the user acknowledges them.
-  for (const stored of database.listWorktreeLifecycle?.() ?? []) {
-    if (!storedState(stored)) continue;
-    let state = stored;
+  for (let state of stored) {
     if (state.status === "running") {
-      state = { ...state, status: "interrupted", outcomeUnknown: true, updatedAt: now(),
+      revision += 1;
+      state = { ...state, revision, status: "interrupted", outcomeUnknown: true, updatedAt: now(),
         checkpoints: { ...state.checkpoints, [state.phase]: { configDigest: state.configDigest, stepIndex: state.stepIndex } },
         error: `Outright stopped during step ${state.stepIndex + 1}; its effects may be partial, and its processes are not yet confirmed stopped.` };
       persist(state);
@@ -667,6 +674,14 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
       throw apiError(409, `${LIFECYCLE_CONFIG_FILE} changed after it was shown; review it again`, { code: "LIFECYCLE_CONFIG_CHANGED" });
     }
     database.trustLifecycleConfig(target.project.id, target.project.path, digest);
+    // A refusal recorded for this file no longer stands. It keeps what it
+    // carried (checkpoints, run id, unconfirmed processes), so no status
+    // still asks for review.
+    for (const state of [...states.values()]) {
+      if (state.status === "needs-trust" && state.projectId === target.project.id && state.configDigest === digest && !holding(state.worktreePath)) {
+        commit({ ...state, status: "trusted", error: null, updatedAt: now() });
+      }
+    }
     return describe(target);
   }
 
@@ -698,7 +713,18 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     const known = states.delete(worktreePath);
     try { database.deleteWorktreeLifecycle(worktreePath); }
     catch (error) { onPersistError(error); }
-    if (known) publish({ type: "worktree.lifecycle", payload: { worktreePath, removed: true } });
+    if (known) publish({ type: "worktree.lifecycle", payload: { worktreePath, removed: true, revision: ++revision } });
+  }
+
+  // The states that describe the worktree now at each path, as describe()
+  // decides, and the revision they were read at. A state of an earlier
+  // worktree at a path is left out, unless its processes are unconfirmed.
+  async function list() {
+    const at = revision;
+    const listed = [...states.values()];
+    const instances = await Promise.all(listed.map((state) => (state.outcomeUnknown || holding(state.worktreePath)
+      ? state.instance : identify(state.worktreePath))));
+    return { revision: at, states: listed.filter((state, index) => instances[index] === state.instance).map(publicState) };
   }
 
   async function shutdown() {
@@ -712,6 +738,6 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
   return {
     setup, removeWorktree, cancel, trust, describe, acknowledge, reconcile, shutdown, hold,
     busy: (worktreePath) => Boolean(holding(worktreePath)),
-    list: () => [...states.values()].map(publicState),
+    list,
   };
 }
