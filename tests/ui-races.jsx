@@ -2419,9 +2419,10 @@ async function terminalScrollbackFindRegression() {
   show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 2, data: "\r\nstep new FAIL again\r\n$ " } });
   await until(() => status() === "3 of 8", "new output counted while the current match stays");
   assert(rows().includes("step 1750 FAIL build"), "New output moved the view away from the current match");
-  // The reset buffer's only match is on its first row, on the right, where
-  // the view cannot scroll it out from under the bar.
-  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 3, data: "\x1bc\x1b[1;50Hfresh FAIL only\r\n$ " } });
+  // The reset buffer's only match is on its first row, at the right edge
+  // under the bar, where the view cannot scroll it out from under the bar.
+  const size = () => sent.filter((message) => message.type === "terminal.resize").at(-1);
+  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 3, data: `\x1bc\x1b[1;${size().cols - 14}Hfresh FAIL only\r\n$ ` } });
   await until(() => status() === "1 match", "a terminal reset recounts and drops the earlier match");
   key(find(), { key: "Enter" });
   await until(() => status() === "1 of 1", "Enter selects in the reset buffer");
@@ -2448,7 +2449,6 @@ async function terminalScrollbackFindRegression() {
 
   // A wide character that does not fit in the last column wraps and leaves
   // an empty cell behind, which Find does not read as a space.
-  const size = () => sent.filter((message) => message.type === "terminal.resize").at(-1);
   show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 4, data: `\r\n${"a".repeat(size().cols - 2)}d日 end\r\n$ ` } });
   await until(() => rows().includes("日 end"), "a wide character wrapped past the last column");
   setControlValue(find(), "d日");
@@ -2497,6 +2497,25 @@ async function terminalScrollbackFindRegression() {
   await settledResize("420px", "the terminal is resized back");
   assert(size().cols === before.cols && status() === "1 of 1", `The resize back dropped the current match: ${status()}`);
   assert(!highlighted(), "A resize put Find's match back in place of the user's selection");
+
+  // The bar covers only the right part of the top rows: a match left of it
+  // stays where it is and the bar stays up; one under it is scrolled out.
+  const viewRows = () => [...host.querySelectorAll(".terminal-host .xterm-rows > div")].map((row) => row.textContent);
+  const filler = (count) => Array.from({ length: count }, (_, index) => `fill ${index}\r\n`).join("");
+  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 5, data: `\r\n${filler(40)}LEFT mark\r\n${" ".repeat(size().cols - 14)}RIGHT mark\r\n${filler(size().rows - 3)}$ ` } });
+  await until(() => viewRows()[0]?.startsWith("LEFT mark") && viewRows()[1]?.trim() === "RIGHT mark", "a match at the top left and one at the top right of the view");
+  setControlValue(find(), "left mark");
+  await until(() => status() === "1 of 1" && host.querySelector(".terminal-host .xterm-selection")?.childElementCount > 0, "the top-left match is current");
+  await settle();
+  assert(viewRows()[0]?.startsWith("LEFT mark"), `Find scrolled a match the bar does not cover: ${JSON.stringify(viewRows()[0])}`);
+  assert(!host.querySelector(".terminal-find.is-lowered"), "The Find bar lowered over the prompt for a match it does not cover");
+  setControlValue(find(), "right mark");
+  await until(() => status() === "1 of 1" && !viewRows()[1]?.includes("RIGHT mark"), "Find scrolls a match the bar covers out from under it");
+  await settle();
+  const barRect = host.querySelector(".terminal-find").getBoundingClientRect();
+  const marked = [...host.querySelectorAll(".terminal-host .xterm-selection > *")].map((node) => node.getBoundingClientRect());
+  assert(marked.length && marked.every((rect) => rect.bottom <= barRect.top || rect.top >= barRect.bottom), "The Find bar covers the current match at the top right");
+  assert(!host.querySelector(".terminal-find.is-lowered"), "The Find bar lowered for a match scrolled out from under it");
   key(find(), { key: "Escape" });
   await until(() => !find() && document.activeElement === textarea(), "Escape in the query closes Find");
   opener.click();

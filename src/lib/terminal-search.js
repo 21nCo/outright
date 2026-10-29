@@ -135,11 +135,12 @@ function selectionCovers(xterm, match) {
 // the view: a current match keeps its place by a buffer marker, and is
 // dropped when its line leaves the buffer or the newest `limit` matches, a
 // reflow moves it within its own line, or the buffer is reset or switched.
-// A match in the top coveredRows of the view, under the Find bar, is
+// The Find bar covers the top coveredRows of the view from the column
+// coveredColumn() returns to the right edge. A match with a cell there is
 // scrolled into the open like one outside the view. Near the top of the
 // buffer the view cannot scroll that far, so covered says the current match
 // is still under the bar, which then moves out of its way.
-export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_LIMIT, recountMs = RECOUNT_MS, coveredRows = 0 } = {}) {
+export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_LIMIT, recountMs = RECOUNT_MS, coveredRows = 0, coveredColumn = () => 0 } = {}) {
   let query = "";
   let matches = [];
   let capped = false;
@@ -152,11 +153,23 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
   let resizing = false;
   let timer = 0;
 
-  const isCovered = () => {
-    if (!current) return false;
-    const row = current.match.row - xterm.buffer.active.viewportY;
-    return row >= 0 && row < coveredRows;
+  // Whether any cell of a match, on each row it wraps onto, is under the bar
+  // when the view's top row is `top`. The bar is measured only for a match
+  // in its rows.
+  const underBar = (match, top) => {
+    const { cols } = xterm;
+    const end = match.col + match.length;
+    const first = Math.max(match.row, top);
+    const last = Math.min(match.row + Math.ceil(end / cols) - 1, top + coveredRows - 1);
+    if (first > last) return false;
+    const from = coveredColumn();
+    for (let row = first; row <= last; row += 1) {
+      const offset = (row - match.row) * cols;
+      if (Math.min(end - offset, cols) > Math.max(from, match.col - offset)) return true;
+    }
+    return false;
   };
+  const isCovered = () => Boolean(current) && underBar(current.match, xterm.buffer.active.viewportY);
   let covered = false;
   const publish = () => {
     covered = isCovered();
@@ -192,7 +205,7 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
     const marker = xterm.registerMarker(match.row - (buffer.baseY + buffer.cursorY));
     current = { match, marker };
     highlight(match);
-    if (match.row < buffer.viewportY + coveredRows || match.row >= buffer.viewportY + xterm.rows) {
+    if (match.row < buffer.viewportY || match.row >= buffer.viewportY + xterm.rows || underBar(match, buffer.viewportY)) {
       xterm.scrollToLine(Math.max(0, match.row - Math.floor(xterm.rows / 2)));
     }
   }

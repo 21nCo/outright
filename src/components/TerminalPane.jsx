@@ -28,8 +28,14 @@ const NO_FIND_RESULT = { total: 0, capped: false, index: -1, covered: false, sel
 // A count that only output changed is announced at most this often; what the
 // user's own Find actions change is announced as it settles.
 const FIND_OUTPUT_ANNOUNCE_MS = 5000;
-// The Find bar overlays about the first two 15px rows of the output.
+// The Find bar overlays about the first two 15px rows of the output, from
+// the cell under its left edge to the right.
 const FIND_COVERED_ROWS = 2;
+function findCoveredColumn(xterm, bar) {
+  const screen = xterm.element?.querySelector(".xterm-screen")?.getBoundingClientRect();
+  if (!bar || !screen?.width || !(xterm.cols > 0)) return 0;
+  return Math.max(0, Math.floor((bar.getBoundingClientRect().left - screen.left) / (screen.width / xterm.cols)));
+}
 // Ctrl+F is a shell key, so outside macOS Find takes Ctrl+Shift+F. Either
 // shortcut is withheld from the process; every other key still reaches it.
 const MAC_SHORTCUTS = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
@@ -100,6 +106,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
   const [savedPage, setSavedPage] = useState(null);
   const searchRef = useRef(null);
   const findInputRef = useRef(null);
+  const findBarRef = useRef(null);
   const focusFindRef = useRef(false);
   const findOpenRef = useRef(false);
   const findValueRef = useRef("");
@@ -132,7 +139,10 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     xtermRef.current = xterm;
     // Find reads the shown buffer only; the process never sees its keys.
     xterm.attachCustomKeyEventHandler((event) => !isFindShortcut(event));
-    const search = createTerminalSearch(xterm, setFindResult, { coveredRows: FIND_COVERED_ROWS });
+    const search = createTerminalSearch(xterm, setFindResult, {
+      coveredRows: FIND_COVERED_ROWS,
+      coveredColumn: () => findCoveredColumn(xterm, findBarRef.current),
+    });
     searchRef.current = search;
     if (findOpenRef.current) search.setQuery(findValueRef.current);
     const resizeTerminal = () => {
@@ -792,7 +802,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     {/* Find overlays the output, so opening it never resizes the process. */}
     <div className="terminal-stage">
       {/* It moves to the bottom while the current match is under it. */}
-      {findOpen && <div className={`window-find terminal-find${findResult.covered ? " is-lowered" : ""}`} id="terminal-find" role="search" aria-label={`Find in ${activeTerminal?.name ?? "terminal"} output`} onKeyDown={findKey}>
+      {findOpen && <div ref={findBarRef} className={`window-find terminal-find${findResult.covered ? " is-lowered" : ""}`} id="terminal-find" role="search" aria-label={`Find in ${activeTerminal?.name ?? "terminal"} output`} onKeyDown={findKey}>
         <input ref={findInputRef} type="text" aria-label="Find in terminal output" aria-keyshortcuts={FIND_SHORTCUT} aria-describedby="terminal-find-help" spellCheck={false} autoComplete="off" value={findValue}
           onChange={(event) => { setFindAction((count) => count + 1); setFindValue(event.target.value); searchRef.current?.setQuery(event.target.value); }} />
         <span aria-hidden="true">{findStatus}</span>
