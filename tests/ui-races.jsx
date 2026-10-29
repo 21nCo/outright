@@ -1219,6 +1219,7 @@ async function lifecycleStatusOrder() {
   await until(() => chip() === "Setup failed", "an event newer than the snapshot was not shown");
   root.render(null); await settle();
   await lifecycleDialogAfterRemoval();
+  await lifecycleRemovalCancel();
 }
 
 // Watching teardown progress during a removal never leaves the setup dialog
@@ -1249,6 +1250,77 @@ async function lifecycleDialogAfterRemoval() {
   removal.resolve(response({ removed: true }));
   await until(() => document.querySelector(".toast")?.textContent.includes("Worktree removed"), "the removal did not finish");
   await remainsTrue(() => !document.querySelector(".lifecycle-dialog"), 150, "the setup dialog stayed open after the removal");
+  root.render(null); await settle();
+}
+
+// A pending removal is cancelled only by Cancel removal, for the worktree it
+// started for; closing the dialog lets it continue, and its outcome never
+// shows under another worktree.
+async function lifecycleRemovalCancel() {
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const sibling = { id: "A2", name: "A2", path: "/fixture/A2", branch: "next", changedCount: 0, isLinked: true };
+  const linkedProjects = projects.map((item) => item.id === "A" ? { ...item, worktrees: [{ ...item.worktrees[0], isLinked: true }, sibling] } : item);
+  let removal = deferred();
+  let cancelReply = () => response({ state: null });
+  const sent = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: linkedProjects, projectGroups: { groups: [], memberships: {} },
+      settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname.startsWith("/api/worktrees") && options?.method && options.method !== "GET") sent.push({ path: url.pathname, body: JSON.parse(options.body ?? "null") });
+    if (url.pathname === "/api/worktrees" && options?.method === "DELETE") return removal.promise;
+    if (url.pathname === "/api/worktrees/lifecycle/cancel") return cancelReply();
+    if (url.pathname === "/api/conversations") return response({ conversations: [] });
+    return response({});
+  };
+  const buttons = (scope = document) => [...scope.querySelectorAll("button")];
+  const dialog = () => [...document.querySelectorAll('[role="dialog"]')].find((node) => node.querySelector("#remove-worktree-confirmation"));
+  const kept = (message) => response({ error: message, code: "WORKTREE_TEARDOWN_FAILED", lifecycle: { worktreePath: "/fixture/A", phase: "teardown", status: "cancelled" } }, 409);
+  async function startRemoval(path) {
+    host.querySelector('[aria-label="Worktree options"]').click();
+    await until(() => [...document.querySelectorAll('[role="menuitem"]')].some((item) => item.textContent.includes("Remove worktree")), "remove worktree menu item");
+    [...document.querySelectorAll('[role="menuitem"]')].find((item) => item.textContent.includes("Remove worktree")).click();
+    await until(() => dialog(), "remove worktree confirmation");
+    setControlValue(document.querySelector("#remove-worktree-confirmation"), path);
+    buttons(dialog()).find((item) => item.textContent === "Remove worktree").click();
+    await until(() => buttons(dialog()).some((item) => item.textContent === "Cancel removal"), "Cancel removal was not offered while removing");
+  }
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[aria-label="Worktree options"]'), "linked worktree options");
+  // Cancel removal stops this worktree's teardown, and the worktree is kept.
+  await startRemoval("/fixture/A");
+  assert(!buttons(dialog()).some((item) => item.textContent === "Cancel") && buttons(dialog()).some((item) => item.textContent === "Close"), "dismissing a pending removal was labeled Cancel");
+  buttons(dialog()).find((item) => item.textContent === "Cancel removal").click();
+  await until(() => sent.some((item) => item.path === "/api/worktrees/lifecycle/cancel"), "Cancel removal did not cancel teardown");
+  assert(sent.at(-1).body.worktreePath === "/fixture/A" && sent.at(-1).body.projectId === "A", "the cancel did not name the worktree being removed");
+  removal.resolve(kept("Cancelled before Git removed anything, so the worktree was kept."));
+  await until(() => /worktree was kept/.test(dialog()?.querySelector('[role="alert"]')?.textContent ?? ""), "a cancelled removal did not say the worktree was kept");
+  assert(dialog().querySelectorAll('.lifecycle-choices input[type="radio"]').length > 0, "a cancelled removal offered no choices");
+  assert([...host.querySelectorAll(".worktree-row strong")].some((node) => node.textContent === "A"), "a cancelled removal hid the worktree");
+  // Once Git has started, the refused cancel is announced and nothing else is sent.
+  buttons(dialog()).find((item) => item.textContent === "Cancel").click();
+  await until(() => !dialog(), "the removal dialog did not close");
+  removal = deferred();
+  cancelReply = () => response({ error: "Git is already removing this worktree; that can no longer be cancelled", code: "WORKTREE_REMOVAL_STARTED" }, 409);
+  await startRemoval("/fixture/A");
+  const before = sent.length;
+  buttons(dialog()).find((item) => item.textContent === "Cancel removal").click();
+  await until(() => /can no longer be cancelled/.test(dialog().querySelector('[role="status"]')?.textContent ?? ""), "a cancel refused once Git started was not announced");
+  await remainsTrue(() => sent.length === before + 1, 100, "a refused cancel sent another request");
+  // Closing lets the removal continue; its refusal belongs to A, not to A2.
+  buttons(dialog()).find((item) => item.textContent === "Close").click();
+  await until(() => !dialog(), "Close did not close the pending removal dialog");
+  assert(sent.length === before + 1, "Close cancelled the removal");
+  [...host.querySelectorAll(".worktree-row")].find((row) => row.querySelector("strong")?.textContent === "A2").click();
+  await until(() => host.querySelector(".workspace-context strong")?.textContent === "A2", "worktree A2 was not selected");
+  // A2's dialog, open while A is still being removed, never takes A's outcome.
+  host.querySelector('[aria-label="Worktree options"]').click();
+  await until(() => [...document.querySelectorAll('[role="menuitem"]')].some((item) => item.textContent.includes("Remove worktree")), "remove worktree menu item for A2");
+  [...document.querySelectorAll('[role="menuitem"]')].find((item) => item.textContent.includes("Remove worktree")).click();
+  await until(() => /Another worktree is being removed/.test(dialog()?.textContent ?? ""), "A2's removal dialog did not say another removal is running");
+  assert(!buttons(dialog()).some((item) => item.textContent === "Cancel removal"), "A2's dialog offered to cancel A's removal");
+  removal.resolve(kept("Teardown did not finish, so the worktree was kept. Step Down failed."));
+  await until(() => !/Another worktree is being removed/.test(dialog()?.textContent ?? ""), "A's removal did not finish");
+  await remainsTrue(() => dialog() && !/Teardown did not finish/.test(dialog().textContent) && !dialog().querySelector(".lifecycle-choices"), 150, "A2's removal dialog showed A's refusal or choices");
   root.render(null); await settle();
 }
 
