@@ -226,34 +226,29 @@ export function createTerminalSearch(xterm, onChange, { limit = TERMINAL_MATCH_L
     timer = setTimeout(recount, recountMs);
   }
 
-  // xterm starts the user's selection when a mouse button goes down but
-  // reports it only on release, so the selection becomes the user's as soon
-  // as a press changes it; a recount during the drag then leaves it alone.
-  // A press xterm does not select with (a right-click on the selection, a
-  // click a program tracking the mouse receives) leaves Find's highlight
-  // Find's. xterm handles the press on its element before this does.
-  const selectionKey = () => {
-    const range = xterm.getSelectionPosition();
-    return range ? `${range.start.x},${range.start.y},${range.end.x},${range.end.y}` : "";
-  };
-  let pressedOn = null;
-  const pressStart = () => { pressedOn = selectionKey(); };
-  const pressEnd = () => {
-    const before = pressedOn;
-    pressedOn = null;
-    if (!selection || selectionKey() === before) return;
+  // xterm starts the user's selection when the primary button goes down but
+  // reports it only on release, and a click begins with an empty selection
+  // that getSelectionPosition cannot see. So the selection becomes the
+  // user's on any press xterm selects with, under the conditions of its
+  // SelectionService.handleMouseDown, whether Find's highlight is shown or
+  // xterm has just cleared it for a change of height; a recount during the
+  // drag then leaves it alone. A press xterm does not select with (another
+  // button, a click a program tracking the mouse receives) leaves Find's
+  // highlight Find's.
+  const forcesSelection = (event) => (/Mac/.test(globalThis.navigator?.platform ?? "")
+    ? event.altKey && Boolean(xterm.options.macOptionClickForcesSelection)
+    : event.shiftKey);
+  const press = (event) => {
+    if (!selection || event.button !== 0) return;
+    if (xterm.modes.mouseTrackingMode !== "none" && !forcesSelection(event)) return;
     selection = null;
     publish();
   };
-  xterm.element?.addEventListener("mousedown", pressStart, true);
-  xterm.element?.addEventListener("mousedown", pressEnd);
+  xterm.element?.addEventListener("mousedown", press, true);
 
   const subscriptions = [
     {
-      dispose: () => {
-        xterm.element?.removeEventListener("mousedown", pressStart, true);
-        xterm.element?.removeEventListener("mousedown", pressEnd);
-      },
+      dispose: () => xterm.element?.removeEventListener("mousedown", press, true),
     },
     xterm.onWriteParsed(schedule),
     // xterm clears the selection for a change of height right after this.

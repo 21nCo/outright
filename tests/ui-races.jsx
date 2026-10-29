@@ -2705,7 +2705,7 @@ async function terminalFindHighlightRegression() {
     screen.dispatchEvent(new MouseEvent("mousedown", { ...point, buttons: 1, detail: 1, clientX: box.left + 1 }));
     document.dispatchEvent(new MouseEvent("mousemove", { ...point, buttons: 1, clientX: box.right - 2 }));
     await during();
-    assert(selectionColor() && !amber.includes(selectionColor()), "The user's drag is drawn as Find's match before release");
+    assert(selectionColor() && !amber.includes(selectionColor()), `The user's drag across ${text} is drawn as Find's match before release`);
     document.dispatchEvent(new MouseEvent("mouseup", { ...point, clientX: box.right - 2 }));
     await settle();
   };
@@ -2718,6 +2718,21 @@ async function terminalFindHighlightRegression() {
   await drag("after 3", () => write("\x1b7\x1b[1;1H\x1b[L\x1b8"));
   assert(selectedText() === "after 2" && status() === "1 of 1", `A recount during the user's drag after a line was inserted replaced it with ${JSON.stringify(selectedText())}`);
   assert(selectionColor() && !amber.includes(selectionColor()), "The user's drag is drawn as Find's match after a line was inserted");
+  // A click starts with an empty selection, so a drag that begins after a
+  // change of height cleared Find's highlight, before the recount draws it
+  // again, changes no visible selection; it is still the user's.
+  key(find(), { key: "Enter" });
+  await until(() => selectedText() === "NEEDLE row" && amber.includes(selectionColor()), "Find highlights its match before the height changes");
+  const tall = size();
+  const tallHeight = frameElement().style.height;
+  frameElement().style.height = "300px";
+  await until(() => size() !== tall && !selectedText() && host.querySelectorAll(".terminal-host .xterm-rows > div").length === size().rows,
+    "xterm clears Find's highlight for a change of height");
+  assert(size().cols === tall.cols && size().rows < tall.rows, `The resize changed more than the height: ${JSON.stringify([tall, size()])}`);
+  await drag("after 1", () => new Promise((resolve) => setTimeout(resolve, 500)));
+  assert(selectedText() === "after 1" && status() === "1 of 1", `A recount after a change of height replaced the user's drag with ${JSON.stringify(selectedText())}`);
+  assert(selectionColor() && !amber.includes(selectionColor()), "The user's drag after a change of height is drawn as Find's match");
+  await settledResize("height", tallHeight, "the terminal is resized back");
 
   // A press xterm does not select with leaves Find's highlight Find's: one on
   // the scrollbar, a right-click on the highlight, and a click while a
