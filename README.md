@@ -8,7 +8,7 @@ Outright is a local-first workspace for running coding agents across Git project
 - Live run status over WebSockets, run cancellation, a concurrency queue, and interrupted-run recovery
 - SQLite state in `~/.outright/outright.db` (override with `OUTRIGHT_DATA_DIR`)
 - Project trust, sandbox/approval choices, exact-path guards, same-origin runtime access, and an audit log
-- Real PTY terminals with multiple tabs, resize/input/output streaming, and reconnectable scrollback
+- Real PTY terminals with multiple tabs, resize/input/output streaming, reconnectable scrollback, and Find in the retained scrollback
 - Git status, diffs, stage/unstage, commits, guarded worktree creation/removal, and editor launching
 - Project spaces, searchable conversations/messages, draggable/pinnable/renamable/archivable tabs, cross-worktree conversation moves, prompt templates, notifications, and keyboard shortcuts
 - Repository context for AGENTS/Claude/Copilot instructions, local skills, and the current GitHub pull request
@@ -69,6 +69,7 @@ Layouts are saved in the browser's local storage per worktree, for the 64 most r
 - `Cmd/Ctrl K`: project, worktree, and conversation search
 - `Cmd/Ctrl N`: new conversation
 - `Cmd/Ctrl Shift T`: open or focus the terminal pane
+- `Cmd F` on macOS, `Ctrl Shift F` elsewhere, with focus in the terminal pane: find in its scrollback; `Enter` / `Shift Enter` move to the next (newer) or previous (older) match and `Escape` closes Find and returns to the terminal
 - `F6` / `Shift F6`: move focus to the next or previous pane
 - `Enter`: send a prompt
 - `Shift Enter`: newline in the prompt
@@ -82,6 +83,10 @@ npm run test:sites
 ```
 
 The suite covers provider command construction and event normalization, SQLite recovery, PTY input/output, Git review/staging/commits, guarded worktree lifecycle, scanner parsing, and browser interaction regressions. Install Chrome or Chromium before running `npm test`; the browser suite fails explicitly rather than skipping coverage if it cannot find an executable. GitHub CI runners include Chrome, and `CHROME_PATH` overrides the detected location.
+
+## Terminal Find
+
+Find searches the output the terminal still holds: the last 5,000 lines of a live terminal, or the shown part of saved output. The query is literal, not a regular expression, and ignores case using Unicode case folding, so `STRASSE` finds `Straße`; a match may span a wrapped line. The bar shows the current match and the total, such as `3 of 12`, and screen readers hear the same when you search or move between matches; a count that only new output changed is announced at most every 5 seconds. When there are more than 1,000 matches, only the newest 1,000 are counted and navigable, shown as `1000+`; a match inside one character that case folding expands, such as `s` in `ß`, counts that character once. A new query selects the newest match at or above the bottom of the view. Output that arrives while Find is open updates the count without moving the view; the current match stays current, and highlighted where lines inserted or deleted above it or a resize moved it, until its line leaves the scrollback, newer output pushes it out of the newest 1,000 matches, or the terminal is reset. A width change that rewraps the current match within its own line drops it. Find highlights only its current match in amber; once you start a selection in the terminal, type or paste there, Find leaves that selection alone, even while you are still dragging it or right after a resize, and a press that selects nothing, such as one on the scrollbar, a right-click on the highlight or a click a program tracking the mouse receives, leaves Find's highlight in place. Find keys never reach the process: the shortcut is withheld, typing goes to the query, `Escape` from any Find control closes it, and `Escape` in the terminal itself still goes to the program. The bar overlays the right of the top rows, so opening it does not resize the terminal. A match left of the bar stays where it is; one under it, or one that wraps below the view, is scrolled into the open, whole when it fits, and near the top of the output, where the view cannot scroll, the bar moves to the bottom instead.
 
 ## Terminals across restarts
 

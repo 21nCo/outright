@@ -2343,6 +2343,537 @@ function savedTerminal(id, name, endReason, exitCode, endedAt) {
 }
 function terminalStatusText() { return [...host.querySelectorAll('.terminal-pane [role="status"]')].map((node) => node.textContent).join(" "); }
 
+// Find reads the retained scrollback without taking keys from the process:
+// its shortcut and query never reach the terminal, Escape inside the
+// terminal still does, and closing Find gives the keyboard back.
+async function terminalScrollbackFindRegression() {
+  root.render(null);
+  await settle();
+  const sent = [];
+  const errors = [];
+  const lines = Array.from({ length: 4900 }, (_, index) => index % 700 === 350 ? `step ${index} FAIL build` : `row ${index} ok`);
+  lines.splice(2000, 0, "Straße 日本語 ✓ done");
+  route = async (url) => {
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A")] });
+    return response({ ...terminal("A"), buffer: `${lines.join("\r\n")}\r\n$ `, outputCursor: 1 });
+  };
+  const sendRuntime = (message) => sent.push(message);
+  const show = (event = null) => root.render(<div className="fixture-terminal-frame" style={{ width: 640, height: 420 }}><TerminalPane worktree={projects[0].worktrees[0]}
+    runtimeEvent={event} onError={(error) => errors.push(error)} sendRuntime={sendRuntime} /></div>);
+  const rows = () => host.querySelector(".terminal-host .xterm-rows")?.textContent ?? "";
+  const find = () => host.querySelector('input[aria-label="Find in terminal output"]');
+  const status = () => host.querySelector(".terminal-find > span[aria-hidden]")?.textContent ?? "";
+  const inputs = () => sent.filter((message) => message.type === "terminal.input").map((message) => message.data);
+  const textarea = () => host.querySelector(".terminal-host .xterm-helper-textarea");
+  const key = (target, init) => target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init }));
+  show();
+  await until(() => terminalReady("Terminal A") && rows().includes("row 4899 ok") && sent.some((message) => message.type === "terminal.resize"), "large retained output ready for input");
+
+  textarea().focus();
+  key(textarea(), { key: "Escape", code: "Escape", keyCode: 27 });
+  assert(inputs().join("") === "\x1b" && !find(), "Escape in the terminal did not reach the process");
+  const resizes = () => sent.filter((message) => message.type === "terminal.resize").length;
+  const resizesBeforeFind = resizes();
+  const mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+  const shortcut = mac ? { metaKey: true } : { ctrlKey: true, shiftKey: true };
+  key(textarea(), { key: mac ? "f" : "F", code: "KeyF", keyCode: 70, ...shortcut });
+  await until(() => find() && document.activeElement === find(), "Find shortcut focuses the query");
+  const opener = host.querySelector('[aria-label="Find in terminal"]');
+  assert(opener.getAttribute("aria-expanded") === "true" && opener.getAttribute("aria-keyshortcuts") === (mac ? "Meta+F" : "Control+Shift+F"), "Find toggle state or shortcut is not exposed");
+
+  const startedAt = performance.now();
+  setControlValue(find(), "fail");
+  const searchMs = performance.now() - startedAt;
+  window.__performanceEvidence = { ...window.__performanceEvidence, terminalFindMs: Math.round(searchMs) };
+  await until(() => status() === "7 of 7", "a new query selects the newest match");
+  assert(searchMs < 500, `Searching 4,900 retained lines took ${Math.round(searchMs)}ms`);
+  await until(() => rows().includes("step 4550 FAIL build"), "newest match shown");
+  // Enter that confirms an IME composition stays with the composition.
+  key(find(), { key: "Enter", isComposing: true });
+  key(find(), { key: "Enter", keyCode: 229 });
+  await settle();
+  assert(status() === "7 of 7", "Enter during IME composition moved the match");
+  key(find(), { key: "Enter", shiftKey: true });
+  await until(() => status() === "6 of 7" && rows().includes("step 3850 FAIL build"), "Shift+Enter moves to the previous match");
+  key(find(), { key: "Enter" });
+  key(find(), { key: "Enter" });
+  await until(() => status() === "1 of 7" && rows().includes("step 350 FAIL build"), "Enter wraps to the earliest match");
+  host.querySelector('[aria-label="Previous terminal match"]').click();
+  await until(() => status() === "7 of 7", "Previous wraps to the newest match");
+  await until(() => host.querySelector(".terminal-find [role=status]").textContent === "Match 7 of 7", "match state announced");
+  assert(host.querySelector(".terminal-host .xterm-selection")?.childElementCount > 0, "The current match is not highlighted");
+
+  setControlValue(find(), "STRASSE 日本");
+  await until(() => status() === "1 of 1" && rows().includes("Straße 日本語"), "Unicode case folding finds a wide-character line");
+  setControlValue(find(), "r.w 1");
+  await until(() => status() === "No matches", "a regex-looking query is literal");
+  assert(!inputs().slice(1).length, `Find sent keys to the process: ${JSON.stringify(inputs())}`);
+  await settle();
+  assert(resizes() === resizesBeforeFind, "Opening Find resized the process's terminal");
+
+  // A new query starts from the view, still at the Unicode line. New output
+  // recounts without moving the current match; a full reset drops it, and
+  // the next step starts in the new buffer.
+  setControlValue(find(), "fail");
+  await until(() => status() === "3 of 7" && rows().includes("step 1750 FAIL build"), "a query selects the newest match above the view's bottom");
+  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 2, data: "\r\nstep new FAIL again\r\n$ " } });
+  await until(() => status() === "3 of 8", "new output counted while the current match stays");
+  assert(rows().includes("step 1750 FAIL build"), "New output moved the view away from the current match");
+  // The reset buffer's only match is on its first row, at the right edge
+  // under the bar, where the view cannot scroll it out from under the bar.
+  const size = () => sent.filter((message) => message.type === "terminal.resize").at(-1);
+  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 3, data: `\x1bc\x1b[1;${size().cols - 14}Hfresh FAIL only\r\n$ ` } });
+  await until(() => status() === "1 match", "a terminal reset recounts and drops the earlier match");
+  key(find(), { key: "Enter" });
+  await until(() => status() === "1 of 1", "Enter selects in the reset buffer");
+  await until(() => host.querySelector(".terminal-find.is-lowered"), "the bar moves off a match it covers");
+  await settle();
+  const bar = host.querySelector(".terminal-find").getBoundingClientRect();
+  const selected = [...host.querySelectorAll(".terminal-host .xterm-selection > *")].map((node) => node.getBoundingClientRect());
+  assert(selected.length && selected.every((rect) => rect.right <= bar.left || rect.left >= bar.right || rect.bottom <= bar.top || rect.top >= bar.bottom),
+    "The Find bar covers the current match on the first row");
+  assert(resizes() === resizesBeforeFind, "Moving the Find bar resized the process's terminal");
+
+  const next = host.querySelector('[aria-label="Next terminal match"]');
+  next.focus();
+  key(next, { key: "Escape" });
+  await until(() => !find() && document.activeElement === textarea(), "Escape from a Find button closes Find and returns focus to the terminal");
+  await until(() => !host.querySelector(".terminal-host .xterm-selection")?.childElementCount, "closing Find clears its match selection");
+  key(textarea(), { key: "Escape", code: "Escape", keyCode: 27 });
+  assert(inputs().join("") === "\x1b\x1b", "Input did not return to the process after Find closed");
+  opener.click();
+  await until(() => find()?.value === "fail" && document.activeElement === find() && status() === "1 of 1", "reopened Find searches its query again");
+  key(find(), { key: "Escape", isComposing: true });
+  await settle();
+  assert(find(), "Escape that cancels an IME composition closed Find");
+
+  // A wide character that does not fit in the last column wraps and leaves
+  // an empty cell behind, which Find does not read as a space.
+  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 4, data: `\r\n${"a".repeat(size().cols - 2)}d日 end\r\n$ ` } });
+  await until(() => rows().includes("日 end"), "a wide character wrapped past the last column");
+  setControlValue(find(), "d日");
+  await until(() => status() === "1 of 1", "a wide character wrapped to the next row is found");
+  setControlValue(find(), "d 日");
+  await until(() => status() === "No matches", "the cell a wide character wrapped past is not a space");
+
+  // xterm clears the selection when the view's height changes; Find selects
+  // its current match again, but never in place of the user's selection.
+  const highlighted = () => host.querySelector(".terminal-host .xterm-selection")?.childElementCount > 0;
+  const terminalFrame = host.querySelector(".fixture-terminal-frame");
+  const settledResize = async (height, label) => {
+    const count = sent.filter((message) => message.type === "terminal.resize").length;
+    terminalFrame.style.height = height;
+    await until(() => sent.filter((message) => message.type === "terminal.resize").length > count, label);
+    // Past the recount, so xterm has painted the selection it cleared.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await settle();
+  };
+  // xterm measures cells in the terminal font once it has loaded and applies
+  // them at a later fit. Fit until the width holds, so the resizes below
+  // change only the height.
+  await document.fonts.load('12px "DM Sans Variable"');
+  await settledResize("400px", "the terminal measures its loaded font");
+  for (let attempt = 0, cols = 0; attempt < 4 && size().cols !== cols; attempt += 1) {
+    cols = size().cols;
+    await settledResize(attempt % 2 ? "400px" : "390px", "the terminal fits its loaded font");
+  }
+  setControlValue(find(), "日 end");
+  await until(() => status() === "1 of 1" && highlighted(), "the wrapped wide-character match is current and highlighted");
+  const before = size();
+  await settledResize("340px", "the terminal is resized to fewer rows");
+  assert(size().cols === before.cols && size().rows < before.rows, `The resize changed more than the height: ${JSON.stringify([before, size()])}`);
+  assert(status() === "1 of 1" && highlighted(), "A resize left the current match without its highlight");
+  assert(rows().includes("日 end"), "The resize moved the view");
+  const screen = host.querySelector(".terminal-host .xterm-screen").getBoundingClientRect();
+  const rowHeight = screen.height / size().rows;
+  const selectedRows = () => [...host.querySelectorAll(".terminal-host .xterm-selection > *")].map((node) => Math.round((node.getBoundingClientRect().top - screen.top) / rowHeight));
+  // The user double-clicks the word that wraps onto the match's row, from
+  // the row above it, which Find's selection does not cover.
+  const userRow = Math.min(...selectedRows()) - 1;
+  const point = { bubbles: true, cancelable: true, button: 0, clientX: screen.left + 4, clientY: screen.top + rowHeight * (userRow + 0.5) };
+  host.querySelector(".terminal-host .xterm-screen").dispatchEvent(new MouseEvent("mousedown", { ...point, detail: 2 }));
+  document.dispatchEvent(new MouseEvent("mouseup", { ...point, detail: 2 }));
+  await until(() => selectedRows().includes(userRow), "the user's double-click replaces Find's selection");
+  await settledResize("420px", "the terminal is resized back");
+  assert(size().cols === before.cols && status() === "1 of 1", `The resize back dropped the current match: ${status()}`);
+  assert(!highlighted(), "A resize put Find's match back in place of the user's selection");
+
+  // The bar covers only the right part of the top rows: a match left of it
+  // stays where it is and the bar stays up; one under it is scrolled out.
+  const viewRows = () => [...host.querySelectorAll(".terminal-host .xterm-rows > div")].map((row) => row.textContent);
+  const filler = (count) => Array.from({ length: count }, (_, index) => `fill ${index}\r\n`).join("");
+  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 5, data: `\r\n${filler(40)}LEFT mark\r\n${" ".repeat(size().cols - 14)}RIGHT mark\r\n${filler(size().rows - 3)}$ ` } });
+  await until(() => viewRows()[0]?.startsWith("LEFT mark") && viewRows()[1]?.trim() === "RIGHT mark", "a match at the top left and one at the top right of the view");
+  setControlValue(find(), "left mark");
+  await until(() => status() === "1 of 1" && host.querySelector(".terminal-host .xterm-selection")?.childElementCount > 0, "the top-left match is current");
+  await settle();
+  assert(viewRows()[0]?.startsWith("LEFT mark"), `Find scrolled a match the bar does not cover: ${JSON.stringify(viewRows()[0])}`);
+  assert(!host.querySelector(".terminal-find.is-lowered"), "The Find bar lowered over the prompt for a match it does not cover");
+  // Reopened with its query, from the shortcut or the button, Find decides
+  // from the mounted bar too: the bar is never drawn lowered for it.
+  const lowered = [];
+  const watchLowered = new MutationObserver(() => { if (host.querySelector(".terminal-find.is-lowered")) lowered.push(status()); });
+  const reopensLeftOfBar = async (text, query) => {
+    for (const [label, open] of [["the shortcut", () => key(textarea(), { key: mac ? "f" : "F", code: "KeyF", keyCode: 70, ...shortcut })], ["the button", () => opener.click()]]) {
+      key(find(), { key: "Escape" });
+      await until(() => !find() && document.activeElement === textarea(), `Escape closes Find before it reopens from ${label}`);
+      watchLowered.observe(host, { attributes: true, attributeFilter: ["class"], childList: true, subtree: true });
+      open();
+      await until(() => find()?.value === query && document.activeElement === find() && status() === "1 of 1" && highlighted(), `Find reopens from ${label} on ${text}`);
+      await settle();
+      watchLowered.disconnect();
+      assert(viewRows()[0]?.startsWith(text), `Reopening Find from ${label} scrolled a match the bar does not cover: ${JSON.stringify(viewRows()[0])}`);
+      assert(!lowered.length, `Reopening Find from ${label} lowered the bar for a match it does not cover`);
+    }
+  };
+  await reopensLeftOfBar("LEFT mark", "left mark");
+  setControlValue(find(), "right mark");
+  await until(() => status() === "1 of 1" && !viewRows()[1]?.includes("RIGHT mark"), "Find scrolls a match the bar covers out from under it");
+  await settle();
+  const barRect = host.querySelector(".terminal-find").getBoundingClientRect();
+  const marked = [...host.querySelectorAll(".terminal-host .xterm-selection > *")].map((node) => node.getBoundingClientRect());
+  assert(marked.length && marked.every((rect) => rect.bottom <= barRect.top || rect.top >= barRect.bottom), "The Find bar covers the current match at the top right");
+  assert(!host.querySelector(".terminal-find.is-lowered"), "The Find bar lowered for a match scrolled out from under it");
+  // A match that starts on the last row of the view and wraps below it is
+  // scrolled until it is shown whole.
+  const middle = size().rows - 1 - Math.floor(size().rows / 2);
+  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 6, data: `\r\n${filler(40)}ANCHOR mark\r\n${filler(middle - 1)}${" ".repeat(size().cols - 4)}WRAP mark\r\n${filler(size().rows)}$ ` } });
+  // Output is parsed by the second frame.
+  await settle();
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  await settle();
+  setControlValue(find(), "anchor mark");
+  await until(() => status() === "1 of 1" && viewRows().at(-1)?.trimEnd().endsWith("WRAP"), "the view ends on the first row of a wrapped match");
+  setControlValue(find(), "wrap mark");
+  await until(() => status() === "1 of 1" && highlighted(), "the wrapped match is current");
+  await settle();
+  const wrapRow = viewRows().findIndex((row) => row.trimEnd().endsWith("WRAP"));
+  assert(wrapRow >= 0 && viewRows()[wrapRow + 1]?.trim() === "mark", `Find left the wrapped part of its match below the view: ${JSON.stringify(viewRows().slice(-2))}`);
+  // At the top of the buffer the view cannot scroll, so only the bar's
+  // real left edge keeps it up for a top-left match.
+  show({ type: "terminal.output", terminalId: "term-A", payload: { cursor: 7, data: "\x1bcTOP mark\r\n$ " } });
+  await until(() => viewRows()[0]?.startsWith("TOP mark") && status() === "No matches", "a reset buffer starts with a top-left match");
+  setControlValue(find(), "top mark");
+  await until(() => status() === "1 of 1" && highlighted(), "the match at the top of the buffer is current");
+  await reopensLeftOfBar("TOP mark", "top mark");
+  host.querySelector('[aria-label="Close terminal find"]').click();
+  await until(() => !find() && document.activeElement === textarea(), "Close returns focus to the terminal");
+  assert(!errors.length, `Unexpected terminal errors: ${errors.map((error) => error.message).join("; ")}`);
+}
+
+// Find's highlight stays on its current match's text wherever output or a
+// resize moves the match, only that highlight is drawn as the match, a
+// selection the user made or is dragging is left alone, and streaming output does not keep
+// re-announcing the count.
+async function terminalFindHighlightRegression() {
+  root.render(null);
+  await settle();
+  const sent = [];
+  const errors = [];
+  let cursor = 1;
+  route = async (url) => {
+    if (url.pathname === "/api/terminals") return response({ terminals: [terminal("A")] });
+    return response({ ...terminal("A"), buffer: "alpha\r\nfirst\r\nTARGET one\r\nlast\r\n$ ", outputCursor: 1 });
+  };
+  const sendRuntime = (message) => sent.push(message);
+  const show = (data = null) => root.render(<div className="fixture-terminal-frame" style={{ width: 640, height: 420 }}><TerminalPane worktree={projects[0].worktrees[0]}
+    runtimeEvent={data === null ? null : { type: "terminal.output", terminalId: "term-A", payload: { cursor: ++cursor, data } }}
+    onError={(error) => errors.push(error)} sendRuntime={sendRuntime} /></div>);
+  // Output is parsed by the second frame, and its recount follows 200ms later.
+  const write = async (data) => { show(data); await settle(); await new Promise((resolve) => setTimeout(resolve, 300)); await settle(); };
+  const find = () => host.querySelector('input[aria-label="Find in terminal output"]');
+  const status = () => host.querySelector(".terminal-find > span[aria-hidden]")?.textContent ?? "";
+  // An unchanged announcement toggles a trailing no-break space, which trim drops.
+  const announced = () => host.querySelector(".terminal-find [role=status]")?.textContent.trim() ?? "";
+  const size = () => sent.filter((message) => message.type === "terminal.resize").at(-1);
+  const textarea = () => host.querySelector(".terminal-host .xterm-helper-textarea");
+  const key = (target, init) => target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init }));
+  // Records the live region's text each time it is mounted or changes.
+  const watchAnnouncements = () => {
+    const seen = [];
+    let last = host.querySelector(".terminal-find [role=status]");
+    let lastText = last?.textContent;
+    const record = () => {
+      const region = host.querySelector(".terminal-find [role=status]");
+      if (!region || (region === last && region.textContent === lastText)) return;
+      last = region;
+      lastText = region.textContent;
+      seen.push(lastText.trim());
+    };
+    const observer = new MutationObserver(record);
+    observer.observe(host, { childList: true, characterData: true, subtree: true });
+    return { seen, stop: () => observer.disconnect() };
+  };
+  // xterm copies its own selection, so the copied text is what it selected.
+  const selectedText = () => {
+    const clipboardData = new DataTransfer();
+    textarea().dispatchEvent(new ClipboardEvent("copy", { bubbles: true, cancelable: true, clipboardData }));
+    return clipboardData.getData("text/plain");
+  };
+  const amber = ["rgb(196, 132, 12)", "rgb(232, 176, 74)"];
+  const selectionColor = () => { const node = host.querySelector(".terminal-host .xterm-selection > *"); return node ? getComputedStyle(node).backgroundColor : ""; };
+  const screenRows = () => [...host.querySelectorAll(".terminal-host .xterm-rows > div")].map((row) => row.textContent);
+  const doubleClick = (text) => {
+    const screen = host.querySelector(".terminal-host .xterm-screen");
+    const box = screen.getBoundingClientRect();
+    const rowHeight = box.height / size().rows;
+    const row = screenRows().findIndex((line) => line.startsWith(text));
+    assert(row >= 0, `No row starts with ${text}`);
+    const point = { bubbles: true, cancelable: true, button: 0, clientX: box.left + 4, clientY: box.top + rowHeight * (row + 0.5) };
+    screen.dispatchEvent(new MouseEvent("mousedown", { ...point, detail: 2 }));
+    document.dispatchEvent(new MouseEvent("mouseup", { ...point, detail: 2 }));
+  };
+  const frameElement = () => host.querySelector(".fixture-terminal-frame");
+  const settledResize = async (property, value, label) => {
+    const count = sent.filter((message) => message.type === "terminal.resize").length;
+    frameElement().style[property] = value;
+    await until(() => sent.filter((message) => message.type === "terminal.resize").length > count, label);
+    // The recount follows xterm's resize, which is sent before this.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await settle();
+  };
+  show();
+  await until(() => terminalReady("Terminal A") && screenRows().some((line) => line.startsWith("TARGET one")) && size(), "terminal ready");
+  // The terminal font's late load changes its cells at a later fit; fit until
+  // the size holds, so the resizes below change only what they mean to.
+  await document.fonts.load('12px "DM Sans Variable"');
+  await settledResize("height", "390px", "the terminal measures its loaded font");
+  for (let attempt = 0, cols = 0; attempt < 4 && size().cols !== cols; attempt += 1) {
+    cols = size().cols;
+    await settledResize("height", attempt % 2 ? "390px" : "360px", "the terminal fits its loaded font");
+  }
+
+  host.querySelector('[aria-label="Find in terminal"]').click();
+  await until(() => document.activeElement === find(), "Find opens");
+  setControlValue(find(), "target one");
+  await until(() => status() === "1 of 1" && selectedText() === "TARGET one", "the query selects its match");
+  await until(() => amber.includes(selectionColor()), "Find's match is drawn in the match color");
+
+  // A line inserted (CSI L) or deleted (CSI M) above the match moves it, while
+  // xterm keeps the selection on the same cells.
+  await write("\x1b7\x1b[1;1H\x1b[L\x1b8");
+  assert(status() === "1 of 1" && selectedText() === "TARGET one", `A line inserted above left Find's highlight on ${JSON.stringify(selectedText())}`);
+  await write("\x1b7\x1b[1;1H\x1b[M\x1b8");
+  assert(status() === "1 of 1" && selectedText() === "TARGET one", `A line deleted above left Find's highlight on ${JSON.stringify(selectedText())}`);
+
+  // The user's selection is theirs: drawn in the normal color and not moved
+  // or replaced as output moves the match.
+  doubleClick("first");
+  await until(() => selectedText() === "first" && selectionColor() && !amber.includes(selectionColor()), "the user's selection keeps the normal selection color");
+  await write("\x1b7\x1b[1;1H\x1b[L\x1b8");
+  assert(selectedText() === "alpha" && status() === "1 of 1", `Find moved the user's selection after a line was inserted: ${JSON.stringify(selectedText())}`);
+  await write("\x1b7\x1b[1;1H\x1b[M\x1b8");
+  assert(selectedText() === "first", `Find moved the user's selection after a line was deleted: ${JSON.stringify(selectedText())}`);
+  key(find(), { key: "Enter" });
+  await until(() => selectedText() === "TARGET one" && amber.includes(selectionColor()), "Next highlights the match in the match color again");
+
+  // A width change reflows a long line above the match onto more rows.
+  await write(`\r\n${"x".repeat(size().cols - 4)}\r\nTARGET two\r\n$ `);
+  setControlValue(find(), "target two");
+  await until(() => status() === "1 of 1" && selectedText() === "TARGET two", "the match below a long line is selected");
+  const wide = size();
+  await settledResize("width", "420px", "the terminal is narrowed");
+  assert(size().rows === wide.rows && size().cols < wide.cols - 4, `The resize changed more than the width: ${JSON.stringify([wide, size()])}`);
+  assert(status() === "1 of 1" && selectedText() === "TARGET two", `A reflow above left Find's highlight on ${JSON.stringify(selectedText())}`);
+  doubleClick("first");
+  await until(() => selectedText() === "first", "the user selects other text");
+  await settledResize("width", "640px", "the terminal is widened");
+  assert(size().cols === wide.cols && status() === "1 of 1" && selectedText() === "first", `Find took over the user's selection on a reflow: ${JSON.stringify(selectedText())}`);
+
+  // Output alone announces the count at most every few seconds; the visible
+  // count still follows it.
+  await write("\r\ntick 0\r\n$ ");
+  setControlValue(find(), "tick");
+  await until(() => announced() === "Match 1 of 1", "a new query is announced");
+
+  // A user action is announced even when its text does not change: Next on
+  // the only match, and Find reopened within the output pacing interval.
+  let watch = watchAnnouncements();
+  key(find(), { key: "Enter" });
+  await until(() => watch.seen.length && announced() === "Match 1 of 1", "Next on the only match is announced again");
+  watch.stop();
+  key(find(), { key: "Escape" });
+  await until(() => !find(), "Escape closes Find");
+  watch = watchAnnouncements();
+  host.querySelector('[aria-label="Find in terminal"]').click();
+  await until(() => find() && announced() === "Match 1 of 1", "the reopened query is announced");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  watch.stop();
+  assert(watch.seen[0] === "" && watch.seen.at(-1) === "Match 1 of 1", `Reopening Find did not change its live region: ${JSON.stringify(watch.seen)}`);
+  const announcements = [];
+  const observer = new MutationObserver(() => announcements.push(announced()));
+  observer.observe(host.querySelector(".terminal-find [role=status]"), { childList: true, characterData: true, subtree: true });
+  for (let index = 1; index <= 12; index += 1) {
+    show(`\r\ntick ${index}\r\n$ `);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  await until(() => status() === "1 of 13", "streamed output is counted");
+  observer.disconnect();
+  assert(announcements.length <= 1, `Streaming output re-announced the count: ${JSON.stringify(announcements)}`);
+  key(find(), { key: "Enter" });
+  await until(() => announced() === "Match 2 of 13", "a step is announced at once");
+
+  // A current match that newer output pushes out of the newest 1,000 matches
+  // is no longer current.
+  await write(Array.from({ length: 1100 }, (_, index) => `\r\nhit ${index}`).join("") + "\r\n$ ");
+  setControlValue(find(), "hit");
+  await until(() => /^(1|1000) of 1000\+$/.test(status()), "one of many matches is current");
+  if (status() !== "1 of 1000+") key(find(), { key: "Enter" });
+  await until(() => status() === "1 of 1000+" && selectedText() === "hit", "the oldest counted match is current");
+  await write("\r\nhit again\r\n$ ");
+  await until(() => status() === "1000+ matches" && !selectedText(), "a match pushed out of the newest 1,000 is dropped with its highlight");
+
+  // Once the scrollback is full, output trims the oldest lines and xterm
+  // moves the selection with its text, so Find's highlight stays on its match
+  // without being drawn again.
+  const fill = Array.from({ length: 5100 }, (_, index) => `\r\nfill ${index}`).join("");
+  await write(`${fill}\r\nNEEDLE row${Array.from({ length: 5 }, (_, index) => `\r\nafter ${index}`).join("")}\r\n$ `);
+  setControlValue(find(), "needle row");
+  await until(() => status() === "1 of 1" && selectedText() === "NEEDLE row" && amber.includes(selectionColor()), "the match in a full scrollback is highlighted");
+  const select = Terminal.prototype.select;
+  let selects = 0;
+  Terminal.prototype.select = function countSelect(...args) { selects += 1; return select.apply(this, args); };
+  const stream = async (label, count = 3) => {
+    for (let index = 0; index < count; index += 1) {
+      show(`\r\n${label} ${index}`);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    await settle();
+  };
+  try {
+    await stream("more");
+    assert(selects === 0, `Streaming into a full scrollback drew Find's highlight again ${selects} times`);
+  } finally {
+    Terminal.prototype.select = select;
+  }
+  assert(status() === "1 of 1" && selectedText() === "NEEDLE row" && amber.includes(selectionColor()), `Streaming into a full scrollback moved Find's highlight to ${JSON.stringify(selectedText())}`);
+
+  // A drag the user starts is theirs before xterm reports it on release, so a
+  // recount during the drag, after output trims the scrollback or inserts a
+  // line above the match, neither replaces nor ends it.
+  const drag = async (text, during) => {
+    const screen = host.querySelector(".terminal-host .xterm-screen");
+    const box = screen.getBoundingClientRect();
+    const rowHeight = box.height / size().rows;
+    const row = screenRows().findIndex((line) => line.startsWith(text));
+    assert(row >= 0, `No row starts with ${text}`);
+    const clientY = box.top + rowHeight * (row + 0.5);
+    const point = { bubbles: true, cancelable: true, button: 0, clientY };
+    screen.dispatchEvent(new MouseEvent("mousedown", { ...point, buttons: 1, detail: 1, clientX: box.left + 1 }));
+    document.dispatchEvent(new MouseEvent("mousemove", { ...point, buttons: 1, clientX: box.right - 2 }));
+    await during();
+    assert(selectionColor() && !amber.includes(selectionColor()), `The user's drag across ${text} is drawn as Find's match before release`);
+    document.dispatchEvent(new MouseEvent("mouseup", { ...point, clientX: box.right - 2 }));
+    await settle();
+  };
+  await drag("after 1", () => stream("drag"));
+  assert(selectedText() === "after 1" && status() === "1 of 1", `A recount during the user's drag in a full scrollback replaced it with ${JSON.stringify(selectedText())}`);
+  assert(selectionColor() && !amber.includes(selectionColor()), "The user's drag is drawn as Find's match");
+  key(find(), { key: "Enter" });
+  await until(() => selectedText() === "NEEDLE row" && amber.includes(selectionColor()), "Next highlights the match again");
+  // The inserted line moves the text under the user's cells down one row.
+  await drag("after 3", () => write("\x1b7\x1b[1;1H\x1b[L\x1b8"));
+  assert(selectedText() === "after 2" && status() === "1 of 1", `A recount during the user's drag after a line was inserted replaced it with ${JSON.stringify(selectedText())}`);
+  assert(selectionColor() && !amber.includes(selectionColor()), "The user's drag is drawn as Find's match after a line was inserted");
+  // xterm clears the selection for a change of height; Find draws its
+  // highlight again at once, before the recount. A drag, typing or a paste
+  // that comes after the change and before the recount is the user's, so the
+  // recount leaves it alone and the input still reaches the process.
+  const tall = size();
+  const tallHeight = frameElement().style.height;
+  const heightChanged = async (height, label) => {
+    key(find(), { key: "Enter" });
+    await until(() => selectedText() === "NEEDLE row" && amber.includes(selectionColor()), `Find highlights its match before ${label}`);
+    const before = size();
+    frameElement().style.height = height;
+    await until(() => size() !== before && host.querySelectorAll(".terminal-host .xterm-rows > div").length === size().rows, `the height changes before ${label}`);
+    assert(size().cols === tall.cols && size().rows !== before.rows, `The resize changed more than the height: ${JSON.stringify([before, size()])}`);
+    assert(selectedText() === "NEEDLE row" && amber.includes(selectionColor()), `A change of height left Find's highlight on ${JSON.stringify(selectedText())} before ${label}`);
+  };
+  await heightChanged("300px", "a drag");
+  await drag("after 1", () => new Promise((resolve) => setTimeout(resolve, 300)));
+  assert(selectedText() === "after 1" && status() === "1 of 1", `A recount after a change of height replaced the user's drag with ${JSON.stringify(selectedText())}`);
+  assert(selectionColor() && !amber.includes(selectionColor()), "The user's drag after a change of height is drawn as Find's match");
+  const sends = (data) => sent.filter((message) => message.type === "terminal.input" && message.data === data).length;
+  for (const [label, height, data, input] of [
+    ["typing", tallHeight, "x", () => key(textarea(), { key: "x", code: "KeyX", keyCode: 88, which: 88 })],
+    ["a paste", "300px", "pasted", () => {
+      const clipboardData = new DataTransfer();
+      clipboardData.setData("text/plain", "pasted");
+      textarea().dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData }));
+    }],
+  ]) {
+    await heightChanged(height, label);
+    const count = sends(data);
+    input();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await settle();
+    assert(sends(data) === count + 1, `${label} after a change of height did not reach the process`);
+    assert(!selectedText() && !amber.includes(selectionColor()) && status() === "1 of 1",
+      `A recount after ${label} drew Find's highlight again on ${JSON.stringify(selectedText())}`);
+  }
+  await settledResize("height", tallHeight, "the terminal is resized back");
+
+  // A press xterm does not select with leaves Find's highlight Find's: one on
+  // the scrollbar, a right-click on the highlight, and a click while a
+  // program tracks the mouse. These are native presses, so the browser
+  // decides which mouse events reach the page. Afterwards a line inserted
+  // above still moves the highlight with its match, and closing Find
+  // removes it.
+  assert(window.__fixtureMouse, "Native mouse input is unavailable");
+  const press = async (x, y, button = "left") => {
+    await window.__fixtureMouse("mousePressed", x, y, button);
+    await window.__fixtureMouse("mouseReleased", x, y, button);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await settle();
+  };
+  const rowPoint = (text) => {
+    const box = host.querySelector(".terminal-host .xterm-screen").getBoundingClientRect();
+    const rowHeight = box.height / size().rows;
+    const row = screenRows().findIndex((line) => line.startsWith(text));
+    assert(row >= 0, `No row starts with ${text}`);
+    return { x: box.left + 4, y: box.top + rowHeight * (row + 0.5) };
+  };
+  const keepsHighlight = async (label, pressed) => {
+    key(find(), { key: "Enter" });
+    await until(() => selectedText() === "NEEDLE row" && amber.includes(selectionColor()), `Find highlights its match before ${label}`);
+    await pressed();
+    assert(status() === "1 of 1" && selectedText() === "NEEDLE row" && amber.includes(selectionColor()), `${label} took Find's highlight from it (${JSON.stringify(selectedText())}, ${selectionColor()})`);
+    await write("\x1b7\x1b[1;1H\x1b[L\x1b8");
+    assert(status() === "1 of 1" && selectedText() === "NEEDLE row" && amber.includes(selectionColor()), `After ${label}, a line inserted above left Find's highlight on ${JSON.stringify(selectedText())}`);
+    key(find(), { key: "Escape" });
+    await until(() => !find(), `Escape closes Find after ${label}`);
+    assert(!selectedText(), `Closing Find after ${label} left ${JSON.stringify(selectedText())} selected`);
+    host.querySelector('[aria-label="Find in terminal"]').click();
+    await until(() => document.activeElement === find() && status() === "1 of 1", `Find reopens after ${label}`);
+  };
+  await keepsHighlight("a press on the scrollbar", async () => {
+    const slider = host.querySelector(".terminal-host .xterm-scrollable-element > .scrollbar.vertical > .slider");
+    assert(slider, "The terminal has no scrollbar slider");
+    const box = slider.getBoundingClientRect();
+    const shown = screenRows().join("\n");
+    // The scrollbar takes presses once the pointer over the terminal shows it.
+    await window.__fixtureMouse("mouseMoved", box.left + box.width / 2, box.top + box.height / 2);
+    await until(() => document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2) === slider, "the scrollbar shows under the pointer");
+    await press(box.left + box.width / 2, box.top + box.height / 2);
+    assert(screenRows().join("\n") === shown, "Pressing the scrollbar slider scrolled the terminal");
+  });
+  await keepsHighlight("a right-click on the highlight", async () => {
+    const { x, y } = rowPoint("NEEDLE row");
+    await press(x, y, "right");
+  });
+  await write("\x1b[?1000h");
+  await keepsHighlight("a click while the program tracks the mouse", async () => {
+    assert(host.querySelector(".terminal-host .xterm.enable-mouse-events"), "The terminal does not track the mouse");
+    const { x, y } = rowPoint("after 4");
+    await press(x, y);
+  });
+  await write("\x1b[?1000l");
+  key(find(), { key: "Escape" });
+  await until(() => !find() && document.activeElement === textarea(), "Escape closes Find");
+  assert(!errors.length, `Unexpected terminal errors: ${errors.map((error) => error.message).join("; ")}`);
+}
+
 async function terminalSavedSessionRegression() {
   root.render(null);
   await settle();
@@ -8371,6 +8902,8 @@ try {
     ["terminal keyboard", terminalKeyboardRegression, "terminal keyboard switching retains focus and ignores non-tab controls"],
     ["terminal unknown", terminalUnknownRegression, "unverified terminal ownership blocks interaction and survives restart"],
     ["terminal unknown during activation", terminalUnknownDuringActivationRegression, "a newer unknown event wins over an in-flight running detail"],
+    ["terminal scrollback find", terminalScrollbackFindRegression, "Find counts and steps through large, Unicode and reset scrollback by keyboard without taking the process's keys"],
+    ["terminal find highlight", terminalFindHighlightRegression, "Find keeps its highlight on the current match as output and reflow move it, leaves user selections alone and paces output announcements"],
     ["terminal saved session", terminalSavedSessionRegression, "saved output stays read-only, relaunches as a marked new shell and dismisses"],
     ["terminal reservation restored", terminalReservationRestoredRegression, "a reservation that becomes saved output updates in place and storage warnings announce once"],
     ["terminal saved session sync", terminalSavedSessionSyncRegression, "coalesced restores, eviction, expiry and dismissing an expired session converge with the server"],

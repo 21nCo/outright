@@ -1,12 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { ArrowsClockwise, Plus, TerminalWindow, X } from "@phosphor-icons/react";
+import { ArrowDown, ArrowUp, ArrowsClockwise, MagnifyingGlass, Plus, TerminalWindow, X } from "@phosphor-icons/react";
 import "@xterm/xterm/css/xterm.css";
 import { Button } from "@/components/ui/button";
 import { domId, nextTabIndex } from "@/lib/accessibility";
 import { preferredTerminal, pruneExitedIds, savedOutputRows, savedPageText, savedRowPages, terminalEndLabel, terminalTabBadge, terminalTabLabel } from "@/lib/terminal-exit-state";
 import { api } from "@/lib/runtime-api";
+import { createTerminalSearch, TERMINAL_MATCH_LIMIT } from "@/lib/terminal-search";
 
 const EMPTY_UNVERIFIED_IDS = new Set();
 const NEW_SHELL_MARKER = "\x1b[90m[new shell started; the saved session was not resumed]\x1b[0m\r\n";
@@ -23,6 +24,26 @@ const RESERVATION_LABEL = "its prior-run owner is unverified and not attached";
 const EARLIER_NOT_SHOWN = "\x1b[90m[earlier saved output not shown]\x1b[0m\r\n";
 // One announcement per distinct storage condition for this page session.
 let announcedHistoryWarning = "";
+const NO_FIND_RESULT = { total: 0, capped: false, index: -1, covered: false, selected: false };
+// A count that only output changed is announced at most this often; what the
+// user's own Find actions change is announced as it settles.
+const FIND_OUTPUT_ANNOUNCE_MS = 5000;
+// The Find bar overlays about the first two 15px rows of the output, from
+// the cell under its left edge to the right.
+const FIND_COVERED_ROWS = 2;
+function findCoveredColumn(xterm, bar) {
+  const screen = xterm.element?.querySelector(".xterm-screen")?.getBoundingClientRect();
+  if (!bar || !screen?.width || !(xterm.cols > 0)) return 0;
+  return Math.max(0, Math.floor((bar.getBoundingClientRect().left - screen.left) / (screen.width / xterm.cols)));
+}
+// Ctrl+F is a shell key, so outside macOS Find takes Ctrl+Shift+F. Either
+// shortcut is withheld from the process; every other key still reaches it.
+const MAC_SHORTCUTS = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+const FIND_SHORTCUT = MAC_SHORTCUTS ? "Meta+F" : "Control+Shift+F";
+function isFindShortcut(event) {
+  if (event.key?.toLowerCase() !== "f" || event.altKey) return false;
+  return MAC_SHORTCUTS ? event.metaKey && !event.ctrlKey && !event.shiftKey : event.ctrlKey && event.shiftKey && !event.metaKey;
+}
 
 export function TerminalPane(props) {
   return <WorktreeTerminalPane key={JSON.stringify([props.worktree.id, props.worktree.path])} {...props} />;
@@ -83,6 +104,23 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
   const [loading, setLoading] = useState(true);
   const [exitNotice, setExitNotice] = useState("");
   const [savedPage, setSavedPage] = useState(null);
+  const searchRef = useRef(null);
+  const findInputRef = useRef(null);
+  const findBarRef = useRef(null);
+  const focusFindRef = useRef(false);
+  const findOpenRef = useRef(false);
+  const findValueRef = useRef("");
+  const [findOpen, setFindOpen] = useState(false);
+  const [findValue, setFindValue] = useState("");
+  const [findResult, setFindResult] = useState(NO_FIND_RESULT);
+  const [announcedFind, setAnnouncedFind] = useState("");
+  const [findAction, setFindAction] = useState(0);
+  const findActionSeenRef = useRef(0);
+  const findActionPendingRef = useRef(false);
+  const findAnnouncedAtRef = useRef(0);
+  const findHighlightRef = useRef(false);
+  findOpenRef.current = findOpen;
+  findValueRef.current = findValue;
 
   useEffect(() => {
     const xterm = new Terminal({
@@ -93,12 +131,20 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       lineHeight: 1.25,
       screenReaderMode: true,
       scrollback: LIVE_SCROLLBACK,
-      theme: terminalTheme(),
+      theme: findHighlightRef.current ? findTheme() : terminalTheme(),
     });
     const fit = new FitAddon();
     xterm.loadAddon(fit);
     xterm.open(hostRef.current);
     xtermRef.current = xterm;
+    // Find reads the shown buffer only; the process never sees its keys.
+    xterm.attachCustomKeyEventHandler((event) => !isFindShortcut(event));
+    const search = createTerminalSearch(xterm, setFindResult, {
+      coveredRows: FIND_COVERED_ROWS,
+      coveredColumn: () => findCoveredColumn(xterm, findBarRef.current),
+    });
+    searchRef.current = search;
+    if (findOpenRef.current) search.setQuery(findValueRef.current);
     const resizeTerminal = () => {
       try {
         if (document.hidden) return;
@@ -123,7 +169,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       if (inputReadyRef.current && !loadingRef.current && activeIdRef.current
         && !unverifiedTerminalIdsRef.current.has(activeIdRef.current)) sendRuntime({ type: "terminal.input", terminalId: activeIdRef.current, data });
     });
-    return () => { disposable.dispose(); document.removeEventListener("visibilitychange", resizeTerminal); resize.disconnect(); fitSelectedRef.current = null; xterm.dispose(); xtermRef.current = null; };
+    return () => { disposable.dispose(); search.dispose(); searchRef.current = null; document.removeEventListener("visibilitychange", resizeTerminal); resize.disconnect(); fitSelectedRef.current = null; xterm.dispose(); xtermRef.current = null; };
   }, [sendRuntime]);
 
   // The selected terminal and the busy state both change the committed pane.
@@ -640,14 +686,113 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     if (next.id !== activeIdRef.current || (!inputReadyRef.current && !awaitingVisibleFitRef.current)) selectTerminal(next);
   }
 
+  // Opening Find moves focus to its query, selected so typing replaces it.
+  function openFind() {
+    setFindAction((count) => count + 1);
+    if (findOpenRef.current) { findInputRef.current?.focus(); findInputRef.current?.select(); return; }
+    focusFindRef.current = true;
+    findOpenRef.current = true;
+    setFindOpen(true);
+  }
+
+  // Closing Find removes its selection and returns focus to the terminal,
+  // which routes keys to the process again when it accepts input.
+  function closeFind() {
+    searchRef.current?.clear();
+    findOpenRef.current = false;
+    setFindOpen(false);
+    setFindResult(NO_FIND_RESULT);
+    setAnnouncedFind("");
+    xtermRef.current?.focus();
+  }
+
+  // Enter in the query steps; Escape anywhere in the bar closes it. Keys
+  // that confirm or cancel an IME composition stay with the composition.
+  function findKey(event) {
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+    if (event.key === "Enter" && event.target === findInputRef.current) {
+      event.preventDefault();
+      stepFind(event.shiftKey ? -1 : 1);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeFind();
+    }
+  }
+
+  function stepFind(direction) {
+    setFindAction((count) => count + 1);
+    searchRef.current?.step(direction);
+  }
+
+  function paneKey(event) {
+    if (!isFindShortcut(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    openFind();
+  }
+
+  // Only Find's own highlight is drawn as the current match; a selection the
+  // user makes while Find is open keeps the normal selection color.
+  const findHighlight = findOpen && findResult.selected;
+  findHighlightRef.current = findHighlight;
+  useLayoutEffect(() => {
+    if (xtermRef.current) xtermRef.current.options.theme = findHighlight ? findTheme() : terminalTheme();
+  }, [findHighlight]);
+
+  // A reopened query searches the view again once the bar is mounted, so
+  // whether to scroll its match and lower the bar is decided from where the
+  // bar really is, before it is painted.
+  useLayoutEffect(() => {
+    if (findOpen) searchRef.current?.setQuery(findValueRef.current);
+  }, [findOpen]);
+
+  useLayoutEffect(() => {
+    if (!findOpen || !focusFindRef.current) return;
+    focusFindRef.current = false;
+    findInputRef.current?.focus();
+    findInputRef.current?.select();
+  }, [findOpen]);
+
   const activeTerminal = terminals.find((terminal) => terminal.id === activeId);
   const activeSaved = activeTerminal?.status === "ended" || activeTerminal?.recoveryReservation ? activeTerminal : null;
+  // Saved output is searched one shown part at a time.
+  const findScope = activeSaved && savedPage?.id === activeSaved.id && savedPage.count > 1 ? " in this part" : "";
+  const findQuery = findOpen && findValue.trim();
+  let findStatus = "";
+  let findAnnouncement = "";
+  if (findQuery && !findResult.total) {
+    findStatus = "No matches";
+    findAnnouncement = `No matches${findScope}`;
+  } else if (findQuery) {
+    const total = `${findResult.total}${findResult.capped ? "+" : ""}`;
+    const more = findResult.capped ? `; only the newest ${TERMINAL_MATCH_LIMIT} are counted` : "";
+    const matches = `${total} ${findResult.total === 1 ? "match" : "matches"}`;
+    findStatus = findResult.index >= 0 ? `${findResult.index + 1} of ${total}` : matches;
+    findAnnouncement = (findResult.index >= 0 ? `Match ${findResult.index + 1} of ${findResult.total}` : matches) + findScope + more;
+  }
+  // Streaming output recounts every 200 ms; announcing each count would talk
+  // over the user, so output-only changes wait for the slower cadence. A user
+  // action is always announced: when its text is unchanged (one match, or a
+  // reopen), a trailing no-break space toggles so the live region still changes.
+  useEffect(() => {
+    if (findActionSeenRef.current !== findAction) { findActionSeenRef.current = findAction; findActionPendingRef.current = true; }
+    const action = findActionPendingRef.current;
+    const delay = action ? 180 : Math.max(180, findAnnouncedAtRef.current + FIND_OUTPUT_ANNOUNCE_MS - Date.now());
+    const timer = window.setTimeout(() => {
+      findActionPendingRef.current = false;
+      findAnnouncedAtRef.current = Date.now();
+      setAnnouncedFind((shown) => action && findAnnouncement && shown === findAnnouncement ? `${findAnnouncement}\u00a0` : findAnnouncement);
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [findAnnouncement, findAction]);
 
-  return <section className="terminal-pane" aria-label="Worktree terminals">
+  return <section className="terminal-pane" aria-label="Worktree terminals" onKeyDown={paneKey}>
     <p className="sr-only" id="terminal-help">Terminal input and output. Use the left and right arrow keys on a terminal tab to switch sessions.</p>
     <header className="terminal-tabs" role="tablist" aria-label="Open terminals" aria-orientation="horizontal" aria-busy={loading} onKeyDown={navigateTerminalTabs}>
       {terminals.map((terminal) => <div className={`terminal-tab ${terminal.id === activeId ? "is-active" : ""}`} key={terminal.id}><button className="terminal-tab-select" id={domId("terminal-tab", terminal.id)} data-tab-id={terminal.id} role="tab" aria-selected={terminal.id === activeId} aria-controls="terminal-panel" tabIndex={terminal.id === activeId || (!activeId && terminals[0]?.id === terminal.id) ? 0 : -1} aria-disabled={loading || undefined} aria-label={terminalTabLabel(terminal)} onClick={() => selectTerminal(terminal)}><TerminalWindow /><span>{terminal.name}</span>{terminalTabBadge(terminal) && <span className="terminal-tab-badge">{terminalTabBadge(terminal)}</span>}</button><button className="terminal-tab-close" aria-label={terminal.status === "ended" ? `Dismiss saved terminal ${terminal.name}` : `Close terminal ${terminal.name}`} disabled={loading || terminal.recoveryReservation} onClick={() => closeTerminal(terminal.id)}><X /></button></div>)}
       <Button variant="ghost" size="icon-xs" disabled={loading} onClick={createTerminal} aria-label="New terminal"><Plus /></Button>
+      <Button variant="ghost" size="icon-xs" onClick={() => findOpen ? closeFind() : openFind()} aria-label="Find in terminal" aria-expanded={findOpen} aria-controls={findOpen ? "terminal-find" : undefined} aria-keyshortcuts={FIND_SHORTCUT}><MagnifyingGlass /></Button>
       {loading && <span className="terminal-loading" role="status"><ArrowsClockwise className="spin" />Loading terminal</span>}
     </header>
     {activeSaved && <div className="terminal-saved-bar" role="group" aria-label="Saved terminal session">
@@ -659,9 +804,31 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
       </>}
       {activeSaved.status === "ended" && <Button variant="outline" size="xs" aria-disabled={loading || undefined} onClick={() => startNewShell(activeSaved)}>Start new shell</Button>}
     </div>}
-    <div className="terminal-host" id="terminal-panel" ref={hostRef} role="tabpanel" aria-label="Active terminal output" aria-labelledby={activeId ? domId("terminal-tab", activeId) : undefined} aria-describedby="terminal-help" />
+    {/* Find overlays the output, so opening it never resizes the process. */}
+    <div className="terminal-stage">
+      {/* It moves to the bottom while the current match is under it. */}
+      {findOpen && <div ref={findBarRef} className={`window-find terminal-find${findResult.covered ? " is-lowered" : ""}`} id="terminal-find" role="search" aria-label={`Find in ${activeTerminal?.name ?? "terminal"} output`} onKeyDown={findKey}>
+        <input ref={findInputRef} type="text" aria-label="Find in terminal output" aria-keyshortcuts={FIND_SHORTCUT} aria-describedby="terminal-find-help" spellCheck={false} autoComplete="off" value={findValue}
+          onChange={(event) => { setFindAction((count) => count + 1); setFindValue(event.target.value); searchRef.current?.setQuery(event.target.value); }} />
+        <span aria-hidden="true">{findStatus}</span>
+        <button type="button" onClick={() => stepFind(-1)} disabled={!findQuery} aria-label="Previous terminal match"><ArrowUp /></button>
+        <button type="button" onClick={() => stepFind(1)} disabled={!findQuery} aria-label="Next terminal match"><ArrowDown /></button>
+        <button type="button" onClick={closeFind} aria-label="Close terminal find"><X /></button>
+        <span className="sr-only" id="terminal-find-help">Enter finds the next match, Shift+Enter the previous, and Escape closes Find and returns to the terminal.</span>
+        <span className="sr-only" role="status">{announcedFind}</span>
+      </div>}
+      <div className="terminal-host" id="terminal-panel" ref={hostRef} role="tabpanel" aria-label="Active terminal output" aria-labelledby={activeId ? domId("terminal-tab", activeId) : undefined} aria-describedby="terminal-help" />
+    </div>
     <span className="sr-only" role="status">{exitNotice}</span>
   </section>;
+}
+
+// While Find holds the selection it is the current match, drawn opaque amber
+// with dark text whatever color the program used: at least 3:1 against the
+// terminal background and 4.5:1 for the text, focused or not.
+function findTheme() {
+  const match = document.documentElement.classList.contains("dark") ? "#e8b04a" : "#c4840c";
+  return { ...terminalTheme(), selectionBackground: match, selectionInactiveBackground: match, selectionForeground: "#111110" };
 }
 
 function terminalTheme() {

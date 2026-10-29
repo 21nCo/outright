@@ -21,6 +21,7 @@ tests.push(
   path.join(root, "tests", "run-tests.test.mjs"),
   path.join(root, "tests", "ui-accessibility.test.mjs"),
   path.join(root, "tests", "terminal-exit-state.test.mjs"),
+  path.join(root, "tests", "terminal-search.test.mjs"),
   path.join(root, "tests", "pane-layout.test.mjs"),
   path.join(root, "tests", "ui-races.test.mjs"),
 );
