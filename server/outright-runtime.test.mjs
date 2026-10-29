@@ -3663,3 +3663,59 @@ test("bootstrap omits saved terminal sessions, which clients list over /api/term
       terminalManagerFactory: (options) => createTerminalManager({ ...options, history: openTerminalHistory({ directory }) }) })();
   } finally { rmSync(historyRoot, { recursive: true, force: true }); }
 });
+
+test("a created worktree waits for trusted setup, refuses agent work until ready, and tears down before removal", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const root = path.dirname(worktree.path);
+  const gate = path.join(root, "setup-gate");
+  const tornDown = path.join(root, "torn-down");
+  const step = (name, script, ...args) => ({ name, command: [process.execPath, "-e", script, ...args] });
+  writeFileSync(path.join(worktree.path, "outright.worktree.json"), JSON.stringify({ version: 1,
+    setup: [step("Wait for services", "const fs = require('fs'); const t = setInterval(() => { if (fs.existsSync(process.argv[1])) { clearInterval(t); console.log('services up'); } }, 20);", gate)],
+    teardown: [step("Stop services", "require('fs').writeFileSync(process.argv[1], 'down')", tornDown)] }));
+  spawnSync("git", ["-C", worktree.path, "add", "outright.worktree.json"]);
+  spawnSync("git", ["-C", worktree.path, "commit", "-m", "lifecycle"]);
+
+  const created = await callRuntime(runtime, "POST", "/api/worktrees", { projectId: project.id, branch: "feature/setup", name: "repo-setup" });
+  assert.equal(created.statusCode, 201, created.raw);
+  assert.equal(created.body.lifecycle.state.status, "needs-trust", "untrusted repository commands ran on creation");
+  const scanned = (await runtime.projects(true)).projects.find((item) => item.id === project.id);
+  const added = scanned.worktrees.find((item) => realpathSync.native(item.path) === realpathSync.native(created.body.path));
+  const target = { projectId: project.id, worktreeId: added.id, worktreePath: added.path };
+  const query = `/api/worktrees/lifecycle?projectId=${encodeURIComponent(project.id)}&worktreeId=${encodeURIComponent(added.id)}&path=${encodeURIComponent(added.path)}`;
+  const described = await callRuntime(runtime, "GET", query);
+  assert.equal(described.statusCode, 200, described.raw);
+  assert.equal(described.body.config.trusted, false);
+  assert.deepEqual(described.body.config.setup.map((item) => item.name), ["Wait for services"]);
+  const bootstrap = await callRuntime(runtime, "GET", "/api/bootstrap");
+  assert.equal(bootstrap.body.worktreeLifecycle.find((state) => state.worktreeId === added.id)?.status, "needs-trust");
+
+  const stale = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/trust", { ...target, digest: "sha256:stale" });
+  assert.equal(stale.body.code, "LIFECYCLE_CONFIG_CHANGED");
+  assert.equal((await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/trust", { ...target, digest: described.body.config.digest })).body.config.trusted, true);
+  const started = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/setup", target);
+  assert.equal(started.statusCode, 202, started.raw);
+  assert.equal(started.body.state.status, "running");
+
+  const conversation = runtime.database.createConversation({ ...target, title: "Too early", provider: "codex" });
+  const early = await callRuntime(runtime, "POST", `/api/conversations/${conversation.id}/runs`, { prompt: "start before setup" });
+  assert.equal(early.statusCode, 409, early.raw);
+  assert.equal(early.body.code, "WORKTREE_LIFECYCLE_BUSY");
+  assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+  const removeEarly = await callRuntime(runtime, "DELETE", "/api/worktrees", { projectId: project.id, worktreePath: added.path, confirmation: added.path });
+  assert.equal(removeEarly.body.code, "WORKTREE_LIFECYCLE_BUSY");
+
+  writeFileSync(gate, "");
+  let ready;
+  for (const deadline = Date.now() + 15_000; ready?.state?.status !== "ready"; await new Promise((resolve) => setTimeout(resolve, 20))) {
+    if (Date.now() > deadline) assert.fail(`setup did not become ready: ${JSON.stringify(ready?.state)}`);
+    ready = (await callRuntime(runtime, "GET", query)).body;
+  }
+  assert.match(ready.state.output, /services up/);
+
+  runtime.database.updateConversation(conversation.id, { archived: true });
+  const removed = await callRuntime(runtime, "DELETE", "/api/worktrees", { projectId: project.id, worktreePath: added.path, confirmation: added.path });
+  assert.equal(removed.statusCode, 200, removed.raw);
+  assert.equal(readFileSync(tornDown, "utf8"), "down", "removal skipped the trusted teardown");
+  assert.equal(existsSync(added.path), false);
+  assert.equal((await callRuntime(runtime, "GET", "/api/bootstrap")).body.worktreeLifecycle.some((state) => state.worktreeId === added.id), false);
+}));

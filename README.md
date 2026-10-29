@@ -10,6 +10,7 @@ Outright is a local-first workspace for running coding agents across Git project
 - Project trust, sandbox/approval choices, exact-path guards, same-origin runtime access, and an audit log
 - Real PTY terminals with multiple tabs, resize/input/output streaming, reconnectable scrollback, and Find in the retained scrollback
 - Git status, diffs, stage/unstage, commits, guarded worktree creation/removal, and editor launching
+- Trusted repository setup and teardown commands for worktrees, with live progress, cancellation, and resumable retry
 - Project spaces, searchable conversations/messages, draggable/pinnable/renamable/archivable tabs, cross-worktree conversation moves, prompt templates, notifications, and keyboard shortcuts
 - Repository context for AGENTS/Claude/Copilot instructions, local skills, and the current GitHub pull request
 - Split panes: place the conversation beside the terminal, changes, and context views; resize, move, and close panes; each worktree restores its own arrangement
@@ -64,6 +65,33 @@ Separators resize with the pointer or, when focused, with the arrow keys, `Home`
 
 Layouts are saved in the browser's local storage per worktree, for the 64 most recently arranged worktrees. A saved layout with an unknown or duplicate view or an invalid size is repaired on restore, and an unreadable one falls back to the conversation alone; Outright names the repair it made, and says only once per session when the saved layouts cannot be read at all.
 
+## Worktree setup and teardown
+
+A repository can describe commands that prepare a new worktree and clean one up before removal, in `outright.worktree.json` at the worktree root:
+
+```json
+{
+  "version": 1,
+  "setup": [
+    { "name": "Install dependencies", "command": ["npm", "ci"], "timeoutSeconds": 900 },
+    { "name": "Copy local settings", "command": ["sh", "-c", "cp \"$OUTRIGHT_ROOT_PATH/.env\" .env"] }
+  ],
+  "teardown": [
+    { "name": "Stop services", "command": ["docker", "compose", "down"] }
+  ]
+}
+```
+
+Each step is a program and its arguments, run without a shell unless you name one, in the worktree, with your environment plus `OUTRIGHT_WORKTREE_PATH`, `OUTRIGHT_ROOT_PATH` (the project's primary checkout) and `OUTRIGHT_LIFECYCLE_PHASE`. Steps run without a terminal, so a command that waits for input waits until it times out. A step's `timeoutSeconds` defaults to 600 and may be at most 3600. The file may hold at most 16 setup and 16 teardown steps and 64 KiB; any other field, or any invalid value, makes the whole file invalid, and nothing in it runs. On Windows, name `cmd` (`["cmd", "/c", "npm ci"]`) for commands that are batch files.
+
+Nothing runs until you trust the file. Creating a worktree selects it and, when its file is not yet trusted or is invalid, opens **Worktree setup** (also in the worktree options menu) to show every command. Trust covers that project and the exact bytes you reviewed; a changed file asks again, and removing the project's trust removes it. A project keeps its 16 most recently trusted versions, so branches with different files do not ask each time.
+
+Setup starts when the worktree is created and runs its steps in order. The toolbar shows the current step, and Worktree setup shows the output; new agent runs in the worktree are refused until setup or teardown finishes. A step that exits with a non-zero status, times out, or is cancelled stops the run, and the worktree is reported as failed, cancelled or interrupted, never as ready. A retry resumes at the step that did not finish, so finished steps do not run again; a changed file starts from the first step. Cancelling, a timeout, or quitting Outright ends the step's whole process tree, including programs it started in the background. If Outright cannot confirm that tree ended, the state says so and running again needs your acknowledgement. Steps should still be safe to run again: an interrupted step may have done part of its work.
+
+Removing a worktree runs its teardown steps first, after the usual checks. If a step fails or is cancelled, or the file is untrusted or invalid, the worktree is kept and the removal dialog says why; retrying resumes at the failed step, and **Remove without running teardown** removes it without cleanup. If teardown finishes but Git keeps the worktree, a retry goes straight to removal.
+
+Output is kept as plain text, with terminal colors and control characters removed: the newest 32 KiB of each run while Outright runs, and with a failed, cancelled or interrupted state across restarts. The output of a run that finished is not stored. Output stays on this computer and out of the audit log, which records only each run's step names, file digest and outcome; a command that prints a secret still shows it in Worktree setup.
+
 ## Keyboard shortcuts
 
 - `Cmd/Ctrl K`: project, worktree, and conversation search
@@ -82,7 +110,7 @@ npm run build
 npm run test:sites
 ```
 
-The suite covers provider command construction and event normalization, SQLite recovery, PTY input/output, Git review/staging/commits, guarded worktree lifecycle, scanner parsing, and browser interaction regressions. Install Chrome or Chromium before running `npm test`; the browser suite fails explicitly rather than skipping coverage if it cannot find an executable. GitHub CI runners include Chrome, and `CHROME_PATH` overrides the detected location.
+The suite covers provider command construction and event normalization, SQLite recovery, PTY input/output, Git review/staging/commits, guarded worktree lifecycle including trusted setup and teardown, scanner parsing, and browser interaction regressions. Install Chrome or Chromium before running `npm test`; the browser suite fails explicitly rather than skipping coverage if it cannot find an executable. GitHub CI runners include Chrome, and `CHROME_PATH` overrides the detected location.
 
 ## Terminal Find
 
