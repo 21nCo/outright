@@ -1103,10 +1103,11 @@ test("a cancel or shutdown accepted while setup's outcome is saved is honored, a
 test("credentials in step output are masked before it is published, kept or saved, also when split across chunks", withLifecycle(async ({ database, project, create, events }) => {
   const secret = "s3cr3t-env-value-0123456789";
   const token = `ghp_${"A1b2C3d4E5".repeat(4)}`;
+  const bearer = ["abcdefgh", "ijklmnop"].join("");
   const chunks = {
     stdout: ["visible line\nexport DEPLOY_", "SECRET_VALUE_", `HALF=${secret.slice(0, 9)}`, `${secret.slice(9)} end\nbare ${secret.slice(0, 5)}`,
       `${secret.slice(5)}\nAPI_KEY=abc123xyz\n`],
-    stderr: [`push ${token.slice(0, 20)}`, `${token.slice(20)} ok\n`, "curl -H 'Authorization: Bearer abcdefghijklmnop'\n",
+    stderr: [`push ${token.slice(0, 20)}`, `${token.slice(20)} ok\n`, `curl -H 'Authorization: Bearer ${bearer}'\n`,
       "fetch https://deploy:hunter2hunter2@example.com/repo\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n",
       "-----END OPENSSH PRIVATE KEY-----\ntail line"],
   };
@@ -1129,7 +1130,7 @@ test("credentials in step output are masked before it is published, kept or save
     const published = events.filter((event) => event.type === "worktree.lifecycle.output").map((event) => event.payload.text).join("");
     const saved = database.listWorktreeLifecycle().find((state) => state.worktreePath === "/w/a");
     for (const [name, text] of [["published", published], ["shown", failed.output], ["saved", saved.output], ["error", saved.error]]) {
-      for (const leaked of [secret.slice(0, 9), secret.slice(9), token.slice(0, 20), "abc123xyz", "abcdefghijklmnop", "hunter2hunter2", "b3BlbnNzaC1rZXktdjEAAAAA"]) {
+      for (const leaked of [secret.slice(0, 9), secret.slice(9), token.slice(0, 20), "abc123xyz", bearer, "hunter2hunter2", "b3BlbnNzaC1rZXktdjEAAAAA"]) {
         assert.ok(!text.includes(leaked), `${name} output kept ${leaked}`);
       }
     }
@@ -1235,7 +1236,8 @@ test("the output mask covers credentials split anywhere around the line bound, a
   const whole = createOutputDecoder(createOutputMask());
   assert.equal(whole.write(Buffer.from(`${"a ".repeat(2500)}${credentials[0]} end\n`)), `${"a ".repeat(2500)}[redacted] end\n`);
   const mask = createOutputMask();
-  assert.equal(mask("SIGNING_KEY=abc\nAuthorization: token abcdef0123456789\nAUTH_HEADER=Bearer xyzxyzxyz1\nauthor: Someone\nkeyboard: us"),
+  const [value, bearer] = [["abcdef", "0123456789"].join(""), ["xyzxyz", "xyz1"].join("")];
+  assert.equal(mask(`SIGNING_KEY=abc\nAuthorization: token ${value}\nAUTH_HEADER=Bearer ${bearer}\nauthor: Someone\nkeyboard: us`),
     "SIGNING_KEY=[redacted]\nAuthorization: [redacted]\nAUTH_HEADER=[redacted] [redacted]\nauthor: Someone\nkeyboard: us");
 });
 
@@ -1272,7 +1274,7 @@ test("credentials in a step's command line are masked in its output, its running
       assert.ok(text, `${name} is empty`);
       for (const fragment of [token, password, secret, jwt].flatMap(fragmentsOf)) assert.ok(!text.includes(fragment), `${name} kept ${fragment}`);
     }
-    assert.ok(failed.output.includes(`$ curl -H "Authorization: [redacted]" https://deploy:[redacted]@example.com/repo --id-token=[redacted] [redacted]\n`), failed.output);
+    assert.ok(failed.output.includes("$ curl (5 arguments not shown)\n"), failed.output);
     // The trust review shows exactly what runs.
     assert.deepEqual((await lifecycle.describe(a)).config.setup[0].command, command);
   } finally { delete process.env.OUTRIGHT_TEST_COMMAND_SECRET; }
@@ -1280,8 +1282,9 @@ test("credentials in a step's command line are masked in its output, its running
 
 test("a quoted credential, the rest of an argument after a secret name, and an escaped secret are masked whole in every sink, also when the outcome cannot be saved", withLifecycle(async ({ database, project, create, events }) => {
   const escaped = String.raw`p"ss\word-12345678`;
+  const bearer = ["zyxwvuts", "87654321"].join("");
   const commands = [["sh", "-c", 'export TOKEN="abcdefgh12345678"; exit 1'], ["deploy", "--password=correct horse battery"],
-    ["deploy", "--password", escaped], ["curl", "-H", "Authorization: Bearer zyxwvuts87654321"]];
+    ["deploy", "--password", escaped], ["curl", "-H", `Authorization: Bearer ${bearer}`]];
   const config = { digest: "sha256:trusted", version: 1, teardown: [], setup: commands.map((command, index) => ({ name: `Step ${index + 1}`, command, timeoutSeconds: 1 })) };
   const output = { stdout: ['export TOKEN="abcd efgh', ' ijkl"\nTOKEN=\'abcd;efgh\'\n'], stderr: ['password: "hunter2 hunter3"\nAPI_KEY="unclosed value here\n'] };
   let release;
@@ -1313,14 +1316,14 @@ test("a quoted credential, the rest of an argument after a secret name, and an e
     assert.deepEqual([failed.status, failed.unsaved], ["failed", true]);
     assert.match(failed.error, /could not save that outcome \(database rejected \[redacted\]\)/);
     const published = events.filter((event) => event.type === "worktree.lifecycle.output").map((event) => event.payload.text).join("");
-    const credentials = ["abcdefgh12345678", "horse battery", escaped, JSON.stringify(escaped), "zyxwvuts87654321", "abcd efgh ijkl", "abcd;efgh", "hunter2 hunter3", "unclosed value here"];
+    const credentials = ["abcdefgh12345678", "horse battery", escaped, JSON.stringify(escaped), bearer, "abcd efgh ijkl", "abcd;efgh", "hunter2 hunter3", "unclosed value here"];
     for (const [name, text] of [["published", published], ["running row", checkpoint.output], ["running state", during.output],
       ["shown", failed.output], ["shown error", failed.error]]) {
       assert.ok(text, `${name} is empty`);
       for (const fragment of credentials.flatMap(fragmentsOf)) assert.ok(!text.includes(fragment), `${name} kept ${fragment}`);
     }
-    for (const line of ['$ sh -c "export TOKEN=[redacted]"\n', '$ deploy "--password=[redacted]"\n', '$ deploy --password "[redacted]"\n',
-      '$ curl -H "Authorization: [redacted]"\n', "export TOKEN=[redacted]\nTOKEN=[redacted]\n", "password: [redacted]\nAPI_KEY=[redacted]\n"]) {
+    for (const line of ["$ sh (2 arguments not shown)\n", "$ deploy (1 argument not shown)\n", "$ deploy (2 arguments not shown)\n",
+      "$ curl (2 arguments not shown)\n", "export TOKEN=[redacted]\nTOKEN=[redacted]\n", "password: [redacted]\nAPI_KEY=[redacted]\n"]) {
       assert.ok(failed.output.includes(line), `${JSON.stringify(line)} not in ${failed.output}`);
     }
     // The trust review shows exactly what runs.
@@ -1328,6 +1331,96 @@ test("a quoted credential, the rest of an argument after a secret name, and an e
   } finally {
     database.saveWorktreeLifecycle = save;
     delete process.env.OUTRIGHT_TEST_DEPLOY_PASSWORD;
+  }
+}));
+
+test("a step's arguments are never printed, and an error is masked before it is cut, in every sink", withLifecycle(async ({ database, project, create, events }) => {
+  const token = `ghp_${"A1b2C3d4E5".repeat(4)}`;
+  const secret = "straddle-secret-0123456789";
+  const [begin, end] = ["BEGIN", "END"].map((word) => `-----${word} PRIVATE KEY-----`);
+  const body = ["Synthetic", "PrivateKeyBody", "0123456789"].join("");
+  const values = ["hunter2-separate-val", "gh-separate-value-01", "api-separate-value-1"];
+  const commands = [["node", "-e", "x", begin, body, end], ["mysql", "--password", values[0]], ["gh", "--token", values[1]],
+    ["x", "--api-key", values[2]], ["deploy", "--verbose", "visible-0123"]];
+  const config = { digest: "sha256:trusted", version: 1, teardown: [{ name: "Down", command: ["down"], timeoutSeconds: 1 }],
+    setup: commands.map((command, index) => ({ name: `Step ${index + 1}`, command, timeoutSeconds: 1 })) };
+  // Each raw error carries a credential across the point where its text is cut.
+  const cut = (limit, credential) => `${"e".repeat(limit - 1 - Math.floor(credential.length / 2))} ${credential}`;
+  let release;
+  const running = new Promise((resolve) => { release = resolve; });
+  const { target, start } = scriptedLifecycle(create, database, project);
+  let failTrust = false;
+  let failProgress = false;
+  const subprocesses = { capacity: () => ({ active: 0, limit: 4, unknown: 0 }), run: async (file, _args, { cwd }) => {
+    if (cwd === "/w/b") failTrust = true;
+    if (cwd === "/w/c") failProgress = true;
+    if (cwd !== "/w/a" || file !== "deploy") return;
+    await running;
+    throw new Error(cut(512, token));
+  } };
+  const isTrusted = database.isLifecycleConfigTrusted;
+  database.isLifecycleConfigTrusted = (...args) => {
+    if (failTrust) {
+      failTrust = false;
+      throw new Error(cut(200, secret));
+    }
+    return isTrusted.apply(database, args);
+  };
+  const save = database.saveWorktreeLifecycle;
+  database.saveWorktreeLifecycle = (state) => {
+    if (failProgress && state.status === "running") throw new Error(cut(512, secret));
+    if (state.worktreePath !== "/w/a" && state.status !== "running") throw new Error(cut(200, token));
+    return save.call(database, state);
+  };
+  process.env.OUTRIGHT_TEST_STRADDLE_TOKEN = secret;
+  const fragments = [body, ...values, token, secret].flatMap(fragmentsOf);
+  const check = (name, text) => {
+    assert.ok(text, `${name} is empty`);
+    for (const fragment of fragments) assert.ok(!text.includes(fragment), `${name} kept ${fragment}`);
+  };
+  try {
+    const lifecycle = start({ subprocesses, readConfig: async () => config, limits: { ...LIFECYCLE_LIMITS, persistRetryDelaysMs: [0] },
+      onPersistError: () => {} });
+    const a = target("/w/a");
+    await lifecycle.setup(a);
+    await waitFor(() => events.some((event) => event.type === "worktree.lifecycle.output" && event.payload.text.includes("$ deploy")), 5_000, "the last step did not start");
+    check("running row", database.listWorktreeLifecycle().find((state) => state.worktreePath === "/w/a").output);
+    check("running state", (await lifecycle.describe(a)).state.output);
+    release();
+    const failed = (await settled(lifecycle, a)).state;
+    const saved = database.listWorktreeLifecycle().find((state) => state.worktreePath === "/w/a");
+    assert.match(failed.error, /^"Step 5" could not run: e+ \[reda/);
+    for (const [name, text] of [["shown", failed.output], ["shown error", failed.error], ["saved", saved.output], ["saved error", saved.error]]) check(name, text);
+    for (const line of ["$ node (5 arguments not shown)\n", "$ mysql (2 arguments not shown)\n", "$ gh (2 arguments not shown)\n", "$ x (2 arguments not shown)\n"]) {
+      assert.ok(failed.output.includes(line), `${JSON.stringify(line)} not in ${failed.output}`);
+    }
+    // A trust check and the outcome save fail; then a progress save does.
+    const b = target("/w/b");
+    await lifecycle.setup(b);
+    const untrusted = (await settled(lifecycle, b)).state;
+    assert.match(untrusted.error, /could not check trust .*could not save that outcome/s);
+    check("trust-check error", untrusted.error);
+    const c = target("/w/c");
+    await lifecycle.setup(c);
+    const unsaved = (await settled(lifecycle, c)).state;
+    assert.match(unsaved.error, /could not save progress before "Step 2"/);
+    check("progress-save error", unsaved.error);
+    failProgress = false;
+    // Git removal fails after teardown finished.
+    await assert.rejects(lifecycle.removeWorktree(a, { remove: async (prepare) => { await prepare(); throw new Error(cut(512, secret)); } }));
+    const kept = (await lifecycle.describe(a)).state;
+    assert.match(kept.error, /could not be removed/);
+    check("removal error", kept.error);
+    const published = events.filter((event) => event.type === "worktree.lifecycle.output").map((event) => event.payload.text).join("");
+    check("published", published);
+    assert.ok(published.includes("$ deploy (2 arguments not shown)\n"));
+    // The trust review shows exactly what runs.
+    assert.deepEqual((await lifecycle.describe(a)).config.setup.map((step) => step.command), commands);
+  } finally {
+    release();
+    database.isLifecycleConfigTrusted = isTrusted;
+    database.saveWorktreeLifecycle = save;
+    delete process.env.OUTRIGHT_TEST_STRADDLE_TOKEN;
   }
 }));
 

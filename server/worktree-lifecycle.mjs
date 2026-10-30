@@ -66,9 +66,6 @@ const SECRET_RULES = [
   new RegExp(SECRET_ASSIGNMENT + SECRET_VALUE, "gi"),
   /\b([a-z][\w+.-]*:\/\/[^\s/@:]+:)[^\s/@]+(?=@)/gi,
 ];
-// In one argument of a step's command, an assignment's value is the rest of
-// that argument (`--password=correct horse battery`).
-const ARGUMENT_ASSIGNMENT = new RegExp(String.raw`${SECRET_ASSIGNMENT}[\s\S]+`, "i");
 const PLAIN_ARGUMENT = /^[\w@%+=:,./-]+$/;
 const PRIVATE_KEY_BEGIN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
 const PRIVATE_KEY_END = /-----END [A-Z0-9 ]*PRIVATE KEY-----/;
@@ -273,14 +270,20 @@ function tail(text, limit) {
   return text.slice(start);
 }
 
-// The command line a step's output shows (the trust review shows the exact
-// command). Each argument is masked as it runs, before quoting could change
-// how a credential in it reads, and is quoted only where it needs to be.
+// The command line a step's output shows: its program and how many
+// arguments follow, never the arguments, which can carry credentials in
+// forms no mask recognizes. The trust review shows the exact command.
 export function displayCommand(command, secrets = []) {
-  return command.map((argument) => {
-    const masked = createOutputMask(secrets)(argument).replace(ARGUMENT_ASSIGNMENT, `$1${REDACTED}`);
-    return PLAIN_ARGUMENT.test(argument) ? masked : JSON.stringify(masked);
-  }).join(" ");
+  const program = createOutputMask(secrets)(command[0].split(/[\\/]/).pop());
+  const shown = PLAIN_ARGUMENT.test(program) ? program : JSON.stringify(program);
+  const count = command.length - 1;
+  return count ? `${shown} (${count} argument${count === 1 ? "" : "s"} not shown)` : shown;
+}
+
+// An error's text for output and state: masked whole, then cut, so a cut
+// never leaves part of a credential the mask no longer recognizes.
+function errorText(error, limit, mask) {
+  return mask(String(error?.message ?? error)).slice(0, limit);
 }
 
 function apiError(statusCode, message, details) {
@@ -332,7 +335,7 @@ function finishedCheckpoints(checkpoints, phase, configDigest, outcome, stepCoun
   return { ...checkpoints, [phase]: { configDigest, stepIndex: outcome.stepIndex } };
 }
 
-function stepFailure(error, step, signal, capacity) {
+function stepFailure(error, step, signal, capacity, mask) {
   const unknown = error?.code === "SUBPROCESS_OWNERSHIP_UNKNOWN";
   // Unconfirmed ownership wraps what stopped the step, such as its timeout.
   let cause = error;
@@ -343,7 +346,7 @@ function stepFailure(error, step, signal, capacity) {
     return { status: shutdown ? "interrupted" : "cancelled", outcomeUnknown: unknown,
       error: `${shutdown ? "Outright stopped during" : "Cancelled during"} "${step.name}"; its effects may be partial.${suffix}` };
   }
-  let message = `"${step.name}" could not run: ${String(cause?.message ?? cause).slice(0, 512)}`;
+  let message = `"${step.name}" could not run: ${errorText(cause, 512, mask)}`;
   if (cause?.code === "SUBPROCESS_CAPACITY") {
     message = `Setup and teardown capacity is full${capacity ? ` (${capacity.active} of ${capacity.limit} steps running or unconfirmed)` : ""}; retry when one finishes.`;
   }
@@ -401,7 +404,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     const finished = state.status === "ready" || state.status === "complete";
     return commit({ ...state, status: finished ? "failed" : state.status, unsaved: true,
       checkpoints: { ...state.checkpoints, [state.phase]: { configDigest: state.configDigest, stepIndex: state.stepIndex } },
-      error: mask(`${state.error ? `${state.error} ` : ""}The ${state.phase} ${finished ? "finished" : "stopped"}, but Outright could not save that outcome (${String(failure?.message ?? failure).slice(0, 200)}). Run it again to record it.`) }, { memoryOnly: true });
+      error: mask(`${state.error ? `${state.error} ` : ""}The ${state.phase} ${finished ? "finished" : "stopped"}, but Outright could not save that outcome (${errorText(failure, 200, mask)}). Run it again to record it.`) }, { memoryOnly: true });
   }
 
   // Memory holds every state the database keeps, so a lookup never misses a
@@ -631,8 +634,8 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     const log = openLog(worktreePath, runId);
     const env = { ...process.env, OUTRIGHT_LIFECYCLE_PHASE: phase, OUTRIGHT_WORKTREE_PATH: worktreePath, OUTRIGHT_ROOT_PATH: target.project.path };
     const secrets = environmentSecrets(env);
-    // Outright's own lines and errors, such as a step's command line, are
-    // masked like step output, each through a mask of its own.
+    // Outright's own lines and errors, such as a step's program, are masked
+    // like step output, each through a mask of its own.
     const maskText = (text) => createOutputMask(secrets)(text);
     const note = (text) => append(worktreePath, log, maskText(text));
     if (resumeAt) note(`Resuming at step ${resumeAt + 1}; earlier steps already finished.\n`);
@@ -648,13 +651,13 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     for (let index = resumeAt; index < steps.length; index += 1) {
       const step = steps[index];
       if (signal.aborted) {
-        outcome = { ...stepFailure(null, step, signal, null), stepIndex: index };
+        outcome = { ...stepFailure(null, step, signal, null, maskText), stepIndex: index };
         break;
       }
       // Trust removed during the run stops it before the next step.
       let untrusted = null;
       try { if (!trusted(target, state.configDigest)) untrusted = `Trust in ${LIFECYCLE_CONFIG_FILE} was removed`; }
-      catch (error) { untrusted = `Outright could not check trust in ${LIFECYCLE_CONFIG_FILE} (${String(error?.message ?? error).slice(0, 200)})`; }
+      catch (error) { untrusted = `Outright could not check trust in ${LIFECYCLE_CONFIG_FILE} (${errorText(error, 200, maskText)})`; }
       if (untrusted) {
         outcome = { status: "failed", stepIndex: index, outcomeUnknown: false, error: `${untrusted}, so "${step.name}" did not run.` };
         break;
@@ -665,7 +668,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
       try { state = commit({ ...state, stepIndex: index, output: log.text, outputTruncated: log.truncated, updatedAt: now() }, { strict: true }); }
       catch (error) {
         outcome = { status: "failed", stepIndex: index, outcomeUnknown: false,
-          error: `Outright could not save progress before "${step.name}", so it did not run: ${String(error?.message ?? error).slice(0, 512)}` };
+          error: `Outright could not save progress before "${step.name}", so it did not run: ${errorText(error, 512, maskText)}` };
         break;
       }
       const decoders = { stdout: createOutputDecoder(createOutputMask(secrets)), stderr: createOutputDecoder(createOutputMask(secrets)) };
@@ -675,7 +678,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
           onOutput: (stream, chunk) => append(worktreePath, log, decoders[stream].write(chunk)),
         });
       } catch (error) {
-        outcome = { ...stepFailure(error, step, signal, subprocesses.capacity?.()), stepIndex: index };
+        outcome = { ...stepFailure(error, step, signal, subprocesses.capacity?.(), maskText), stepIndex: index };
         break;
       } finally {
         append(worktreePath, log, decoders.stdout.end() + decoders.stderr.end());
@@ -804,7 +807,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
         // Teardown finished but Git kept the worktree. Its checkpoint sends a
         // retry straight to removal.
         commit({ ...finished, status: "failed", stepIndex: finished.steps.length, updatedAt: now(),
-          error: `Teardown finished, but the worktree could not be removed: ${String(error.message ?? error).slice(0, 512)}` });
+          error: `Teardown finished, but the worktree could not be removed: ${errorText(error, 512, createOutputMask(environmentSecrets(process.env)))}` });
       }
       throw error;
     } finally { entry.release(); }
