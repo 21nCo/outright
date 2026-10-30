@@ -1337,6 +1337,88 @@ async function lifecycleRemovalCancel() {
   root.render(null); await settle();
 }
 
+// The refresh that drops a removed worktree can land before its DELETE
+// answers and move the selection to the primary checkout. The remove and setup
+// dialogs stay bound to the worktree they were opened for: they never show or
+// act for the primary checkout, and a dialog opened for another worktree is
+// left alone.
+async function worktreeRemovalRetargetRegression() {
+  keys.forEach((key, index) => localStorage.setItem(key, ["A", "A-two", "chat-A"][index]));
+  const linked = (name) => ({ id: name, name, path: `/fixture/${name}`, branch: name, changedCount: 0, isLinked: true });
+  const listed = (...names) => projects.map((item) => item.id === "A" ? { ...item, worktrees: [item.worktrees[0], ...names.map(linked)] } : item);
+  let current = listed("A-two", "A-three", "A-four");
+  let removal = deferred();
+  let loads = 0;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") { loads += 1; return response({ projects: current, projectGroups: { groups: [], memberships: {} },
+      settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] }); }
+    if (url.pathname === "/api/worktrees" && options?.method === "DELETE") return removal.promise;
+    if (url.pathname === "/api/worktrees/lifecycle") return response({ file: "outright.worktree.json", worktreePath: url.searchParams.get("path"), config: null, state: null, running: null });
+    if (url.pathname === "/api/conversations") return response({ conversations: [] });
+    return response({});
+  };
+  const buttons = (scope = document) => [...scope.querySelectorAll("button")];
+  const dialog = () => [...document.querySelectorAll('[role="dialog"]')].find((node) => node.querySelector("#remove-worktree-confirmation"));
+  const selected = () => host.querySelector(".workspace-context strong")?.textContent;
+  const primaryShown = () => [...document.querySelectorAll('[role="dialog"]')].some((node) => node.querySelector(".confirm-path")?.textContent === "/fixture/A")
+    || Boolean(document.querySelector(".lifecycle-dialog"));
+  async function openRemove(path, confirmation) {
+    host.querySelector('[aria-label="Worktree options"]').click();
+    await until(() => [...document.querySelectorAll('[role="menuitem"]')].some((item) => item.textContent.includes("Remove worktree")), `remove worktree menu item for ${path}`);
+    [...document.querySelectorAll('[role="menuitem"]')].find((item) => item.textContent.includes("Remove worktree")).click();
+    await until(() => dialog()?.querySelector(".confirm-path")?.textContent === path, `the remove dialog did not open for ${path}`);
+    setControlValue(document.querySelector("#remove-worktree-confirmation"), confirmation);
+  }
+  async function startRemoval(path) {
+    await openRemove(path, path);
+    buttons(dialog()).find((item) => item.textContent === "Remove worktree").click();
+    await until(() => buttons(dialog()).some((item) => item.textContent === "Cancel removal"), `the removal of ${path} did not start`);
+  }
+  // Git has removed the worktree: the server's refresh lands, then the DELETE answers.
+  async function finishAfterRefresh(removed, ...remaining) {
+    current = listed(...remaining);
+    fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "projects.changed", payload: { projects: current } }) }));
+    await until(() => ![...host.querySelectorAll(".worktree-row strong")].some((node) => node.textContent === removed), `the refresh did not drop ${removed}`);
+    await remainsTrue(() => !primaryShown(), 100, `a dialog for ${removed} was retargeted to the primary checkout before its removal answered`);
+    const before = loads;
+    removal.resolve(response({ removed: true }));
+    await until(() => loads > before, "the removal did not finish");
+    removal = deferred();
+  }
+  const choose = async (name) => {
+    [...host.querySelectorAll(".worktree-row")].find((row) => row.querySelector("strong")?.textContent === name).click();
+    await until(() => selected() === name, `worktree ${name} was not selected`);
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => selected() === "A-two", "linked worktree A-two was not selected");
+  // The remove dialog is open when the refresh moves the selection to main.
+  await startRemoval("/fixture/A-two");
+  await finishAfterRefresh("A-two", "A-three", "A-four");
+  assert(selected() === "A", "the removal did not fall back to the primary checkout");
+  await until(() => !dialog(), "the remove dialog stayed open after its worktree was removed");
+  await remainsTrue(() => !dialog() && !primaryShown(), 150, "a dialog was retargeted to the primary checkout after the removal");
+  // A dialog opened for another worktree while one is being removed keeps its own target and confirmation.
+  await choose("A-three");
+  await startRemoval("/fixture/A-three");
+  buttons(dialog()).find((item) => item.textContent === "Close").click();
+  await until(() => !dialog(), "Close did not close the pending removal dialog");
+  await choose("A-four");
+  await openRemove("/fixture/A-four", "/fixture/A-fo");
+  await finishAfterRefresh("A-three", "A-four");
+  await remainsTrue(() => dialog()?.querySelector(".confirm-path")?.textContent === "/fixture/A-four"
+    && document.querySelector("#remove-worktree-confirmation")?.value === "/fixture/A-fo", 150, "another worktree's removal closed or cleared this remove dialog");
+  // Watching teardown progress when the refresh moves the selection to main.
+  setControlValue(document.querySelector("#remove-worktree-confirmation"), "/fixture/A-four");
+  buttons(dialog()).find((item) => item.textContent === "Remove worktree").click();
+  await until(() => buttons(dialog()).some((item) => item.textContent === "Show teardown progress"), "teardown progress was not offered");
+  buttons(dialog()).find((item) => item.textContent === "Show teardown progress").click();
+  await until(() => document.querySelector(".lifecycle-dialog"), "teardown progress did not open");
+  await finishAfterRefresh("A-four");
+  await until(() => selected() === "A" && !document.querySelector(".lifecycle-dialog"), "the setup dialog stayed open after its worktree was removed");
+  await remainsTrue(() => !dialog() && !primaryShown(), 150, "the setup dialog was retargeted to the primary checkout after the removal");
+  root.render(null); await settle();
+}
+
 async function settingsCapacityWithoutEventRegression() {
   root.render(null); await settle();
   const settings = { provider: "codex", model: "", approvalPolicy: "read-only", reasoningEffort: "medium",
@@ -9211,6 +9293,7 @@ try {
     ["settings shared refresh order", settingsSharedRefreshOrderRegression, "a settings save preserves an in-flight template refresh without reverting the new quota"],
     ["bootstrap error ownership", bootstrapRefreshErrorOwnershipRegression, "a background bootstrap cannot dismiss an unrelated operation error"],
     ["settings migration completion", settingsMigrationCompletionRegression, "an open Settings dialog refreshes capacity when migration finishes"],
+    ["worktree removal retarget", worktreeRemovalRetargetRegression, "a refresh that drops a removed worktree never retargets its remove or setup dialog, and another worktree's dialog is left alone"],
     ["worktree lifecycle", worktreeLifecycleRegression, "an open setup dialog reconciles an interrupted run on reconnect, and teardown choices are explicit and bound to their worktree"],
     ["settings live capacity", settingsCapacityWithoutEventRegression, "an open Settings dialog reads another client's quota changes without a capacity event"],
     ["provider accounts window aging", providerAccountsWindowAgingRegression, "an open account list drops a run that leaves the 5-hour window without any event"],
