@@ -46,18 +46,29 @@ const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b-\u001f\u007f]/g; // NOSONAR S63
 // Output is shown, kept and saved, so credentials are masked before any of
 // that: values of the step's secret-named environment variables, common
 // token formats, secret assignments, authorization headers, URL passwords
-// and private key blocks.
+// and private key blocks. Names and assignments share one set of words; a
+// `key` counts as a whole word (SIGNING_KEY, key=), and `auth` does, except
+// in AUTHOR names and SSH_AUTH_SOCK.
 const REDACTED = "[redacted]";
-const SECRET_NAME = /secret|token|passw(?:or)?d|api[-_]?key|access[-_]?key|private[-_]?key|credential|auth(?!or|_sock)/i;
-const TOKEN_FORMAT = /\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_\w{22,}|glpat-[\w-]{20,}|xox[abprs]-[\w-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}|sk-[\w-]{20,}|AIza[\w-]{35}|npm_[A-Za-z0-9]{36}|eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,})/g;
-const SECRET_ASSIGNMENT = /\b([\w.-]{0,64}(?:secret|token|passw(?:or)?d|api[-_]?key|access[-_]?key|private[-_]?key|credentials?)[\w.-]{0,64}["']?\s*[:=]\s*["']?)[^\s"',;]+/gi;
-const AUTHORIZATION = /\b(bearer|basic)\s+[\w.~+/=-]{8,}/gi;
-const URL_PASSWORD = /\b([a-z][\w+.-]*:\/\/[^\s/@:]+:)[^\s/@]+@/gi;
+const SECRET_WORD = String.raw`secret|token|passw(?:or)?d|credential|(?:api|access|private)[-_]?key|(?<![^\W_])key(?![^\W_])|auth(?!or(?!iz)|_sock)`;
+const SECRET_NAME = new RegExp(SECRET_WORD, "i");
+const TOKEN_FORMATS = [/\bgh[pousr]_[A-Za-z0-9]{36,}/g, /\bgithub_pat_\w{22,}/g, /\bglpat-[\w-]{20,}/g, /\bxox[abprs]-[\w-]{10,}/g,
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}/g, /\bsk-[\w-]{20,}/g, /\bAIza[\w-]{35}/g, /\bnpm_[A-Za-z0-9]{36}/g, /\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}/g];
+// Each rule keeps its first group and masks the rest; schemes go first, so
+// an assignment never masks only the scheme in front of a credential.
+const SECRET_RULES = [
+  /\b((?:bearer|basic)\s+)[\w.~+/=-]{8,}/gi,
+  /\b(authorization\s*[:=]\s*["']?)(?:[a-z]+\s+)?[^\s"',;]+/gi,
+  new RegExp(String.raw`\b([\w.-]{0,64}(?:${SECRET_WORD})[\w.-]{0,64}["']?\s*[:=]\s*["']?)[^\s"',;]+`, "gi"),
+  /\b([a-z][\w+.-]*:\/\/[^\s/@:]+:)[^\s/@]+(?=@)/gi,
+];
 const PRIVATE_KEY_BEGIN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
 const PRIVATE_KEY_END = /-----END [A-Z0-9 ]*PRIVATE KEY-----/;
 // Masking works on whole lines, so a value split across chunks is still
-// found; a longer line is passed on at its last space.
+// found. An unfinished line longer than this is withheld up to its end,
+// never shown in pieces the mask cannot see whole.
 const OUTPUT_LINE_CHARACTERS = 4096;
+const WITHHELD_LINE = `[output line longer than ${OUTPUT_LINE_CHARACTERS} characters withheld]\n`;
 // Characters that render invisibly or reorder the text around them (bidi
 // controls, zero-width and other format characters, line separators, and
 // spaces that look like an argument break). A reviewed command must look
@@ -183,18 +194,29 @@ export function createOutputMask(secrets = []) {
     }
     let masked = line;
     for (const secret of secrets) masked = masked.replaceAll(secret, REDACTED);
-    return masked.replace(TOKEN_FORMAT, REDACTED).replace(SECRET_ASSIGNMENT, `$1${REDACTED}`)
-      .replace(AUTHORIZATION, `$1 ${REDACTED}`).replace(URL_PASSWORD, `$1${REDACTED}@`);
+    for (const format of TOKEN_FORMATS) masked = masked.replace(format, REDACTED);
+    for (const rule of SECRET_RULES) masked = masked.replace(rule, `$1${REDACTED}`);
+    return masked;
   }).join("\n");
 }
 
 // Decodes one stream's UTF-8, holding back a sequence or line ending that a
 // chunk boundary split, so neither leaks into the text half-removed, and the
-// unfinished line, so it is masked whole.
+// unfinished line, so it is masked whole. An unfinished line past the bound
+// is replaced by one notice and dropped up to its end, so memory stays
+// bounded and no part of it is shown unmasked; the mask still learns whether
+// it opened or closed a private key block.
 export function createOutputDecoder(mask = createOutputMask()) {
   const decoder = new StringDecoder("utf8");
   let carry = "";
   let line = "";
+  let withheld = null;
+  const watch = (text) => {
+    const seen = withheld.overlap + text;
+    withheld.begin ||= PRIVATE_KEY_BEGIN.test(seen);
+    withheld.end ||= PRIVATE_KEY_END.test(seen);
+    withheld.overlap = seen.slice(-256);
+  };
   const take = (text, final) => {
     let value = carry + text;
     carry = "";
@@ -208,12 +230,27 @@ export function createOutputDecoder(mask = createOutputMask()) {
         value = value.slice(0, -1);
       }
     }
-    line += sanitizeOutput(value);
-    let cut = final ? line.length : line.lastIndexOf("\n") + 1;
-    if (!cut && line.length > OUTPUT_LINE_CHARACTERS) cut = line.lastIndexOf(" ") + 1 || line.length;
-    const complete = line.slice(0, cut);
+    value = sanitizeOutput(value);
+    if (withheld) {
+      const end = value.indexOf("\n");
+      watch(end < 0 ? value : value.slice(0, end));
+      if (end < 0) return "";
+      // The mask sees the markers the whole line held, and nothing else.
+      mask(`${withheld.begin ? "-----BEGIN PRIVATE KEY-----" : ""}${withheld.end ? "-----END PRIVATE KEY-----" : ""}`);
+      withheld = null;
+      value = value.slice(end + 1);
+    }
+    line += value;
+    const cut = final ? line.length : line.lastIndexOf("\n") + 1;
+    let shown = mask(line.slice(0, cut));
     line = line.slice(cut);
-    return mask(complete);
+    if (line.length > OUTPUT_LINE_CHARACTERS) {
+      withheld = { overlap: "", begin: false, end: false };
+      watch(line);
+      line = "";
+      shown += WITHHELD_LINE;
+    }
+    return shown;
   };
   return { write: (chunk) => take(decoder.write(chunk), false), end: () => take(decoder.end(), true) };
 }

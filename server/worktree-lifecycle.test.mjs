@@ -1093,7 +1093,7 @@ test("a cancel or shutdown accepted while setup's outcome is saved is honored, a
     const d = target("/w/d");
     stop = true;
     await lifecycle.setup(d);
-    await waitFor(() => stopped, 5000, "shutdown did not start");
+    await waitFor(() => stop === null, 5000, "shutdown did not start");
     await stopped;
     const interrupted = database.listWorktreeLifecycle().find((state) => state.worktreePath === "/w/d");
     assert.deepEqual([interrupted.status, interrupted.checkpoints.setup?.stepIndex], ["interrupted", 3]);
@@ -1142,14 +1142,91 @@ test("credentials in step output are masked before it is published, kept or save
     assert.ok(failed.output.length <= LIFECYCLE_LIMITS.outputCharacters);
   } finally { delete process.env.OUTRIGHT_TEST_DEPLOY_TOKEN; }
 
-  // A line longer than the masking bound is passed on at a space, within bounds.
   // Paths and names in variables like PWD, SSH_AUTH_SOCK and GIT_AUTHOR_NAME stay readable.
   assert.deepEqual(environmentSecrets({ GITHUB_TOKEN: "short", NPM_AUTH: "longer-value", PATH: "/usr/bin:/bin:/usr/local/bin",
     PWD: "/Users/someone/project", SSH_AUTH_SOCK: "/private/tmp/agent.sock", GIT_AUTHOR_NAME: "Someone Example" }), ["longer-value"]);
   const decoder = createOutputDecoder(createOutputMask(["longer-value"]));
   assert.equal(decoder.write(Buffer.from("partial longer-")), "");
   assert.equal(decoder.write(Buffer.from("value\n")), "partial [redacted]\n");
-  const long = decoder.write(Buffer.from(`${"x".repeat(5000)} rest`));
-  assert.equal(long, `${"x".repeat(5000)} `);
-  assert.equal(decoder.end(), "rest");
 }));
+
+// Fragments of 6 or more characters that would show a credential.
+function fragmentsOf(credential) {
+  const fragments = [];
+  for (let start = 0; start + 6 <= credential.length; start += 1) fragments.push(credential.slice(start, start + 6));
+  return fragments;
+}
+
+test("no part of a credential in a line past the masking bound is shown, kept or saved", withLifecycle(async ({ database, project, create, events }) => {
+  const token = `ghp_${"A1b2C3d4E5".repeat(4)}`;
+  const secret = "correct horse battery staple";
+  const signing = "signing-key-value-0123";
+  const chunks = {
+    stdout: [`${"x".repeat(4090)}:${token.slice(0, 15)}`, `${token.slice(15)}\nshort line\n`, `${"y ".repeat(2046)}zz correct horse`, " battery staple\nafter\n"],
+    stderr: [`SIGNING_KEY is ${signing.slice(0, 7)}`, `${signing.slice(7)}\n`, "q".repeat(5000), `${token} end`],
+  };
+  const { target, start } = scriptedLifecycle(create, database, project);
+  const subprocesses = { capacity: () => ({ active: 0, limit: 4, unknown: 0 }), run: async (_command, _args, { onOutput }) => {
+    for (let index = 0; index < 4; index += 1) {
+      for (const stream of ["stdout", "stderr"]) onOutput(stream, Buffer.from(chunks[stream][index]));
+      await new Promise((resolve) => { setImmediate(resolve); });
+    }
+    throw Object.assign(new Error(`exited ${secret}`), { code: 1 });
+  } };
+  Object.assign(process.env, { OUTRIGHT_TEST_DB_PASSWORD: secret, OUTRIGHT_TEST_SIGNING_KEY: signing });
+  try {
+    const lifecycle = start({ subprocesses });
+    const a = target("/w/a");
+    await lifecycle.setup(a);
+    const failed = (await settled(lifecycle, a)).state;
+    assert.equal(failed.status, "failed");
+    const published = events.filter((event) => event.type === "worktree.lifecycle.output").map((event) => event.payload.text).join("");
+    const saved = database.listWorktreeLifecycle().find((state) => state.worktreePath === "/w/a");
+    for (const [name, text] of [["published", published], ["shown", failed.output], ["saved", saved.output], ["error", saved.error]]) {
+      for (const leaked of [...fragmentsOf(token), "correct horse", "battery staple", ...fragmentsOf(signing)]) {
+        assert.ok(!text.includes(leaked), `${name} output kept ${leaked}`);
+      }
+    }
+    const withheld = `[output line longer than 4096 characters withheld]\n`;
+    // Each stream shows a notice for its withheld line and resumes after it.
+    assert.ok(failed.output.includes(`$ one\n${withheld}short line\nSIGNING_KEY is [redacted]\n${withheld}${withheld}after\n`), failed.output);
+    assert.ok(!failed.output.includes("xxxxxx") && !failed.output.includes("qqqqqq"));
+  } finally {
+    delete process.env.OUTRIGHT_TEST_DB_PASSWORD;
+    delete process.env.OUTRIGHT_TEST_SIGNING_KEY;
+  }
+}));
+
+test("the output mask covers credentials split anywhere around the line bound, and every secret name it documents", () => {
+  const credentials = [`ghp_${"A1b2C3d4E5".repeat(4)}`, `glpat-${"Zy9Xw8Vu7T".repeat(2)}abcd`,
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", `sk-${"proj_AbCdEfGhIj".repeat(2)}`];
+  for (const credential of credentials) {
+    for (let pad = 4080; pad <= 4100; pad += 1) {
+      for (let split = 1; split < credential.length; split += 1) {
+        const decoder = createOutputDecoder(createOutputMask());
+        const text = decoder.write(Buffer.from(`${" ".repeat(pad)}${credential.slice(0, split)}`)) + decoder.write(Buffer.from(`${credential.slice(split)}\n`)) + decoder.end();
+        const leaked = fragmentsOf(credential).find((fragment) => text.includes(fragment));
+        assert.equal(leaked, undefined, `${credential.slice(0, 5)} split at ${split} after ${pad} characters showed ${leaked}`);
+      }
+    }
+  }
+  // An endless line keeps the buffer bounded, shows one notice, and output resumes after it ends.
+  const decoder = createOutputDecoder(createOutputMask());
+  let text = "";
+  for (let index = 0; index < 1000; index += 1) text += decoder.write(Buffer.from("w".repeat(1000)));
+  assert.equal(text + decoder.write(Buffer.from("w\nnext\n")), "[output line longer than 4096 characters withheld]\nnext\n");
+  // A private key block opened in a withheld line stays masked.
+  const key = createOutputDecoder(createOutputMask());
+  assert.equal(key.write(Buffer.from(`${"z".repeat(4200)}-----BEGIN RSA PRI`)) + key.write(Buffer.from("VATE KEY-----\nMIIEbody\n-----END RSA PRIVATE KEY-----\nafter\n")),
+    "[output line longer than 4096 characters withheld]\n[redacted]\n[redacted]\nafter\n");
+
+  for (const name of ["SIGNING_KEY", "ENCRYPTION_KEY", "MASTER_KEY", "STRIPE_KEY", "KEY", "AUTHORIZATION", "NPM_AUTH", "GH_AUTH_TOKEN", "DB_PASSWORD"]) {
+    assert.deepEqual(environmentSecrets({ [name]: "abcdefgh12345678" }), ["abcdefgh12345678"], `${name} was not masked`);
+  }
+  for (const name of ["SSH_AUTH_SOCK", "AUTHOR", "GIT_AUTHOR_EMAIL", "XAUTHORITY", "KEYBOARD_LAYOUT", "MONKEY", "PATH"]) {
+    assert.deepEqual(environmentSecrets({ [name]: "abcdefgh12345678" }), [], `${name} was masked`);
+  }
+  const mask = createOutputMask();
+  assert.equal(mask("SIGNING_KEY=abc\nAuthorization: token abcdef0123456789\nAUTH_HEADER=Bearer xyzxyzxyz1\nauthor: Someone\nkeyboard: us"),
+    "SIGNING_KEY=[redacted]\nAuthorization: [redacted]\nAUTH_HEADER=[redacted] [redacted]\nauthor: Someone\nkeyboard: us");
+});
