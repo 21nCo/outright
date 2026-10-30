@@ -1057,6 +1057,19 @@ async function worktreeLifecycleRegression() {
   await until(() => buttons().includes("Retry from step 2"), "the reopened dialog did not load");
   held[0].resolve(response(running));
   await remainsTrue(() => !buttons().includes("Cancel setup"), 150, "a read from before closing replaced the reopened dialog's state");
+  // A read answered after newer output of the same run keeps that output.
+  held = null;
+  detail = running;
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => buttons().includes("Cancel setup"), "the running setup did not load");
+  held = [];
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => held.length === 1, "the read was not issued");
+  const output = () => dialog().querySelector(".lifecycle-output")?.textContent ?? "";
+  events.dispatchEvent(new CustomEvent("output", { detail: { worktreePath: worktree.path, runId: "run-1", start: 10, text: "seeding\n" } }));
+  await until(() => output().includes("installed\nseeding\n"), "streamed output was not shown");
+  held[0].resolve(response(running));
+  await remainsTrue(() => output().includes("installed\nseeding\n"), 150, "a read answered late took away newer streamed output");
   held = null;
 
   // Unconfirmed processes hold agent work until the user acknowledges them.

@@ -8,7 +8,7 @@ import { createOutrightDatabase } from "./database.mjs";
 import { createGitService } from "./git-service.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { lifecycleSummary } from "../src/lib/worktree-lifecycle.js";
-import { LIFECYCLE_CONFIG_FILE, LIFECYCLE_LIMITS, createWorktreeLifecycle, parseLifecycleConfig, readLifecycleConfig, sanitizeOutput, worktreeInstance } from "./worktree-lifecycle.mjs";
+import { LIFECYCLE_CONFIG_FILE, LIFECYCLE_LIMITS, createOutputDecoder, createOutputMask, createWorktreeLifecycle, environmentSecrets, parseLifecycleConfig, readLifecycleConfig, sanitizeOutput, worktreeInstance } from "./worktree-lifecycle.mjs";
 
 // Disposable repositories must not be attached to a host Git Trace2 consumer.
 process.env.GIT_TRACE2_EVENT = "0";
@@ -1002,4 +1002,154 @@ test("trusting a configuration from one worktree leaves a sibling's unrun setup 
   const summary = lifecycleSummary(sibling);
   assert.deepEqual([summary.quiet, summary.tone, summary.short], [undefined, "trust", "Run setup"], "a sibling whose setup never ran looked ready");
   assert.deepEqual(ran, [], "trust ran nothing");
+}));
+
+test("trust removed after admission stops teardown before Git and setup before its next step", withLifecycle(async ({ database, project, create }) => {
+  let revokeDuring = null;
+  const { ran, target, start } = scriptedLifecycle(create, database, project, {
+    fail: (cwd, command) => { if (`${cwd}:${command}` === revokeDuring) database.untrustProject(project.id); return null; } });
+  const lifecycle = start();
+  const b = target("/w/b");
+  let removed = false;
+  // Trust is removed while the fresh Git status runs.
+  await assert.rejects(lifecycle.removeWorktree(b, { remove: async (prepareRemoval) => {
+    await prepareRemoval({ requireClean: async () => { database.untrustProject(project.id); } });
+    removed = true;
+  } }), (error) => error.details?.code === "LIFECYCLE_TRUST_REQUIRED");
+  assert.equal(removed, false, "Git removed the worktree");
+  assert.deepEqual(ran, [], "teardown ran after its trust was removed");
+  assert.equal((await lifecycle.describe(b)).state.status, "needs-trust", "the refusal was recorded as a failed teardown");
+
+  database.trustLifecycleConfig(project.id, project.path, "sha256:trusted");
+  revokeDuring = "/w/c:one";
+  const c = target("/w/c");
+  await lifecycle.setup(c);
+  const stopped = (await settled(lifecycle, c)).state;
+  assert.deepEqual(ran, ["/w/c:one"], "a step ran after trust was removed");
+  assert.deepEqual([stopped.status, stopped.stepIndex], ["failed", 1]);
+  assert.match(stopped.error, /Trust in outright\.worktree\.json was removed, so "two" did not run/);
+}));
+
+test("a cancel or shutdown accepted while setup's outcome is saved is honored, and the audit names the committed outcome", withLifecycle(async ({ database, project, create, events }) => {
+  const { ran, target, start } = scriptedLifecycle(create, database, project);
+  const save = database.saveWorktreeLifecycle;
+  let stop = null;
+  let stopped = null;
+  database.saveWorktreeLifecycle = (state) => {
+    if (["ready", "complete"].includes(state.status) && stop) {
+      const action = stop;
+      stop = null;
+      stopped = new Promise((resolve) => { setImmediate(() => resolve(action(state))); });
+      throw new Error("database busy");
+    }
+    return save.call(database, state);
+  };
+  const audited = (runId) => database.listAudit(100).filter((entry) => entry.details?.operationId === runId
+    && /^worktree\.lifecycle\.(setup|teardown)\.[a-z-]+$/.test(entry.action) && !entry.action.endsWith(".requested")).map((entry) => entry.action);
+  const errors = [];
+  const lifecycle = start({ limits: { ...LIFECYCLE_LIMITS, persistRetryDelaysMs: [0, 100] }, onPersistError: (error) => errors.push(error) });
+  try {
+    // Cancel during the retry delay: cancelled, with every step finished.
+    const a = target("/w/a");
+    stop = () => lifecycle.cancel(a);
+    const running = await lifecycle.setup(a);
+    const cancelled = (await settled(lifecycle, a)).state;
+    assert.equal((await stopped).status, "running", "the cancel was not accepted while setup held the worktree");
+    assert.deepEqual([cancelled.status, cancelled.stepIndex, cancelled.checkpoints.setup?.stepIndex], ["cancelled", 3, 3]);
+    assert.ok(!events.some((event) => event.type === "worktree.lifecycle" && event.payload.worktreePath === "/w/a" && event.payload.status === "ready"),
+      "ready was published after the cancel was accepted");
+    assert.equal(database.listWorktreeLifecycle().find((state) => state.worktreePath === "/w/a").status, "cancelled");
+    assert.deepEqual(audited(running.runId), ["worktree.lifecycle.setup.cancelled"]);
+    // A retry runs no step again and records ready.
+    ran.length = 0;
+    await lifecycle.setup(a);
+    assert.equal((await settled(lifecycle, a)).state.status, "ready");
+    assert.deepEqual(ran, []);
+
+    // Every save of the outcome fails: the audit says failed, as the state does.
+    database.saveWorktreeLifecycle = (state) => {
+      if (["ready", "complete"].includes(state.status)) throw new Error("database unavailable");
+      return save.call(database, state);
+    };
+    const b = target("/w/b");
+    const unsaved = await lifecycle.setup(b);
+    assert.equal((await settled(lifecycle, b)).state.status, "failed");
+    assert.deepEqual(audited(unsaved.runId), ["worktree.lifecycle.setup.failed"]);
+    await assert.rejects(lifecycle.removeWorktree(b, { remove: async (prepareRemoval) => { await prepareRemoval(); } }),
+      (error) => error.details?.code === "WORKTREE_TEARDOWN_FAILED");
+    const teardown = (await lifecycle.describe(b)).state;
+    assert.equal(teardown.status, "failed");
+    assert.deepEqual(audited(teardown.runId), ["worktree.lifecycle.teardown.failed"]);
+
+    // Shutdown during the retry delay: interrupted, never ready.
+    database.saveWorktreeLifecycle = (state) => {
+      if (["ready", "complete"].includes(state.status) && stop) {
+        stop = null;
+        stopped = lifecycle.shutdown();
+        throw new Error("database busy");
+      }
+      return save.call(database, state);
+    };
+    const d = target("/w/d");
+    stop = true;
+    await lifecycle.setup(d);
+    await waitFor(() => stopped, 5000, "shutdown did not start");
+    await stopped;
+    const interrupted = database.listWorktreeLifecycle().find((state) => state.worktreePath === "/w/d");
+    assert.deepEqual([interrupted.status, interrupted.checkpoints.setup?.stepIndex], ["interrupted", 3]);
+  } finally { database.saveWorktreeLifecycle = save; }
+}));
+
+test("credentials in step output are masked before it is published, kept or saved, also when split across chunks", withLifecycle(async ({ database, project, create, events }) => {
+  const secret = "s3cr3t-env-value-0123456789";
+  const token = `ghp_${"A1b2C3d4E5".repeat(4)}`;
+  const chunks = {
+    stdout: ["visible line\nexport DEPLOY_", "SECRET_VALUE_", `HALF=${secret.slice(0, 9)}`, `${secret.slice(9)} end\nbare ${secret.slice(0, 5)}`,
+      `${secret.slice(5)}\nAPI_KEY=abc123xyz\n`],
+    stderr: [`push ${token.slice(0, 20)}`, `${token.slice(20)} ok\n`, "curl -H 'Authorization: Bearer abcdefghijklmnop'\n",
+      "fetch https://deploy:hunter2hunter2@example.com/repo\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n",
+      "-----END OPENSSH PRIVATE KEY-----\ntail line"],
+  };
+  const { target, start } = scriptedLifecycle(create, database, project);
+  const subprocesses = { capacity: () => ({ active: 0, limit: 4, unknown: 0 }), run: async (_command, _args, { env, onOutput }) => {
+    assert.equal(env.OUTRIGHT_TEST_DEPLOY_TOKEN, secret);
+    for (let index = 0; index < 5; index += 1) {
+      for (const stream of ["stdout", "stderr"]) if (chunks[stream][index]) onOutput(stream, Buffer.from(chunks[stream][index]));
+      await new Promise((resolve) => { setImmediate(resolve); });
+    }
+    throw Object.assign(new Error(`exited ${secret}`), { code: 1 });
+  } };
+  process.env.OUTRIGHT_TEST_DEPLOY_TOKEN = secret;
+  try {
+    const lifecycle = start({ subprocesses });
+    const a = target("/w/a");
+    await lifecycle.setup(a);
+    const failed = (await settled(lifecycle, a)).state;
+    assert.equal(failed.status, "failed");
+    const published = events.filter((event) => event.type === "worktree.lifecycle.output").map((event) => event.payload.text).join("");
+    const saved = database.listWorktreeLifecycle().find((state) => state.worktreePath === "/w/a");
+    for (const [name, text] of [["published", published], ["shown", failed.output], ["saved", saved.output], ["error", saved.error]]) {
+      for (const leaked of [secret.slice(0, 9), secret.slice(9), token.slice(0, 20), "abc123xyz", "abcdefghijklmnop", "hunter2hunter2", "b3BlbnNzaC1rZXktdjEAAAAA"]) {
+        assert.ok(!text.includes(leaked), `${name} output kept ${leaked}`);
+      }
+    }
+    assert.match(failed.output, /visible line\n/);
+    assert.match(failed.output, /export DEPLOY_SECRET_VALUE_HALF=\[redacted\] end\n/);
+    assert.match(failed.output, /bare \[redacted\]\n/, "the step's secret-named environment value was not masked");
+    assert.match(failed.output, /push \[redacted\] ok\n/);
+    assert.match(failed.output, /fetch https:\/\/deploy:\[redacted\]@example\.com\/repo\n/);
+    assert.match(failed.output, /tail line/);
+    assert.ok(failed.output.length <= LIFECYCLE_LIMITS.outputCharacters);
+  } finally { delete process.env.OUTRIGHT_TEST_DEPLOY_TOKEN; }
+
+  // A line longer than the masking bound is passed on at a space, within bounds.
+  // Paths and names in variables like PWD, SSH_AUTH_SOCK and GIT_AUTHOR_NAME stay readable.
+  assert.deepEqual(environmentSecrets({ GITHUB_TOKEN: "short", NPM_AUTH: "longer-value", PATH: "/usr/bin:/bin:/usr/local/bin",
+    PWD: "/Users/someone/project", SSH_AUTH_SOCK: "/private/tmp/agent.sock", GIT_AUTHOR_NAME: "Someone Example" }), ["longer-value"]);
+  const decoder = createOutputDecoder(createOutputMask(["longer-value"]));
+  assert.equal(decoder.write(Buffer.from("partial longer-")), "");
+  assert.equal(decoder.write(Buffer.from("value\n")), "partial [redacted]\n");
+  const long = decoder.write(Buffer.from(`${"x".repeat(5000)} rest`));
+  assert.equal(long, `${"x".repeat(5000)} `);
+  assert.equal(decoder.end(), "rest");
 }));

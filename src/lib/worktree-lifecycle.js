@@ -69,6 +69,16 @@ export function lifecycleOutputUpdate(state, payload) {
   return { ...state, output, outputEnd: stop, outputTruncated };
 }
 
+// A read answered after an output event of the same run may hold less of
+// its output than is shown; it never takes that output away.
+export function lifecycleDetailUpdate(current, next) {
+  const shown = current?.state;
+  const read = next?.state;
+  if (!shown?.runId || !read || read.runId !== shown.runId || read.worktreePath !== shown.worktreePath
+    || (shown.outputEnd ?? 0) <= (read.outputEnd ?? 0)) return next;
+  return { ...next, state: { ...read, output: shown.output, outputEnd: shown.outputEnd, outputTruncated: shown.outputTruncated } };
+}
+
 // States and removals carry the runtime's revision, which only grows. An
 // event replaces what the client has for its path unless that is newer, or
 // the applied snapshot (read at `watermark`) already decided it, absence

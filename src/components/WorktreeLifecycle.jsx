@@ -3,7 +3,7 @@ import { CheckCircle, CircleNotch, ShieldWarning, WarningCircle, Wrench } from "
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { api, query } from "@/lib/runtime-api";
-import { lifecycleOutputUpdate, lifecycleSummary } from "@/lib/worktree-lifecycle";
+import { lifecycleDetailUpdate, lifecycleOutputUpdate, lifecycleSummary } from "@/lib/worktree-lifecycle";
 
 const ICONS = { running: CircleNotch, ready: CheckCircle, attention: WarningCircle, trust: ShieldWarning };
 
@@ -59,7 +59,7 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
       if (generation <= shownRef.current) return;
       shownRef.current = generation;
       canonicalRef.current = next.worktreePath ?? null;
-      setDetail(next);
+      setDetail((current) => lifecycleDetailUpdate(current, next));
     } catch (error) {
       if (generation > shownRef.current) onError(error);
     }
@@ -141,7 +141,7 @@ export function WorktreeLifecycleDialog({ open, onOpenChange, project, worktree,
       <StepList title="Teardown" steps={config.teardown} current={matching && state.phase === "teardown" ? state : null} />
     </>}
     {summary && <p className={`lifecycle-summary ${summary.tone}`} role="status" aria-live="polite">{config && !matching ? `For an earlier version of ${detail.file}: ` : ""}{summary.label}{state.error ? ` ${state.error}` : ""}</p>}
-    {state?.output ? <pre ref={outputRef} className="lifecycle-output" tabIndex={0} aria-label={`${state.phase === "teardown" ? "Teardown" : "Setup"} output`}
+    {state?.output ? <pre ref={outputRef} className="lifecycle-output" tabIndex={0} /* NOSONAR S6845: a scrollable log must be reachable by keyboard */ aria-label={`${state.phase === "teardown" ? "Teardown" : "Setup"} output`}
       onScroll={(event) => { const element = event.currentTarget; pinnedRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 24; }}>
       {state.outputTruncated ? "… earlier output was not kept\n" : ""}{state.output}</pre> : null}
     {needsAcknowledgement && <p className="lifecycle-note">Agent runs in this worktree wait until these processes are confirmed stopped or you acknowledge them.{state.phase === "teardown" ? " To run teardown again, remove the worktree again and acknowledge there." : ""}</p>}

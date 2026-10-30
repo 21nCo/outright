@@ -40,9 +40,24 @@ const STATUSES = new Set(["needs-trust", "trusted", "invalid", "running", "ready
 const RESUMABLE = new Set(["failed", "cancelled", "interrupted"]);
 const CONFIG_KEYS = new Set(["version", "setup", "teardown"]);
 const STEP_KEYS = new Set(["name", "command", "timeoutSeconds"]);
-const ESCAPE_SEQUENCE = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|[@-Z\\-_])/g;
-const COMPLETE_ESCAPE = /^\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[@-Z\\-_])/;
-const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b-\u001f\u007f]/g;
+const ESCAPE_SEQUENCE = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|[@-Z\\-_])/g; // NOSONAR S6324: matches terminal escape sequences
+const COMPLETE_ESCAPE = /^\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[@-Z\\-_])/; // NOSONAR S6324: matches terminal escape sequences
+const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b-\u001f\u007f]/g; // NOSONAR S6324: removes control characters
+// Output is shown, kept and saved, so credentials are masked before any of
+// that: values of the step's secret-named environment variables, common
+// token formats, secret assignments, authorization headers, URL passwords
+// and private key blocks.
+const REDACTED = "[redacted]";
+const SECRET_NAME = /secret|token|passw(?:or)?d|api[-_]?key|access[-_]?key|private[-_]?key|credential|auth(?!or|_sock)/i;
+const TOKEN_FORMAT = /\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_\w{22,}|glpat-[\w-]{20,}|xox[abprs]-[\w-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}|sk-[\w-]{20,}|AIza[\w-]{35}|npm_[A-Za-z0-9]{36}|eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,})/g;
+const SECRET_ASSIGNMENT = /\b([\w.-]{0,64}(?:secret|token|passw(?:or)?d|api[-_]?key|access[-_]?key|private[-_]?key|credentials?)[\w.-]{0,64}["']?\s*[:=]\s*["']?)[^\s"',;]+/gi;
+const AUTHORIZATION = /\b(bearer|basic)\s+[\w.~+/=-]{8,}/gi;
+const URL_PASSWORD = /\b([a-z][\w+.-]*:\/\/[^\s/@:]+:)[^\s/@]+@/gi;
+const PRIVATE_KEY_BEGIN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
+const PRIVATE_KEY_END = /-----END [A-Z0-9 ]*PRIVATE KEY-----/;
+// Masking works on whole lines, so a value split across chunks is still
+// found; a longer line is passed on at its last space.
+const OUTPUT_LINE_CHARACTERS = 4096;
 // Characters that render invisibly or reorder the text around them (bidi
 // controls, zero-width and other format characters, line separators, and
 // spaces that look like an argument break). A reviewed command must look
@@ -150,11 +165,36 @@ export function sanitizeOutput(text) {
   return text.replace(ESCAPE_SEQUENCE, "").replaceAll("\r\n", "\n").replaceAll("\r", "\n").replace(CONTROL_CHARACTERS, "");
 }
 
+// The values of secret-named variables in a step's environment.
+export function environmentSecrets(env) {
+  return Object.entries(env).filter(([name, value]) => SECRET_NAME.test(name) && typeof value === "string" && value.length >= 8)
+    .map(([, value]) => value).sort((a, b) => b.length - a.length);
+}
+
+// Masks credentials in complete lines of one stream; a private key block
+// spans lines, so the mask remembers being inside one.
+export function createOutputMask(secrets = []) {
+  let privateKey = false;
+  return (text) => text.split("\n").map((line) => {
+    if (!line) return line;
+    if (privateKey || PRIVATE_KEY_BEGIN.test(line)) {
+      privateKey = !PRIVATE_KEY_END.test(line);
+      return REDACTED;
+    }
+    let masked = line;
+    for (const secret of secrets) masked = masked.replaceAll(secret, REDACTED);
+    return masked.replace(TOKEN_FORMAT, REDACTED).replace(SECRET_ASSIGNMENT, `$1${REDACTED}`)
+      .replace(AUTHORIZATION, `$1 ${REDACTED}`).replace(URL_PASSWORD, `$1${REDACTED}@`);
+  }).join("\n");
+}
+
 // Decodes one stream's UTF-8, holding back a sequence or line ending that a
-// chunk boundary split, so neither leaks into the text half-removed.
-function createOutputDecoder() {
+// chunk boundary split, so neither leaks into the text half-removed, and the
+// unfinished line, so it is masked whole.
+export function createOutputDecoder(mask = createOutputMask()) {
   const decoder = new StringDecoder("utf8");
   let carry = "";
+  let line = "";
   const take = (text, final) => {
     let value = carry + text;
     carry = "";
@@ -168,7 +208,12 @@ function createOutputDecoder() {
         value = value.slice(0, -1);
       }
     }
-    return sanitizeOutput(value);
+    line += sanitizeOutput(value);
+    let cut = final ? line.length : line.lastIndexOf("\n") + 1;
+    if (!cut && line.length > OUTPUT_LINE_CHARACTERS) cut = line.lastIndexOf(" ") + 1 || line.length;
+    const complete = line.slice(0, cut);
+    line = line.slice(cut);
+    return mask(complete);
   };
   return { write: (chunk) => take(decoder.write(chunk), false), end: () => take(decoder.end(), true) };
 }
@@ -285,13 +330,17 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
   }
 
   // A run's outcome is saved before it is reported: a few attempts while the
-  // run still holds its worktree. When none succeeds the run is reported as
-  // failed with what it reached, never as ready, and a retry in this runtime
-  // records it; after a restart the durable running state is interrupted.
-  async function commitOutcome(state) {
+  // run still holds its worktree. `outcome(aborted)` builds the state for
+  // each attempt, so a cancel or shutdown accepted before one is honored.
+  // When none succeeds the run is reported as failed with what it reached,
+  // never as ready, and a retry in this runtime records it; after a restart
+  // the durable running state is interrupted.
+  async function commitOutcome(outcome, signal) {
     let failure;
+    let state;
     for (const delay of limits.persistRetryDelaysMs ?? LIFECYCLE_LIMITS.persistRetryDelaysMs) {
-      if (delay) await new Promise((resolve) => { setTimeout(resolve, delay); });
+      if (delay) await new Promise((resolve) => { setTimeout(resolve, delay); }); // NOSONAR S9382: bounded retries wait between saves
+      state = outcome(signal.aborted);
       try { return commit(state, { strict: true }); }
       catch (error) { failure = error; }
     }
@@ -500,13 +549,17 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     }
     const steps = config[phase];
     if (!steps.length) return null;
-    if (!database.isLifecycleConfigTrusted(target.project.id, target.project.path, config.digest)) {
+    if (!trusted(target, config.digest)) {
       refused({ ...baseState(target, phase, config, instance, previous), ...refusal, status: "needs-trust" }, 409,
         `Review and trust ${LIFECYCLE_CONFIG_FILE} before its ${phase} commands run`, "LIFECYCLE_TRUST_REQUIRED");
     }
     const checkpoint = previous?.checkpoints?.[phase];
     const resumeAt = checkpoint?.configDigest === config.digest ? Math.min(checkpoint.stepIndex, steps.length) : 0;
     return { config, steps, resumeAt, instance, previous };
+  }
+
+  function trusted(target, digest) {
+    return database.isLifecycleConfigTrusted(target.project.id, target.project.path, digest);
   }
 
   // Admits one phase run under the caller's claim. The admission audit and
@@ -533,10 +586,20 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     const { signal } = entry.controller;
     let state = initial;
     let outcome = { status: phase === "setup" ? "ready" : "complete", stepIndex: steps.length };
+    const env = { ...process.env, OUTRIGHT_LIFECYCLE_PHASE: phase, OUTRIGHT_WORKTREE_PATH: worktreePath, OUTRIGHT_ROOT_PATH: target.project.path };
+    const secrets = environmentSecrets(env);
     for (let index = resumeAt; index < steps.length; index += 1) {
       const step = steps[index];
       if (signal.aborted) {
         outcome = { ...stepFailure(null, step, signal, null), stepIndex: index };
+        break;
+      }
+      // Trust removed during the run stops it before the next step.
+      let untrusted = null;
+      try { if (!trusted(target, state.configDigest)) untrusted = `Trust in ${LIFECYCLE_CONFIG_FILE} was removed`; }
+      catch (error) { untrusted = `Outright could not check trust in ${LIFECYCLE_CONFIG_FILE} (${String(error?.message ?? error).slice(0, 200)})`; }
+      if (untrusted) {
+        outcome = { status: "failed", stepIndex: index, outcomeUnknown: false, error: `${untrusted}, so "${step.name}" did not run.` };
         break;
       }
       append(worktreePath, log, `\n▸ Step ${index + 1} of ${steps.length}: ${step.name}\n$ ${displayCommand(step.command)}\n`);
@@ -548,15 +611,15 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
           error: `Outright could not save progress before "${step.name}", so it did not run: ${String(error?.message ?? error).slice(0, 512)}` };
         break;
       }
-      const decoders = { stdout: createOutputDecoder(), stderr: createOutputDecoder() };
+      const decoders = { stdout: createOutputDecoder(createOutputMask(secrets)), stderr: createOutputDecoder(createOutputMask(secrets)) };
       try {
         await subprocesses.run(step.command[0], step.command.slice(1), { // NOSONAR S9382: steps run in their declared order
-          cwd: worktreePath, signal, timeout: step.timeoutSeconds * 1000,
-          env: { ...process.env, OUTRIGHT_LIFECYCLE_PHASE: phase, OUTRIGHT_WORKTREE_PATH: worktreePath, OUTRIGHT_ROOT_PATH: target.project.path },
+          cwd: worktreePath, signal, timeout: step.timeoutSeconds * 1000, env,
           onOutput: (stream, chunk) => append(worktreePath, log, decoders[stream].write(chunk)),
         });
       } catch (error) {
         outcome = { ...stepFailure(error, step, signal, subprocesses.capacity?.()), stepIndex: index };
+        outcome.error = createOutputMask(secrets)(outcome.error);
         break;
       } finally {
         append(worktreePath, log, decoders.stdout.end() + decoders.stderr.end());
@@ -564,13 +627,25 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     }
     append(worktreePath, log, outcome.error ? `\n${outcome.error}\n` : `\n${phase === "setup" ? "Setup" : "Teardown"} finished.\n`);
     flushLog(worktreePath, log);
+    const running = state;
     // Output is kept with a state the user must act on; a finished run's
-    // output stays only in memory.
-    const keepOutput = RESUMABLE.has(outcome.status);
-    const checkpoints = finishedCheckpoints(state.checkpoints, phase, state.configDigest, outcome, steps.length);
-    state = await commitOutcome({ ...state, error: null, outcomeUnknown: false, ...outcome, checkpoints, output: keepOutput ? log.text : undefined,
-      outputTruncated: keepOutput ? log.truncated : undefined, finishedAt: now(), updatedAt: now() });
-    try { database.auditCritical(`worktree.lifecycle.${phase}.${outcome.status}`, { target: worktreePath, operationId: runId, stepIndex: state.stepIndex, outcomeUnknown: state.outcomeUnknown }); }
+    // output stays only in memory. A setup cancelled or stopped after its
+    // last step keeps every step as finished, so a retry only records ready;
+    // removal handles a finished teardown's cancel before Git starts.
+    state = await commitOutcome((aborted) => {
+      let final = outcome;
+      if (aborted && outcome.status === "ready") {
+        const shutdown = signal.reason === "shutdown";
+        final = { status: shutdown ? "interrupted" : "cancelled", stepIndex: steps.length, outcomeUnknown: false,
+          error: `${shutdown ? "Outright stopped" : "Cancelled"} after every setup step finished, before setup was recorded as ready; run it again to record it.` };
+      }
+      const keepOutput = RESUMABLE.has(final.status);
+      return { ...running, error: null, outcomeUnknown: false, ...final,
+        checkpoints: finishedCheckpoints(running.checkpoints, phase, running.configDigest, final, steps.length),
+        output: keepOutput ? log.text : undefined, outputTruncated: keepOutput ? log.truncated : undefined, finishedAt: now(), updatedAt: now() };
+    }, signal);
+    // The audit names the outcome that was committed.
+    try { database.auditCritical(`worktree.lifecycle.${phase}.${state.status}`, { target: worktreePath, operationId: runId, stepIndex: state.stepIndex, outcomeUnknown: state.outcomeUnknown }); }
     catch (error) { onPersistError(error); }
     return state;
   }
@@ -655,7 +730,9 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
         // Teardown commands could change edits that Git removal would refuse
         // to delete, so a dirty worktree is refused before any of them run.
         await requireClean?.();
-        finished = await runSteps(begin(entry, target, "teardown", prepared));
+        // Trust removed while the status ran refuses here, as before it.
+        const admitted = prepare(target, "teardown", prepared.config, { previous: current(target.worktreePath, instance), instance });
+        finished = await runSteps(begin(entry, target, "teardown", admitted));
         if (finished.status !== "complete") {
           throw apiError(409, `Teardown did not finish, so the worktree was kept. ${finished.error ?? ""}`.trim(),
             { code: "WORKTREE_TEARDOWN_FAILED", lifecycle: publicState(finished) });

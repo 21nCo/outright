@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LIFECYCLE_OUTPUT_CHARACTERS, lifecycleFor, lifecycleOutputUpdate, lifecycleSummary, mergeLifecycleSnapshot, removalRequest, teardownProblem, upsertLifecycleState } from "../src/lib/worktree-lifecycle.js";
+import { LIFECYCLE_OUTPUT_CHARACTERS, lifecycleDetailUpdate, lifecycleFor, lifecycleOutputUpdate, lifecycleSummary, mergeLifecycleSnapshot, removalRequest, teardownProblem, upsertLifecycleState } from "../src/lib/worktree-lifecycle.js";
 import { LIFECYCLE_LIMITS } from "../server/worktree-lifecycle.mjs";
 
 const steps = ["Install", "Migrate", "Seed"];
@@ -39,6 +39,21 @@ test("streamed output appends once, in order, and asks for a reload across a gap
   const long = lifecycleOutputUpdate(state, { worktreePath: "/w", runId: "run-1", start: 3, text: "x".repeat(LIFECYCLE_OUTPUT_CHARACTERS) });
   assert.equal(long.output.length, LIFECYCLE_OUTPUT_CHARACTERS);
   assert.equal(long.outputTruncated, true);
+});
+
+test("a read never takes away newer streamed output of the same run, and replaces any other run's", () => {
+  const shown = { state: { worktreePath: "/w", runId: "run-1", status: "running", output: "abcdef", outputEnd: 6, outputTruncated: false } };
+  const older = { config: { digest: "d" }, state: { ...shown.state, stepIndex: 1, output: "abc", outputEnd: 3 } };
+  assert.deepEqual(lifecycleDetailUpdate(shown, older), { ...older, state: { ...older.state, output: "abcdef", outputEnd: 6, outputTruncated: false } });
+  const newer = { state: { ...shown.state, output: "abcdefgh", outputEnd: 8 } };
+  assert.equal(lifecycleDetailUpdate(shown, newer), newer);
+  const next = { state: { ...shown.state, runId: "run-2", output: "", outputEnd: 0 } };
+  assert.equal(lifecycleDetailUpdate(shown, next), next);
+  const other = { state: { ...shown.state, worktreePath: "/v", output: "", outputEnd: 0 } };
+  assert.equal(lifecycleDetailUpdate(shown, other), other);
+  assert.equal(lifecycleDetailUpdate(null, older), older);
+  const none = { state: null };
+  assert.equal(lifecycleDetailUpdate(shown, none), none);
 });
 
 test("state events replace or remove a worktree's state by path, and lookup never crosses worktrees sharing an id", () => {
