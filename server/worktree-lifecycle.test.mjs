@@ -274,6 +274,50 @@ test("a failed teardown keeps the worktree; a retry or an explicit skip removes 
   assert.ok(database.listAudit(20).some((entry) => entry.action === "worktree.lifecycle.teardown.skipped"));
 }));
 
+test("teardown never runs on edits the scan has not seen: a fresh Git status refuses a dirty worktree first, and a failed status keeps it", { timeout: 30_000 }, withLifecycle(async ({ root, repository, database, project, subprocesses, create }) => {
+  const marker = path.join(root, "teardown-ran");
+  // This teardown would erase exactly what Git removal refuses to delete.
+  writeConfig(repository, { teardown: [{ name: "Reset", command: node(
+    "const fs = require('fs'); fs.appendFileSync(process.argv[1], 't'); fs.writeFileSync('notes.txt', 'base'); fs.rmSync('scratch.txt', { force: true })", marker) }] });
+  writeFileSync(path.join(repository, "notes.txt"), "base");
+  git(repository, ["add", "."]);
+  git(repository, ["commit", "-m", "lifecycle"]);
+  database.trustLifecycleConfig(project.id, project.path, (await readLifecycleConfig(repository)).digest);
+  let statusFails = false;
+  const probing = { ...subprocesses, run: (command, args, options) => statusFails && args.includes("status")
+    ? Promise.reject(new Error("git status failed")) : subprocesses.run(command, args, options) };
+  // The cached scan saw the worktree clean before the edits below.
+  let worktrees = [{ id: "main", path: repository, isLinked: false, changedCount: 0 }];
+  const service = createGitService({ database, subprocesses: probing, getProjects: () => [{ ...project, worktrees }], getConfig: async () => ({ scanRoots: [root] }) });
+  const created = await service.createWorktree({ projectId: project.id, branch: "dirty", name: "dirty" });
+  worktrees = [...worktrees, { id: "dirty", path: created.path, isLinked: true, changedCount: 0 }];
+  const target = { project, worktree: { id: "dirty" }, worktreePath: created.path };
+  const lifecycle = create();
+  const attempt = () => lifecycle.removeWorktree(target, { remove: (prepare) =>
+    service.removeWorktree({ projectId: project.id, worktreePath: created.path, confirmation: created.path, prepare }) });
+
+  writeFileSync(path.join(created.path, "notes.txt"), "edited");
+  await assert.rejects(attempt(), (error) => error.statusCode === 409 && /uncommitted changes/.test(error.message));
+  assert.equal(existsSync(marker), false, "teardown ran on a tracked edit");
+  assert.equal(readFileSync(path.join(created.path, "notes.txt"), "utf8"), "edited");
+  git(created.path, ["checkout", "--", "notes.txt"]);
+  writeFileSync(path.join(created.path, "scratch.txt"), "untracked");
+  await assert.rejects(attempt(), (error) => error.statusCode === 409 && /uncommitted changes/.test(error.message));
+  assert.equal(existsSync(marker), false, "teardown ran on an untracked file");
+  assert.equal(readFileSync(path.join(created.path, "scratch.txt"), "utf8"), "untracked");
+  assert.equal((await lifecycle.describe(target)).state, null, "a refused dirty removal recorded a teardown outcome");
+
+  rmSync(path.join(created.path, "scratch.txt"));
+  statusFails = true;
+  await assert.rejects(attempt(), /git status failed/);
+  assert.equal(existsSync(marker), false, "teardown ran without a fresh status");
+  assert.equal(existsSync(created.path), true);
+  statusFails = false;
+  await attempt();
+  assert.equal(readFileSync(marker, "utf8"), "t", "a clean worktree tears down once");
+  assert.equal(existsSync(created.path), false);
+}));
+
 test("a run going when the runtime stopped is interrupted, not ready, and holds its worktree until its processes are proven gone", withLifecycle(async ({ repository, database, project, target, create }) => {
   writeConfig(repository, { setup: [{ name: "Wait", command: node("setInterval(() => {}, 1000)") }] });
   const lifecycle = create();

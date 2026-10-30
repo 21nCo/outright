@@ -630,7 +630,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
       entry.removing = true;
     };
     try {
-      const result = await remove(async () => {
+      const result = await remove(async ({ requireClean } = {}) => {
         const instance = await identify(target.worktreePath);
         const prepared = skipTeardown ? null : prepare(target, "teardown", await readConfig(target.worktreePath),
           { previous: current(target.worktreePath, instance), instance });
@@ -652,6 +652,9 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
             stepIndex: prepared.steps.length };
           return proceed();
         }
+        // Teardown commands could change edits that Git removal would refuse
+        // to delete, so a dirty worktree is refused before any of them run.
+        await requireClean?.();
         finished = await runSteps(begin(entry, target, "teardown", prepared));
         if (finished.status !== "complete") {
           throw apiError(409, `Teardown did not finish, so the worktree was kept. ${finished.error ?? ""}`.trim(),
