@@ -54,14 +54,22 @@ const SECRET_WORD = String.raw`secret|token|passw(?:or)?d|credential|(?:api|acce
 const SECRET_NAME = new RegExp(SECRET_WORD, "i");
 const TOKEN_FORMATS = [/\bgh[pousr]_[A-Za-z0-9]{36,}/g, /\bgithub_pat_\w{22,}/g, /\bglpat-[\w-]{20,}/g, /\bxox[abprs]-[\w-]{10,}/g,
   /\b(?:AKIA|ASIA)[0-9A-Z]{16}/g, /\bsk-[\w-]{20,}/g, /\bAIza[\w-]{35}/g, /\bnpm_[A-Za-z0-9]{36}/g, /\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}/g];
+// A quoted value is masked through its closing quote, or to the end of the
+// line when it never closes; an unquoted one ends at a space or separator.
+const SECRET_VALUE = String.raw`(?:"(?:[^"\\\n]|\\.)*"?|'[^'\n]*'?|[^\s"',;]+)`;
+const SECRET_ASSIGNMENT = String.raw`\b([\w.-]{0,64}(?:${SECRET_WORD})[\w.-]{0,64}["']?\s*[:=]\s*)`;
 // Each rule keeps its first group and masks the rest; schemes go first, so
 // an assignment never masks only the scheme in front of a credential.
 const SECRET_RULES = [
   /\b((?:bearer|basic)\s+)[\w.~+/=-]{8,}/gi,
-  /\b(authorization\s*[:=]\s*["']?)(?:[a-z]+\s+)?[^\s"',;]+/gi,
-  new RegExp(String.raw`\b([\w.-]{0,64}(?:${SECRET_WORD})[\w.-]{0,64}["']?\s*[:=]\s*["']?)[^\s"',;]+`, "gi"),
+  new RegExp(String.raw`\b(authorization["']?\s*[:=]\s*)(?:[a-z]+\s+)?${SECRET_VALUE}`, "gi"),
+  new RegExp(SECRET_ASSIGNMENT + SECRET_VALUE, "gi"),
   /\b([a-z][\w+.-]*:\/\/[^\s/@:]+:)[^\s/@]+(?=@)/gi,
 ];
+// In one argument of a step's command, an assignment's value is the rest of
+// that argument (`--password=correct horse battery`).
+const ARGUMENT_ASSIGNMENT = new RegExp(String.raw`${SECRET_ASSIGNMENT}[\s\S]+`, "i");
+const PLAIN_ARGUMENT = /^[\w@%+=:,./-]+$/;
 const PRIVATE_KEY_BEGIN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
 const PRIVATE_KEY_END = /-----END [A-Z0-9 ]*PRIVATE KEY-----/;
 // Masking works on whole lines, so a value split across chunks is still
@@ -176,10 +184,11 @@ export function sanitizeOutput(text) {
   return text.replace(ESCAPE_SEQUENCE, "").replaceAll("\r\n", "\n").replaceAll("\r", "\n").replace(CONTROL_CHARACTERS, "");
 }
 
-// The values of secret-named variables in a step's environment.
+// The values of secret-named variables in a step's environment, also as
+// they read escaped in a JSON or quoted string.
 export function environmentSecrets(env) {
   return Object.entries(env).filter(([name, value]) => SECRET_NAME.test(name) && typeof value === "string" && value.length >= 8)
-    .map(([, value]) => value).sort((a, b) => b.length - a.length);
+    .flatMap(([, value]) => [...new Set([value, JSON.stringify(value).slice(1, -1)])]).sort((a, b) => b.length - a.length);
 }
 
 // Masks credentials in complete lines of one stream; a private key block
@@ -264,8 +273,14 @@ function tail(text, limit) {
   return text.slice(start);
 }
 
-export function displayCommand(command) {
-  return command.map((argument) => /^[\w@%+=:,./-]+$/.test(argument) ? argument : JSON.stringify(argument)).join(" ");
+// The command line a step's output shows (the trust review shows the exact
+// command). Each argument is masked as it runs, before quoting could change
+// how a credential in it reads, and is quoted only where it needs to be.
+export function displayCommand(command, secrets = []) {
+  return command.map((argument) => {
+    const masked = createOutputMask(secrets)(argument).replace(ARGUMENT_ASSIGNMENT, `$1${REDACTED}`);
+    return PLAIN_ARGUMENT.test(argument) ? masked : JSON.stringify(masked);
+  }).join(" ");
 }
 
 function apiError(statusCode, message, details) {
@@ -368,11 +383,12 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
 
   // A run's outcome is saved before it is reported: a few attempts while the
   // run still holds its worktree. `outcome(aborted)` builds the state for
-  // each attempt, so a cancel or shutdown accepted before one is honored.
+  // each attempt, so a cancel or shutdown accepted before one is honored,
+  // and `mask` the run's credential mask for the error it then reports.
   // When none succeeds the run is reported as failed with what it reached,
   // never as ready, and a retry in this runtime records it; after a restart
   // the durable running state is interrupted.
-  async function commitOutcome(outcome, signal) {
+  async function commitOutcome(outcome, signal, mask) {
     let failure;
     let state;
     for (const delay of limits.persistRetryDelaysMs ?? LIFECYCLE_LIMITS.persistRetryDelaysMs) {
@@ -385,7 +401,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     const finished = state.status === "ready" || state.status === "complete";
     return commit({ ...state, status: finished ? "failed" : state.status, unsaved: true,
       checkpoints: { ...state.checkpoints, [state.phase]: { configDigest: state.configDigest, stepIndex: state.stepIndex } },
-      error: `${state.error ? `${state.error} ` : ""}The ${state.phase} ${finished ? "finished" : "stopped"}, but Outright could not save that outcome (${String(failure?.message ?? failure).slice(0, 200)}). Run it again to record it.` }, { memoryOnly: true });
+      error: mask(`${state.error ? `${state.error} ` : ""}The ${state.phase} ${finished ? "finished" : "stopped"}, but Outright could not save that outcome (${String(failure?.message ?? failure).slice(0, 200)}). Run it again to record it.`) }, { memoryOnly: true });
   }
 
   // Memory holds every state the database keeps, so a lookup never misses a
@@ -615,15 +631,16 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     const log = openLog(worktreePath, runId);
     const env = { ...process.env, OUTRIGHT_LIFECYCLE_PHASE: phase, OUTRIGHT_WORKTREE_PATH: worktreePath, OUTRIGHT_ROOT_PATH: target.project.path };
     const secrets = environmentSecrets(env);
-    // Outright's own lines, such as a step's command line, are masked like
-    // step output, through a mask of their own.
-    const note = (text) => append(worktreePath, log, createOutputMask(secrets)(text));
+    // Outright's own lines and errors, such as a step's command line, are
+    // masked like step output, each through a mask of its own.
+    const maskText = (text) => createOutputMask(secrets)(text);
+    const note = (text) => append(worktreePath, log, maskText(text));
     if (resumeAt) note(`Resuming at step ${resumeAt + 1}; earlier steps already finished.\n`);
-    return { entry, target, phase, steps, resumeAt, runId, log, env, secrets, note, state };
+    return { entry, target, phase, steps, resumeAt, runId, log, env, secrets, maskText, note, state };
   }
 
   // Runs the admitted steps in order. Resolves with the final state.
-  async function runSteps({ entry, target, phase, steps, resumeAt, runId, log, env, secrets, note, state: initial }) {
+  async function runSteps({ entry, target, phase, steps, resumeAt, runId, log, env, secrets, maskText, note, state: initial }) {
     const { worktreePath } = target;
     const { signal } = entry.controller;
     let state = initial;
@@ -642,7 +659,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
         outcome = { status: "failed", stepIndex: index, outcomeUnknown: false, error: `${untrusted}, so "${step.name}" did not run.` };
         break;
       }
-      note(`\n▸ Step ${index + 1} of ${steps.length}: ${step.name}\n$ ${displayCommand(step.command)}\n`);
+      note(`\n▸ Step ${index + 1} of ${steps.length}: ${step.name}\n$ ${displayCommand(step.command, secrets)}\n`);
       // A step starts only once the checkpoint saying earlier steps finished
       // is durable, so a retry after a restart never repeats them.
       try { state = commit({ ...state, stepIndex: index, output: log.text, outputTruncated: log.truncated, updatedAt: now() }, { strict: true }); }
@@ -665,7 +682,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
       }
     }
     // The error is saved with the state as well as shown in the output.
-    if (outcome.error) outcome.error = createOutputMask(secrets)(outcome.error);
+    if (outcome.error) outcome.error = maskText(outcome.error);
     note(outcome.error ? `\n${outcome.error}\n` : `\n${phase === "setup" ? "Setup" : "Teardown"} finished.\n`);
     flushLog(worktreePath, log);
     const running = state;
@@ -684,7 +701,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
       return { ...running, error: null, outcomeUnknown: false, ...final,
         checkpoints: finishedCheckpoints(running.checkpoints, phase, running.configDigest, final, steps.length),
         output: keepOutput ? log.text : undefined, outputTruncated: keepOutput ? log.truncated : undefined, finishedAt: now(), updatedAt: now() };
-    }, signal);
+    }, signal, maskText);
     // The audit names the outcome that was committed.
     try { database.auditCritical(`worktree.lifecycle.${phase}.${state.status}`, { target: worktreePath, operationId: runId, stepIndex: state.stepIndex, outcomeUnknown: state.outcomeUnknown }); }
     catch (error) { onPersistError(error); }

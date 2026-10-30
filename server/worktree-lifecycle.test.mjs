@@ -1277,3 +1277,74 @@ test("credentials in a step's command line are masked in its output, its running
     assert.deepEqual((await lifecycle.describe(a)).config.setup[0].command, command);
   } finally { delete process.env.OUTRIGHT_TEST_COMMAND_SECRET; }
 }));
+
+test("a quoted credential, the rest of an argument after a secret name, and an escaped secret are masked whole in every sink, also when the outcome cannot be saved", withLifecycle(async ({ database, project, create, events }) => {
+  const escaped = String.raw`p"ss\word-12345678`;
+  const commands = [["sh", "-c", 'export TOKEN="abcdefgh12345678"; exit 1'], ["deploy", "--password=correct horse battery"],
+    ["deploy", "--password", escaped], ["curl", "-H", "Authorization: Bearer zyxwvuts87654321"]];
+  const config = { digest: "sha256:trusted", version: 1, teardown: [], setup: commands.map((command, index) => ({ name: `Step ${index + 1}`, command, timeoutSeconds: 1 })) };
+  const output = { stdout: ['export TOKEN="abcd efgh', ' ijkl"\nTOKEN=\'abcd;efgh\'\n'], stderr: ['password: "hunter2 hunter3"\nAPI_KEY="unclosed value here\n'] };
+  let release;
+  const running = new Promise((resolve) => { release = resolve; });
+  const { target, start } = scriptedLifecycle(create, database, project);
+  const subprocesses = { capacity: () => ({ active: 0, limit: 4, unknown: 0 }), run: async (file, _args, { onOutput }) => {
+    if (file === "sh") for (const stream of ["stdout", "stderr"]) for (const chunk of output[stream]) onOutput(stream, Buffer.from(chunk));
+    if (file !== "curl") return;
+    await running;
+    throw new Error(`refused ${escaped}`);
+  } };
+  // Saving the outcome fails with the credential in the database's error.
+  const save = database.saveWorktreeLifecycle;
+  database.saveWorktreeLifecycle = (state) => {
+    if (state.status !== "running") throw new Error(`database rejected ${escaped}`);
+    return save.call(database, state);
+  };
+  process.env.OUTRIGHT_TEST_DEPLOY_PASSWORD = escaped;
+  try {
+    const lifecycle = start({ subprocesses, readConfig: async () => config, limits: { ...LIFECYCLE_LIMITS, persistRetryDelaysMs: [0, 0] },
+      onPersistError: () => {} });
+    const a = target("/w/a");
+    await lifecycle.setup(a);
+    await waitFor(() => events.some((event) => event.type === "worktree.lifecycle.output" && event.payload.text.includes("$ curl")), 5_000, "the last step did not start");
+    const checkpoint = database.listWorktreeLifecycle().find((state) => state.worktreePath === "/w/a");
+    const during = (await lifecycle.describe(a)).state;
+    release();
+    const failed = (await settled(lifecycle, a)).state;
+    assert.deepEqual([failed.status, failed.unsaved], ["failed", true]);
+    assert.match(failed.error, /could not save that outcome \(database rejected \[redacted\]\)/);
+    const published = events.filter((event) => event.type === "worktree.lifecycle.output").map((event) => event.payload.text).join("");
+    const credentials = ["abcdefgh12345678", "horse battery", escaped, JSON.stringify(escaped), "zyxwvuts87654321", "abcd efgh ijkl", "abcd;efgh", "hunter2 hunter3", "unclosed value here"];
+    for (const [name, text] of [["published", published], ["running row", checkpoint.output], ["running state", during.output],
+      ["shown", failed.output], ["shown error", failed.error]]) {
+      assert.ok(text, `${name} is empty`);
+      for (const fragment of credentials.flatMap(fragmentsOf)) assert.ok(!text.includes(fragment), `${name} kept ${fragment}`);
+    }
+    for (const line of ['$ sh -c "export TOKEN=[redacted]"\n', '$ deploy "--password=[redacted]"\n', '$ deploy --password "[redacted]"\n',
+      '$ curl -H "Authorization: [redacted]"\n', "export TOKEN=[redacted]\nTOKEN=[redacted]\n", "password: [redacted]\nAPI_KEY=[redacted]\n"]) {
+      assert.ok(failed.output.includes(line), `${JSON.stringify(line)} not in ${failed.output}`);
+    }
+    // The trust review shows exactly what runs.
+    assert.deepEqual((await lifecycle.describe(a)).config.setup.map((step) => step.command), commands);
+  } finally {
+    database.saveWorktreeLifecycle = save;
+    delete process.env.OUTRIGHT_TEST_DEPLOY_PASSWORD;
+  }
+}));
+
+test("a quoted secret value is masked through its closing quote however the stream splits it, and other quoted text stays readable", () => {
+  const cases = [['export TOKEN="abcd efgh ijkl"; next', "export TOKEN=[redacted]; next"], ["TOKEN='abcd;efgh', more", "TOKEN=[redacted], more"],
+    ['password: "hunter2 hunter3"', "password: [redacted]"], ['"api_key": "a b\\"c d", "user": "bob"', '"api_key": [redacted], "user": "bob"'],
+    ['Authorization: "token abc def"', "Authorization: [redacted]"], ['SECRET="never closed at all', "SECRET=[redacted]"],
+    ['author: "Some One"', 'author: "Some One"'], ['keyboard: "us intl"', 'keyboard: "us intl"'], ['SSH_AUTH_SOCK="/tmp/a b"', 'SSH_AUTH_SOCK="/tmp/a b"'],
+    ['PATH="/usr/bin:/bin" say "hello world"', 'PATH="/usr/bin:/bin" say "hello world"'], ["DB_PASSWORD=abc def", "DB_PASSWORD=[redacted] def"]];
+  for (const [line, shown] of cases) {
+    for (let split = 0; split <= line.length; split += 1) {
+      const decoder = createOutputDecoder(createOutputMask());
+      const text = decoder.write(Buffer.from(line.slice(0, split))) + decoder.write(Buffer.from(`${line.slice(split)}\nafter\n`)) + decoder.end();
+      assert.equal(text, `${shown}\nafter\n`, `${line} split at ${split}`);
+    }
+  }
+  // A secret's value is also masked as it reads escaped in JSON.
+  const escaped = String.raw`p"ss\word-12345678`;
+  assert.equal(createOutputMask(environmentSecrets({ DEPLOY_PASSWORD: escaped }))(`{"value":${JSON.stringify(escaped)}}`), '{"value":"[redacted]"}');
+});
