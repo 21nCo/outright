@@ -1150,6 +1150,12 @@ test("credentials in step output are masked before it is published, kept or save
   assert.equal(decoder.write(Buffer.from("value\n")), "partial [redacted]\n");
 }));
 
+// A token in JWT form, assembled here so the fixture is not a literal token.
+function sampleJwt() {
+  const part = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return [part({ alg: "HS256" }), part({ sub: "outright-test" }), Buffer.from("not a real signature").toString("base64url")].join(".");
+}
+
 // Fragments of 6 or more characters that would show a credential.
 function fragmentsOf(credential) {
   const fragments = [];
@@ -1198,8 +1204,7 @@ test("no part of a credential in a line past the masking bound is shown, kept or
 }));
 
 test("the output mask covers credentials split anywhere around the line bound, and every secret name it documents", () => {
-  const credentials = [`ghp_${"A1b2C3d4E5".repeat(4)}`, `glpat-${"Zy9Xw8Vu7T".repeat(2)}abcd`,
-    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", `sk-${"proj_AbCdEfGhIj".repeat(2)}`];
+  const credentials = [`ghp_${"A1b2C3d4E5".repeat(4)}`, `glpat-${"Zy9Xw8Vu7T".repeat(2)}abcd`, sampleJwt(), `sk-${"proj_AbCdEfGhIj".repeat(2)}`];
   for (const credential of credentials) {
     for (let pad = 4080; pad <= 4100; pad += 1) {
       for (let split = 1; split < credential.length; split += 1) {
@@ -1226,7 +1231,49 @@ test("the output mask covers credentials split anywhere around the line bound, a
   for (const name of ["SSH_AUTH_SOCK", "AUTHOR", "GIT_AUTHOR_EMAIL", "XAUTHORITY", "KEYBOARD_LAYOUT", "MONKEY", "PATH"]) {
     assert.deepEqual(environmentSecrets({ [name]: "abcdefgh12345678" }), [], `${name} was masked`);
   }
+  // A complete line past the bound in one chunk is masked whole and shown.
+  const whole = createOutputDecoder(createOutputMask());
+  assert.equal(whole.write(Buffer.from(`${"a ".repeat(2500)}${credentials[0]} end\n`)), `${"a ".repeat(2500)}[redacted] end\n`);
   const mask = createOutputMask();
   assert.equal(mask("SIGNING_KEY=abc\nAuthorization: token abcdef0123456789\nAUTH_HEADER=Bearer xyzxyzxyz1\nauthor: Someone\nkeyboard: us"),
     "SIGNING_KEY=[redacted]\nAuthorization: [redacted]\nAUTH_HEADER=[redacted] [redacted]\nauthor: Someone\nkeyboard: us");
 });
+
+test("credentials in a step's command line are masked in its output, its running and saved state and its error, not in the trust review", withLifecycle(async ({ database, project, create, events }) => {
+  const token = `ghp_${"Q9w8E7r6T5".repeat(4)}`;
+  const password = "pw-0123456789";
+  const secret = "command-env-value-0123";
+  const jwt = sampleJwt();
+  const command = ["curl", "-H", `Authorization: Bearer ${token}`, `https://deploy:${password}@example.com/repo`, `--id-token=${jwt}`, secret];
+  const config = { digest: "sha256:trusted", version: 1, teardown: [], setup: [{ name: "Fetch", command, timeoutSeconds: 1 }] };
+  let release;
+  const running = new Promise((resolve) => { release = resolve; });
+  const { target, start } = scriptedLifecycle(create, database, project);
+  const subprocesses = { capacity: () => ({ active: 0, limit: 4, unknown: 0 }), run: async () => {
+    await running;
+    throw new Error(`refused ${token} for https://deploy:${password}@example.com with ${secret}`);
+  } };
+  process.env.OUTRIGHT_TEST_COMMAND_SECRET = secret;
+  try {
+    const lifecycle = start({ subprocesses, readConfig: async () => config });
+    const a = target("/w/a");
+    await lifecycle.setup(a);
+    await waitFor(() => events.some((event) => event.type === "worktree.lifecycle.output"), 5_000, "no output was published");
+    const checkpoint = database.listWorktreeLifecycle().find((state) => state.worktreePath === "/w/a");
+    assert.equal(checkpoint.status, "running");
+    const during = (await lifecycle.describe(a)).state;
+    release();
+    const failed = (await settled(lifecycle, a)).state;
+    assert.equal(failed.status, "failed");
+    const published = events.filter((event) => event.type === "worktree.lifecycle.output").map((event) => event.payload.text).join("");
+    const saved = database.listWorktreeLifecycle().find((state) => state.worktreePath === "/w/a");
+    for (const [name, text] of [["published", published], ["running row", checkpoint.output], ["running state", during.output],
+      ["shown", failed.output], ["shown error", failed.error], ["saved", saved.output], ["saved error", saved.error]]) {
+      assert.ok(text, `${name} is empty`);
+      for (const fragment of [token, password, secret, jwt].flatMap(fragmentsOf)) assert.ok(!text.includes(fragment), `${name} kept ${fragment}`);
+    }
+    assert.ok(failed.output.includes(`$ curl -H "Authorization: [redacted]" https://deploy:[redacted]@example.com/repo --id-token=[redacted] [redacted]\n`), failed.output);
+    // The trust review shows exactly what runs.
+    assert.deepEqual((await lifecycle.describe(a)).config.setup[0].command, command);
+  } finally { delete process.env.OUTRIGHT_TEST_COMMAND_SECRET; }
+}));

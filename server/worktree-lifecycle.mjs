@@ -613,18 +613,21 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     const state = commit({ ...base, checkpoints: phase === "setup" ? kept : base.checkpoints, status: "running", runId,
       stepIndex: resumeAt, startedAt: now() }, { strict: true });
     const log = openLog(worktreePath, runId);
-    if (resumeAt) append(worktreePath, log, `Resuming at step ${resumeAt + 1}; earlier steps already finished.\n`);
-    return { entry, target, phase, steps, resumeAt, runId, log, state };
+    const env = { ...process.env, OUTRIGHT_LIFECYCLE_PHASE: phase, OUTRIGHT_WORKTREE_PATH: worktreePath, OUTRIGHT_ROOT_PATH: target.project.path };
+    const secrets = environmentSecrets(env);
+    // Outright's own lines, such as a step's command line, are masked like
+    // step output, through a mask of their own.
+    const note = (text) => append(worktreePath, log, createOutputMask(secrets)(text));
+    if (resumeAt) note(`Resuming at step ${resumeAt + 1}; earlier steps already finished.\n`);
+    return { entry, target, phase, steps, resumeAt, runId, log, env, secrets, note, state };
   }
 
   // Runs the admitted steps in order. Resolves with the final state.
-  async function runSteps({ entry, target, phase, steps, resumeAt, runId, log, state: initial }) {
+  async function runSteps({ entry, target, phase, steps, resumeAt, runId, log, env, secrets, note, state: initial }) {
     const { worktreePath } = target;
     const { signal } = entry.controller;
     let state = initial;
     let outcome = { status: phase === "setup" ? "ready" : "complete", stepIndex: steps.length };
-    const env = { ...process.env, OUTRIGHT_LIFECYCLE_PHASE: phase, OUTRIGHT_WORKTREE_PATH: worktreePath, OUTRIGHT_ROOT_PATH: target.project.path };
-    const secrets = environmentSecrets(env);
     for (let index = resumeAt; index < steps.length; index += 1) {
       const step = steps[index];
       if (signal.aborted) {
@@ -639,7 +642,7 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
         outcome = { status: "failed", stepIndex: index, outcomeUnknown: false, error: `${untrusted}, so "${step.name}" did not run.` };
         break;
       }
-      append(worktreePath, log, `\n▸ Step ${index + 1} of ${steps.length}: ${step.name}\n$ ${displayCommand(step.command)}\n`);
+      note(`\n▸ Step ${index + 1} of ${steps.length}: ${step.name}\n$ ${displayCommand(step.command)}\n`);
       // A step starts only once the checkpoint saying earlier steps finished
       // is durable, so a retry after a restart never repeats them.
       try { state = commit({ ...state, stepIndex: index, output: log.text, outputTruncated: log.truncated, updatedAt: now() }, { strict: true }); }
@@ -656,13 +659,14 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
         });
       } catch (error) {
         outcome = { ...stepFailure(error, step, signal, subprocesses.capacity?.()), stepIndex: index };
-        outcome.error = createOutputMask(secrets)(outcome.error);
         break;
       } finally {
         append(worktreePath, log, decoders.stdout.end() + decoders.stderr.end());
       }
     }
-    append(worktreePath, log, outcome.error ? `\n${outcome.error}\n` : `\n${phase === "setup" ? "Setup" : "Teardown"} finished.\n`);
+    // The error is saved with the state as well as shown in the output.
+    if (outcome.error) outcome.error = createOutputMask(secrets)(outcome.error);
+    note(outcome.error ? `\n${outcome.error}\n` : `\n${phase === "setup" ? "Setup" : "Teardown"} finished.\n`);
     flushLog(worktreePath, log);
     const running = state;
     // Output is kept with a state the user must act on; a finished run's
